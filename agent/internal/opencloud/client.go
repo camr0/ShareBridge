@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -141,20 +142,19 @@ func parsePROPFIND(data []byte, token string) ([]FileInfo, error) {
 	}
 
 	var files []FileInfo
-	prefix := "/remote.php/dav/public-files/" + token + "/"
 
 	for _, r := range ms.Response {
-		// Skip the root collection
+		// Skip collections (directories)
 		if r.Propstat.Prop.ResourceType.Collection != nil {
 			continue
 		}
 
-		// Extract filename from href
-		name := strings.TrimPrefix(r.Href, prefix)
-		if name == "" || name == "/" {
+		// Extract filename from href using path.Base
+		// This handles both single-file shares and files in folders
+		name := path.Base(r.Href)
+		if name == "" || name == "." {
 			continue
 		}
-		name = strings.TrimPrefix(name, "/")
 
 		size := int64(0)
 		if r.Propstat.Prop.ContentLength != "" {
