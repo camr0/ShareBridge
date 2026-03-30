@@ -5,7 +5,7 @@ import (
 )
 
 func TestNew_ValidURL(t *testing.T) {
-	c, err := New("https://cloud.example.com/s/AbCdEfGh", "cloud.example.com")
+	c, err := New("https://cloud.example.com/s/AbCdEfGh", "cloud.example.com", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -15,14 +15,14 @@ func TestNew_ValidURL(t *testing.T) {
 }
 
 func TestNew_InvalidURL(t *testing.T) {
-	_, err := New("://invalid-url", "cloud.example.com")
+	_, err := New("://invalid-url", "cloud.example.com", "")
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
 }
 
 func TestNew_SSRF(t *testing.T) {
-	_, err := New("https://evil.com/s/token", "cloud.example.com")
+	_, err := New("https://evil.com/s/token", "cloud.example.com", "")
 	if err == nil {
 		t.Error("expected SSRF error for mismatched host")
 	}

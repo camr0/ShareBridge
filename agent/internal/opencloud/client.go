@@ -23,12 +23,14 @@ type FileInfo struct {
 type Client struct {
 	baseURL    string // https://host/remote.php/dav/public-files/{token}
 	token      string
+	password   string // OpenCloud share password (empty if share is unprotected)
 	httpClient *http.Client
 }
 
 // New creates a WebDAV client for the given public share URL.
+// password is the OpenCloud share password; pass empty string for unprotected shares.
 // allowedHost restricts which hosts are permitted (SSRF protection).
-func New(shareURL string, allowedHost string) (*Client, error) {
+func New(shareURL string, allowedHost string, password string) (*Client, error) {
 	u, err := url.Parse(shareURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
@@ -48,8 +50,9 @@ func New(shareURL string, allowedHost string) (*Client, error) {
 	baseURL := fmt.Sprintf("https://%s/remote.php/dav/public-files/%s", u.Host, token)
 
 	return &Client{
-		baseURL: baseURL,
-		token:   token,
+		baseURL:  baseURL,
+		token:    token,
+		password: password,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -57,9 +60,9 @@ func New(shareURL string, allowedHost string) (*Client, error) {
 }
 
 // authHeader returns the Basic Auth header for WebDAV requests.
-// OpenCloud public shares use the token as username with empty password.
+// OpenCloud public shares use the token as username, share password (or empty) as password.
 func (c *Client) authHeader() string {
-	auth := base64.StdEncoding.EncodeToString([]byte(c.token + ":"))
+	auth := base64.StdEncoding.EncodeToString([]byte(c.token + ":" + c.password))
 	return "Basic " + auth
 }
 

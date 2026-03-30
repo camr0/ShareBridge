@@ -56,7 +56,7 @@ func runShare(cmd *cobra.Command, args []string) error {
 	cfg.Password = password
 	cfg.MaxDownloads = maxDownloads
 
-	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost)
+	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost, password)
 	if err != nil {
 		return fmt.Errorf("create WebDAV client: %w", err)
 	}
