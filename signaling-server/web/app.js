@@ -44,6 +44,7 @@ function join() {
         break;
 
       case 'offer':
+        if (!pc) return;
         await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
         remoteDescSet = true;
 
@@ -60,6 +61,7 @@ function join() {
         break;
 
       case 'ice_candidate':
+        if (!pc) return;
         if (!remoteDescSet) {
           pendingCandidates.push(msg.candidate);
         } else {
