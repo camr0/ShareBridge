@@ -27,6 +27,7 @@ func CreateSession(sessions *session.Manager, h *hub.Hub, authToken string) gin.
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
 		}
+		// In single-user mode the auth token is also the agent's connection key in the hub.
 		if !h.AgentConnected(token) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "agent not connected — connect WebSocket first"})
 			return
