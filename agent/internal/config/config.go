@@ -3,17 +3,18 @@ package config
 import "os"
 
 type Config struct {
-	SignalingServer string // e.g. ws://localhost:8080
+	SignalingServer string
 	AuthToken       string
-	ShareURL        string
 	AllowedHost     string
+	// Password and MaxDownloads are set from CLI flags, not env vars
+	Password     string
+	MaxDownloads int
 }
 
 func Load() *Config {
 	return &Config{
 		SignalingServer: getEnv("SIGNALING_SERVER", "ws://localhost:8080"),
 		AuthToken:       getEnv("AUTH_TOKEN", "dev-token"),
-		ShareURL:        getEnv("SHARE_URL", ""),
 		AllowedHost:     getEnv("ALLOWED_OPENCLOUD_HOST", ""),
 	}
 }
