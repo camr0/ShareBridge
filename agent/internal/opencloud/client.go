@@ -14,9 +14,9 @@ import (
 
 // FileInfo describes a file in an OpenCloud share.
 type FileInfo struct {
-	Name        string
-	Size        int64
-	ContentType string
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"mimeType"`
 }
 
 // Client provides WebDAV access to OpenCloud public shares.
