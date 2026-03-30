@@ -22,17 +22,19 @@ Recipient clicks a file in the browser, it downloads end-to-end via the DataChan
 
 ## Protocol Specification
 
-All messages are JSON over the WebRTC DataChannel.
+Two frame types over the DataChannel:
+- **Text frames**: JSON control messages (list_request, file_request, file_list, file_header, chunk_end, error)
+- **Binary frames**: Raw file data chunks (ArrayBuffer in browser, []byte in Go)
 
-### Message Types
+### Message Types (Text Frames)
 
 #### Browser → Agent
 
 ```json
-// Request file listing
+// Request file listing (sent automatically when DataChannel opens)
 {"type": "list_request"}
 
-// Request specific file
+// Request specific file (only when no transfer in progress)
 {"type": "file_request", "name": "document.pdf"}
 ```
 
@@ -48,7 +50,7 @@ All messages are JSON over the WebRTC DataChannel.
   ]
 }
 
-// File metadata before transfer
+// File metadata before binary transfer begins
 {
   "type": "file_header",
   "name": "report.pdf",
@@ -56,38 +58,41 @@ All messages are JSON over the WebRTC DataChannel.
   "mimeType": "application/pdf"
 }
 
-// Binary data chunk (base64 encoded)
-{
-  "type": "chunk",
-  "data": "base64encodeddata..."
-}
-
-// Transfer complete
+// Transfer complete (sent after last binary chunk)
 {"type": "chunk_end"}
 
 // Error response
 {"type": "error", "message": "file not found"}
 ```
 
+### Binary Frames
+
+File data is sent as raw binary DataChannel messages (not JSON). Each binary frame contains exactly one 64KB chunk (except the last which may be smaller).
+
 ### Message Sequence
 
 ```
 Browser                          Agent
    |                                |
+   |--- DataChannel opens --------->|
    |--- list_request -------------->|
    |                                |-- PROPFIND share URL
    |<-- file_list ------------------|   (folder: list contents)
    |                                |   (file: single item)
    |                                |
+   [User clicks file]               |
    |--- file_request -------------->|
    |                                |-- GET file from WebDAV
    |<-- file_header ----------------|
-   |<-- chunk ----------------------|
-   |<-- chunk ----------------------|
+   |<-- BINARY (64KB) --------------|
+   |<-- BINARY (64KB) --------------|
+   |<-- BINARY (remainder) -------->|
    |<-- chunk_end ------------------|
    |                                |
    [Browser assembles chunks, triggers download]
 ```
+
+**Concurrent transfer behavior:** If a `file_request` arrives while a transfer is already in progress, the agent sends `error: "transfer in progress"` and ignores the request. The browser must wait for the current download to complete before requesting another file.
 
 ## Component Design
 
@@ -148,8 +153,7 @@ Add DataChannel message handling to existing Peer struct:
 type Peer struct {
     // ... existing fields ...
     dc              *webrtc.DataChannel
-    OnMessage       func(data []byte)
-    OnBufferedAmountLow func()
+    OnMessage       func(data []byte)  // Called for both text and binary frames
 }
 
 // Send transmits a message over the DataChannel.
@@ -190,8 +194,6 @@ func (m *Manager) SendFile(ctx context.Context, name string) error
 type DataChannel interface {
     Send(data []byte) error
     BufferedAmount() uint64
-    SetBufferedAmountLowThreshold(threshold uint64)
-    OnBufferedAmountLow(f func())
 }
 ```
 
@@ -223,41 +225,63 @@ func (m *Manager) sendWithBackpressure(data []byte) error {
 
 ```javascript
 // Handle incoming DataChannel messages
-function onDataChannelMessage(event) {
+dc.onmessage = (event) => {
+  if (event.data instanceof ArrayBuffer) {
+    // Binary frame: file data chunk
+    appendChunk(new Uint8Array(event.data));
+    return;
+  }
+
+  // Text frame: JSON control message
   const msg = JSON.parse(event.data);
   switch (msg.type) {
     case 'file_list': renderFileList(msg.files); break;
     case 'file_header': startDownload(msg); break;
-    case 'chunk': appendChunk(msg.data); break;
     case 'chunk_end': completeDownload(); break;
     case 'error': showError(msg.message); break;
   }
-}
+};
+
+dc.onopen = () => {
+  // Automatically request file list when channel opens
+  dc.send(JSON.stringify({type: 'list_request'}));
+};
 
 // Request and render file list
 function renderFileList(files) {
   // Render clickable file list with sizes
-  // Click handler sends file_request
+  // Click handler sends file_request (only if not downloading)
 }
 
 // Download assembly
 const chunks = [];
 let currentFile = null;
+let receivedBytes = 0;
 
 function startDownload(header) {
   currentFile = header;
   chunks.length = 0;
+  receivedBytes = 0;
   updateProgress(0, header.size);
 }
 
-function appendChunk(base64Data) {
-  const bytes = base64ToUint8Array(base64Data);
+function appendChunk(bytes) {
   chunks.push(bytes);
+  receivedBytes += bytes.length;
   updateProgress(receivedBytes, currentFile.size);
 }
 
 function completeDownload() {
-  const blob = new Blob(chunks, { type: currentFile.mimeType });
+  // Combine all chunks into single Uint8Array
+  const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
+  const combined = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  const blob = new Blob([combined], { type: currentFile.mimeType });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -286,6 +310,7 @@ function completeDownload() {
 | WebDAV timeout | Close chunk stream, send `error` | Show "transfer failed" |
 | DataChannel closed mid-transfer | Stop reading, cleanup | Show "connection lost", reset UI |
 | Invalid message | Send `error: "invalid request"` | Log error, ignore |
+| Transfer in progress | Send `error: "transfer in progress"` | Ignore or disable other file clicks |
 
 ## Testing Strategy
 
