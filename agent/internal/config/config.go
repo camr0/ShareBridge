@@ -6,6 +6,7 @@ type Config struct {
 	SignalingServer string // e.g. ws://localhost:8080
 	AuthToken       string
 	ShareURL        string
+	AllowedHost     string
 }
 
 func Load() *Config {
@@ -13,6 +14,7 @@ func Load() *Config {
 		SignalingServer: getEnv("SIGNALING_SERVER", "ws://localhost:8080"),
 		AuthToken:       getEnv("AUTH_TOKEN", "dev-token"),
 		ShareURL:        getEnv("SHARE_URL", ""),
+		AllowedHost:     getEnv("ALLOWED_OPENCLOUD_HOST", ""),
 	}
 }
 

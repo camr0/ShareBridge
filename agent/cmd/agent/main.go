@@ -9,14 +9,21 @@ import (
 
 	"github.com/pion/webrtc/v4"
 	"opencloudshare/agent/internal/config"
+	"opencloudshare/agent/internal/opencloud"
 	"opencloudshare/agent/internal/peer"
 	"opencloudshare/agent/internal/signaling"
+	"opencloudshare/agent/internal/transfer"
 )
 
 func main() {
 	cfg := config.Load()
 	if cfg.ShareURL == "" {
 		log.Fatal("SHARE_URL env var is required")
+	}
+
+	webdavClient, err := opencloud.New(cfg.ShareURL, cfg.AllowedHost)
+	if err != nil {
+		log.Fatalf("create WebDAV client: %v", err)
 	}
 
 	ctx := context.Background()
@@ -84,6 +91,10 @@ func main() {
 				log.Printf("create offer: %v", err)
 				return
 			}
+
+			tm := transfer.NewManager(p, webdavClient)
+			p.SetOnMessage(tm.HandleMessage)
+
 			if err := sig.Send(ctx, map[string]any{
 				"type":       "offer",
 				"session_id": sessionID,
