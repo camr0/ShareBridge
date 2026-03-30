@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/spf13/cobra"
 	"opencloudshare/agent/internal/config"
 	"opencloudshare/agent/internal/opencloud"
 	"opencloudshare/agent/internal/peer"
@@ -15,28 +19,98 @@ import (
 	"opencloudshare/agent/internal/transfer"
 )
 
+var (
+	password     string
+	maxDownloads int
+)
+
+func init() {
+	rootCmd.AddCommand(shareCmd)
+	shareCmd.Flags().StringVarP(&password, "password", "p", "", "Optional password for share access")
+	shareCmd.Flags().IntVarP(&maxDownloads, "max-downloads", "n", 0, "Maximum number of downloads (0=unlimited)")
+}
+
+var rootCmd = &cobra.Command{
+	Use:   "agent",
+	Short: "OpenCloudShare agent for secure file sharing",
+}
+
+var shareCmd = &cobra.Command{
+	Use:   "share [SHARE_URL]",
+	Short: "Share files from a WebDAV URL",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runShare,
+}
+
 func main() {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func runShare(cmd *cobra.Command, args []string) error {
+	shareURL := args[0]
+
 	cfg := config.Load()
-	if cfg.ShareURL == "" {
-		log.Fatal("SHARE_URL env var is required")
-	}
+	cfg.Password = password
+	cfg.MaxDownloads = maxDownloads
 
-	webdavClient, err := opencloud.New(cfg.ShareURL, cfg.AllowedHost)
+	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost)
 	if err != nil {
-		log.Fatalf("create WebDAV client: %v", err)
+		return fmt.Errorf("create WebDAV client: %w", err)
 	}
 
-	ctx := context.Background()
+	// Handle Ctrl-C gracefully
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 
+	backoff := signaling.NewBackoff()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("shutting down...")
+			return nil
+		default:
+		}
+
+		if err := runSession(ctx, cfg, webdavClient, shareURL); err != nil {
+			log.Printf("session ended: %v", err)
+		}
+
+		// Check if context was cancelled before retrying
+		select {
+		case <-ctx.Done():
+			log.Println("shutting down...")
+			return nil
+		default:
+		}
+
+		delay := backoff.Next()
+		log.Printf("reconnecting in %v...", delay)
+
+		select {
+		case <-ctx.Done():
+			log.Println("shutting down...")
+			return nil
+		case <-time.After(delay):
+			// Continue to retry
+		}
+	}
+}
+
+func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string) error {
 	sig := signaling.New(cfg.SignalingServer, cfg.AuthToken)
+
 	if err := sig.Connect(ctx); err != nil {
-		log.Fatalf("connect to signaling server: %v", err)
+		return fmt.Errorf("connect to signaling server: %w", err)
 	}
 	log.Printf("connected to signaling server at %s", cfg.SignalingServer)
 
-	code, err := sig.CreateSession(ctx, cfg.ShareURL, "24h")
+	code, err := sig.CreateSession(ctx, shareURL, "")
 	if err != nil {
-		log.Fatalf("create session: %v", err)
+		return fmt.Errorf("create session: %w", err)
 	}
 	log.Printf("session ready — code: %s", code)
 	log.Printf("open browser: http://localhost:8080  then enter code: %s", code)
@@ -67,9 +141,6 @@ func main() {
 			peers[sessionID] = p
 			mu.Unlock()
 
-			p.OnOpen = func() {
-				log.Printf("✓ DataChannel open! (session %s)", sessionID)
-			}
 			p.OnClosed = func() {
 				log.Printf("peer closed (session %s)", sessionID)
 				mu.Lock()
@@ -92,7 +163,32 @@ func main() {
 				return
 			}
 
-			tm := transfer.NewManager(p, webdavClient)
+			tm := transfer.NewManager(p, webdavClient, cfg.Password, cfg.MaxDownloads)
+
+			// Wire OnAuthFailed to send auth_failed to server
+			tm.OnAuthFailed = func() {
+				if err := sig.Send(ctx, map[string]any{
+					"type":       "auth_failed",
+					"session_id": sessionID,
+				}); err != nil {
+					log.Printf("send auth_failed: %v", err)
+				}
+			}
+
+			// Wire OnSessionExpired to send session_expired to server
+			tm.OnSessionExpired = func() {
+				if err := sig.Send(ctx, map[string]any{
+					"type":       "session_expired",
+					"session_id": sessionID,
+				}); err != nil {
+					log.Printf("send session_expired: %v", err)
+				}
+			}
+
+			p.OnOpen = func() {
+				log.Printf("✓ DataChannel open! (session %s)", sessionID)
+				tm.HandleOpen()
+			}
 			p.SetOnMessage(tm.HandleMessage)
 
 			if err := sig.Send(ctx, map[string]any{
@@ -137,7 +233,8 @@ func main() {
 
 	log.Println("waiting for browser connections (Ctrl-C to stop)...")
 	if err := sig.Listen(ctx); err != nil {
-		log.Printf("signaling disconnected: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("signaling disconnected: %w", err)
 	}
+
+	return nil
 }
