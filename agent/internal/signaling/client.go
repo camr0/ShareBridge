@@ -44,7 +44,10 @@ func (c *Client) Connect(ctx context.Context) error {
 
 // CreateSession calls POST /api/v1/sessions and returns the session code.
 func (c *Client) CreateSession(ctx context.Context, shareURL, ttl string) (string, error) {
-	body, _ := json.Marshal(map[string]string{"share_url": shareURL, "ttl": ttl})
+	body, err := json.Marshal(map[string]string{"share_url": shareURL, "ttl": ttl})
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
 
 	httpBase := strings.NewReplacer("ws://", "http://", "wss://", "https://").Replace(c.serverURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpBase+"/api/v1/sessions", bytes.NewReader(body))
@@ -79,7 +82,7 @@ func (c *Client) CreateSession(ctx context.Context, shareURL, ttl string) (strin
 func (c *Client) Send(ctx context.Context, msg any) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal message: %w", err)
 	}
 	return c.conn.Write(ctx, websocket.MessageText, data)
 }
