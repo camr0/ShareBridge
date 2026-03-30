@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>OpenCloudShare</title>
+  <style>
+    body { font-family: sans-serif; max-width: 400px; margin: 80px auto; padding: 0 1rem; }
+    input { width: 100%; padding: 8px; font-size: 1rem; box-sizing: border-box; }
+    button { margin-top: 8px; padding: 8px 16px; font-size: 1rem; cursor: pointer; }
+    #status { margin-top: 16px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>OpenCloudShare</h2>
+  <input id="code" placeholder="Enter session code" autocomplete="off" />
+  <br>
+  <button onclick="join()">Join</button>
+  <div id="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
