@@ -89,3 +89,25 @@ func (p *Peer) AddICECandidate(init webrtc.ICECandidateInit) error {
 func (p *Peer) Close() error {
 	return p.pc.Close()
 }
+
+// SendBinary sends a binary message over the DataChannel.
+func (p *Peer) SendBinary(data []byte) error {
+	return p.dc.Send(data)
+}
+
+// SendText sends a text message over the DataChannel.
+func (p *Peer) SendText(text string) error {
+	return p.dc.SendText(text)
+}
+
+// BufferedAmount returns the number of bytes currently buffered for sending.
+func (p *Peer) BufferedAmount() uint64 {
+	return p.dc.BufferedAmount()
+}
+
+// SetOnMessage sets the callback for receiving messages on the DataChannel.
+func (p *Peer) SetOnMessage(handler func(data []byte)) {
+	p.dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		handler(msg.Data)
+	})
+}
