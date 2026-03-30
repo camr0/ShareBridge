@@ -2,8 +2,8 @@ package transfer
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"opencloudshare/agent/internal/opencloud"
@@ -26,7 +26,7 @@ type DataChannel interface {
 type Manager struct {
 	dc       DataChannel
 	client   *opencloud.Client
-	transfer bool // true if transfer in progress
+	transfer atomic.Bool // true if transfer in progress
 }
 
 // NewManager creates a transfer manager.
@@ -88,7 +88,7 @@ func (m *Manager) handleListRequest() {
 }
 
 func (m *Manager) handleFileRequest(name string) {
-	if m.transfer {
+	if m.transfer.Load() {
 		m.sendError("transfer in progress")
 		return
 	}
@@ -134,12 +134,12 @@ func (m *Manager) handleFileRequest(name string) {
 	}
 
 	// Start transfer
-	m.transfer = true
+	m.transfer.Store(true)
 	go m.streamFile(name)
 }
 
 func (m *Manager) streamFile(name string) {
-	defer func() { m.transfer = false }()
+	defer func() { m.transfer.Store(false) }()
 
 	// Create a pipe: WebDAV writes to writer, we read from reader
 	pr, pw := io.Pipe()
@@ -195,9 +195,3 @@ func (m *Manager) sendError(message string) {
 	m.dc.SendText(string(data))
 }
 
-// parseInt64 parses a string to int64
-func parseInt64(s string) (int64, error) {
-	var n int64
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
-}

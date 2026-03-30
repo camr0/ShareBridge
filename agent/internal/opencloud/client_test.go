@@ -15,7 +15,7 @@ func TestNew_ValidURL(t *testing.T) {
 }
 
 func TestNew_InvalidURL(t *testing.T) {
-	_, err := New("not-a-url", "cloud.example.com")
+	_, err := New("://invalid-url", "cloud.example.com")
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
