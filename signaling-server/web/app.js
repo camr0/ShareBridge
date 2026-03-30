@@ -8,6 +8,9 @@ let receivedBytes = 0;
 let fileChunks = [];
 let isDownloading = false;
 
+// Auth state
+let authAttempts = 0;
+
 function status(msg) {
   document.getElementById('status').textContent = msg;
 }
@@ -100,9 +103,7 @@ function setupDataChannel() {
   dc.onopen = () => {
     status('DataChannel open!');
     hideSection('join-section');
-    showSection('file-list');
-    // Request file list
-    dc.send(JSON.stringify({ type: 'list_request' }));
+    // Wait for hello message before requesting file list
   };
 
   dc.onmessage = (event) => {
@@ -116,6 +117,9 @@ function setupDataChannel() {
     // Text frame: JSON control message
     const msg = JSON.parse(event.data);
     switch (msg.type) {
+      case 'hello':
+        handleHello(msg);
+        break;
       case 'file_list':
         renderFileList(msg.files);
         break;
@@ -126,14 +130,17 @@ function setupDataChannel() {
         completeDownload();
         break;
       case 'error':
-        status('Error: ' + msg.message);
-        isDownloading = false;
+        handleError(msg);
         break;
     }
   };
 
   dc.onclose = () => {
-    status('Connection closed');
+    if (authAttempts >= 3) {
+      status('Too many incorrect attempts. Connection closed.');
+    } else {
+      status('Connection closed');
+    }
     resetUI();
   };
 }
@@ -216,14 +223,59 @@ function completeDownload() {
   fileChunks = [];
 }
 
+function handleHello(msg) {
+  if (msg.password_required) {
+    showSection('password-section');
+    document.getElementById('password-input').focus();
+  } else {
+    // No password required, request file list immediately
+    requestFileList('');
+  }
+}
+
+function submitPassword() {
+  const password = document.getElementById('password-input').value;
+  requestFileList(password);
+}
+
+function requestFileList(password) {
+  dc.send(JSON.stringify({ type: 'list_request', password: password }));
+}
+
+function handleError(msg) {
+  const message = msg.message || '';
+  if (message.toLowerCase().includes('incorrect password')) {
+    authAttempts++;
+    const errorDiv = document.getElementById('password-error');
+    if (authAttempts >= 3) {
+      errorDiv.textContent = 'Too many incorrect attempts. Connection closed.';
+      document.getElementById('password-input').disabled = true;
+      document.querySelector('#password-section button').disabled = true;
+    } else {
+      errorDiv.textContent = `Incorrect password. ${3 - authAttempts} attempts remaining.`;
+      document.getElementById('password-input').value = '';
+      document.getElementById('password-input').focus();
+    }
+  } else {
+    status('Error: ' + message);
+    isDownloading = false;
+  }
+}
+
 function resetUI() {
   showSection('join-section');
+  hideSection('password-section');
   hideSection('file-list');
   hideSection('progress-container');
   document.getElementById('file-list').innerHTML = '';
+  document.getElementById('password-error').textContent = '';
+  document.getElementById('password-input').value = '';
+  document.getElementById('password-input').disabled = false;
+  document.querySelector('#password-section button').disabled = false;
   currentFile = null;
   fileChunks = [];
   isDownloading = false;
+  authAttempts = 0;
 }
 
 function escapeHtml(text) {

@@ -26,6 +26,12 @@
     <button onclick="join()">Join</button>
   </div>
   <div id="status"></div>
+  <div id="password-section" class="hidden">
+    <p>This share is password protected.</p>
+    <input id="password-input" type="password" placeholder="Enter password" />
+    <button onclick="submitPassword()">Submit</button>
+    <div id="password-error" style="color:red; margin-top:8px;"></div>
+  </div>
   <div id="file-list" class="hidden"></div>
   <div id="progress-container" class="hidden">
     <div id="progress-bar"></div>
