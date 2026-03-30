@@ -76,6 +76,12 @@ func AgentWS(h *hub.Hub, authToken string) gin.HandlerFunc {
 					"type":      "ice_candidate",
 					"candidate": msg.Candidate,
 				})
+
+			case "auth_failed":
+				log.Printf("auth failed on session %s", msg.SessionID)
+
+			case "session_expired":
+				log.Printf("session expired (max downloads): %s", msg.SessionID)
 			}
 		}
 	}
