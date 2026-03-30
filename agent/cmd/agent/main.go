@@ -182,13 +182,14 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 				log.Printf("✓ DataChannel open! (session %s)", sessionID)
 				tm.HandleOpen()
 			}
-			p.SetOnMessage(tm.HandleMessage)
 
+			// CreateOffer creates the DataChannel internally — SetOnMessage must come after
 			sdp, err := p.CreateOffer()
 			if err != nil {
 				log.Printf("create offer: %v", err)
 				return
 			}
+			p.SetOnMessage(tm.HandleMessage)
 
 			if err := sig.Send(ctx, map[string]any{
 				"type":       "offer",
