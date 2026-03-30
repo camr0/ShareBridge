@@ -16,7 +16,10 @@ Production-quality agent invocation: a real CLI, password-protected shares, down
 | TTL flag | None | OpenCloud share expiry is source of truth |
 | Password validation | Agent only | Server is untrusted — never sees password content |
 | Auth failure signaling | Generic event to server (no password) | Server can rate-limit without learning credentials |
+| Agent-side auth banning | 3 failures → close DataChannel permanently | Limits brute force per connection, independent of server-side limiting |
+| Password UX | `hello` message with `password_required` flag | Browser shows password field only when needed, no awkward failed first attempt |
 | Max downloads | In-memory counter (resets on restart) | Simple, sufficient for MVP |
+| Downloads counted | Successful only (after chunk_end sent) | Don't penalize users for connection drops |
 | Persistence | None (deferred to Slice 4) | Fresh session code on each restart |
 | Reconnect backoff | Exponential: 1s→2s→4s→8s→16s→30s cap, ±20% jitter | Standard approach, prevents thundering herd |
 
@@ -68,20 +71,26 @@ Config struct gains `Password` and `MaxDownloads` fields — populated from flag
 
 ### 2. Password Authentication
 
-**Protocol addition** — `list_request` carries an optional password field:
+**Handshake** — when the DataChannel opens, agent sends a `hello` message before any file list request:
+
+```json
+{"type": "hello", "password_required": true}
+```
+
+Browser shows a password input immediately if `password_required` is true; skips it if false. No failed first attempt, no guessing.
+
+**Protocol** — `list_request` carries an optional password field:
 
 ```json
 {"type": "list_request", "password": "hunter2"}
 ```
 
 **Agent behavior:**
-1. If `--password` was set and `list_request.password` doesn't match → send error to browser, send auth_failed to server, close DataChannel.
-2. If `--password` was set and field is missing → treat as wrong password.
-3. If no `--password` configured → ignore the field, proceed normally.
-
-**Browser behavior:**
-- If server responds with `error: "incorrect password"` → show password prompt, re-request.
-- Browser UI gains a password input field (hidden until needed — shown only if first `list_request` returns incorrect password error).
+1. On DataChannel open → send `hello` with `password_required`.
+2. If `--password` was set and `list_request.password` matches → proceed normally.
+3. If `--password` was set and password is wrong or missing → increment failure counter, send `error: "incorrect password"` to browser, send `auth_failed` to server.
+4. After 3 failures on the same connection → close the DataChannel permanently (no further retries accepted).
+5. If no `--password` configured → ignore the field, proceed normally.
 
 **Auth failure signal to server:**
 
@@ -90,7 +99,7 @@ Agent sends over the signaling WebSocket:
 {"type": "auth_failed", "session_id": "daxziivs"}
 ```
 
-No password content. Server logs the event and can track failure counts per session for rate limiting (Slice 5).
+No password content. Server logs the event; rate limiting deferred to Slice 5.
 
 ### 3. Max Downloads (`agent/internal/transfer/`)
 
@@ -181,7 +190,10 @@ On each reconnect: full connect → register → create/re-register session → 
 ### New Agent → Browser messages
 
 ```json
-// Wrong password
+// Sent immediately when DataChannel opens
+{"type": "hello", "password_required": true}
+
+// Wrong password (up to 3 attempts, then DataChannel closed)
 {"type": "error", "message": "incorrect password"}
 
 // Max downloads reached
@@ -191,18 +203,20 @@ On each reconnect: full connect → register → create/re-register session → 
 ## Browser UI Changes
 
 Password prompt flow:
-1. DataChannel opens → browser sends `list_request` (no password if none entered yet)
-2. If agent responds with `error: "incorrect password"` → show password input field + retry button
-3. User enters password → browser sends `list_request` with password
-4. On success → show file list as normal
-
-No password field shown by default — only revealed on first failure. This avoids showing a password field for unprotected shares.
+1. DataChannel opens → agent sends `hello` with `password_required`
+2. If `password_required: false` → browser sends `list_request` immediately (no password field shown)
+3. If `password_required: true` → browser shows password input + submit button before sending `list_request`
+4. User submits password → browser sends `list_request` with password
+5. If agent responds `error: "incorrect password"` → show error, allow retry (up to 3 attempts)
+6. After 3 failures → agent closes DataChannel, browser shows "too many incorrect attempts"
+7. On success → show file list as normal
 
 ## Error Handling
 
 | Scenario | Agent Behavior | Browser Behavior |
 |----------|---------------|------------------|
-| Wrong password | Send `error: "incorrect password"`, signal server `auth_failed` | Show password input, allow retry |
+| Wrong password (attempt 1-2) | Send `error: "incorrect password"`, signal server `auth_failed` | Show error, allow retry |
+| Wrong password (attempt 3) | Send `error: "incorrect password"`, signal server `auth_failed`, close DataChannel | Show "too many incorrect attempts" |
 | Max downloads reached | Send `error: "share has reached its download limit"`, signal server `session_expired` | Show message, no retry |
 | Signaling disconnect | Log error, reconnect with backoff | No change (WebRTC connection may persist) |
 | Reconnect fails repeatedly | Keep retrying up to 30s interval | No change |
@@ -215,8 +229,10 @@ No password field shown by default — only revealed on first failure. This avoi
 - `transfer/manager_test.go`: max-downloads counter increment and rejection (extend existing mock)
 
 **Manual E2E Tests:**
-1. `opencloudshare share <url> --password secret` → browser prompted for password on wrong attempt, succeeds on correct
-2. `opencloudshare share <url> --max-downloads 2` → third download attempt rejected
+1. `opencloudshare share <url>` → no password field shown, file list appears immediately
+2. `opencloudshare share <url> --password secret` → password field shown, correct password shows file list
+3. `opencloudshare share <url> --password secret` → 3 wrong passwords → DataChannel closed, browser shows "too many incorrect attempts"
+4. `opencloudshare share <url> --max-downloads 2` → third download attempt rejected
 3. Kill signaling server mid-session → agent reconnects automatically, prints new session code
 4. Ctrl-C → clean shutdown
 
