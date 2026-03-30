@@ -31,7 +31,7 @@ func init() {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "agent",
+	Use:   "opencloudshare",
 	Short: "OpenCloudShare agent for secure file sharing",
 }
 
@@ -77,6 +77,8 @@ func runShare(cmd *cobra.Command, args []string) error {
 
 		if err := runSession(ctx, cfg, webdavClient, shareURL); err != nil {
 			log.Printf("session ended: %v", err)
+		} else {
+			backoff.Reset()
 		}
 
 		// Check if context was cancelled before retrying
@@ -157,15 +159,9 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 				}
 			}
 
-			sdp, err := p.CreateOffer()
-			if err != nil {
-				log.Printf("create offer: %v", err)
-				return
-			}
-
 			tm := transfer.NewManager(p, webdavClient, cfg.Password, cfg.MaxDownloads)
 
-			// Wire OnAuthFailed to send auth_failed to server
+			// Wire callbacks before CreateOffer to avoid any race with a fast peer
 			tm.OnAuthFailed = func() {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "auth_failed",
@@ -174,8 +170,6 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 					log.Printf("send auth_failed: %v", err)
 				}
 			}
-
-			// Wire OnSessionExpired to send session_expired to server
 			tm.OnSessionExpired = func() {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "session_expired",
@@ -184,12 +178,17 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 					log.Printf("send session_expired: %v", err)
 				}
 			}
-
 			p.OnOpen = func() {
 				log.Printf("✓ DataChannel open! (session %s)", sessionID)
 				tm.HandleOpen()
 			}
 			p.SetOnMessage(tm.HandleMessage)
+
+			sdp, err := p.CreateOffer()
+			if err != nil {
+				log.Printf("create offer: %v", err)
+				return
+			}
 
 			if err := sig.Send(ctx, map[string]any{
 				"type":       "offer",

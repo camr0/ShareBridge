@@ -117,7 +117,6 @@ func TestHandleOpen_WithPassword(t *testing.T) {
 	var hello struct {
 		Type             string `json:"type"`
 		PasswordRequired bool   `json:"password_required"`
-		MaxDownloads     int    `json:"max_downloads,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(lastMsg), &hello); err != nil {
 		t.Fatalf("failed to parse hello: %v", err)
@@ -128,9 +127,6 @@ func TestHandleOpen_WithPassword(t *testing.T) {
 	}
 	if !hello.PasswordRequired {
 		t.Error("expected password_required=true when password is set")
-	}
-	if hello.MaxDownloads != 5 {
-		t.Errorf("expected max_downloads=5, got %d", hello.MaxDownloads)
 	}
 }
 
@@ -249,8 +245,8 @@ func TestMaxDownloads_Rejected(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	lastMsg := dc.getLastTextMessage()
-	if !strings.Contains(lastMsg, "max downloads reached") {
-		t.Errorf("expected 'max downloads reached' error, got: %s", lastMsg)
+	if !strings.Contains(lastMsg, "share has reached its download limit") {
+		t.Errorf("expected download limit error, got: %s", lastMsg)
 	}
 	if !sessionExpiredCalled {
 		t.Error("OnSessionExpired callback should have been called")

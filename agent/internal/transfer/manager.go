@@ -55,16 +55,9 @@ func (m *Manager) HandleOpen() {
 	hello := struct {
 		Type             string `json:"type"`
 		PasswordRequired bool   `json:"password_required"`
-		MaxDownloads     int    `json:"max_downloads,omitempty"`
 	}{
 		Type:             "hello",
 		PasswordRequired: m.password != "",
-		MaxDownloads:     m.maxDownloads,
-	}
-
-	// Omit MaxDownloads if zero (unlimited)
-	if m.maxDownloads == 0 {
-		hello.MaxDownloads = 0
 	}
 
 	data, _ := json.Marshal(hello)
@@ -103,7 +96,7 @@ func (m *Manager) handleListRequest(password string) {
 	// Check password if required
 	if m.password != "" {
 		if password != m.password {
-			m.handleAuthFailure("invalid password")
+			m.handleAuthFailure()
 			return
 		}
 		// Reset auth failures on successful password
@@ -112,7 +105,7 @@ func (m *Manager) handleListRequest(password string) {
 
 	// Check max downloads limit
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
-		m.sendError("max downloads reached")
+		m.sendError("share has reached its download limit")
 		if m.OnSessionExpired != nil {
 			m.OnSessionExpired()
 		}
@@ -151,25 +144,25 @@ func (m *Manager) handleListRequest(password string) {
 	}
 }
 
-func (m *Manager) handleAuthFailure(reason string) {
+func (m *Manager) handleAuthFailure() {
 	failures := m.authFailures.Add(1)
 
+	// Notify server of every auth failure (for rate limiting in Slice 5)
+	if m.OnAuthFailed != nil {
+		m.OnAuthFailed()
+	}
+
+	m.sendError("incorrect password")
+
 	if failures >= maxAuthFailures {
-		m.sendError("authentication failed: too many attempts")
-		if m.OnAuthFailed != nil {
-			m.OnAuthFailed()
-		}
-		// Close the channel after 3 strikes
 		m.dc.Close()
-	} else {
-		m.sendError("authentication failed: " + reason)
 	}
 }
 
 func (m *Manager) handleFileRequest(name string) {
 	// Check max downloads limit before starting transfer
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
-		m.sendError("max downloads reached")
+		m.sendError("share has reached its download limit")
 		if m.OnSessionExpired != nil {
 			m.OnSessionExpired()
 		}

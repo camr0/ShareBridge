@@ -146,6 +146,8 @@ function setupDataChannel() {
 }
 
 function renderFileList(files) {
+  hideSection('password-section');
+  showSection('file-list');
   const container = document.getElementById('file-list');
   container.innerHTML = '';
 
