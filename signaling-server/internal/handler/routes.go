@@ -9,4 +9,5 @@ import (
 
 func RegisterRoutes(r *gin.Engine, sessions *session.Manager, h *hub.Hub, cfg *config.Config) {
 	r.POST("/api/v1/sessions", CreateSession(sessions, h, cfg.AuthToken))
+	r.GET("/ws/agent", AgentWS(h, cfg.AuthToken))
 }
