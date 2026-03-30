@@ -156,10 +156,15 @@ type Peer struct {
     OnMessage       func(data []byte)  // Called for both text and binary frames
 }
 
-// Send transmits a message over the DataChannel.
-func (p *Peer) Send(data []byte) error
+// SendBinary transmits a binary frame over the DataChannel.
+func (p *Peer) SendBinary(data []byte) error
+
+// SendText transmits a text frame (JSON control message) over the DataChannel.
+func (p *Peer) SendText(s string) error
 
 // SetOnMessage sets the callback for incoming DataChannel messages.
+// For text frames, data contains the UTF-8 bytes of the JSON.
+// For binary frames, data contains the raw chunk bytes.
 func (p *Peer) SetOnMessage(handler func(data []byte))
 ```
 
@@ -192,7 +197,8 @@ func (m *Manager) HandleMessage(msg []byte)
 func (m *Manager) SendFile(ctx context.Context, name string) error
 
 type DataChannel interface {
-    Send(data []byte) error
+    SendBinary(data []byte) error  // binary frames (file chunks)
+    SendText(s string) error       // text frames (JSON control messages)
     BufferedAmount() uint64
 }
 ```
@@ -210,7 +216,7 @@ func (m *Manager) sendWithBackpressure(data []byte) error {
     for m.dc.BufferedAmount() > maxBuffer {
         time.Sleep(sleepInterval)
     }
-    return m.dc.Send(data)
+    return m.dc.SendBinary(data)
 }
 ```
 
