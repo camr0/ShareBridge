@@ -33,12 +33,13 @@ func (m *Manager) Create(token, shareURL string, ttl time.Duration) (*Session, e
 	if err != nil {
 		return nil, fmt.Errorf("generate code: %w", err)
 	}
+	now := time.Now()
 	s := &Session{
 		ID:        id,
 		Token:     token,
 		ShareURL:  shareURL,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(ttl),
+		CreatedAt: now,
+		ExpiresAt: now.Add(ttl),
 	}
 	m.mu.Lock()
 	m.sessions[id] = s
@@ -48,8 +49,8 @@ func (m *Manager) Create(token, shareURL string, ttl time.Duration) (*Session, e
 
 func (m *Manager) Get(id string) (*Session, bool) {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	s, ok := m.sessions[id]
-	m.mu.RUnlock()
 	if !ok || time.Now().After(s.ExpiresAt) {
 		return nil, false
 	}
