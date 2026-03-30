@@ -218,8 +218,8 @@ Password prompt flow:
 | Wrong password (attempt 1-2) | Send `error: "incorrect password"`, signal server `auth_failed` | Show error, allow retry |
 | Wrong password (attempt 3) | Send `error: "incorrect password"`, signal server `auth_failed`, close DataChannel | Show "too many incorrect attempts" |
 | Max downloads reached | Send `error: "share has reached its download limit"`, signal server `session_expired` | Show message, no retry |
-| Signaling disconnect | Log error, reconnect with backoff | No change (WebRTC connection may persist) |
-| Reconnect fails repeatedly | Keep retrying up to 30s interval | No change |
+| Signaling disconnect | Log error, reconnect with backoff | No change — WebRTC DataChannel is independent of signaling; if DataChannel stays up the user sees nothing. If DataChannel also closes, existing `dc.onclose` handler shows "Connection closed" (Slice 2). |
+| Reconnect fails repeatedly | Keep retrying up to 30s interval | No change — same as above; browser is unaware of signaling state |
 | Ctrl-C | Graceful shutdown, close peer connections | Connection lost |
 
 ## Testing Strategy
