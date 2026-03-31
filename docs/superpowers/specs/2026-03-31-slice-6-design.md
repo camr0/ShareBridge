@@ -106,7 +106,10 @@ Add `authenticated atomic.Bool` to `Manager`. It starts `true` for password-free
 The auth check is centralized in `HandleMessage` — before the `switch` statement, any message type other than `list_request` is rejected if `!authenticated.Load()`. This means new message types added in future slices are automatically protected without needing per-handler checks.
 
 ```go
-// Gate everything except list_request (which IS the auth step)
+// Gate everything except list_request behind authentication.
+// Note: list_request is now dual-purpose (auth + folder navigation), which is
+// a known awkwardness. A dedicated auth message on hello would be cleaner —
+// deferred to the daemon slice when the protocol gets a version field anyway.
 if msg.Type != "list_request" && !m.authenticated.Load() {
     m.sendError("authentication required")
     return
