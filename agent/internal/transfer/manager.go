@@ -204,11 +204,13 @@ func (m *Manager) handleFileRequest(name string) {
 		Name     string `json:"name"`
 		Size     int64  `json:"size"`
 		MimeType string `json:"mimeType"`
+		SHA1     string `json:"sha1,omitempty"`
 	}{
 		Type:     "file_header",
 		Name:     fileInfo.Name,
 		Size:     fileInfo.Size,
 		MimeType: fileInfo.ContentType,
+		SHA1:     fileInfo.SHA1,
 	}
 	headerData, _ := json.Marshal(header)
 	if err := m.dc.SendText(string(headerData)); err != nil {
