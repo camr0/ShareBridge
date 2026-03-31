@@ -43,8 +43,12 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 // CreateSession calls POST /api/v1/sessions and returns the session code.
-func (c *Client) CreateSession(ctx context.Context, shareURL, ttl string) (string, error) {
-	body, err := json.Marshal(map[string]string{"share_url": shareURL, "ttl": ttl})
+func (c *Client) CreateSession(ctx context.Context, shareURL, preferredCode string) (string, error) {
+	reqBody := map[string]string{"share_url": shareURL}
+	if preferredCode != "" {
+		reqBody["preferred_code"] = preferredCode
+	}
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
