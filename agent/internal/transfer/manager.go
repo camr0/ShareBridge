@@ -224,6 +224,7 @@ func (m *Manager) streamFile(name string) {
 
 	// Create a pipe: WebDAV writes to writer, we read from reader
 	pr, pw := io.Pipe()
+	defer pr.Close() // unblocks the writer goroutine if we exit early
 
 	// Stream from WebDAV in background
 	go func() {

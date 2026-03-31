@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -54,7 +55,15 @@ func New(shareURL string, allowedHost string, password string) (*Client, error) 
 		token:    token,
 		password: password,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			// No global Timeout: large file bodies take minutes to stream.
+			// Use transport-level timeouts only (dial, TLS, headers).
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: 10 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
 		},
 	}, nil
 }
