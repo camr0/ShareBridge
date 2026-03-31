@@ -16,6 +16,7 @@ import (
 	"opencloudshare/agent/internal/opencloud"
 	"opencloudshare/agent/internal/peer"
 	"opencloudshare/agent/internal/signaling"
+	"opencloudshare/agent/internal/store"
 	"opencloudshare/agent/internal/transfer"
 )
 
@@ -61,6 +62,14 @@ func runShare(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create WebDAV client: %w", err)
 	}
 
+	st, err := store.New()
+	if err != nil {
+		return fmt.Errorf("session store: %w", err)
+	}
+
+	// Load persisted state before reconnect loop
+	preferredCode := st.GetCode(shareURL)
+
 	// Handle Ctrl-C gracefully
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -75,10 +84,15 @@ func runShare(cmd *cobra.Command, args []string) error {
 		default:
 		}
 
-		if err := runSession(ctx, cfg, webdavClient, shareURL); err != nil {
+		code, err := runSession(ctx, cfg, webdavClient, shareURL, st, preferredCode)
+		if err != nil {
 			log.Printf("session ended: %v", err)
 		} else {
 			backoff.Reset()
+		}
+		// Update preferredCode for next reconnect
+		if code != "" {
+			preferredCode = code
 		}
 
 		// Check if context was cancelled before retrying
@@ -102,20 +116,24 @@ func runShare(cmd *cobra.Command, args []string) error {
 	}
 }
 
-func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string) error {
+func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, st *store.Store, preferredCode string) (string, error) {
 	sig := signaling.New(cfg.SignalingServer, cfg.AuthToken)
 
 	if err := sig.Connect(ctx); err != nil {
-		return fmt.Errorf("connect to signaling server: %w", err)
+		return "", fmt.Errorf("connect to signaling server: %w", err)
 	}
 	log.Printf("connected to signaling server at %s", cfg.SignalingServer)
 
-	code, err := sig.CreateSession(ctx, shareURL, "")
+	code, err := sig.CreateSession(ctx, shareURL, preferredCode)
 	if err != nil {
-		return fmt.Errorf("create session: %w", err)
+		return "", fmt.Errorf("create session: %w", err)
 	}
 	log.Printf("session ready — code: %s", code)
 	log.Printf("open browser: http://localhost:8080  then enter code: %s", code)
+
+	if err := st.SetCode(shareURL, code); err != nil {
+		return code, fmt.Errorf("save session code: %w", err)
+	}
 
 	var (
 		mu    sync.Mutex
@@ -160,6 +178,15 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 			}
 
 			tm := transfer.NewManager(p, webdavClient, cfg.Password, cfg.MaxDownloads)
+
+			// Restore persisted download count
+			tm.SetDownloadCount(st.GetDownloadCount(shareURL))
+			// Wire persistence callback
+			tm.OnDownloadComplete = func() {
+				if _, err := st.IncrementDownloadCount(shareURL); err != nil {
+					log.Printf("warning: could not persist download count: %v", err)
+				}
+			}
 
 			// Wire callbacks before CreateOffer to avoid any race with a fast peer
 			tm.OnAuthFailed = func() {
@@ -233,8 +260,8 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 
 	log.Println("waiting for browser connections (Ctrl-C to stop)...")
 	if err := sig.Listen(ctx); err != nil {
-		return fmt.Errorf("signaling disconnected: %w", err)
+		return code, fmt.Errorf("signaling disconnected: %w", err)
 	}
 
-	return nil
+	return code, nil
 }
