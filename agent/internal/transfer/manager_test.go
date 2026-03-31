@@ -301,7 +301,8 @@ func TestFileHeader_OmitsSHA1(t *testing.T) {
 // TestHandleFileRequest_UnauthenticatedBlocked verifies file_request is rejected before auth
 func TestHandleFileRequest_UnauthenticatedBlocked(t *testing.T) {
 	dc := &mockDC{}
-	mgr := NewManager(dc, nil, "secret", 0) // password-protected share
+	mc := &mockOpenCloudClient{}
+	mgr := NewManager(dc, mc, "secret", 0) // password-protected share
 
 	// Send file_request without authenticating via list_request first
 	req, _ := json.Marshal(map[string]string{
@@ -315,12 +316,22 @@ func TestHandleFileRequest_UnauthenticatedBlocked(t *testing.T) {
 	if !strings.Contains(lastMsg, "authentication required") {
 		t.Errorf("expected 'authentication required' error, got: %s", lastMsg)
 	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	if mc.listFilesPath != "" {
+		t.Errorf("expected ListFiles not called, got path %q", mc.listFilesPath)
+	}
+	if mc.getFilePath != "" {
+		t.Errorf("expected GetFile not called, got path %q", mc.getFilePath)
+	}
 }
 
-// TestHandleFileRequest_PathTraversal verifies .. in path returns error
+// TestHandleFileRequest_PathTraversal verifies .. in path returns error and ListFiles is never called
 func TestHandleFileRequest_PathTraversal(t *testing.T) {
 	dc := &mockDC{}
-	mgr := NewManager(dc, nil, "", 0) // no password — authenticated from start
+	mc := &mockOpenCloudClient{}
+	mgr := NewManager(dc, mc, "", 0) // no password — authenticated from start
 
 	req, _ := json.Marshal(map[string]string{
 		"type": "file_request",
@@ -332,6 +343,12 @@ func TestHandleFileRequest_PathTraversal(t *testing.T) {
 	lastMsg := dc.getLastTextMessage()
 	if !strings.Contains(lastMsg, "invalid path") {
 		t.Errorf("expected 'invalid path' error, got: %s", lastMsg)
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	if mc.listFilesPath != "" {
+		t.Errorf("expected ListFiles not called, got path %q", mc.listFilesPath)
 	}
 }
 
