@@ -2,10 +2,13 @@ package transfer
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"opencloudshare/agent/internal/opencloud"
 )
 
 // mockDC implements DataChannel for testing
@@ -65,6 +68,29 @@ func (m *mockDC) reset() {
 	m.textMessages = nil
 	m.binaryData = nil
 	m.closed = false
+}
+
+// mockOpenCloudClient implements openCloudClient for testing
+type mockOpenCloudClient struct {
+	mu              sync.Mutex
+	listFilesPath   string
+	listFilesResult []opencloud.FileInfo
+	listFilesErr    error
+	getFilePath     string
+}
+
+func (m *mockOpenCloudClient) ListFiles(subpath string) ([]opencloud.FileInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listFilesPath = subpath
+	return m.listFilesResult, m.listFilesErr
+}
+
+func (m *mockOpenCloudClient) GetFile(filePath string, w io.Writer) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getFilePath = filePath
+	return 0, nil
 }
 
 // TestHandleOpen_NoPassword verifies hello sent with password_required=false
@@ -272,6 +298,110 @@ func TestFileHeader_OmitsSHA1(t *testing.T) {
 	}
 }
 
+// TestHandleFileRequest_UnauthenticatedBlocked verifies file_request is rejected before auth
+func TestHandleFileRequest_UnauthenticatedBlocked(t *testing.T) {
+	dc := &mockDC{}
+	mgr := NewManager(dc, nil, "secret", 0) // password-protected share
+
+	// Send file_request without authenticating via list_request first
+	req, _ := json.Marshal(map[string]string{
+		"type": "file_request",
+		"path": "secret.txt",
+	})
+	mgr.HandleMessage(req)
+	time.Sleep(10 * time.Millisecond)
+
+	lastMsg := dc.getLastTextMessage()
+	if !strings.Contains(lastMsg, "authentication required") {
+		t.Errorf("expected 'authentication required' error, got: %s", lastMsg)
+	}
+}
+
+// TestHandleFileRequest_PathTraversal verifies .. in path returns error
+func TestHandleFileRequest_PathTraversal(t *testing.T) {
+	dc := &mockDC{}
+	mgr := NewManager(dc, nil, "", 0) // no password — authenticated from start
+
+	req, _ := json.Marshal(map[string]string{
+		"type": "file_request",
+		"path": "../escape.txt",
+	})
+	mgr.HandleMessage(req)
+	time.Sleep(10 * time.Millisecond)
+
+	lastMsg := dc.getLastTextMessage()
+	if !strings.Contains(lastMsg, "invalid path") {
+		t.Errorf("expected 'invalid path' error, got: %s", lastMsg)
+	}
+}
+
+// TestHandleListRequest_Subpath verifies list_request with path calls ListFiles with that path
+func TestHandleListRequest_Subpath(t *testing.T) {
+	dc := &mockDC{}
+	mc := &mockOpenCloudClient{
+		listFilesResult: []opencloud.FileInfo{
+			{Name: "report.pdf", Size: 1024, ContentType: "application/pdf"},
+		},
+	}
+	mgr := NewManager(dc, mc, "", 0)
+
+	req, _ := json.Marshal(map[string]interface{}{
+		"type":     "list_request",
+		"password": "",
+		"path":     "docs",
+	})
+	mgr.HandleMessage(req)
+	time.Sleep(10 * time.Millisecond)
+
+	mc.mu.Lock()
+	gotPath := mc.listFilesPath
+	mc.mu.Unlock()
+
+	if gotPath != "docs" {
+		t.Errorf("expected ListFiles called with 'docs', got %q", gotPath)
+	}
+}
+
+// TestHandleFileRequest_NestedPath verifies file_header uses basename, ListFiles called with dir
+func TestHandleFileRequest_NestedPath(t *testing.T) {
+	dc := &mockDC{}
+	mc := &mockOpenCloudClient{
+		listFilesResult: []opencloud.FileInfo{
+			{Name: "file.txt", Size: 512, ContentType: "text/plain"},
+		},
+	}
+	mgr := NewManager(dc, mc, "", 0)
+
+	req, _ := json.Marshal(map[string]string{
+		"type": "file_request",
+		"path": "docs/file.txt",
+	})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	// ListFiles should be called with the directory part "docs"
+	mc.mu.Lock()
+	gotListPath := mc.listFilesPath
+	mc.mu.Unlock()
+	if gotListPath != "docs" {
+		t.Errorf("expected ListFiles called with 'docs', got %q", gotListPath)
+	}
+
+	// file_header should use basename "file.txt", not full path
+	var headerName string
+	dc.mu.Lock()
+	for _, msg := range dc.textMessages {
+		var parsed map[string]interface{}
+		if json.Unmarshal([]byte(msg), &parsed) == nil && parsed["type"] == "file_header" {
+			headerName, _ = parsed["name"].(string)
+		}
+	}
+	dc.mu.Unlock()
+	if headerName != "file.txt" {
+		t.Errorf("expected file_header name 'file.txt', got %q", headerName)
+	}
+}
+
 // TestMaxDownloads_Rejected verifies download limit reached returns error
 func TestMaxDownloads_Rejected(t *testing.T) {
 	dc := &mockDC{}
@@ -290,7 +420,7 @@ func TestMaxDownloads_Rejected(t *testing.T) {
 	// Third download request should be rejected
 	req, _ := json.Marshal(map[string]string{
 		"type": "file_request",
-		"name": "test.txt",
+		"path": "test.txt",
 	})
 	mgr.HandleMessage(req)
 
