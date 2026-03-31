@@ -35,8 +35,9 @@ type Manager struct {
 	authFailures atomic.Int32 // consecutive password failures
 
 	// Callbacks for external handling
-	OnAuthFailed     func() // called when auth fails after 3 strikes
-	OnSessionExpired func() // called when max downloads reached
+	OnAuthFailed       func() // called when auth fails after 3 strikes
+	OnSessionExpired   func() // called when max downloads reached
+	OnDownloadComplete func() // called after each successful download (after chunk_end sent)
 }
 
 // NewManager creates a transfer manager with optional password and download limit.
@@ -259,6 +260,9 @@ func (m *Manager) streamFile(name string) {
 
 	// Increment download counter on successful completion
 	m.downloads.Add(1)
+	if m.OnDownloadComplete != nil {
+		m.OnDownloadComplete()
+	}
 }
 
 func (m *Manager) sendWithBackpressure(data []byte) error {
@@ -278,4 +282,9 @@ func (m *Manager) sendError(message string) {
 	}
 	data, _ := json.Marshal(err)
 	m.dc.SendText(string(data))
+}
+
+// SetDownloadCount initializes the download counter from persisted state.
+func (m *Manager) SetDownloadCount(n int) {
+	m.downloads.Store(int32(n))
 }
