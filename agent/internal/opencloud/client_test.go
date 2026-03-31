@@ -48,7 +48,7 @@ func TestParsePROPFIND(t *testing.T) {
   </d:response>
 </d:multistatus>`
 
-	files, err := parsePROPFIND([]byte(xml), "token")
+	files, err := parsePROPFIND([]byte(xml), "/remote.php/dav/public-files/token")
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestParsePROPFIND_WithChecksums(t *testing.T) {
   </d:response>
 </d:multistatus>`
 
-	files, err := parsePROPFIND([]byte(xmlData), "token")
+	files, err := parsePROPFIND([]byte(xmlData), "/remote.php/dav/public-files/token")
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestParsePROPFIND_WithoutChecksums(t *testing.T) {
   </d:response>
 </d:multistatus>`
 
-	files, err := parsePROPFIND([]byte(xmlData), "token")
+	files, err := parsePROPFIND([]byte(xmlData), "/remote.php/dav/public-files/token")
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
@@ -140,5 +140,83 @@ func TestExtractSHA1(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("extractSHA1(%q) = %q, want %q", tc.input, got, tc.want)
 		}
+	}
+}
+
+func TestParsePROPFIND_WithSubdirectory(t *testing.T) {
+	xmlData := `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/public-files/token/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/public-files/token/docs</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/public-files/token/README.txt</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getcontentlength>1024</d:getcontentlength>
+        <d:getcontenttype>text/plain</d:getcontenttype>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`
+
+	files, err := parsePROPFIND([]byte(xmlData), "/remote.php/dav/public-files/token")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(files))
+	}
+	var folder, file *FileInfo
+	for i := range files {
+		if files[i].IsDir {
+			folder = &files[i]
+		} else {
+			file = &files[i]
+		}
+	}
+	if folder == nil {
+		t.Fatal("expected a directory entry")
+	}
+	if folder.Name != "docs" {
+		t.Errorf("expected folder name 'docs', got %q", folder.Name)
+	}
+	if file == nil {
+		t.Fatal("expected a file entry")
+	}
+	if file.Name != "README.txt" {
+		t.Errorf("expected file name 'README.txt', got %q", file.Name)
+	}
+	if file.IsDir {
+		t.Error("file entry should not have IsDir=true")
+	}
+}
+
+func TestParsePROPFIND_EmptyFolder(t *testing.T) {
+	xmlData := `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/public-files/token/empty-dir</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`
+
+	files, err := parsePROPFIND([]byte(xmlData), "/remote.php/dav/public-files/token/empty-dir")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("expected 0 entries for empty folder, got %d", len(files))
 	}
 }

@@ -23,11 +23,12 @@ const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
   </D:prop>
 </D:propfind>`
 
-// FileInfo describes a file in an OpenCloud share.
+// FileInfo describes a file or directory in an OpenCloud share.
 type FileInfo struct {
 	Name        string `json:"name"`
 	Size        int64  `json:"size"`
 	ContentType string `json:"mimeType"`
+	IsDir       bool   `json:"isDir"`
 	SHA1        string `json:"-"` // not sent in file_list; passed separately in file_header
 }
 
@@ -86,11 +87,17 @@ func (c *Client) authHeader() string {
 	return "Basic " + auth
 }
 
-// ListFiles returns file info for the share.
-// For folder shares: returns all items.
-// For file shares: returns a single item.
-func (c *Client) ListFiles() ([]FileInfo, error) {
-	req, err := http.NewRequest("PROPFIND", c.baseURL, strings.NewReader(propfindBody))
+// ListFiles returns file and directory info for the share at the given subpath.
+// Pass "" for the share root. Pass "docs/reports" for a nested subfolder.
+func (c *Client) ListFiles(subpath string) ([]FileInfo, error) {
+	requestURL := c.baseURL
+	selfPath := "/remote.php/dav/public-files/" + c.token
+	if subpath != "" {
+		requestURL = c.baseURL + "/" + subpath
+		selfPath += "/" + subpath
+	}
+
+	req, err := http.NewRequest("PROPFIND", requestURL, strings.NewReader(propfindBody))
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +120,7 @@ func (c *Client) ListFiles() ([]FileInfo, error) {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	return parsePROPFIND(body, c.token)
+	return parsePROPFIND(body, selfPath)
 }
 
 // GetFile streams the named file to the writer.
@@ -162,7 +169,10 @@ type response struct {
 }
 
 // parsePROPFIND parses the WebDAV PROPFIND response XML.
-func parsePROPFIND(data []byte, token string) ([]FileInfo, error) {
+// selfPath is the URL path of the directory being listed (e.g. "/remote.php/dav/public-files/token"
+// for root, or "/remote.php/dav/public-files/token/docs" for a subpath).
+// The self-entry (the directory itself) is excluded; its child collections are returned as IsDir:true.
+func parsePROPFIND(data []byte, selfPath string) ([]FileInfo, error) {
 	var ms multistatus
 	if err := xml.Unmarshal(data, &ms); err != nil {
 		return nil, fmt.Errorf("parse XML: %w", err)
@@ -171,13 +181,20 @@ func parsePROPFIND(data []byte, token string) ([]FileInfo, error) {
 	var files []FileInfo
 
 	for _, r := range ms.Response {
-		// Skip collections (directories)
 		if r.Propstat.Prop.ResourceType.Collection != nil {
+			// Skip the self-entry (the directory we're listing)
+			if path.Clean(r.Href) == path.Clean(selfPath) {
+				continue
+			}
+			// Include child subdirectories as IsDir entries
+			files = append(files, FileInfo{
+				Name:  path.Base(r.Href),
+				IsDir: true,
+			})
 			continue
 		}
 
-		// Extract filename from href using path.Base
-		// This handles both single-file shares and files in folders
+		// Extract filename from href
 		name := path.Base(r.Href)
 		if name == "" || name == "." {
 			continue
@@ -192,6 +209,7 @@ func parsePROPFIND(data []byte, token string) ([]FileInfo, error) {
 			Name:        name,
 			Size:        size,
 			ContentType: r.Propstat.Prop.ContentType,
+			IsDir:       false,
 			SHA1:        extractSHA1(r.Propstat.Prop.Checksums.Checksum),
 		})
 	}
