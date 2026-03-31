@@ -203,3 +203,40 @@ func TestSetCode_FilePermissions(t *testing.T) {
 		t.Errorf("sessions.json has permissions %o, expected %o", mode, expectedMode)
 	}
 }
+
+// TestGetCode_MidRunCorruption verifies that GetCode returns empty string
+// when the file becomes corrupted after the store was created (mid-run).
+// This should not panic.
+func TestGetCode_MidRunCorruption(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+
+	// Create store and set a code
+	store, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	shareURL := "https://example.com/share/abc"
+	if err := store.SetCode(shareURL, "validcode"); err != nil {
+		t.Fatalf("SetCode failed: %v", err)
+	}
+
+	// Verify code was stored
+	code := store.GetCode(shareURL)
+	if code != "validcode" {
+		t.Fatalf("Expected code 'validcode', got %q", code)
+	}
+
+	// Corrupt the file after store creation
+	sessionsFile := filepath.Join(tmpDir, "sessions.json")
+	if err := os.WriteFile(sessionsFile, []byte("{ invalid json"), 0600); err != nil {
+		t.Fatalf("Failed to corrupt sessions.json: %v", err)
+	}
+
+	// GetCode should return empty string without panicking
+	code = store.GetCode(shareURL)
+	if code != "" {
+		t.Errorf("Expected empty code after corruption, got %q", code)
+	}
+}

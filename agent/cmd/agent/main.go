@@ -132,7 +132,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 	log.Printf("open browser: http://localhost:8080  then enter code: %s", code)
 
 	if err := st.SetCode(shareURL, code); err != nil {
-		return code, fmt.Errorf("save session code: %w", err)
+		log.Fatalf("fatal: could not save session code: %v", err)
 	}
 
 	var (

@@ -72,14 +72,6 @@ func (m *Manager) Delete(id string) {
 	m.mu.Unlock()
 }
 
-// isCodeTaken returns true if the code is in use by a different token.
-// Same token re-registering the same code is allowed.
-func (m *Manager) isCodeTaken(code, token string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.isCodeTakenLocked(code, token)
-}
-
 // isCodeTakenLocked is the internal version that requires the caller to hold
 // mu (either read or write lock).
 func (m *Manager) isCodeTakenLocked(code, token string) bool {

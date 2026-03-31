@@ -2,7 +2,9 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -51,7 +53,7 @@ func New() (*Store, error) {
 	// Try to load existing data to validate it's not malformed
 	_, err := store.load()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("sessions.json is malformed — fix or delete %s: %w", store.filePath, err)
 	}
 
 	return store, nil
@@ -146,16 +148,11 @@ func (s *Store) load() (storeData, error) {
 	var data storeData
 	data.Sessions = make(map[string]sessionEntry)
 
-	_, err := os.Stat(s.filePath)
-	if os.IsNotExist(err) {
-		return data, nil
-	}
-	if err != nil {
-		return data, fmt.Errorf("failed to stat sessions file: %w", err)
-	}
-
 	fileContent, err := os.ReadFile(s.filePath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return data, nil
+		}
 		return data, fmt.Errorf("failed to read sessions file: %w", err)
 	}
 
