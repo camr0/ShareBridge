@@ -2,19 +2,104 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>OpenCloudShare</title>
   <style>
-    body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 1rem; }
-    input { width: 100%; padding: 8px; font-size: 1rem; box-sizing: border-box; }
-    button { margin-top: 8px; padding: 8px 16px; font-size: 1rem; cursor: pointer; }
-    #status { margin-top: 16px; font-weight: bold; }
-    #file-list { margin-top: 20px; }
-    .file-item { padding: 10px; border: 1px solid #ddd; margin: 5px 0; cursor: pointer; }
-    .file-item:hover { background: #f0f0f0; }
-    .file-size { color: #666; font-size: 0.9em; }
-    #progress-container { margin-top: 20px; }
-    #progress-bar { width: 0%; background: #4CAF50; height: 20px; transition: width 0.3s; }
-    #progress-text { margin-top: 5px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      max-width: 640px;
+      margin: 48px auto;
+      padding: 0 1rem;
+    }
+    h2 { font-size: 1.4rem; font-weight: 600; margin-bottom: 24px; }
+
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      font-size: 1rem;
+      background: #313244;
+      color: #cdd6f4;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      outline: none;
+    }
+    input:focus { border-color: #89b4fa; }
+    input::placeholder { color: #6c7086; }
+    input:disabled { opacity: 0.5; }
+
+    button {
+      margin-top: 8px;
+      padding: 10px 20px;
+      font-size: 0.95rem;
+      background: #89b4fa;
+      color: #1e1e2e;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #status { margin: 16px 0; color: #6c7086; font-size: 0.9rem; min-height: 1.2em; }
+
+    #password-section { margin-top: 16px; }
+    #password-section p { margin-bottom: 8px; color: #a6adc8; }
+    #password-error { color: #f38ba8; margin-top: 8px; font-size: 0.9rem; min-height: 1.2em; }
+
+    #file-list { margin-top: 8px; }
+
+    .file-item {
+      padding: 12px 14px;
+      background: #313244;
+      border-radius: 8px;
+      margin: 6px 0;
+      cursor: pointer;
+      border-left: 3px solid #45475a;
+      transition: border-color 0.2s;
+    }
+    .file-item:hover:not(.downloading):not(.verified):not(.corrupted):not(.done) {
+      background: #363650;
+    }
+    .file-item.downloading { border-left-color: #89b4fa; cursor: default; }
+    .file-item.verified   { border-left-color: #a6e3a1; cursor: default; }
+    .file-item.corrupted  { border-left-color: #f38ba8; cursor: default; }
+    .file-item.done       { border-left-color: #6c7086; cursor: default; }
+
+    .file-main {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .file-name { font-weight: 500; word-break: break-all; }
+    .file-status { font-size: 0.85rem; white-space: nowrap; margin-left: 12px; flex-shrink: 0; }
+    .file-status.speed { color: #a6e3a1; }
+    .file-status.ok    { color: #a6e3a1; }
+    .file-status.fail  { color: #f38ba8; }
+
+    .file-meta { margin-top: 4px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+    .file-size { color: #6c7086; font-size: 0.85rem; }
+    .file-hash { color: #45475a; font-size: 0.75rem; font-family: monospace; word-break: break-all; }
+
+    .file-progress { margin-top: 8px; }
+    .file-progress-track {
+      height: 3px;
+      background: #45475a;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .file-progress-fill {
+      height: 100%;
+      background: #89b4fa;
+      border-radius: 2px;
+      width: 0%;
+      transition: width 0.15s;
+    }
+    .file-progress-text { color: #6c7086; font-size: 0.8rem; margin-top: 4px; }
+
     .hidden { display: none; }
   </style>
 </head>
@@ -29,14 +114,10 @@
   <div id="password-section" class="hidden">
     <p>This share is password protected.</p>
     <input id="password-input" type="password" placeholder="Enter password" />
-    <button onclick="submitPassword()">Submit</button>
-    <div id="password-error" style="color:red; margin-top:8px;"></div>
+    <button onclick="submitPassword()">Unlock</button>
+    <div id="password-error"></div>
   </div>
   <div id="file-list" class="hidden"></div>
-  <div id="progress-container" class="hidden">
-    <div id="progress-bar"></div>
-    <div id="progress-text">0%</div>
-  </div>
   <script src="/app.js"></script>
 </body>
 </html>
