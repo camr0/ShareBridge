@@ -99,18 +99,24 @@ Signature unchanged in behavior — `filePath` is now the full relative path (e.
 
 `HandleMessage` struct gains `Path string \`json:"path"\``.
 
+### Authentication state
+
+Add `authenticated atomic.Bool` to `Manager`. It starts `true` for password-free shares (set in `NewManager` when `password == ""`), and is set to `true` on the first successful `list_request` auth. Both `handleListRequest` and `handleFileRequest` check it — this closes an existing gap where a client could skip `list_request` entirely and send a `file_request` directly with a guessed filename to bypass the password.
+
 ### `handleListRequest(password, path string)`
 
+- If `m.password != ""` and not yet authenticated: validate password, set `authenticated = true` on success
+- If `m.password != ""` and already authenticated: still validate password on every call (browser always sends `sessionPassword`)
 - Passes `path` to `client.ListFiles(path)`
-- Password auth logic unchanged — validated on every `list_request` (browser caches `sessionPassword` and sends it with every subfolder navigation)
 
 ### `handleFileRequest(filePath string)`
 
-1. Reject if `strings.Contains(filePath, "..")` — returns `error` message (defense-in-depth; OpenCloud's own auth is the real protection)
-2. Derive `dir = path.Dir(filePath)`, `name = path.Base(filePath)` (using Go's `path` package, not `filepath` — share paths use forward slashes on all platforms)
-3. Call `client.ListFiles(dir)` to validate file exists
-4. Send `file_header` with `Name: name` (basename only)
-5. Stream with `client.GetFile(filePath)`
+1. If `!authenticated.Load()` — return `error: "authentication required"`
+2. Reject if `strings.Contains(filePath, "..")` — returns `error` message (defense-in-depth; OpenCloud's own auth is the real protection)
+3. Derive `dir = path.Dir(filePath)`, `name = path.Base(filePath)` (using Go's `path` package, not `filepath` — share paths use forward slashes on all platforms)
+4. Call `client.ListFiles(dir)` to validate file exists
+5. Send `file_header` with `Name: name` (basename only)
+6. Stream with `client.GetFile(filePath)`
 
 ---
 
@@ -251,6 +257,7 @@ CSS (Catppuccin Mocha, consistent with existing theme):
 - `TestHandleFileRequest_NestedPath` — `file_request` with `path: "docs/file.txt"`; assert `file_header` name is `"file.txt"`, `GetFile` called with full path
 - `TestHandleFileRequest_PathTraversal` — `path: "../escape"`; assert error returned, no `ListFiles` call made
 - `TestHandleListRequest_Subpath` — `list_request` with `path: "docs"`; assert `ListFiles("docs")` called
+- `TestHandleFileRequest_UnauthenticatedBlocked` — `file_request` sent before any `list_request` on a password-protected share; assert `error` returned, no `ListFiles` or `GetFile` call made
 
 ---
 
