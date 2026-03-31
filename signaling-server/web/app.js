@@ -283,6 +283,7 @@ async function completeDownload() {
 
   // Reset transfer state
   isDownloading = false;
+  status('');
   currentFile = null;
   fileChunks = [];
   receivedBytes = 0;
