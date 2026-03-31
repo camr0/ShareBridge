@@ -7,6 +7,7 @@ let currentFile = null;
 let receivedBytes = 0;
 let fileChunks = [];
 let isDownloading = false;
+let transferStartTime = 0;
 
 // Auth state
 let authAttempts = 0;
@@ -98,23 +99,20 @@ function join() {
 }
 
 function setupDataChannel() {
-  dc.binaryType = 'arraybuffer';  // Required: receive binary as ArrayBuffer, not Blob
+  dc.binaryType = 'arraybuffer';
 
   dc.onopen = () => {
     status('DataChannel open!');
     hideSection('join-section');
-    // Wait for hello message before requesting file list
   };
 
   dc.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
-      // Binary frame: file chunk
       const bytes = new Uint8Array(event.data);
       appendChunk(bytes);
       return;
     }
 
-    // Text frame: JSON control message
     const msg = JSON.parse(event.data);
     switch (msg.type) {
       case 'hello':
@@ -152,20 +150,37 @@ function renderFileList(files) {
   container.innerHTML = '';
 
   if (files.length === 0) {
-    container.innerHTML = '<p>No files in share</p>';
+    container.innerHTML = '<p style="color:#6c7086;margin-top:8px">No files in share</p>';
     return;
   }
 
   files.forEach(file => {
     const div = document.createElement('div');
     div.className = 'file-item';
+    div.dataset.name = file.name;
     div.innerHTML = `
-      <div>${escapeHtml(file.name)}</div>
-      <div class="file-size">${formatBytes(file.size)}</div>
+      <div class="file-main">
+        <div class="file-name">${escapeHtml(file.name)}</div>
+        <div class="file-status"></div>
+      </div>
+      <div class="file-meta">
+        <span class="file-size">${formatBytes(file.size)}</span>
+        <span class="file-hash"></span>
+      </div>
+      <div class="file-progress hidden">
+        <div class="file-progress-track">
+          <div class="file-progress-fill"></div>
+        </div>
+        <div class="file-progress-text"></div>
+      </div>
     `;
     div.onclick = () => requestFile(file.name);
     container.appendChild(div);
   });
+}
+
+function getFileItem(name) {
+  return document.querySelector(`.file-item[data-name="${CSS.escape(name)}"]`);
 }
 
 function requestFile(name) {
@@ -181,25 +196,41 @@ function startDownload(header) {
   receivedBytes = 0;
   fileChunks = [];
   isDownloading = true;
-  status(`Downloading ${header.name}...`);
-  showSection('progress-container');
-  updateProgress(0, header.size);
+  transferStartTime = Date.now();
+  status('');
+
+  const fileItem = getFileItem(header.name);
+  if (fileItem) {
+    fileItem.classList.add('downloading');
+    fileItem.onclick = null;
+    fileItem.querySelector('.file-progress').classList.remove('hidden');
+    fileItem.querySelector('.file-progress-text').textContent = '0%';
+  }
 }
 
 function appendChunk(bytes) {
+  if (!currentFile) return;
   fileChunks.push(bytes);
   receivedBytes += bytes.length;
-  updateProgress(receivedBytes, currentFile.size);
+
+  const pct = currentFile.size > 0 ? Math.round((receivedBytes / currentFile.size) * 100) : 0;
+  const elapsed = (Date.now() - transferStartTime) / 1000;
+  const speedBps = elapsed > 0 ? receivedBytes / elapsed : 0;
+
+  const fileItem = getFileItem(currentFile.name);
+  if (fileItem) {
+    fileItem.querySelector('.file-progress-fill').style.width = pct + '%';
+    fileItem.querySelector('.file-progress-text').textContent =
+      `${pct}% — ${formatBytes(receivedBytes)} of ${formatBytes(currentFile.size)}`;
+    const statusEl = fileItem.querySelector('.file-status');
+    statusEl.textContent = '↓ ' + formatSpeed(speedBps);
+    statusEl.className = 'file-status speed';
+  }
 }
 
-function updateProgress(received, total) {
-  const pct = total > 0 ? Math.round((received / total) * 100) : 0;
-  document.getElementById('progress-bar').style.width = pct + '%';
-  document.getElementById('progress-text').textContent = `${pct}% (${formatBytes(received)} / ${formatBytes(total)})`;
-}
-
-function completeDownload() {
-  // Combine all chunks
+async function completeDownload() {
+  if (!currentFile) return;
+  // Assemble all chunks
   const totalLength = fileChunks.reduce((sum, c) => sum + c.length, 0);
   const combined = new Uint8Array(totalLength);
   let offset = 0;
@@ -208,21 +239,71 @@ function completeDownload() {
     offset += chunk.length;
   }
 
-  // Create download
+  // Trigger browser file save immediately — don't wait for SHA-1
   const blob = new Blob([combined], { type: currentFile.mimeType || 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
+  const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url;
+  a.href = objectUrl;
   a.download = currentFile.name;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  URL.revokeObjectURL(objectUrl);
 
-  status(`Downloaded ${currentFile.name}`);
+  const elapsed = (Date.now() - transferStartTime) / 1000;
+  const avgSpeed = elapsed > 0 ? formatSpeed(totalLength / elapsed) : '—';
+
+  // Capture state before reset
+  const downloadedFile = currentFile;
+  const downloadedBuffer = combined;
+
+  // Reset transfer state
   isDownloading = false;
-  hideSection('progress-container');
+  currentFile = null;
   fileChunks = [];
+  receivedBytes = 0;
+  transferStartTime = 0;
+
+  const fileItem = getFileItem(downloadedFile.name);
+  if (fileItem) {
+    fileItem.querySelector('.file-progress').classList.add('hidden');
+  }
+
+  // SHA-1 verification (async — updates UI after save dialog appears)
+  if (downloadedFile.sha1 && typeof crypto !== 'undefined' && crypto.subtle) {
+    try {
+      const hashBuffer = await crypto.subtle.digest('SHA-1', downloadedBuffer.buffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const computed = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      const ok = computed === downloadedFile.sha1.toLowerCase();
+
+      if (fileItem) {
+        fileItem.classList.remove('downloading');
+        fileItem.classList.add(ok ? 'verified' : 'corrupted');
+        fileItem.querySelector('.file-status').textContent = ok ? '✓ intact' : '✗ corrupted';
+        fileItem.querySelector('.file-status').className = 'file-status ' + (ok ? 'ok' : 'fail');
+        fileItem.querySelector('.file-size').textContent =
+          formatBytes(downloadedFile.size) + ' · avg ' + avgSpeed;
+        fileItem.querySelector('.file-hash').textContent = ok
+          ? 'SHA-1: ' + downloadedFile.sha1.toLowerCase()
+          : 'expected ' + downloadedFile.sha1.slice(0, 8) + '… got ' + computed.slice(0, 8) + '…';
+      }
+    } catch (_) {
+      markFileDone(fileItem, downloadedFile, avgSpeed);
+    }
+  } else {
+    markFileDone(fileItem, downloadedFile, avgSpeed);
+  }
+}
+
+function markFileDone(fileItem, file, avgSpeed) {
+  if (!fileItem) return;
+  fileItem.classList.remove('downloading');
+  fileItem.classList.add('done');
+  fileItem.querySelector('.file-status').textContent = '✓ done';
+  fileItem.querySelector('.file-status').className = 'file-status ok';
+  fileItem.querySelector('.file-size').textContent =
+    formatBytes(file.size) + ' · avg ' + avgSpeed;
 }
 
 function handleHello(msg) {
@@ -230,7 +311,6 @@ function handleHello(msg) {
     showSection('password-section');
     document.getElementById('password-input').focus();
   } else {
-    // No password required, request file list immediately
     requestFileList('');
   }
 }
@@ -268,7 +348,6 @@ function resetUI() {
   showSection('join-section');
   hideSection('password-section');
   hideSection('file-list');
-  hideSection('progress-container');
   document.getElementById('file-list').innerHTML = '';
   document.getElementById('password-error').textContent = '';
   document.getElementById('password-input').value = '';
@@ -277,6 +356,8 @@ function resetUI() {
   currentFile = null;
   fileChunks = [];
   isDownloading = false;
+  receivedBytes = 0;
+  transferStartTime = 0;
   authAttempts = 0;
 }
 
@@ -292,4 +373,10 @@ function formatBytes(bytes) {
   const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatSpeed(bps) {
+  if (bps >= 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + ' MB/s';
+  if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
+  return Math.round(bps) + ' B/s';
 }

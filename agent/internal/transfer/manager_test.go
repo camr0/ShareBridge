@@ -220,6 +220,58 @@ func TestPassword_ThreeStrikesClosesChannel(t *testing.T) {
 	}
 }
 
+// TestFileHeader_IncludesSHA1 verifies sha1 field is present when FileInfo has a checksum
+func TestFileHeader_IncludesSHA1(t *testing.T) {
+	header := struct {
+		Type     string `json:"type"`
+		Name     string `json:"name"`
+		Size     int64  `json:"size"`
+		MimeType string `json:"mimeType"`
+		SHA1     string `json:"sha1,omitempty"`
+	}{
+		Type:     "file_header",
+		Name:     "video.mp4",
+		Size:     1048576,
+		MimeType: "video/mp4",
+		SHA1:     "a7e0206e573edbef0c4d8107a151271fbeccf2fe",
+	}
+	data, err := json.Marshal(header)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if result["sha1"] != "a7e0206e573edbef0c4d8107a151271fbeccf2fe" {
+		t.Errorf("expected sha1 in file_header, got: %s", data)
+	}
+}
+
+// TestFileHeader_OmitsSHA1 verifies sha1 field is absent when FileInfo has no checksum
+func TestFileHeader_OmitsSHA1(t *testing.T) {
+	header := struct {
+		Type     string `json:"type"`
+		Name     string `json:"name"`
+		Size     int64  `json:"size"`
+		MimeType string `json:"mimeType"`
+		SHA1     string `json:"sha1,omitempty"`
+	}{
+		Type:     "file_header",
+		Name:     "notes.txt",
+		Size:     512,
+		MimeType: "text/plain",
+		SHA1:     "",
+	}
+	data, err := json.Marshal(header)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if strings.Contains(string(data), "sha1") {
+		t.Errorf("expected sha1 to be omitted from file_header, got: %s", data)
+	}
+}
+
 // TestMaxDownloads_Rejected verifies download limit reached returns error
 func TestMaxDownloads_Rejected(t *testing.T) {
 	dc := &mockDC{}
