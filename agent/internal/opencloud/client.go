@@ -181,21 +181,23 @@ func parsePROPFIND(data []byte, selfPath string) ([]FileInfo, error) {
 	var files []FileInfo
 
 	for _, r := range ms.Response {
+		href, _ := url.PathUnescape(r.Href)
+
 		if r.Propstat.Prop.ResourceType.Collection != nil {
 			// Skip the self-entry (the directory we're listing)
-			if path.Clean(r.Href) == path.Clean(selfPath) {
+			if path.Clean(href) == path.Clean(selfPath) {
 				continue
 			}
 			// Include child subdirectories as IsDir entries
 			files = append(files, FileInfo{
-				Name:  path.Base(r.Href),
+				Name:  path.Base(href),
 				IsDir: true,
 			})
 			continue
 		}
 
 		// Extract filename from href
-		name := path.Base(r.Href)
+		name := path.Base(href)
 		if name == "" || name == "." {
 			continue
 		}

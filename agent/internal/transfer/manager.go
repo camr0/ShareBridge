@@ -3,6 +3,8 @@ package transfer
 import (
 	"encoding/json"
 	"io"
+	"path"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -24,15 +26,23 @@ type DataChannel interface {
 	Close() error
 }
 
+// openCloudClient abstracts the OpenCloud WebDAV client for testability.
+// *opencloud.Client satisfies this interface.
+type openCloudClient interface {
+	ListFiles(subpath string) ([]opencloud.FileInfo, error)
+	GetFile(filePath string, w io.Writer) (int64, error)
+}
+
 // Manager handles file transfer state, authentication, and backpressure.
 type Manager struct {
 	dc           DataChannel
-	client       *opencloud.Client
-	transfer     atomic.Bool // true if transfer in progress
-	password     string      // empty = no password required
-	maxDownloads int         // 0 = unlimited
+	client       openCloudClient
+	transfer     atomic.Bool  // true if transfer in progress
+	password     string       // empty = no password required
+	maxDownloads int          // 0 = unlimited
 	downloads    atomic.Int32 // completed download counter
 	authFailures atomic.Int32 // consecutive password failures
+	authenticated atomic.Bool // true once password accepted (or no password required)
 
 	// Callbacks for external handling
 	OnAuthFailed       func() // called when auth fails after 3 strikes
@@ -41,13 +51,17 @@ type Manager struct {
 }
 
 // NewManager creates a transfer manager with optional password and download limit.
-func NewManager(dc DataChannel, client *opencloud.Client, password string, maxDownloads int) *Manager {
-	return &Manager{
+func NewManager(dc DataChannel, client openCloudClient, password string, maxDownloads int) *Manager {
+	mgr := &Manager{
 		dc:           dc,
 		client:       client,
 		password:     password,
 		maxDownloads: maxDownloads,
 	}
+	if password == "" {
+		mgr.authenticated.Store(true)
+	}
+	return mgr
 }
 
 // HandleOpen sends the hello message when DataChannel opens.
@@ -72,36 +86,44 @@ func (m *Manager) HandleMessage(data []byte) {
 		return // Ignore messages after lockout
 	}
 
-	// Parse JSON message
 	var msg struct {
 		Type     string `json:"type"`
-		Name     string `json:"name"`
 		Password string `json:"password"`
+		Path     string `json:"path"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		m.sendError("invalid message format")
 		return
 	}
 
+	// Gate everything except list_request behind authentication.
+	// Note: list_request is dual-purpose (auth + folder navigation) — a dedicated
+	// auth message on hello would be cleaner but is deferred to the daemon slice.
+	if msg.Type != "list_request" && !m.authenticated.Load() {
+		m.sendError("authentication required")
+		return
+	}
+
 	switch msg.Type {
 	case "list_request":
-		m.handleListRequest(msg.Password)
+		m.handleListRequest(msg.Password, msg.Path)
 	case "file_request":
-		m.handleFileRequest(msg.Name)
+		m.handleFileRequest(msg.Path)
 	default:
 		m.sendError("unknown message type: " + msg.Type)
 	}
 }
 
-func (m *Manager) handleListRequest(password string) {
+func (m *Manager) handleListRequest(password, subpath string) {
 	// Check password if required
 	if m.password != "" {
 		if password != m.password {
 			m.handleAuthFailure()
 			return
 		}
-		// Reset auth failures on successful password
+		// Correct password — mark session as authenticated
 		m.authFailures.Store(0)
+		m.authenticated.Store(true)
 	}
 
 	// Check max downloads limit
@@ -118,13 +140,12 @@ func (m *Manager) handleListRequest(password string) {
 		return
 	}
 
-	files, err := m.client.ListFiles()
+	files, err := m.client.ListFiles(subpath)
 	if err != nil {
 		m.sendError("share unavailable: " + err.Error())
 		return
 	}
 
-	// Convert to JSON
 	resp := struct {
 		Type  string                `json:"type"`
 		Files []opencloud.FileInfo `json:"files"`
@@ -140,7 +161,6 @@ func (m *Manager) handleListRequest(password string) {
 	}
 
 	if err := m.dc.SendText(string(data)); err != nil {
-		// Log error, connection may be closed
 		return
 	}
 }
@@ -160,7 +180,7 @@ func (m *Manager) handleAuthFailure() {
 	}
 }
 
-func (m *Manager) handleFileRequest(name string) {
+func (m *Manager) handleFileRequest(filePath string) {
 	// Check max downloads limit before starting transfer
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
 		m.sendError("share has reached its download limit")
@@ -174,13 +194,34 @@ func (m *Manager) handleFileRequest(name string) {
 		m.sendError("transfer in progress")
 		return
 	}
-	if name == "" {
-		m.sendError("file name required")
+
+	// Reject path traversal (defense-in-depth; OpenCloud auth is the real protection)
+	if strings.Contains(filePath, "..") {
+		m.sendError("invalid path")
 		return
 	}
 
-	// Get file info to send header
-	files, err := m.client.ListFiles()
+	if filePath == "" {
+		m.sendError("file path required")
+		return
+	}
+
+	// Split full path into directory and filename
+	// path.Dir("README.txt") = "." → use "" for root
+	// path.Dir("docs/file.txt") = "docs"
+	dir := path.Dir(filePath)
+	name := path.Base(filePath)
+	if dir == "." {
+		dir = ""
+	}
+
+	if m.client == nil {
+		m.sendError("share unavailable: client not initialized")
+		return
+	}
+
+	// Validate file exists by listing its parent directory
+	files, err := m.client.ListFiles(dir)
 	if err != nil {
 		m.sendError("share unavailable")
 		return
@@ -189,7 +230,8 @@ func (m *Manager) handleFileRequest(name string) {
 	var fileInfo *opencloud.FileInfo
 	for _, f := range files {
 		if f.Name == name {
-			fileInfo = &f
+			fi := f
+			fileInfo = &fi
 			break
 		}
 	}
@@ -198,7 +240,7 @@ func (m *Manager) handleFileRequest(name string) {
 		return
 	}
 
-	// Send file header
+	// Send file header (name is basename — what the browser saves the download as)
 	header := struct {
 		Type     string `json:"type"`
 		Name     string `json:"name"`
@@ -217,12 +259,12 @@ func (m *Manager) handleFileRequest(name string) {
 		return
 	}
 
-	// Start transfer
+	// Start transfer with full path (e.g. "docs/reports/Q1.pdf")
 	m.transfer.Store(true)
-	go m.streamFile(name)
+	go m.streamFile(filePath)
 }
 
-func (m *Manager) streamFile(name string) {
+func (m *Manager) streamFile(filePath string) {
 	defer func() { m.transfer.Store(false) }()
 
 	// Create a pipe: WebDAV writes to writer, we read from reader
@@ -231,7 +273,7 @@ func (m *Manager) streamFile(name string) {
 
 	// Stream from WebDAV in background
 	go func() {
-		_, err := m.client.GetFile(name, pw)
+		_, err := m.client.GetFile(filePath, pw)
 		pw.CloseWithError(err)
 	}()
 
