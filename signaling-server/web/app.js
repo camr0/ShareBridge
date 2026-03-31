@@ -209,6 +209,7 @@ function startDownload(header) {
 }
 
 function appendChunk(bytes) {
+  if (!currentFile) return;
   fileChunks.push(bytes);
   receivedBytes += bytes.length;
 
@@ -228,6 +229,7 @@ function appendChunk(bytes) {
 }
 
 async function completeDownload() {
+  if (!currentFile) return;
   // Assemble all chunks
   const totalLength = fileChunks.reduce((sum, c) => sum + c.length, 0);
   const combined = new Uint8Array(totalLength);
