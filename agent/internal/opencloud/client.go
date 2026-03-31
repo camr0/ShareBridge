@@ -13,11 +13,22 @@ import (
 	"time"
 )
 
+const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <D:prop>
+    <D:getcontentlength/>
+    <D:getcontenttype/>
+    <D:resourcetype/>
+    <oc:checksums/>
+  </D:prop>
+</D:propfind>`
+
 // FileInfo describes a file in an OpenCloud share.
 type FileInfo struct {
 	Name        string `json:"name"`
 	Size        int64  `json:"size"`
 	ContentType string `json:"mimeType"`
+	SHA1        string `json:"-"` // not sent in file_list; passed separately in file_header
 }
 
 // Client provides WebDAV access to OpenCloud public shares.
@@ -79,12 +90,13 @@ func (c *Client) authHeader() string {
 // For folder shares: returns all items.
 // For file shares: returns a single item.
 func (c *Client) ListFiles() ([]FileInfo, error) {
-	req, err := http.NewRequest("PROPFIND", c.baseURL, nil)
+	req, err := http.NewRequest("PROPFIND", c.baseURL, strings.NewReader(propfindBody))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Depth", "1")
 	req.Header.Set("Authorization", c.authHeader())
+	req.Header.Set("Content-Type", "application/xml")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -134,14 +146,17 @@ type multistatus struct {
 }
 
 type response struct {
-	Href   string `xml:"href"`
+	Href     string `xml:"href"`
 	Propstat struct {
 		Prop struct {
-			ContentLength string   `xml:"getcontentlength"`
-			ContentType   string   `xml:"getcontenttype"`
+			ContentLength string `xml:"getcontentlength"`
+			ContentType   string `xml:"getcontenttype"`
 			ResourceType  struct {
 				Collection *struct{} `xml:"collection"`
 			} `xml:"resourcetype"`
+			Checksums struct {
+				Checksum string `xml:"checksum"`
+			} `xml:"checksums"`
 		} `xml:"prop"`
 	} `xml:"propstat"`
 }
@@ -177,6 +192,7 @@ func parsePROPFIND(data []byte, token string) ([]FileInfo, error) {
 			Name:        name,
 			Size:        size,
 			ContentType: r.Propstat.Prop.ContentType,
+			SHA1:        extractSHA1(r.Propstat.Prop.Checksums.Checksum),
 		})
 	}
 
@@ -187,4 +203,16 @@ func parseInt64(s string) (int64, error) {
 	var n int64
 	_, err := fmt.Sscanf(s, "%d", &n)
 	return n, err
+}
+
+// extractSHA1 parses the first SHA1 value from an OpenCloud checksum string.
+// Input format: "SHA1:<hex> MD5:<hex> ADLER32:<hex>" (space-separated, any order).
+// Returns empty string if no SHA1 token is found.
+func extractSHA1(checksumStr string) string {
+	for _, token := range strings.Fields(checksumStr) {
+		if strings.HasPrefix(token, "SHA1:") {
+			return strings.ToLower(token[5:])
+		}
+	}
+	return ""
 }
