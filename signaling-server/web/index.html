@@ -100,6 +100,22 @@
     }
     .file-progress-text { color: #6c7086; font-size: 0.8rem; margin-top: 4px; }
 
+    #breadcrumb {
+      margin-bottom: 8px;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .breadcrumb-link {
+      color: #89b4fa;
+      cursor: pointer;
+    }
+    .breadcrumb-link:hover { text-decoration: underline; }
+    .breadcrumb-current { color: #cdd6f4; }
+    .breadcrumb-sep { color: #45475a; }
+
     .hidden { display: none; }
   </style>
 </head>
@@ -117,6 +133,7 @@
     <button onclick="submitPassword()">Unlock</button>
     <div id="password-error"></div>
   </div>
+  <div id="breadcrumb" class="hidden"></div>
   <div id="file-list" class="hidden"></div>
   <script src="/app.js"></script>
 </body>

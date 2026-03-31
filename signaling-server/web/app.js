@@ -9,6 +9,10 @@ let fileChunks = [];
 let isDownloading = false;
 let transferStartTime = 0;
 
+// Navigation state
+let currentPath = [];     // e.g. [] = root, ["docs", "reports"] = two levels deep
+let sessionPassword = ''; // cached after password submit; cleared on resetUI
+
 // Auth state
 let authAttempts = 0;
 
@@ -146,35 +150,54 @@ function setupDataChannel() {
 function renderFileList(files) {
   hideSection('password-section');
   showSection('file-list');
+  renderBreadcrumb();
+
   const container = document.getElementById('file-list');
   container.innerHTML = '';
 
   if (files.length === 0) {
-    container.innerHTML = '<p style="color:#6c7086;margin-top:8px">No files in share</p>';
+    const emptyMsg = currentPath.length === 0 ? 'No files in share' : 'No files in this folder';
+    container.innerHTML = `<p style="color:#6c7086;margin-top:8px">${emptyMsg}</p>`;
     return;
   }
 
-  files.forEach(file => {
+  // Sort: folders first, then files, each group alphabetically
+  const sorted = [...files].sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  sorted.forEach(file => {
     const div = document.createElement('div');
     div.className = 'file-item';
     div.dataset.name = file.name;
-    div.innerHTML = `
-      <div class="file-main">
-        <div class="file-name">${escapeHtml(file.name)}</div>
-        <div class="file-status"></div>
-      </div>
-      <div class="file-meta">
-        <span class="file-size">${formatBytes(file.size)}</span>
-        <span class="file-hash"></span>
-      </div>
-      <div class="file-progress hidden">
-        <div class="file-progress-track">
-          <div class="file-progress-fill"></div>
+
+    if (file.isDir) {
+      div.innerHTML = `
+        <div class="file-main">
+          <div class="file-name">📁 ${escapeHtml(file.name)}</div>
         </div>
-        <div class="file-progress-text"></div>
-      </div>
-    `;
-    div.onclick = () => requestFile(file.name);
+      `;
+      div.onclick = () => openFolder(file.name);
+    } else {
+      div.innerHTML = `
+        <div class="file-main">
+          <div class="file-name">${escapeHtml(file.name)}</div>
+          <div class="file-status"></div>
+        </div>
+        <div class="file-meta">
+          <span class="file-size">${formatBytes(file.size)}</span>
+          <span class="file-hash"></span>
+        </div>
+        <div class="file-progress hidden">
+          <div class="file-progress-track">
+            <div class="file-progress-fill"></div>
+          </div>
+          <div class="file-progress-text"></div>
+        </div>
+      `;
+      div.onclick = () => requestFile(file.name);
+    }
     container.appendChild(div);
   });
 }
@@ -188,7 +211,8 @@ function requestFile(name) {
     status('Download in progress, please wait');
     return;
   }
-  dc.send(JSON.stringify({ type: 'file_request', name }));
+  const fullPath = [...currentPath, name].join('/');
+  dc.send(JSON.stringify({ type: 'file_request', path: fullPath }));
 }
 
 function startDownload(header) {
@@ -311,17 +335,52 @@ function handleHello(msg) {
     showSection('password-section');
     document.getElementById('password-input').focus();
   } else {
-    requestFileList('');
+    requestFileList(''); // path=root; sessionPassword is '' for unprotected shares
   }
 }
 
-function submitPassword() {
-  const password = document.getElementById('password-input').value;
-  requestFileList(password);
+function renderBreadcrumb() {
+  const breadcrumb = document.getElementById('breadcrumb');
+  if (currentPath.length === 0) {
+    breadcrumb.classList.add('hidden');
+    return;
+  }
+  breadcrumb.classList.remove('hidden');
+  const parts = [
+    { label: 'Share root', index: -1 },
+    ...currentPath.map((seg, i) => ({ label: seg, index: i })),
+  ];
+  breadcrumb.innerHTML = parts.map((part, i) => {
+    const isLast = i === parts.length - 1;
+    if (isLast) {
+      return `<span class="breadcrumb-current">${escapeHtml(part.label)}</span>`;
+    }
+    return `<span class="breadcrumb-link" onclick="navigateTo(${part.index})">${escapeHtml(part.label)}</span>`;
+  }).join('<span class="breadcrumb-sep"> › </span>');
 }
 
-function requestFileList(password) {
-  dc.send(JSON.stringify({ type: 'list_request', password: password }));
+function navigateTo(index) {
+  // index -1 = share root, 0 = first segment, 1 = second, etc.
+  currentPath = index === -1 ? [] : currentPath.slice(0, index + 1);
+  requestFileList(currentPath.join('/'));
+}
+
+function openFolder(name) {
+  if (isDownloading) {
+    status('Download in progress, please wait');
+    return;
+  }
+  currentPath.push(name);
+  requestFileList(currentPath.join('/'));
+}
+
+function submitPassword() {
+  sessionPassword = document.getElementById('password-input').value;
+  requestFileList('');
+}
+
+function requestFileList(subpath) {
+  dc.send(JSON.stringify({ type: 'list_request', password: sessionPassword, path: subpath }));
 }
 
 function handleError(msg) {
@@ -348,6 +407,7 @@ function resetUI() {
   showSection('join-section');
   hideSection('password-section');
   hideSection('file-list');
+  document.getElementById('breadcrumb').classList.add('hidden');
   document.getElementById('file-list').innerHTML = '';
   document.getElementById('password-error').textContent = '';
   document.getElementById('password-input').value = '';
@@ -359,6 +419,8 @@ function resetUI() {
   receivedBytes = 0;
   transferStartTime = 0;
   authAttempts = 0;
+  currentPath = [];
+  sessionPassword = '';
 }
 
 function escapeHtml(text) {
