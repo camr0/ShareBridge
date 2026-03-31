@@ -11,8 +11,9 @@ import (
 )
 
 type createSessionRequest struct {
-	ShareURL string `json:"share_url" binding:"required"`
-	TTL      string `json:"ttl"`
+	ShareURL      string `json:"share_url" binding:"required"`
+	TTL           string `json:"ttl"`
+	PreferredCode string `json:"preferred_code"`
 }
 
 type createSessionResponse struct {
@@ -49,7 +50,7 @@ func CreateSession(sessions *session.Manager, h *hub.Hub, authToken string) gin.
 			}
 		}
 
-		s, err := sessions.Create(token, req.ShareURL, ttl)
+		s, err := sessions.Create(token, req.ShareURL, req.PreferredCode, ttl)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 			return

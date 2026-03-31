@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/rand"
 	"fmt"
+	"log"
 	"math/big"
 	"sync"
 	"time"
@@ -28,21 +29,28 @@ func NewManager() *Manager {
 	return &Manager{sessions: make(map[string]*Session)}
 }
 
-func (m *Manager) Create(token, shareURL string, ttl time.Duration) (*Session, error) {
-	id, err := generateCode()
-	if err != nil {
-		return nil, fmt.Errorf("generate code: %w", err)
+func (m *Manager) Create(token, shareURL, preferredCode string, ttl time.Duration) (*Session, error) {
+	code := preferredCode
+	if code == "" || m.isCodeTaken(code, token) {
+		if code != "" {
+			log.Printf("warning: requested code %s is already taken, assigning new code", code)
+		}
+		var err error
+		code, err = generateCode()
+		if err != nil {
+			return nil, fmt.Errorf("generate code: %w", err)
+		}
 	}
 	now := time.Now()
 	s := &Session{
-		ID:        id,
+		ID:        code,
 		Token:     token,
 		ShareURL:  shareURL,
 		CreatedAt: now,
 		ExpiresAt: now.Add(ttl),
 	}
 	m.mu.Lock()
-	m.sessions[id] = s
+	m.sessions[code] = s
 	m.mu.Unlock()
 	return s, nil
 }
@@ -61,6 +69,15 @@ func (m *Manager) Delete(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
 	m.mu.Unlock()
+}
+
+// isCodeTaken returns true if the code is in use by a different token.
+// Same token re-registering the same code is allowed.
+func (m *Manager) isCodeTaken(code, token string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[code]
+	return ok && s.Token != token && time.Now().Before(s.ExpiresAt)
 }
 
 func generateCode() (string, error) {
