@@ -30,8 +30,11 @@ func NewManager() *Manager {
 }
 
 func (m *Manager) Create(token, shareURL, preferredCode string, ttl time.Duration) (*Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	code := preferredCode
-	if code == "" || m.isCodeTaken(code, token) {
+	if code == "" || m.isCodeTakenLocked(code, token) {
 		if code != "" {
 			log.Printf("warning: requested code %s is already taken, assigning new code", code)
 		}
@@ -49,9 +52,7 @@ func (m *Manager) Create(token, shareURL, preferredCode string, ttl time.Duratio
 		CreatedAt: now,
 		ExpiresAt: now.Add(ttl),
 	}
-	m.mu.Lock()
 	m.sessions[code] = s
-	m.mu.Unlock()
 	return s, nil
 }
 
@@ -76,6 +77,12 @@ func (m *Manager) Delete(id string) {
 func (m *Manager) isCodeTaken(code, token string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.isCodeTakenLocked(code, token)
+}
+
+// isCodeTakenLocked is the internal version that requires the caller to hold
+// mu (either read or write lock).
+func (m *Manager) isCodeTakenLocked(code, token string) bool {
 	s, ok := m.sessions[code]
 	return ok && s.Token != token && time.Now().Before(s.ExpiresAt)
 }
