@@ -1,2 +1,5 @@
 # Git worktrees
 .worktrees/
+
+# Brainstorming mockups
+.superpowers/
