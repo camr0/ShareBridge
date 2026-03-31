@@ -101,22 +101,30 @@ Signature unchanged in behavior — `filePath` is now the full relative path (e.
 
 ### Authentication state
 
-Add `authenticated atomic.Bool` to `Manager`. It starts `true` for password-free shares (set in `NewManager` when `password == ""`), and is set to `true` on the first successful `list_request` auth. Both `handleListRequest` and `handleFileRequest` check it — this closes an existing gap where a client could skip `list_request` entirely and send a `file_request` directly with a guessed filename to bypass the password.
+Add `authenticated atomic.Bool` to `Manager`. It starts `true` for password-free shares (set in `NewManager` when `password == ""`), and is set to `true` on the first successful `list_request` auth.
+
+The auth check is centralized in `HandleMessage` — before the `switch` statement, any message type other than `list_request` is rejected if `!authenticated.Load()`. This means new message types added in future slices are automatically protected without needing per-handler checks.
+
+```go
+// Gate everything except list_request (which IS the auth step)
+if msg.Type != "list_request" && !m.authenticated.Load() {
+    m.sendError("authentication required")
+    return
+}
+```
 
 ### `handleListRequest(password, path string)`
 
-- If `m.password != ""` and not yet authenticated: validate password, set `authenticated = true` on success
-- If `m.password != ""` and already authenticated: still validate password on every call (browser always sends `sessionPassword`)
+- If `m.password != ""`: validate password on every call; set `authenticated = true` on success
 - Passes `path` to `client.ListFiles(path)`
 
 ### `handleFileRequest(filePath string)`
 
-1. If `!authenticated.Load()` — return `error: "authentication required"`
-2. Reject if `strings.Contains(filePath, "..")` — returns `error` message (defense-in-depth; OpenCloud's own auth is the real protection)
-3. Derive `dir = path.Dir(filePath)`, `name = path.Base(filePath)` (using Go's `path` package, not `filepath` — share paths use forward slashes on all platforms)
-4. Call `client.ListFiles(dir)` to validate file exists
-5. Send `file_header` with `Name: name` (basename only)
-6. Stream with `client.GetFile(filePath)`
+1. Reject if `strings.Contains(filePath, "..")` — returns `error` message (defense-in-depth; OpenCloud's own auth is the real protection)
+2. Derive `dir = path.Dir(filePath)`, `name = path.Base(filePath)` (using Go's `path` package, not `filepath` — share paths use forward slashes on all platforms)
+3. Call `client.ListFiles(dir)` to validate file exists
+4. Send `file_header` with `Name: name` (basename only)
+5. Stream with `client.GetFile(filePath)`
 
 ---
 
