@@ -4,9 +4,9 @@ import "os"
 
 type Config struct {
 	SignalingServer string
-	AuthToken       string
+	APIKey          string // NEW: replaces AuthToken
 	AllowedHost     string
-	// Password and MaxDownloads are set from CLI flags, not env vars
+	// Password and MaxDownloads are set from CLI flags
 	Password     string
 	MaxDownloads int
 }
@@ -14,7 +14,7 @@ type Config struct {
 func Load() *Config {
 	return &Config{
 		SignalingServer: getEnv("SIGNALING_SERVER", "ws://localhost:8080"),
-		AuthToken:       getEnv("AUTH_TOKEN", "dev-token"),
+		APIKey:          getEnv("OPENCLOUDSHARE_API_KEY", ""),
 		AllowedHost:     getEnv("ALLOWED_OPENCLOUD_HOST", ""),
 	}
 }

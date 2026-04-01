@@ -1,85 +1,110 @@
 package signaling
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
 
 	"github.com/coder/websocket"
 )
 
 // Message is any message received from the signaling server.
 type Message struct {
-	Type      string          `json:"type"`
-	SessionID string          `json:"session_id,omitempty"`
-	SDP       string          `json:"sdp,omitempty"`
-	Candidate json.RawMessage `json:"candidate,omitempty"`
-	Err       string          `json:"message,omitempty"`
+	Type        string          `json:"type"`
+	SessionID   string          `json:"session_id,omitempty"`
+	SDP         string          `json:"sdp,omitempty"`
+	Candidate   json.RawMessage `json:"candidate,omitempty"`
+	Err         string          `json:"message,omitempty"`
+	Code        string          `json:"code,omitempty"`
+	Reconnected bool            `json:"reconnected,omitempty"`
 }
 
 // Client manages a WebSocket connection to the signaling server.
 type Client struct {
-	serverURL string // ws:// or wss://
-	token     string
+	serverURL string
+	apiKey    string
+	agentID   string
 	conn      *websocket.Conn
 	OnMessage func(msg Message)
 }
 
-func New(serverURL, token string) *Client {
-	return &Client{serverURL: serverURL, token: token}
+func New(serverURL, apiKey, agentID string) *Client {
+	return &Client{
+		serverURL: serverURL,
+		apiKey:    apiKey,
+		agentID:   agentID,
+	}
 }
 
-// Connect dials the signaling server and sends the register message.
+// Connect dials the signaling server with API key auth and sends hello.
 func (c *Client) Connect(ctx context.Context) error {
-	conn, _, err := websocket.Dial(ctx, c.serverURL+"/ws/agent", nil)
+	// WebSocket URL with api_key query param
+	wsURL := c.serverURL + "/ws/agent?api_key=" + c.apiKey
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial signaling server: %w", err)
 	}
 	c.conn = conn
-	return c.Send(ctx, map[string]string{"type": "register", "token": c.token})
+
+	// Send hello message
+	if err := c.Send(ctx, map[string]string{
+		"type":     "hello",
+		"version":  "1.0",
+		"agent_id": c.agentID,
+	}); err != nil {
+		conn.CloseNow()
+		return fmt.Errorf("send hello: %w", err)
+	}
+
+	return nil
 }
 
-// CreateSession calls POST /api/v1/sessions and returns the session code.
-func (c *Client) CreateSession(ctx context.Context, shareURL, preferredCode string) (string, error) {
-	reqBody := map[string]string{"share_url": shareURL}
+// RegisterShare sends register_share message and waits for response.
+func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string) (string, bool, error) {
+	msg := map[string]string{
+		"type":      "register_share",
+		"share_url": shareURL,
+	}
 	if preferredCode != "" {
-		reqBody["preferred_code"] = preferredCode
-	}
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		msg["code"] = preferredCode
 	}
 
-	httpBase := strings.NewReplacer("ws://", "http://", "wss://", "https://").Replace(c.serverURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpBase+"/api/v1/sessions", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("create session request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		var e struct{ Error string `json:"error"` }
-		json.NewDecoder(resp.Body).Decode(&e)
-		return "", fmt.Errorf("server returned %d: %s", resp.StatusCode, e.Error)
+	if err := c.Send(ctx, msg); err != nil {
+		return "", false, fmt.Errorf("send register_share: %w", err)
 	}
 
-	var result struct {
-		Code string `json:"code"`
+	// Wait for response
+	for {
+		_, data, err := c.conn.Read(ctx)
+		if err != nil {
+			return "", false, fmt.Errorf("read response: %w", err)
+		}
+
+		var resp Message
+		if err := json.Unmarshal(data, &resp); err != nil {
+			continue
+		}
+
+		switch resp.Type {
+		case "welcome":
+			// Hello acknowledged, continue waiting for share_registered
+			continue
+		case "share_registered":
+			return resp.Code, resp.Reconnected, nil
+		case "error":
+			return "", false, fmt.Errorf("server error: %s", resp.Err)
+		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
-	}
-	return result.Code, nil
+}
+
+// DownloadComplete notifies server of completed download.
+func (c *Client) DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error {
+	return c.Send(ctx, map[string]any{
+		"type":              "download_complete",
+		"code":              code,
+		"bytes_transferred": bytesTransferred,
+	})
 }
 
 // Send serializes msg as JSON and writes it to the WebSocket.
@@ -92,7 +117,6 @@ func (c *Client) Send(ctx context.Context, msg any) error {
 }
 
 // Listen reads messages in a loop and calls OnMessage for each one.
-// Returns when the connection is closed or ctx is cancelled.
 func (c *Client) Listen(ctx context.Context) error {
 	for {
 		_, data, err := c.conn.Read(ctx)
