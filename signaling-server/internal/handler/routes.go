@@ -1,17 +1,13 @@
 package handler
 
 import (
-	"database/sql"
-
 	"github.com/gin-gonic/gin"
 	"opencloudshare/server/internal/config"
 	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/hub"
 )
 
-func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, database *sql.DB) {
-	apiKeyRepo := db.NewAPIKeyRepo(database)
-	sessionRepo := db.NewSessionRepo(database)
+func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo) {
 
 	// Public session lookup endpoint
 	r.GET("/sessions/:code", GetSessionInfo(sessionRepo))
