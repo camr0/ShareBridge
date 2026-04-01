@@ -45,9 +45,9 @@ type Manager struct {
 	authenticated atomic.Bool // true once password accepted (or no password required)
 
 	// Callbacks for external handling
-	OnAuthFailed       func() // called when auth fails after 3 strikes
-	OnSessionExpired   func() // called when max downloads reached
-	OnDownloadComplete func() // called after each successful download (after chunk_end sent)
+	OnAuthFailed       func()             // called when auth fails after 3 strikes
+	OnSessionExpired   func()             // called when max downloads reached
+	OnDownloadComplete func(bytesTransferred int64) // called after each successful download
 }
 
 // NewManager creates a transfer manager with optional password and download limit.
@@ -278,10 +278,12 @@ func (m *Manager) streamFile(filePath string) {
 	}()
 
 	// Read chunks and send
+	var totalBytes int64
 	buf := make([]byte, chunkSize)
 	for {
 		n, err := pr.Read(buf)
 		if n > 0 {
+			totalBytes += int64(n)
 			// Send with backpressure
 			if err := m.sendWithBackpressure(buf[:n]); err != nil {
 				return // Connection closed
@@ -305,7 +307,7 @@ func (m *Manager) streamFile(filePath string) {
 	// Increment download counter on successful completion
 	m.downloads.Add(1)
 	if m.OnDownloadComplete != nil {
-		m.OnDownloadComplete()
+		m.OnDownloadComplete(totalBytes)
 	}
 }
 

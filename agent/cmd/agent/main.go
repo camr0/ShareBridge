@@ -57,6 +57,11 @@ func runShare(cmd *cobra.Command, args []string) error {
 	cfg.Password = password
 	cfg.MaxDownloads = maxDownloads
 
+	// Validate API key is set
+	if cfg.APIKey == "" {
+		return fmt.Errorf("OPENCLOUDSHARE_API_KEY environment variable required")
+	}
+
 	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost, password)
 	if err != nil {
 		return fmt.Errorf("create WebDAV client: %w", err)
@@ -67,7 +72,10 @@ func runShare(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("session store: %w", err)
 	}
 
-	// Load persisted state before reconnect loop
+	// Get or generate AgentID
+	agentID := st.GetAgentID()
+
+	// Load persisted state
 	preferredCode := st.GetCode(shareURL)
 
 	// Handle Ctrl-C gracefully
@@ -84,7 +92,7 @@ func runShare(cmd *cobra.Command, args []string) error {
 		default:
 		}
 
-		code, err := runSession(ctx, cfg, webdavClient, shareURL, st, preferredCode)
+		code, err := runSession(ctx, cfg, webdavClient, shareURL, st, preferredCode, agentID)
 		if err != nil {
 			log.Printf("session ended: %v", err)
 		} else {
@@ -116,20 +124,25 @@ func runShare(cmd *cobra.Command, args []string) error {
 	}
 }
 
-func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, st *store.Store, preferredCode string) (string, error) {
-	sig := signaling.New(cfg.SignalingServer, cfg.AuthToken)
+func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, st *store.Store, preferredCode string, agentID string) (string, error) {
+	sig := signaling.New(cfg.SignalingServer, cfg.APIKey, agentID)
 
 	if err := sig.Connect(ctx); err != nil {
 		return "", fmt.Errorf("connect to signaling server: %w", err)
 	}
 	log.Printf("connected to signaling server at %s", cfg.SignalingServer)
 
-	code, err := sig.CreateSession(ctx, shareURL, preferredCode)
+	// Use new RegisterShare instead of CreateSession
+	code, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode)
 	if err != nil {
-		return "", fmt.Errorf("create session: %w", err)
+		return "", fmt.Errorf("register share: %w", err)
 	}
-	log.Printf("session ready — code: %s", code)
-	log.Printf("open browser: http://localhost:8080  then enter code: %s", code)
+	if reconnected {
+		log.Printf("session reclaimed — code: %s", code)
+	} else {
+		log.Printf("session ready — code: %s", code)
+	}
+	log.Printf("open browser: http://localhost:8080 then enter code: %s", code)
 
 	if err := st.SetCode(shareURL, code); err != nil {
 		log.Fatalf("fatal: could not save session code: %v", err)
@@ -142,8 +155,8 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 
 	sig.OnMessage = func(msg signaling.Message) {
 		switch msg.Type {
-		case "registered":
-			log.Println("agent registered with signaling server")
+		case "welcome":
+			log.Println("agent authenticated with signaling server")
 
 		case "join":
 			log.Printf("browser joined session %s — starting WebRTC handshake", msg.SessionID)
@@ -181,12 +194,6 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 
 			// Restore persisted download count
 			tm.SetDownloadCount(st.GetDownloadCount(shareURL))
-			// Wire persistence callback
-			tm.OnDownloadComplete = func() {
-				if _, err := st.IncrementDownloadCount(shareURL); err != nil {
-					log.Printf("warning: could not persist download count: %v", err)
-				}
-			}
 
 			// Wire callbacks before CreateOffer to avoid any race with a fast peer
 			tm.OnAuthFailed = func() {
@@ -203,6 +210,16 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 					"session_id": sessionID,
 				}); err != nil {
 					log.Printf("send session_expired: %v", err)
+				}
+			}
+			tm.OnDownloadComplete = func(bytesTransferred int64) {
+				// Persist download count
+				if _, err := st.IncrementDownloadCount(shareURL); err != nil {
+					log.Printf("warning: could not persist download count: %v", err)
+				}
+				// Notify server for tier tracking
+				if err := sig.DownloadComplete(ctx, code, bytesTransferred); err != nil {
+					log.Printf("warning: could not send download_complete: %v", err)
 				}
 			}
 			p.OnOpen = func() {

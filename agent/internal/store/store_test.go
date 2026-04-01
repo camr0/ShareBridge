@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // TestNew_CreatesMissingDir verifies that New() creates the data directory
@@ -238,5 +240,38 @@ func TestGetCode_MidRunCorruption(t *testing.T) {
 	code = store.GetCode(shareURL)
 	if code != "" {
 		t.Errorf("Expected empty code after corruption, got %q", code)
+	}
+}
+
+func TestAgentID_GeneratedOnFirstLoad(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+
+	store, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	// First call should generate and return a UUID
+	id1 := store.GetAgentID()
+	if id1 == "" {
+		t.Fatal("GetAgentID() returned empty string on first call")
+	}
+
+	// Verify it's a valid UUID format
+	if _, err := uuid.Parse(id1); err != nil {
+		t.Fatalf("GetAgentID() returned non-UUID: %q, error: %v", id1, err)
+	}
+
+	// Create new store instance (simulating restart)
+	store2, err := New()
+	if err != nil {
+		t.Fatalf("New() second call failed: %v", err)
+	}
+
+	// Should return same ID
+	id2 := store2.GetAgentID()
+	if id1 != id2 {
+		t.Fatalf("AgentID changed after restart: %q -> %q", id1, id2)
 	}
 }
