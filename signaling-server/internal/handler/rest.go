@@ -2,67 +2,48 @@ package handler
 
 import (
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"opencloudshare/server/internal/hub"
-	"opencloudshare/server/internal/session"
+	"opencloudshare/server/internal/db"
 )
 
-type createSessionRequest struct {
-	ShareURL      string `json:"share_url" binding:"required"`
-	TTL           string `json:"ttl"`
-	PreferredCode string `json:"preferred_code"`
+type SessionInfoResponse struct {
+	Code      string     `json:"code"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	IsActive  bool       `json:"is_active"`
 }
 
-type createSessionResponse struct {
-	Code      string `json:"code"`
-	ExpiresAt string `json:"expires_at"`
-}
-
-func CreateSession(sessions *session.Manager, h *hub.Hub, authToken string) gin.HandlerFunc {
+// GetSessionInfo returns session info by code.
+// Does NOT expose share_url for privacy.
+func GetSessionInfo(sessionRepo *db.SessionRepo) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		token := extractToken(c.GetHeader("Authorization"))
-		if token != authToken {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-			return
-		}
-		// In single-user mode the auth token is also the agent's connection key in the hub.
-		if !h.AgentConnected(token) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "agent not connected — connect WebSocket first"})
+		code := c.Param("code")
+		if code == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "code required"})
 			return
 		}
 
-		var req createSessionRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-
-		ttl := 24 * time.Hour
-		if req.TTL != "" {
-			var err error
-			ttl, err = time.ParseDuration(req.TTL)
-			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid ttl: use Go duration format e.g. 24h"})
-				return
-			}
-		}
-
-		s, err := sessions.Create(token, req.ShareURL, req.PreferredCode, ttl)
+		session, err := sessionRepo.GetByCode(code)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to lookup session"})
+			return
+		}
+		if session == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 			return
 		}
 
-		c.JSON(http.StatusCreated, createSessionResponse{
-			Code:      s.ID,
-			ExpiresAt: s.ExpiresAt.Format(time.RFC3339),
+		// Determine if session is active
+		isActive := true
+		if session.ExpiresAt != nil && session.ExpiresAt.Before(time.Now()) {
+			isActive = false
+		}
+
+		c.JSON(http.StatusOK, SessionInfoResponse{
+			Code:      session.Code,
+			ExpiresAt: session.ExpiresAt,
+			IsActive:  isActive,
 		})
 	}
-}
-
-func extractToken(authHeader string) string {
-	return strings.TrimPrefix(authHeader, "Bearer ")
 }

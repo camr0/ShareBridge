@@ -8,12 +8,10 @@ import (
 	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/handler"
 	"opencloudshare/server/internal/hub"
-	"opencloudshare/server/internal/session"
 )
 
 func main() {
 	cfg := config.Load()
-	sessions := session.NewManager()
 	h := hub.New()
 
 	// Initialize database
@@ -24,7 +22,7 @@ func main() {
 	defer database.Close()
 
 	r := gin.Default()
-	handler.RegisterRoutes(r, sessions, h, cfg, database)
+	handler.RegisterRoutes(r, h, cfg, database)
 
 	log.Printf("signaling server listening on :%s", cfg.Port)
 	if err := r.Run(":" + cfg.Port); err != nil {

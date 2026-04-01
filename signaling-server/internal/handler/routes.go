@@ -7,16 +7,42 @@ import (
 	"opencloudshare/server/internal/config"
 	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/hub"
-	"opencloudshare/server/internal/session"
 )
 
-func RegisterRoutes(r *gin.Engine, sessions *session.Manager, h *hub.Hub, cfg *config.Config, database *sql.DB) {
+func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, database *sql.DB) {
 	apiKeyRepo := db.NewAPIKeyRepo(database)
 	sessionRepo := db.NewSessionRepo(database)
 
-	r.POST("/api/v1/sessions", CreateSession(sessions, h, cfg.AuthToken))
+	// Public session lookup endpoint
+	r.GET("/sessions/:code", GetSessionInfo(sessionRepo))
+
+	// WebSocket endpoints
 	r.GET("/ws/agent", AgentWS(h, apiKeyRepo, sessionRepo))
 	r.GET("/ws/client", BrowserWS(h, sessionRepo, cfg.STUNURL))
+
+	// Admin API routes (protected by auth token)
+	admin := r.Group("/admin/api")
+	admin.Use(AdminAuthMiddleware(cfg.AuthToken))
+	{
+		admin.POST("/keys", CreateAPIKey(apiKeyRepo))
+		admin.GET("/keys", ListAPIKeys(apiKeyRepo))
+		admin.DELETE("/keys/:id", RevokeAPIKey(apiKeyRepo))
+	}
+
+	// Static web files
 	r.StaticFile("/", "./web/index.html")
 	r.StaticFile("/app.js", "./web/app.js")
+}
+
+// AdminAuthMiddleware validates the admin auth token.
+func AdminAuthMiddleware(authToken string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.GetHeader("Authorization")
+		if token == "" || token != "Bearer "+authToken {
+			c.JSON(401, gin.H{"error": "unauthorized"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
 }
