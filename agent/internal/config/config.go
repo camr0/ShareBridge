@@ -4,7 +4,7 @@ import "os"
 
 type Config struct {
 	SignalingServer string
-	APIKey          string // NEW: replaces AuthToken
+	APIKey          string
 	AllowedHost     string
 	// Password and MaxDownloads are set from CLI flags
 	Password     string

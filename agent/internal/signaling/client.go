@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 
 	"github.com/coder/websocket"
 )
@@ -39,7 +40,9 @@ func New(serverURL, apiKey, agentID string) *Client {
 // Connect dials the signaling server with API key auth and sends hello.
 func (c *Client) Connect(ctx context.Context) error {
 	// WebSocket URL with api_key query param
-	wsURL := c.serverURL + "/ws/agent?api_key=" + c.apiKey
+	params := url.Values{}
+	params.Set("api_key", c.apiKey)
+	wsURL := c.serverURL + "/ws/agent?" + params.Encode()
 
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
@@ -94,6 +97,9 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 			return resp.Code, resp.Reconnected, nil
 		case "error":
 			return "", false, fmt.Errorf("server error: %s", resp.Err)
+		default:
+			// Unexpected message type - ignore and continue waiting
+			continue
 		}
 	}
 }

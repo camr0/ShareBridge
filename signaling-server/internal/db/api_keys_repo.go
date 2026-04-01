@@ -81,10 +81,17 @@ func (r *APIKeyRepo) Validate(fullKey string) (*APIKey, error) {
 	return key, nil
 }
 
-// Revoke marks an API key as inactive.
-func (r *APIKeyRepo) Revoke(id string) error {
-	_, err := r.db.Exec("UPDATE api_keys SET is_active = FALSE WHERE id = ?", id)
-	return err
+// Revoke marks an API key as inactive. Returns true if a key was found and revoked, false if no key was found.
+func (r *APIKeyRepo) Revoke(id string) (bool, error) {
+	result, err := r.db.Exec("UPDATE api_keys SET is_active = FALSE WHERE id = ?", id)
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
 }
 
 // List returns all API keys.

@@ -39,7 +39,7 @@ var migrateCmd = &cobra.Command{
 			return fmt.Errorf("open database: %w", err)
 		}
 		defer database.Close()
-		fmt.Println("migrations complete")
+		fmt.Println("Migrations complete")
 		return nil
 	},
 }
@@ -127,9 +127,22 @@ var revokeKeyCmd = &cobra.Command{
 		}
 		defer database.Close()
 
+		// Confirmation prompt
+		fmt.Printf("Are you sure you want to revoke key %s? (yes/no): ", args[0])
+		var response string
+		fmt.Scanln(&response)
+		if response != "yes" {
+			fmt.Println("revocation cancelled")
+			return nil
+		}
+
 		repo := db.NewAPIKeyRepo(database)
-		if err := repo.Revoke(args[0]); err != nil {
+		found, err := repo.Revoke(args[0])
+		if err != nil {
 			return fmt.Errorf("revoke key: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("key not found: %s", args[0])
 		}
 
 		fmt.Printf("revoked: %s\n", args[0])

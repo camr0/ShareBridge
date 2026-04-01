@@ -25,8 +25,10 @@ func TestAgentWS_HelloFlow(t *testing.T) {
 
 	// Create API key
 	keyRepo := db.NewAPIKeyRepo(database)
-	hash, _ := bcrypt.GenerateFromPassword([]byte("ak_test.agentsecret"), bcrypt.DefaultCost)
-	keyRepo.Create("ak_test", string(hash))
+	hash, err := bcrypt.GenerateFromPassword([]byte("ak_test.agentsecret"), bcrypt.DefaultCost)
+	require.NoError(t, err)
+	err = keyRepo.Create("ak_test", string(hash))
+	require.NoError(t, err)
 
 	sessionRepo := db.NewSessionRepo(database)
 	h := hub.New()
@@ -87,10 +89,14 @@ func TestAgentWS_CodeOwnership(t *testing.T) {
 
 	// Create two API keys
 	keyRepo := db.NewAPIKeyRepo(database)
-	hash1, _ := bcrypt.GenerateFromPassword([]byte("ak_alice.alicesecret"), bcrypt.DefaultCost)
-	keyRepo.Create("ak_alice", string(hash1))
-	hash2, _ := bcrypt.GenerateFromPassword([]byte("ak_mallory.mallorysecret"), bcrypt.DefaultCost)
-	keyRepo.Create("ak_mallory", string(hash2))
+	hash1, err := bcrypt.GenerateFromPassword([]byte("ak_alice.alicesecret"), bcrypt.DefaultCost)
+	require.NoError(t, err)
+	err = keyRepo.Create("ak_alice", string(hash1))
+	require.NoError(t, err)
+	hash2, err := bcrypt.GenerateFromPassword([]byte("ak_mallory.mallorysecret"), bcrypt.DefaultCost)
+	require.NoError(t, err)
+	err = keyRepo.Create("ak_mallory", string(hash2))
+	require.NoError(t, err)
 
 	sessionRepo := db.NewSessionRepo(database)
 	h := hub.New()
@@ -117,12 +123,16 @@ func TestAgentWS_CodeOwnership(t *testing.T) {
 	require.NoError(t, err)
 
 	// Send hello
-	conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","version":"1.0","agent_id":"mallory-agent"}`))
-	conn.Read(ctx) // welcome
+	err = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","version":"1.0","agent_id":"mallory-agent"}`))
+	require.NoError(t, err)
+	_, _, err = conn.Read(ctx) // welcome
+	require.NoError(t, err)
 
 	// Try to register same code
-	conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://evil.com","code":"CUSTOM01"}`))
-	_, data, _ := conn.Read(ctx)
+	err = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://evil.com","code":"CUSTOM01"}`))
+	require.NoError(t, err)
+	_, data, err := conn.Read(ctx)
+	require.NoError(t, err)
 
 	assert.Contains(t, string(data), "error")
 	assert.Contains(t, string(data), "code already in use")

@@ -89,8 +89,13 @@ func RevokeAPIKey(keyRepo *db.APIKeyRepo) gin.HandlerFunc {
 			return
 		}
 
-		if err := keyRepo.Revoke(keyID); err != nil {
+		found, err := keyRepo.Revoke(keyID)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke key"})
+			return
+		}
+		if !found {
+			c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
 			return
 		}
 
