@@ -65,7 +65,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo)
 			if err != nil {
 				if agentID != "" {
 					log.Printf("agent disconnected: %s (agent_id: %s)", apiKey.ID, agentID)
-					h.UnregisterAgent(agentID)
+					h.UnregisterAgent(apiKey.ID)
 				}
 				return
 			}
@@ -134,8 +134,8 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 		return
 	}
 
-	// Register agent with the hub using agentID
-	h.RegisterAgent(agentID, conn)
+	// Register agent with the hub using apiKeyID
+	h.RegisterAgent(apiKeyID, conn)
 	log.Printf("agent hello received: api_key=%s agent_id=%s", apiKeyID, agentID)
 
 	hub.SendDirect(ctx, conn, map[string]string{
@@ -168,7 +168,8 @@ func handleRegisterShare(
 
 	if code == "" {
 		// Generate a new random code
-		code, err := generateRandomCode()
+		var err error
+		code, err = generateRandomCode()
 		if err != nil {
 			log.Printf("failed to generate random code: %v", err)
 			hub.SendDirect(ctx, conn, map[string]string{
@@ -248,7 +249,15 @@ func handleRegisterShare(
 			}
 
 			if existingSession != nil {
-				// Reconnecting to existing session - update agent_id
+				// Verify agent_id matches for reconnection
+				if existingSession.AgentID != agentID {
+					hub.SendDirect(ctx, conn, map[string]string{
+						"type":    "error",
+						"message": "session owned by different agent",
+					})
+					return
+				}
+				// Reconnecting to existing session - update timestamps
 				existingSession.AgentID = agentID
 				if err := sessionRepo.Update(existingSession); err != nil {
 					log.Printf("db error updating session: %v", err)
