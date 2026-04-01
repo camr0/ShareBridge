@@ -1,26 +1,54 @@
 package handler
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"log"
+	"math/big"
+	"regexp"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
+	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/hub"
 )
 
+// Agent message types from agent to server
 type agentMsg struct {
-	Type      string          `json:"type"`
-	Token     string          `json:"token,omitempty"`
-	SessionID string          `json:"session_id,omitempty"`
-	SDP       string          `json:"sdp,omitempty"`
-	Candidate json.RawMessage `json:"candidate,omitempty"`
+	Type       string          `json:"type"`
+	AgentID    string          `json:"agent_id,omitempty"`
+	Code       string          `json:"code,omitempty"`
+	ShareURL   string          `json:"share_url,omitempty"`
+	ExpiresAt  *time.Time      `json:"expires_at,omitempty"`
+	MaxDownloads *int          `json:"max_downloads,omitempty"`
+	SessionID  string          `json:"session_id,omitempty"`
+	SDP        string          `json:"sdp,omitempty"`
+	Candidate  json.RawMessage `json:"candidate,omitempty"`
 }
 
-func AgentWS(h *hub.Hub, authToken string) gin.HandlerFunc {
+// codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
+var codeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,30}$`)
+
+func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Extract and validate API key from query param
+		apiKeyFull := c.Query("api_key")
+		if apiKeyFull == "" {
+			c.JSON(401, gin.H{"error": "missing api_key"})
+			return
+		}
+
+		apiKey, err := apiKeyRepo.Validate(apiKeyFull)
+		if err != nil || apiKey == nil {
+			c.JSON(401, gin.H{"error": "invalid api_key"})
+			return
+		}
+
+		// Upgrade to WebSocket
 		conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
-			InsecureSkipVerify: true, // allow any origin in dev
+			InsecureSkipVerify: true,
 		})
 		if err != nil {
 			log.Printf("agent_ws accept: %v", err)
@@ -29,14 +57,15 @@ func AgentWS(h *hub.Hub, authToken string) gin.HandlerFunc {
 		defer conn.CloseNow()
 
 		ctx := c.Request.Context()
-		var token string
+		var agentID string
 
+		// Main message loop
 		for {
 			_, data, err := conn.Read(ctx)
 			if err != nil {
-				if token != "" {
-					log.Printf("agent disconnected: %s", token)
-					h.UnregisterAgent(token)
+				if agentID != "" {
+					log.Printf("agent disconnected: %s (agent_id: %s)", apiKey.ID, agentID)
+					h.UnregisterAgent(agentID)
 				}
 				return
 			}
@@ -47,20 +76,28 @@ func AgentWS(h *hub.Hub, authToken string) gin.HandlerFunc {
 			}
 
 			switch msg.Type {
-			case "register":
-				if msg.Token != authToken {
-					// token var is still "" here — use SendDirect, not SendToAgent
-					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "unauthorized"})
-					conn.Close(websocket.StatusPolicyViolation, "unauthorized")
-					return
+			case "hello":
+				handleHello(ctx, conn, h, apiKey.ID, msg.AgentID)
+				agentID = msg.AgentID
+
+			case "register_share":
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{
+						"type":    "error",
+						"message": "hello required before register_share",
+					})
+					continue
 				}
-				token = msg.Token
-				h.RegisterAgent(token, conn)
-				log.Printf("agent registered: %s", token)
-				h.SendToAgent(ctx, token, map[string]string{"type": "registered"})
+				handleRegisterShare(ctx, conn, h, apiKey, sessionRepo, agentID, msg)
+
+			case "download_complete":
+				if agentID == "" {
+					continue
+				}
+				handleDownloadComplete(ctx, conn, sessionRepo, msg.SessionID)
 
 			case "offer":
-				if token == "" {
+				if agentID == "" {
 					continue
 				}
 				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
@@ -69,7 +106,7 @@ func AgentWS(h *hub.Hub, authToken string) gin.HandlerFunc {
 				})
 
 			case "ice_candidate":
-				if token == "" {
+				if agentID == "" {
 					continue
 				}
 				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
@@ -85,4 +122,240 @@ func AgentWS(h *hub.Hub, authToken string) gin.HandlerFunc {
 			}
 		}
 	}
+}
+
+// handleHello processes the hello message and sends welcome response
+func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID string, agentID string) {
+	if agentID == "" {
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "agent_id required",
+		})
+		return
+	}
+
+	// Register agent with the hub using agentID
+	h.RegisterAgent(agentID, conn)
+	log.Printf("agent hello received: api_key=%s agent_id=%s", apiKeyID, agentID)
+
+	hub.SendDirect(ctx, conn, map[string]string{
+		"type": "welcome",
+	})
+}
+
+// handleRegisterShare processes share registration (new or reconnect)
+func handleRegisterShare(
+	ctx context.Context,
+	conn *websocket.Conn,
+	h *hub.Hub,
+	apiKey *db.APIKey,
+	sessionRepo *db.SessionRepo,
+	agentID string,
+	msg agentMsg,
+) {
+	// Validate share_url is provided
+	if msg.ShareURL == "" {
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "share_url required",
+		})
+		return
+	}
+
+	// Determine the code to use
+	code := msg.Code
+	reconnected := false
+
+	if code == "" {
+		// Generate a new random code
+		code, err := generateRandomCode()
+		if err != nil {
+			log.Printf("failed to generate random code: %v", err)
+			hub.SendDirect(ctx, conn, map[string]string{
+				"type":    "error",
+				"message": "failed to generate code",
+			})
+			return
+		}
+
+		// Try to create with collision retry (5 attempts)
+		created := false
+		for i := 0; i < 5; i++ {
+			session := &db.Session{
+				Code:         code,
+				APIKeyID:     apiKey.ID,
+				AgentID:      agentID,
+				ShareURL:     msg.ShareURL,
+				ExpiresAt:    msg.ExpiresAt,
+				MaxDownloads: msg.MaxDownloads,
+			}
+			err = sessionRepo.Create(session)
+			if err == nil {
+				created = true
+				break
+			}
+
+			// Collision, generate new code
+			code, err = generateRandomCode()
+			if err != nil {
+				log.Printf("failed to generate random code: %v", err)
+				hub.SendDirect(ctx, conn, map[string]string{
+					"type":    "error",
+					"message": "failed to generate code",
+				})
+				return
+			}
+		}
+
+		if !created {
+			hub.SendDirect(ctx, conn, map[string]string{
+				"type":    "error",
+				"message": "code collision, try again",
+			})
+			return
+		}
+	} else {
+		// Validate custom code format
+		if !codeRegex.MatchString(code) {
+			hub.SendDirect(ctx, conn, map[string]string{
+				"type":    "error",
+				"message": "invalid code format (8-30 chars, alphanumeric + hyphen + underscore)",
+			})
+			return
+		}
+
+		// Check if code exists and is owned by this API key
+		available, err := sessionRepo.IsCodeAvailable(code, apiKey.ID)
+		if err != nil {
+			log.Printf("db error checking code availability: %v", err)
+			hub.SendDirect(ctx, conn, map[string]string{
+				"type":    "error",
+				"message": "database error",
+			})
+			return
+		}
+
+		if available {
+			// Code is available (new or owned by this API key)
+			existingSession, err := sessionRepo.GetByCode(code)
+			if err != nil {
+				log.Printf("db error getting session: %v", err)
+				hub.SendDirect(ctx, conn, map[string]string{
+					"type":    "error",
+					"message": "database error",
+				})
+				return
+			}
+
+			if existingSession != nil {
+				// Reconnecting to existing session - update agent_id
+				existingSession.AgentID = agentID
+				if err := sessionRepo.Update(existingSession); err != nil {
+					log.Printf("db error updating session: %v", err)
+					hub.SendDirect(ctx, conn, map[string]string{
+						"type":    "error",
+						"message": "database error",
+					})
+					return
+				}
+				reconnected = true
+				log.Printf("session reconnected: code=%s api_key=%s agent_id=%s", code, apiKey.ID, agentID)
+			} else {
+				// Creating new session with custom code
+				session := &db.Session{
+					Code:         code,
+					APIKeyID:     apiKey.ID,
+					AgentID:      agentID,
+					ShareURL:     msg.ShareURL,
+					ExpiresAt:    msg.ExpiresAt,
+					MaxDownloads: msg.MaxDownloads,
+				}
+				if err := sessionRepo.Create(session); err != nil {
+					log.Printf("db error creating session: %v", err)
+					hub.SendDirect(ctx, conn, map[string]string{
+						"type":    "error",
+						"message": "failed to create session",
+					})
+					return
+				}
+			}
+		} else {
+			// Code is taken by a different API key
+			hub.SendDirect(ctx, conn, map[string]string{
+				"type":    "error",
+				"message": "code already in use",
+			})
+			return
+		}
+	}
+
+	// Register code with hub
+	h.RegisterCode(code, apiKey.ID)
+
+	// Get session for response
+	session, err := sessionRepo.GetByCode(code)
+	if err != nil || session == nil {
+		log.Printf("db error getting session after creation: %v", err)
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "failed to retrieve session",
+		})
+		return
+	}
+
+	// Send success response
+	response := map[string]any{
+		"type":        "share_registered",
+		"code":        code,
+		"reconnected": reconnected,
+	}
+	if session.ExpiresAt != nil {
+		response["expires_at"] = session.ExpiresAt.Format(time.RFC3339)
+	}
+
+	hub.SendDirect(ctx, conn, response)
+	log.Printf("share registered: code=%s api_key=%s agent_id=%s reconnected=%v", code, apiKey.ID, agentID, reconnected)
+}
+
+// handleDownloadComplete increments the download count for a session
+func handleDownloadComplete(
+	ctx context.Context,
+	conn *websocket.Conn,
+	sessionRepo *db.SessionRepo,
+	sessionID string,
+) {
+	if sessionID == "" {
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "session_id required",
+		})
+		return
+	}
+
+	if err := sessionRepo.IncrementDownloadCount(sessionID); err != nil {
+		log.Printf("failed to increment download count for %s: %v", sessionID, err)
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "failed to update download count",
+		})
+		return
+	}
+
+	log.Printf("download complete recorded for session %s", sessionID)
+}
+
+// generateRandomCode generates a random 8-character code
+func generateRandomCode() (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	const length = 8
+
+	result := make([]byte, length)
+	for i := range result {
+		randIdx, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		result[i] = charset[randIdx.Int64()]
+	}
+	return string(result), nil
 }
