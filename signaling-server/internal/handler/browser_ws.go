@@ -4,11 +4,12 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
+	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/hub"
-	"opencloudshare/server/internal/session"
 )
 
 type browserMsg struct {
@@ -17,11 +18,24 @@ type browserMsg struct {
 	Candidate json.RawMessage `json:"candidate,omitempty"`
 }
 
-func BrowserWS(h *hub.Hub, sessions *session.Manager, stunURL string) gin.HandlerFunc {
+func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, stunURL string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		sessionID := c.Query("session")
-		s, ok := sessions.Get(sessionID)
-		if !ok {
+		sessionCode := c.Query("session")
+
+		// Lookup session in database
+		session, err := sessionRepo.GetByCode(sessionCode)
+		if err != nil {
+			log.Printf("browser_ws: error looking up session: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
+			return
+		}
+		if session == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found or expired"})
+			return
+		}
+
+		// Check expiry
+		if session.ExpiresAt != nil && time.Now().After(*session.ExpiresAt) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "session not found or expired"})
 			return
 		}
@@ -37,14 +51,14 @@ func BrowserWS(h *hub.Hub, sessions *session.Manager, stunURL string) gin.Handle
 
 		ctx := c.Request.Context()
 
-		if err := h.PairSession(sessionID, s.Token, conn); err != nil {
+		if err := h.PairSession(sessionCode, conn); err != nil {
 			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
 			conn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
-		defer h.UnpairSession(sessionID)
+		defer h.UnpairSession(sessionCode)
 
-		log.Printf("browser joined session %s", sessionID)
+		log.Printf("browser joined session %s", sessionCode)
 
 		// Send ICE config to browser
 		hub.SendDirect(ctx, conn, map[string]any{
@@ -55,16 +69,16 @@ func BrowserWS(h *hub.Hub, sessions *session.Manager, stunURL string) gin.Handle
 		})
 
 		// Notify agent that browser has joined
-		h.SendToAgent(ctx, s.Token, map[string]string{
+		h.SendToAgent(ctx, session.APIKeyID, map[string]string{
 			"type":       "join",
-			"session_id": sessionID,
+			"session_id": sessionCode,
 		})
 
 		// Relay messages from browser to agent
 		for {
 			_, data, err := conn.Read(ctx)
 			if err != nil {
-				log.Printf("browser disconnected from session %s", sessionID)
+				log.Printf("browser disconnected from session %s", sessionCode)
 				return
 			}
 
@@ -75,15 +89,15 @@ func BrowserWS(h *hub.Hub, sessions *session.Manager, stunURL string) gin.Handle
 
 			switch msg.Type {
 			case "answer":
-				h.ForwardToAgent(ctx, sessionID, map[string]any{
+				h.ForwardToAgent(ctx, sessionCode, map[string]any{
 					"type":       "answer",
-					"session_id": sessionID,
+					"session_id": sessionCode,
 					"sdp":        msg.SDP,
 				})
 			case "ice_candidate":
-				h.ForwardToAgent(ctx, sessionID, map[string]any{
+				h.ForwardToAgent(ctx, sessionCode, map[string]any{
 					"type":       "ice_candidate",
-					"session_id": sessionID,
+					"session_id": sessionCode,
 					"candidate":  msg.Candidate,
 				})
 			}
