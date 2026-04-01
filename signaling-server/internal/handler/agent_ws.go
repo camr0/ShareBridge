@@ -331,18 +331,18 @@ func handleDownloadComplete(
 	ctx context.Context,
 	conn *websocket.Conn,
 	sessionRepo *db.SessionRepo,
-	sessionID string,
+	code string,
 ) {
-	if sessionID == "" {
+	if code == "" {
 		hub.SendDirect(ctx, conn, map[string]string{
 			"type":    "error",
-			"message": "session_id required",
+			"message": "code required",
 		})
 		return
 	}
 
-	if err := sessionRepo.IncrementDownloadCount(sessionID); err != nil {
-		log.Printf("failed to increment download count for %s: %v", sessionID, err)
+	if err := sessionRepo.IncrementDownloadCount(code); err != nil {
+		log.Printf("failed to increment download count for %s: %v", code, err)
 		hub.SendDirect(ctx, conn, map[string]string{
 			"type":    "error",
 			"message": "failed to update download count",
@@ -350,7 +350,7 @@ func handleDownloadComplete(
 		return
 	}
 
-	log.Printf("download complete recorded for session %s", sessionID)
+	log.Printf("download complete recorded for session %s", code)
 }
 
 // generateRandomCode generates a random 8-character code
