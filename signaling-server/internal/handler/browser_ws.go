@@ -51,6 +51,14 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, stunURL string) gin.Hand
 
 		ctx := c.Request.Context()
 
+		// Check if agent is connected before pairing
+		_, ok := h.GetAgentConn(sessionCode)
+		if !ok {
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
+			conn.Close(websocket.StatusNormalClosure, "agent not connected")
+			return
+		}
+
 		if err := h.PairSession(sessionCode, conn); err != nil {
 			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
 			conn.Close(websocket.StatusNormalClosure, "agent not connected")
