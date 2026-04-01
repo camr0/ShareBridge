@@ -17,42 +17,65 @@ type pair struct {
 
 type Hub struct {
 	mu     sync.RWMutex
-	agents map[string]*websocket.Conn // token → conn
+	agents map[string]*websocket.Conn // apiKey → conn (one conn per API key)
+	codes  map[string]string          // code → apiKey (for browser lookup)
 	pairs  map[string]*pair           // sessionID → pair
 }
 
 func New() *Hub {
 	return &Hub{
 		agents: make(map[string]*websocket.Conn),
+		codes:  make(map[string]string),
 		pairs:  make(map[string]*pair),
 	}
 }
 
-func (h *Hub) RegisterAgent(token string, conn *websocket.Conn) {
+func (h *Hub) RegisterAgent(apiKey string, conn *websocket.Conn) {
 	h.mu.Lock()
-	h.agents[token] = conn
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	h.agents[apiKey] = conn
 }
 
-func (h *Hub) UnregisterAgent(token string) {
+func (h *Hub) UnregisterAgent(apiKey string) {
 	h.mu.Lock()
-	delete(h.agents, token)
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	delete(h.agents, apiKey)
 }
 
-func (h *Hub) AgentConnected(token string) bool {
+func (h *Hub) AgentConnected(apiKey string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	_, ok := h.agents[token]
+	_, ok := h.agents[apiKey]
 	return ok
 }
 
-// PairSession associates a browser connection with the agent that owns sessionID.
-// Returns an error if the agent is not currently connected.
-func (h *Hub) PairSession(sessionID, agentToken string, browserConn *websocket.Conn) error {
+func (h *Hub) RegisterCode(code, apiKey string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	agentConn, ok := h.agents[agentToken]
+	h.codes[code] = apiKey
+}
+
+func (h *Hub) GetAgentConn(code string) (*websocket.Conn, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	apiKey, ok := h.codes[code]
+	if !ok {
+		return nil, false
+	}
+	conn, ok := h.agents[apiKey]
+	return conn, ok
+}
+
+// PairSession associates a browser connection with the agent that owns sessionID.
+func (h *Hub) PairSession(sessionID string, browserConn *websocket.Conn) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Direct lookup - don't call GetAgentConn which also acquires the lock
+	apiKey, ok := h.codes[sessionID]
+	if !ok {
+		return fmt.Errorf("code not registered")
+	}
+	agentConn, ok := h.agents[apiKey]
 	if !ok {
 		return fmt.Errorf("agent not connected")
 	}
@@ -62,45 +85,40 @@ func (h *Hub) PairSession(sessionID, agentToken string, browserConn *websocket.C
 
 func (h *Hub) UnpairSession(sessionID string) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	delete(h.pairs, sessionID)
-	h.mu.Unlock()
 }
 
-// SendToAgent sends a message to the agent identified by token.
-func (h *Hub) SendToAgent(ctx context.Context, token string, msg any) error {
+func (h *Hub) SendToAgent(ctx context.Context, apiKey string, msg any) error {
 	h.mu.RLock()
-	conn, ok := h.agents[token]
+	conn, ok := h.agents[apiKey]
 	h.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("agent not connected: %s", token)
+		return fmt.Errorf("agent not connected: %s", apiKey)
 	}
 	return send(ctx, conn, msg)
 }
 
-// ForwardToAgent forwards a message to the agent in the paired session.
 func (h *Hub) ForwardToAgent(ctx context.Context, sessionID string, msg any) error {
 	h.mu.RLock()
 	p, ok := h.pairs[sessionID]
 	h.mu.RUnlock()
 	if !ok {
-		return nil // session already gone, ignore
+		return nil
 	}
 	return send(ctx, p.agentConn, msg)
 }
 
-// ForwardToBrowser forwards a message to the browser in the paired session.
 func (h *Hub) ForwardToBrowser(ctx context.Context, sessionID string, msg any) error {
 	h.mu.RLock()
 	p, ok := h.pairs[sessionID]
 	h.mu.RUnlock()
 	if !ok {
-		return nil // session already gone, ignore
+		return nil
 	}
 	return send(ctx, p.browserConn, msg)
 }
 
-// SendDirect sends a message directly to a connection without going through the hub index.
-// Used for one-off messages before a connection is registered (e.g. error on join).
 func SendDirect(ctx context.Context, conn *websocket.Conn, msg any) error {
 	return send(ctx, conn, msg)
 }
