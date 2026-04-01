@@ -8,14 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 type sessionEntry struct {
 	Code          string `json:"code"`
 	DownloadCount int    `json:"download_count"`
+	APIKeyID      string `json:"api_key_id"` // track which key created this
 }
 
 type storeData struct {
+	AgentID  string                  `json:"agent_id"` // UUID for reconnection
 	Sessions map[string]sessionEntry `json:"sessions"`
 }
 
@@ -140,6 +144,66 @@ func (s *Store) IncrementDownloadCount(shareURL string) (int, error) {
 	}
 
 	return entry.DownloadCount, nil
+}
+
+// GetAgentID returns the agent's unique ID, generating one if it doesn't exist.
+func (s *Store) GetAgentID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := s.load()
+	if err != nil {
+		// Generate new ID even if load fails
+		newID := uuid.New().String()
+		s.save(storeData{AgentID: newID, Sessions: make(map[string]sessionEntry)})
+		return newID
+	}
+
+	if data.AgentID == "" {
+		data.AgentID = uuid.New().String()
+		s.save(data)
+	}
+
+	return data.AgentID
+}
+
+// SetAPIKeyID sets the API key ID for a given shareURL.
+func (s *Store) SetAPIKeyID(shareURL string, apiKeyID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := s.load()
+	if err != nil {
+		return err
+	}
+
+	if data.Sessions == nil {
+		data.Sessions = make(map[string]sessionEntry)
+	}
+
+	entry := data.Sessions[shareURL]
+	entry.APIKeyID = apiKeyID
+	data.Sessions[shareURL] = entry
+
+	return s.save(data)
+}
+
+// GetAPIKeyID returns the API key ID for a given shareURL, or "" if not found.
+func (s *Store) GetAPIKeyID(shareURL string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := s.load()
+	if err != nil {
+		return ""
+	}
+
+	entry, exists := data.Sessions[shareURL]
+	if !exists {
+		return ""
+	}
+
+	return entry.APIKeyID
 }
 
 // load reads sessions.json. Returns empty storeData if file doesn't exist.
