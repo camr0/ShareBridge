@@ -10,7 +10,7 @@ import (
 func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo) {
 
 	// Public session lookup endpoint
-	r.GET("/sessions/:code", GetSessionInfo(sessionRepo))
+	r.GET("/sessions/:code", GetSessionInfo(sessionRepo, h))
 
 	// WebSocket endpoints
 	r.GET("/ws/agent", AgentWS(h, apiKeyRepo, sessionRepo))

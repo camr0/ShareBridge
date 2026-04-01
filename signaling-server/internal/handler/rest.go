@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"opencloudshare/server/internal/db"
+	"opencloudshare/server/internal/hub"
 )
 
 type SessionInfoResponse struct {
@@ -16,7 +17,7 @@ type SessionInfoResponse struct {
 
 // GetSessionInfo returns session info by code.
 // Does NOT expose share_url for privacy.
-func GetSessionInfo(sessionRepo *db.SessionRepo) gin.HandlerFunc {
+func GetSessionInfo(sessionRepo *db.SessionRepo, h *hub.Hub) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		code := c.Param("code")
 		if code == "" {
@@ -34,9 +35,14 @@ func GetSessionInfo(sessionRepo *db.SessionRepo) gin.HandlerFunc {
 			return
 		}
 
-		// Determine if session is active
+		// Determine if session is active:
+		// 1. Must not be expired
+		// 2. Agent must be connected via hub
 		isActive := true
 		if session.ExpiresAt != nil && session.ExpiresAt.Before(time.Now()) {
+			isActive = false
+		}
+		if !h.AgentConnected(session.APIKeyID) {
 			isActive = false
 		}
 

@@ -94,7 +94,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo)
 				if agentID == "" {
 					continue
 				}
-				handleDownloadComplete(ctx, conn, sessionRepo, msg.SessionID)
+				handleDownloadComplete(ctx, conn, sessionRepo, msg.Code)
 
 			case "offer":
 				if agentID == "" {
