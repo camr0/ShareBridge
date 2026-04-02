@@ -162,9 +162,14 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 			log.Printf("browser joined session %s — starting WebRTC handshake", msg.SessionID)
 			sessionID := msg.SessionID
 
-			p, err := peer.New([]webrtc.ICEServer{
-				{URLs: []string{"stun:stun.cloudflare.com:3478"}},
-			})
+			iceServers := sig.GetICEServers()
+			if len(iceServers) == 0 {
+				log.Printf("warning: no ICE servers received, using default STUN")
+				iceServers = []webrtc.ICEServer{
+					{URLs: []string{"stun:stun.cloudflare.com:3478"}},
+				}
+			}
+			p, err := peer.New(iceServers)
 			if err != nil {
 				log.Printf("create peer: %v", err)
 				return

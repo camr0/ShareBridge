@@ -5,9 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sync"
 
 	"github.com/coder/websocket"
+	"github.com/pion/webrtc/v4"
 )
+
+// ICEServer represents an ICE server configuration from the signaling server.
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
 
 // Message is any message received from the signaling server.
 type Message struct {
@@ -18,15 +27,18 @@ type Message struct {
 	Err         string          `json:"message,omitempty"`
 	Code        string          `json:"code,omitempty"`
 	Reconnected bool            `json:"reconnected,omitempty"`
+	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
 }
 
 // Client manages a WebSocket connection to the signaling server.
 type Client struct {
-	serverURL string
-	apiKey    string
-	agentID   string
-	conn      *websocket.Conn
-	OnMessage func(msg Message)
+	serverURL  string
+	apiKey     string
+	agentID    string
+	conn       *websocket.Conn
+	OnMessage  func(msg Message)
+	mu         sync.Mutex
+	iceServers []webrtc.ICEServer // Store ICE config from server
 }
 
 func New(serverURL, apiKey, agentID string) *Client {
@@ -91,7 +103,20 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 
 		switch resp.Type {
 		case "welcome":
-			// Hello acknowledged, continue waiting for share_registered
+			// Store ICE servers from welcome message
+			if len(resp.ICEServers) > 0 {
+				c.mu.Lock()
+				c.iceServers = make([]webrtc.ICEServer, len(resp.ICEServers))
+				for i, s := range resp.ICEServers {
+					c.iceServers[i] = webrtc.ICEServer{
+						URLs:       s.URLs,
+						Username:   s.Username,
+						Credential: s.Credential,
+					}
+				}
+				c.mu.Unlock()
+			}
+			// Continue waiting for share_registered
 			continue
 		case "share_registered":
 			return resp.Code, resp.Reconnected, nil
@@ -120,6 +145,13 @@ func (c *Client) Send(ctx context.Context, msg any) error {
 		return fmt.Errorf("marshal message: %w", err)
 	}
 	return c.conn.Write(ctx, websocket.MessageText, data)
+}
+
+// GetICEServers returns the ICE servers received from the server's welcome message.
+func (c *Client) GetICEServers() []webrtc.ICEServer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.iceServers
 }
 
 // Listen reads messages in a loop and calls OnMessage for each one.
