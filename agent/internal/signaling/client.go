@@ -171,3 +171,10 @@ func (c *Client) Listen(ctx context.Context) error {
 		}
 	}
 }
+
+// SetOnMessage sets the message handler callback.
+func (c *Client) SetOnMessage(handler func(Message)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.OnMessage = handler
+}
