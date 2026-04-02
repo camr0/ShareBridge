@@ -482,9 +482,15 @@ async function detectConnectionType() {
   return 'direct';
 }
 
-function updateConnectionStatus() {
+function updateConnectionStatus(retries = 5) {
   detectConnectionType().then(type => {
-    if (!type) return;
+    if (!type) {
+      // ICE not settled yet, retry with backoff
+      if (retries > 0) {
+        setTimeout(() => updateConnectionStatus(retries - 1), 500);
+      }
+      return;
+    }
 
     const statusEl = document.getElementById('connection-status');
     const typeEl = document.getElementById('connection-type');
