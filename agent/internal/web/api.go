@@ -125,6 +125,7 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("HX-Trigger", "shareCreated")
 	if err := tmpl.ExecuteTemplate(w, "share-card", data); err != nil {
 		http.Error(w, fmt.Sprintf("render share card: %v", err), http.StatusInternalServerError)
 		return
@@ -174,14 +175,14 @@ func (ws *WebServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	if ws.daemon == nil {
-		w.Write([]byte(`<span class="status-dot status-offline"></span><span>Offline</span>`))
+		w.Write([]byte(`<span class="status-chip status-chip-offline">● Offline</span>`))
 		return
 	}
 
 	if ws.daemon.IsConnected() {
-		w.Write([]byte(`<span class="status-dot status-online"></span><span>Connected</span>`))
+		w.Write([]byte(`<span class="status-chip status-chip-online">● Connected</span>`))
 	} else {
-		w.Write([]byte(`<span class="status-dot status-unknown"></span><span>Connecting...</span>`))
+		w.Write([]byte(`<span class="status-chip status-chip-unknown">● Connecting...</span>`))
 	}
 }
 

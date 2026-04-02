@@ -8,7 +8,6 @@
     </header>
 
     <form hx-put="/api/settings" hx-target="#settings-result">
-        <!-- Signaling Server Section -->
         <fieldset>
             <legend>Signaling Server</legend>
             <div class="grid">
@@ -19,14 +18,19 @@
                 </label>
                 <label for="api-key">
                     API Key
-                    <input type="password" id="api-key" name="api_key"
-                        placeholder="ocs_..." value="{{.Config.APIKey}}">
+                    <div class="api-key-row">
+                        <input type="password" id="api-key" name="api_key"
+                            placeholder="ocs_..." value="{{.Config.APIKey}}">
+                        <button type="button"
+                            onclick="var inp=document.getElementById('api-key'); inp.type=inp.type==='password'?'text':'password'; this.textContent=inp.type==='password'?'Show':'Hide'">
+                            Show
+                        </button>
+                    </div>
                     <small>Key shown once on creation — enter from your OpenCloud instance</small>
                 </label>
             </div>
         </fieldset>
 
-        <!-- OpenCloud Section -->
         <fieldset>
             <legend>OpenCloud</legend>
             <label for="allowed-host">
@@ -37,18 +41,17 @@
             </label>
         </fieldset>
 
-        <!-- Default Share Settings Section -->
         <fieldset>
             <legend>Default Share Settings</legend>
             <div class="grid">
                 <label for="default-expiry">
                     Default Expiry
                     <select id="default-expiry" name="default_expiry_hours">
-                        <option value="1" {{if eq .Config.DefaultExpiry 1}}selected{{end}}>1 hour</option>
-                        <option value="6" {{if eq .Config.DefaultExpiry 6}}selected{{end}}>6 hours</option>
-                        <option value="12" {{if eq .Config.DefaultExpiry 12}}selected{{end}}>12 hours</option>
-                        <option value="24" {{if eq .Config.DefaultExpiry 24}}selected{{end}}>24 hours (1 day)</option>
-                        <option value="72" {{if eq .Config.DefaultExpiry 72}}selected{{end}}>3 days</option>
+                        <option value="1"   {{if eq .Config.DefaultExpiry 1}}selected{{end}}>1 hour</option>
+                        <option value="6"   {{if eq .Config.DefaultExpiry 6}}selected{{end}}>6 hours</option>
+                        <option value="12"  {{if eq .Config.DefaultExpiry 12}}selected{{end}}>12 hours</option>
+                        <option value="24"  {{if eq .Config.DefaultExpiry 24}}selected{{end}}>24 hours (1 day)</option>
+                        <option value="72"  {{if eq .Config.DefaultExpiry 72}}selected{{end}}>3 days</option>
                         <option value="168" {{if eq .Config.DefaultExpiry 168}}selected{{end}}>7 days</option>
                     </select>
                 </label>
@@ -62,7 +65,7 @@
                     Default Connection Mode
                     <select id="default-mode" name="default_relay_only">
                         <option value="false" {{if not .Config.DefaultRelayOnly}}selected{{end}}>Direct (recommended)</option>
-                        <option value="true" {{if .Config.DefaultRelayOnly}}selected{{end}}>Relay (hide IP)</option>
+                        <option value="true"  {{if .Config.DefaultRelayOnly}}selected{{end}}>Relay (hide IP)</option>
                     </select>
                 </label>
             </div>
@@ -78,9 +81,7 @@
 </article>
 
 <article>
-    <header>
-        <h2>About</h2>
-    </header>
+    <header><h2>About</h2></header>
     <p>
         OpenCloudShare Agent v{{.Version}}<br>
         Uptime: {{.Uptime}}

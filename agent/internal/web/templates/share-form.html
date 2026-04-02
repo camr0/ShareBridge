@@ -1,21 +1,19 @@
 {{define "share-form"}}
-<dialog open>
+<dialog>
     <article>
         <header>
-            <h2>New Share</h2>
-            <p>Create a new share session</p>
+            <h3>Create New Share</h3>
         </header>
 
-        <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend"
-              hx-on::after-request="if(event.detail.successful) this.closest('dialog').close()">
+        <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend">
             <label for="share-url">
                 OpenCloud Share URL
                 <input type="url" id="share-url" name="share_url"
-                    placeholder="https://opencloud.example.com/s/xyz789" required>
+                    placeholder="https://opencloud.example.com/s/xyz789" required autofocus>
             </label>
 
             <label for="password">
-                Password (optional)
+                Password <small>(optional)</small>
                 <input type="password" id="password" name="password"
                     placeholder="Leave empty if share has no password">
             </label>
@@ -44,7 +42,7 @@
                             <div class="mode-option-desc">All traffic via TURN server, IP never exposed</div>
                         </div>
                     </div>
-                    <div class="mode-option-warning amber" id="relay-description">
+                    <div class="mode-option-warning red">
                         ⚠️ Requires TURN server. Connection will fail if TURN is not configured.
                     </div>
                 </div>
@@ -62,57 +60,50 @@
                         <option value="168">7 days</option>
                     </select>
                 </label>
-
                 <label for="max-downloads">
                     Max Downloads
                     <input type="number" id="max-downloads" name="max_downloads"
-                        placeholder="10" value="10" min="0" style="width: 100px;">
-                    <small style="color: var(--accent);">💡 Recommended: limit downloads to prevent link abuse</small>
+                        value="10" min="0">
+                    <small>💡 Limit downloads to prevent link abuse. 0 = unlimited.</small>
                 </label>
             </div>
 
             <footer>
-                <button type="button" onclick="this.closest('dialog').close()">Cancel</button>
-                <button type="submit" class="primary">Create Share</button>
+                <div class="grid">
+                    <button type="submit" class="primary">Create Share</button>
+                    <button type="button" class="secondary outline"
+                        onclick="this.closest('dialog').close()">Cancel</button>
+                </div>
             </footer>
         </form>
     </article>
 </dialog>
 
 <script>
-    // Show modal on load
-    document.currentScript.closest('dialog').showModal();
+    (function() {
+        var dlg = document.currentScript.closest('#modal-container').querySelector('dialog');
+        dlg.showModal();
 
-    // Mode option click handlers - toggle selected class
-    const directOption = document.getElementById('direct-option');
-    const relayOption = document.getElementById('relay-option');
-    const modeDirect = document.getElementById('mode-direct');
-    const modeRelay = document.getElementById('mode-relay');
+        var directOption = dlg.querySelector('#direct-option');
+        var relayOption  = dlg.querySelector('#relay-option');
+        var modeDirect   = dlg.querySelector('#mode-direct');
+        var modeRelay    = dlg.querySelector('#mode-relay');
 
-    directOption.addEventListener('click', (e) => {
-        if (e.target.tagName !== 'INPUT') {
-            modeDirect.checked = true;
-            directOption.classList.add('selected');
-            relayOption.classList.remove('selected');
+        function setMode(direct) {
+            directOption.classList.toggle('selected', direct);
+            relayOption.classList.toggle('selected', !direct);
         }
-    });
 
-    relayOption.addEventListener('click', (e) => {
-        if (e.target.tagName !== 'INPUT') {
-            modeRelay.checked = true;
-            relayOption.classList.add('selected');
-            directOption.classList.remove('selected');
-        }
-    });
-
-    modeDirect.addEventListener('change', () => {
-        directOption.classList.add('selected');
-        relayOption.classList.remove('selected');
-    });
-
-    modeRelay.addEventListener('change', () => {
-        relayOption.classList.add('selected');
-        directOption.classList.remove('selected');
-    });
+        directOption.addEventListener('click', function(e) {
+            if (e.target.tagName !== 'INPUT') { modeDirect.checked = true; }
+            setMode(true);
+        });
+        relayOption.addEventListener('click', function(e) {
+            if (e.target.tagName !== 'INPUT') { modeRelay.checked = true; }
+            setMode(false);
+        });
+        modeDirect.addEventListener('change', function() { setMode(true); });
+        modeRelay.addEventListener('change',  function() { setMode(false); });
+    })();
 </script>
 {{end}}

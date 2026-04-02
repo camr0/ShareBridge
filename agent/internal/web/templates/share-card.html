@@ -1,34 +1,26 @@
 {{define "share-card"}}
-<div class="card share-card" id="share-{{.Code}}">
-    <header>
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-            <h3 style="margin: 0;">{{.Code}}</h3>
-            {{if .RelayOnly}}
-            <span class="badge badge-relay">Relay</span>
-            {{else}}
-            <span class="badge badge-direct">Direct</span>
-            {{end}}
+<article class="share-card" id="share-{{.Code}}">
+    <div class="share-card-header">
+        <div>
+            <strong class="share-code">{{.Code}}</strong>
+            <div class="share-url">{{.ShareURL}}</div>
         </div>
-    </header>
-    <p class="share-url">{{.ShareURL}}</p>
-    <footer>
-        <div class="grid">
-            <div>
-                <small>Downloads: {{.Downloads}}{{if .MaxDownloads}}/{{.MaxDownloads}}{{else}}/unlimited{{end}}</small>
-            </div>
-            <div>
-                <small>Expires: {{.ExpiresAtFormatted}}</small>
-            </div>
-            <div>
-                <button class="btn-revoke secondary outline"
-                    hx-delete="/api/shares/{{.Code}}"
-                    hx-target="closest .share-card"
-                    hx-swap="outerHTML swap:0.5s"
-                    hx-confirm="Are you sure you want to revoke this share?">
-                    Revoke
-                </button>
-            </div>
-        </div>
-    </footer>
-</div>
+        {{if .RelayOnly}}
+        <span class="badge badge-relay">Relay</span>
+        {{else}}
+        <span class="badge badge-direct">Direct</span>
+        {{end}}
+    </div>
+    <div class="share-card-footer">
+        <span class="share-stat">Downloads: <strong>{{.Downloads}}{{if .MaxDownloads}}/{{.MaxDownloads}}{{else}}/∞{{end}}</strong></span>
+        <span class="share-stat">Expires: <strong>{{.ExpiresAtFormatted}}</strong></span>
+        <button class="btn-revoke outline"
+            hx-delete="/api/shares/{{.Code}}"
+            hx-target="closest .share-card"
+            hx-swap="outerHTML swap:0.3s"
+            hx-confirm="Revoke this share?">
+            Revoke
+        </button>
+    </div>
+</article>
 {{end}}

@@ -20,9 +20,11 @@
                 <li><a href="/settings" {{if eq .ActivePage "settings"}}aria-current="page"{{end}}>Settings</a></li>
             </ul>
             <ul>
-                <li id="conn-status" hx-get="/api/status" hx-trigger="load, every 5s">
-                    <span class="status-dot status-unknown"></span>
-                    <span>Checking...</span>
+                <li id="conn-status"
+                    hx-get="/api/status"
+                    hx-trigger="load, every 5s"
+                    hx-swap="innerHTML">
+                    <span class="status-chip status-chip-unknown">● Connecting...</span>
                 </li>
             </ul>
         </nav>
@@ -34,13 +36,15 @@
         <hr>
         <small>
             OpenCloudShare Agent v{{.Version}} · Uptime: {{.Uptime}}
-            <span style="float: right;">
+            <span class="footer-links">
                 <a href="https://github.com/ali-raheem/OpenCloudShare" target="_blank">GitHub</a> ·
                 <a href="https://github.com/ali-raheem/OpenCloudShare/wiki" target="_blank">Docs</a> ·
                 <a href="https://github.com/ali-raheem/OpenCloudShare/issues" target="_blank">Report Issue</a>
             </span>
         </small>
     </footer>
-    <div id="modal-container"></div>
+    <!-- shareCreated event (from HX-Trigger header) closes the modal -->
+    <div id="modal-container"
+         hx-on:shareCreated="this.querySelector('dialog')?.close()"></div>
 </body>
 </html>
