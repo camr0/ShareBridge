@@ -18,7 +18,7 @@ func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, apiKeyRepo *d
 
 	// Admin API routes (protected by auth token)
 	admin := r.Group("/admin/api")
-	admin.Use(AdminAuthMiddleware(cfg.AuthToken))
+	admin.Use(AdminAuthMiddleware(cfg.AdminToken))
 	{
 		admin.POST("/keys", CreateAPIKey(apiKeyRepo))
 		admin.GET("/keys", ListAPIKeys(apiKeyRepo))
