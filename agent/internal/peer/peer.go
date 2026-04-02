@@ -16,10 +16,16 @@ type Peer struct {
 }
 
 // New creates a PeerConnection with the given ICE servers.
-func New(iceServers []webrtc.ICEServer) (*Peer, error) {
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+// If relayOnly is true, forces ICETransportPolicyRelay to hide the agent's IP.
+func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
+	config := webrtc.Configuration{
 		ICEServers: iceServers,
-	})
+	}
+	if relayOnly {
+		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	}
+
+	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
 		return nil, fmt.Errorf("new peer connection: %w", err)
 	}

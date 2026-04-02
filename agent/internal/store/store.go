@@ -5,27 +5,36 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
 
-type sessionEntry struct {
-	Code          string `json:"code"`
-	DownloadCount int    `json:"download_count"`
-	APIKeyID      string `json:"api_key_id"` // track which key created this
+// SessionEntry represents a single share session with full metadata.
+type SessionEntry struct {
+	Code        string    `json:"code"`
+	ShareURL    string    `json:"share_url"`
+	Password    string    `json:"password,omitempty"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	MaxDownloads int      `json:"max_downloads,omitempty"` // 0 = unlimited
+	Downloads   int       `json:"downloads"`
+	RelayOnly   bool      `json:"relay_only"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type storeData struct {
-	AgentID  string                  `json:"agent_id"` // UUID for reconnection
-	Sessions map[string]sessionEntry `json:"sessions"`
+	AgentID  string         `json:"agent_id"` // UUID for reconnection
+	Sessions []SessionEntry `json:"sessions"`
 }
 
 type Store struct {
 	mu       sync.Mutex
-	filePath string // full path to sessions.json
+	filePath string     // full path to sessions.json
+	data     *storeData // in-memory cache
 }
 
 // New resolves the data directory (OPENCLOUDSHARE_DATA_DIR or ~/.opencloudshare),
@@ -54,96 +63,14 @@ func New() (*Store, error) {
 		filePath: filePath,
 	}
 
-	// Try to load existing data to validate it's not malformed
-	_, err := store.load()
+	// Load existing data or initialize empty
+	data, err := store.load()
 	if err != nil {
 		return nil, fmt.Errorf("sessions.json is malformed — fix or delete %s: %w", store.filePath, err)
 	}
+	store.data = data
 
 	return store, nil
-}
-
-// GetCode returns the code for a given shareURL, or "" if not found.
-func (s *Store) GetCode(shareURL string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := s.load()
-	if err != nil {
-		return ""
-	}
-
-	entry, exists := data.Sessions[shareURL]
-	if !exists {
-		return ""
-	}
-
-	return entry.Code
-}
-
-// SetCode sets the code for a given shareURL.
-func (s *Store) SetCode(shareURL string, code string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := s.load()
-	if err != nil {
-		return err
-	}
-
-	if data.Sessions == nil {
-		data.Sessions = make(map[string]sessionEntry)
-	}
-
-	entry := data.Sessions[shareURL]
-	entry.Code = code
-	data.Sessions[shareURL] = entry
-
-	return s.save(data)
-}
-
-// GetDownloadCount returns the download count for a given shareURL, or 0 if not found.
-func (s *Store) GetDownloadCount(shareURL string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := s.load()
-	if err != nil {
-		return 0
-	}
-
-	entry, exists := data.Sessions[shareURL]
-	if !exists {
-		return 0
-	}
-
-	return entry.DownloadCount
-}
-
-// IncrementDownloadCount increments the download count for a given shareURL and persists it.
-// Returns the new count.
-func (s *Store) IncrementDownloadCount(shareURL string) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := s.load()
-	if err != nil {
-		return 0, err
-	}
-
-	if data.Sessions == nil {
-		data.Sessions = make(map[string]sessionEntry)
-	}
-
-	entry := data.Sessions[shareURL]
-	entry.DownloadCount++
-	data.Sessions[shareURL] = entry
-
-	if err := s.save(data); err != nil {
-		return 0, err
-	}
-
-	return entry.DownloadCount, nil
 }
 
 // GetAgentID returns the agent's unique ID, generating one if it doesn't exist.
@@ -151,87 +78,139 @@ func (s *Store) GetAgentID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := s.load()
-	if err != nil {
-		// Generate new ID even if load fails
-		newID := uuid.New().String()
-		s.save(storeData{AgentID: newID, Sessions: make(map[string]sessionEntry)})
-		return newID
+	if s.data.AgentID == "" {
+		s.data.AgentID = uuid.New().String()
+		if err := s.save(); err != nil {
+			log.Printf("failed to persist AgentID: %v", err)
+		}
 	}
 
-	if data.AgentID == "" {
-		data.AgentID = uuid.New().String()
-		s.save(data)
-	}
-
-	return data.AgentID
+	return s.data.AgentID
 }
 
-// SetAPIKeyID sets the API key ID for a given shareURL.
-func (s *Store) SetAPIKeyID(shareURL string, apiKeyID string) error {
+// GetSession returns the session for a given code, or nil if not found.
+func (s *Store) GetSession(code string) *SessionEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := s.load()
-	if err != nil {
-		return err
+	for i := range s.data.Sessions {
+		if s.data.Sessions[i].Code == code {
+			return &s.data.Sessions[i]
+		}
 	}
-
-	if data.Sessions == nil {
-		data.Sessions = make(map[string]sessionEntry)
-	}
-
-	entry := data.Sessions[shareURL]
-	entry.APIKeyID = apiKeyID
-	data.Sessions[shareURL] = entry
-
-	return s.save(data)
+	return nil
 }
 
-// GetAPIKeyID returns the API key ID for a given shareURL, or "" if not found.
-func (s *Store) GetAPIKeyID(shareURL string) string {
+// GetByShareURL returns the session for a given shareURL, or nil if not found.
+// Used for single-session mode persistence.
+func (s *Store) GetByShareURL(shareURL string) *SessionEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := s.load()
-	if err != nil {
-		return ""
+	for i := range s.data.Sessions {
+		if s.data.Sessions[i].ShareURL == shareURL {
+			return &s.data.Sessions[i]
+		}
+	}
+	return nil
+}
+
+// ListSessions returns all sessions, optionally filtering out expired ones.
+func (s *Store) ListSessions(filterExpired bool) []SessionEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !filterExpired {
+		return s.data.Sessions
 	}
 
-	entry, exists := data.Sessions[shareURL]
-	if !exists {
-		return ""
+	var result []SessionEntry
+	now := time.Now()
+	for _, session := range s.data.Sessions {
+		if session.ExpiresAt.IsZero() || session.ExpiresAt.After(now) {
+			result = append(result, session)
+		}
+	}
+	return result
+}
+
+// SaveSession adds or updates a session. If a session with the same code exists,
+// it is replaced.
+func (s *Store) SaveSession(session SessionEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find existing session with same code
+	for i := range s.data.Sessions {
+		if s.data.Sessions[i].Code == session.Code {
+			s.data.Sessions[i] = session
+			return s.save()
+		}
 	}
 
-	return entry.APIKeyID
+	// Not found, append new session
+	s.data.Sessions = append(s.data.Sessions, session)
+	return s.save()
+}
+
+// DeleteSession removes a session by code. Returns nil if session didn't exist.
+func (s *Store) DeleteSession(code string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.data.Sessions {
+		if s.data.Sessions[i].Code == code {
+			// Remove element by appending remaining
+			s.data.Sessions = append(s.data.Sessions[:i], s.data.Sessions[i+1:]...)
+			return s.save()
+		}
+	}
+
+	// Not found, no error
+	return nil
+}
+
+// IncrementDownloads increments the download count for a session and returns the new count.
+func (s *Store) IncrementDownloads(code string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.data.Sessions {
+		if s.data.Sessions[i].Code == code {
+			s.data.Sessions[i].Downloads++
+			newCount := s.data.Sessions[i].Downloads
+			return newCount, s.save()
+		}
+	}
+
+	return 0, fmt.Errorf("session with code %q not found", code)
 }
 
 // load reads sessions.json. Returns empty storeData if file doesn't exist.
 // Returns error if file exists but is malformed JSON.
-func (s *Store) load() (storeData, error) {
+func (s *Store) load() (*storeData, error) {
 	var data storeData
-	data.Sessions = make(map[string]sessionEntry)
 
 	fileContent, err := os.ReadFile(s.filePath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return data, nil
+			return &data, nil
 		}
-		return data, fmt.Errorf("failed to read sessions file: %w", err)
+		return nil, fmt.Errorf("failed to read sessions file: %w", err)
 	}
 
 	if err := json.Unmarshal(fileContent, &data); err != nil {
-		return storeData{}, fmt.Errorf("malformed sessions.json: %w", err)
+		return nil, fmt.Errorf("malformed sessions.json: %w", err)
 	}
 
-	return data, nil
+	return &data, nil
 }
 
-// save writes storeData to sessions.json atomically (write to temp file, rename).
-func (s *Store) save(data storeData) error {
+// save writes s.data to sessions.json atomically (write to temp file, rename).
+func (s *Store) save() error {
 	tempFile := s.filePath + ".tmp"
 
-	jsonData, err := json.MarshalIndent(data, "", "  ")
+	jsonData, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal store data: %w", err)
 	}

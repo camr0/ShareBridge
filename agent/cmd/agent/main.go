@@ -169,7 +169,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 					{URLs: []string{"stun:stun.cloudflare.com:3478"}},
 				}
 			}
-			p, err := peer.New(iceServers)
+			p, err := peer.New(iceServers, false) // false = Direct mode (default)
 			if err != nil {
 				log.Printf("create peer: %v", err)
 				return

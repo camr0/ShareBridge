@@ -21,7 +21,8 @@ type ICEServer struct {
 // Message is any message received from the signaling server.
 type Message struct {
 	Type        string          `json:"type"`
-	SessionID   string          `json:"session_id,omitempty"`
+	SessionID   string          `json:"session_id,omitempty"`  // Share code
+	PeerID      string          `json:"peer_id,omitempty"`     // Unique peer connection ID
 	SDP         string          `json:"sdp,omitempty"`
 	Candidate   json.RawMessage `json:"candidate,omitempty"`
 	Err         string          `json:"message,omitempty"`
