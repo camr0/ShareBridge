@@ -121,11 +121,32 @@ p, err := peer.New(iceServers, false) // false = Direct mode (default)
 Run: `cd agent && go test ./internal/peer/... -v`
 Expected: PASS (or update tests if needed)
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Add PeerID field to signaling Message struct**
+
+Modify `agent/internal/signaling/client.go`, add PeerID field:
+
+```go
+// Message is any message received from the signaling server.
+type Message struct {
+	Type        string          `json:"type"`
+	SessionID   string          `json:"session_id,omitempty"`  // Share code
+	PeerID      string          `json:"peer_id,omitempty"`     // Unique peer connection ID
+	SDP         string          `json:"sdp,omitempty"`
+	Candidate   json.RawMessage `json:"candidate,omitempty"`
+	Err         string          `json:"message,omitempty"`
+	Code        string          `json:"code,omitempty"`
+	Reconnected bool            `json:"reconnected,omitempty"`
+	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
+}
+```
+
+This enables routing answers and ICE candidates to the correct peer when multiple browsers connect to the same share.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add agent/internal/peer/peer.go agent/cmd/agent/main.go
-git commit -m "feat(agent): add relayOnly parameter to peer.New for Relay mode"
+git add agent/internal/peer/peer.go agent/cmd/agent/main.go agent/internal/signaling/client.go
+git commit -m "feat(agent): add relayOnly parameter and PeerID for multi-connection routing"
 ```
 
 ---
@@ -386,7 +407,7 @@ git commit -m "feat(store): replace session model with full metadata, keyed by c
 - Modify: `agent/internal/config/config.go`
 - Create: `agent/internal/config/config_test.go`
 
-**Context:** Config currently only loads from env vars. Need to add JSON file persistence for the Settings UI.
+**Context:** Config currently only loads from env vars. Need to add JSON file persistence for the Settings UI. Env vars should only fill in empty/zero fields (file takes precedence).
 
 - [ ] **Step 1: Update Config struct with new fields**
 
@@ -405,14 +426,14 @@ import (
 )
 
 type Config struct {
-	SignalingURL       string `json:"signaling_url"`
-	APIKey             string `json:"api_key"`
-	AllowedHost        string `json:"allowed_host"`
-	DefaultExpiry      int    `json:"default_expiry_hours"`    // Default: 24
-	DefaultMaxDownloads int   `json:"default_max_downloads"`  // Default: 10, 0 = unlimited
-	DefaultRelayOnly   bool   `json:"default_relay_only"`
-	UIPort             int    `json:"ui_port"`                // Default: 7878
-	UIPassword         string `json:"ui_password,omitempty"`
+	SignalingURL        string `json:"signaling_url"`
+	APIKey              string `json:"api_key"`
+	AllowedHost         string `json:"allowed_host"`
+	DefaultExpiry       int    `json:"default_expiry_hours"`    // Default: 24
+	DefaultMaxDownloads int    `json:"default_max_downloads"`  // Default: 10, 0 = unlimited
+	DefaultRelayOnly    bool   `json:"default_relay_only"`
+	UIPort              int    `json:"ui_port"`                // Default: 7878
+	UIPassword          string `json:"ui_password,omitempty"`
 }
 
 type Manager struct {
@@ -440,7 +461,6 @@ func NewManager() (*Manager, error) {
 		filePath: filePath,
 	}
 
-	// Load from file, fall back to env vars
 	cfg, err := m.load()
 	if err != nil {
 		return nil, err
@@ -461,7 +481,8 @@ func (m *Manager) Save(cfg *Config) error {
 	return m.save()
 }
 
-// load reads config.json, falling back to env vars for missing fields.
+// load reads config.json, then fills empty fields from env vars.
+// File takes precedence; env vars are fallback only.
 func (m *Manager) load() (*Config, error) {
 	cfg := &Config{
 		DefaultExpiry:       24,
@@ -469,7 +490,7 @@ func (m *Manager) load() (*Config, error) {
 		UIPort:              7878,
 	}
 
-	// Try reading file
+	// Try reading file first
 	fileContent, err := os.ReadFile(m.filePath)
 	if err == nil {
 		if err := json.Unmarshal(fileContent, cfg); err != nil {
@@ -477,21 +498,31 @@ func (m *Manager) load() (*Config, error) {
 		}
 	}
 
-	// Override with env vars if set (env takes precedence for some fields)
-	if v := os.Getenv("SIGNALING_SERVER"); v != "" {
-		cfg.SignalingURL = v
+	// Fill empty/zero fields from env vars (env is fallback, not override)
+	if cfg.SignalingURL == "" {
+		if v := os.Getenv("SIGNALING_SERVER"); v != "" {
+			cfg.SignalingURL = v
+		}
 	}
-	if v := os.Getenv("OPENCLOUDSHARE_API_KEY"); v != "" {
-		cfg.APIKey = v
+	if cfg.APIKey == "" {
+		if v := os.Getenv("OPENCLOUDSHARE_API_KEY"); v != "" {
+			cfg.APIKey = v
+		}
 	}
-	if v := os.Getenv("ALLOWED_OPENCLOUD_HOST"); v != "" {
-		cfg.AllowedHost = v
+	if cfg.AllowedHost == "" {
+		if v := os.Getenv("ALLOWED_OPENCLOUD_HOST"); v != "" {
+			cfg.AllowedHost = v
+		}
 	}
-	if v := os.Getenv("UI_PORT"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.UIPort)
+	if cfg.UIPort == 0 {
+		if v := os.Getenv("UI_PORT"); v != "" {
+			fmt.Sscanf(v, "%d", &cfg.UIPort)
+		}
 	}
-	if v := os.Getenv("UI_PASSWORD"); v != "" {
-		cfg.UIPassword = v
+	if cfg.UIPassword == "" {
+		if v := os.Getenv("UI_PASSWORD"); v != "" {
+			cfg.UIPassword = v
+		}
 	}
 
 	return cfg, nil
@@ -523,14 +554,13 @@ func (m *Manager) save() error {
 func Load() *Config {
 	m, err := NewManager()
 	if err != nil {
-		// Return defaults on error
 		return &Config{
-			SignalingURL:  getEnv("SIGNALING_SERVER", "ws://localhost:8080"),
-			APIKey:        getEnv("OPENCLOUDSHARE_API_KEY", ""),
-			AllowedHost:   getEnv("ALLOWED_OPENCLOUD_HOST", ""),
-			DefaultExpiry: 24,
+			SignalingURL:        getEnv("SIGNALING_SERVER", "ws://localhost:8080"),
+			APIKey:              getEnv("OPENCLOUDSHARE_API_KEY", ""),
+			AllowedHost:         getEnv("ALLOWED_OPENCLOUD_HOST", ""),
+			DefaultExpiry:       24,
 			DefaultMaxDownloads: 10,
-			UIPort:        7878,
+			UIPort:              7878,
 		}
 	}
 	return m.Get()
@@ -597,7 +627,7 @@ type Session struct {
 
 	// Runtime state
 	webdavClient *opencloud.Client
-	peers        map[string]*peer.Peer // peerID -> Peer
+	peers        map[string]*peer.Peer // peerID -> Peer (peerID from signaling server)
 	mu           sync.Mutex
 }
 
@@ -627,13 +657,17 @@ func New(cfgMgr *config.Manager, st *store.Store) (*Daemon, error) {
 }
 
 // Start begins the daemon: connects to signaling, starts web server, loads sessions.
-func (d *Daemon) Start(ctx context.Context) error {
+// Returns an error channel that will receive web server errors.
+func (d *Daemon) Start(ctx context.Context) <-chan error {
+	errCh := make(chan error, 1)
+
 	// Connect to signaling server
 	agentID := d.store.GetAgentID()
 	sig := signaling.New(d.config.SignalingURL, d.config.APIKey, agentID)
 
 	if err := sig.Connect(ctx); err != nil {
-		return err
+		go func() { errCh <- err }()
+		return errCh
 	}
 	d.signaling = sig
 
@@ -649,10 +683,18 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Start web server
 	webServer, err := NewWebServer(d, d.config.UIPort, d.config.UIPassword)
 	if err != nil {
-		return err
+		go func() { errCh <- err }()
+		return errCh
 	}
 	d.webServer = webServer
-	go webServer.Start()
+	go func() {
+		if err := webServer.Start(); err != nil {
+			errCh <- err
+		}
+	}()
+
+	return errCh
+}
 
 	return nil
 }
@@ -767,35 +809,35 @@ func (d *Daemon) GetSession(code string) *Session {
 func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	switch msg.Type {
 	case "join":
-		d.handleBrowserJoin(msg.SessionID)
+		d.handleBrowserJoin(msg.SessionID, msg.PeerID)
 	case "answer":
-		d.handleAnswer(msg.SessionID, msg.SDP)
+		d.handleAnswer(msg.PeerID, msg.SDP)
 	case "ice_candidate":
-		d.handleICECandidate(msg.SessionID, msg.Candidate)
+		d.handleICECandidate(msg.PeerID, msg.Candidate)
 	}
 }
 
 // handleBrowserJoin handles a new browser connection.
-func (d *Daemon) handleBrowserJoin(sessionID string) {
-	// sessionID is the session code
+// sessionCode is the share code, peerID is a unique identifier for this connection.
+func (d *Daemon) handleBrowserJoin(sessionCode string, peerID string) {
 	d.mu.RLock()
-	session, exists := d.sessions[sessionID]
+	session, exists := d.sessions[sessionCode]
 	d.mu.RUnlock()
 
 	if !exists {
-		log.Printf("join for unknown session: %s", sessionID)
+		log.Printf("join for unknown session: %s", sessionCode)
 		return
 	}
 
 	// Check if session expired
 	if time.Now().After(session.ExpiresAt) {
-		log.Printf("join for expired session: %s", sessionID)
+		log.Printf("join for expired session: %s", sessionCode)
 		return
 	}
 
 	// Check max downloads
 	if session.MaxDownloads > 0 && session.Downloads >= session.MaxDownloads {
-		log.Printf("join for session at max downloads: %s", sessionID)
+		log.Printf("join for session at max downloads: %s", sessionCode)
 		return
 	}
 
@@ -808,12 +850,12 @@ func (d *Daemon) handleBrowserJoin(sessionID string) {
 	}
 
 	session.mu.Lock()
-	session.peers[sessionID] = p
+	session.peers[peerID] = p
 	session.mu.Unlock()
 
 	p.OnClosed = func() {
 		session.mu.Lock()
-		delete(session.peers, sessionID)
+		delete(session.peers, peerID)
 		session.mu.Unlock()
 	}
 
@@ -834,45 +876,50 @@ func (d *Daemon) handleBrowserJoin(sessionID string) {
 	}
 	p.SetOnMessage(tm.HandleMessage)
 
-	// Send offer via signaling
+	// Send offer via signaling (use peerID for routing back to this peer)
 	d.signaling.Send(context.Background(), map[string]any{
 		"type":       "offer",
-		"session_id": sessionID,
+		"session_id": sessionCode,
+		"peer_id":    peerID,
 		"sdp":        sdp,
 	})
 }
 
-func (d *Daemon) handleAnswer(sessionID, sdp string) {
+func (d *Daemon) handleAnswer(peerID string, sdp string) {
 	d.mu.RLock()
-	var session *Session
-	for _, s := range d.sessions {
-		if s.peers != nil {
-			if p, ok := s.peers[sessionID]; ok {
-				p.SetAnswer(sdp)
-				session = s
-				break
-			}
+	defer d.mu.RUnlock()
+
+	// Find the session that owns this peer
+	for _, session := range d.sessions {
+		session.mu.Lock()
+		if p, ok := session.peers[peerID]; ok {
+			p.SetAnswer(sdp)
+			session.mu.Unlock()
+			return
 		}
+		session.mu.Unlock()
 	}
-	d.mu.RUnlock()
 }
 
-func (d *Daemon) handleICECandidate(sessionID string, candidate json.RawMessage) {
+func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
 	var init webrtc.ICECandidateInit
 	if err := json.Unmarshal(candidate, &init); err != nil {
 		return
 	}
 
 	d.mu.RLock()
-	for _, s := range d.sessions {
-		if s.peers != nil {
-			if p, ok := s.peers[sessionID]; ok {
-				p.AddICECandidate(init)
-				break
-			}
+	defer d.mu.RUnlock()
+
+	// Find the session that owns this peer
+	for _, session := range d.sessions {
+		session.mu.Lock()
+		if p, ok := session.peers[peerID]; ok {
+			p.AddICECandidate(init)
+			session.mu.Unlock()
+			return
 		}
+		session.mu.Unlock()
 	}
-	d.mu.RUnlock()
 }
 
 // loadSessionsFromStore loads sessions from store and re-registers them.
@@ -982,7 +1029,6 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
-	"strings"
 
 	"opencloudshare/agent/internal/daemon"
 )
@@ -1000,8 +1046,20 @@ type WebServer struct {
 }
 
 func NewWebServer(d *daemon.Daemon, port int, password string) (*WebServer, error) {
-	// Parse templates
-	tmpl, err := template.ParseFS(embeddedFS, "templates/*.html")
+	// Parse templates - layout must be parsed first, then pages
+	tmpl := template.New("")
+	
+	// Parse layout first
+	layoutContent, err := embeddedFS.ReadFile("templates/layout.html")
+	if err != nil {
+		return nil, fmt.Errorf("read layout: %w", err)
+	}
+	if _, err := tmpl.Parse(string(layoutContent)); err != nil {
+		return nil, fmt.Errorf("parse layout: %w", err)
+	}
+	
+	// Parse all other templates
+	tmpl, err = tmpl.ParseFS(embeddedFS, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
 	}
@@ -1034,6 +1092,7 @@ func (s *WebServer) Start() error {
 
 	// API routes
 	mux.HandleFunc("/api/shares", s.csrfMiddleware(s.handleSharesAPI))
+	mux.HandleFunc("DELETE /api/shares/{code}", s.csrfMiddleware(s.handleRevokeShare))
 	mux.HandleFunc("/api/share-form", s.csrfMiddleware(s.handleShareForm))
 	mux.HandleFunc("/api/status", s.csrfMiddleware(s.handleStatus))
 	mux.HandleFunc("/api/settings", s.csrfMiddleware(s.handleSettingsAPI))
@@ -1279,14 +1338,14 @@ git commit -m "feat(web): add HTTP server with embedded assets and CSRF protecti
 - [ ] **Step 6: Create share-form.html**
 
 ```html
-<dialog open>
+<dialog id="share-dialog">
   <article>
     <header>
-      <a href="#" class="close" hx-on:click="this.closest('dialog').close()">&times;</a>
+      <a href="#/" class="close" hx-on:click="document.getElementById('share-dialog').close()">&times;</a>
       <h3>Create New Share</h3>
     </header>
 
-    <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend">
+    <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend" hx-on::after-request="document.getElementById('share-dialog').close()">
       <label>
         OpenCloud Share URL
         <input type="url" name="share_url" placeholder="https://opencloud.example.com/s/xyz789" required>
@@ -1333,9 +1392,14 @@ git commit -m "feat(web): add HTTP server with embedded assets and CSRF protecti
       </div>
 
       <footer>
-        <button type="button" hx-on:click="this.closest('dialog').close()">Cancel</button>
+        <button type="button" hx-on:click="document.getElementById('share-dialog').close()">Cancel</button>
         <button type="submit">Create Share</button>
       </footer>
+    </form>
+  </article>
+  <script>document.getElementById('share-dialog').showModal()</script>
+</dialog>
+```
     </form>
   </article>
 </dialog>
@@ -1507,12 +1571,12 @@ Create `agent/internal/web/api.go`:
 package web
 
 import (
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"opencloudshare/agent/internal/store"
+	"opencloudshare/agent/internal/config"
 )
 
 // handleSharesAPI handles GET (list) and POST (create) for shares.
@@ -1522,8 +1586,6 @@ func (s *WebServer) handleSharesAPI(w http.ResponseWriter, r *http.Request) {
 		s.listShares(w, r)
 	case http.MethodPost:
 		s.createShare(w, r)
-	case http.MethodDelete:
-		s.revokeShare(w, r)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -1565,14 +1627,63 @@ func (s *WebServer) createShare(w http.ResponseWriter, r *http.Request) {
 	s.templates.ExecuteTemplate(w, "share-card", session)
 }
 
-func (s *WebServer) revokeShare(w http.ResponseWriter, r *http.Request) {
+// handleRevokeShare handles DELETE /api/shares/{code}
+func (s *WebServer) handleRevokeShare(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
-	if code == "" {
-		// Try extracting from URL path manually
-		parts := strings.Split(r.URL.Path, "/")
-		if len(parts) >= 4 {
-			code = parts[3]
-		}
+
+	if err := s.daemon.RevokeSession(code); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleShareForm returns the new share form modal.
+func (s *WebServer) handleShareForm(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	s.templates.ExecuteTemplate(w, "share-form.html", s.daemon.GetConfig())
+}
+
+// handleStatus returns connection status.
+func (s *WebServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status := "Connected"
+	if !s.daemon.IsConnected() {
+		status = "Disconnected"
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, `<span class="status">%s</span>`, status)
+}
+
+// handleSettingsAPI handles PUT to save settings (form-encoded).
+func (s *WebServer) handleSettingsAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Invalid form", http.StatusBadRequest)
+		return
+	}
+
+	cfg := s.daemon.GetConfig()
+	cfg.SignalingURL = r.FormValue("signaling_url")
+	cfg.APIKey = r.FormValue("api_key")
+	cfg.AllowedHost = r.FormValue("allowed_host")
+	cfg.DefaultExpiry, _ = strconv.Atoi(r.FormValue("default_expiry"))
+	cfg.DefaultMaxDownloads, _ = strconv.Atoi(r.FormValue("default_max_downloads"))
+	cfg.DefaultRelayOnly = r.FormValue("default_relay_only") == "true"
+
+	if err := s.daemon.SaveConfig(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+```
 	}
 
 	if err := s.daemon.RevokeSession(code); err != nil {
@@ -1789,10 +1900,9 @@ func runShareClient(shareURL string) error {
 }
 
 func runShareSingle(shareURL string) error {
-	// Existing runShare logic (renamed)
+	// Single-session mode (fallback when daemon not running)
+	// This is the legacy CLI behavior - one share, one process
 	cfg := config.Load()
-	cfg.Password = password
-	cfg.MaxDownloads = maxDownloads
 
 	if cfg.APIKey == "" {
 		return fmt.Errorf("OPENCLOUDSHARE_API_KEY environment variable required")
@@ -1809,7 +1919,8 @@ func runShareSingle(shareURL string) error {
 	}
 
 	agentID := st.GetAgentID()
-	preferredCode := st.GetCode(shareURL)
+	// Note: Single-session mode doesn't use preferredCode persistence
+	// Each run starts fresh - daemon mode handles persistence
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -1824,14 +1935,11 @@ func runShareSingle(shareURL string) error {
 		default:
 		}
 
-		code, err := runSession(ctx, cfg, webdavClient, shareURL, st, preferredCode, agentID)
+		code, err := runSession(ctx, cfg, webdavClient, shareURL, password, maxDownloads, st, agentID)
 		if err != nil {
 			log.Printf("session ended: %v", err)
 		} else {
 			backoff.Reset()
-		}
-		if code != "" {
-			preferredCode = code
 		}
 
 		select {
@@ -1852,21 +1960,167 @@ func runShareSingle(shareURL string) error {
 		}
 	}
 }
+
+// runSession is the legacy single-session connection loop.
+// Note: password and maxDownloads are per-session, not config fields.
+func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, sessionPassword string, sessionMaxDownloads int, st *store.Store, agentID string) (string, error) {
+	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
+
+	if err := sig.Connect(ctx); err != nil {
+		return "", fmt.Errorf("connect to signaling server: %w", err)
+	}
+	log.Printf("connected to signaling server at %s", cfg.SignalingURL)
+
+	// Register share (no preferredCode in single-session mode)
+	code, reconnected, err := sig.RegisterShare(ctx, shareURL, "")
+	if err != nil {
+		return "", fmt.Errorf("register share: %w", err)
+	}
+	if reconnected {
+		log.Printf("session reclaimed — code: %s", code)
+	} else {
+		log.Printf("session ready — code: %s", code)
+	}
+	log.Printf("open browser: http://localhost:8080 then enter code: %s", code)
+
+	var (
+		mu    sync.Mutex
+		peers = make(map[string]*peer.Peer)
+	)
+
+	sig.OnMessage = func(msg signaling.Message) {
+		switch msg.Type {
+		case "welcome":
+			log.Println("agent authenticated with signaling server")
+
+		case "join":
+			log.Printf("browser joined session %s — starting WebRTC handshake", msg.SessionID)
+			peerID := msg.PeerID
+
+			iceServers := sig.GetICEServers()
+			if len(iceServers) == 0 {
+				log.Printf("warning: no ICE servers received, using default STUN")
+				iceServers = []webrtc.ICEServer{
+					{URLs: []string{"stun:stun.cloudflare.com:3478"}},
+				}
+			}
+			p, err := peer.New(iceServers, false) // false = Direct mode in single-session fallback
+			if err != nil {
+				log.Printf("create peer: %v", err)
+				return
+			}
+
+			mu.Lock()
+			peers[peerID] = p
+			mu.Unlock()
+
+			p.OnClosed = func() {
+				log.Printf("peer closed (peer %s)", peerID)
+				mu.Lock()
+				delete(peers, peerID)
+				mu.Unlock()
+			}
+			p.OnICECandidate = func(init webrtc.ICECandidateInit) {
+				if err := sig.Send(ctx, map[string]any{
+					"type":       "ice_candidate",
+					"session_id": msg.SessionID,
+					"peer_id":    peerID,
+					"candidate":  init,
+				}); err != nil {
+					log.Printf("send ICE candidate: %v", err)
+				}
+			}
+
+			tm := transfer.NewManager(p, webdavClient, sessionPassword, sessionMaxDownloads)
+
+			p.OnOpen = func() {
+				log.Printf("✓ DataChannel open! (peer %s)", peerID)
+				tm.HandleOpen()
+			}
+
+			sdp, err := p.CreateOffer()
+			if err != nil {
+				log.Printf("create offer: %v", err)
+				return
+			}
+			p.SetOnMessage(tm.HandleMessage)
+
+			if err := sig.Send(ctx, map[string]any{
+				"type":       "offer",
+				"session_id": msg.SessionID,
+				"peer_id":    peerID,
+				"sdp":        sdp,
+			}); err != nil {
+				log.Printf("send offer: %v", err)
+			}
+
+		case "answer":
+			mu.Lock()
+			p, ok := peers[msg.PeerID]
+			mu.Unlock()
+			if !ok {
+				return
+			}
+			if err := p.SetAnswer(msg.SDP); err != nil {
+				log.Printf("set answer: %v", err)
+			}
+
+		case "ice_candidate":
+			mu.Lock()
+			p, ok := peers[msg.PeerID]
+			mu.Unlock()
+			if !ok {
+				return
+			}
+			var init webrtc.ICECandidateInit
+			if err := json.Unmarshal(msg.Candidate, &init); err != nil {
+				log.Printf("parse ICE candidate: %v", err)
+				return
+			}
+			if err := p.AddICECandidate(init); err != nil {
+				log.Printf("add ICE candidate: %v", err)
+			}
+
+		case "error":
+			log.Printf("signaling error: %s", msg.Err)
+		}
+	}
+
+	log.Println("waiting for browser connections (Ctrl-C to stop)...")
+	if err := sig.Listen(ctx); err != nil {
+		return code, fmt.Errorf("signaling disconnected: %w", err)
+	}
+
+	return code, nil
+}
 ```
 
-- [ ] **Step 5: Update peer.New call in runSession**
+- [ ] **Step 5: Add Daemon helper methods**
 
-In the existing `runSession` function, change line 172:
+Add these methods to the Daemon struct (in daemon.go):
 
 ```go
-p, err := peer.New(iceServers, false) // false = Direct mode (default)
+// GetConfig returns the current config.
+func (d *Daemon) GetConfig() *config.Config {
+	return d.config
+}
+
+// SaveConfig persists config changes.
+func (d *Daemon) SaveConfig(cfg *config.Config) error {
+	return d.configMgr.Save(cfg)
+}
+
+// IsConnected returns true if connected to signaling server.
+func (d *Daemon) IsConnected() bool {
+	return d.signaling != nil
+}
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add agent/cmd/agent/main.go
-git commit -m "feat(cli): add daemon subcommand and client mode fallback"
+git add agent/cmd/agent/main.go agent/internal/daemon/daemon.go
+git commit -m "feat(cli): add daemon subcommand, client mode fallback, and peer routing"
 ```
 
 ---
