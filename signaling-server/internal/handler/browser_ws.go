@@ -8,8 +8,10 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
+	"opencloudshare/server/internal/config"
 	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/hub"
+	"opencloudshare/server/internal/turn"
 )
 
 type browserMsg struct {
@@ -18,7 +20,7 @@ type browserMsg struct {
 	Candidate json.RawMessage `json:"candidate,omitempty"`
 }
 
-func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, stunURL string) gin.HandlerFunc {
+func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionCode := c.Query("session")
 
@@ -68,12 +70,25 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, stunURL string) gin.Hand
 
 		log.Printf("browser joined session %s", sessionCode)
 
+		// Build ICE config
+		var turnCreds *turn.Credentials
+		if cfg.HasTurn() {
+			// Cap TURN credential TTL at 24h
+			turnExpiry := time.Now().Add(24 * time.Hour)
+			creds := turn.GenerateCredentials(cfg.TurnSecret, sessionCode, turnExpiry)
+			turnCreds = &creds
+		}
+
+		iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
+			STUNURL:     cfg.STUNURL,
+			TurnURL:     cfg.TurnURL(),
+			Credentials: turnCreds,
+		})
+
 		// Send ICE config to browser
 		hub.SendDirect(ctx, conn, map[string]any{
-			"type": "ice_config",
-			"ice_servers": []map[string]string{
-				{"urls": stunURL},
-			},
+			"type":       "ice_config",
+			"ice_servers": iceServers,
 		})
 
 		// Notify agent that browser has joined

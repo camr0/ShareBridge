@@ -14,7 +14,7 @@ func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, apiKeyRepo *d
 
 	// WebSocket endpoints
 	r.GET("/ws/agent", AgentWS(h, apiKeyRepo, sessionRepo))
-	r.GET("/ws/client", BrowserWS(h, sessionRepo, cfg.STUNURL))
+	r.GET("/ws/client", BrowserWS(h, sessionRepo, cfg))
 
 	// Admin API routes (protected by auth token)
 	admin := r.Group("/admin/api")
