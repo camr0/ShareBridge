@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
+	"opencloudshare/server/internal/config"
 	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/hub"
 )
@@ -35,7 +36,8 @@ func TestAgentWS_HelloFlow(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo))
+	cfg := config.Load()
+	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo, cfg))
 
 	server := httptest.NewServer(router)
 	defer server.Close()
@@ -54,6 +56,7 @@ func TestAgentWS_HelloFlow(t *testing.T) {
 	_, data, err := conn.Read(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), `"type":"welcome"`)
+	assert.Contains(t, string(data), `"ice_servers"`)
 }
 
 func TestAgentWS_InvalidAPIKey(t *testing.T) {
@@ -68,7 +71,8 @@ func TestAgentWS_InvalidAPIKey(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo))
+	cfg := config.Load()
+	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo, cfg))
 
 	server := httptest.NewServer(router)
 	defer server.Close()
@@ -111,7 +115,8 @@ func TestAgentWS_CodeOwnership(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo))
+	cfg := config.Load()
+	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo, cfg))
 
 	server := httptest.NewServer(router)
 	defer server.Close()

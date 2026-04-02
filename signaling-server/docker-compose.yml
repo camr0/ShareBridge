@@ -23,8 +23,8 @@ services:
     command: >
       -n
       --log-file=stdout
-      --min-port=49160
-      --max-port=49200
+      --min-port=49152
+      --max-port=65535
       --realm=opencloudshare
       --use-auth-secret
       --static-auth-secret=${TURN_SECRET}
