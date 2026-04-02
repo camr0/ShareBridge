@@ -125,7 +125,6 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("HX-Trigger", "shareCreated")
 	if err := tmpl.ExecuteTemplate(w, "share-card", data); err != nil {
 		http.Error(w, fmt.Sprintf("render share card: %v", err), http.StatusInternalServerError)
 		return

@@ -81,6 +81,7 @@ type Daemon struct {
 	mu        sync.RWMutex
 
 	webServer       WebServer
+	startTime       time.Time
 	signalingConnected bool // true once welcome received
 	hasTURN         bool
 
@@ -102,6 +103,7 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 		store:     st,
 		signaling: sig,
 		sessions:  make(map[string]*Session),
+		startTime: time.Now(),
 	}, nil
 }
 
@@ -667,6 +669,21 @@ func (d *Daemon) GetConfig() *config.Config {
 	cfg := d.config
 	d.mu.RUnlock()
 	return cfg
+}
+
+// GetUptime returns the duration since the daemon started.
+func (d *Daemon) GetUptime() time.Duration {
+	return time.Since(d.startTime)
+}
+
+// GetConfigPath returns the path to the config file on disk.
+func (d *Daemon) GetConfigPath() string {
+	if d.configMgr != nil {
+		if mgr, ok := d.configMgr.(*config.Manager); ok {
+			return mgr.FilePath()
+		}
+	}
+	return ""
 }
 
 // SaveConfig updates and persists the configuration.

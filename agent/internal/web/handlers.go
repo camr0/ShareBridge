@@ -3,6 +3,7 @@ package web
 import (
 	"fmt"
 	"net/http"
+	"runtime"
 	"time"
 )
 
@@ -12,6 +13,8 @@ type pageData struct {
 	ActivePage  string
 	Version     string
 	Uptime      string
+	GoVersion   string
+	ConfigPath  string
 	Config      configData
 }
 
@@ -59,9 +62,13 @@ func (ws *WebServer) renderPage(w http.ResponseWriter, name string, data pageDat
 		data.Version = "dev"
 	}
 
-	// Set default uptime if not provided
+	// Auto-populate uptime from daemon if not already set
 	if data.Uptime == "" {
-		data.Uptime = "unknown"
+		if ws.daemon != nil {
+			data.Uptime = formatUptime(time.Now().Add(-ws.daemon.GetUptime()))
+		} else {
+			data.Uptime = "unknown"
+		}
 	}
 
 	// Execute the template
@@ -97,10 +104,17 @@ func (ws *WebServer) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	configPath := ""
+	if ws.daemon != nil {
+		configPath = ws.daemon.GetConfigPath()
+	}
+
 	data := pageData{
 		Title:      "Settings",
 		ActivePage: "settings",
 		Config:     cfg,
+		GoVersion:  runtime.Version(),
+		ConfigPath: configPath,
 	}
 	ws.renderPage(w, "settings.html", data)
 }

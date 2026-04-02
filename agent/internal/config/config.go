@@ -61,6 +61,11 @@ func (m *Manager) Get() *Config {
 	return m.config
 }
 
+// FilePath returns the path to the config file.
+func (m *Manager) FilePath() string {
+	return m.filePath
+}
+
 // Save persists the configuration to the config file.
 func (m *Manager) Save(cfg *Config) error {
 	m.config = cfg

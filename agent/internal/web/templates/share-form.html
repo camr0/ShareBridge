@@ -5,7 +5,8 @@
             <h3>Create New Share</h3>
         </header>
 
-        <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend">
+        <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend"
+              hx-on::after-request="if(event.detail.successful) this.closest('dialog').close()">
             <label for="share-url">
                 OpenCloud Share URL
                 <input type="url" id="share-url" name="share_url"
@@ -49,17 +50,20 @@
             </fieldset>
 
             <div class="grid">
-                <label for="expiry">
-                    Expires After
-                    <select id="expiry" name="expiry_hours">
-                        <option value="1">1 hour</option>
-                        <option value="6">6 hours</option>
-                        <option value="12">12 hours</option>
-                        <option value="24" selected>24 hours</option>
-                        <option value="72">3 days</option>
-                        <option value="168">7 days</option>
-                    </select>
-                </label>
+                <div>
+                    <label for="expiry">
+                        Expires After
+                        <select id="expiry" name="expiry_hours">
+                            <option value="1">1 hour</option>
+                            <option value="6">6 hours</option>
+                            <option value="12">12 hours</option>
+                            <option value="24" selected>24 hours</option>
+                            <option value="72">3 days</option>
+                            <option value="168">7 days</option>
+                        </select>
+                    </label>
+                    <small id="expiry-hint" style="color: var(--text-secondary);"></small>
+                </div>
                 <label for="max-downloads">
                     Max Downloads
                     <input type="number" id="max-downloads" name="max_downloads"
@@ -104,6 +108,18 @@
         });
         modeDirect.addEventListener('change', function() { setMode(true); });
         modeRelay.addEventListener('change',  function() { setMode(false); });
+
+        var expirySelect = dlg.querySelector('#expiry');
+        var expiryHint   = dlg.querySelector('#expiry-hint');
+
+        function updateExpiryHint() {
+            var hours = parseInt(expirySelect.value, 10);
+            var expires = new Date(Date.now() + hours * 3600 * 1000);
+            expiryHint.textContent = 'Expires ' + expires.toLocaleDateString(undefined, {month: 'short', day: 'numeric', year: 'numeric'}) + ' at ' + expires.toLocaleTimeString(undefined, {hour: 'numeric', minute: '2-digit'});
+        }
+
+        expirySelect.addEventListener('change', updateExpiryHint);
+        updateExpiryHint();
     })();
 </script>
 {{end}}

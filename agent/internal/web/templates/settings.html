@@ -82,14 +82,13 @@
 
 <article>
     <header><h2>About</h2></header>
-    <p>
-        OpenCloudShare Agent v{{.Version}}<br>
-        Uptime: {{.Uptime}}
-    </p>
-    <small>
-        <a href="https://github.com/ali-raheem/OpenCloudShare" target="_blank">GitHub</a> ·
-        <a href="https://github.com/ali-raheem/OpenCloudShare/wiki" target="_blank">Documentation</a> ·
-        <a href="https://github.com/ali-raheem/OpenCloudShare/issues" target="_blank">Report Issue</a>
-    </small>
+    <table>
+        <tbody>
+            <tr><th>Version</th><td>{{.Version}}</td></tr>
+            <tr><th>Uptime</th><td>{{.Uptime}}</td></tr>
+            <tr><th>Go</th><td>{{.GoVersion}}</td></tr>
+            <tr><th>Config</th><td><code>{{.ConfigPath}}</code></td></tr>
+        </tbody>
+    </table>
 </article>
 {{end}}
