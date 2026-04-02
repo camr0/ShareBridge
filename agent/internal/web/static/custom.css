@@ -11,6 +11,13 @@
   --border: var(--pico-form-element-border-color, #e5e7eb);
 }
 
+/* ===== Compact form elements sitewide ===== */
+main,
+dialog {
+  --pico-form-element-spacing-vertical: 0.4rem;
+  --pico-form-element-spacing-horizontal: 0.75rem;
+}
+
 /* ===== Layout ===== */
 .page-header {
   display: flex;
@@ -23,8 +30,10 @@
   margin: 0;
 }
 
-.footer-links {
-  float: right;
+footer small {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 
 /* ===== Share Cards ===== */
@@ -50,6 +59,7 @@
 
 .share-code {
   font-size: 1.1rem;
+  font-weight: 600;
   display: block;
   margin-bottom: 0.2rem;
 }
@@ -64,7 +74,7 @@
 .share-card-footer {
   display: flex;
   align-items: center;
-  gap: 1.5rem;
+  gap: 1rem;
   margin-top: 0.75rem;
   font-size: 0.875rem;
   color: var(--text-secondary);
@@ -76,14 +86,14 @@
 
 .btn-revoke {
   margin-left: auto;
-  padding: 0.25rem 0.75rem;
-  font-size: 0.8rem;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.875rem;
   color: var(--error) !important;
   border-color: var(--error) !important;
 }
 
 .btn-revoke:hover {
-  background: #fee2e2 !important;
+  background: rgba(220, 38, 38, 0.08) !important;
 }
 
 /* Empty state */
@@ -106,12 +116,12 @@
 
 .badge-direct {
   background: #dbeafe;
-  color: #1d4ed8;
+  color: #1e40af;
 }
 
 .badge-relay {
   background: #fef3c7;
-  color: #b45309;
+  color: #92400e;
 }
 
 /* ===== Status indicator ===== */
@@ -166,17 +176,17 @@
 
 /* ===== Mode options in share form ===== */
 .mode-option {
-  border: 1px solid var(--border);
+  border: 2px solid var(--border);
   border-radius: 8px;
   padding: 0.6rem 0.75rem;
   margin-bottom: 0.4rem;
   cursor: pointer;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, background-color 0.15s;
 }
 
 .mode-option.selected {
   border-color: var(--accent);
-  border-width: 2px;
+  background: rgba(59, 130, 246, 0.05);
 }
 
 .mode-option-header {
@@ -210,7 +220,7 @@
 
 .mode-option-warning.amber {
   background: #fef3c7;
-  color: #b45309;
+  color: #92400e;
 }
 
 .mode-option-warning.red {
@@ -236,8 +246,6 @@
 
 /* ===== Dialog ===== */
 dialog {
-  --pico-form-element-spacing-vertical: 0.4rem;
-  --pico-form-element-spacing-horizontal: 0.75rem;
   font-size: 0.875rem;
 }
 
