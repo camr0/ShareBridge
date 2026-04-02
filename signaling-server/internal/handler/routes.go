@@ -13,7 +13,7 @@ func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, apiKeyRepo *d
 	r.GET("/sessions/:code", GetSessionInfo(sessionRepo, h))
 
 	// WebSocket endpoints
-	r.GET("/ws/agent", AgentWS(h, apiKeyRepo, sessionRepo))
+	r.GET("/ws/agent", AgentWS(h, apiKeyRepo, sessionRepo, cfg))
 	r.GET("/ws/client", BrowserWS(h, sessionRepo, cfg))
 
 	// Admin API routes (protected by auth token)

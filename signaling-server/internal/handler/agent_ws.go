@@ -11,8 +11,10 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
+	"opencloudshare/server/internal/config"
 	"opencloudshare/server/internal/db"
 	"opencloudshare/server/internal/hub"
+	"opencloudshare/server/internal/turn"
 )
 
 // Agent message types from agent to server
@@ -31,7 +33,7 @@ type agentMsg struct {
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
 var codeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,30}$`)
 
-func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo) gin.HandlerFunc {
+func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo, cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract and validate API key from query param
 		apiKeyFull := c.Query("api_key")
@@ -77,7 +79,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo)
 
 			switch msg.Type {
 			case "hello":
-				handleHello(ctx, conn, h, apiKey.ID, msg.AgentID)
+				handleHello(ctx, conn, h, apiKey.ID, msg.AgentID, cfg)
 				agentID = msg.AgentID
 
 			case "register_share":
@@ -125,7 +127,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo)
 }
 
 // handleHello processes the hello message and sends welcome response
-func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID string, agentID string) {
+func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID string, agentID string, cfg *config.Config) {
 	if agentID == "" {
 		hub.SendDirect(ctx, conn, map[string]string{
 			"type":    "error",
@@ -138,8 +140,23 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
 	log.Printf("agent hello received: api_key=%s agent_id=%s", apiKeyID, agentID)
 
-	hub.SendDirect(ctx, conn, map[string]string{
-		"type": "welcome",
+	// Build ICE config for agent
+	var turnCreds *turn.Credentials
+	if cfg.HasTurn() {
+		turnExpiry := time.Now().Add(24 * time.Hour)
+		creds := turn.GenerateCredentials(cfg.TurnSecret, apiKeyID, turnExpiry)
+		turnCreds = &creds
+	}
+
+	iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
+		STUNURL:     cfg.STUNURL,
+		TurnURL:     cfg.TurnURL(),
+		Credentials: turnCreds,
+	})
+
+	hub.SendDirect(ctx, conn, map[string]any{
+		"type":       "welcome",
+		"ice_servers": iceServers,
 	})
 }
 
