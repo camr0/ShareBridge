@@ -80,8 +80,9 @@ type Daemon struct {
 	sessions  map[string]*Session // code -> Session
 	mu        sync.RWMutex
 
-	webServer WebServer
-	hasTURN   bool
+	webServer       WebServer
+	signalingConnected bool // true once welcome received
+	hasTURN         bool
 
 	// Callbacks for external handling (e.g., web server refresh)
 	OnSessionAdded   func(session *Session)
@@ -135,15 +136,15 @@ func (d *Daemon) Start(ctx context.Context) <-chan error {
 		errChan <- fmt.Errorf("connect to signaling server: %w", err)
 		return errChan
 	}
-	log.Printf("connected to signaling server at %s", d.config.SignalingURL)
+	log.Printf("connected to signaling server at %s", d.GetConfig().SignalingURL)
 
 	// Set up message handler before starting listener
 	d.signaling.SetOnMessage(d.handleSignalingMessage)
 
-	// Load persisted sessions and re-register them
-	d.loadSessionsFromStore(ctx)
-
-	// Start signaling listener in background
+	// Start signaling listener before loading sessions — Listen is the sole
+	// WebSocket reader, and RegisterShare (called during loadSessionsFromStore)
+	// waits on a channel that Listen feeds. Starting it first avoids a
+	// concurrent-read race that corrupts WebSocket frame boundaries.
 	go func() {
 		if err := d.signaling.Listen(ctx); err != nil {
 			if !errors.Is(err, context.Canceled) {
@@ -151,6 +152,9 @@ func (d *Daemon) Start(ctx context.Context) <-chan error {
 			}
 		}
 	}()
+
+	// Load persisted sessions and re-register them
+	d.loadSessionsFromStore(ctx)
 
 	// Start expiry pruner
 	go d.runExpiryPruner(ctx)
@@ -203,18 +207,18 @@ func (d *Daemon) Stop() error {
 // CreateSession creates a new share session and registers it with the
 // signaling server.
 func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
+	cfg := d.GetConfig()
+
 	// Validate share URL against allowed host
-	if d.config.AllowedHost != "" {
-		// Parse URL and check host
-		// This is done by opencloud.New, but we do it here first for early error
-		_, err := opencloud.New(shareURL, d.config.AllowedHost, password)
+	if cfg.AllowedHost != "" {
+		_, err := opencloud.New(shareURL, cfg.AllowedHost, password)
 		if err != nil {
 			return "", fmt.Errorf("validate share URL: %w", err)
 		}
 	}
 
 	// Create WebDAV client
-	webdavClient, err := opencloud.New(shareURL, d.config.AllowedHost, password)
+	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost, password)
 	if err != nil {
 		return "", fmt.Errorf("create WebDAV client: %w", err)
 	}
@@ -339,12 +343,12 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	switch msg.Type {
 	case "welcome":
 		log.Println("agent authenticated with signaling server")
-		// Check if TURN servers are available
+		d.signalingConnected = true
 		iceServers := d.signaling.GetICEServers()
 		d.hasTURN = hasTURNServer(iceServers)
 
 	case "join":
-		d.handleBrowserJoin(msg.SessionID, msg.PeerID)
+		go d.handleBrowserJoin(msg.SessionID, msg.PeerID)
 
 	case "answer":
 		d.handleAnswer(msg.PeerID, msg.SDP)
@@ -547,9 +551,10 @@ func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
 func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	sessions := d.store.ListSessions(true) // Filter expired
 
+	cfg := d.GetConfig()
 	for _, entry := range sessions {
 		// Create WebDAV client
-		webdavClient, err := opencloud.New(entry.ShareURL, d.config.AllowedHost, entry.Password)
+		webdavClient, err := opencloud.New(entry.ShareURL, cfg.AllowedHost, entry.Password)
 		if err != nil {
 			log.Printf("warning: could not create WebDAV client for %s: %v", entry.Code, err)
 			continue
@@ -646,20 +651,30 @@ func (d *Daemon) pruneExpiredSessions() {
 	}
 }
 
+// IsConnected returns whether the daemon has authenticated with the signaling server.
+func (d *Daemon) IsConnected() bool {
+	return d.signalingConnected
+}
+
 // HasTURN returns whether TURN servers are available.
 func (d *Daemon) HasTURN() bool {
 	return d.hasTURN
 }
 
-// GetConfig returns the current configuration.
+// GetConfig returns a copy of the current configuration.
 func (d *Daemon) GetConfig() *config.Config {
-	return d.config
+	d.mu.RLock()
+	cfg := d.config
+	d.mu.RUnlock()
+	return cfg
 }
 
 // SaveConfig updates and persists the configuration.
 // It uses the config manager to save to the config file.
 func (d *Daemon) SaveConfig(cfg *config.Config) error {
+	d.mu.Lock()
 	d.config = cfg
+	d.mu.Unlock()
 	if d.configMgr != nil {
 		// Cast to concrete type to access Save method
 		if mgr, ok := d.configMgr.(*config.Manager); ok {

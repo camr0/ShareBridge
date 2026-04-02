@@ -147,12 +147,15 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/settings", ws.csrfMiddleware(ws.saveSettingsHandler))
 }
 
-// csrfMiddleware verifies the X-Requested-With header on non-GET requests.
-// HTMX sends this header by default, providing CSRF protection for local-only binding.
+// csrfMiddleware verifies a browser-set request header on non-GET requests.
+// Accepts HX-Request (sent by HTMX) or X-Requested-With (sent by XHR/jQuery/CLI client).
+// Either header proves the request came from JS, not a cross-origin form POST.
 func (ws *WebServer) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" && r.Method != "HEAD" {
-			if r.Header.Get("X-Requested-With") != "XMLHttpRequest" {
+			htmxRequest := r.Header.Get("HX-Request") == "true"
+			xhrRequest := r.Header.Get("X-Requested-With") == "XMLHttpRequest"
+			if !htmxRequest && !xhrRequest {
 				http.Error(w, "Forbidden - CSRF check failed", http.StatusForbidden)
 				return
 			}

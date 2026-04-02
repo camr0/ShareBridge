@@ -178,14 +178,10 @@ func (ws *WebServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if signaling connection is active by checking for TURN status
-	// (TURN is set when welcome message is received)
-	if ws.daemon.HasTURN() {
-		// TURN available - good connection
+	if ws.daemon.IsConnected() {
 		w.Write([]byte(`<span class="status-dot status-online"></span><span>Connected</span>`))
 	} else {
-		// No TURN yet - might be connecting
-		w.Write([]byte(`<span class="status-dot status-unknown"></span><span>Checking...</span>`))
+		w.Write([]byte(`<span class="status-dot status-unknown"></span><span>Connecting...</span>`))
 	}
 }
 

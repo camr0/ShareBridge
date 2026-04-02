@@ -2,13 +2,12 @@
 <dialog open>
     <article>
         <header>
-            <hgroup>
-                <h2>New Share</h2>
-                <p>Create a new share session</p>
-            </hgroup>
+            <h2>New Share</h2>
+            <p>Create a new share session</p>
         </header>
 
-        <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend">
+        <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend"
+              hx-on::after-request="if(event.detail.successful) this.closest('dialog').close()">
             <label for="share-url">
                 OpenCloud Share URL
                 <input type="url" id="share-url" name="share_url"
@@ -16,34 +15,39 @@
             </label>
 
             <label for="password">
-                Password
+                Password (optional)
                 <input type="password" id="password" name="password"
                     placeholder="Leave empty if share has no password">
-                <small>Optional — leave empty if the share doesn't require a password</small>
             </label>
 
             <fieldset>
                 <legend>Connection Mode</legend>
 
-                <label for="mode-direct">
-                    <input type="radio" id="mode-direct" name="relay_only" value="false" checked>
-                    Direct (recommended)
-                </label>
-                <p class="warning-amber">
-                    <strong>Note:</strong> Your IP address will be visible to recipients if direct connection succeeds.
-                    TURN server used only as fallback.
-                </p>
+                <div class="mode-option selected" id="direct-option">
+                    <div class="mode-option-header">
+                        <input type="radio" id="mode-direct" name="relay_only" value="false" checked>
+                        <div>
+                            <div class="mode-option-title">Direct (recommended)</div>
+                            <div class="mode-option-desc">Fast, free, uses TURN only as fallback</div>
+                        </div>
+                    </div>
+                    <div class="mode-option-warning amber">
+                        ⚠️ Your IP address will be visible to recipients if direct connection succeeds
+                    </div>
+                </div>
 
-                <label for="mode-relay">
-                    <input type="radio" id="mode-relay" name="relay_only" value="true">
-                    Relay (hide IP)
-                </label>
-                <p class="warning-amber" id="relay-description">
-                    All traffic via TURN server, IP never exposed to recipients.
-                </p>
-                <p class="warning-red" id="turn-warning" style="display: none;">
-                    <strong>Warning:</strong> Requires TURN server. Connection will fail if TURN is not configured.
-                </p>
+                <div class="mode-option" id="relay-option">
+                    <div class="mode-option-header">
+                        <input type="radio" id="mode-relay" name="relay_only" value="true">
+                        <div>
+                            <div class="mode-option-title">Relay (hide IP)</div>
+                            <div class="mode-option-desc">All traffic via TURN server, IP never exposed</div>
+                        </div>
+                    </div>
+                    <div class="mode-option-warning amber" id="relay-description">
+                        ⚠️ Requires TURN server. Connection will fail if TURN is not configured.
+                    </div>
+                </div>
             </fieldset>
 
             <div class="grid">
@@ -53,7 +57,7 @@
                         <option value="1">1 hour</option>
                         <option value="6">6 hours</option>
                         <option value="12">12 hours</option>
-                        <option value="24" selected>24 hours (1 day)</option>
+                        <option value="24" selected>24 hours</option>
                         <option value="72">3 days</option>
                         <option value="168">7 days</option>
                     </select>
@@ -62,8 +66,8 @@
                 <label for="max-downloads">
                     Max Downloads
                     <input type="number" id="max-downloads" name="max_downloads"
-                        placeholder="10" value="10" min="0">
-                    <small>0 = unlimited</small>
+                        placeholder="10" value="10" min="0" style="width: 100px;">
+                    <small style="color: var(--accent);">💡 Recommended: limit downloads to prevent link abuse</small>
                 </label>
             </div>
 
@@ -79,34 +83,36 @@
     // Show modal on load
     document.currentScript.closest('dialog').showModal();
 
-    // Check TURN status and show warning if relay selected without TURN
-    const modeRelay = document.getElementById('mode-relay');
+    // Mode option click handlers - toggle selected class
+    const directOption = document.getElementById('direct-option');
+    const relayOption = document.getElementById('relay-option');
     const modeDirect = document.getElementById('mode-direct');
-    const turnWarning = document.getElementById('turn-warning');
-    let turnAvailable = null;
+    const modeRelay = document.getElementById('mode-relay');
 
-    // Fetch TURN status on load
-    fetch('/api/turn-status')
-        .then(response => response.json())
-        .then(data => {
-            turnAvailable = data.available;
-            updateTurnWarning();
-        })
-        .catch(err => {
-            console.error('Failed to fetch TURN status:', err);
-            turnAvailable = false;
-            updateTurnWarning();
-        });
-
-    function updateTurnWarning() {
-        if (modeRelay.checked && !turnAvailable) {
-            turnWarning.style.display = 'block';
-        } else {
-            turnWarning.style.display = 'none';
+    directOption.addEventListener('click', (e) => {
+        if (e.target.tagName !== 'INPUT') {
+            modeDirect.checked = true;
+            directOption.classList.add('selected');
+            relayOption.classList.remove('selected');
         }
-    }
+    });
 
-    modeRelay.addEventListener('change', updateTurnWarning);
-    modeDirect.addEventListener('change', updateTurnWarning);
+    relayOption.addEventListener('click', (e) => {
+        if (e.target.tagName !== 'INPUT') {
+            modeRelay.checked = true;
+            relayOption.classList.add('selected');
+            directOption.classList.remove('selected');
+        }
+    });
+
+    modeDirect.addEventListener('change', () => {
+        directOption.classList.add('selected');
+        relayOption.classList.remove('selected');
+    });
+
+    modeRelay.addEventListener('change', () => {
+        relayOption.classList.add('selected');
+        directOption.classList.remove('selected');
+    });
 </script>
 {{end}}

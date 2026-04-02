@@ -73,11 +73,11 @@
   margin-right: 0.25rem;
 }
 
-.status-connected {
+.status-online {
   background: #22c55e;
 }
 
-.status-disconnected {
+.status-offline {
   background: #ef4444;
 }
 

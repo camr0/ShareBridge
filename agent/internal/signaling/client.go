@@ -40,6 +40,13 @@ type Client struct {
 	OnMessage  func(msg Message)
 	mu         sync.Mutex
 	iceServers []webrtc.ICEServer // Store ICE config from server
+
+	// pendingReg receives the share_registered (or error) response for the
+	// RegisterShare call currently in flight. nil when no registration pending.
+	// All WebSocket reads go through Listen, so RegisterShare must not call
+	// conn.Read directly while Listen is running.
+	pendingReg   chan Message
+	pendingRegMu sync.Mutex
 }
 
 func New(serverURL, apiKey, agentID string) *Client {
@@ -76,8 +83,20 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
-// RegisterShare sends register_share message and waits for response.
+// RegisterShare sends register_share message and waits for the response.
+// It must not call conn.Read directly — all reads go through Listen.
+// The response is delivered via pendingReg, which Listen feeds.
 func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string) (string, bool, error) {
+	responseCh := make(chan Message, 1)
+	c.pendingRegMu.Lock()
+	c.pendingReg = responseCh
+	c.pendingRegMu.Unlock()
+	defer func() {
+		c.pendingRegMu.Lock()
+		c.pendingReg = nil
+		c.pendingRegMu.Unlock()
+	}()
+
 	msg := map[string]string{
 		"type":      "register_share",
 		"share_url": shareURL,
@@ -85,48 +104,18 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 	if preferredCode != "" {
 		msg["code"] = preferredCode
 	}
-
 	if err := c.Send(ctx, msg); err != nil {
 		return "", false, fmt.Errorf("send register_share: %w", err)
 	}
 
-	// Wait for response
-	for {
-		_, data, err := c.conn.Read(ctx)
-		if err != nil {
-			return "", false, fmt.Errorf("read response: %w", err)
-		}
-
-		var resp Message
-		if err := json.Unmarshal(data, &resp); err != nil {
-			continue
-		}
-
-		switch resp.Type {
-		case "welcome":
-			// Store ICE servers from welcome message
-			if len(resp.ICEServers) > 0 {
-				c.mu.Lock()
-				c.iceServers = make([]webrtc.ICEServer, len(resp.ICEServers))
-				for i, s := range resp.ICEServers {
-					c.iceServers[i] = webrtc.ICEServer{
-						URLs:       s.URLs,
-						Username:   s.Username,
-						Credential: s.Credential,
-					}
-				}
-				c.mu.Unlock()
-			}
-			// Continue waiting for share_registered
-			continue
-		case "share_registered":
-			return resp.Code, resp.Reconnected, nil
-		case "error":
+	select {
+	case resp := <-responseCh:
+		if resp.Type == "error" {
 			return "", false, fmt.Errorf("server error: %s", resp.Err)
-		default:
-			// Unexpected message type - ignore and continue waiting
-			continue
 		}
+		return resp.Code, resp.Reconnected, nil
+	case <-ctx.Done():
+		return "", false, ctx.Err()
 	}
 }
 
@@ -155,7 +144,9 @@ func (c *Client) GetICEServers() []webrtc.ICEServer {
 	return c.iceServers
 }
 
-// Listen reads messages in a loop and calls OnMessage for each one.
+// Listen reads messages in a loop and dispatches them.
+// It is the sole reader of the WebSocket connection — RegisterShare and
+// other callers must not call conn.Read concurrently.
 func (c *Client) Listen(ctx context.Context) error {
 	for {
 		_, data, err := c.conn.Read(ctx)
@@ -166,6 +157,32 @@ func (c *Client) Listen(ctx context.Context) error {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+
+		// Update ICE servers whenever the server sends a welcome.
+		if msg.Type == "welcome" && len(msg.ICEServers) > 0 {
+			c.mu.Lock()
+			c.iceServers = make([]webrtc.ICEServer, len(msg.ICEServers))
+			for i, s := range msg.ICEServers {
+				c.iceServers[i] = webrtc.ICEServer{
+					URLs:       s.URLs,
+					Username:   s.Username,
+					Credential: s.Credential,
+				}
+			}
+			c.mu.Unlock()
+		}
+
+		// Route registration responses to RegisterShare if one is in flight.
+		if msg.Type == "share_registered" || msg.Type == "error" {
+			c.pendingRegMu.Lock()
+			ch := c.pendingReg
+			c.pendingRegMu.Unlock()
+			if ch != nil {
+				ch <- msg
+				continue
+			}
+		}
+
 		if c.OnMessage != nil {
 			c.OnMessage(msg)
 		}
