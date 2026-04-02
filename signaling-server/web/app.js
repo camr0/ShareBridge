@@ -108,6 +108,7 @@ function setupDataChannel() {
   dc.onopen = () => {
     status('DataChannel open!');
     hideSection('join-section');
+    setTimeout(updateConnectionStatus, 1000);
   };
 
   dc.onmessage = (event) => {
@@ -408,6 +409,8 @@ function resetUI() {
   showSection('join-section');
   hideSection('password-section');
   hideSection('file-list');
+  document.getElementById('connection-status').classList.add('hidden');
+  document.getElementById('connection-type').className = 'connection-badge';
   document.getElementById('breadcrumb').classList.add('hidden');
   document.getElementById('file-list').innerHTML = '';
   document.getElementById('password-error').textContent = '';
@@ -442,4 +445,59 @@ function formatSpeed(bps) {
   if (bps >= 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + ' MB/s';
   if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s';
   return Math.round(bps) + ' B/s';
+}
+
+async function detectConnectionType() {
+  if (!pc) return null;
+
+  const stats = await pc.getStats();
+  let selectedPair = null;
+  let localCandidateType = null;
+  let remoteCandidateType = null;
+
+  // Pass 1: find the nominated (selected) candidate pair
+  stats.forEach(report => {
+    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
+      selectedPair = report;
+    }
+  });
+
+  // If no nominated pair found, ICE hasn't settled yet
+  if (!selectedPair) return null;
+
+  // Pass 2: look up candidate types using the selected pair's IDs
+  stats.forEach(report => {
+    if (report.type === 'local-candidate' && report.id === selectedPair.localCandidateId) {
+      localCandidateType = report.candidateType;
+    }
+    if (report.type === 'remote-candidate' && report.id === selectedPair.remoteCandidateId) {
+      remoteCandidateType = report.candidateType;
+    }
+  });
+
+  // If either side uses relay, it's a relayed connection
+  if (localCandidateType === 'relay' || remoteCandidateType === 'relay') {
+    return 'relay';
+  }
+  return 'direct';
+}
+
+function updateConnectionStatus() {
+  detectConnectionType().then(type => {
+    if (!type) return;
+
+    const statusEl = document.getElementById('connection-status');
+    const typeEl = document.getElementById('connection-type');
+
+    statusEl.classList.remove('hidden');
+    typeEl.classList.remove('connection-direct', 'connection-relay');
+
+    if (type === 'direct') {
+      typeEl.textContent = '● Connected (Direct)';
+      typeEl.classList.add('connection-direct');
+    } else {
+      typeEl.textContent = '● Connected (Relay)';
+      typeEl.classList.add('connection-relay');
+    }
+  });
 }

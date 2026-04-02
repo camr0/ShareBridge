@@ -118,6 +118,25 @@
 
     .hidden { display: none; }
     #breadcrumb.hidden { display: none; }
+
+    .connection-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 500;
+      margin-bottom: 12px;
+    }
+
+    .connection-direct {
+      background: #10b981;
+      color: white;
+    }
+
+    .connection-relay {
+      background: #f59e0b;
+      color: white;
+    }
   </style>
 </head>
 <body>
@@ -133,6 +152,9 @@
     <input id="password-input" type="password" placeholder="Enter password" />
     <button onclick="submitPassword()">Unlock</button>
     <div id="password-error"></div>
+  </div>
+  <div id="connection-status" class="hidden">
+    <span id="connection-type" class="connection-badge">● Connected</span>
   </div>
   <div id="breadcrumb" class="hidden"></div>
   <div id="file-list" class="hidden"></div>
