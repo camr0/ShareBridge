@@ -107,9 +107,13 @@ func main() {
         // Print resulting code
         return
     }
-    // Otherwise, error or start daemon (based on flag)
+    // Fallback: run in single-session mode (current behavior)
+    // This preserves backward compatibility for users who don't run the daemon
+    runSingleSessionMode(url, password, maxDownloads)
 }
 ```
+
+**Note:** This preserves backward compatibility. Users can continue using `opencloudshare share <url>` without running a daemon — it will work exactly as before (single share, process exits when share expires).
 
 ### Process Management
 
@@ -127,7 +131,21 @@ The daemon should handle SIGTERM/SIGINT gracefully:
 
 ## Session Model
 
+### In-Memory Representation
+
+The daemon maintains sessions as a map keyed by session code for O(1) lookup:
+
+```go
+type Daemon struct {
+    // ...
+    sessions map[string]*SessionEntry  // code -> session
+    // ...
+}
+```
+
 ### Persisted Session (sessions.json)
+
+Sessions are stored as an array on disk (preserves order, simpler JSON):
 
 ```go
 type SessionEntry struct {
@@ -142,7 +160,42 @@ type SessionEntry struct {
 }
 ```
 
+**Loading:** On startup, read array from JSON, build in-memory map keyed by `code`.
+
+**Saving:** On any change, rebuild array from map values, write to JSON with atomic rename.
+
 **Breaking change from current store:** The current `sessions.json` only stores `code`, `download_count`, and `api_key_id`. Migration: on first run with new version, existing sessions are invalid (agent re-registers with fresh codes).
+
+### Session Expiry Pruning
+
+The daemon runs a background goroutine that prunes expired sessions:
+
+```go
+func (d *Daemon) startExpiryPruner() {
+    ticker := time.NewTicker(1 * time.Minute)
+    go func() {
+        for range ticker.C {
+            d.pruneExpiredSessions()
+        }
+    }()
+}
+
+func (d *Daemon) pruneExpiredSessions() {
+    now := time.Now()
+    for code, session := range d.sessions {
+        if session.ExpiresAt.Before(now) {
+            // Deregister from signaling server
+            d.signaling.DeregisterSession(code)
+            // Remove from memory
+            delete(d.sessions, code)
+            // Persist changes
+            d.store.Save(d.sessions)
+        }
+    }
+}
+```
+
+This ensures expired sessions are cleaned up even if no user interaction occurs.
 
 ### Store File Structure
 
@@ -232,20 +285,24 @@ When user clicks "Save Settings":
 PicoCSS and HTMX are embedded into the binary via `go:embed`:
 
 ```go
-//go:embed static/*
-var staticFS embed.FS
+// In internal/web/server.go:
+//go:embed static/* templates/*
+var embeddedFS embed.FS
 
 // In server setup:
-http.Handle("/static/", http.FileServer(http.FS(staticFS)))
+http.Handle("/static/", http.FileServer(http.FS(embeddedFS)))
 ```
 
-Directory structure:
+Directory structure (inside `internal/web/`):
 ```
-agent/
+agent/internal/web/
 ├── static/
-│   ├── pico.min.css      # Downloaded from PicoCSS CDN
-│   ├── htmx.min.js       # Downloaded from HTMX CDN
+│   ├── pico.min.css      # Downloaded from PicoCSS release
+│   ├── htmx.min.js       # Downloaded from HTMX release
 │   └── custom.css        # Mode badges, warning boxes
+└── templates/
+    ├── layout.html
+    └── ...
 ```
 
 This ensures the UI works offline (home server without internet access).
@@ -494,18 +551,29 @@ agent/
 │   └── main.go              # Entry point, starts daemon + web server
 ├── internal/
 │   ├── web/
-│   │   ├── server.go        # HTTP server setup, routes
+│   │   ├── server.go        # HTTP server setup, routes, go:embed directives
 │   │   ├── handlers.go      # Page handlers (Dashboard, Settings, etc.)
-│   │   └── api.go           # HTMX API endpoints
+│   │   ├── api.go           # HTMX API endpoints
+│   │   ├── static/          # Embedded static files (go:embed)
+│   │   │   ├── pico.min.css
+│   │   │   ├── htmx.min.js
+│   │   │   └── custom.css
+│   │   └── templates/       # Embedded templates (go:embed)
+│   │       ├── layout.html
+│   │       ├── dashboard.html
+│   │       ├── settings.html
+│   │       ├── history.html
+│   │       ├── share-form.html
+│   │       └── share-card.html
 │   └── store/
-│       └── store.go         # Session persistence (add RelayOnly field)
-└── templates/
-    ├── layout.html          # Base layout (header, footer, nav)
-    ├── dashboard.html       # Dashboard page content
-    ├── settings.html        # Settings page content
-    ├── history.html         # History page content (placeholder)
-    ├── share-form.html      # New Share modal content
-    └── share-card.html      # Session card fragment (for HTMX)
+│       └── store.go         # Session persistence
+```
+
+**Note:** `static/` and `templates/` are inside `internal/web/` because `go:embed` can only reference paths relative to the file containing the directive. The embed directive in `server.go`:
+
+```go
+//go:embed static/* templates/*
+var embeddedFS embed.FS
 ```
 
 ---
@@ -570,7 +638,9 @@ Files are embedded via `go:embed` (see Tech Stack section) and served from `/sta
 
 4. **API key storage:** Stored in `config.json` with user-only permissions (0600). UI shows masked value with Show/Hide toggle.
 
-5. **CSRF protection:** All state-modifying endpoints (POST, DELETE, PUT) verify the `X-Requested-With: XMLHttpRequest` header, which HTMX sends by default. Reject requests missing this header with 403 Forbidden.
+5. **Plaintext passwords in sessions.json:** Session passwords are stored in plaintext because they're needed to re-register sessions after daemon restart. Mitigation: `sessions.json` has 0600 permissions (user-only read/write). The threat model assumes an attacker with file system access already controls the machine.
+
+6. **CSRF protection:** All state-modifying endpoints (POST, DELETE, PUT) verify the `X-Requested-With: XMLHttpRequest` header, which HTMX sends by default. Reject requests missing this header with 403 Forbidden.
 
    ```go
    func csrfMiddleware(next http.Handler) http.Handler {
