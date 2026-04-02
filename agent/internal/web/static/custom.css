@@ -1,1 +1,164 @@
-/* Placeholder - custom CSS will be added here */
+/* Mode badges */
+.badge {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.badge-direct {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.badge-relay {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+/* Warning boxes */
+.warning {
+  padding: 0.75rem 1rem;
+  border-radius: 4px;
+  margin: 0.5rem 0;
+  font-size: 0.875rem;
+}
+
+.warning-amber {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.warning-red {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+/* Revoke button */
+.btn-revoke {
+  background: transparent;
+  color: #dc2626;
+  border-color: #dc2626;
+}
+
+.btn-revoke:hover {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+/* Share card */
+.share-card {
+  margin-bottom: 1rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  transition: opacity 0.5s ease-out;
+}
+
+.share-card .share-url {
+  color: #6b7280;
+  font-family: monospace;
+  font-size: 0.875rem;
+  word-break: break-all;
+}
+
+/* Status indicator */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 0.25rem;
+}
+
+.status-connected {
+  background: #22c55e;
+}
+
+.status-disconnected {
+  background: #ef4444;
+}
+
+.status-unknown {
+  background: #9ca3af;
+}
+
+/* Connection status text */
+#conn-status {
+  display: flex;
+  align-items: center;
+  font-size: 0.875rem;
+}
+
+/* HTMX indicators */
+.htmx-request .htmx-indicator {
+  display: inline-block;
+}
+
+.htmx-indicator {
+  display: none;
+}
+
+/* Placeholder message */
+.placeholder-message {
+  text-align: center;
+  padding: 2rem;
+  color: #6b7280;
+}
+
+.placeholder-message h3 {
+  color: #374151;
+  margin-bottom: 1rem;
+}
+
+.placeholder-message ul {
+  text-align: left;
+  display: inline-block;
+  margin-top: 1rem;
+}
+
+/* Placeholder (legacy class) */
+.placeholder {
+  text-align: center;
+  padding: 2rem;
+  color: #666;
+}
+
+/* Dialog */
+dialog article {
+  max-width: 600px;
+}
+
+dialog article header hgroup {
+  margin-bottom: 1rem;
+}
+
+dialog .close {
+  float: right;
+  text-decoration: none;
+  font-size: 1.5rem;
+}
+
+/* Form fieldsets */
+fieldset {
+  margin-bottom: 1rem;
+}
+
+fieldset legend {
+  font-weight: 600;
+}
+
+/* Grid improvements for share cards */
+.share-card .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1rem;
+  align-items: center;
+}
+
+/* Fade out animation for removed shares */
+.share-card.htmx-swapping {
+  opacity: 0;
+}

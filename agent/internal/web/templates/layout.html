@@ -4,12 +4,43 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{.Title}} - OpenCloudShare Agent</title>
-    <!-- Placeholder - styles will be added here -->
+    <link rel="stylesheet" href="/static/pico.min.css">
+    <link rel="stylesheet" href="/static/custom.css">
+    <script src="/static/htmx.min.js" defer></script>
 </head>
 <body>
-    <!-- Placeholder - layout content will be added here -->
-    <main>
+    <header class="container">
+        <nav>
+            <ul>
+                <li><strong><a href="/">OpenCloudShare</a></strong></li>
+            </ul>
+            <ul>
+                <li><a href="/" {{if eq .ActivePage "dashboard"}}aria-current="page"{{end}}>Dashboard</a></li>
+                <li><a href="/history" {{if eq .ActivePage "history"}}aria-current="page"{{end}}>History</a></li>
+                <li><a href="/settings" {{if eq .ActivePage "settings"}}aria-current="page"{{end}}>Settings</a></li>
+            </ul>
+            <ul>
+                <li id="conn-status" hx-get="/api/status" hx-trigger="load, every 5s">
+                    <span class="status-dot status-unknown"></span>
+                    <span>Checking...</span>
+                </li>
+            </ul>
+        </nav>
+    </header>
+    <main class="container">
         {{template "content" .}}
     </main>
+    <footer class="container">
+        <hr>
+        <small>
+            OpenCloudShare Agent v{{.Version}} · Uptime: {{.Uptime}}
+            <span style="float: right;">
+                <a href="https://github.com/ali-raheem/OpenCloudShare" target="_blank">GitHub</a> ·
+                <a href="https://github.com/ali-raheem/OpenCloudShare/wiki" target="_blank">Docs</a> ·
+                <a href="https://github.com/ali-raheem/OpenCloudShare/issues" target="_blank">Report Issue</a>
+            </span>
+        </small>
+    </footer>
+    <div id="modal-container"></div>
 </body>
 </html>

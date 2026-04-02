@@ -1,0 +1,94 @@
+{{define "content"}}
+<article>
+    <header>
+        <hgroup>
+            <h1>Settings</h1>
+            <p>Configure your agent connection and defaults</p>
+        </hgroup>
+    </header>
+
+    <form hx-put="/api/settings" hx-target="#settings-result">
+        <!-- Signaling Server Section -->
+        <fieldset>
+            <legend>Signaling Server</legend>
+            <div class="grid">
+                <label for="signaling-url">
+                    Server URL
+                    <input type="url" id="signaling-url" name="signaling_url"
+                        placeholder="wss://share.example.com" value="{{.Config.SignalingURL}}" required>
+                </label>
+                <label for="api-key">
+                    API Key
+                    <input type="password" id="api-key" name="api_key"
+                        placeholder="ocs_..." value="{{.Config.APIKey}}">
+                    <small>Key shown once on creation — enter from your OpenCloud instance</small>
+                </label>
+            </div>
+        </fieldset>
+
+        <!-- OpenCloud Section -->
+        <fieldset>
+            <legend>OpenCloud</legend>
+            <label for="allowed-host">
+                Allowed Host
+                <input type="text" id="allowed-host" name="allowed_host"
+                    placeholder="opencloud.example.com" value="{{.Config.AllowedHost}}">
+                <small>SSRF protection — only shares from this host are allowed</small>
+            </label>
+        </fieldset>
+
+        <!-- Default Share Settings Section -->
+        <fieldset>
+            <legend>Default Share Settings</legend>
+            <div class="grid">
+                <label for="default-expiry">
+                    Default Expiry
+                    <select id="default-expiry" name="default_expiry_hours">
+                        <option value="1" {{if eq .Config.DefaultExpiry 1}}selected{{end}}>1 hour</option>
+                        <option value="6" {{if eq .Config.DefaultExpiry 6}}selected{{end}}>6 hours</option>
+                        <option value="12" {{if eq .Config.DefaultExpiry 12}}selected{{end}}>12 hours</option>
+                        <option value="24" {{if eq .Config.DefaultExpiry 24}}selected{{end}}>24 hours (1 day)</option>
+                        <option value="72" {{if eq .Config.DefaultExpiry 72}}selected{{end}}>3 days</option>
+                        <option value="168" {{if eq .Config.DefaultExpiry 168}}selected{{end}}>7 days</option>
+                    </select>
+                </label>
+                <label for="default-max-downloads">
+                    Default Max Downloads
+                    <input type="number" id="default-max-downloads" name="default_max_downloads"
+                        placeholder="10" value="{{.Config.DefaultMaxDownloads}}" min="0">
+                    <small>0 = unlimited</small>
+                </label>
+                <label for="default-mode">
+                    Default Connection Mode
+                    <select id="default-mode" name="default_relay_only">
+                        <option value="false" {{if not .Config.DefaultRelayOnly}}selected{{end}}>Direct (recommended)</option>
+                        <option value="true" {{if .Config.DefaultRelayOnly}}selected{{end}}>Relay (hide IP)</option>
+                    </select>
+                </label>
+            </div>
+        </fieldset>
+
+        <div class="grid">
+            <button type="submit" class="primary">Save Settings</button>
+            <button type="button" onclick="resetForm()">Reset to Defaults</button>
+        </div>
+
+        <div id="settings-result"></div>
+    </form>
+</article>
+
+<article>
+    <header>
+        <h2>About</h2>
+    </header>
+    <p>
+        OpenCloudShare Agent v{{.Version}}<br>
+        Uptime: {{.Uptime}}
+    </p>
+    <small>
+        <a href="https://github.com/ali-raheem/OpenCloudShare" target="_blank">GitHub</a> ·
+        <a href="https://github.com/ali-raheem/OpenCloudShare/wiki" target="_blank">Documentation</a> ·
+        <a href="https://github.com/ali-raheem/OpenCloudShare/issues" target="_blank">Report Issue</a>
+    </small>
+</article>
+{{end}}

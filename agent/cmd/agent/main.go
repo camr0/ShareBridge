@@ -1,34 +1,50 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/spf13/cobra"
 	"opencloudshare/agent/internal/config"
+	"opencloudshare/agent/internal/daemon"
 	"opencloudshare/agent/internal/opencloud"
 	"opencloudshare/agent/internal/peer"
 	"opencloudshare/agent/internal/signaling"
 	"opencloudshare/agent/internal/store"
 	"opencloudshare/agent/internal/transfer"
+	"opencloudshare/agent/internal/web"
 )
 
 var (
 	password     string
 	maxDownloads int
+	expiryHours  int
+	relayOnly    bool
 )
 
 func init() {
 	rootCmd.AddCommand(shareCmd)
+	rootCmd.AddCommand(daemonCmd)
+
 	shareCmd.Flags().StringVarP(&password, "password", "p", "", "Optional password for share access")
 	shareCmd.Flags().IntVarP(&maxDownloads, "max-downloads", "n", 0, "Maximum number of downloads (0=unlimited)")
+	shareCmd.Flags().IntVarP(&expiryHours, "expiry", "e", 24, "Expiry time in hours")
+	shareCmd.Flags().BoolVarP(&relayOnly, "relay", "r", false, "Force relay-only mode (TURN required)")
+
+	daemonCmd.Flags().StringVarP(&password, "password", "p", "", "Password for web UI (optional)")
 }
 
 var rootCmd = &cobra.Command{
@@ -43,6 +59,12 @@ var shareCmd = &cobra.Command{
 	RunE:  runShare,
 }
 
+var daemonCmd = &cobra.Command{
+	Use:   "daemon",
+	Short: "Start the persistent daemon with web UI",
+	RunE:  runDaemon,
+}
+
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -50,9 +72,182 @@ func main() {
 	}
 }
 
+// runDaemon starts the persistent daemon with web UI.
+func runDaemon(cmd *cobra.Command, args []string) error {
+	// Create config manager
+	cfgMgr, err := config.NewManager()
+	if err != nil {
+		return fmt.Errorf("create config manager: %w", err)
+	}
+	cfg := cfgMgr.Get()
+
+	// Validate API key is set
+	if cfg.APIKey == "" {
+		return fmt.Errorf("API key required — set in config.json or OPENCLOUDSHARE_API_KEY env var")
+	}
+
+	// Create store
+	st, err := store.New()
+	if err != nil {
+		return fmt.Errorf("session store: %w", err)
+	}
+
+	// Create daemon
+	d, err := daemon.New(cfgMgr, st)
+	if err != nil {
+		return fmt.Errorf("create daemon: %w", err)
+	}
+
+	// Create web server
+	uiPort := cfg.UIPort
+	uiPassword := cfg.UIPassword
+	if uiPassword == "" {
+		uiPassword = password // Allow CLI override
+	}
+
+	webServer, err := web.NewWebServer(nil, uiPort, uiPassword)
+	if err != nil {
+		return fmt.Errorf("create web server: %w", err)
+	}
+
+	// Set up circular reference
+	d.SetWebServer(webServer)
+	webServer.SetDaemon(d)
+
+	// Handle Ctrl-C gracefully
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	// Start daemon
+	errChan := d.Start(ctx)
+
+	log.Printf("daemon started — web UI at http://127.0.0.1:%d", uiPort)
+
+	// Wait for interrupt or error
+	select {
+	case <-ctx.Done():
+		log.Println("shutting down...")
+	case err := <-errChan:
+		log.Printf("daemon error: %v", err)
+	}
+
+	// Stop gracefully
+	if err := d.Stop(); err != nil {
+		log.Printf("stop error: %v", err)
+	}
+
+	return nil
+}
+
+// runShare shares a file URL, either by delegating to a running daemon
+// or by running in single-session mode.
 func runShare(cmd *cobra.Command, args []string) error {
 	shareURL := args[0]
 
+	// Check if daemon is running
+	daemonURL := "http://127.0.0.1:7878/api/status"
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	resp, err := client.Get(daemonURL)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		resp.Body.Close()
+		// Daemon is running — delegate to it
+		return runShareClient(shareURL)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	// Daemon not running — run in single-session mode
+	return runShareSingle(shareURL)
+}
+
+// runShareClient sends a create-share request to the running daemon.
+func runShareClient(shareURL string) error {
+	// Build form data
+	formData := url.Values{}
+	formData.Set("share_url", shareURL)
+	if password != "" {
+		formData.Set("password", password)
+	}
+	formData.Set("expiry_hours", strconv.Itoa(expiryHours))
+	formData.Set("max_downloads", strconv.Itoa(maxDownloads))
+	if relayOnly {
+		formData.Set("relay_only", "true")
+	}
+
+	// POST to daemon API
+	daemonURL := "http://127.0.0.1:7878/api/shares"
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequest("POST", daemonURL, bytes.NewBufferString(formData.Encode()))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest") // CSRF header
+
+	// Add basic auth if UI password is set
+	uiPassword := os.Getenv("UI_PASSWORD")
+	if uiPassword != "" {
+		req.SetBasicAuth("", uiPassword)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("daemon request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("daemon error (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	// Parse the response HTML to extract the share code
+	// The response is a share-card HTML fragment
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	// Extract code from HTML (simple parsing)
+	// Looking for data-code attribute in share-card
+	code := extractCodeFromHTML(string(body))
+	if code == "" {
+		// If we couldn't extract, just show success
+		fmt.Printf("Share created — check daemon web UI at http://127.0.0.1:7878\n")
+	} else {
+		fmt.Printf("Session ready — code: %s\n", code)
+		fmt.Printf("Open http://localhost:8080 and enter code: %s\n", code)
+	}
+
+	return nil
+}
+
+// extractCodeFromHTML extracts the share code from share-card HTML.
+func extractCodeFromHTML(html string) string {
+	// Look for <h3 style="margin: 0;">CODE</h3>
+	h3Start := strings.Index(html, "<h3")
+	if h3Start == -1 {
+		return ""
+	}
+	contentStart := strings.Index(html[h3Start:], ">")
+	if contentStart == -1 {
+		return ""
+	}
+	contentStart += h3Start + 1
+
+	h3End := strings.Index(html[contentStart:], "</h3>")
+	if h3End == -1 {
+		return ""
+	}
+
+	return strings.TrimSpace(html[contentStart:contentStart+h3End])
+}
+
+// runShareSingle runs the share in single-session mode without daemon.
+func runShareSingle(shareURL string) error {
 	cfg := config.Load()
 	cfg.Password = password
 	cfg.MaxDownloads = maxDownloads
@@ -72,11 +267,16 @@ func runShare(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("session store: %w", err)
 	}
 
-	// Get or generate AgentID
+	// Get AgentID
 	agentID := st.GetAgentID()
 
-	// Load persisted state
-	preferredCode := st.GetCode(shareURL)
+	// Check for existing session for this share URL
+	var preferredCode string
+	existingSession := st.GetByShareURL(shareURL)
+	if existingSession != nil {
+		preferredCode = existingSession.Code
+		log.Printf("found existing session for this URL — code: %s", preferredCode)
+	}
 
 	// Handle Ctrl-C gracefully
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -125,12 +325,12 @@ func runShare(cmd *cobra.Command, args []string) error {
 }
 
 func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, st *store.Store, preferredCode string, agentID string) (string, error) {
-	sig := signaling.New(cfg.SignalingServer, cfg.APIKey, agentID)
+	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
 	if err := sig.Connect(ctx); err != nil {
 		return "", fmt.Errorf("connect to signaling server: %w", err)
 	}
-	log.Printf("connected to signaling server at %s", cfg.SignalingServer)
+	log.Printf("connected to signaling server at %s", cfg.SignalingURL)
 
 	// Use new RegisterShare instead of CreateSession
 	code, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode)
@@ -144,13 +344,25 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 	}
 	log.Printf("open browser: http://localhost:8080 then enter code: %s", code)
 
-	if err := st.SetCode(shareURL, code); err != nil {
-		log.Fatalf("fatal: could not save session code: %v", err)
+	// Save session to store
+	now := time.Now()
+	session := store.SessionEntry{
+		Code:         code,
+		ShareURL:     shareURL,
+		Password:     password,
+		ExpiresAt:    now.Add(time.Duration(expiryHours) * time.Hour),
+		MaxDownloads: maxDownloads,
+		Downloads:    0,
+		RelayOnly:    relayOnly,
+		CreatedAt:    now,
+	}
+	if err := st.SaveSession(session); err != nil {
+		log.Printf("warning: could not save session: %v", err)
 	}
 
 	var (
 		mu    sync.Mutex
-		peers = make(map[string]*peer.Peer)
+		peers = make(map[string]*peer.Peer) // peerID -> Peer
 	)
 
 	sig.OnMessage = func(msg signaling.Message) {
@@ -159,8 +371,9 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 			log.Println("agent authenticated with signaling server")
 
 		case "join":
-			log.Printf("browser joined session %s — starting WebRTC handshake", msg.SessionID)
-			sessionID := msg.SessionID
+			sessionCode := msg.SessionID
+			peerID := msg.PeerID
+			log.Printf("browser joined session %s (peer %s) — starting WebRTC handshake", sessionCode, peerID)
 
 			iceServers := sig.GetICEServers()
 			if len(iceServers) == 0 {
@@ -169,42 +382,49 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 					{URLs: []string{"stun:stun.cloudflare.com:3478"}},
 				}
 			}
-			p, err := peer.New(iceServers, false) // false = Direct mode (default)
+			p, err := peer.New(iceServers, relayOnly)
 			if err != nil {
 				log.Printf("create peer: %v", err)
 				return
 			}
 
 			mu.Lock()
-			peers[sessionID] = p
+			peers[peerID] = p
 			mu.Unlock()
 
 			p.OnClosed = func() {
-				log.Printf("peer closed (session %s)", sessionID)
+				log.Printf("peer closed (peer %s, session %s)", peerID, sessionCode)
 				mu.Lock()
-				delete(peers, sessionID)
+				delete(peers, peerID)
 				mu.Unlock()
 			}
 			p.OnICECandidate = func(init webrtc.ICECandidateInit) {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "ice_candidate",
-					"session_id": sessionID,
+					"session_id": sessionCode,
+					"peer_id":    peerID,
 					"candidate":  init,
 				}); err != nil {
 					log.Printf("send ICE candidate: %v", err)
 				}
 			}
 
-			tm := transfer.NewManager(p, webdavClient, cfg.Password, cfg.MaxDownloads)
+			// Get persisted download count from store
+			existingSession := st.GetSession(code)
+			downloadCount := 0
+			if existingSession != nil {
+				downloadCount = existingSession.Downloads
+			}
 
-			// Restore persisted download count
-			tm.SetDownloadCount(st.GetDownloadCount(shareURL))
+			tm := transfer.NewManager(p, webdavClient, cfg.Password, cfg.MaxDownloads)
+			tm.SetDownloadCount(downloadCount)
 
 			// Wire callbacks before CreateOffer to avoid any race with a fast peer
 			tm.OnAuthFailed = func() {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "auth_failed",
-					"session_id": sessionID,
+					"session_id": sessionCode,
+					"peer_id":    peerID,
 				}); err != nil {
 					log.Printf("send auth_failed: %v", err)
 				}
@@ -212,14 +432,15 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 			tm.OnSessionExpired = func() {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "session_expired",
-					"session_id": sessionID,
+					"session_id": sessionCode,
+					"peer_id":    peerID,
 				}); err != nil {
 					log.Printf("send session_expired: %v", err)
 				}
 			}
 			tm.OnDownloadComplete = func(bytesTransferred int64) {
 				// Persist download count
-				if _, err := st.IncrementDownloadCount(shareURL); err != nil {
+				if _, err := st.IncrementDownloads(code); err != nil {
 					log.Printf("warning: could not persist download count: %v", err)
 				}
 				// Notify server for tier tracking
@@ -228,7 +449,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 				}
 			}
 			p.OnOpen = func() {
-				log.Printf("✓ DataChannel open! (session %s)", sessionID)
+				log.Printf("DataChannel open! (peer %s, session %s)", peerID, sessionCode)
 				tm.HandleOpen()
 			}
 
@@ -242,7 +463,8 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 
 			if err := sig.Send(ctx, map[string]any{
 				"type":       "offer",
-				"session_id": sessionID,
+				"session_id": sessionCode,
+				"peer_id":    peerID,
 				"sdp":        sdp,
 			}); err != nil {
 				log.Printf("send offer: %v", err)
@@ -250,9 +472,10 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 
 		case "answer":
 			mu.Lock()
-			p, ok := peers[msg.SessionID]
+			p, ok := peers[msg.PeerID]
 			mu.Unlock()
 			if !ok {
+				log.Printf("answer for unknown peer %s", msg.PeerID)
 				return
 			}
 			if err := p.SetAnswer(msg.SDP); err != nil {
@@ -261,9 +484,10 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 
 		case "ice_candidate":
 			mu.Lock()
-			p, ok := peers[msg.SessionID]
+			p, ok := peers[msg.PeerID]
 			mu.Unlock()
 			if !ok {
+				log.Printf("ICE candidate for unknown peer %s", msg.PeerID)
 				return
 			}
 			var init webrtc.ICECandidateInit

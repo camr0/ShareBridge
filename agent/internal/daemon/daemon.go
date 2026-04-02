@@ -651,6 +651,24 @@ func (d *Daemon) HasTURN() bool {
 	return d.hasTURN
 }
 
+// GetConfig returns the current configuration.
+func (d *Daemon) GetConfig() *config.Config {
+	return d.config
+}
+
+// SaveConfig updates and persists the configuration.
+// It uses the config manager to save to the config file.
+func (d *Daemon) SaveConfig(cfg *config.Config) error {
+	d.config = cfg
+	if d.configMgr != nil {
+		// Cast to concrete type to access Save method
+		if mgr, ok := d.configMgr.(*config.Manager); ok {
+			return mgr.Save(cfg)
+		}
+	}
+	return nil
+}
+
 // hasTURNServer checks if any ICE server is a TURN server.
 func hasTURNServer(servers []webrtc.ICEServer) bool {
 	for _, server := range servers {

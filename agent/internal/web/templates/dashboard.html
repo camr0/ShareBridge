@@ -1,0 +1,22 @@
+{{define "content"}}
+<article>
+    <header>
+        <hgroup>
+            <h1>Active Shares</h1>
+            <p>Manage your active share sessions</p>
+        </hgroup>
+    </header>
+    <div style="display: flex; justify-content: flex-end; margin-bottom: 1rem;">
+        <button
+            hx-get="/api/share-form"
+            hx-target="#modal-container"
+            hx-swap="innerHTML"
+            class="primary">
+            + New Share
+        </button>
+    </div>
+    <div id="shares-list" hx-get="/api/shares" hx-trigger="load, every 10s">
+        <p><em>Loading shares...</em></p>
+    </div>
+</article>
+{{end}}
