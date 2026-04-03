@@ -25,6 +25,13 @@ func (ws *WebServer) listSharesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get signaling URL for deriving public share URLs
+	signalingURL := ""
+	if ws.daemon != nil {
+		cfg := ws.daemon.GetConfig()
+		signalingURL = cfg.SignalingURL
+	}
+
 	// Parse the share-card template
 	tmpl, err := template.ParseFS(embeddedFS, "templates/share-card.html")
 	if err != nil {
@@ -38,6 +45,7 @@ func (ws *WebServer) listSharesHandler(w http.ResponseWriter, r *http.Request) {
 		data := sessionData{
 			Code:              session.Code,
 			ShareURL:          session.ShareURL,
+			PublicURL:         derivePublicURL(signalingURL, session.Code),
 			Downloads:         session.Downloads,
 			MaxDownloads:      session.MaxDownloads,
 			RelayOnly:         session.RelayOnly,
@@ -107,6 +115,13 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Get signaling URL for deriving public share URL
+	signalingURL := ""
+	if ws.daemon != nil {
+		cfg := ws.daemon.GetConfig()
+		signalingURL = cfg.SignalingURL
+	}
+
 	// Parse share-card template
 	tmpl, err := template.ParseFS(embeddedFS, "templates/share-card.html")
 	if err != nil {
@@ -118,6 +133,7 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 	data := sessionData{
 		Code:              session.Code,
 		ShareURL:          session.ShareURL,
+		PublicURL:         derivePublicURL(signalingURL, session.Code),
 		Downloads:         session.Downloads,
 		MaxDownloads:      session.MaxDownloads,
 		RelayOnly:         session.RelayOnly,

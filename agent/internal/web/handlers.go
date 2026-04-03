@@ -33,6 +33,7 @@ type configData struct {
 type sessionData struct {
 	Code              string
 	ShareURL          string
+	PublicURL         string // Derived from signaling URL: https://host/s/:code
 	Downloads         int
 	MaxDownloads      int
 	RelayOnly         bool
@@ -149,4 +150,28 @@ func formatUptime(start time.Time) string {
 	}
 
 	return fmt.Sprintf("%dm", minutes)
+}
+
+// derivePublicURL converts a signaling WebSocket URL to a public share URL.
+// e.g., "wss://signal.example.com/ws" -> "https://signal.example.com/s/:code"
+func derivePublicURL(signalingURL, code string) string {
+	// Handle common WebSocket URL patterns
+	url := signalingURL
+
+	// Replace ws:// with http:// and wss:// with https://
+	if len(url) >= 5 && url[:5] == "ws://" {
+		url = "http://" + url[5:]
+	} else if len(url) >= 6 && url[:6] == "wss://" {
+		url = "https://" + url[6:]
+	}
+
+	// Remove trailing /ws or / if present
+	if len(url) >= 3 && url[len(url)-3:] == "/ws" {
+		url = url[:len(url)-3]
+	} else if len(url) >= 1 && url[len(url)-1] == '/' {
+		url = url[:len(url)-1]
+	}
+
+	// Build the public share URL
+	return url + "/s/" + code
 }
