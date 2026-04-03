@@ -119,8 +119,34 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 					"candidate": msg.Candidate,
 				})
 
+			case "nonce":
+				// Route nonce from agent to the specific browser identified by connID.
+				if agentID == "" {
+					continue
+				}
+				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+					"type":         "nonce",
+					"conn_id":      msg.ConnID,
+					"value":        msg.Value,
+					"has_password": msg.HasPassword,
+				})
+
 			case "auth_failed":
-				log.Printf("auth failed on session %s", msg.SessionID)
+				// Track failures per connID. After 3, close the browser WebSocket.
+				// Browser receives auth_failed with attempts_remaining so it can re-prompt.
+				if agentID == "" {
+					continue
+				}
+				failures := h.IncrementAuthFailure(msg.ConnID)
+				log.Printf("HMAC auth failed: conn %s failure %d/3", msg.ConnID, failures)
+				if failures >= 3 {
+					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
+				} else {
+					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+						"type":              "auth_failed",
+						"attempts_remaining": 3 - failures,
+					})
+				}
 
 			case "session_expired":
 				log.Printf("session expired (max downloads): %s", msg.SessionID)
