@@ -19,15 +19,18 @@ import (
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type       string          `json:"type"`
-	AgentID    string          `json:"agent_id,omitempty"`
-	Code       string          `json:"code,omitempty"`
-	ShareURL   string          `json:"share_url,omitempty"`
-	ExpiresAt  *time.Time      `json:"expires_at,omitempty"`
-	MaxDownloads *int          `json:"max_downloads,omitempty"`
-	SessionID  string          `json:"session_id,omitempty"`
-	SDP        string          `json:"sdp,omitempty"`
-	Candidate  json.RawMessage `json:"candidate,omitempty"`
+	Type         string          `json:"type"`
+	AgentID      string          `json:"agent_id,omitempty"`
+	Code         string          `json:"code,omitempty"`
+	ShareURL     string          `json:"share_url,omitempty"`
+	ExpiresAt    *time.Time      `json:"expires_at,omitempty"`
+	MaxDownloads *int            `json:"max_downloads,omitempty"`
+	SessionID    string          `json:"session_id,omitempty"`
+	SDP          string          `json:"sdp,omitempty"`
+	Candidate    json.RawMessage `json:"candidate,omitempty"`
+	ConnID       string          `json:"conn_id,omitempty"`
+	Value        string          `json:"value,omitempty"`
+	HasPassword  bool            `json:"has_password,omitempty"`
 }
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore

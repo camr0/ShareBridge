@@ -27,6 +27,8 @@ type Message struct {
 	Candidate   json.RawMessage `json:"candidate,omitempty"`
 	Err         string          `json:"message,omitempty"`
 	Code        string          `json:"code,omitempty"`
+	ConnID      string          `json:"conn_id,omitempty"`
+	HMAC        string          `json:"hmac,omitempty"`
 	Reconnected bool            `json:"reconnected,omitempty"`
 	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
 }

@@ -18,6 +18,7 @@ type browserMsg struct {
 	Type      string          `json:"type"`
 	SDP       string          `json:"sdp,omitempty"`
 	Candidate json.RawMessage `json:"candidate,omitempty"`
+	HMAC      string          `json:"hmac,omitempty"`
 }
 
 func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.HandlerFunc {
