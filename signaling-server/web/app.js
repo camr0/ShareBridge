@@ -10,11 +10,11 @@ let isDownloading = false;
 let transferStartTime = 0;
 
 // Navigation state
-let currentPath = [];     // e.g. [] = root, ["docs", "reports"] = two levels deep
-let sessionPassword = ''; // cached after password submit; cleared on resetUI
+let currentPath = [];
+let sessionPassword = ''; // set from URL hash on load, or from password input
 
-// Auth state
-let authAttempts = 0;
+// HMAC pre-challenge state
+let pendingNonce = null; // nonce received from agent, consumed on join
 
 function status(msg) {
   document.getElementById('status').textContent = msg;
@@ -62,6 +62,37 @@ function join() {
             resetUI();
           }
         };
+
+        // Send knock immediately after ICE config received
+        ws.send(JSON.stringify({ type: 'knock' }));
+        break;
+
+      case 'nonce':
+        pendingNonce = msg.value;
+        if (msg.has_password && !sessionPassword) {
+          showSection('password-section');
+          document.getElementById('password-input').focus();
+        } else {
+          sendJoin();
+        }
+        break;
+
+      case 'auth_failed':
+        {
+          const errorDiv = document.getElementById('password-error');
+          const attemptsRemaining = msg.attempts_remaining || 0;
+          if (attemptsRemaining <= 0) {
+            errorDiv.textContent = 'Too many incorrect attempts. Connection closed.';
+            document.getElementById('password-input').disabled = true;
+            document.querySelector('#password-section button').disabled = true;
+          } else {
+            errorDiv.textContent = `Incorrect password. ${attemptsRemaining} attempt${attemptsRemaining === 1 ? '' : 's'} remaining.`;
+            document.getElementById('password-input').value = '';
+            document.getElementById('password-input').focus();
+            // Knock again to get a fresh nonce
+            ws.send(JSON.stringify({ type: 'knock' }));
+          }
+        }
         break;
 
       case 'offer':
@@ -102,13 +133,38 @@ function join() {
   };
 }
 
+async function computeHMAC(password, nonce) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(password),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(nonce));
+  return Array.from(new Uint8Array(signature))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function sendJoin() {
+  if (!pendingNonce) return;
+  const hmac = await computeHMAC(sessionPassword, pendingNonce);
+  ws.send(JSON.stringify({ type: 'join', hmac }));
+  pendingNonce = null;
+}
+
 function setupDataChannel() {
   dc.binaryType = 'arraybuffer';
 
   dc.onopen = () => {
     status('DataChannel open!');
     hideSection('join-section');
+    hideSection('password-section');
     setTimeout(updateConnectionStatus, 1000);
+    // Request file list immediately - auth already done via HMAC
+    requestFileList('');
   };
 
   dc.onmessage = (event) => {
@@ -120,9 +176,6 @@ function setupDataChannel() {
 
     const msg = JSON.parse(event.data);
     switch (msg.type) {
-      case 'hello':
-        handleHello(msg);
-        break;
       case 'file_list':
         renderFileList(msg.files);
         break;
@@ -139,11 +192,7 @@ function setupDataChannel() {
   };
 
   dc.onclose = () => {
-    if (authAttempts >= 3) {
-      status('Too many incorrect attempts. Connection closed.');
-    } else {
-      status('Connection closed');
-    }
+    status('Connection closed');
     resetUI();
   };
 }
@@ -332,15 +381,6 @@ function markFileDone(fileItem, file, avgSpeed) {
     formatBytes(file.size) + ' · avg ' + avgSpeed;
 }
 
-function handleHello(msg) {
-  if (msg.password_required) {
-    showSection('password-section');
-    document.getElementById('password-input').focus();
-  } else {
-    requestFileList(''); // path=root; sessionPassword is '' for unprotected shares
-  }
-}
-
 function renderBreadcrumb() {
   const breadcrumb = document.getElementById('breadcrumb');
   if (currentPath.length === 0) {
@@ -378,31 +418,17 @@ function openFolder(name) {
 
 function submitPassword() {
   sessionPassword = document.getElementById('password-input').value;
-  requestFileList('');
+  sendJoin();
 }
 
 function requestFileList(subpath) {
-  dc.send(JSON.stringify({ type: 'list_request', password: sessionPassword, path: subpath }));
+  dc.send(JSON.stringify({ type: 'list_request', path: subpath }));
 }
 
 function handleError(msg) {
   const message = msg.message || '';
-  if (message.toLowerCase().includes('incorrect password')) {
-    authAttempts++;
-    const errorDiv = document.getElementById('password-error');
-    if (authAttempts >= 3) {
-      errorDiv.textContent = 'Too many incorrect attempts. Connection closed.';
-      document.getElementById('password-input').disabled = true;
-      document.querySelector('#password-section button').disabled = true;
-    } else {
-      errorDiv.textContent = `Incorrect password. ${3 - authAttempts} attempts remaining.`;
-      document.getElementById('password-input').value = '';
-      document.getElementById('password-input').focus();
-    }
-  } else {
-    status('Error: ' + message);
-    isDownloading = false;
-  }
+  status('Error: ' + message);
+  isDownloading = false;
 }
 
 function resetUI() {
@@ -422,7 +448,7 @@ function resetUI() {
   isDownloading = false;
   receivedBytes = 0;
   transferStartTime = 0;
-  authAttempts = 0;
+  pendingNonce = null;
   currentPath = [];
   sessionPassword = '';
 }
@@ -507,3 +533,23 @@ function updateConnectionStatus(retries = 5) {
     }
   });
 }
+
+function initFromURL() {
+  const parts = window.location.pathname.split('/');
+  // /s/ABC123 → ['', 's', 'ABC123']
+  if (parts[1] === 's' && parts[2]) {
+    document.getElementById('code').value = parts[2];
+  }
+
+  if (window.location.hash) {
+    sessionPassword = decodeURIComponent(window.location.hash.slice(1));
+    history.replaceState(null, '', window.location.pathname);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  initFromURL();
+  if (document.getElementById('code').value) {
+    join();
+  }
+});
