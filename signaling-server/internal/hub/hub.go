@@ -16,17 +16,21 @@ type pair struct {
 }
 
 type Hub struct {
-	mu     sync.RWMutex
-	agents map[string]*websocket.Conn // apiKey → conn (one conn per API key)
-	codes  map[string]string          // code → apiKey (for browser lookup)
-	pairs  map[string]*pair           // sessionID → pair
+	mu           sync.RWMutex
+	agents       map[string]*websocket.Conn // apiKey → conn (one conn per API key)
+	codes        map[string]string          // code → apiKey (for browser lookup)
+	pairs        map[string]*pair           // sessionID → pair
+	connBrowsers map[string]*websocket.Conn // connID → browser conn
+	connFails    map[string]int             // connID → auth failure count
 }
 
 func New() *Hub {
 	return &Hub{
-		agents: make(map[string]*websocket.Conn),
-		codes:  make(map[string]string),
-		pairs:  make(map[string]*pair),
+		agents:       make(map[string]*websocket.Conn),
+		codes:        make(map[string]string),
+		pairs:        make(map[string]*pair),
+		connBrowsers: make(map[string]*websocket.Conn),
+		connFails:    make(map[string]int),
 	}
 }
 
@@ -129,4 +133,55 @@ func send(ctx context.Context, conn *websocket.Conn, msg any) error {
 		return err
 	}
 	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+// RegisterBrowserConn stores a browser WebSocket connection keyed by connID.
+// Called when a browser WebSocket connects, before the knock/join flow.
+func (h *Hub) RegisterBrowserConn(connID string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.connBrowsers[connID] = conn
+}
+
+// UnregisterBrowserConn removes the browser conn and its failure count.
+// Called in the browser_ws.go defer when the WebSocket closes.
+func (h *Hub) UnregisterBrowserConn(connID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.connBrowsers, connID)
+	delete(h.connFails, connID)
+}
+
+// ForwardToBrowserByConnID sends msg to the browser identified by connID.
+// Used to route nonce responses from the agent back to the correct browser.
+func (h *Hub) ForwardToBrowserByConnID(ctx context.Context, connID string, msg any) error {
+	h.mu.RLock()
+	conn, ok := h.connBrowsers[connID]
+	h.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return send(ctx, conn, msg)
+}
+
+// IncrementAuthFailure increments the failure count for connID and returns
+// the new total. Used by agent_ws.go to enforce the 3-strike limit.
+func (h *Hub) IncrementAuthFailure(connID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.connFails[connID]++
+	return h.connFails[connID]
+}
+
+// CloseBrowserConnWithError sends an error message to the browser identified by
+// connID and then closes its WebSocket. Used after 3 HMAC auth failures.
+func (h *Hub) CloseBrowserConnWithError(ctx context.Context, connID, message string) {
+	h.mu.RLock()
+	conn, ok := h.connBrowsers[connID]
+	h.mu.RUnlock()
+	if !ok {
+		return
+	}
+	send(ctx, conn, map[string]string{"type": "error", "message": message})
+	conn.Close(websocket.StatusNormalClosure, message)
 }
