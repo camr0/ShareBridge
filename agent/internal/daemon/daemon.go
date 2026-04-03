@@ -2,6 +2,10 @@ package daemon
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +22,12 @@ import (
 	"opencloudshare/agent/internal/store"
 	"opencloudshare/agent/internal/transfer"
 )
+
+// nonceEntry holds a per-connection nonce for HMAC pre-challenge.
+type nonceEntry struct {
+	nonce     string
+	expiresAt time.Time
+}
 
 // WebServer is the interface for the admin UI web server.
 // This interface avoids a circular import between daemon and web packages.
@@ -85,6 +95,10 @@ type Daemon struct {
 	signalingConnected bool // true once welcome received
 	hasTURN         bool
 
+	// Nonce store for HMAC pre-challenge (connID -> nonce)
+	nonces   map[string]nonceEntry
+	noncesMu sync.Mutex
+
 	// Callbacks for external handling (e.g., web server refresh)
 	OnSessionAdded   func(session *Session)
 	OnSessionRemoved func(code string)
@@ -103,6 +117,7 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 		store:     st,
 		signaling: sig,
 		sessions:  make(map[string]*Session),
+		nonces:    make(map[string]nonceEntry),
 		startTime: time.Now(),
 	}, nil
 }
@@ -118,6 +133,7 @@ func NewWithSignaling(cfgMgr ConfigManagerInterface, st StoreInterface, sig Sign
 		store:     st,
 		signaling: sig,
 		sessions:  make(map[string]*Session),
+		nonces:    make(map[string]nonceEntry),
 	}, nil
 }
 
@@ -349,8 +365,11 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 		iceServers := d.signaling.GetICEServers()
 		d.hasTURN = hasTURNServer(iceServers)
 
+	case "knock":
+		go d.handleKnock(msg.ConnID, msg.Code)
+
 	case "join":
-		go d.handleBrowserJoin(msg.SessionID, msg.PeerID)
+		go d.handleJoin(msg.ConnID, msg.Code, msg.HMAC)
 
 	case "answer":
 		d.handleAnswer(msg.PeerID, msg.SDP)
@@ -363,8 +382,99 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	}
 }
 
-// handleBrowserJoin handles a browser joining a session.
-func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
+// handleKnock handles a knock from a browser (via signaling server).
+// It generates a per-connection nonce, stores it with a 60s TTL, and
+// sends it back so the browser can compute the HMAC proof.
+func (d *Daemon) handleKnock(connID, sessionCode string) {
+	d.mu.RLock()
+	session, ok := d.sessions[sessionCode]
+	d.mu.RUnlock()
+	if !ok {
+		log.Printf("knock for unknown session %s", sessionCode)
+		return
+	}
+
+	// Generate 32 random bytes → 64-char hex nonce
+	nonceBytes := make([]byte, 32)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		log.Printf("generate nonce for session %s: %v", sessionCode, err)
+		return
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+
+	// Sweep expired nonces and store new one (under same lock)
+	d.noncesMu.Lock()
+	now := time.Now()
+	for id, entry := range d.nonces {
+		if now.After(entry.expiresAt) {
+			delete(d.nonces, id)
+		}
+	}
+	d.nonces[connID] = nonceEntry{nonce: nonce, expiresAt: now.Add(60 * time.Second)}
+	d.noncesMu.Unlock()
+
+	// Send nonce back to browser (via signaling server)
+	d.signaling.Send(context.Background(), map[string]any{
+		"type":         "nonce",
+		"conn_id":      connID,
+		"value":        nonce,
+		"has_password": session.Password != "",
+	})
+
+	log.Printf("nonce sent for session %s conn %s", sessionCode, connID)
+}
+
+// handleJoin verifies the HMAC from the browser. If valid, creates a WebRTC
+// peer. If invalid, notifies the signaling server (which tracks failures and
+// closes the browser WS after 3 strikes).
+func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
+	d.mu.RLock()
+	session, ok := d.sessions[sessionCode]
+	d.mu.RUnlock()
+	if !ok {
+		log.Printf("join for unknown session %s", sessionCode)
+		return
+	}
+
+	// Atomically delete nonce entry before verifying — prevents race where
+	// two concurrent join messages both read the nonce before either deletes it.
+	d.noncesMu.Lock()
+	entry, found := d.nonces[connID]
+	delete(d.nonces, connID)
+	d.noncesMu.Unlock()
+
+	if !found || time.Now().After(entry.expiresAt) {
+		log.Printf("join with expired/missing nonce: session %s conn %s", sessionCode, connID)
+		d.signaling.Send(context.Background(), map[string]any{
+			"type":    "auth_failed",
+			"conn_id": connID,
+		})
+		return
+	}
+
+	// Verify HMAC for password-protected shares. Password-less shares skip verification.
+	if session.Password != "" {
+		mac := hmac.New(sha256.New, []byte(session.Password))
+		mac.Write([]byte(entry.nonce))
+		expectedMAC := mac.Sum(nil)
+
+		receivedBytes, err := hex.DecodeString(receivedHMAC)
+		if err != nil || !hmac.Equal(expectedMAC, receivedBytes) {
+			log.Printf("HMAC mismatch for session %s conn %s", sessionCode, connID)
+			d.signaling.Send(context.Background(), map[string]any{
+				"type":    "auth_failed",
+				"conn_id": connID,
+			})
+			return
+		}
+	}
+
+	log.Printf("HMAC verified for session %s conn %s — creating peer", sessionCode, connID)
+	go d.createPeer(connID, sessionCode)
+}
+
+// createPeer creates a WebRTC peer connection for a browser joining a session.
+func (d *Daemon) createPeer(connID, sessionCode string) {
 	d.mu.RLock()
 	session, ok := d.sessions[sessionCode]
 	d.mu.RUnlock()
@@ -374,7 +484,7 @@ func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
 		return
 	}
 
-	log.Printf("browser joined session %s (peer %s) - starting WebRTC handshake", sessionCode, peerID)
+	log.Printf("browser joined session %s (conn %s) - starting WebRTC handshake", sessionCode, connID)
 
 	// Get ICE servers from signaling client
 	iceServers := d.signaling.GetICEServers()
@@ -394,14 +504,14 @@ func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
 
 	// Add peer to session
 	session.mu.Lock()
-	session.peers[peerID] = p
+	session.peers[connID] = p
 	session.mu.Unlock()
 
 	// Set up peer callbacks
 	p.OnClosed = func() {
-		log.Printf("peer %s closed (session %s)", peerID, sessionCode)
+		log.Printf("peer %s closed (session %s)", connID, sessionCode)
 		session.mu.Lock()
-		delete(session.peers, peerID)
+		delete(session.peers, connID)
 		session.mu.Unlock()
 	}
 
@@ -409,7 +519,7 @@ func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
 		d.signaling.Send(context.Background(), map[string]any{
 			"type":       "ice_candidate",
 			"session_id": sessionCode,
-			"peer_id":    peerID,
+			"peer_id":    connID,
 			"candidate":  init,
 		})
 	}
@@ -423,7 +533,7 @@ func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
 		d.signaling.Send(context.Background(), map[string]any{
 			"type":       "session_expired",
 			"session_id": sessionCode,
-			"peer_id":    peerID,
+			"peer_id":    connID,
 		})
 	}
 	tm.OnDownloadComplete = func(bytesTransferred int64) {
@@ -445,7 +555,7 @@ func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
 	}
 
 	p.OnOpen = func() {
-		log.Printf("DataChannel open for peer %s (session %s)", peerID, sessionCode)
+		log.Printf("DataChannel open for peer %s (session %s)", connID, sessionCode)
 		tm.HandleOpen()
 	}
 
@@ -460,7 +570,7 @@ func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
 	d.signaling.Send(context.Background(), map[string]any{
 		"type":       "offer",
 		"session_id": sessionCode,
-		"peer_id":    peerID,
+		"peer_id":    connID,
 		"sdp":        sdp,
 	})
 }
