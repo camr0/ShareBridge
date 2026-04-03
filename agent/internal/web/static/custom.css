@@ -73,6 +73,7 @@ footer small {
 
 .share-public-url {
   color: var(--accent);
+  font-family: monospace;
   font-size: 0.8rem;
   word-break: break-all;
   margin-top: 0.3rem;
