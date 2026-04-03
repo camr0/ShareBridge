@@ -154,9 +154,15 @@ Password-less shares exist primarily for convenience ("anyone with the code can 
 - WebRTC peer creation, ICE negotiation, DataChannel — unchanged
 - Post-connection file transfer protocol — unchanged
 - API key authentication for agents — unchanged
-- The DataChannel-level `list_request` password field is removed: password is now proven via HMAC before the DataChannel opens. The agent no longer needs to re-verify on `list_request`.
 
-> **Note on DataChannel password removal:** The HMAC pre-challenge fully replaces DataChannel-level password auth. Once the peer is created, the browser is already proven. Keeping a second password check on `list_request` would be redundant and confusing.
+## Breaking Changes to Existing Protocol
+
+| Field | Location | Change |
+|-------|----------|--------|
+| `password` | `list_request` DataChannel message (browser→agent) | **Removed** — auth is proven via HMAC before WebRTC; re-checking on `list_request` is redundant |
+| `password_required` | `hello` DataChannel message (agent→browser) | **Removed** — browser now learns `has_password` from the `nonce` response before WebRTC starts |
+
+> **Context:** Password was previously piggybacked on `list_request` as a dual-purpose auth+navigation message. A comment in `agent/internal/transfer/manager.go` already flagged this as a known wart deferred from Slice 3. This slice resolves it.
 
 ---
 
