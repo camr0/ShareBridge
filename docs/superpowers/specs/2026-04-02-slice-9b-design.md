@@ -164,6 +164,10 @@ Password-less shares exist primarily for convenience ("anyone with the code can 
 
 > **Context:** Password was previously piggybacked on `list_request` as a dual-purpose auth+navigation message. A comment in `agent/internal/transfer/manager.go` already flagged this as a known wart deferred from Slice 3. This slice resolves it.
 
+**`transfer/Manager` changes:** The `authenticated` atomic bool initialises as `true` for all peers (HMAC already proved auth before peer creation). The `authFailures` counter and DataChannel-level lockout are removed — the 3-strike limit now lives on the signaling server counting `auth_failed` messages. The gate `if msg.Type != "list_request" && !authenticated` is removed entirely.
+
+**Side effect:** With the `authenticated` gate gone, a browser could send `file_request` before `list_request`. This is not a security issue — the browser is already proven — but it is a protocol assumption change. An invalid path on `file_request` already returns an error gracefully, so no special handling is needed.
+
 ---
 
 ## Out of Scope
