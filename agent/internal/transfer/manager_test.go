@@ -93,156 +93,26 @@ func (m *mockOpenCloudClient) GetFile(filePath string, w io.Writer) (int64, erro
 	return 0, nil
 }
 
-// TestHandleOpen_NoPassword verifies hello sent with password_required=false
-func TestHandleOpen_NoPassword(t *testing.T) {
+// TestHandleOpen_SendsHello verifies hello is sent without password_required
+func TestHandleOpen_SendsHello(t *testing.T) {
 	dc := &mockDC{}
-	// Use nil client - we won't be making any client calls in this test
-
-	mgr := NewManager(dc, nil, "", 0)
+	mgr := NewManager(dc, nil, 0)
 	mgr.HandleOpen()
-
-	// Wait for async message
 	time.Sleep(10 * time.Millisecond)
 
 	lastMsg := dc.getLastTextMessage()
 	if lastMsg == "" {
 		t.Fatal("expected hello message")
 	}
-
-	var hello struct {
-		Type             string `json:"type"`
-		PasswordRequired bool   `json:"password_required"`
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(lastMsg), &result); err != nil {
+		t.Fatalf("parse hello: %v", err)
 	}
-	if err := json.Unmarshal([]byte(lastMsg), &hello); err != nil {
-		t.Fatalf("failed to parse hello: %v", err)
+	if result["type"] != "hello" {
+		t.Errorf("expected type 'hello', got %v", result["type"])
 	}
-
-	if hello.Type != "hello" {
-		t.Errorf("expected type 'hello', got '%s'", hello.Type)
-	}
-	if hello.PasswordRequired {
-		t.Error("expected password_required=false when no password set")
-	}
-}
-
-// TestHandleOpen_WithPassword verifies hello sent with password_required=true
-func TestHandleOpen_WithPassword(t *testing.T) {
-	dc := &mockDC{}
-
-	mgr := NewManager(dc, nil, "secret123", 5)
-	mgr.HandleOpen()
-
-	// Wait for async message
-	time.Sleep(10 * time.Millisecond)
-
-	lastMsg := dc.getLastTextMessage()
-	if lastMsg == "" {
-		t.Fatal("expected hello message")
-	}
-
-	var hello struct {
-		Type             string `json:"type"`
-		PasswordRequired bool   `json:"password_required"`
-	}
-	if err := json.Unmarshal([]byte(lastMsg), &hello); err != nil {
-		t.Fatalf("failed to parse hello: %v", err)
-	}
-
-	if hello.Type != "hello" {
-		t.Errorf("expected type 'hello', got '%s'", hello.Type)
-	}
-	if !hello.PasswordRequired {
-		t.Error("expected password_required=true when password is set")
-	}
-}
-
-// TestPassword_WrongThenCorrect verifies wrong password returns error but channel stays open
-func TestPassword_WrongThenCorrect(t *testing.T) {
-	dc := &mockDC{}
-
-	mgr := NewManager(dc, nil, "secret123", 0)
-
-	// Send wrong password
-	req, _ := json.Marshal(map[string]string{
-		"type":     "list_request",
-		"password": "wrongpassword",
-	})
-	mgr.HandleMessage(req)
-
-	// Wait for processing
-	time.Sleep(10 * time.Millisecond)
-
-	// Should get error but channel not closed
-	lastMsg := dc.getLastTextMessage()
-	if !strings.Contains(lastMsg, "error") {
-		t.Errorf("expected error message, got: %s", lastMsg)
-	}
-	if dc.isClosed() {
-		t.Error("channel should not be closed after first wrong password")
-	}
-
-	dc.reset()
-
-	// Send correct password
-	req, _ = json.Marshal(map[string]string{
-		"type":     "list_request",
-		"password": "secret123",
-	})
-	mgr.HandleMessage(req)
-
-	time.Sleep(10 * time.Millisecond)
-
-	// After correct password, auth failures should reset to 0
-	// and message should be processed (though will error due to nil client)
-	lastMsg = dc.getLastTextMessage()
-	if lastMsg == "" {
-		t.Error("expected some response after correct password")
-	}
-}
-
-// TestPassword_ThreeStrikesClosesChannel verifies 3 failures closes channel
-func TestPassword_ThreeStrikesClosesChannel(t *testing.T) {
-	dc := &mockDC{}
-
-	mgr := NewManager(dc, nil, "secret123", 0)
-
-	// Track if auth failed callback was called
-	authFailedCalled := false
-	mgr.OnAuthFailed = func() {
-		authFailedCalled = true
-	}
-
-	// Send 3 wrong passwords
-	for i := 0; i < 3; i++ {
-		dc.reset()
-		req, _ := json.Marshal(map[string]string{
-			"type":     "list_request",
-			"password": "wrongpassword",
-		})
-		mgr.HandleMessage(req)
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	// Channel should be closed after 3 strikes
-	if !dc.isClosed() {
-		t.Error("channel should be closed after 3 failed password attempts")
-	}
-	if !authFailedCalled {
-		t.Error("OnAuthFailed callback should have been called")
-	}
-
-	// Reset and verify we can't send messages anymore
-	dc.reset()
-	req, _ := json.Marshal(map[string]string{
-		"type":     "list_request",
-		"password": "secret123",
-	})
-	mgr.HandleMessage(req)
-	time.Sleep(10 * time.Millisecond)
-
-	// No messages should be sent after channel closed
-	if dc.getLastTextMessage() != "" {
-		t.Error("no messages should be processed after channel closed")
+	if _, ok := result["password_required"]; ok {
+		t.Error("hello must not include password_required field")
 	}
 }
 
@@ -298,40 +168,11 @@ func TestFileHeader_OmitsSHA1(t *testing.T) {
 	}
 }
 
-// TestHandleFileRequest_UnauthenticatedBlocked verifies file_request is rejected before auth
-func TestHandleFileRequest_UnauthenticatedBlocked(t *testing.T) {
-	dc := &mockDC{}
-	mc := &mockOpenCloudClient{}
-	mgr := NewManager(dc, mc, "secret", 0) // password-protected share
-
-	// Send file_request without authenticating via list_request first
-	req, _ := json.Marshal(map[string]string{
-		"type": "file_request",
-		"path": "secret.txt",
-	})
-	mgr.HandleMessage(req)
-	time.Sleep(10 * time.Millisecond)
-
-	lastMsg := dc.getLastTextMessage()
-	if !strings.Contains(lastMsg, "authentication required") {
-		t.Errorf("expected 'authentication required' error, got: %s", lastMsg)
-	}
-
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	if mc.listFilesPath != "" {
-		t.Errorf("expected ListFiles not called, got path %q", mc.listFilesPath)
-	}
-	if mc.getFilePath != "" {
-		t.Errorf("expected GetFile not called, got path %q", mc.getFilePath)
-	}
-}
-
 // TestHandleFileRequest_PathTraversal verifies .. in path returns error and ListFiles is never called
 func TestHandleFileRequest_PathTraversal(t *testing.T) {
 	dc := &mockDC{}
 	mc := &mockOpenCloudClient{}
-	mgr := NewManager(dc, mc, "", 0) // no password — authenticated from start
+	mgr := NewManager(dc, mc, 0)
 
 	req, _ := json.Marshal(map[string]string{
 		"type": "file_request",
@@ -360,12 +201,11 @@ func TestHandleListRequest_Subpath(t *testing.T) {
 			{Name: "report.pdf", Size: 1024, ContentType: "application/pdf"},
 		},
 	}
-	mgr := NewManager(dc, mc, "", 0)
+	mgr := NewManager(dc, mc, 0)
 
 	req, _ := json.Marshal(map[string]interface{}{
-		"type":     "list_request",
-		"password": "",
-		"path":     "docs",
+		"type": "list_request",
+		"path": "docs",
 	})
 	mgr.HandleMessage(req)
 	time.Sleep(10 * time.Millisecond)
@@ -387,7 +227,7 @@ func TestHandleFileRequest_NestedPath(t *testing.T) {
 			{Name: "file.txt", Size: 512, ContentType: "text/plain"},
 		},
 	}
-	mgr := NewManager(dc, mc, "", 0)
+	mgr := NewManager(dc, mc, 0)
 
 	req, _ := json.Marshal(map[string]string{
 		"type": "file_request",
@@ -396,7 +236,6 @@ func TestHandleFileRequest_NestedPath(t *testing.T) {
 	mgr.HandleMessage(req)
 	time.Sleep(50 * time.Millisecond)
 
-	// ListFiles should be called with the directory part "docs"
 	mc.mu.Lock()
 	gotListPath := mc.listFilesPath
 	mc.mu.Unlock()
@@ -404,7 +243,6 @@ func TestHandleFileRequest_NestedPath(t *testing.T) {
 		t.Errorf("expected ListFiles called with 'docs', got %q", gotListPath)
 	}
 
-	// file_header should use basename "file.txt", not full path
 	var headerName string
 	dc.mu.Lock()
 	for _, msg := range dc.textMessages {
@@ -422,25 +260,20 @@ func TestHandleFileRequest_NestedPath(t *testing.T) {
 // TestMaxDownloads_Rejected verifies download limit reached returns error
 func TestMaxDownloads_Rejected(t *testing.T) {
 	dc := &mockDC{}
+	mgr := NewManager(dc, nil, 2)
 
-	mgr := NewManager(dc, nil, "", 2)
-
-	// Track session expired callback
 	sessionExpiredCalled := false
 	mgr.OnSessionExpired = func() {
 		sessionExpiredCalled = true
 	}
 
-	// Simulate 2 downloads completing
 	mgr.downloads.Store(2)
 
-	// Third download request should be rejected
 	req, _ := json.Marshal(map[string]string{
 		"type": "file_request",
 		"path": "test.txt",
 	})
 	mgr.HandleMessage(req)
-
 	time.Sleep(10 * time.Millisecond)
 
 	lastMsg := dc.getLastTextMessage()

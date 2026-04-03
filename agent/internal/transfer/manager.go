@@ -15,7 +15,6 @@ const (
 	chunkSize     = 64 * 1024  // 64KB
 	maxBuffer     = 256 * 1024 // 256KB
 	sleepInterval = 10 * time.Millisecond
-	maxAuthFailures = 3 // 3 strikes policy for password auth
 )
 
 // DataChannel abstracts the DataChannel for sending.
@@ -27,86 +26,54 @@ type DataChannel interface {
 }
 
 // openCloudClient abstracts the OpenCloud WebDAV client for testability.
-// *opencloud.Client satisfies this interface.
 type openCloudClient interface {
 	ListFiles(subpath string) ([]opencloud.FileInfo, error)
 	GetFile(filePath string, w io.Writer) (int64, error)
 }
 
-// Manager handles file transfer state, authentication, and backpressure.
+// Manager handles file transfer state and backpressure.
+// Authentication is handled at the signaling layer (HMAC pre-challenge)
+// before the WebRTC peer is created — no auth needed here.
 type Manager struct {
 	dc           DataChannel
 	client       openCloudClient
-	transfer     atomic.Bool  // true if transfer in progress
-	password     string       // empty = no password required
-	maxDownloads int          // 0 = unlimited
-	downloads    atomic.Int32 // completed download counter
-	authFailures atomic.Int32 // consecutive password failures
-	authenticated atomic.Bool // true once password accepted (or no password required)
+	transfer     atomic.Bool
+	maxDownloads int
+	downloads    atomic.Int32
 
-	// Callbacks for external handling
-	OnAuthFailed       func()             // called when auth fails after 3 strikes
-	OnSessionExpired   func()             // called when max downloads reached
-	OnDownloadComplete func(bytesTransferred int64) // called after each successful download
+	OnSessionExpired   func()
+	OnDownloadComplete func(bytesTransferred int64)
 }
 
-// NewManager creates a transfer manager with optional password and download limit.
-func NewManager(dc DataChannel, client openCloudClient, password string, maxDownloads int) *Manager {
-	mgr := &Manager{
+// NewManager creates a transfer manager with an optional download limit.
+func NewManager(dc DataChannel, client openCloudClient, maxDownloads int) *Manager {
+	return &Manager{
 		dc:           dc,
 		client:       client,
-		password:     password,
 		maxDownloads: maxDownloads,
 	}
-	if password == "" {
-		mgr.authenticated.Store(true)
-	}
-	return mgr
 }
 
 // HandleOpen sends the hello message when DataChannel opens.
-// Called by the DataChannel open handler.
 func (m *Manager) HandleOpen() {
-	hello := struct {
-		Type             string `json:"type"`
-		PasswordRequired bool   `json:"password_required"`
-	}{
-		Type:             "hello",
-		PasswordRequired: m.password != "",
-	}
-
-	data, _ := json.Marshal(hello)
+	data, _ := json.Marshal(map[string]string{"type": "hello"})
 	m.dc.SendText(string(data))
 }
 
 // HandleMessage processes incoming DataChannel messages.
 func (m *Manager) HandleMessage(data []byte) {
-	// Check if channel is closed due to auth failures
-	if m.authFailures.Load() >= maxAuthFailures {
-		return // Ignore messages after lockout
-	}
-
 	var msg struct {
-		Type     string `json:"type"`
-		Password string `json:"password"`
-		Path     string `json:"path"`
+		Type string `json:"type"`
+		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		m.sendError("invalid message format")
 		return
 	}
 
-	// Gate everything except list_request behind authentication.
-	// Note: list_request is dual-purpose (auth + folder navigation) — a dedicated
-	// auth message on hello would be cleaner but is deferred to the daemon slice.
-	if msg.Type != "list_request" && !m.authenticated.Load() {
-		m.sendError("authentication required")
-		return
-	}
-
 	switch msg.Type {
 	case "list_request":
-		m.handleListRequest(msg.Password, msg.Path)
+		m.handleListRequest(msg.Path)
 	case "file_request":
 		m.handleFileRequest(msg.Path)
 	default:
@@ -114,19 +81,7 @@ func (m *Manager) HandleMessage(data []byte) {
 	}
 }
 
-func (m *Manager) handleListRequest(password, subpath string) {
-	// Check password if required
-	if m.password != "" {
-		if password != m.password {
-			m.handleAuthFailure()
-			return
-		}
-		// Correct password — mark session as authenticated
-		m.authFailures.Store(0)
-		m.authenticated.Store(true)
-	}
-
-	// Check max downloads limit
+func (m *Manager) handleListRequest(subpath string) {
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
 		m.sendError("share has reached its download limit")
 		if m.OnSessionExpired != nil {
@@ -147,7 +102,7 @@ func (m *Manager) handleListRequest(password, subpath string) {
 	}
 
 	resp := struct {
-		Type  string                `json:"type"`
+		Type  string               `json:"type"`
 		Files []opencloud.FileInfo `json:"files"`
 	}{
 		Type:  "file_list",
@@ -159,29 +114,10 @@ func (m *Manager) handleListRequest(password, subpath string) {
 		m.sendError("internal error")
 		return
 	}
-
-	if err := m.dc.SendText(string(data)); err != nil {
-		return
-	}
-}
-
-func (m *Manager) handleAuthFailure() {
-	failures := m.authFailures.Add(1)
-
-	// Notify server of every auth failure (for rate limiting in Slice 5)
-	if m.OnAuthFailed != nil {
-		m.OnAuthFailed()
-	}
-
-	m.sendError("incorrect password")
-
-	if failures >= maxAuthFailures {
-		m.dc.Close()
-	}
+	m.dc.SendText(string(data))
 }
 
 func (m *Manager) handleFileRequest(filePath string) {
-	// Check max downloads limit before starting transfer
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
 		m.sendError("share has reached its download limit")
 		if m.OnSessionExpired != nil {
@@ -195,7 +131,6 @@ func (m *Manager) handleFileRequest(filePath string) {
 		return
 	}
 
-	// Reject path traversal (defense-in-depth; OpenCloud auth is the real protection)
 	if strings.Contains(filePath, "..") {
 		m.sendError("invalid path")
 		return
@@ -206,9 +141,6 @@ func (m *Manager) handleFileRequest(filePath string) {
 		return
 	}
 
-	// Split full path into directory and filename
-	// path.Dir("README.txt") = "." → use "" for root
-	// path.Dir("docs/file.txt") = "docs"
 	dir := path.Dir(filePath)
 	name := path.Base(filePath)
 	if dir == "." {
@@ -220,7 +152,6 @@ func (m *Manager) handleFileRequest(filePath string) {
 		return
 	}
 
-	// Validate file exists by listing its parent directory
 	files, err := m.client.ListFiles(dir)
 	if err != nil {
 		m.sendError("share unavailable")
@@ -240,7 +171,6 @@ func (m *Manager) handleFileRequest(filePath string) {
 		return
 	}
 
-	// Send file header (name is basename — what the browser saves the download as)
 	header := struct {
 		Type     string `json:"type"`
 		Name     string `json:"name"`
@@ -259,7 +189,6 @@ func (m *Manager) handleFileRequest(filePath string) {
 		return
 	}
 
-	// Start transfer with full path (e.g. "docs/reports/Q1.pdf")
 	m.transfer.Store(true)
 	go m.streamFile(filePath)
 }
@@ -267,26 +196,22 @@ func (m *Manager) handleFileRequest(filePath string) {
 func (m *Manager) streamFile(filePath string) {
 	defer func() { m.transfer.Store(false) }()
 
-	// Create a pipe: WebDAV writes to writer, we read from reader
 	pr, pw := io.Pipe()
-	defer pr.Close() // unblocks the writer goroutine if we exit early
+	defer pr.Close()
 
-	// Stream from WebDAV in background
 	go func() {
 		_, err := m.client.GetFile(filePath, pw)
 		pw.CloseWithError(err)
 	}()
 
-	// Read chunks and send
 	var totalBytes int64
 	buf := make([]byte, chunkSize)
 	for {
 		n, err := pr.Read(buf)
 		if n > 0 {
 			totalBytes += int64(n)
-			// Send with backpressure
 			if err := m.sendWithBackpressure(buf[:n]); err != nil {
-				return // Connection closed
+				return
 			}
 		}
 		if err != nil {
@@ -297,14 +222,12 @@ func (m *Manager) streamFile(filePath string) {
 		}
 	}
 
-	// Send end marker
 	end := struct {
 		Type string `json:"type"`
 	}{Type: "chunk_end"}
 	endData, _ := json.Marshal(end)
 	m.dc.SendText(string(endData))
 
-	// Increment download counter on successful completion
 	m.downloads.Add(1)
 	if m.OnDownloadComplete != nil {
 		m.OnDownloadComplete(totalBytes)
@@ -319,14 +242,14 @@ func (m *Manager) sendWithBackpressure(data []byte) error {
 }
 
 func (m *Manager) sendError(message string) {
-	err := struct {
+	errMsg := struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
 	}{
 		Type:    "error",
 		Message: message,
 	}
-	data, _ := json.Marshal(err)
+	data, _ := json.Marshal(errMsg)
 	m.dc.SendText(string(data))
 }
 

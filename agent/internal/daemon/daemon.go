@@ -415,17 +415,10 @@ func (d *Daemon) handleBrowserJoin(sessionCode, peerID string) {
 	}
 
 	// Create transfer manager
-	tm := transfer.NewManager(p, session.webdavClient, session.Password, session.MaxDownloads)
+	tm := transfer.NewManager(p, session.webdavClient, session.MaxDownloads)
 	tm.SetDownloadCount(session.Downloads)
 
 	// Wire transfer callbacks
-	tm.OnAuthFailed = func() {
-		d.signaling.Send(context.Background(), map[string]any{
-			"type":       "auth_failed",
-			"session_id": sessionCode,
-			"peer_id":    peerID,
-		})
-	}
 	tm.OnSessionExpired = func() {
 		d.signaling.Send(context.Background(), map[string]any{
 			"type":       "session_expired",

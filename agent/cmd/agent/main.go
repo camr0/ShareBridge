@@ -416,19 +416,10 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 				downloadCount = existingSession.Downloads
 			}
 
-			tm := transfer.NewManager(p, webdavClient, cfg.Password, cfg.MaxDownloads)
+			tm := transfer.NewManager(p, webdavClient, cfg.MaxDownloads)
 			tm.SetDownloadCount(downloadCount)
 
 			// Wire callbacks before CreateOffer to avoid any race with a fast peer
-			tm.OnAuthFailed = func() {
-				if err := sig.Send(ctx, map[string]any{
-					"type":       "auth_failed",
-					"session_id": sessionCode,
-					"peer_id":    peerID,
-				}); err != nil {
-					log.Printf("send auth_failed: %v", err)
-				}
-			}
 			tm.OnSessionExpired = func() {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "session_expired",
