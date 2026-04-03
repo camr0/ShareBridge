@@ -28,6 +28,12 @@ func RegisterRoutes(r *gin.Engine, h *hub.Hub, cfg *config.Config, apiKeyRepo *d
 	// Static web files
 	r.StaticFile("/", "./web/index.html")
 	r.StaticFile("/app.js", "./web/app.js")
+
+	// Direct-link route: /s/:code serves index.html.
+	// Browser JS reads the code from window.location.pathname and auto-fills it.
+	r.GET("/s/:code", func(c *gin.Context) {
+		c.File("./web/index.html")
+	})
 }
 
 // AdminAuthMiddleware validates the admin auth token.
