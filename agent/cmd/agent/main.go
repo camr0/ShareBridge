@@ -3,6 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,6 +38,12 @@ var (
 	expiryHours  int
 	relayOnly    bool
 )
+
+// nonceEntry holds a per-connection nonce for HMAC pre-challenge (standalone mode).
+type nonceEntry struct {
+	nonce     string
+	expiresAt time.Time
+}
 
 func init() {
 	rootCmd.AddCommand(shareCmd)
@@ -243,7 +253,7 @@ func extractCodeFromHTML(html string) string {
 		return ""
 	}
 
-	return strings.TrimSpace(html[contentStart:contentStart+h3End])
+	return strings.TrimSpace(html[contentStart : contentStart+h3End])
 }
 
 // runShareSingle runs the share in single-session mode without daemon.
@@ -361,8 +371,10 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 	}
 
 	var (
-		mu    sync.Mutex
-		peers = make(map[string]*peer.Peer) // peerID -> Peer
+		mu       sync.Mutex
+		peers    = make(map[string]*peer.Peer) // peerID -> Peer
+		nonces   = make(map[string]nonceEntry) // connID -> nonce
+		noncesMu sync.Mutex
 	)
 
 	sig.OnMessage = func(msg signaling.Message) {
@@ -370,10 +382,77 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 		case "welcome":
 			log.Println("agent authenticated with signaling server")
 
+		case "knock":
+			connID := msg.ConnID
+			// msg.Code is the session code — not needed for knock handling
+
+			// Generate 32 random bytes → 64-char hex nonce
+			nonceBytes := make([]byte, 32)
+			if _, err := rand.Read(nonceBytes); err != nil {
+				log.Printf("generate nonce: %v", err)
+				return
+			}
+			nonce := hex.EncodeToString(nonceBytes)
+
+			// Sweep expired nonces and store new one
+			noncesMu.Lock()
+			now := time.Now()
+			for id, entry := range nonces {
+				if now.After(entry.expiresAt) {
+					delete(nonces, id)
+				}
+			}
+			nonces[connID] = nonceEntry{nonce: nonce, expiresAt: now.Add(60 * time.Second)}
+			noncesMu.Unlock()
+
+			// Send nonce back to browser
+			if err := sig.Send(ctx, map[string]any{
+				"type":         "nonce",
+				"conn_id":      connID,
+				"value":        nonce,
+				"has_password": password != "",
+			}); err != nil {
+				log.Printf("send nonce: %v", err)
+			}
+
 		case "join":
-			sessionCode := msg.SessionID
-			peerID := msg.PeerID
-			log.Printf("browser joined session %s (peer %s) — starting WebRTC handshake", sessionCode, peerID)
+			connID := msg.ConnID
+			sessionCode := msg.Code
+			receivedHMAC := msg.HMAC
+
+			// Atomically delete nonce entry before verifying
+			noncesMu.Lock()
+			entry, found := nonces[connID]
+			delete(nonces, connID)
+			noncesMu.Unlock()
+
+			if !found || time.Now().After(entry.expiresAt) {
+				log.Printf("join with expired/missing nonce: conn %s", connID)
+				sig.Send(ctx, map[string]any{
+					"type":    "auth_failed",
+					"conn_id": connID,
+				})
+				return
+			}
+
+			// Verify HMAC for password-protected shares
+			if password != "" {
+				mac := hmac.New(sha256.New, []byte(password))
+				mac.Write([]byte(entry.nonce))
+				expectedMAC := mac.Sum(nil)
+
+				receivedBytes, err := hex.DecodeString(receivedHMAC)
+				if err != nil || !hmac.Equal(expectedMAC, receivedBytes) {
+					log.Printf("HMAC mismatch for conn %s", connID)
+					sig.Send(ctx, map[string]any{
+						"type":    "auth_failed",
+						"conn_id": connID,
+					})
+					return
+				}
+			}
+
+			log.Printf("browser joined session %s (conn %s) — starting WebRTC handshake", sessionCode, connID)
 
 			iceServers := sig.GetICEServers()
 			if len(iceServers) == 0 {
@@ -389,20 +468,20 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 			}
 
 			mu.Lock()
-			peers[peerID] = p
+			peers[connID] = p
 			mu.Unlock()
 
 			p.OnClosed = func() {
-				log.Printf("peer closed (peer %s, session %s)", peerID, sessionCode)
+				log.Printf("peer closed (conn %s, session %s)", connID, sessionCode)
 				mu.Lock()
-				delete(peers, peerID)
+				delete(peers, connID)
 				mu.Unlock()
 			}
 			p.OnICECandidate = func(init webrtc.ICECandidateInit) {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "ice_candidate",
 					"session_id": sessionCode,
-					"peer_id":    peerID,
+					"peer_id":    connID,
 					"candidate":  init,
 				}); err != nil {
 					log.Printf("send ICE candidate: %v", err)
@@ -424,7 +503,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "session_expired",
 					"session_id": sessionCode,
-					"peer_id":    peerID,
+					"peer_id":    connID,
 				}); err != nil {
 					log.Printf("send session_expired: %v", err)
 				}
@@ -440,7 +519,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 				}
 			}
 			p.OnOpen = func() {
-				log.Printf("DataChannel open! (peer %s, session %s)", peerID, sessionCode)
+				log.Printf("DataChannel open! (conn %s, session %s)", connID, sessionCode)
 				tm.HandleOpen()
 			}
 
@@ -455,7 +534,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 			if err := sig.Send(ctx, map[string]any{
 				"type":       "offer",
 				"session_id": sessionCode,
-				"peer_id":    peerID,
+				"peer_id":    connID,
 				"sdp":        sdp,
 			}); err != nil {
 				log.Printf("send offer: %v", err)
