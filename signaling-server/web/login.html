@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login - ShareBridge</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+    .login-container {
+      width: 100%;
+      max-width: 400px;
+      background: #313244;
+      border-radius: 12px;
+      padding: 40px;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+    }
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      text-align: center;
+    }
+    .subtitle {
+      color: #a6adc8;
+      text-align: center;
+      margin-bottom: 32px;
+      font-size: 0.95rem;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: #a6adc8;
+    }
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 1rem;
+      background: #45475a;
+      color: #cdd6f4;
+      border: 1px solid #6c7086;
+      border-radius: 8px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus { border-color: #89b4fa; }
+    input::placeholder { color: #6c7086; }
+    input:disabled { opacity: 0.5; }
+
+    button {
+      width: 100%;
+      padding: 14px;
+      font-size: 1rem;
+      background: #89b4fa;
+      color: #1e1e2e;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+    button:hover:not(:disabled) { opacity: 0.9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .error-message {
+      color: #f38ba8;
+      background: rgba(243, 139, 168, 0.1);
+      border: 1px solid rgba(243, 139, 168, 0.3);
+      border-radius: 6px;
+      padding: 12px;
+      margin-bottom: 20px;
+      font-size: 0.9rem;
+      display: none;
+    }
+    .error-message.visible { display: block; }
+
+    .footer-links {
+      margin-top: 24px;
+      text-align: center;
+      font-size: 0.9rem;
+      color: #a6adc8;
+    }
+    .footer-links a {
+      color: #89b4fa;
+      text-decoration: none;
+    }
+    .footer-links a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <h1>Welcome back</h1>
+    <p class="subtitle">Sign in to your ShareBridge account</p>
+
+    <div id="error" class="error-message"></div>
+
+    <form id="login-form">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input
+          type="email"
+          id="email"
+          name="email"
+          placeholder="you@example.com"
+          required
+          autocomplete="email"
+        />
+      </div>
+
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input
+          type="password"
+          id="password"
+          name="password"
+          placeholder="Enter your password"
+          required
+          autocomplete="current-password"
+        />
+      </div>
+
+      <button type="submit" id="submit-btn">Sign In</button>
+    </form>
+
+    <div class="footer-links">
+      Don't have an account? <a href="/register">Create one</a>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('login-form');
+    const submitBtn = document.getElementById('submit-btn');
+    const errorDiv = document.getElementById('error');
+
+    function showError(message) {
+      errorDiv.textContent = message;
+      errorDiv.classList.add('visible');
+    }
+
+    function hideError() {
+      errorDiv.textContent = '';
+      errorDiv.classList.remove('visible');
+    }
+
+    function setLoading(loading) {
+      submitBtn.disabled = loading;
+      submitBtn.textContent = loading ? 'Signing in...' : 'Sign In';
+      document.getElementById('email').disabled = loading;
+      document.getElementById('password').disabled = loading;
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      hideError();
+
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+
+      if (!email || !password) {
+        showError('Please enter both email and password.');
+        return;
+      }
+
+      setLoading(true);
+
+      try {
+        const response = await fetch('/api/collections/users/auth-with-password', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            identity: email,
+            password: password,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          const message = data.message || 'Login failed. Please check your credentials.';
+          throw new Error(message);
+        }
+
+        // Store JWT token in localStorage
+        if (data.token) {
+          localStorage.setItem('pb_token', data.token);
+        }
+
+        // Store user data if available
+        if (data.record) {
+          localStorage.setItem('pb_user', JSON.stringify(data.record));
+        }
+
+        // Redirect to account page
+        window.location.href = '/account';
+
+      } catch (error) {
+        setLoading(false);
+        showError(error.message || 'An error occurred. Please try again.');
+      }
+    });
+
+    // Check if user is already logged in
+    const existingToken = localStorage.getItem('pb_token');
+    if (existingToken) {
+      window.location.href = '/account';
+    }
+  </script>
+</body>
+</html>
