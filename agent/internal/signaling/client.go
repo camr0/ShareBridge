@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
@@ -150,6 +151,25 @@ func (c *Client) GetICEServers() []webrtc.ICEServer {
 // It is the sole reader of the WebSocket connection — RegisterShare and
 // other callers must not call conn.Read concurrently.
 func (c *Client) Listen(ctx context.Context) error {
+	// Keepalive ping: sends every 30s to prevent Cloudflare's 100s WebSocket timeout
+	// from disconnecting idle agents. Any WebSocket frame resets the timeout.
+	keepaliveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := c.conn.Ping(keepaliveCtx); err != nil {
+					return // Connection closed or error
+				}
+			case <-keepaliveCtx.Done():
+				return
+			}
+		}
+	}()
+
 	for {
 		_, data, err := c.conn.Read(ctx)
 		if err != nil {
