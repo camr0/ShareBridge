@@ -6,8 +6,11 @@ services:
     environment:
       - PORT=8080
       - DATABASE_PATH=/data/signaling.db
-      - ADMIN_TOKEN=${ADMIN_TOKEN}
       - TURN_HOST=${TURN_HOST}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
       - TURN_PORT=3478
       - TURN_SECRET=${TURN_SECRET}
     volumes:
