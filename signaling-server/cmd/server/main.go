@@ -56,8 +56,8 @@ func main() {
 		})
 
 		router.GET("/ws/client", func(e *core.RequestEvent) error {
-			// TODO: Update browser_ws to use PocketBase in Task 2
-			return apis.NewApiError(http.StatusNotImplemented, "client WebSocket not yet implemented", nil)
+			handler.BrowserWS(app, h, cfg)(e.Response, e.Request)
+			return nil
 		})
 
 		// Session info REST endpoint - placeholder
@@ -98,7 +98,7 @@ func main() {
 
 	// Set port and data directory explicitly from config
 	// PocketBase uses --dir for data and --http for port via CLI args
-	os.Args = append(os.Args, "--http="+cfg.Port, "--dir="+cfg.DBPath)
+	os.Args = append(os.Args, "--http=0.0.0.0:"+cfg.Port, "--dir="+cfg.DBPath)
 
 	if err := app.Start(); err != nil {
 		log.Fatal(err)

@@ -54,17 +54,22 @@ func createTestAPIKey(app core.App, userID string, secret string) (*core.Record,
 		return nil, err
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
-	if err != nil {
+	// Save first to get the record ID, then hash fullKey = record.Id + "." + secret.
+	// This matches the production CreateAPIKey handler.
+	record := core.NewRecord(apiKeysCol)
+	record.Set("account_id", userID)
+	record.Set("is_active", true)
+	record.Set("label", "test key")
+	if err := app.Save(record); err != nil {
 		return nil, err
 	}
 
-	record := core.NewRecord(apiKeysCol)
-	record.Set("account_id", userID)
+	fullKey := record.Id + "." + secret
+	hash, err := bcrypt.GenerateFromPassword([]byte(fullKey), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
 	record.Set("key_hash", string(hash))
-	record.Set("is_active", true)
-	record.Set("label", "test key")
-
 	if err := app.Save(record); err != nil {
 		return nil, err
 	}

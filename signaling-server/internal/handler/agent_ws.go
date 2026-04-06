@@ -21,18 +21,17 @@ import (
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type         string          `json:"type"`
-	AgentID      string          `json:"agent_id,omitempty"`
-	Code         string          `json:"code,omitempty"`
-	ShareURL     string          `json:"share_url,omitempty"`
-	ExpiresAt    *time.Time      `json:"expires_at,omitempty"`
-	MaxDownloads *int            `json:"max_downloads,omitempty"`
-	SessionID    string          `json:"session_id,omitempty"`
-	SDP          string          `json:"sdp,omitempty"`
-	Candidate    json.RawMessage `json:"candidate,omitempty"`
-	ConnID       string          `json:"conn_id,omitempty"`
-	Value        string          `json:"value,omitempty"`
-	HasPassword  bool            `json:"has_password,omitempty"`
+	Type        string          `json:"type"`
+	AgentID     string          `json:"agent_id,omitempty"`
+	Code        string          `json:"code,omitempty"`
+	ShareURL    string          `json:"share_url,omitempty"` // received for protocol compat, not stored
+	ExpiresAt   *time.Time      `json:"expires_at,omitempty"`
+	SessionID   string          `json:"session_id,omitempty"`
+	SDP         string          `json:"sdp,omitempty"`
+	Candidate   json.RawMessage `json:"candidate,omitempty"`
+	ConnID      string          `json:"conn_id,omitempty"`
+	Value       string          `json:"value,omitempty"`
+	HasPassword bool            `json:"has_password,omitempty"`
 }
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
@@ -42,8 +41,9 @@ var codeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,30}$`)
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
 func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Extract API key ID from context (set by middleware)
+		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
 		apiKeyID := middleware.GetAPIKeyID(r.Context())
+		accountID := middleware.GetAccountID(r.Context())
 		if apiKeyID == "" {
 			http.Error(w, `{"error":"missing api_key"}`, http.StatusUnauthorized)
 			return
@@ -91,13 +91,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 					})
 					continue
 				}
-				handleRegisterShare(ctx, conn, h, app, apiKeyID, agentID, msg)
-
-			case "download_complete":
-				if agentID == "" {
-					continue
-				}
-				handleDownloadComplete(ctx, conn, app, msg.Code)
+				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg)
 
 			case "offer":
 				if agentID == "" {
@@ -194,18 +188,10 @@ func handleRegisterShare(
 	h *hub.Hub,
 	app core.App,
 	apiKeyID string,
+	accountID string,
 	agentID string,
 	msg agentMsg,
 ) {
-	// Validate share_url is provided
-	if msg.ShareURL == "" {
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "share_url required",
-		})
-		return
-	}
-
 	// Determine the code to use
 	code := msg.Code
 	reconnected := false
@@ -226,7 +212,7 @@ func handleRegisterShare(
 		// Try to create with collision retry (5 attempts)
 		created := false
 		for i := 0; i < 5; i++ {
-			err = createSession(app, code, apiKeyID, agentID, msg.ShareURL, msg.ExpiresAt, msg.MaxDownloads)
+			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt)
 			if err == nil {
 				created = true
 				break
@@ -262,7 +248,7 @@ func handleRegisterShare(
 		}
 
 		// Check if code exists and is owned by this API key
-		available, existingSession, err := isCodeAvailable(app, code, apiKeyID)
+		available, existingSession, err := isCodeAvailable(app, code, apiKeyID, accountID)
 		if err != nil {
 			log.Printf("db error checking code availability: %v", err)
 			hub.SendDirect(ctx, conn, map[string]string{
@@ -297,7 +283,7 @@ func handleRegisterShare(
 				log.Printf("session reconnected: code=%s api_key=%s agent_id=%s", code, apiKeyID, agentID)
 			} else {
 				// Creating new session with custom code
-				err := createSession(app, code, apiKeyID, agentID, msg.ShareURL, msg.ExpiresAt, msg.MaxDownloads)
+				err := createSession(app, code, apiKeyID, agentID, msg.ExpiresAt)
 				if err != nil {
 					log.Printf("db error creating session: %v", err)
 					hub.SendDirect(ctx, conn, map[string]string{
@@ -345,9 +331,9 @@ func handleRegisterShare(
 	log.Printf("share registered: code=%s api_key=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, reconnected)
 }
 
-// createSession creates a new session record in PocketBase
-func createSession(app core.App, code, apiKeyID, agentID, shareURL string, expiresAt *time.Time, maxDownloads *int) error {
-	// Get the api_keys collection
+// createSession creates a new session record in PocketBase.
+// share_url and max_downloads are intentionally not stored — the server is untrusted.
+func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time) error {
 	col, err := app.FindCollectionByNameOrId("sessions")
 	if err != nil {
 		return err
@@ -357,14 +343,10 @@ func createSession(app core.App, code, apiKeyID, agentID, shareURL string, expir
 	record.Set("code", code)
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", agentID)
-	record.Set("share_url", shareURL)
 
 	if expiresAt != nil {
 		dt, _ := types.ParseDateTime(*expiresAt)
 		record.Set("expires_at", dt)
-	}
-	if maxDownloads != nil {
-		record.Set("max_downloads", *maxDownloads)
 	}
 
 	return app.Save(record)
@@ -389,11 +371,13 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 	return records[0], nil
 }
 
-// isCodeAvailable checks if a code is not taken by a different API key.
-// Returns (available, existingSession, error)
-// - available = true if code is free or owned by the same API key
-// - existingSession = the session record if it exists, nil otherwise
-func isCodeAvailable(app core.App, code string, apiKeyID string) (bool, *core.Record, error) {
+// isCodeAvailable checks whether a code can be claimed by the requesting API key.
+// Returns (available, existingSession, error).
+//   - available = true if the code is free, owned by the same key, or owned by a
+//     different key that belongs to the same account (key rotation case).
+//   - When available=true and existingSession!=nil, the session's api_key_id is
+//     updated in-place so the new key takes over ownership.
+func isCodeAvailable(app core.App, code string, apiKeyID string, accountID string) (bool, *core.Record, error) {
 	session, err := getSessionByCode(app, code)
 	if err != nil {
 		return false, nil, err
@@ -401,56 +385,31 @@ func isCodeAvailable(app core.App, code string, apiKeyID string) (bool, *core.Re
 	if session == nil {
 		return true, nil, nil
 	}
-	// Code exists - check if it's owned by the same API key
+
 	existingKeyID := session.GetString("api_key_id")
-	return existingKeyID == apiKeyID, session, nil
-}
-
-// handleDownloadComplete increments the download count for a session
-func handleDownloadComplete(
-	ctx context.Context,
-	conn *websocket.Conn,
-	app core.App,
-	code string,
-) {
-	if code == "" {
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "code required",
-		})
-		return
+	if existingKeyID == apiKeyID {
+		// Same key — straightforward reconnect.
+		return true, session, nil
 	}
 
-	session, err := getSessionByCode(app, code)
+	// Different key: check if it belongs to the same account (key rotation).
+	existingKey, err := app.FindRecordById("api_keys", existingKeyID)
 	if err != nil {
-		log.Printf("failed to find session for download count increment %s: %v", code, err)
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "failed to update download count",
-		})
-		return
+		// Key record missing (e.g. deleted) — treat code as available.
+		return true, session, nil
 	}
-	if session == nil {
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "session not found",
-		})
-		return
+	existingAccountID := existingKey.GetString("account_id")
+	if existingAccountID != accountID {
+		// Owned by a different account — not available.
+		return false, nil, nil
 	}
 
-	currentCount := session.GetInt("download_count")
-	session.Set("download_count", currentCount+1)
-
+	// Same account, different key (key rotation). Update ownership.
+	session.Set("api_key_id", apiKeyID)
 	if err := app.Save(session); err != nil {
-		log.Printf("failed to increment download count for %s: %v", code, err)
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "failed to update download count",
-		})
-		return
+		return false, nil, err
 	}
-
-	log.Printf("download complete recorded for session %s", code)
+	return true, session, nil
 }
 
 // generateRandomCode generates a random 8-character code

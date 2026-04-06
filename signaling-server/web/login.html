@@ -203,11 +203,6 @@
           localStorage.setItem('pb_token', data.token);
         }
 
-        // Store user data if available
-        if (data.record) {
-          localStorage.setItem('pb_user', JSON.stringify(data.record));
-        }
-
         // Redirect to account page
         window.location.href = '/account';
 

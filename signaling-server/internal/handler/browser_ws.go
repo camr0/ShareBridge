@@ -9,9 +9,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/gin-gonic/gin"
+	"github.com/pocketbase/pocketbase/core"
 	"sharebridge/server/internal/config"
-	"sharebridge/server/internal/db"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/turn"
 )
@@ -23,26 +22,36 @@ type browserMsg struct {
 	HMAC      string          `json:"hmac,omitempty"`
 }
 
-func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		sessionCode := c.Query("session")
+func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionCode := r.URL.Query().Get("session")
 
-		session, err := sessionRepo.GetByCode(sessionCode)
+		records, err := app.FindRecordsByFilter(
+			"sessions",
+			"code = {:code}",
+			"",
+			1,
+			0,
+			map[string]any{"code": sessionCode},
+		)
 		if err != nil {
 			log.Printf("browser_ws: db error looking up session: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
+			http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
 			return
 		}
-		if session == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session not found or expired"})
+		if len(records) == 0 {
+			http.Error(w, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
-		if session.ExpiresAt != nil && time.Now().After(*session.ExpiresAt) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session not found or expired"})
+		session := records[0]
+
+		expiresAt := session.GetDateTime("expires_at")
+		if !expiresAt.IsZero() && time.Now().After(expiresAt.Time()) {
+			http.Error(w, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
 
-		conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 		})
 		if err != nil {
@@ -51,7 +60,7 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 		}
 		defer conn.CloseNow()
 
-		ctx := c.Request.Context()
+		ctx := r.Context()
 
 		_, agentOK := h.GetAgentConn(sessionCode)
 		if !agentOK {
@@ -67,8 +76,6 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 		}
 		defer h.UnpairSession(sessionCode)
 
-		// Generate a unique connID for this browser connection.
-		// Used to correlate knock/nonce/join messages and route auth failures.
 		connID := generateConnID()
 		h.RegisterBrowserConn(connID, conn)
 		defer h.UnregisterBrowserConn(connID)
@@ -93,9 +100,7 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 			"ice_servers": iceServers,
 		})
 
-		// NOTE: we do NOT notify the agent here (no join message).
-		// The agent is notified only after the browser passes HMAC verification
-		// via the knock → nonce → join(hmac) flow.
+		apiKeyID := session.GetString("api_key_id")
 
 		for {
 			_, data, err := conn.Read(ctx)
@@ -111,16 +116,14 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 
 			switch msg.Type {
 			case "knock":
-				// Forward knock to agent with connID and session code added by server.
-				h.SendToAgent(ctx, session.APIKeyID, map[string]any{
+				h.SendToAgent(ctx, apiKeyID, map[string]any{
 					"type":    "knock",
 					"conn_id": connID,
 					"code":    sessionCode,
 				})
 
 			case "join":
-				// Forward join to agent with connID, code, and HMAC. Agent verifies.
-				h.SendToAgent(ctx, session.APIKeyID, map[string]any{
+				h.SendToAgent(ctx, apiKeyID, map[string]any{
 					"type":    "join",
 					"conn_id": connID,
 					"code":    sessionCode,
@@ -128,7 +131,6 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 				})
 
 			case "answer":
-				// Include connID as peer_id so agent can look up the right peer.
 				h.ForwardToAgent(ctx, sessionCode, map[string]any{
 					"type":       "answer",
 					"session_id": sessionCode,

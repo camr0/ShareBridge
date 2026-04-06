@@ -100,8 +100,11 @@ func CreateCollections(app core.App) error {
 		"CREATE UNIQUE INDEX `idx_sessions_code` ON `{{COLLECTION}}` (`code`)",
 	}
 
-	// API rules: sessions not directly readable by end users
-	// Only server-side code can access sessions via pbstore
+	// API rules: sessions are not accessible via PocketBase's REST API at all.
+	// The rule "@request.auth.id = ''" allows only unauthenticated requests through
+	// the collection API — but since no client ever calls the sessions API directly,
+	// this effectively locks it down to server-side Go code (app.FindRecordsByFilter
+	// bypasses collection rules entirely).
 	sessionsRule := "@request.auth.id = ''"
 	sessionsCol.ListRule = &sessionsRule
 	sessionsCol.ViewRule = &sessionsRule

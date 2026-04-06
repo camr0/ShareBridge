@@ -58,24 +58,29 @@ func createTestAPIKey(app core.App, userID string, secret string) (*core.Record,
 		return nil, err
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
-	if err != nil {
+	// Save first to get the record ID, then hash fullKey = record.Id + "." + secret.
+	// This matches the production CreateAPIKey handler.
+	record := core.NewRecord(apiKeysCol)
+	record.Set("account_id", userID)
+	record.Set("is_active", true)
+	record.Set("label", "test key")
+	if err := app.Save(record); err != nil {
 		return nil, err
 	}
 
-	record := core.NewRecord(apiKeysCol)
-	record.Set("account_id", userID)
+	fullKey := record.Id + "." + secret
+	hash, err := bcrypt.GenerateFromPassword([]byte(fullKey), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
 	record.Set("key_hash", string(hash))
-	record.Set("is_active", true)
-	record.Set("label", "test key")
-
 	if err := app.Save(record); err != nil {
 		return nil, err
 	}
 	return record, nil
 }
 
-func createTestSession(app core.App, apiKeyID, agentID, code, shareURL string) (*core.Record, error) {
+func createTestSession(app core.App, apiKeyID, agentID, code string) (*core.Record, error) {
 	sessionsCol, err := app.FindCollectionByNameOrId("sessions")
 	if err != nil {
 		return nil, err
@@ -85,7 +90,6 @@ func createTestSession(app core.App, apiKeyID, agentID, code, shareURL string) (
 	record.Set("code", code)
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", agentID)
-	record.Set("share_url", shareURL)
 
 	if err := app.Save(record); err != nil {
 		return nil, err
@@ -176,7 +180,7 @@ func TestAgentWS_CodeOwnership(t *testing.T) {
 	require.NoError(t, err)
 
 	// Alice creates session "CUSTOM01"
-	_, err = createTestSession(app, aliceKey.Id, "alice-agent", "CUSTOM01", "ocs://alice.com/share")
+	_, err = createTestSession(app, aliceKey.Id, "alice-agent", "CUSTOM01")
 	require.NoError(t, err)
 
 	h := hub.New()

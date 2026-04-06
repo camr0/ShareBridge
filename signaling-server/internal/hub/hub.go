@@ -135,19 +135,43 @@ func send(ctx context.Context, conn *websocket.Conn, msg any) error {
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
-// CloseAgent closes the WebSocket connection for the agent identified by apiKeyID
-// and removes it from the hub. Used when an API key is revoked.
+// CloseAgent closes the WebSocket connection for the agent identified by apiKeyID,
+// removes it from the hub, and purges all associated codes and pairs.
+// Used when an API key is revoked.
 func (h *Hub) CloseAgent(apiKeyID string) {
 	h.mu.Lock()
 	conn, ok := h.agents[apiKeyID]
 	if ok {
 		delete(h.agents, apiKeyID)
 	}
+
+	// Purge all codes that belonged to this agent.
+	var staleCodes []string
+	for code, keyID := range h.codes {
+		if keyID == apiKeyID {
+			staleCodes = append(staleCodes, code)
+			delete(h.codes, code)
+		}
+	}
+
+	// Collect and remove any active pairs for the stale codes, grabbing browser
+	// conns so we can close them outside the lock.
+	var browserConns []*websocket.Conn
+	for _, code := range staleCodes {
+		if p, exists := h.pairs[code]; exists {
+			if p.browserConn != nil {
+				browserConns = append(browserConns, p.browserConn)
+			}
+			delete(h.pairs, code)
+		}
+	}
 	h.mu.Unlock()
 
 	if ok && conn != nil {
-		// Close the connection with a status indicating the key was revoked
 		conn.Close(websocket.StatusPolicyViolation, "API key revoked")
+	}
+	for _, bc := range browserConns {
+		bc.Close(websocket.StatusNormalClosure, "agent disconnected")
 	}
 }
 

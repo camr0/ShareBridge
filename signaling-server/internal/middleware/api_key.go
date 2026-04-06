@@ -22,8 +22,8 @@ func APIKeyAuth(app core.App) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Parse <record_id>.<secret> format
-			recordID, secret, ok := splitAPIKey(apiKeyFull)
+			// Parse <record_id>.<secret> format — we only need recordID for the DB lookup
+			recordID, _, ok := splitAPIKey(apiKeyFull)
 			if !ok {
 				http.Error(w, `{"error":"invalid api_key format"}`, http.StatusUnauthorized)
 				return
@@ -42,9 +42,10 @@ func APIKeyAuth(app core.App) func(http.Handler) http.Handler {
 				return
 			}
 
-			// bcrypt compare secret against stored key_hash
+			// bcrypt compare the full key (<record_id>.<secret>) against stored key_hash.
+			// CreateAPIKey hashes fullKey, not just secret.
 			storedHash := record.GetString("key_hash")
-			if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(secret)); err != nil {
+			if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(apiKeyFull)); err != nil {
 				http.Error(w, `{"error":"invalid api_key"}`, http.StatusUnauthorized)
 				return
 			}
