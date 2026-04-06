@@ -57,6 +57,8 @@ API rules: only the owning user can read/create/delete their own keys. `key_hash
 
 **Key format change:** Keys no longer use `ak_xxx.secret` format. The full key is `<record_id>.<random_secret>` — same pattern, different ID source. The `id` comes from PocketBase's auto-generated record ID.
 
+**Key generation:** The secret is 32 bytes from `crypto/rand`, base64url-encoded (no padding), giving ~43 characters of entropy. The full key (`<record_id>.<secret>`) is returned once in the `POST /api/keys` response and never stored — only `key_hash` (bcrypt) is persisted. The `/account` UI displays the full key in a copy-once dialog with a warning.
+
 ### `sessions` collection
 
 | Field | Type | Notes |
@@ -65,14 +67,13 @@ API rules: only the owning user can read/create/delete their own keys. `key_hash
 | `code` | Text | Unique, 8 chars, the share code |
 | `api_key_id` | Relation → api_keys | Required, CascadeDelete: true |
 | `agent_id` | Text | UUID of connected agent, nullable |
-| `share_url` | Text | WebDAV URL being shared |
 | `expires_at` | Date | Nullable |
-| `max_downloads` | Number | Nullable |
-| `download_count` | Number | Default 0 |
 | `created` | Auto (PocketBase) | |
 | `updated` | Auto (PocketBase) | |
 
-`CascadeDelete: true` on `api_key_id` — deleting an API key deletes all its sessions. API rules: sessions are not directly readable by end users (only agents and the signaling server logic access them).
+`CascadeDelete: true` on `api_key_id` — deleting an API key deletes all its sessions. This is PocketBase's built-in relation cascade (application-layer, not SQLite foreign keys) — no manual hooks required. API rules: sessions are not directly readable by end users (only agents and the signaling server logic access them).
+
+**Same-account reclaim rule:** if account A reconnects to an existing code using a different API key owned by the same account, the session is reassigned to the new `api_key_id` during reconnect. This transfer is required so revoking the old key does not cascade-delete the reclaimed session.
 
 ---
 
@@ -87,7 +88,20 @@ users ──< api_keys ──< sessions
 - Deleting an API key cascades to its sessions
 - Deleting a user cascades to their API keys (and transitively their sessions)
 
-`IsCodeAvailable` now checks: code is unclaimed, OR code is owned by a session whose api_key belongs to the same account. This allows agent reconnect with the same code.
+`IsCodeAvailable` is no longer the final ownership decision. Reconnect uses an atomic claim-or-reassign operation:
+- If no session with the code exists, create it.
+- If the code exists and belongs to the same account, update that session in place and set `session.api_key_id = requesting_api_key_id`.
+- If the code exists and belongs to a different account, reject it as unavailable.
+
+```
+claim succeeds if:
+  no session with this code exists
+  OR
+  session exists AND session.api_key.account_id == requesting agent's account_id
+    -> then transfer session.api_key_id to the reconnecting key
+```
+
+A session owned by a *different* account blocks the code (treat as unavailable).
 
 ---
 
@@ -155,6 +169,18 @@ Validation logic:
 
 ---
 
+## Agent Lifecycle on Key Revocation
+
+When an API key is revoked (`DELETE /api/keys/{id}`):
+1. Key is marked `is_active = false` in PocketBase.
+2. The hub's `CloseAgent(apiKeyID)` is called immediately — closes the live WebSocket if one exists.
+3. `CloseAgent` also removes in-memory code mappings and pairings for that key so revoked shares stop resolving immediately, not only after process restart.
+4. The agent is ejected from the hub and will fail to reconnect (next connect attempt hits `ValidateAPIKey` → nil).
+
+`hub.CloseAgent` must clean up all hub state tied to the revoked key, not just the socket. The `RevokeAPIKey` handler receives the hub as a parameter alongside `app`.
+
+---
+
 ## User-Facing Web Pages
 
 Three new pages served by the signaling server:
@@ -162,8 +188,9 @@ Three new pages served by the signaling server:
 ### `/register`
 - Email + password registration form
 - Calls PocketBase's `POST /api/collections/users/records`
-- On success: redirects to `/login` with a "check your email to verify" message
-- Email verification required before login (configurable via PocketBase SMTP settings)
+- On success: redirects to `/login` with a generic post-registration notice
+- If SMTP is configured, the notice tells the user to check email for verification before login
+- If SMTP is not configured, email verification is treated as disabled for this self-hosted install and the user may log in immediately
 
 ### `/login`
 - Email + password login form
@@ -183,22 +210,11 @@ These are simple HTML+JS pages consistent with the existing browser UI style (Ca
 
 ## Admin UI Access Control
 
-PocketBase's `/_/` admin UI is for the server operator only. It is blocked from public access via middleware:
+PocketBase's `/_/` admin UI is for the server operator only. It must not be exposed on the public reverse-proxied site.
 
-```go
-se.Router.Use(func(e *core.RequestEvent) error {
-    if strings.HasPrefix(e.Request.URL.Path, "/_/") {
-        // Allow only localhost
-        host, _, _ := net.SplitHostPort(e.Request.RemoteAddr)
-        if host != "127.0.0.1" && host != "::1" {
-            return e.NotFoundError("not found", nil)
-        }
-    }
-    return e.Next()
-})
-```
-
-Operators access `/_/` via SSH tunnel or local access only. This is consistent with how the agent admin UI at `:7878` is local-only.
+- Primary control: block `/_/` in nginx/Caddy/Traefik and return 404/deny before the request reaches PocketBase.
+- Optional defense in depth: a server-side localhost check may remain for direct non-proxied access, but it is not sufficient by itself because a same-host reverse proxy makes `RemoteAddr` appear local.
+- Operator access is via SSH tunnel or direct loopback-only access.
 
 Superuser account: on first start with no superuser, PocketBase prints a one-time setup URL to the logs. Operator visits it once to set their superuser password.
 
@@ -222,14 +238,14 @@ This is acceptable for 10a — the project has no production users yet. A migrat
 
 | Variable | Purpose | Change |
 |----------|---------|--------|
-| `PORT` | HTTP listen port | Unchanged (PocketBase respects this) |
-| `DATABASE_PATH` | SQLite path | Unchanged |
+| `PORT` | HTTP listen port | Unchanged, but `cmd/server/main.go` must wire PocketBase to listen on this port explicitly |
+| `DATABASE_PATH` | SQLite path | Unchanged, but `cmd/server/main.go` must point PocketBase at this data/DB location explicitly |
 | `TURN_HOST`, `TURN_PORT`, `TURN_SECRET` | TURN config | Unchanged |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | Email for verification/reset | New (optional; disables email flows if absent) |
 | `ADMIN_TOKEN` | Static admin token | **Removed** (replaced by PocketBase superuser) |
 | `AUTH_TOKEN` | Deprecated token | **Removed** |
 
-SMTP config is passed to PocketBase's mailer settings on startup. If absent, email verification is skipped (useful for local dev/self-hosted installs without email setup).
+SMTP config is passed to PocketBase's mailer settings on startup. If absent, the server runs in no-verification mode for end-user accounts: registration still works, but login does not require a verified email.
 
 ---
 
@@ -265,6 +281,7 @@ The CLI tool becomes minimal — most management happens via the web UI.
 | API key format | `ak_xxx.secret` | `<pb_record_id>.<secret>` |
 | Key management | `ADMIN_TOKEN` + `/admin/api/keys` | User JWT + `/api/keys` |
 | DB file | `signaling.db` (custom schema) | `signaling.db` (PocketBase schema) |
+| `share_url` | Stored in sessions table (unused) | **Removed** — server never needed it; agent retains it locally |
 | Server framework | Gin | PocketBase (net/http router) |
 | Key creation | CLI `create-key` command | `/account` web page |
 

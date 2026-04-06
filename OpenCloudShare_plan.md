@@ -101,27 +101,14 @@ The signaling server never handles file data in any scenario.
 **Configuration**:
 ```yaml
 signaling_server: "wss://share.yourdomain.com"
-auth_token: "your-secret-token"
-
-# Only share links from this host will be accepted (prevents SSRF)
+api_key: "ocs_a3f9k2..."   # unique per user, issued at registration
 allowed_opencloud_host: "opencloud.example.com"
 
 # No OpenCloud credentials needed — access is via share links only
-
-# TURN server (optional)
-# If omitted, the bundled Coturn instance is used automatically.
-# Supported providers: static credentials, Cloudflare Calls API, Metered.ca API
-turn:
-  provider: "static"            # static | cloudflare | metered
-  urls:
-    - "turn:your-turn-server.com:3478"
-  username: "your-turn-username"
-  credential: "your-turn-credential"
-  # For cloudflare provider:
-  # api_token: "${CF_TURN_TOKEN}"
-  # For metered provider:
-  # api_key: "${METERED_API_KEY}"
+# No TURN config needed — signaling server provides ICE config to both agent and browser
 ```
+
+> **Updated 2026-04-01:** TURN configuration moved from agent to signaling server. Both agent and browser receive ICE config (STUN + TURN credentials) from the server during handshake. This simplifies agent config and allows centralized TURN management.
 
 ### 3. Coturn (Bundled TURN Server)
 
@@ -150,19 +137,16 @@ shared secret, so Coturn requires no per-user account management.
 ```go
 type Session struct {
     ID           string        // 8-character alphanumeric code, e.g. "a3f9k2xp" (crypto/rand + base36 lowercase, ~2.8T combinations)
-    AgentID      string        // Agent identifier
-    ShareURL     string        // OpenCloud public share URL (e.g. https://opencloud.example.com/s/XYZ789)
+    APIKeyID     string        // API key that currently owns this session
     CreatedAt    time.Time
     ExpiresAt    time.Time
-    MaxDownloads     int    // Optional limit (0 = unlimited)
-    Password         string // OpenCloud share password — empty if the share has no password (OpenCloud requires one on creation, but it can be removed after). If non-empty, recipients must provide it to connect.
-    Downloads        int    // Current download count
 }
 ```
 
-**MaxDownloads behaviour**: when `Downloads` reaches `MaxDownloads`, the session is
-automatically revoked — subsequent `join` attempts receive a `session_expired` error.
-In-progress transfers at the moment of revocation are not interrupted.
+> **Updated 2026-04-06 for Slice 10a:** sessions remain owned by `api_key_id`, but a same-account reconnect with a different key transfers the session to the new `api_key_id` atomically. This preserves key rotation without breaking cascade delete semantics.
+
+`share_url`, password material, and download-limit counters are agent-local concerns.
+The signaling server only needs session identity, ownership, and expiry metadata.
 
 The **agent** persists sessions to a local JSON file (`~/.opencloudshare/sessions.json`)
 — shares survive agent container restarts. On startup the agent re-registers all
@@ -346,7 +330,7 @@ public share endpoint differs (it is PHP-based: `/public.php/webdav/`).
 
 **Browser**:
 - Alphanumeric code required to initiate connection
-- Password protection if the OpenCloud share has one (checked server-side before pairing; no bypass)
+- Password protection if the OpenCloud share has one (checked by the agent after pairing; signaling server never sees the password)
 - Session expiration (24h default)
 - Optional download limits
 
@@ -369,7 +353,10 @@ state file alongside sessions. The file structure is:
     {
       "id": "a3f9k2xp",
       "share_url": "https://opencloud.example.com/s/XYZ789",
-      "expires_at": "2026-03-30T12:00:00Z"
+      "expires_at": "2026-03-30T12:00:00Z",
+      "password": "U@y$yx353GYs",
+      "max_downloads": 10,
+      "downloads": 3
     }
   ]
 }
@@ -440,54 +427,72 @@ allowed_opencloud_host: "opencloud.example.com"
 - Admin can revoke individual API keys without affecting other users
 - Optional: invite-only registration to limit signaling server load
 
-### Self-Hosted vs Public
+### Deployment Modes
 
-The same binary supports both modes:
+> **Updated 2026-04-01:** Single mode removed. All deployments use accounts + API keys. Self-hosters create one account for themselves; SaaS operators allow public registration.
+
+The same binary supports both self-hosted and SaaS deployments:
 
 ```yaml
-# Single-user / homelab (default)
-mode: "single"
-auth_token: "your-static-token"
+# Self-hosted (registration closed, create your own account via admin CLI)
+registration: "closed"
 
-# Multi-user / public service
-mode: "multi"
-registration: "open"    # open | invite-only | closed
+# SaaS / public service (open registration)
+registration: "open"
+
+# Invite-only (beta/limited access)
+registration: "invite-only"
 ```
 
-## Implementation Phases
+**Configuration:**
+```yaml
+signaling_server: "wss://share.yourdomain.com"
+api_key: "ocs_a3f9k2..."   # unique per user, issued at registration
+allowed_opencloud_host: "opencloud.example.com"
+```
 
-### Phase 1: MVP
+### Phase 1: MVP ✅ COMPLETE
 
 **Signaling Server**:
-- [ ] WebSocket server with in-memory session management
-- [ ] Create session endpoint (`POST /api/v1/sessions`)
-- [ ] Pair agent with browser, relay WebRTC signaling
-- [ ] ICE config endpoint — serve STUN + Coturn HMAC credentials
-- [ ] Simple web UI for code entry and file list
+- [x] WebSocket server with in-memory session management
+- [x] Create session endpoint (`POST /api/v1/sessions`)
+- [x] Pair agent with browser, relay WebRTC signaling
+- [x] ICE config endpoint — serve STUN + Coturn HMAC credentials
+- [x] Simple web UI for code entry and file list
 
 **Coturn**:
-- [ ] Add to docker-compose with HMAC shared secret config
-- [ ] Signaling server generates per-session HMAC credentials
+- [x] Add to docker-compose with HMAC shared secret config
+- [x] Signaling server generates per-session HMAC credentials
 
 **OpenCloud Agent**:
 - [x] **Verified** public share WebDAV endpoint: `remote.php/dav/public-files/{token}`, Basic Auth `token:` (OpenCloud 5.2.0)
-- [ ] JSON file persistence for sessions and stable AgentID (`~/.opencloudshare/sessions.json`)
-- [ ] WebSocket client with reconnect/backoff + session re-registration on reconnect
-- [ ] WebRTC peer connection with configurable ICE servers
-- [ ] File listing via public share WebDAV PROPFIND
-- [ ] Single file download via share link with chunking + backpressure
-- [ ] Phase 1 CLI: `opencloudshare share <url> [--ttl 24h] [--password x] [--max-downloads 10]`
+- [x] JSON file persistence for sessions and stable AgentID (`~/.opencloudshare/sessions.json`)
+- [x] WebSocket client with reconnect/backoff + session re-registration on reconnect
+- [x] WebRTC peer connection with configurable ICE servers
+- [x] File listing via public share WebDAV PROPFIND
+- [x] Single file download via share link with chunking + backpressure
+- [x] Phase 1 CLI: `opencloudshare share <url> [--ttl 24h] [--password x] [--max-downloads 10]`
 
-### Phase 2: Admin UI + Enhanced Features
+**Completed in Phase 1** (Slices 1-7, 9):
+- WebRTC DataChannel + signaling
+- File transfer with chunking and backpressure
+- Password protection + max downloads
+- Persistence + stable AgentID
+- Speed display + SHA-1 checksum verification
+- Nested folder navigation
+- Multi-tenancy + API keys + SQLite
+- Coturn TURN server + HMAC credentials + ICE config from server
+- Connection status indicator (Direct/Relay) in browser UI
+
+### Phase 2: Admin UI + Enhanced Features (Slice 8)
 
 The agent gains a local web UI (served on `localhost:7878` by default) for
 configuration and share management — modelled on the arr suite (Sonarr, Radarr).
 No separate app required; just open a browser on the machine running the agent.
 
 **Admin UI — Settings page**:
-- Signaling server URL + auth token
+- Signaling server URL + API key
 - Allowed OpenCloud host (SSRF protection)
-- TURN provider selection (bundled Coturn / static / Cloudflare / Metered) + credentials
 - Default session TTL and download limits
 
 **Admin UI — Dashboard**:
@@ -496,16 +501,29 @@ No separate app required; just open a browser on the machine running the agent.
 - Revoke button per share
 - Connection status indicator (agent ↔ signaling server)
 
+**Share Creation UI — Direct vs Relay Mode**:
+- Privacy warning: "Your IP address will be visible to anyone with this code"
+- Mode selection:
+  - **Direct** (default): Fast, free, IP visible — normal ICE (host + srflx + relay candidates)
+  - **Relay**: Hide IP, uses TURN server only — forces `iceTransportPolicy: relay` on agent
+- Warning if Relay selected but TURN not configured: "Relay mode requires a TURN server. Connection will fail."
+- Per-session `relay_only` flag stored in session metadata
+- Peer creation passes relay flag: `peer.New(iceServers, relayOnly)`
+
 **Other Phase 2 items**:
 - [ ] Agent local web server + admin UI (Settings + Dashboard)
+- [ ] Agent becomes long-running daemon (not single-shot CLI)
+- [ ] REST API for adding/removing shares dynamically
+- [ ] Multiple concurrent shares with different codes
+- [ ] CLI becomes client to daemon
 - [ ] ~~Agent local JSON persistence~~ (moved to Phase 1)
 - [ ] Third-party TURN provider support (Cloudflare Calls, Metered.ca)
 - [ ] DNS rebinding hardening: resolve and pin `allowed_opencloud_host` IP on first use
-- [ ] Binary DataChannel protocol — `[1B type][2B length][payload]` replacing JSON+base64 (~33% less bandwidth, matters for large files); chunk size remains 64KB
-- [ ] Folder navigation in recipient browser UI
+- [x] ~~Binary DataChannel protocol~~ — **completed**, chunks sent as raw binary
+- [x] ~~Folder navigation in recipient browser UI~~ — **completed** (Slice 6)
 - [ ] QR code generation in admin UI (for in-person sharing)
-- [ ] Password protection on sessions
-- [ ] Download limits
+- [x] ~~Password protection on sessions~~ — **completed** (Slice 3)
+- [x] ~~Download limits~~ — **completed** (Slice 3)
 - [ ] Session revocation
 - [ ] Mobile optimizations for recipient UI
 
@@ -535,15 +553,39 @@ in a modal.
 - [ ] Documentation
 - [ ] Monitoring/logging
 - [ ] Performance optimization
+- [ ] **Rate limiting implementation** — basic in-memory rate limiting on signaling server (currently designed but unassigned to a slice): max 5 failed join attempts/min per IP, max 3 concurrent WebSocket connections per IP, max 10 session creations/min per API key. Redis for persistence moves to Phase 4b.
+- [ ] **HMAC pre-challenge for join** — before the agent creates a peer connection, require the browser to prove it knows the share password without revealing it to the signaling server:
+  1. Browser sends `knock(code)` to signaling server → relayed to agent
+  2. Agent generates a random nonce, sends it back via signaling
+  3. Browser computes `HMAC-SHA256(nonce, password)` and sends it as part of `join`
+  4. Agent verifies HMAC — only creates peer if valid; drops join silently if invalid
+  - Signaling server sees only the nonce and HMAC output, never the password
+  - Fresh nonce per challenge prevents replay attacks
+  - Password-less shares skip the knock step entirely (fall back to rate limiting + auth timeout)
+  - Prevents a malicious or compromised signaling server from flooding `join` messages to exhaust agent resources with unauthenticated peer connections
 
-### Phase 4b: Public Multi-Tenant Hosting
+### Phase 4b: Public Multi-Tenant Hosting + Billing (Slice 10)
 
-- [ ] Multi-tenant mode: per-user API key registration (`POST /api/v1/register`)
-- [ ] Registration UI at `/register` (email → API key)
+- [ ] PocketBase-backed user accounts with `/register`, `/login`, and `/account`
+- [ ] Self-serve per-account API key management (`POST/GET/DELETE /api/keys`)
 - [ ] Per-key usage tracking and admin dashboard
-- [ ] **SQLite** — persists API keys and user registrations on the signaling server; without this, all registered agents lose access on every server restart
+- [ ] **PocketBase SQLite** — persists users, API keys, and sessions in one process
 - [ ] **Redis** — persists rate limit state across restarts (prevents abuse window during deploys); not needed for API key storage (that's SQLite)
 - [ ] **Cloudflare proxy** — put signaling server behind Cloudflare for bot detection, IP reputation, and DDoS protection; replaces DIY progressive IP banning for distributed attacks
+
+**Accounts + Billing**:
+- [ ] PocketBase `users` auth collection (email/password, optional email verification)
+- [ ] Sessions owned by `api_key_id`, with same-account reclaim transferring ownership during key rotation
+- [ ] Multiple API keys per account
+- [ ] Stripe integration for pro tier
+
+**Tier-based Relay Quotas (builds on Phase 2 Direct/Relay mode)**:
+- Free tier: 10GB/month relay bandwidth
+- Pro tier ($10/year): 1TB/month relay bandwidth
+- BYOK option: User provides own Cloudflare/Twilio TURN API key — bypasses server quotas
+- Bandwidth quota display: "Pro: 850GB remaining this month" or "Free: 0GB remaining [Upgrade]"
+- Relay mode checkbox shows quota status before share creation
+- Direct mode remains free/unlimited (no TURN usage)
 
 ## API Specification
 
