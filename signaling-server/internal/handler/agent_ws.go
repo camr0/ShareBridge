@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"math/big"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"sharebridge/server/internal/config"
@@ -36,6 +39,8 @@ type agentMsg struct {
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
 var codeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,30}$`)
+
+var errCodeAlreadyInUse = errors.New("code already in use")
 
 // AgentWS handles WebSocket connections from agents.
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
@@ -247,9 +252,22 @@ func handleRegisterShare(
 			return
 		}
 
-		// Check if code exists and is owned by this API key
-		available, existingSession, err := isCodeAvailable(app, code, apiKeyID, accountID)
+		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt)
 		if err != nil {
+			if errors.Is(err, errCodeAlreadyInUse) {
+				hub.SendDirect(ctx, conn, map[string]string{
+					"type":    "error",
+					"message": "code already in use",
+				})
+				return
+			}
+			if err.Error() == "session owned by different agent" {
+				hub.SendDirect(ctx, conn, map[string]string{
+					"type":    "error",
+					"message": "session owned by different agent",
+				})
+				return
+			}
 			log.Printf("db error checking code availability: %v", err)
 			hub.SendDirect(ctx, conn, map[string]string{
 				"type":    "error",
@@ -257,50 +275,14 @@ func handleRegisterShare(
 			})
 			return
 		}
-
-		if available {
-			if existingSession != nil {
-				// Verify agent_id matches for reconnection
-				existingAgentID := existingSession.GetString("agent_id")
-				if existingAgentID != agentID {
-					hub.SendDirect(ctx, conn, map[string]string{
-						"type":    "error",
-						"message": "session owned by different agent",
-					})
-					return
-				}
-				// Reconnecting to existing session - update timestamps
-				existingSession.Set("agent_id", agentID)
-				if err := app.Save(existingSession); err != nil {
-					log.Printf("db error updating session: %v", err)
-					hub.SendDirect(ctx, conn, map[string]string{
-						"type":    "error",
-						"message": "database error",
-					})
-					return
-				}
-				reconnected = true
-				log.Printf("session reconnected: code=%s api_key=%s agent_id=%s", code, apiKeyID, agentID)
-			} else {
-				// Creating new session with custom code
-				err := createSession(app, code, apiKeyID, agentID, msg.ExpiresAt)
-				if err != nil {
-					log.Printf("db error creating session: %v", err)
-					hub.SendDirect(ctx, conn, map[string]string{
-						"type":    "error",
-						"message": "failed to create session",
-					})
-					return
-				}
-			}
-		} else {
-			// Code is taken by a different API key
+		if session == nil {
 			hub.SendDirect(ctx, conn, map[string]string{
 				"type":    "error",
-				"message": "code already in use",
+				"message": "failed to retrieve session",
 			})
 			return
 		}
+		reconnected = reclaimed
 	}
 
 	// Register code with hub
@@ -371,45 +353,71 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 	return records[0], nil
 }
 
-// isCodeAvailable checks whether a code can be claimed by the requesting API key.
-// Returns (available, existingSession, error).
-//   - available = true if the code is free, owned by the same key, or owned by a
-//     different key that belongs to the same account (key rotation case).
-//   - When available=true and existingSession!=nil, the session's api_key_id is
-//     updated in-place so the new key takes over ownership.
-func isCodeAvailable(app core.App, code string, apiKeyID string, accountID string) (bool, *core.Record, error) {
-	session, err := getSessionByCode(app, code)
+// claimSessionCode atomically creates or reassigns a custom code.
+func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time) (*core.Record, bool, error) {
+	var claimed *core.Record
+	reconnected := false
+
+	err := app.RunInTransaction(func(txApp core.App) error {
+		var existing struct {
+			SessionID string `db:"session_id"`
+			AccountID string `db:"account_id"`
+			AgentID   string `db:"agent_id"`
+		}
+
+		err := txApp.DB().
+			NewQuery(`SELECT s.id AS session_id, ak.account_id, s.agent_id
+				FROM sessions s
+				JOIN api_keys ak ON ak.id = s.api_key_id
+				WHERE s.code = {:code}
+				LIMIT 1`).
+			Bind(dbx.Params{"code": code}).
+			One(&existing)
+
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt); err != nil {
+				return err
+			}
+			record, getErr := getSessionByCode(txApp, code)
+			if getErr != nil {
+				return getErr
+			}
+			claimed = record
+			return nil
+		}
+
+		if existing.AccountID != accountID {
+			return errCodeAlreadyInUse
+		}
+		if existing.AgentID != "" && existing.AgentID != agentID {
+			return errors.New("session owned by different agent")
+		}
+
+		record, err := txApp.FindRecordById("sessions", existing.SessionID)
+		if err != nil {
+			return err
+		}
+		record.Set("api_key_id", apiKeyID)
+		record.Set("agent_id", agentID)
+		if expiresAt != nil {
+			dt, _ := types.ParseDateTime(*expiresAt)
+			record.Set("expires_at", dt)
+		}
+		if err := txApp.Save(record); err != nil {
+			return err
+		}
+
+		claimed = record
+		reconnected = true
+		return nil
+	})
 	if err != nil {
-		return false, nil, err
+		return nil, false, err
 	}
-	if session == nil {
-		return true, nil, nil
-	}
-
-	existingKeyID := session.GetString("api_key_id")
-	if existingKeyID == apiKeyID {
-		// Same key — straightforward reconnect.
-		return true, session, nil
-	}
-
-	// Different key: check if it belongs to the same account (key rotation).
-	existingKey, err := app.FindRecordById("api_keys", existingKeyID)
-	if err != nil {
-		// Key record missing (e.g. deleted) — treat code as available.
-		return true, session, nil
-	}
-	existingAccountID := existingKey.GetString("account_id")
-	if existingAccountID != accountID {
-		// Owned by a different account — not available.
-		return false, nil, nil
-	}
-
-	// Same account, different key (key rotation). Update ownership.
-	session.Set("api_key_id", apiKeyID)
-	if err := app.Save(session); err != nil {
-		return false, nil, err
-	}
-	return true, session, nil
+	return claimed, reconnected, nil
 }
 
 // generateRandomCode generates a random 8-character code

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/apis"
@@ -19,11 +22,15 @@ import (
 func main() {
 	cfg := config.Load()
 	h := hub.New()
+	dataDir := pocketBaseDataDir(cfg.DBPath)
 
-	app := pocketbase.New()
+	app := pocketbase.NewWithConfig(pocketbase.Config{
+		DefaultDataDir: dataDir,
+	})
 
 	// IMPORTANT: wire PocketBase to cfg.DBPath and cfg.Port explicitly.
-	// The PocketBase CLI uses --dir for data directory
+	// PocketBase expects a data directory, while DATABASE_PATH is historically a file path.
+	// We preserve the deployment contract by deriving the PocketBase data dir from it.
 
 	// Configure SMTP if provided (must be done before Bootstrap so email flows work).
 	if cfg.HasSMTP() {
@@ -60,8 +67,8 @@ func main() {
 			return nil
 		})
 
-		// Session info REST endpoint - placeholder
-		router.GET("/sessions/{code}", placeholderSessionHandler())
+		// Public session info endpoint
+		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
 
 		// Direct link route - serves index.html; JS reads code from window.location
 		router.GET("/s/{code}", handler.ServeFile("./web/index.html"))
@@ -79,45 +86,64 @@ func main() {
 		// Uses Bind middleware for auth (apis.RequireAuth returns *hook.Handler)
 		apiKeys := router.Group("/api/keys")
 		apiKeys.Bind(apis.RequireAuth())
-		apiKeys.POST("/", handler.CreateAPIKey(app))
-		apiKeys.GET("/", handler.ListAPIKeys(app))
+		apiKeys.POST("", handler.CreateAPIKey(app))
+		apiKeys.GET("", handler.ListAPIKeys(app))
 		apiKeys.DELETE("/{id}", handler.RevokeAPIKey(app, h))
 
 		// Cron: clean up expired sessions every 5 minutes
-		// Placeholder - full implementation with pbstore in Task 4
 		app.Cron().MustAdd("expiry_cleanup", "*/5 * * * *", func() {
-			log.Printf("Running expired session cleanup (placeholder)")
-			// Full implementation: pbstore.DeleteExpiredSessions(app)
+			if err := deleteExpiredSessions(app); err != nil {
+				log.Printf("error cleaning expired sessions: %v", err)
+			}
 		})
 
 		log.Printf("signaling server listening on :%s", cfg.Port)
 		log.Printf("database path: %s", cfg.DBPath)
+		log.Printf("pocketbase data dir: %s", dataDir)
 
 		return se.Next()
 	})
 
-	// Set port and data directory explicitly from config
-	// PocketBase uses --dir for data and --http for port via CLI args
-	os.Args = append(os.Args, "--http=0.0.0.0:"+cfg.Port, "--dir="+cfg.DBPath)
+	// Set the listen address explicitly from config.
+	os.Args = append(os.Args, "--http=0.0.0.0:"+cfg.Port)
 
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// placeholderSessionHandler returns a placeholder session handler
-func placeholderSessionHandler() func(*core.RequestEvent) error {
-	return func(e *core.RequestEvent) error {
-		return apis.NewApiError(http.StatusNotImplemented, "session lookup not yet implemented", nil)
+func pocketBaseDataDir(dbPath string) string {
+	if dbPath == "" {
+		return ""
 	}
+	clean := filepath.Clean(dbPath)
+	if filepath.Ext(clean) == ".db" {
+		return filepath.Dir(clean)
+	}
+	return clean
 }
 
-// placeholderAPIHandler returns a placeholder API handler
-func placeholderAPIHandler(name string) func(*core.RequestEvent) error {
-	return func(e *core.RequestEvent) error {
-		e.Response.Header().Set("Content-Type", "application/json")
-		e.Response.WriteHeader(http.StatusNotImplemented)
-		e.Response.Write([]byte(`{"message":"` + name + ` not yet implemented"}`))
-		return nil
+func deleteExpiredSessions(app core.App) error {
+	for {
+		records, err := app.FindRecordsByFilter(
+			"sessions",
+			"expires_at <= {:now}",
+			"",
+			500,
+			0,
+			map[string]any{"now": time.Now().UTC().Format(time.RFC3339)},
+		)
+		if err != nil {
+			return err
+		}
+		if len(records) == 0 {
+			return nil
+		}
+
+		for _, record := range records {
+			if err := app.Delete(record); err != nil {
+				return fmt.Errorf("delete expired session %s: %w", record.Id, err)
+			}
+		}
 	}
 }

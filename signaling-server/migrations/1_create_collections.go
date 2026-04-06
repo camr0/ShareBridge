@@ -100,17 +100,14 @@ func CreateCollections(app core.App) error {
 		"CREATE UNIQUE INDEX `idx_sessions_code` ON `{{COLLECTION}}` (`code`)",
 	}
 
-	// API rules: sessions are not accessible via PocketBase's REST API at all.
-	// The rule "@request.auth.id = ''" allows only unauthenticated requests through
-	// the collection API — but since no client ever calls the sessions API directly,
-	// this effectively locks it down to server-side Go code (app.FindRecordsByFilter
-	// bypasses collection rules entirely).
-	sessionsRule := "@request.auth.id = ''"
-	sessionsCol.ListRule = &sessionsRule
-	sessionsCol.ViewRule = &sessionsRule
-	sessionsCol.CreateRule = &sessionsRule
-	sessionsCol.UpdateRule = &sessionsRule
-	sessionsCol.DeleteRule = &sessionsRule
+	// Sessions are internal server state and must not be exposed through the
+	// PocketBase collection REST API. Leaving the rules nil keeps access limited
+	// to server-side Go code and PocketBase superusers only.
+	sessionsCol.ListRule = nil
+	sessionsCol.ViewRule = nil
+	sessionsCol.CreateRule = nil
+	sessionsCol.UpdateRule = nil
+	sessionsCol.DeleteRule = nil
 	if err := app.Save(sessionsCol); err != nil {
 		// Check if it's a "collection already exists" error
 		if strings.Contains(err.Error(), "already exists") {

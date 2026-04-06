@@ -71,6 +71,7 @@ func CreateAPIKey(app core.App) func(*core.RequestEvent) error {
 		// Generate 32-byte random secret (base64url encoded = 43 chars)
 		secretBytes := make([]byte, 32)
 		if _, err := rand.Read(secretBytes); err != nil {
+			_ = app.Delete(record)
 			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to generate secret"})
 		}
 		secret := base64.RawURLEncoding.EncodeToString(secretBytes)
@@ -81,12 +82,14 @@ func CreateAPIKey(app core.App) func(*core.RequestEvent) error {
 		// Generate bcrypt hash of the full key for storage
 		hash, err := bcrypt.GenerateFromPassword([]byte(fullKey), bcrypt.DefaultCost)
 		if err != nil {
+			_ = app.Delete(record)
 			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to hash key"})
 		}
 
 		// Update record with the hash
 		record.Set("key_hash", string(hash))
 		if err := app.Save(record); err != nil {
+			_ = app.Delete(record)
 			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save key hash"})
 		}
 
