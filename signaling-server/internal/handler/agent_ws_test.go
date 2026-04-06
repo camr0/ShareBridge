@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
-	"opencloudshare/server/internal/config"
-	"opencloudshare/server/internal/db"
-	"opencloudshare/server/internal/hub"
+	"sharebridge/server/internal/config"
+	"sharebridge/server/internal/db"
+	"sharebridge/server/internal/hub"
 )
 
 func TestAgentWS_HelloFlow(t *testing.T) {

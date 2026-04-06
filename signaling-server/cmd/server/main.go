@@ -5,10 +5,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"opencloudshare/server/internal/config"
-	"opencloudshare/server/internal/db"
-	"opencloudshare/server/internal/handler"
-	"opencloudshare/server/internal/hub"
+	"sharebridge/server/internal/config"
+	"sharebridge/server/internal/db"
+	"sharebridge/server/internal/handler"
+	"sharebridge/server/internal/hub"
 )
 
 func main() {

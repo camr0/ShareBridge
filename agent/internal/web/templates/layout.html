@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{.Title}} - OpenCloudShare Agent</title>
+    <title>{{.Title}} - ShareBridge Agent</title>
     <link rel="stylesheet" href="/static/pico.min.css">
     <link rel="stylesheet" href="/static/custom.css">
     <script src="/static/htmx.min.js" defer></script>
@@ -12,7 +12,7 @@
     <header class="container">
         <nav>
             <ul>
-                <li><strong><a href="/">OpenCloudShare</a></strong></li>
+                <li><strong><a href="/">ShareBridge</a></strong></li>
             </ul>
             <ul>
                 <li><a href="/" {{if eq .ActivePage "dashboard"}}aria-current="page"{{end}}>Dashboard</a></li>
@@ -35,7 +35,7 @@
     <footer class="container">
         <hr>
         <small>
-            OpenCloudShare Agent v{{.Version}} · Uptime: {{.Uptime}}
+            ShareBridge Agent v{{.Version}} · Uptime: {{.Uptime}}
             <span class="footer-links">
                 <a href="#">GitHub</a> ·
                 <a href="#">Docs</a> ·

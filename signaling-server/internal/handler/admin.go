@@ -7,7 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
-	"opencloudshare/server/internal/db"
+	"sharebridge/server/internal/db"
 )
 
 type CreateAPIKeyResponse struct {

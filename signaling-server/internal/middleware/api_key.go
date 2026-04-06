@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"opencloudshare/server/internal/db"
+	"sharebridge/server/internal/db"
 )
 
 // APIKeyAuth extracts and validates API key from query parameter.

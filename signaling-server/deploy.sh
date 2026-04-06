@@ -166,7 +166,7 @@ mkdir -p data
 
 # Create Caddyfile (user will need to edit domain)
 cat > /etc/caddy/Caddyfile <<'EOF'
-# OpenCloudShare Signaling Server
+# ShareBridge Signaling Server
 # EDIT THIS: Replace with your domain
 share.example.com {
     reverse_proxy localhost:8080
@@ -234,10 +234,10 @@ Point your domain's A record to this server's IP address.
 cd /opt/sharebridge/signaling-server
 
 # Build the Docker image (or pull from registry)
-# docker build -t opencloudshare/signaling-server:latest /path/to/signaling-server
+# docker build -t sharebridge/signaling-server:latest /path/to/signaling-server
 
 # Start services
-systemctl start opencloudshare-signaling
+systemctl start sharebridge-signaling
 \`\`\`
 
 ## 4. Verify everything is running
@@ -299,6 +299,6 @@ echo "Next steps:"
 echo "  1. Configure your domain in /etc/caddy/Caddyfile"
 echo "  2. Point DNS to this server"
 echo "  3. Build/deploy your signaling server container"
-echo "  4. Start services: systemctl start opencloudshare-signaling"
+echo "  4. Start services: systemctl start sharebridge-signaling"
 echo ""
 echo -e "${GREEN}================================================${NC}"

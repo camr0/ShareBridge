@@ -15,7 +15,7 @@ func TestNew_CreatesMissingDir(t *testing.T) {
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "nonexistent", "subdir")
 
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", dataDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", dataDir)
 
 	_, err := New()
 	if err != nil {
@@ -32,7 +32,7 @@ func TestNew_CreatesMissingDir(t *testing.T) {
 // sessions.json exists but contains invalid JSON.
 func TestNew_MalformedJSON_Fatal(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	// Create malformed JSON file
 	sessionsFile := filepath.Join(tmpDir, "sessions.json")
@@ -51,7 +51,7 @@ func TestNew_MalformedJSON_Fatal(t *testing.T) {
 // sessions.json does not exist.
 func TestGetSession_MissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -68,7 +68,7 @@ func TestGetSession_MissingFile(t *testing.T) {
 // together to store and retrieve the same value.
 func TestSaveSession_GetSession_RoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -120,7 +120,7 @@ func TestSaveSession_GetSession_RoundTrip(t *testing.T) {
 // independently and can both be retrieved.
 func TestSaveSession_MultipleSessions(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -159,7 +159,7 @@ func TestSaveSession_MultipleSessions(t *testing.T) {
 // TestGetByShareURL verifies that GetByShareURL correctly retrieves sessions by URL.
 func TestGetByShareURL(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -196,7 +196,7 @@ func TestGetByShareURL(t *testing.T) {
 // increments and returns the count.
 func TestIncrementDownloads(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -248,7 +248,7 @@ func TestIncrementDownloads(t *testing.T) {
 // TestDeleteSession verifies that DeleteSession removes sessions correctly.
 func TestDeleteSession(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -289,7 +289,7 @@ func TestDeleteSession(t *testing.T) {
 // TestListSessions verifies ListSessions with and without expired filtering.
 func TestListSessions(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -352,7 +352,7 @@ func TestListSessions(t *testing.T) {
 // 0600 permissions (readable and writable only by owner).
 func TestSaveSession_FilePermissions(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -387,7 +387,7 @@ func TestSaveSession_FilePermissions(t *testing.T) {
 // updates the existing session.
 func TestSaveSession_UpdatesExisting(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {
@@ -437,7 +437,7 @@ func TestSaveSession_UpdatesExisting(t *testing.T) {
 // This should not panic.
 func TestGetSession_MidRunCorruption(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	// Create store and save a session
 	store, err := New()
@@ -475,7 +475,7 @@ func TestGetSession_MidRunCorruption(t *testing.T) {
 
 func TestAgentID_GeneratedOnFirstLoad(t *testing.T) {
 	tmpDir := t.TempDir()
-	t.Setenv("OPENCLOUDSHARE_DATA_DIR", tmpDir)
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
 
 	store, err := New()
 	if err != nil {

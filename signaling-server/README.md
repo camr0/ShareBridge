@@ -1,4 +1,4 @@
-# OpenCloudShare Signaling Server
+# ShareBridge Signaling Server
 
 WebSocket-based signaling server for WebRTC peer connection establishment.
 

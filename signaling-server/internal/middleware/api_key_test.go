@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
-	"opencloudshare/server/internal/db"
+	"sharebridge/server/internal/db"
 )
 
 func TestAPIKeyAuth_ValidKey(t *testing.T) {

@@ -10,10 +10,10 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
-	"opencloudshare/server/internal/config"
-	"opencloudshare/server/internal/db"
-	"opencloudshare/server/internal/hub"
-	"opencloudshare/server/internal/turn"
+	"sharebridge/server/internal/config"
+	"sharebridge/server/internal/db"
+	"sharebridge/server/internal/hub"
+	"sharebridge/server/internal/turn"
 )
 
 type browserMsg struct {

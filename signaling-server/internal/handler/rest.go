@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"opencloudshare/server/internal/db"
-	"opencloudshare/server/internal/hub"
+	"sharebridge/server/internal/db"
+	"sharebridge/server/internal/hub"
 )
 
 type SessionInfoResponse struct {

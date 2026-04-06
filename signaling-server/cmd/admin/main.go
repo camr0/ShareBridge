@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/bcrypt"
-	"opencloudshare/server/internal/db"
+	"sharebridge/server/internal/db"
 )
 
 var dbPath string
@@ -15,7 +15,7 @@ var dbPath string
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "admin",
-		Short: "OpenCloudShare signaling server admin tool",
+		Short: "ShareBridge signaling server admin tool",
 	}
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "./signaling.db", "database path")
 
@@ -75,7 +75,7 @@ var createKeyCmd = &cobra.Command{
 		fmt.Printf("  ID:       %s\n", keyID)
 		fmt.Printf("  Full key: %s\n", fullKey)
 		fmt.Println("\nSet environment variable:")
-		fmt.Printf("  export OPENCLOUDSHARE_API_KEY=%s\n", fullKey)
+		fmt.Printf("  export SHAREBRIDGE_API_KEY=%s\n", fullKey)
 
 		return nil
 	},
