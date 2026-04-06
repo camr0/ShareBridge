@@ -3,3 +3,19 @@
 
 # Brainstorming mockups
 .superpowers/
+
+# Go build and test artifacts
+.gocache/
+*.test
+*.out
+*.prof
+coverage.out
+coverage.txt
+
+# Local runtime data
+pb_data/
+
+# Common local build outputs
+bin/
+dist/
+signaling-server/server
