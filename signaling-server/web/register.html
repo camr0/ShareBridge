@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Register - ShareBridge</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 400px;
+    }
+
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      text-align: center;
+      color: #cdd6f4;
+    }
+
+    .subtitle {
+      text-align: center;
+      color: #6c7086;
+      margin-bottom: 32px;
+      font-size: 0.95rem;
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 0.9rem;
+      color: #a6adc8;
+    }
+
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 1rem;
+      background: #313244;
+      color: #cdd6f4;
+      border: 1px solid #45475a;
+      border-radius: 8px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input:focus {
+      border-color: #89b4fa;
+    }
+
+    input::placeholder {
+      color: #6c7086;
+    }
+
+    input.error {
+      border-color: #f38ba8;
+    }
+
+    .error-message {
+      color: #f38ba8;
+      font-size: 0.85rem;
+      margin-top: 6px;
+      min-height: 1.2em;
+    }
+
+    .password-requirements {
+      font-size: 0.85rem;
+      color: #6c7086;
+      margin-top: 6px;
+    }
+
+    .password-requirements.valid {
+      color: #a6e3a1;
+    }
+
+    button {
+      width: 100%;
+      padding: 12px;
+      font-size: 1rem;
+      background: #89b4fa;
+      color: #1e1e2e;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      margin-top: 8px;
+      transition: opacity 0.2s;
+    }
+
+    button:hover:not(:disabled) {
+      opacity: 0.9;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .links {
+      text-align: center;
+      margin-top: 24px;
+      font-size: 0.9rem;
+    }
+
+    .links a {
+      color: #89b4fa;
+      text-decoration: none;
+    }
+
+    .links a:hover {
+      text-decoration: underline;
+    }
+
+    .notice {
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-size: 0.9rem;
+      display: none;
+    }
+
+    .notice.success {
+      display: block;
+      background: #313244;
+      border: 1px solid #a6e3a1;
+      color: #a6e3a1;
+    }
+
+    .notice.error {
+      display: block;
+      background: #313244;
+      border: 1px solid #f38ba8;
+      color: #f38ba8;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid #1e1e2e;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Create Account</h1>
+    <p class="subtitle">Join ShareBridge to manage your shares</p>
+
+    <div id="notice" class="notice"></div>
+
+    <form id="register-form" novalidate>
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input
+          type="email"
+          id="email"
+          name="email"
+          placeholder="you@example.com"
+          required
+          autocomplete="email"
+        >
+        <div class="error-message" id="email-error"></div>
+      </div>
+
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input
+          type="password"
+          id="password"
+          name="password"
+          placeholder="Enter a strong password"
+          required
+          autocomplete="new-password"
+        >
+        <div class="password-requirements" id="password-requirements">
+          At least 8 characters
+        </div>
+        <div class="error-message" id="password-error"></div>
+      </div>
+
+      <div class="form-group">
+        <label for="confirm-password">Confirm Password</label>
+        <input
+          type="password"
+          id="confirm-password"
+          name="confirm-password"
+          placeholder="Re-enter your password"
+          required
+          autocomplete="new-password"
+        >
+        <div class="error-message" id="confirm-password-error"></div>
+      </div>
+
+      <button type="submit" id="submit-btn">Create Account</button>
+    </form>
+
+    <div class="links">
+      Already have an account? <a href="/login">Sign in</a>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('register-form');
+    const emailInput = document.getElementById('email');
+    const passwordInput = document.getElementById('password');
+    const confirmInput = document.getElementById('confirm-password');
+    const submitBtn = document.getElementById('submit-btn');
+    const notice = document.getElementById('notice');
+
+    const emailError = document.getElementById('email-error');
+    const passwordError = document.getElementById('password-error');
+    const confirmError = document.getElementById('confirm-password-error');
+    const passwordRequirements = document.getElementById('password-requirements');
+
+    // Email validation regex
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    function showFieldError(input, errorEl, message) {
+      input.classList.add('error');
+      errorEl.textContent = message;
+    }
+
+    function clearFieldError(input, errorEl) {
+      input.classList.remove('error');
+      errorEl.textContent = '';
+    }
+
+    function showNotice(type, message) {
+      notice.className = 'notice ' + type;
+      notice.textContent = message;
+    }
+
+    function clearNotice() {
+      notice.className = 'notice';
+      notice.textContent = '';
+    }
+
+    function validateEmail() {
+      const value = emailInput.value.trim();
+      if (!value) {
+        showFieldError(emailInput, emailError, 'Email is required');
+        return false;
+      }
+      if (!emailRegex.test(value)) {
+        showFieldError(emailInput, emailError, 'Please enter a valid email address');
+        return false;
+      }
+      clearFieldError(emailInput, emailError);
+      return true;
+    }
+
+    function validatePassword() {
+      const value = passwordInput.value;
+      if (!value) {
+        showFieldError(passwordInput, passwordError, 'Password is required');
+        passwordRequirements.classList.remove('valid');
+        return false;
+      }
+      if (value.length < 8) {
+        showFieldError(passwordInput, passwordError, 'Password must be at least 8 characters');
+        passwordRequirements.classList.remove('valid');
+        return false;
+      }
+      clearFieldError(passwordInput, passwordError);
+      passwordRequirements.classList.add('valid');
+      return true;
+    }
+
+    function validateConfirmPassword() {
+      const value = confirmInput.value;
+      if (!value) {
+        showFieldError(confirmInput, confirmError, 'Please confirm your password');
+        return false;
+      }
+      if (value !== passwordInput.value) {
+        showFieldError(confirmInput, confirmError, 'Passwords do not match');
+        return false;
+      }
+      clearFieldError(confirmInput, confirmError);
+      return true;
+    }
+
+    // Real-time validation
+    emailInput.addEventListener('blur', validateEmail);
+    emailInput.addEventListener('input', () => {
+      if (emailInput.classList.contains('error')) {
+        validateEmail();
+      }
+    });
+
+    passwordInput.addEventListener('input', () => {
+      if (passwordInput.value.length >= 8) {
+        passwordRequirements.classList.add('valid');
+      } else {
+        passwordRequirements.classList.remove('valid');
+      }
+      if (passwordInput.classList.contains('error')) {
+        validatePassword();
+      }
+      // Re-validate confirm password if it has a value
+      if (confirmInput.value) {
+        validateConfirmPassword();
+      }
+    });
+
+    confirmInput.addEventListener('input', () => {
+      if (confirmInput.classList.contains('error')) {
+        validateConfirmPassword();
+      }
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      clearNotice();
+
+      // Validate all fields
+      const isEmailValid = validateEmail();
+      const isPasswordValid = validatePassword();
+      const isConfirmValid = validateConfirmPassword();
+
+      if (!isEmailValid || !isPasswordValid || !isConfirmValid) {
+        return;
+      }
+
+      // Disable submit button and show loading
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span class="spinner"></span>Creating account...';
+
+      try {
+        const response = await fetch('/api/collections/users/records', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email: emailInput.value.trim(),
+            password: passwordInput.value,
+            passwordConfirm: confirmInput.value,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+          // Registration successful
+          // Check if email verification is required
+          const isVerified = data.verified === true;
+
+          if (isVerified) {
+            // Email verified immediately (no SMTP configured), redirect to login
+            window.location.href = '/login?registered=true&verified=true';
+          } else {
+            // Email verification required, redirect to login with notice
+            window.location.href = '/login?registered=true&verify=true';
+          }
+        } else {
+          // Registration failed
+          const message = data.message || 'Registration failed. Please try again.';
+          showNotice('error', message);
+
+          // Handle specific field errors from PocketBase
+          if (data.data) {
+            if (data.data.email) {
+              showFieldError(emailInput, emailError, data.data.email.message || 'Invalid email');
+            }
+            if (data.data.password) {
+              showFieldError(passwordInput, passwordError, data.data.password.message || 'Invalid password');
+            }
+          }
+        }
+      } catch (err) {
+        showNotice('error', 'Network error. Please check your connection and try again.');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Create Account';
+      }
+    });
+  </script>
+</body>
+</html>

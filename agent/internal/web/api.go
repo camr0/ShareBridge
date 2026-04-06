@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
@@ -234,10 +235,16 @@ func (ws *WebServer) saveSettingsHandler(w http.ResponseWriter, r *http.Request)
 	// Get current config
 	currentCfg := ws.daemon.GetConfig()
 
-	// Update fields from form
-	currentCfg.SignalingURL = r.FormValue("signaling_url")
-	currentCfg.APIKey = r.FormValue("api_key")
-	currentCfg.AllowedHost = r.FormValue("allowed_host")
+	// Ignore env-managed fields even if a crafted request sends them.
+	if os.Getenv("SIGNALING_SERVER") == "" {
+		currentCfg.SignalingURL = r.FormValue("signaling_url")
+	}
+	if os.Getenv("SHAREBRIDGE_API_KEY") == "" {
+		currentCfg.APIKey = r.FormValue("api_key")
+	}
+	if os.Getenv("ALLOWED_SHAREBRIDGE_HOST") == "" {
+		currentCfg.AllowedHost = r.FormValue("allowed_host")
+	}
 
 	// Parse default expiry hours
 	if val := r.FormValue("default_expiry_hours"); val != "" {

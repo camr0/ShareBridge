@@ -4,47 +4,127 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/coder/websocket"
-	"github.com/gin-gonic/gin"
+	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tests"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 	"sharebridge/server/internal/config"
-	"sharebridge/server/internal/db"
 	"sharebridge/server/internal/hub"
+	"sharebridge/server/internal/middleware"
+	"sharebridge/server/migrations"
 )
 
+func setupAgentTestApp(t *testing.T) (core.App, func()) {
+	testApp, err := tests.NewTestApp(t.TempDir())
+	require.NoError(t, err)
+
+	// Bootstrap the app and run system migrations
+	err = testApp.Bootstrap()
+	require.NoError(t, err)
+	err = testApp.RunSystemMigrations()
+	require.NoError(t, err)
+
+	// Run our custom migrations
+	err = migrations.CreateCollections(testApp)
+	require.NoError(t, err)
+
+	cleanup := func() { testApp.Cleanup() }
+	return testApp, cleanup
+}
+
+func createTestUser(app core.App, email string) (*core.Record, error) {
+	usersCol, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		return nil, err
+	}
+
+	user := core.NewRecord(usersCol)
+	user.SetEmail(email)
+	user.SetPassword("testpassword123")
+	if err := app.Save(user); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+func createTestAPIKey(app core.App, userID string, secret string) (*core.Record, error) {
+	apiKeysCol, err := app.FindCollectionByNameOrId("api_keys")
+	if err != nil {
+		return nil, err
+	}
+
+	// Save first to get the record ID, then hash fullKey = record.Id + "." + secret.
+	// This matches the production CreateAPIKey handler.
+	record := core.NewRecord(apiKeysCol)
+	record.Set("account_id", userID)
+	record.Set("is_active", true)
+	record.Set("label", "test key")
+	if err := app.Save(record); err != nil {
+		return nil, err
+	}
+
+	fullKey := record.Id + "." + secret
+	hash, err := bcrypt.GenerateFromPassword([]byte(fullKey), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
+	record.Set("key_hash", string(hash))
+	if err := app.Save(record); err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
+func createTestSession(app core.App, apiKeyID, agentID, code string) (*core.Record, error) {
+	sessionsCol, err := app.FindCollectionByNameOrId("sessions")
+	if err != nil {
+		return nil, err
+	}
+
+	record := core.NewRecord(sessionsCol)
+	record.Set("code", code)
+	record.Set("api_key_id", apiKeyID)
+	record.Set("agent_id", agentID)
+
+	if err := app.Save(record); err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
 func TestAgentWS_HelloFlow(t *testing.T) {
-	tmpDir := t.TempDir()
-	database, err := db.Open(filepath.Join(tmpDir, "test.db"))
-	require.NoError(t, err)
-	defer database.Close()
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
 
-	// Create API key
-	keyRepo := db.NewAPIKeyRepo(database)
-	hash, err := bcrypt.GenerateFromPassword([]byte("ak_test.agentsecret"), bcrypt.DefaultCost)
-	require.NoError(t, err)
-	err = keyRepo.Create("ak_test", string(hash))
+	// Create a test user and API key
+	user, err := createTestUser(app, "test@example.com")
 	require.NoError(t, err)
 
-	sessionRepo := db.NewSessionRepo(database)
+	secret := "agentsecret"
+	apiKey, err := createTestAPIKey(app, user.Id, secret)
+	require.NoError(t, err)
+
 	h := hub.New()
-
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
 	cfg := config.Load()
-	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo, cfg))
 
-	server := httptest.NewServer(router)
+	// Create HTTP test server with the AgentWS handler wrapped in auth middleware
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+
+	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	// Connect with valid API key
+	// Connect with valid API key: record_id.secret
+	fullKey := apiKey.Id + "." + secret
 	ctx := context.Background()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key=ak_test.agentsecret", nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
 	require.NoError(t, err)
 	defer conn.CloseNow()
 
@@ -60,21 +140,18 @@ func TestAgentWS_HelloFlow(t *testing.T) {
 }
 
 func TestAgentWS_InvalidAPIKey(t *testing.T) {
-	tmpDir := t.TempDir()
-	database, err := db.Open(filepath.Join(tmpDir, "test.db"))
-	require.NoError(t, err)
-	defer database.Close()
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
 
-	keyRepo := db.NewAPIKeyRepo(database)
-	sessionRepo := db.NewSessionRepo(database)
 	h := hub.New()
-
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
 	cfg := config.Load()
-	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo, cfg))
 
-	server := httptest.NewServer(router)
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+
+	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	// Connect with invalid API key
@@ -86,45 +163,42 @@ func TestAgentWS_InvalidAPIKey(t *testing.T) {
 }
 
 func TestAgentWS_CodeOwnership(t *testing.T) {
-	tmpDir := t.TempDir()
-	database, err := db.Open(filepath.Join(tmpDir, "test.db"))
-	require.NoError(t, err)
-	defer database.Close()
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
 
-	// Create two API keys
-	keyRepo := db.NewAPIKeyRepo(database)
-	hash1, err := bcrypt.GenerateFromPassword([]byte("ak_alice.alicesecret"), bcrypt.DefaultCost)
+	// Create two test users and API keys
+	alice, err := createTestUser(app, "alice@example.com")
 	require.NoError(t, err)
-	err = keyRepo.Create("ak_alice", string(hash1))
-	require.NoError(t, err)
-	hash2, err := bcrypt.GenerateFromPassword([]byte("ak_mallory.mallorysecret"), bcrypt.DefaultCost)
-	require.NoError(t, err)
-	err = keyRepo.Create("ak_mallory", string(hash2))
+	mallory, err := createTestUser(app, "mallory@example.com")
 	require.NoError(t, err)
 
-	sessionRepo := db.NewSessionRepo(database)
-	h := hub.New()
+	aliceSecret := "alicesecret"
+	mallorySecret := "mallorysecret"
+	aliceKey, err := createTestAPIKey(app, alice.Id, aliceSecret)
+	require.NoError(t, err)
+	malloryKey, err := createTestAPIKey(app, mallory.Id, mallorySecret)
+	require.NoError(t, err)
 
 	// Alice creates session "CUSTOM01"
-	sessionRepo.Create(&db.Session{
-		Code:     "CUSTOM01",
-		APIKeyID: "ak_alice",
-		AgentID:  "alice-agent",
-		ShareURL: "ocs://alice.com/share",
-	})
+	_, err = createTestSession(app, aliceKey.Id, "alice-agent", "CUSTOM01")
+	require.NoError(t, err)
 
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
+	h := hub.New()
 	cfg := config.Load()
-	router.GET("/ws/agent", AgentWS(h, keyRepo, sessionRepo, cfg))
 
-	server := httptest.NewServer(router)
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+
+	server := httptest.NewServer(mux)
 	defer server.Close()
 
 	ctx := context.Background()
 
 	// Mallory tries to claim "CUSTOM01"
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key=ak_mallory.mallorysecret", nil)
+	malloryFullKey := malloryKey.Id + "." + mallorySecret
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+malloryFullKey, nil)
 	require.NoError(t, err)
 
 	// Send hello

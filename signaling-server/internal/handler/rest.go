@@ -4,10 +4,17 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"sharebridge/server/internal/db"
+	"github.com/pocketbase/pocketbase/core"
 	"sharebridge/server/internal/hub"
 )
+
+// ServeFile returns a handler that serves a single static file.
+func ServeFile(path string) func(*core.RequestEvent) error {
+	return func(requestEvent *core.RequestEvent) error {
+		http.ServeFile(requestEvent.Response, requestEvent.Request, path)
+		return nil
+	}
+}
 
 type SessionInfoResponse struct {
 	Code      string     `json:"code"`
@@ -15,40 +22,49 @@ type SessionInfoResponse struct {
 	IsActive  bool       `json:"is_active"`
 }
 
-// GetSessionInfo returns session info by code.
-// Does NOT expose share_url for privacy.
-func GetSessionInfo(sessionRepo *db.SessionRepo, h *hub.Hub) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		code := c.Param("code")
+// GetSessionInfo returns basic public session info by code.
+func GetSessionInfo(app core.App, sessionHub *hub.Hub) func(*core.RequestEvent) error {
+	return func(requestEvent *core.RequestEvent) error {
+		code := requestEvent.Request.PathValue("code")
 		if code == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "code required"})
-			return
+			return requestEvent.JSON(http.StatusBadRequest, map[string]string{"error": "code required"})
 		}
 
-		session, err := sessionRepo.GetByCode(code)
+		records, err := app.FindRecordsByFilter(
+			"sessions",
+			"code = {:code}",
+			"",
+			1,
+			0,
+			map[string]any{"code": code},
+		)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to lookup session"})
-			return
+			return requestEvent.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to lookup session"})
 		}
-		if session == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
-			return
+		if len(records) == 0 {
+			return requestEvent.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
 		}
 
-		// Determine if session is active:
-		// 1. Must not be expired
-		// 2. Agent must be connected via hub
+		sessionRecord := records[0]
+		var expiresAtPtr *time.Time
 		isActive := true
-		if session.ExpiresAt != nil && session.ExpiresAt.Before(time.Now()) {
-			isActive = false
+
+		expiresAt := sessionRecord.GetDateTime("expires_at")
+		if !expiresAt.IsZero() {
+			expiresAtTime := expiresAt.Time()
+			expiresAtPtr = &expiresAtTime
+			if expiresAtTime.Before(time.Now()) {
+				isActive = false
+			}
 		}
-		if !h.AgentConnected(session.APIKeyID) {
+
+		if !sessionHub.AgentConnected(sessionRecord.GetString("api_key_id")) {
 			isActive = false
 		}
 
-		c.JSON(http.StatusOK, SessionInfoResponse{
-			Code:      session.Code,
-			ExpiresAt: session.ExpiresAt,
+		return requestEvent.JSON(http.StatusOK, SessionInfoResponse{
+			Code:      sessionRecord.GetString("code"),
+			ExpiresAt: expiresAtPtr,
 			IsActive:  isActive,
 		})
 	}

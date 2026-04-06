@@ -182,6 +182,12 @@ footer small {
   margin-top: 0.5rem;
 }
 
+.env-managed-note {
+  display: block;
+  margin-top: 0.35rem;
+  color: var(--warning);
+}
+
 /* ===== Mode options in share form ===== */
 .mode-option {
   border: 2px solid var(--border);

@@ -3,65 +3,66 @@ package handler
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"math/big"
+	"net/http"
 	"regexp"
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/gin-gonic/gin"
+	"github.com/pocketbase/dbx"
+	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"sharebridge/server/internal/config"
-	"sharebridge/server/internal/db"
 	"sharebridge/server/internal/hub"
+	"sharebridge/server/internal/middleware"
 	"sharebridge/server/internal/turn"
 )
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type         string          `json:"type"`
-	AgentID      string          `json:"agent_id,omitempty"`
-	Code         string          `json:"code,omitempty"`
-	ShareURL     string          `json:"share_url,omitempty"`
-	ExpiresAt    *time.Time      `json:"expires_at,omitempty"`
-	MaxDownloads *int            `json:"max_downloads,omitempty"`
-	SessionID    string          `json:"session_id,omitempty"`
-	SDP          string          `json:"sdp,omitempty"`
-	Candidate    json.RawMessage `json:"candidate,omitempty"`
-	ConnID       string          `json:"conn_id,omitempty"`
-	Value        string          `json:"value,omitempty"`
-	HasPassword  bool            `json:"has_password,omitempty"`
+	Type        string          `json:"type"`
+	AgentID     string          `json:"agent_id,omitempty"`
+	Code        string          `json:"code,omitempty"`
+	ShareURL    string          `json:"share_url,omitempty"` // received for protocol compat, not stored
+	ExpiresAt   *time.Time      `json:"expires_at,omitempty"`
+	SessionID   string          `json:"session_id,omitempty"`
+	SDP         string          `json:"sdp,omitempty"`
+	Candidate   json.RawMessage `json:"candidate,omitempty"`
+	ConnID      string          `json:"conn_id,omitempty"`
+	Value       string          `json:"value,omitempty"`
+	HasPassword bool            `json:"has_password,omitempty"`
 }
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
 var codeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,30}$`)
 
-func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo, cfg *config.Config) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// Extract and validate API key from query param
-		apiKeyFull := c.Query("api_key")
-		if apiKeyFull == "" {
-			c.JSON(401, gin.H{"error": "missing api_key"})
-			return
-		}
+var errCodeAlreadyInUse = errors.New("code already in use")
 
-		apiKey, err := apiKeyRepo.Validate(apiKeyFull)
-		if err != nil || apiKey == nil {
-			c.JSON(401, gin.H{"error": "invalid api_key"})
+// AgentWS handles WebSocket connections from agents.
+// It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
+func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
+		apiKeyID := middleware.GetAPIKeyID(r.Context())
+		accountID := middleware.GetAccountID(r.Context())
+		if apiKeyID == "" {
+			http.Error(w, `{"error":"missing api_key"}`, http.StatusUnauthorized)
 			return
 		}
 
 		// Upgrade to WebSocket
-		conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
-			InsecureSkipVerify: true,
-		})
+		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			log.Printf("agent_ws accept: %v", err)
 			return
 		}
 		defer conn.CloseNow()
 
-		ctx := c.Request.Context()
+		ctx := r.Context()
 		var agentID string
 
 		// Main message loop
@@ -69,8 +70,8 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 			_, data, err := conn.Read(ctx)
 			if err != nil {
 				if agentID != "" {
-					log.Printf("agent disconnected: %s (agent_id: %s)", apiKey.ID, agentID)
-					h.UnregisterAgent(apiKey.ID)
+					log.Printf("agent disconnected: %s (agent_id: %s)", apiKeyID, agentID)
+					h.UnregisterAgent(apiKeyID)
 				}
 				return
 			}
@@ -82,7 +83,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 
 			switch msg.Type {
 			case "hello":
-				handleHello(ctx, conn, h, apiKey.ID, msg.AgentID, cfg)
+				handleHello(ctx, conn, h, apiKeyID, msg.AgentID, cfg)
 				agentID = msg.AgentID
 
 			case "register_share":
@@ -93,13 +94,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 					})
 					continue
 				}
-				handleRegisterShare(ctx, conn, h, apiKey, sessionRepo, agentID, msg)
-
-			case "download_complete":
-				if agentID == "" {
-					continue
-				}
-				handleDownloadComplete(ctx, conn, sessionRepo, msg.Code)
+				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg)
 
 			case "offer":
 				if agentID == "" {
@@ -143,7 +138,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
 				} else {
 					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-						"type":              "auth_failed",
+						"type":               "auth_failed",
 						"attempts_remaining": 3 - failures,
 					})
 				}
@@ -167,7 +162,7 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 
 	// Register agent with the hub using apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
-	log.Printf("agent hello received: api_key=%s agent_id=%s", apiKeyID, agentID)
+	log.Printf("agent hello received: api_key_id=%s agent_id=%s", apiKeyID, agentID)
 
 	// Build ICE config for agent
 	var turnCreds *turn.Credentials
@@ -184,7 +179,7 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	})
 
 	hub.SendDirect(ctx, conn, map[string]any{
-		"type":       "welcome",
+		"type":        "welcome",
 		"ice_servers": iceServers,
 	})
 }
@@ -194,20 +189,12 @@ func handleRegisterShare(
 	ctx context.Context,
 	conn *websocket.Conn,
 	h *hub.Hub,
-	apiKey *db.APIKey,
-	sessionRepo *db.SessionRepo,
+	app core.App,
+	apiKeyID string,
+	accountID string,
 	agentID string,
 	msg agentMsg,
 ) {
-	// Validate share_url is provided
-	if msg.ShareURL == "" {
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "share_url required",
-		})
-		return
-	}
-
 	// Determine the code to use
 	code := msg.Code
 	reconnected := false
@@ -228,15 +215,7 @@ func handleRegisterShare(
 		// Try to create with collision retry (5 attempts)
 		created := false
 		for i := 0; i < 5; i++ {
-			session := &db.Session{
-				Code:         code,
-				APIKeyID:     apiKey.ID,
-				AgentID:      agentID,
-				ShareURL:     msg.ShareURL,
-				ExpiresAt:    msg.ExpiresAt,
-				MaxDownloads: msg.MaxDownloads,
-			}
-			err = sessionRepo.Create(session)
+			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt)
 			if err == nil {
 				created = true
 				break
@@ -271,9 +250,22 @@ func handleRegisterShare(
 			return
 		}
 
-		// Check if code exists and is owned by this API key
-		available, err := sessionRepo.IsCodeAvailable(code, apiKey.ID)
+		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt)
 		if err != nil {
+			if errors.Is(err, errCodeAlreadyInUse) {
+				hub.SendDirect(ctx, conn, map[string]string{
+					"type":    "error",
+					"message": "code already in use",
+				})
+				return
+			}
+			if err.Error() == "session owned by different agent" {
+				hub.SendDirect(ctx, conn, map[string]string{
+					"type":    "error",
+					"message": "session owned by different agent",
+				})
+				return
+			}
 			log.Printf("db error checking code availability: %v", err)
 			hub.SendDirect(ctx, conn, map[string]string{
 				"type":    "error",
@@ -281,74 +273,21 @@ func handleRegisterShare(
 			})
 			return
 		}
-
-		if available {
-			// Code is available (new or owned by this API key)
-			existingSession, err := sessionRepo.GetByCode(code)
-			if err != nil {
-				log.Printf("db error getting session: %v", err)
-				hub.SendDirect(ctx, conn, map[string]string{
-					"type":    "error",
-					"message": "database error",
-				})
-				return
-			}
-
-			if existingSession != nil {
-				// Verify agent_id matches for reconnection
-				if existingSession.AgentID != agentID {
-					hub.SendDirect(ctx, conn, map[string]string{
-						"type":    "error",
-						"message": "session owned by different agent",
-					})
-					return
-				}
-				// Reconnecting to existing session - update timestamps
-				existingSession.AgentID = agentID
-				if err := sessionRepo.Update(existingSession); err != nil {
-					log.Printf("db error updating session: %v", err)
-					hub.SendDirect(ctx, conn, map[string]string{
-						"type":    "error",
-						"message": "database error",
-					})
-					return
-				}
-				reconnected = true
-				log.Printf("session reconnected: code=%s api_key=%s agent_id=%s", code, apiKey.ID, agentID)
-			} else {
-				// Creating new session with custom code
-				session := &db.Session{
-					Code:         code,
-					APIKeyID:     apiKey.ID,
-					AgentID:      agentID,
-					ShareURL:     msg.ShareURL,
-					ExpiresAt:    msg.ExpiresAt,
-					MaxDownloads: msg.MaxDownloads,
-				}
-				if err := sessionRepo.Create(session); err != nil {
-					log.Printf("db error creating session: %v", err)
-					hub.SendDirect(ctx, conn, map[string]string{
-						"type":    "error",
-						"message": "failed to create session",
-					})
-					return
-				}
-			}
-		} else {
-			// Code is taken by a different API key
+		if session == nil {
 			hub.SendDirect(ctx, conn, map[string]string{
 				"type":    "error",
-				"message": "code already in use",
+				"message": "failed to retrieve session",
 			})
 			return
 		}
+		reconnected = reclaimed
 	}
 
 	// Register code with hub
-	h.RegisterCode(code, apiKey.ID)
+	h.RegisterCode(code, apiKeyID)
 
 	// Get session for response
-	session, err := sessionRepo.GetByCode(code)
+	session, err := getSessionByCode(app, code)
 	if err != nil || session == nil {
 		log.Printf("db error getting session after creation: %v", err)
 		hub.SendDirect(ctx, conn, map[string]string{
@@ -364,39 +303,119 @@ func handleRegisterShare(
 		"code":        code,
 		"reconnected": reconnected,
 	}
-	if session.ExpiresAt != nil {
-		response["expires_at"] = session.ExpiresAt.Format(time.RFC3339)
+	if expiresAt := session.GetDateTime("expires_at"); !expiresAt.IsZero() {
+		response["expires_at"] = expiresAt.Time().Format(time.RFC3339)
 	}
 
 	hub.SendDirect(ctx, conn, response)
-	log.Printf("share registered: code=%s api_key=%s agent_id=%s reconnected=%v", code, apiKey.ID, agentID, reconnected)
+	log.Printf("share registered: code=%s api_key_id=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, reconnected)
 }
 
-// handleDownloadComplete increments the download count for a session
-func handleDownloadComplete(
-	ctx context.Context,
-	conn *websocket.Conn,
-	sessionRepo *db.SessionRepo,
-	code string,
-) {
-	if code == "" {
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "code required",
-		})
-		return
+// createSession creates a new session record in PocketBase.
+// share_url and max_downloads are intentionally not stored — the server is untrusted.
+func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time) error {
+	col, err := app.FindCollectionByNameOrId("sessions")
+	if err != nil {
+		return err
 	}
 
-	if err := sessionRepo.IncrementDownloadCount(code); err != nil {
-		log.Printf("failed to increment download count for %s: %v", code, err)
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "failed to update download count",
-		})
-		return
+	record := core.NewRecord(col)
+	record.Set("code", code)
+	record.Set("api_key_id", apiKeyID)
+	record.Set("agent_id", agentID)
+
+	if expiresAt != nil {
+		dt, _ := types.ParseDateTime(*expiresAt)
+		record.Set("expires_at", dt)
 	}
 
-	log.Printf("download complete recorded for session %s", code)
+	return app.Save(record)
+}
+
+// getSessionByCode retrieves a session by its code
+func getSessionByCode(app core.App, code string) (*core.Record, error) {
+	records, err := app.FindRecordsByFilter(
+		"sessions",
+		"code = {:code}",
+		"",
+		1,
+		0,
+		map[string]any{"code": code},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	return records[0], nil
+}
+
+// claimSessionCode atomically creates or reassigns a custom code.
+func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time) (*core.Record, bool, error) {
+	var claimed *core.Record
+	reconnected := false
+
+	err := app.RunInTransaction(func(txApp core.App) error {
+		var existing struct {
+			SessionID string `db:"session_id"`
+			AccountID string `db:"account_id"`
+			AgentID   string `db:"agent_id"`
+		}
+
+		err := txApp.DB().
+			NewQuery(`SELECT s.id AS session_id, ak.account_id, s.agent_id
+				FROM sessions s
+				JOIN api_keys ak ON ak.id = s.api_key_id
+				WHERE s.code = {:code}
+				LIMIT 1`).
+			Bind(dbx.Params{"code": code}).
+			One(&existing)
+
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt); err != nil {
+				return err
+			}
+			record, getErr := getSessionByCode(txApp, code)
+			if getErr != nil {
+				return getErr
+			}
+			claimed = record
+			return nil
+		}
+
+		if existing.AccountID != accountID {
+			return errCodeAlreadyInUse
+		}
+		if existing.AgentID != "" && existing.AgentID != agentID {
+			return errors.New("session owned by different agent")
+		}
+
+		record, err := txApp.FindRecordById("sessions", existing.SessionID)
+		if err != nil {
+			return err
+		}
+		record.Set("api_key_id", apiKeyID)
+		record.Set("agent_id", agentID)
+		if expiresAt != nil {
+			dt, _ := types.ParseDateTime(*expiresAt)
+			record.Set("expires_at", dt)
+		}
+		if err := txApp.Save(record); err != nil {
+			return err
+		}
+
+		claimed = record
+		reconnected = true
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return claimed, reconnected, nil
 }
 
 // generateRandomCode generates a random 8-character code

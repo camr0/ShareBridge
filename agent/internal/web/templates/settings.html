@@ -14,18 +14,31 @@
                 <label for="signaling-url">
                     Server URL
                     <input type="url" id="signaling-url" name="signaling_url"
-                        placeholder="wss://share.example.com" value="{{.Config.SignalingURL}}" required>
+                        placeholder="wss://share.example.com" value="{{.Config.SignalingURL}}" required
+                        {{if .EnvManaged.SignalingURL}}disabled aria-describedby="signaling-url-managed"{{end}}>
+                    {{if .EnvManaged.SignalingURL}}
+                    <small id="signaling-url-managed" class="env-managed-note">
+                        Managed by environment variable <code>{{.EnvManaged.SignalingURL}}</code>. Remove it to edit this in the UI.
+                    </small>
+                    {{end}}
                 </label>
                 <label for="api-key">
                     API Key
                     <div class="api-key-row">
                         <input type="password" id="api-key" name="api_key"
-                            placeholder="ocs_..." value="{{.Config.APIKey}}">
+                            placeholder="ocs_..." value="{{.Config.APIKey}}"
+                            {{if .EnvManaged.APIKey}}disabled aria-describedby="api-key-managed"{{end}}>
                         <button type="button"
+                            {{if .EnvManaged.APIKey}}disabled{{end}}
                             onclick="var inp=document.getElementById('api-key'); inp.type=inp.type==='password'?'text':'password'; this.textContent=inp.type==='password'?'Show':'Hide'">
                             Show
                         </button>
                     </div>
+                    {{if .EnvManaged.APIKey}}
+                    <small id="api-key-managed" class="env-managed-note">
+                        Managed by environment variable <code>{{.EnvManaged.APIKey}}</code>. Remove it to edit this in the UI.
+                    </small>
+                    {{end}}
                     <small>Key shown once on creation — enter from your OpenCloud instance</small>
                 </label>
             </div>
@@ -36,7 +49,13 @@
             <label for="allowed-host">
                 Allowed Host
                 <input type="text" id="allowed-host" name="allowed_host"
-                    placeholder="opencloud.example.com" value="{{.Config.AllowedHost}}">
+                    placeholder="opencloud.example.com" value="{{.Config.AllowedHost}}"
+                    {{if .EnvManaged.AllowedHost}}disabled aria-describedby="allowed-host-managed"{{end}}>
+                {{if .EnvManaged.AllowedHost}}
+                <small id="allowed-host-managed" class="env-managed-note">
+                    Managed by environment variable <code>{{.EnvManaged.AllowedHost}}</code>. Remove it to edit this in the UI.
+                </small>
+                {{end}}
                 <small>SSRF protection — only shares from this host are allowed</small>
             </label>
         </fieldset>

@@ -105,22 +105,22 @@ func (h *Hub) SendToAgent(ctx context.Context, apiKey string, msg any) error {
 
 func (h *Hub) ForwardToAgent(ctx context.Context, sessionID string, msg any) error {
 	h.mu.RLock()
-	p, ok := h.pairs[sessionID]
+	sessionPair, ok := h.pairs[sessionID]
 	h.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	return send(ctx, p.agentConn, msg)
+	return send(ctx, sessionPair.agentConn, msg)
 }
 
 func (h *Hub) ForwardToBrowser(ctx context.Context, sessionID string, msg any) error {
 	h.mu.RLock()
-	p, ok := h.pairs[sessionID]
+	sessionPair, ok := h.pairs[sessionID]
 	h.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	return send(ctx, p.browserConn, msg)
+	return send(ctx, sessionPair.browserConn, msg)
 }
 
 func SendDirect(ctx context.Context, conn *websocket.Conn, msg any) error {
@@ -133,6 +133,46 @@ func send(ctx context.Context, conn *websocket.Conn, msg any) error {
 		return err
 	}
 	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+// CloseAgent closes the WebSocket connection for the agent identified by apiKeyID,
+// removes it from the hub, and purges all associated codes and pairs.
+// Used when an API key is revoked.
+func (h *Hub) CloseAgent(apiKeyID string) {
+	h.mu.Lock()
+	conn, ok := h.agents[apiKeyID]
+	if ok {
+		delete(h.agents, apiKeyID)
+	}
+
+	// Purge all codes that belonged to this agent.
+	var staleCodes []string
+	for code, keyID := range h.codes {
+		if keyID == apiKeyID {
+			staleCodes = append(staleCodes, code)
+			delete(h.codes, code)
+		}
+	}
+
+	// Collect and remove any active pairs for the stale codes, grabbing browser
+	// conns so we can close them outside the lock.
+	var browserConns []*websocket.Conn
+	for _, code := range staleCodes {
+		if sessionPair, exists := h.pairs[code]; exists {
+			if sessionPair.browserConn != nil {
+				browserConns = append(browserConns, sessionPair.browserConn)
+			}
+			delete(h.pairs, code)
+		}
+	}
+	h.mu.Unlock()
+
+	if ok && conn != nil {
+		conn.Close(websocket.StatusPolicyViolation, "API key revoked")
+	}
+	for _, browserConn := range browserConns {
+		browserConn.Close(websocket.StatusNormalClosure, "agent disconnected")
+	}
 }
 
 // RegisterBrowserConn stores a browser WebSocket connection keyed by connID.

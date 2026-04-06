@@ -239,7 +239,7 @@ This is acceptable for 10a — the project has no production users yet. A migrat
 | Variable | Purpose | Change |
 |----------|---------|--------|
 | `PORT` | HTTP listen port | Unchanged, but `cmd/server/main.go` must wire PocketBase to listen on this port explicitly |
-| `DATABASE_PATH` | SQLite path | Unchanged, but `cmd/server/main.go` must point PocketBase at this data/DB location explicitly |
+| `DATA_DIR` | PocketBase data directory | New; `cmd/server/main.go` points PocketBase directly at this directory |
 | `TURN_HOST`, `TURN_PORT`, `TURN_SECRET` | TURN config | Unchanged |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | Email for verification/reset | New (optional; disables email flows if absent) |
 | `ADMIN_TOKEN` | Static admin token | **Removed** (replaced by PocketBase superuser) |
@@ -280,7 +280,7 @@ The CLI tool becomes minimal — most management happens via the web UI.
 |------|--------|-------|
 | API key format | `ak_xxx.secret` | `<pb_record_id>.<secret>` |
 | Key management | `ADMIN_TOKEN` + `/admin/api/keys` | User JWT + `/api/keys` |
-| DB file | `signaling.db` (custom schema) | `signaling.db` (PocketBase schema) |
+| DB storage | `signaling.db` (custom schema file) | `pb_data/` (PocketBase data directory) |
 | `share_url` | Stored in sessions table (unused) | **Removed** — server never needed it; agent retains it locally |
 | Server framework | Gin | PocketBase (net/http router) |
 | Key creation | CLI `create-key` command | `/account` web page |

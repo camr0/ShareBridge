@@ -9,9 +9,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/gin-gonic/gin"
+	"github.com/pocketbase/pocketbase/core"
 	"sharebridge/server/internal/config"
-	"sharebridge/server/internal/db"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/turn"
 )
@@ -23,55 +22,61 @@ type browserMsg struct {
 	HMAC      string          `json:"hmac,omitempty"`
 }
 
-func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		sessionCode := c.Query("session")
+func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		sessionCode := request.URL.Query().Get("session")
 
-		session, err := sessionRepo.GetByCode(sessionCode)
+		records, err := app.FindRecordsByFilter(
+			"sessions",
+			"code = {:code}",
+			"",
+			1,
+			0,
+			map[string]any{"code": sessionCode},
+		)
 		if err != nil {
 			log.Printf("browser_ws: db error looking up session: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
+			http.Error(responseWriter, `{"error":"database error"}`, http.StatusInternalServerError)
 			return
 		}
-		if session == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session not found or expired"})
+		if len(records) == 0 {
+			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
-		if session.ExpiresAt != nil && time.Now().After(*session.ExpiresAt) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session not found or expired"})
+		sessionRecord := records[0]
+
+		expiresAt := sessionRecord.GetDateTime("expires_at")
+		if !expiresAt.IsZero() && time.Now().After(expiresAt.Time()) {
+			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
 
-		conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
-			InsecureSkipVerify: true,
-		})
+		browserConn, err := websocket.Accept(responseWriter, request, nil)
 		if err != nil {
 			log.Printf("browser_ws accept: %v", err)
 			return
 		}
-		defer conn.CloseNow()
+		defer browserConn.CloseNow()
 
-		ctx := c.Request.Context()
+		requestCtx := request.Context()
 
-		_, agentOK := h.GetAgentConn(sessionCode)
-		if !agentOK {
-			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
-			conn.Close(websocket.StatusNormalClosure, "agent not connected")
+		_, agentConnected := sessionHub.GetAgentConn(sessionCode)
+		if !agentConnected {
+			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
+			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
 
-		if err := h.PairSession(sessionCode, conn); err != nil {
-			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
-			conn.Close(websocket.StatusNormalClosure, "agent not connected")
+		if err := sessionHub.PairSession(sessionCode, browserConn); err != nil {
+			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
+			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
-		defer h.UnpairSession(sessionCode)
+		defer sessionHub.UnpairSession(sessionCode)
 
-		// Generate a unique connID for this browser connection.
-		// Used to correlate knock/nonce/join messages and route auth failures.
 		connID := generateConnID()
-		h.RegisterBrowserConn(connID, conn)
-		defer h.UnregisterBrowserConn(connID)
+		sessionHub.RegisterBrowserConn(connID, browserConn)
+		defer sessionHub.UnregisterBrowserConn(connID)
 
 		log.Printf("browser connected to session %s (conn %s)", sessionCode, connID)
 
@@ -88,17 +93,15 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 			TurnURL:     cfg.TurnURL(),
 			Credentials: turnCreds,
 		})
-		hub.SendDirect(ctx, conn, map[string]any{
+		hub.SendDirect(requestCtx, browserConn, map[string]any{
 			"type":        "ice_config",
 			"ice_servers": iceServers,
 		})
 
-		// NOTE: we do NOT notify the agent here (no join message).
-		// The agent is notified only after the browser passes HMAC verification
-		// via the knock → nonce → join(hmac) flow.
+		apiKeyID := sessionRecord.GetString("api_key_id")
 
 		for {
-			_, data, err := conn.Read(ctx)
+			_, data, err := browserConn.Read(requestCtx)
 			if err != nil {
 				log.Printf("browser disconnected from session %s (conn %s)", sessionCode, connID)
 				return
@@ -111,16 +114,14 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 
 			switch msg.Type {
 			case "knock":
-				// Forward knock to agent with connID and session code added by server.
-				h.SendToAgent(ctx, session.APIKeyID, map[string]any{
+				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
 					"type":    "knock",
 					"conn_id": connID,
 					"code":    sessionCode,
 				})
 
 			case "join":
-				// Forward join to agent with connID, code, and HMAC. Agent verifies.
-				h.SendToAgent(ctx, session.APIKeyID, map[string]any{
+				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
 					"type":    "join",
 					"conn_id": connID,
 					"code":    sessionCode,
@@ -128,8 +129,7 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 				})
 
 			case "answer":
-				// Include connID as peer_id so agent can look up the right peer.
-				h.ForwardToAgent(ctx, sessionCode, map[string]any{
+				sessionHub.ForwardToAgent(requestCtx, sessionCode, map[string]any{
 					"type":       "answer",
 					"session_id": sessionCode,
 					"peer_id":    connID,
@@ -137,7 +137,7 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 				})
 
 			case "ice_candidate":
-				h.ForwardToAgent(ctx, sessionCode, map[string]any{
+				sessionHub.ForwardToAgent(requestCtx, sessionCode, map[string]any{
 					"type":       "ice_candidate",
 					"session_id": sessionCode,
 					"peer_id":    connID,
@@ -150,7 +150,7 @@ func BrowserWS(h *hub.Hub, sessionRepo *db.SessionRepo, cfg *config.Config) gin.
 
 // generateConnID returns a random 32-char hex string for use as a connection ID.
 func generateConnID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	randomBytes := make([]byte, 16)
+	rand.Read(randomBytes)
+	return hex.EncodeToString(randomBytes)
 }

@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Account - ShareBridge</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      max-width: 800px;
+      margin: 48px auto;
+      padding: 0 1rem;
+    }
+    h1 { font-size: 1.8rem; font-weight: 600; margin-bottom: 8px; }
+    .subtitle { color: #6c7086; margin-bottom: 32px; }
+
+    .nav-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 32px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #313244;
+    }
+    .nav-links a {
+      color: #89b4fa;
+      text-decoration: none;
+      margin-left: 16px;
+    }
+    .nav-links a:hover { text-decoration: underline; }
+
+    .section {
+      background: #313244;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+    .section-title {
+      font-size: 1.2rem;
+      font-weight: 600;
+    }
+
+    button {
+      padding: 10px 20px;
+      font-size: 0.95rem;
+      background: #89b4fa;
+      color: #1e1e2e;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.danger {
+      background: #f38ba8;
+      padding: 6px 14px;
+      font-size: 0.85rem;
+    }
+    button.secondary-action {
+      background: #45475a;
+      color: #cdd6f4;
+      padding: 6px 14px;
+      font-size: 0.85rem;
+      margin-right: 8px;
+    }
+
+    .key-list {
+      list-style: none;
+    }
+    .key-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      padding: 16px;
+      background: #1e1e2e;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      border-left: 3px solid #45475a;
+    }
+    .key-item.active { border-left-color: #a6e3a1; }
+    .key-item.revoked { border-left-color: #6c7086; opacity: 0.7; }
+
+    .key-info {
+      flex: 1;
+    }
+    .key-label {
+      font-weight: 500;
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+    .key-label.empty { color: #6c7086; font-style: italic; }
+    .key-meta {
+      font-size: 0.85rem;
+      color: #6c7086;
+    }
+    .key-meta span { margin-right: 16px; }
+    .status-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+    .status-active { background: #a6e3a1; color: #1e1e2e; }
+    .status-revoked { background: #45475a; color: #cdd6f4; }
+
+    .key-actions {
+      margin-left: 16px;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 48px 24px;
+      color: #6c7086;
+    }
+    .empty-state p { margin-bottom: 8px; }
+
+    /* Modal styles */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.2s, visibility 0.2s;
+    }
+    .modal-overlay.visible {
+      opacity: 1;
+      visibility: visible;
+    }
+    .modal {
+      background: #313244;
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 480px;
+      width: 90%;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    }
+    .modal-title {
+      font-size: 1.2rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .modal-body {
+      margin-bottom: 20px;
+    }
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 12px;
+    }
+    .modal-footer button.secondary {
+      background: #45475a;
+      color: #cdd6f4;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 10px 12px;
+      font-size: 1rem;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      outline: none;
+    }
+    input[type="text"]:focus { border-color: #89b4fa; }
+    input[type="text"]::placeholder { color: #6c7086; }
+
+    .key-display {
+      background: #1e1e2e;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 16px;
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 0.9rem;
+      word-break: break-all;
+      margin: 12px 0;
+      color: #a6e3a1;
+    }
+    .warning-box {
+      background: rgba(243, 139, 168, 0.1);
+      border: 1px solid #f38ba8;
+      border-radius: 6px;
+      padding: 12px;
+      margin: 16px 0;
+      color: #f38ba8;
+      font-size: 0.9rem;
+    }
+    .warning-box strong { display: block; margin-bottom: 4px; }
+
+    .copy-btn {
+      width: 100%;
+      margin-top: 12px;
+    }
+    .copy-btn.copied {
+      background: #a6e3a1;
+    }
+
+    .error-message {
+      color: #f38ba8;
+      margin-top: 12px;
+      font-size: 0.9rem;
+    }
+
+    .hidden { display: none; }
+
+    /* Confirmation dialog */
+    .confirm-text {
+      margin-bottom: 16px;
+    }
+    .confirm-key-label {
+      font-weight: 600;
+      color: #cdd6f4;
+    }
+  </style>
+</head>
+<body>
+  <div class="nav-bar">
+    <div class="nav-brand">ShareBridge</div>
+    <div class="nav-links">
+      <a href="/account">Account</a>
+      <a href="#" id="logout-link">Logout</a>
+    </div>
+  </div>
+
+  <h1>Account</h1>
+  <p class="subtitle">Manage your API keys for agent authentication</p>
+
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">API Keys</span>
+      <button id="create-key-btn" onclick="showCreateModal()">Create new key</button>
+    </div>
+    <div id="key-list-container">
+      <div class="empty-state">
+        <p>Loading API keys...</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Key Modal -->
+  <div id="create-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-title">Create New API Key</div>
+      <div class="modal-body">
+        <label for="key-label">Label (optional)</label>
+        <input type="text" id="key-label" placeholder="e.g., Home Server, Work Laptop" maxlength="100">
+        <div id="create-error" class="error-message hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="hideCreateModal()">Cancel</button>
+        <button id="create-confirm-btn" onclick="createKey()">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Show Key Once Modal -->
+  <div id="show-key-modal" class="modal-overlay">
+    <div class="modal">
+      <div id="show-key-title" class="modal-title">API Key Created</div>
+      <div class="modal-body">
+        <div id="show-key-warning" class="warning-box">
+          <strong>Important:</strong>
+          This key will only be shown once. Copy it now and store it securely.
+          You will not be able to see the full key again.
+        </div>
+        <div id="new-key-display" class="key-display"></div>
+        <button id="copy-key-btn" class="copy-btn" onclick="copyKeyToClipboard()">Copy to clipboard</button>
+      </div>
+      <div class="modal-footer">
+        <button onclick="hideShowKeyModal()">I've copied it</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rotate Confirmation Modal -->
+  <div id="rotate-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-title">Rotate API Key</div>
+      <div class="modal-body">
+        <div class="warning-box">
+          <strong>Rotate replaces a lost key immediately.</strong>
+          Rotation creates a replacement key, transfers every share to it, and revokes the old key right away. Copy the new key and update your agent after rotating.
+        </div>
+        <p class="confirm-text">
+          Rotate
+          <span id="rotate-key-label" class="confirm-key-label"></span>?
+        </p>
+        <p>This revokes the old key immediately, disconnects any agent using it, and transfers all shares to the replacement key.</p>
+        <div id="rotate-error" class="error-message hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="hideRotateModal()">Cancel</button>
+        <button id="rotate-confirm-btn" onclick="confirmRotate()">Rotate</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Revoke Confirmation Modal -->
+  <div id="revoke-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-title">Revoke API Key</div>
+      <div class="modal-body">
+        <p class="confirm-text">
+          Are you sure you want to revoke
+          <span id="revoke-key-label" class="confirm-key-label"></span>?
+        </p>
+        <p>This will immediately disconnect any agent using this key. This action cannot be undone.</p>
+        <div id="revoke-error" class="error-message hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="hideRevokeModal()">Cancel</button>
+        <button class="danger" id="revoke-confirm-btn" onclick="confirmRevoke()">Revoke</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // API base URL
+    const API_BASE = '/api';
+
+    // State
+    let apiKeys = [];
+    let currentKeyToRevoke = null;
+    let currentKeyToRotate = null;
+    let newKeyValue = null;
+
+    // Get JWT from localStorage
+    function getJWT() {
+      return localStorage.getItem('pb_token');
+    }
+
+    // Check authentication on load
+    function checkAuth() {
+      const token = getJWT();
+      if (!token) {
+        window.location.href = '/login';
+        return false;
+      }
+      return true;
+    }
+
+    // API request helper with auth
+    async function apiRequest(endpoint, options = {}) {
+      const token = getJWT();
+      const headers = {
+        'Content-Type': 'application/json',
+        ...options.headers
+      };
+
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
+      const response = await fetch(`${API_BASE}${endpoint}`, {
+        ...options,
+        headers
+      });
+
+      if (response.status === 401) {
+        // Token expired or invalid
+        localStorage.removeItem('pb_token');
+        window.location.href = '/login';
+        return null;
+      }
+
+      return response;
+    }
+
+    // Load API keys
+    async function loadKeys() {
+      if (!checkAuth()) return;
+
+      const container = document.getElementById('key-list-container');
+      container.innerHTML = '<div class="empty-state"><p>Loading API keys...</p></div>';
+
+      try {
+        const response = await apiRequest('/keys');
+        if (!response) return;
+
+        if (!response.ok) {
+          throw new Error('Failed to load API keys');
+        }
+
+        apiKeys = await response.json();
+        renderKeys();
+      } catch (error) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <p>Error loading API keys</p>
+            <p>${escapeHtml(error.message)}</p>
+          </div>
+        `;
+      }
+    }
+
+    // Render API key list
+    function renderKeys() {
+      const container = document.getElementById('key-list-container');
+
+      if (apiKeys.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <p>No API keys yet</p>
+            <p>Create a key to authenticate your agents</p>
+          </div>
+        `;
+        return;
+      }
+
+      const list = document.createElement('ul');
+      list.className = 'key-list';
+
+      apiKeys.forEach(key => {
+        const item = document.createElement('li');
+        item.className = `key-item ${key.is_active ? 'active' : 'revoked'}`;
+
+        const labelClass = key.label ? 'key-label' : 'key-label empty';
+        const labelText = key.label || '(no label)';
+        const statusClass = key.is_active ? 'status-active' : 'status-revoked';
+        const statusText = key.is_active ? 'Active' : 'Revoked';
+
+        const createdDate = formatDate(key.created_at);
+        const lastUsed = key.last_used_at ? formatDate(key.last_used_at) : 'Never used';
+
+        item.innerHTML = `
+          <div class="key-info">
+            <div class="${labelClass}">${escapeHtml(labelText)}</div>
+            <div class="key-meta">
+              <span>Created: ${createdDate}</span>
+              <span>Last used: ${lastUsed}</span>
+              <span class="status-badge ${statusClass}">${statusText}</span>
+            </div>
+          </div>
+          ${key.is_active ? `
+            <div class="key-actions">
+              <button class="secondary-action" onclick="showRotateModal('${key.id}')">Rotate</button>
+              <button class="danger" onclick="showRevokeModal('${key.id}')">Revoke</button>
+            </div>
+          ` : ''}
+        `;
+
+        list.appendChild(item);
+      });
+
+      container.innerHTML = '';
+      container.appendChild(list);
+    }
+
+    // Show create modal
+    function showCreateModal() {
+      document.getElementById('key-label').value = '';
+      document.getElementById('create-error').classList.add('hidden');
+      document.getElementById('create-modal').classList.add('visible');
+      document.getElementById('key-label').focus();
+    }
+
+    // Hide create modal
+    function hideCreateModal() {
+      document.getElementById('create-modal').classList.remove('visible');
+    }
+
+    // Create new key
+    async function createKey() {
+      const label = document.getElementById('key-label').value.trim();
+      const errorDiv = document.getElementById('create-error');
+      const btn = document.getElementById('create-confirm-btn');
+
+      btn.disabled = true;
+      errorDiv.classList.add('hidden');
+
+      try {
+        const response = await apiRequest('/keys', {
+          method: 'POST',
+          body: JSON.stringify({ label })
+        });
+
+        if (!response) return;
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.error || 'Failed to create key');
+        }
+
+        const data = await response.json();
+        newKeyValue = data.key;
+
+        hideCreateModal();
+        showNewKeyModal({
+          key: data.key,
+          title: 'API Key Created',
+          warning: '<strong>Important:</strong>This key will only be shown once. Copy it now and store it securely. You will not be able to see the full key again.'
+        });
+        loadKeys(); // Refresh the list
+      } catch (error) {
+        errorDiv.textContent = error.message;
+        errorDiv.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // Show new key modal (show-once pattern)
+    function showNewKeyModal(options) {
+      document.getElementById('show-key-title').textContent = options.title;
+      document.getElementById('show-key-warning').innerHTML = options.warning;
+      document.getElementById('new-key-display').textContent = options.key;
+      document.getElementById('copy-key-btn').textContent = 'Copy to clipboard';
+      document.getElementById('copy-key-btn').classList.remove('copied');
+      document.getElementById('show-key-modal').classList.add('visible');
+    }
+
+    // Hide show key modal
+    function hideShowKeyModal() {
+      document.getElementById('show-key-modal').classList.remove('visible');
+      newKeyValue = null;
+    }
+
+    function showRotateModal(keyId) {
+      const key = apiKeys.find(k => k.id === keyId);
+      if (!key) return;
+
+      currentKeyToRotate = keyId;
+      document.getElementById('rotate-key-label').textContent = key.label || '(no label)';
+      document.getElementById('rotate-error').classList.add('hidden');
+      document.getElementById('rotate-modal').classList.add('visible');
+    }
+
+    function hideRotateModal() {
+      document.getElementById('rotate-modal').classList.remove('visible');
+      currentKeyToRotate = null;
+    }
+
+    async function confirmRotate() {
+      if (!currentKeyToRotate) return;
+
+      const btn = document.getElementById('rotate-confirm-btn');
+      const errorDiv = document.getElementById('rotate-error');
+
+      btn.disabled = true;
+      errorDiv.classList.add('hidden');
+
+      try {
+        const response = await apiRequest(`/keys/${currentKeyToRotate}/rotate`, {
+          method: 'POST',
+          body: JSON.stringify({})
+        });
+
+        if (!response) return;
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.error || 'Failed to rotate key');
+        }
+
+        const data = await response.json();
+        newKeyValue = data.key;
+
+        hideRotateModal();
+        showNewKeyModal({
+          key: data.key,
+          title: 'Replacement Key Created',
+          warning: '<strong>Old key revoked:</strong>The previous key stopped working immediately and all shares were transferred to this replacement key. Update your agent with this new key now.'
+        });
+        loadKeys();
+      } catch (error) {
+        errorDiv.textContent = error.message;
+        errorDiv.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // Copy key to clipboard
+    async function copyKeyToClipboard() {
+      if (!newKeyValue) return;
+
+      try {
+        await navigator.clipboard.writeText(newKeyValue);
+        const btn = document.getElementById('copy-key-btn');
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+      } catch (err) {
+        // Fallback for browsers that don't support clipboard API
+        const textArea = document.createElement('textarea');
+        textArea.value = newKeyValue;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+
+        const btn = document.getElementById('copy-key-btn');
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+      }
+    }
+
+    // Show revoke confirmation modal
+    function showRevokeModal(keyId) {
+      const key = apiKeys.find(k => k.id === keyId);
+      if (!key) return;
+
+      currentKeyToRevoke = keyId;
+      const labelText = key.label || '(no label)';
+      document.getElementById('revoke-key-label').textContent = labelText;
+      document.getElementById('revoke-error').classList.add('hidden');
+      document.getElementById('revoke-modal').classList.add('visible');
+    }
+
+    // Hide revoke modal
+    function hideRevokeModal() {
+      document.getElementById('revoke-modal').classList.remove('visible');
+      currentKeyToRevoke = null;
+    }
+
+    // Confirm revoke
+    async function confirmRevoke() {
+      if (!currentKeyToRevoke) return;
+
+      const btn = document.getElementById('revoke-confirm-btn');
+      const errorDiv = document.getElementById('revoke-error');
+
+      btn.disabled = true;
+      errorDiv.classList.add('hidden');
+
+      try {
+        const response = await apiRequest(`/keys/${currentKeyToRevoke}`, {
+          method: 'DELETE'
+        });
+
+        if (!response) return;
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.error || 'Failed to revoke key');
+        }
+
+        hideRevokeModal();
+        loadKeys(); // Refresh the list
+      } catch (error) {
+        errorDiv.textContent = error.message;
+        errorDiv.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // Logout handler
+    document.getElementById('logout-link').addEventListener('click', (e) => {
+      e.preventDefault();
+      localStorage.removeItem('pb_token');
+      window.location.href = '/login';
+    });
+
+    // Helper: Format date
+    function formatDate(dateString) {
+      const date = new Date(dateString);
+      return date.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric'
+      });
+    }
+
+    // Helper: Escape HTML
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Close modals on overlay click
+    document.querySelectorAll('.modal-overlay').forEach(overlay => {
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) {
+          if (overlay.id === 'create-modal') hideCreateModal();
+          if (overlay.id === 'rotate-modal') hideRotateModal();
+          if (overlay.id === 'revoke-modal') hideRevokeModal();
+          // Don't close show-key-modal on overlay click - force user to acknowledge
+        }
+      });
+    });
+
+    // Handle Enter key in create modal
+    document.getElementById('key-label').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        createKey();
+      }
+    });
+
+    // Load keys on page load
+    document.addEventListener('DOMContentLoaded', loadKeys);
+  </script>
+</body>
+</html>
