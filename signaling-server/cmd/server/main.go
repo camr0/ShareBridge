@@ -75,13 +75,13 @@ func main() {
 		router.GET("/login", handler.ServeFile("./web/login.html"))
 		router.GET("/account", handler.ServeFile("./web/account.html"))
 
-		// User-scoped API key management (requires JWT auth) - placeholder handlers
+		// User-scoped API key management (requires JWT auth)
 		// Uses Bind middleware for auth (apis.RequireAuth returns *hook.Handler)
 		apiKeys := router.Group("/api/keys")
 		apiKeys.Bind(apis.RequireAuth())
-		apiKeys.POST("/", placeholderAPIHandler("create key"))
-		apiKeys.GET("/", placeholderAPIHandler("list keys"))
-		apiKeys.DELETE("/{id}", placeholderAPIHandler("revoke key"))
+		apiKeys.POST("/", handler.CreateAPIKey(app))
+		apiKeys.GET("/", handler.ListAPIKeys(app))
+		apiKeys.DELETE("/{id}", handler.RevokeAPIKey(app, h))
 
 		// Cron: clean up expired sessions every 5 minutes
 		// Placeholder - full implementation with pbstore in Task 4

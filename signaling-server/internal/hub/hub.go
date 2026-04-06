@@ -135,6 +135,22 @@ func send(ctx context.Context, conn *websocket.Conn, msg any) error {
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
+// CloseAgent closes the WebSocket connection for the agent identified by apiKeyID
+// and removes it from the hub. Used when an API key is revoked.
+func (h *Hub) CloseAgent(apiKeyID string) {
+	h.mu.Lock()
+	conn, ok := h.agents[apiKeyID]
+	if ok {
+		delete(h.agents, apiKeyID)
+	}
+	h.mu.Unlock()
+
+	if ok && conn != nil {
+		// Close the connection with a status indicating the key was revoked
+		conn.Close(websocket.StatusPolicyViolation, "API key revoked")
+	}
+}
+
 // RegisterBrowserConn stores a browser WebSocket connection keyed by connID.
 // Called when a browser WebSocket connects, before the knock/join flow.
 func (h *Hub) RegisterBrowserConn(connID string, conn *websocket.Conn) {
