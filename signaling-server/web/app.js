@@ -150,7 +150,7 @@ async function computeHMAC(password, nonce) {
 
 async function sendJoin() {
   if (!pendingNonce) return;
-  const hmac = await computeHMAC(sessionPassword, pendingNonce);
+  const hmac = sessionPassword ? await computeHMAC(sessionPassword, pendingNonce) : '';
   ws.send(JSON.stringify({ type: 'join', hmac }));
   pendingNonce = null;
 }
