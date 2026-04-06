@@ -51,9 +51,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			return
 		}
 
-		browserConn, err := websocket.Accept(responseWriter, request, &websocket.AcceptOptions{
-			InsecureSkipVerify: true,
-		})
+		browserConn, err := websocket.Accept(responseWriter, request, nil)
 		if err != nil {
 			log.Printf("browser_ws accept: %v", err)
 			return
