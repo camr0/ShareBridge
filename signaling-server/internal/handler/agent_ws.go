@@ -6,14 +6,16 @@ import (
 	"encoding/json"
 	"log"
 	"math/big"
+	"net/http"
 	"regexp"
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/gin-gonic/gin"
+	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"sharebridge/server/internal/config"
-	"sharebridge/server/internal/db"
 	"sharebridge/server/internal/hub"
+	"sharebridge/server/internal/middleware"
 	"sharebridge/server/internal/turn"
 )
 
@@ -36,23 +38,19 @@ type agentMsg struct {
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
 var codeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,30}$`)
 
-func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo, cfg *config.Config) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// Extract and validate API key from query param
-		apiKeyFull := c.Query("api_key")
-		if apiKeyFull == "" {
-			c.JSON(401, gin.H{"error": "missing api_key"})
-			return
-		}
-
-		apiKey, err := apiKeyRepo.Validate(apiKeyFull)
-		if err != nil || apiKey == nil {
-			c.JSON(401, gin.H{"error": "invalid api_key"})
+// AgentWS handles WebSocket connections from agents.
+// It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
+func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Extract API key ID from context (set by middleware)
+		apiKeyID := middleware.GetAPIKeyID(r.Context())
+		if apiKeyID == "" {
+			http.Error(w, `{"error":"missing api_key"}`, http.StatusUnauthorized)
 			return
 		}
 
 		// Upgrade to WebSocket
-		conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 		})
 		if err != nil {
@@ -61,7 +59,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 		}
 		defer conn.CloseNow()
 
-		ctx := c.Request.Context()
+		ctx := r.Context()
 		var agentID string
 
 		// Main message loop
@@ -69,8 +67,8 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 			_, data, err := conn.Read(ctx)
 			if err != nil {
 				if agentID != "" {
-					log.Printf("agent disconnected: %s (agent_id: %s)", apiKey.ID, agentID)
-					h.UnregisterAgent(apiKey.ID)
+					log.Printf("agent disconnected: %s (agent_id: %s)", apiKeyID, agentID)
+					h.UnregisterAgent(apiKeyID)
 				}
 				return
 			}
@@ -82,7 +80,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 
 			switch msg.Type {
 			case "hello":
-				handleHello(ctx, conn, h, apiKey.ID, msg.AgentID, cfg)
+				handleHello(ctx, conn, h, apiKeyID, msg.AgentID, cfg)
 				agentID = msg.AgentID
 
 			case "register_share":
@@ -93,13 +91,13 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 					})
 					continue
 				}
-				handleRegisterShare(ctx, conn, h, apiKey, sessionRepo, agentID, msg)
+				handleRegisterShare(ctx, conn, h, app, apiKeyID, agentID, msg)
 
 			case "download_complete":
 				if agentID == "" {
 					continue
 				}
-				handleDownloadComplete(ctx, conn, sessionRepo, msg.Code)
+				handleDownloadComplete(ctx, conn, app, msg.Code)
 
 			case "offer":
 				if agentID == "" {
@@ -143,7 +141,7 @@ func AgentWS(h *hub.Hub, apiKeyRepo *db.APIKeyRepo, sessionRepo *db.SessionRepo,
 					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
 				} else {
 					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-						"type":              "auth_failed",
+						"type":               "auth_failed",
 						"attempts_remaining": 3 - failures,
 					})
 				}
@@ -184,7 +182,7 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	})
 
 	hub.SendDirect(ctx, conn, map[string]any{
-		"type":       "welcome",
+		"type":        "welcome",
 		"ice_servers": iceServers,
 	})
 }
@@ -194,8 +192,8 @@ func handleRegisterShare(
 	ctx context.Context,
 	conn *websocket.Conn,
 	h *hub.Hub,
-	apiKey *db.APIKey,
-	sessionRepo *db.SessionRepo,
+	app core.App,
+	apiKeyID string,
 	agentID string,
 	msg agentMsg,
 ) {
@@ -228,15 +226,7 @@ func handleRegisterShare(
 		// Try to create with collision retry (5 attempts)
 		created := false
 		for i := 0; i < 5; i++ {
-			session := &db.Session{
-				Code:         code,
-				APIKeyID:     apiKey.ID,
-				AgentID:      agentID,
-				ShareURL:     msg.ShareURL,
-				ExpiresAt:    msg.ExpiresAt,
-				MaxDownloads: msg.MaxDownloads,
-			}
-			err = sessionRepo.Create(session)
+			err = createSession(app, code, apiKeyID, agentID, msg.ShareURL, msg.ExpiresAt, msg.MaxDownloads)
 			if err == nil {
 				created = true
 				break
@@ -272,7 +262,7 @@ func handleRegisterShare(
 		}
 
 		// Check if code exists and is owned by this API key
-		available, err := sessionRepo.IsCodeAvailable(code, apiKey.ID)
+		available, existingSession, err := isCodeAvailable(app, code, apiKeyID)
 		if err != nil {
 			log.Printf("db error checking code availability: %v", err)
 			hub.SendDirect(ctx, conn, map[string]string{
@@ -283,20 +273,10 @@ func handleRegisterShare(
 		}
 
 		if available {
-			// Code is available (new or owned by this API key)
-			existingSession, err := sessionRepo.GetByCode(code)
-			if err != nil {
-				log.Printf("db error getting session: %v", err)
-				hub.SendDirect(ctx, conn, map[string]string{
-					"type":    "error",
-					"message": "database error",
-				})
-				return
-			}
-
 			if existingSession != nil {
 				// Verify agent_id matches for reconnection
-				if existingSession.AgentID != agentID {
+				existingAgentID := existingSession.GetString("agent_id")
+				if existingAgentID != agentID {
 					hub.SendDirect(ctx, conn, map[string]string{
 						"type":    "error",
 						"message": "session owned by different agent",
@@ -304,8 +284,8 @@ func handleRegisterShare(
 					return
 				}
 				// Reconnecting to existing session - update timestamps
-				existingSession.AgentID = agentID
-				if err := sessionRepo.Update(existingSession); err != nil {
+				existingSession.Set("agent_id", agentID)
+				if err := app.Save(existingSession); err != nil {
 					log.Printf("db error updating session: %v", err)
 					hub.SendDirect(ctx, conn, map[string]string{
 						"type":    "error",
@@ -314,18 +294,11 @@ func handleRegisterShare(
 					return
 				}
 				reconnected = true
-				log.Printf("session reconnected: code=%s api_key=%s agent_id=%s", code, apiKey.ID, agentID)
+				log.Printf("session reconnected: code=%s api_key=%s agent_id=%s", code, apiKeyID, agentID)
 			} else {
 				// Creating new session with custom code
-				session := &db.Session{
-					Code:         code,
-					APIKeyID:     apiKey.ID,
-					AgentID:      agentID,
-					ShareURL:     msg.ShareURL,
-					ExpiresAt:    msg.ExpiresAt,
-					MaxDownloads: msg.MaxDownloads,
-				}
-				if err := sessionRepo.Create(session); err != nil {
+				err := createSession(app, code, apiKeyID, agentID, msg.ShareURL, msg.ExpiresAt, msg.MaxDownloads)
+				if err != nil {
 					log.Printf("db error creating session: %v", err)
 					hub.SendDirect(ctx, conn, map[string]string{
 						"type":    "error",
@@ -345,10 +318,10 @@ func handleRegisterShare(
 	}
 
 	// Register code with hub
-	h.RegisterCode(code, apiKey.ID)
+	h.RegisterCode(code, apiKeyID)
 
 	// Get session for response
-	session, err := sessionRepo.GetByCode(code)
+	session, err := getSessionByCode(app, code)
 	if err != nil || session == nil {
 		log.Printf("db error getting session after creation: %v", err)
 		hub.SendDirect(ctx, conn, map[string]string{
@@ -364,19 +337,80 @@ func handleRegisterShare(
 		"code":        code,
 		"reconnected": reconnected,
 	}
-	if session.ExpiresAt != nil {
-		response["expires_at"] = session.ExpiresAt.Format(time.RFC3339)
+	if expiresAt := session.GetDateTime("expires_at"); !expiresAt.IsZero() {
+		response["expires_at"] = expiresAt.Time().Format(time.RFC3339)
 	}
 
 	hub.SendDirect(ctx, conn, response)
-	log.Printf("share registered: code=%s api_key=%s agent_id=%s reconnected=%v", code, apiKey.ID, agentID, reconnected)
+	log.Printf("share registered: code=%s api_key=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, reconnected)
+}
+
+// createSession creates a new session record in PocketBase
+func createSession(app core.App, code, apiKeyID, agentID, shareURL string, expiresAt *time.Time, maxDownloads *int) error {
+	// Get the api_keys collection
+	col, err := app.FindCollectionByNameOrId("sessions")
+	if err != nil {
+		return err
+	}
+
+	record := core.NewRecord(col)
+	record.Set("code", code)
+	record.Set("api_key_id", apiKeyID)
+	record.Set("agent_id", agentID)
+	record.Set("share_url", shareURL)
+
+	if expiresAt != nil {
+		dt, _ := types.ParseDateTime(*expiresAt)
+		record.Set("expires_at", dt)
+	}
+	if maxDownloads != nil {
+		record.Set("max_downloads", *maxDownloads)
+	}
+
+	return app.Save(record)
+}
+
+// getSessionByCode retrieves a session by its code
+func getSessionByCode(app core.App, code string) (*core.Record, error) {
+	records, err := app.FindRecordsByFilter(
+		"sessions",
+		"code = {:code}",
+		"",
+		1,
+		0,
+		map[string]any{"code": code},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	return records[0], nil
+}
+
+// isCodeAvailable checks if a code is not taken by a different API key.
+// Returns (available, existingSession, error)
+// - available = true if code is free or owned by the same API key
+// - existingSession = the session record if it exists, nil otherwise
+func isCodeAvailable(app core.App, code string, apiKeyID string) (bool, *core.Record, error) {
+	session, err := getSessionByCode(app, code)
+	if err != nil {
+		return false, nil, err
+	}
+	if session == nil {
+		return true, nil, nil
+	}
+	// Code exists - check if it's owned by the same API key
+	existingKeyID := session.GetString("api_key_id")
+	return existingKeyID == apiKeyID, session, nil
 }
 
 // handleDownloadComplete increments the download count for a session
 func handleDownloadComplete(
 	ctx context.Context,
 	conn *websocket.Conn,
-	sessionRepo *db.SessionRepo,
+	app core.App,
 	code string,
 ) {
 	if code == "" {
@@ -387,7 +421,27 @@ func handleDownloadComplete(
 		return
 	}
 
-	if err := sessionRepo.IncrementDownloadCount(code); err != nil {
+	session, err := getSessionByCode(app, code)
+	if err != nil {
+		log.Printf("failed to find session for download count increment %s: %v", code, err)
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "failed to update download count",
+		})
+		return
+	}
+	if session == nil {
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "session not found",
+		})
+		return
+	}
+
+	currentCount := session.GetInt("download_count")
+	session.Set("download_count", currentCount+1)
+
+	if err := app.Save(session); err != nil {
 		log.Printf("failed to increment download count for %s: %v", code, err)
 		hub.SendDirect(ctx, conn, map[string]string{
 			"type":    "error",

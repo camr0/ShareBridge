@@ -12,12 +12,13 @@ import (
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/handler"
 	"sharebridge/server/internal/hub"
+	"sharebridge/server/internal/middleware"
 	_ "sharebridge/server/migrations"
 )
 
 func main() {
 	cfg := config.Load()
-	_ = hub.New() // h will be used in subsequent tasks for WebSocket handlers
+	h := hub.New()
 
 	app := pocketbase.New()
 
@@ -45,9 +46,19 @@ func main() {
 		// Enforce the primary deny rule in nginx/Caddy/Traefik; a same-host reverse
 		// proxy makes RemoteAddr appear local, so an app-only localhost check is not enough.
 
-		// WebSocket endpoints - placeholder for now (full implementation in Task 6)
-		router.GET("/ws/agent", placeholderWSHandler("agent"))
-		router.GET("/ws/client", placeholderWSHandler("client"))
+		// WebSocket endpoints
+		router.GET("/ws/agent", func(e *core.RequestEvent) error {
+			// Apply API key auth middleware then handler
+			authMiddleware := middleware.APIKeyAuth(app)
+			handlerFunc := handler.AgentWS(app, h, cfg)
+			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
+			return nil
+		})
+
+		router.GET("/ws/client", func(e *core.RequestEvent) error {
+			// TODO: Update browser_ws to use PocketBase in Task 2
+			return apis.NewApiError(http.StatusNotImplemented, "client WebSocket not yet implemented", nil)
+		})
 
 		// Session info REST endpoint - placeholder
 		router.GET("/sessions/{code}", placeholderSessionHandler())
@@ -91,13 +102,6 @@ func main() {
 
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
-	}
-}
-
-// placeholderWSHandler returns a placeholder WebSocket handler
-func placeholderWSHandler(name string) func(*core.RequestEvent) error {
-	return func(e *core.RequestEvent) error {
-		return apis.NewApiError(http.StatusNotImplemented, name+" WebSocket not yet implemented", nil)
 	}
 }
 
