@@ -22,14 +22,14 @@ import (
 
 	"github.com/pion/webrtc/v4"
 	"github.com/spf13/cobra"
-	"opencloudshare/agent/internal/config"
-	"opencloudshare/agent/internal/daemon"
-	"opencloudshare/agent/internal/opencloud"
-	"opencloudshare/agent/internal/peer"
-	"opencloudshare/agent/internal/signaling"
-	"opencloudshare/agent/internal/store"
-	"opencloudshare/agent/internal/transfer"
-	"opencloudshare/agent/internal/web"
+	"sharebridge/agent/internal/config"
+	"sharebridge/agent/internal/daemon"
+	"sharebridge/agent/internal/opencloud"
+	"sharebridge/agent/internal/peer"
+	"sharebridge/agent/internal/signaling"
+	"sharebridge/agent/internal/store"
+	"sharebridge/agent/internal/transfer"
+	"sharebridge/agent/internal/web"
 )
 
 var (
@@ -58,8 +58,8 @@ func init() {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "opencloudshare",
-	Short: "OpenCloudShare agent for secure file sharing",
+	Use:   "sharebridge",
+	Short: "ShareBridge agent for secure file sharing",
 }
 
 var shareCmd = &cobra.Command{
@@ -93,7 +93,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Validate API key is set
 	if cfg.APIKey == "" {
-		return fmt.Errorf("API key required — set in config.json or OPENCLOUDSHARE_API_KEY env var")
+		return fmt.Errorf("API key required — set in config.json or SHAREBRIDGE_API_KEY env var")
 	}
 
 	// Create store
@@ -264,7 +264,7 @@ func runShareSingle(shareURL string) error {
 
 	// Validate API key is set
 	if cfg.APIKey == "" {
-		return fmt.Errorf("OPENCLOUDSHARE_API_KEY environment variable required")
+		return fmt.Errorf("SHAREBRIDGE_API_KEY environment variable required")
 	}
 
 	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost, password)

@@ -39,7 +39,7 @@ func TestNewManager_CreatesConfigDir(t *testing.T) {
 
 	// Directory is created on save, not on load
 	// Verify it doesn't exist yet
-	configDir := filepath.Join(homeDir, ".opencloudshare")
+	configDir := filepath.Join(homeDir, ".sharebridge")
 	if _, err := os.Stat(configDir); !os.IsNotExist(err) {
 		t.Error("config directory should not exist before save")
 	}
@@ -65,14 +65,14 @@ func TestLoad_EnvVarFallback(t *testing.T) {
 
 	// Set env vars
 	os.Setenv("SIGNALING_SERVER", "ws://test.example.com:8080")
-	os.Setenv("OPENCLOUDSHARE_API_KEY", "test-api-key")
-	os.Setenv("ALLOWED_OPENCLOUD_HOST", "cloud.example.com")
+	os.Setenv("SHAREBRIDGE_API_KEY", "test-api-key")
+	os.Setenv("ALLOWED_SHAREBRIDGE_HOST", "cloud.example.com")
 	os.Setenv("UI_PORT", "9999")
 	os.Setenv("UI_PASSWORD", "secret123")
 	defer func() {
 		os.Unsetenv("SIGNALING_SERVER")
-		os.Unsetenv("OPENCLOUDSHARE_API_KEY")
-		os.Unsetenv("ALLOWED_OPENCLOUD_HOST")
+		os.Unsetenv("SHAREBRIDGE_API_KEY")
+		os.Unsetenv("ALLOWED_SHAREBRIDGE_HOST")
 		os.Unsetenv("UI_PORT")
 		os.Unsetenv("UI_PASSWORD")
 	}()
@@ -103,7 +103,7 @@ func TestLoad_EnvVarFallback(t *testing.T) {
 func TestLoad_FileTakesPrecedenceOverEnv(t *testing.T) {
 	tmpDir := t.TempDir()
 	homeDir := filepath.Join(tmpDir, "home")
-	configDir := filepath.Join(homeDir, ".opencloudshare")
+	configDir := filepath.Join(homeDir, ".sharebridge")
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -113,11 +113,11 @@ func TestLoad_FileTakesPrecedenceOverEnv(t *testing.T) {
 
 	// Set env vars (these should be ignored when file has values)
 	os.Setenv("SIGNALING_SERVER", "ws://env.example.com")
-	os.Setenv("OPENCLOUDSHARE_API_KEY", "env-api-key")
+	os.Setenv("SHAREBRIDGE_API_KEY", "env-api-key")
 	os.Setenv("UI_PORT", "1111")
 	defer func() {
 		os.Unsetenv("SIGNALING_SERVER")
-		os.Unsetenv("OPENCLOUDSHARE_API_KEY")
+		os.Unsetenv("SHAREBRIDGE_API_KEY")
 		os.Unsetenv("UI_PORT")
 	}()
 
@@ -165,7 +165,7 @@ func TestLoad_FileTakesPrecedenceOverEnv(t *testing.T) {
 func TestLoad_PartialFileWithEnvFill(t *testing.T) {
 	tmpDir := t.TempDir()
 	homeDir := filepath.Join(tmpDir, "home")
-	configDir := filepath.Join(homeDir, ".opencloudshare")
+	configDir := filepath.Join(homeDir, ".sharebridge")
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -175,10 +175,10 @@ func TestLoad_PartialFileWithEnvFill(t *testing.T) {
 
 	// Set env vars
 	os.Setenv("SIGNALING_SERVER", "ws://env.example.com")
-	os.Setenv("OPENCLOUDSHARE_API_KEY", "env-api-key")
+	os.Setenv("SHAREBRIDGE_API_KEY", "env-api-key")
 	defer func() {
 		os.Unsetenv("SIGNALING_SERVER")
-		os.Unsetenv("OPENCLOUDSHARE_API_KEY")
+		os.Unsetenv("SHAREBRIDGE_API_KEY")
 	}()
 
 	// Write partial config file (missing SignalingURL and APIKey)

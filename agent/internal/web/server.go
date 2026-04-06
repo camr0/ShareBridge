@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"opencloudshare/agent/internal/daemon"
+	"sharebridge/agent/internal/daemon"
 )
 
 //go:embed static/* templates/*
@@ -176,7 +176,7 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 
 		_, password, ok := r.BasicAuth()
 		if !ok || subtle.ConstantTimeCompare([]byte(password), []byte(ws.password)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Basic realm="OpenCloudShare Agent"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="ShareBridge Agent"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}

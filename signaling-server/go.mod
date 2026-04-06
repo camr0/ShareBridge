@@ -1,4 +1,4 @@
-module opencloudshare/server
+module sharebridge/server
 
 go 1.26.1
 

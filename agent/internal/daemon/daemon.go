@@ -15,12 +15,12 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
-	"opencloudshare/agent/internal/config"
-	"opencloudshare/agent/internal/opencloud"
-	"opencloudshare/agent/internal/peer"
-	"opencloudshare/agent/internal/signaling"
-	"opencloudshare/agent/internal/store"
-	"opencloudshare/agent/internal/transfer"
+	"sharebridge/agent/internal/config"
+	"sharebridge/agent/internal/opencloud"
+	"sharebridge/agent/internal/peer"
+	"sharebridge/agent/internal/signaling"
+	"sharebridge/agent/internal/store"
+	"sharebridge/agent/internal/transfer"
 )
 
 // nonceEntry holds a per-connection nonce for HMAC pre-challenge.

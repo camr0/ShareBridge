@@ -37,20 +37,20 @@ type Store struct {
 	data     *storeData // in-memory cache
 }
 
-// New resolves the data directory (OPENCLOUDSHARE_DATA_DIR or ~/.opencloudshare),
+// New resolves the data directory (SHAREBRIDGE_DATA_DIR or ~/.sharebridge),
 // creates it if needed, and returns a Store. Returns error if dir cannot be created
 // or if sessions.json exists but is malformed.
 func New() (*Store, error) {
 	var dataDir string
 
-	if envDir := os.Getenv("OPENCLOUDSHARE_DATA_DIR"); envDir != "" {
+	if envDir := os.Getenv("SHAREBRIDGE_DATA_DIR"); envDir != "" {
 		dataDir = envDir
 	} else {
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get user home directory: %w", err)
 		}
-		dataDir = filepath.Join(homeDir, ".opencloudshare")
+		dataDir = filepath.Join(homeDir, ".sharebridge")
 	}
 
 	if err := os.MkdirAll(dataDir, 0700); err != nil {

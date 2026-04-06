@@ -40,7 +40,7 @@ func NewManager() (*Manager, error) {
 		return nil, err
 	}
 
-	configDir := filepath.Join(homeDir, ".opencloudshare")
+	configDir := filepath.Join(homeDir, ".sharebridge")
 	filePath := filepath.Join(configDir, "config.json")
 
 	m := &Manager{
@@ -100,10 +100,10 @@ func (m *Manager) load() (*Config, error) {
 		cfg.SignalingURL = getEnv("SIGNALING_SERVER", "ws://localhost:8080")
 	}
 	if cfg.APIKey == "" {
-		cfg.APIKey = getEnv("OPENCLOUDSHARE_API_KEY", "")
+		cfg.APIKey = getEnv("SHAREBRIDGE_API_KEY", "")
 	}
 	if cfg.AllowedHost == "" {
-		cfg.AllowedHost = getEnv("ALLOWED_OPENCLOUD_HOST", "")
+		cfg.AllowedHost = getEnv("ALLOWED_SHAREBRIDGE_HOST", "")
 	}
 	if cfg.UIPort == 0 {
 		cfg.UIPort = getEnvInt("UI_PORT", 7878)
@@ -147,8 +147,8 @@ func Load() *Config {
 		// Fallback to env-only config on error
 		return &Config{
 			SignalingURL: getEnv("SIGNALING_SERVER", "ws://localhost:8080"),
-			APIKey:       getEnv("OPENCLOUDSHARE_API_KEY", ""),
-			AllowedHost:  getEnv("ALLOWED_OPENCLOUD_HOST", ""),
+			APIKey:       getEnv("SHAREBRIDGE_API_KEY", ""),
+			AllowedHost:  getEnv("ALLOWED_SHAREBRIDGE_HOST", ""),
 			UIPort:       getEnvInt("UI_PORT", 7878),
 			UIPassword:   getEnv("UI_PASSWORD", ""),
 		}

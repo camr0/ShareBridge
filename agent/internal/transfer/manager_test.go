@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"opencloudshare/agent/internal/opencloud"
+	"sharebridge/agent/internal/opencloud"
 )
 
 // mockDC implements DataChannel for testing

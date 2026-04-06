@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"opencloudshare/agent/internal/opencloud"
+	"sharebridge/agent/internal/opencloud"
 )
 
 const (

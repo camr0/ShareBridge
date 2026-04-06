@@ -1,5 +1,5 @@
 services:
-  signaling-server:
+  sharebridge-server:
     build: .
     ports:
       - "8080:8080"
@@ -7,11 +7,11 @@ services:
       - PORT=8080
       - DATABASE_PATH=/data/signaling.db
       - ADMIN_TOKEN=${ADMIN_TOKEN}
-      - TURN_HOST=${TURN_HOST}  # Public IP or domain, NOT "coturn"
+      - TURN_HOST=${TURN_HOST}
       - TURN_PORT=3478
       - TURN_SECRET=${TURN_SECRET}
     volumes:
-      - signaling-data:/data
+      - sharebridge-data:/data
     depends_on:
       - coturn
 
@@ -23,10 +23,10 @@ services:
       --log-file=stdout
       --min-port=49152
       --max-port=65535
-      --realm=opencloudshare
+      --realm=sharebridge
       --use-auth-secret
       --static-auth-secret=${TURN_SECRET}
     restart: unless-stopped
 
 volumes:
-  signaling-data:
+  sharebridge-data:

@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
-	"opencloudshare/agent/internal/config"
-	"opencloudshare/agent/internal/peer"
-	"opencloudshare/agent/internal/signaling"
-	"opencloudshare/agent/internal/store"
+	"sharebridge/agent/internal/config"
+	"sharebridge/agent/internal/peer"
+	"sharebridge/agent/internal/signaling"
+	"sharebridge/agent/internal/store"
 )
 
 // mockConfigManager implements ConfigManagerInterface for testing.

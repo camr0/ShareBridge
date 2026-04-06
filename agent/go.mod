@@ -1,4 +1,4 @@
-module opencloudshare/agent
+module sharebridge/agent
 
 go 1.26.1
 
