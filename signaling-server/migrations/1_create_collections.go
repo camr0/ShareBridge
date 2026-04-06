@@ -50,6 +50,17 @@ func CreateCollections(app core.App) error {
 		&core.BoolField{
 			Name: "is_active",
 		},
+		&core.AutodateField{
+			Name:     "created",
+			System:   true,
+			OnCreate: true,
+		},
+		&core.AutodateField{
+			System:   true,
+			Name:     "updated",
+			OnCreate: true,
+			OnUpdate: true,
+		},
 	)
 
 	// API rules: only owning user can read/edit their own keys

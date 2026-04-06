@@ -41,6 +41,8 @@ func TestCreateCollections(t *testing.T) {
 	require.NotNil(t, apiKeysCol.Fields.GetByName("label"))
 	require.NotNil(t, apiKeysCol.Fields.GetByName("last_used_at"))
 	require.NotNil(t, apiKeysCol.Fields.GetByName("is_active"))
+	require.NotNil(t, apiKeysCol.Fields.GetByName("created"))
+	require.NotNil(t, apiKeysCol.Fields.GetByName("updated"))
 
 	// Check sessions has expected fields
 	require.NotNil(t, sessionsCol.Fields.GetByName("code"))

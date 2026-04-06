@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"golang.org/x/crypto/bcrypt"
 	"sharebridge/server/internal/hub"
@@ -38,67 +40,103 @@ type APIKeyListItem struct {
 // POST /api/keys
 func CreateAPIKey(app core.App) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		// Extract account_id from authenticated user context
+		authRecord := e.Auth
+		if authRecord == nil {
+			return e.JSON(http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		}
+
+		var req CreateAPIKeyRequest
+		if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+			// Body is optional, continue with empty label.
+		}
+
+		record, fullKey, createdAt, err := createAPIKeyRecord(app, authRecord.Id, req.Label)
+		if err != nil {
+			return e.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+
+		return e.JSON(http.StatusCreated, CreateAPIKeyResponse{
+			ID:        record.Id,
+			Key:       fullKey,
+			Label:     req.Label,
+			CreatedAt: createdAt,
+		})
+	}
+}
+
+// RotateAPIKey creates a replacement key, transfers all sessions from the old
+// key to the new key, immediately revokes the old key, and disconnects any
+// live agent using it.
+func RotateAPIKey(app core.App, sessionHub *hub.Hub) func(*core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
 		authRecord := e.Auth
 		if authRecord == nil {
 			return e.JSON(http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 		}
 		accountID := authRecord.Id
 
-		// Parse optional label from request body
-		var req CreateAPIKeyRequest
-		if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
-			// Body is optional, continue with empty label
+		oldKeyID := e.Request.PathValue("id")
+		if oldKeyID == "" {
+			return e.JSON(http.StatusBadRequest, map[string]string{"error": "key id required"})
 		}
 
-		// Get the api_keys collection
-		col, err := app.FindCollectionByNameOrId("api_keys")
+		oldKeyRecord, err := app.FindRecordById("api_keys", oldKeyID)
 		if err != nil {
-			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to find collection"})
+			return e.JSON(http.StatusNotFound, map[string]string{"error": "key not found"})
+		}
+		if !ownsAPIKey(oldKeyRecord, accountID) {
+			return e.JSON(http.StatusForbidden, map[string]string{"error": "access denied"})
+		}
+		if !oldKeyRecord.GetBool("is_active") {
+			return e.JSON(http.StatusBadRequest, map[string]string{"error": "key is already revoked"})
 		}
 
-		// Create new record to get the ID
-		record := core.NewRecord(col)
-		record.Set("account_id", accountID)
-		record.Set("label", req.Label)
-		record.Set("is_active", true)
+		newLabel := oldKeyRecord.GetString("label")
 
-		// Save to get the record ID
-		if err := app.Save(record); err != nil {
-			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create key"})
-		}
+		var newRecord *core.Record
+		var newFullKey string
+		var createdAt time.Time
 
-		// Generate 32-byte random secret (base64url encoded = 43 chars)
-		secretBytes := make([]byte, 32)
-		if _, err := rand.Read(secretBytes); err != nil {
-			_ = app.Delete(record)
-			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to generate secret"})
-		}
-		secret := base64.RawURLEncoding.EncodeToString(secretBytes)
+		err = app.RunInTransaction(func(txApp core.App) error {
+			var createErr error
+			newRecord, newFullKey, createdAt, createErr = createAPIKeyRecord(txApp, accountID, newLabel)
+			if createErr != nil {
+				return createErr
+			}
 
-		// Full key format: <record_id>.<secret>
-		fullKey := record.Id + "." + secret
+			_, updateErr := txApp.DB().
+				NewQuery(`UPDATE sessions SET api_key_id = {:newKeyID} WHERE api_key_id = {:oldKeyID}`).
+				Bind(dbx.Params{
+					"newKeyID": newRecord.Id,
+					"oldKeyID": oldKeyID,
+				}).
+				Execute()
+			if updateErr != nil {
+				return updateErr
+			}
 
-		// Generate bcrypt hash of the full key for storage
-		hash, err := bcrypt.GenerateFromPassword([]byte(fullKey), bcrypt.DefaultCost)
+			oldKeyTxRecord, findErr := txApp.FindRecordById("api_keys", oldKeyID)
+			if findErr != nil {
+				return findErr
+			}
+			oldKeyTxRecord.Set("is_active", false)
+			if saveErr := txApp.Save(oldKeyTxRecord); saveErr != nil {
+				return saveErr
+			}
+
+			return nil
+		})
 		if err != nil {
-			_ = app.Delete(record)
-			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to hash key"})
+			return e.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
 
-		// Update record with the hash
-		record.Set("key_hash", string(hash))
-		if err := app.Save(record); err != nil {
-			_ = app.Delete(record)
-			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save key hash"})
-		}
+		sessionHub.CloseAgent(oldKeyID)
 
-		// Return the full key (shown once only)
 		return e.JSON(http.StatusCreated, CreateAPIKeyResponse{
-			ID:        record.Id,
-			Key:       fullKey,
-			Label:     req.Label,
-			CreatedAt: time.Now(),
+			ID:        newRecord.Id,
+			Key:       newFullKey,
+			Label:     newLabel,
+			CreatedAt: createdAt,
 		})
 	}
 }
@@ -117,7 +155,7 @@ func ListAPIKeys(app core.App) func(*core.RequestEvent) error {
 		// Query all keys for this account, excluding key_hash
 		records, err := app.FindRecordsByFilter(
 			"api_keys",
-			"account_id = {:accountID}",
+			"account_id.id = {:accountID}",
 			"-created", // sort by created desc
 			100,        // limit
 			0,          // offset
@@ -160,7 +198,6 @@ func ListAPIKeys(app core.App) func(*core.RequestEvent) error {
 // DELETE /api/keys/:id
 func RevokeAPIKey(app core.App, h *hub.Hub) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		// Extract account_id from authenticated user context
 		authRecord := e.Auth
 		if authRecord == nil {
 			return e.JSON(http.StatusUnauthorized, map[string]string{"error": "authentication required"})
@@ -179,15 +216,7 @@ func RevokeAPIKey(app core.App, h *hub.Hub) func(*core.RequestEvent) error {
 			return e.JSON(http.StatusNotFound, map[string]string{"error": "key not found"})
 		}
 
-		// Verify ownership - check account_id matches
-		keyAccountID := ""
-		if relRecord := record.ExpandedOne("account_id"); relRecord != nil {
-			keyAccountID = relRecord.Id
-		} else {
-			keyAccountID = record.GetString("account_id")
-		}
-
-		if keyAccountID != accountID {
+		if !ownsAPIKey(record, accountID) {
 			return e.JSON(http.StatusForbidden, map[string]string{"error": "access denied"})
 		}
 
@@ -202,4 +231,56 @@ func RevokeAPIKey(app core.App, h *hub.Hub) func(*core.RequestEvent) error {
 
 		return e.JSON(http.StatusOK, map[string]string{"message": "key revoked"})
 	}
+}
+
+func createAPIKeyRecord(app core.App, accountID, label string) (*core.Record, string, time.Time, error) {
+	col, err := app.FindCollectionByNameOrId("api_keys")
+	if err != nil {
+		return nil, "", time.Time{}, errors.New("failed to find collection")
+	}
+
+	record := core.NewRecord(col)
+	record.Set("account_id", accountID)
+	record.Set("label", label)
+	record.Set("is_active", true)
+	if err := app.Save(record); err != nil {
+		return nil, "", time.Time{}, errors.New("failed to create key")
+	}
+
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		_ = app.Delete(record)
+		return nil, "", time.Time{}, errors.New("failed to generate secret")
+	}
+	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
+
+	fullKey := record.Id + "." + secret
+	hash, err := bcrypt.GenerateFromPassword([]byte(fullKey), bcrypt.DefaultCost)
+	if err != nil {
+		_ = app.Delete(record)
+		return nil, "", time.Time{}, errors.New("failed to hash key")
+	}
+
+	record.Set("key_hash", string(hash))
+	if err := app.Save(record); err != nil {
+		_ = app.Delete(record)
+		return nil, "", time.Time{}, errors.New("failed to save key hash")
+	}
+
+	createdAt := time.Now()
+	if created := record.GetDateTime("created"); !created.IsZero() {
+		createdAt = created.Time()
+	}
+
+	return record, fullKey, createdAt, nil
+}
+
+func ownsAPIKey(record *core.Record, accountID string) bool {
+	keyAccountID := ""
+	if relRecord := record.ExpandedOne("account_id"); relRecord != nil {
+		keyAccountID = relRecord.Id
+	} else {
+		keyAccountID = record.GetString("account_id")
+	}
+	return keyAccountID == accountID
 }

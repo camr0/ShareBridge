@@ -84,6 +84,7 @@ func main() {
 		apiKeys.Bind(apis.RequireAuth())
 		apiKeys.POST("", handler.CreateAPIKey(app))
 		apiKeys.GET("", handler.ListAPIKeys(app))
+		apiKeys.POST("/{id}/rotate", handler.RotateAPIKey(app, h))
 		apiKeys.DELETE("/{id}", handler.RevokeAPIKey(app, h))
 
 		// Cron: clean up expired sessions every 5 minutes

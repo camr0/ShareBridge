@@ -66,6 +66,13 @@
       padding: 6px 14px;
       font-size: 0.85rem;
     }
+    button.secondary-action {
+      background: #45475a;
+      color: #cdd6f4;
+      padding: 6px 14px;
+      font-size: 0.85rem;
+      margin-right: 8px;
+    }
 
     .key-list {
       list-style: none;
@@ -268,9 +275,9 @@
   <!-- Show Key Once Modal -->
   <div id="show-key-modal" class="modal-overlay">
     <div class="modal">
-      <div class="modal-title">API Key Created</div>
+      <div id="show-key-title" class="modal-title">API Key Created</div>
       <div class="modal-body">
-        <div class="warning-box">
+        <div id="show-key-warning" class="warning-box">
           <strong>Important:</strong>
           This key will only be shown once. Copy it now and store it securely.
           You will not be able to see the full key again.
@@ -280,6 +287,29 @@
       </div>
       <div class="modal-footer">
         <button onclick="hideShowKeyModal()">I've copied it</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rotate Confirmation Modal -->
+  <div id="rotate-modal" class="modal-overlay">
+    <div class="modal">
+      <div class="modal-title">Rotate API Key</div>
+      <div class="modal-body">
+        <div class="warning-box">
+          <strong>Rotate replaces a lost key immediately.</strong>
+          Rotation creates a replacement key, transfers every share to it, and revokes the old key right away. Copy the new key and update your agent after rotating.
+        </div>
+        <p class="confirm-text">
+          Rotate
+          <span id="rotate-key-label" class="confirm-key-label"></span>?
+        </p>
+        <p>This revokes the old key immediately, disconnects any agent using it, and transfers all shares to the replacement key.</p>
+        <div id="rotate-error" class="error-message hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="secondary" onclick="hideRotateModal()">Cancel</button>
+        <button id="rotate-confirm-btn" onclick="confirmRotate()">Rotate</button>
       </div>
     </div>
   </div>
@@ -310,6 +340,7 @@
     // State
     let apiKeys = [];
     let currentKeyToRevoke = null;
+    let currentKeyToRotate = null;
     let newKeyValue = null;
 
     // Get JWT from localStorage
@@ -421,6 +452,7 @@
           </div>
           ${key.is_active ? `
             <div class="key-actions">
+              <button class="secondary-action" onclick="showRotateModal('${key.id}')">Rotate</button>
               <button class="danger" onclick="showRevokeModal('${key.id}')">Revoke</button>
             </div>
           ` : ''}
@@ -472,7 +504,11 @@
         newKeyValue = data.key;
 
         hideCreateModal();
-        showNewKeyModal(data.key);
+        showNewKeyModal({
+          key: data.key,
+          title: 'API Key Created',
+          warning: '<strong>Important:</strong>This key will only be shown once. Copy it now and store it securely. You will not be able to see the full key again.'
+        });
         loadKeys(); // Refresh the list
       } catch (error) {
         errorDiv.textContent = error.message;
@@ -483,8 +519,10 @@
     }
 
     // Show new key modal (show-once pattern)
-    function showNewKeyModal(key) {
-      document.getElementById('new-key-display').textContent = key;
+    function showNewKeyModal(options) {
+      document.getElementById('show-key-title').textContent = options.title;
+      document.getElementById('show-key-warning').innerHTML = options.warning;
+      document.getElementById('new-key-display').textContent = options.key;
       document.getElementById('copy-key-btn').textContent = 'Copy to clipboard';
       document.getElementById('copy-key-btn').classList.remove('copied');
       document.getElementById('show-key-modal').classList.add('visible');
@@ -494,6 +532,61 @@
     function hideShowKeyModal() {
       document.getElementById('show-key-modal').classList.remove('visible');
       newKeyValue = null;
+    }
+
+    function showRotateModal(keyId) {
+      const key = apiKeys.find(k => k.id === keyId);
+      if (!key) return;
+
+      currentKeyToRotate = keyId;
+      document.getElementById('rotate-key-label').textContent = key.label || '(no label)';
+      document.getElementById('rotate-error').classList.add('hidden');
+      document.getElementById('rotate-modal').classList.add('visible');
+    }
+
+    function hideRotateModal() {
+      document.getElementById('rotate-modal').classList.remove('visible');
+      currentKeyToRotate = null;
+    }
+
+    async function confirmRotate() {
+      if (!currentKeyToRotate) return;
+
+      const btn = document.getElementById('rotate-confirm-btn');
+      const errorDiv = document.getElementById('rotate-error');
+
+      btn.disabled = true;
+      errorDiv.classList.add('hidden');
+
+      try {
+        const response = await apiRequest(`/keys/${currentKeyToRotate}/rotate`, {
+          method: 'POST',
+          body: JSON.stringify({})
+        });
+
+        if (!response) return;
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.error || 'Failed to rotate key');
+        }
+
+        const data = await response.json();
+        newKeyValue = data.key;
+
+        hideRotateModal();
+        showNewKeyModal({
+          key: data.key,
+          title: 'Replacement Key Created',
+          warning: '<strong>Old key revoked:</strong>The previous key stopped working immediately and all shares were transferred to this replacement key. Update your agent with this new key now.'
+        });
+        loadKeys();
+      } catch (error) {
+        errorDiv.textContent = error.message;
+        errorDiv.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+      }
     }
 
     // Copy key to clipboard
@@ -599,6 +692,7 @@
       overlay.addEventListener('click', (e) => {
         if (e.target === overlay) {
           if (overlay.id === 'create-modal') hideCreateModal();
+          if (overlay.id === 'rotate-modal') hideRotateModal();
           if (overlay.id === 'revoke-modal') hideRevokeModal();
           // Don't close show-key-modal on overlay click - force user to acknowledge
         }

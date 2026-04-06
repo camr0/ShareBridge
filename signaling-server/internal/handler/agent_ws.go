@@ -162,7 +162,7 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 
 	// Register agent with the hub using apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
-	log.Printf("agent hello received: api_key=%s agent_id=%s", apiKeyID, agentID)
+	log.Printf("agent hello received: api_key_id=%s agent_id=%s", apiKeyID, agentID)
 
 	// Build ICE config for agent
 	var turnCreds *turn.Credentials
@@ -308,7 +308,7 @@ func handleRegisterShare(
 	}
 
 	hub.SendDirect(ctx, conn, response)
-	log.Printf("share registered: code=%s api_key=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, reconnected)
+	log.Printf("share registered: code=%s api_key_id=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, reconnected)
 }
 
 // createSession creates a new session record in PocketBase.
