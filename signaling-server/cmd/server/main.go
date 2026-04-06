@@ -5,7 +5,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -22,15 +21,12 @@ import (
 func main() {
 	cfg := config.Load()
 	h := hub.New()
-	dataDir := pocketBaseDataDir(cfg.DBPath)
 
 	app := pocketbase.NewWithConfig(pocketbase.Config{
-		DefaultDataDir: dataDir,
+		DefaultDataDir: cfg.DataDir,
 	})
 
-	// IMPORTANT: wire PocketBase to cfg.DBPath and cfg.Port explicitly.
-	// PocketBase expects a data directory, while DATABASE_PATH is historically a file path.
-	// We preserve the deployment contract by deriving the PocketBase data dir from it.
+	// IMPORTANT: wire PocketBase to cfg.DataDir and cfg.Port explicitly.
 
 	// Configure SMTP if provided (must be done before Bootstrap so email flows work).
 	if cfg.HasSMTP() {
@@ -98,8 +94,7 @@ func main() {
 		})
 
 		log.Printf("signaling server listening on :%s", cfg.Port)
-		log.Printf("database path: %s", cfg.DBPath)
-		log.Printf("pocketbase data dir: %s", dataDir)
+		log.Printf("pocketbase data dir: %s", cfg.DataDir)
 
 		return se.Next()
 	})
@@ -110,17 +105,6 @@ func main() {
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func pocketBaseDataDir(dbPath string) string {
-	if dbPath == "" {
-		return ""
-	}
-	clean := filepath.Clean(dbPath)
-	if filepath.Ext(clean) == ".db" {
-		return filepath.Dir(clean)
-	}
-	return clean
 }
 
 func deleteExpiredSessions(app core.App) error {

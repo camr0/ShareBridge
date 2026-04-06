@@ -17,7 +17,7 @@ Users behind symmetric NAT (typically corporate/ISP firewalls) will automaticall
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
 | `PORT` | Server port | `8080` |
-| `DATABASE_PATH` | SQLite database path | `./signaling.db` |
+| `DATA_DIR` | PocketBase data directory | `./pb_data` |
 | `TURN_HOST` | Coturn public IP/domain | (optional) |
 | `TURN_PORT` | Coturn port | `3478` |
 | `TURN_SECRET` | HMAC shared secret for TURN | (optional) |

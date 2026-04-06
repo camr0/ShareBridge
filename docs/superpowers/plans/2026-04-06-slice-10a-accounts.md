@@ -10,7 +10,7 @@
 - Session ownership still lives on `sessions.api_key_id`, but a same-account reconnect with a different key must transfer the session to the new `api_key_id` atomically.
 - `/_/` admin access must be blocked at the reverse proxy first; do not trust `RemoteAddr` alone behind nginx/Caddy/Traefik.
 - If SMTP is unset, email verification is disabled for self-hosted installs and users may log in immediately after registration.
-- `PORT` and `DATABASE_PATH` must be wired explicitly in `cmd/server/main.go`; do not assume PocketBase defaults match the current deployment contract.
+- `PORT` and `DATA_DIR` must be wired explicitly in `cmd/server/main.go`; use PocketBase's real data-directory model rather than emulating the old SQLite file-path contract.
 
 **Tech Stack:** PocketBase v0.22+, coder/websocket (unchanged), golang.org/x/crypto/bcrypt (unchanged), Go 1.22+ (for `r.PathValue`)
 
@@ -869,7 +869,7 @@ import (
 type Config struct {
 	Port     string
 	STUNURL  string
-	DBPath   string
+	DataDir  string
 
 	// TURN configuration
 	TurnHost   string
@@ -887,7 +887,7 @@ func Load() *Config {
 	return &Config{
 		Port:    getEnv("PORT", "8080"),
 		STUNURL: getEnv("STUN_URL", "stun:stun.cloudflare.com:3478"),
-		DBPath:  getEnv("DATABASE_PATH", "./signaling.db"),
+		DataDir: getEnv("DATA_DIR", "./pb_data"),
 
 		TurnHost:   getEnv("TURN_HOST", ""),
 		TurnPort:   getEnv("TURN_PORT", "3478"),
@@ -1959,11 +1959,11 @@ func main() {
 	cfg := config.Load()
 	h := hub.New()
 
-	app := pocketbase.New()
+	app := pocketbase.NewWithConfig(pocketbase.Config{
+		DefaultDataDir: cfg.DataDir,
+	})
 
-	// IMPORTANT: wire PocketBase to cfg.DBPath and cfg.Port explicitly.
-	// The exact boot API may vary by PocketBase version; verify this in code rather
-	// than assuming PocketBase's defaults match the old Gin/sqlite setup.
+	// IMPORTANT: wire PocketBase to cfg.DataDir and cfg.Port explicitly.
 
 	// Configure SMTP if provided (must be done before Bootstrap so email flows work).
 	if cfg.HasSMTP() {
@@ -2016,7 +2016,7 @@ func main() {
 		})
 
 		log.Printf("signaling server listening on :%s", cfg.Port)
-		log.Printf("database path: %s", cfg.DBPath)
+		log.Printf("pocketbase data dir: %s", cfg.DataDir)
 
 		return se.Next()
 	})
@@ -2054,7 +2054,7 @@ Expected: compiles cleanly. The old Gin-based cmd/server errors should be resolv
 
 Also verify in the running binary that:
 - the server actually listens on `cfg.Port`
-- PocketBase persists data at `cfg.DBPath`
+- PocketBase persists data at `cfg.DataDir`
 - `/_/` is blocked by the reverse proxy configuration, not only by application code
 
 - [ ] **Step 4: Smoke test**

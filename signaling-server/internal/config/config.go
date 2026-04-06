@@ -8,7 +8,7 @@ import (
 type Config struct {
 	Port    string
 	STUNURL string
-	DBPath  string
+	DataDir string
 
 	// TURN configuration
 	TurnHost   string
@@ -26,7 +26,7 @@ func Load() *Config {
 	return &Config{
 		Port:    getEnv("PORT", "8080"),
 		STUNURL: getEnv("STUN_URL", "stun:stun.cloudflare.com:3478"),
-		DBPath:  getEnv("DATABASE_PATH", "./signaling.db"),
+		DataDir: getEnv("DATA_DIR", "./pb_data"),
 
 		TurnHost:   getEnv("TURN_HOST", ""),
 		TurnPort:   getEnv("TURN_PORT", "3478"),
