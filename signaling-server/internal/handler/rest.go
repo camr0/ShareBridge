@@ -10,8 +10,8 @@ import (
 
 // ServeFile returns a handler that serves a single static file.
 func ServeFile(path string) func(*core.RequestEvent) error {
-	return func(e *core.RequestEvent) error {
-		http.ServeFile(e.Response, e.Request, path)
+	return func(requestEvent *core.RequestEvent) error {
+		http.ServeFile(requestEvent.Response, requestEvent.Request, path)
 		return nil
 	}
 }
@@ -23,11 +23,11 @@ type SessionInfoResponse struct {
 }
 
 // GetSessionInfo returns basic public session info by code.
-func GetSessionInfo(app core.App, h *hub.Hub) func(*core.RequestEvent) error {
-	return func(e *core.RequestEvent) error {
-		code := e.Request.PathValue("code")
+func GetSessionInfo(app core.App, sessionHub *hub.Hub) func(*core.RequestEvent) error {
+	return func(requestEvent *core.RequestEvent) error {
+		code := requestEvent.Request.PathValue("code")
 		if code == "" {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": "code required"})
+			return requestEvent.JSON(http.StatusBadRequest, map[string]string{"error": "code required"})
 		}
 
 		records, err := app.FindRecordsByFilter(
@@ -39,31 +39,31 @@ func GetSessionInfo(app core.App, h *hub.Hub) func(*core.RequestEvent) error {
 			map[string]any{"code": code},
 		)
 		if err != nil {
-			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to lookup session"})
+			return requestEvent.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to lookup session"})
 		}
 		if len(records) == 0 {
-			return e.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
+			return requestEvent.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
 		}
 
-		record := records[0]
+		sessionRecord := records[0]
 		var expiresAtPtr *time.Time
 		isActive := true
 
-		expiresAt := record.GetDateTime("expires_at")
+		expiresAt := sessionRecord.GetDateTime("expires_at")
 		if !expiresAt.IsZero() {
-			t := expiresAt.Time()
-			expiresAtPtr = &t
-			if t.Before(time.Now()) {
+			expiresAtTime := expiresAt.Time()
+			expiresAtPtr = &expiresAtTime
+			if expiresAtTime.Before(time.Now()) {
 				isActive = false
 			}
 		}
 
-		if !h.AgentConnected(record.GetString("api_key_id")) {
+		if !sessionHub.AgentConnected(sessionRecord.GetString("api_key_id")) {
 			isActive = false
 		}
 
-		return e.JSON(http.StatusOK, SessionInfoResponse{
-			Code:      record.GetString("code"),
+		return requestEvent.JSON(http.StatusOK, SessionInfoResponse{
+			Code:      sessionRecord.GetString("code"),
 			ExpiresAt: expiresAtPtr,
 			IsActive:  isActive,
 		})

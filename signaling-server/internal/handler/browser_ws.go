@@ -22,9 +22,9 @@ type browserMsg struct {
 	HMAC      string          `json:"hmac,omitempty"`
 }
 
-func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		sessionCode := r.URL.Query().Get("session")
+func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		sessionCode := request.URL.Query().Get("session")
 
 		records, err := app.FindRecordsByFilter(
 			"sessions",
@@ -36,49 +36,49 @@ func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 		)
 		if err != nil {
 			log.Printf("browser_ws: db error looking up session: %v", err)
-			http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+			http.Error(responseWriter, `{"error":"database error"}`, http.StatusInternalServerError)
 			return
 		}
 		if len(records) == 0 {
-			http.Error(w, `{"error":"session not found or expired"}`, http.StatusNotFound)
+			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
-		session := records[0]
+		sessionRecord := records[0]
 
-		expiresAt := session.GetDateTime("expires_at")
+		expiresAt := sessionRecord.GetDateTime("expires_at")
 		if !expiresAt.IsZero() && time.Now().After(expiresAt.Time()) {
-			http.Error(w, `{"error":"session not found or expired"}`, http.StatusNotFound)
+			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
 
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		browserConn, err := websocket.Accept(responseWriter, request, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 		})
 		if err != nil {
 			log.Printf("browser_ws accept: %v", err)
 			return
 		}
-		defer conn.CloseNow()
+		defer browserConn.CloseNow()
 
-		ctx := r.Context()
+		requestCtx := request.Context()
 
-		_, agentOK := h.GetAgentConn(sessionCode)
-		if !agentOK {
-			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
-			conn.Close(websocket.StatusNormalClosure, "agent not connected")
+		_, agentConnected := sessionHub.GetAgentConn(sessionCode)
+		if !agentConnected {
+			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
+			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
 
-		if err := h.PairSession(sessionCode, conn); err != nil {
-			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
-			conn.Close(websocket.StatusNormalClosure, "agent not connected")
+		if err := sessionHub.PairSession(sessionCode, browserConn); err != nil {
+			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
+			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
-		defer h.UnpairSession(sessionCode)
+		defer sessionHub.UnpairSession(sessionCode)
 
 		connID := generateConnID()
-		h.RegisterBrowserConn(connID, conn)
-		defer h.UnregisterBrowserConn(connID)
+		sessionHub.RegisterBrowserConn(connID, browserConn)
+		defer sessionHub.UnregisterBrowserConn(connID)
 
 		log.Printf("browser connected to session %s (conn %s)", sessionCode, connID)
 
@@ -95,15 +95,15 @@ func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 			TurnURL:     cfg.TurnURL(),
 			Credentials: turnCreds,
 		})
-		hub.SendDirect(ctx, conn, map[string]any{
+		hub.SendDirect(requestCtx, browserConn, map[string]any{
 			"type":        "ice_config",
 			"ice_servers": iceServers,
 		})
 
-		apiKeyID := session.GetString("api_key_id")
+		apiKeyID := sessionRecord.GetString("api_key_id")
 
 		for {
-			_, data, err := conn.Read(ctx)
+			_, data, err := browserConn.Read(requestCtx)
 			if err != nil {
 				log.Printf("browser disconnected from session %s (conn %s)", sessionCode, connID)
 				return
@@ -116,14 +116,14 @@ func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 
 			switch msg.Type {
 			case "knock":
-				h.SendToAgent(ctx, apiKeyID, map[string]any{
+				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
 					"type":    "knock",
 					"conn_id": connID,
 					"code":    sessionCode,
 				})
 
 			case "join":
-				h.SendToAgent(ctx, apiKeyID, map[string]any{
+				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
 					"type":    "join",
 					"conn_id": connID,
 					"code":    sessionCode,
@@ -131,7 +131,7 @@ func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 				})
 
 			case "answer":
-				h.ForwardToAgent(ctx, sessionCode, map[string]any{
+				sessionHub.ForwardToAgent(requestCtx, sessionCode, map[string]any{
 					"type":       "answer",
 					"session_id": sessionCode,
 					"peer_id":    connID,
@@ -139,7 +139,7 @@ func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 				})
 
 			case "ice_candidate":
-				h.ForwardToAgent(ctx, sessionCode, map[string]any{
+				sessionHub.ForwardToAgent(requestCtx, sessionCode, map[string]any{
 					"type":       "ice_candidate",
 					"session_id": sessionCode,
 					"peer_id":    connID,
@@ -152,7 +152,7 @@ func BrowserWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 
 // generateConnID returns a random 32-char hex string for use as a connection ID.
 func generateConnID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	randomBytes := make([]byte, 16)
+	rand.Read(randomBytes)
+	return hex.EncodeToString(randomBytes)
 }
