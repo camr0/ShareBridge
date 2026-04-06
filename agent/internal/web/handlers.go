@@ -3,6 +3,7 @@ package web
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
 	"time"
 )
@@ -16,6 +17,7 @@ type pageData struct {
 	GoVersion   string
 	ConfigPath  string
 	Config      configData
+	EnvManaged  envManagedData
 }
 
 // configData holds configuration data for templates.
@@ -27,6 +29,12 @@ type configData struct {
 	DefaultMaxDownloads int
 	DefaultRelayOnly  bool
 	UIPort            int
+}
+
+type envManagedData struct {
+	SignalingURL string
+	APIKey       string
+	AllowedHost  string
 }
 
 // sessionData holds session data for templates.
@@ -114,10 +122,22 @@ func (ws *WebServer) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		Title:      "Settings",
 		ActivePage: "settings",
 		Config:     cfg,
+		EnvManaged: envManagedData{
+			SignalingURL: envVarNameIfSet("SIGNALING_SERVER"),
+			APIKey:       envVarNameIfSet("SHAREBRIDGE_API_KEY"),
+			AllowedHost:  envVarNameIfSet("ALLOWED_SHAREBRIDGE_HOST"),
+		},
 		GoVersion:  runtime.Version(),
 		ConfigPath: configPath,
 	}
 	ws.renderPage(w, "settings.html", data)
+}
+
+func envVarNameIfSet(name string) string {
+	if os.Getenv(name) != "" {
+		return name
+	}
+	return ""
 }
 
 // historyHandler renders the history page.

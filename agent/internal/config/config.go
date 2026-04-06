@@ -72,8 +72,9 @@ func (m *Manager) Save(cfg *Config) error {
 	return m.save()
 }
 
-// load reads config from file and fills empty/zero fields from env vars.
-// File takes precedence over environment variables.
+// load reads config from file and then applies any explicit environment
+// variable overrides on top. This makes one-off local testing and temporary
+// key rotation easy without editing config.json.
 func (m *Manager) load() (*Config, error) {
 	// Set defaults for fields where 0 is a valid value (so file can override with 0)
 	cfg := &Config{
@@ -95,21 +96,29 @@ func (m *Manager) load() (*Config, error) {
 		}
 	}
 
-	// Fill empty/zero fields from env vars (file takes precedence)
+	// Apply explicit env var overrides. If an env var isn't set, keep the file
+	// value and then fall back to defaults where needed.
+	if v := os.Getenv("SIGNALING_SERVER"); v != "" {
+		cfg.SignalingURL = v
+	}
+	if v := os.Getenv("SHAREBRIDGE_API_KEY"); v != "" {
+		cfg.APIKey = v
+	}
+	if v := os.Getenv("ALLOWED_SHAREBRIDGE_HOST"); v != "" {
+		cfg.AllowedHost = v
+	}
+	if v := os.Getenv("UI_PORT"); v != "" {
+		cfg.UIPort = getEnvInt("UI_PORT", cfg.UIPort)
+	}
+	if v := os.Getenv("UI_PASSWORD"); v != "" {
+		cfg.UIPassword = v
+	}
+
 	if cfg.SignalingURL == "" {
-		cfg.SignalingURL = getEnv("SIGNALING_SERVER", "ws://localhost:8080")
-	}
-	if cfg.APIKey == "" {
-		cfg.APIKey = getEnv("SHAREBRIDGE_API_KEY", "")
-	}
-	if cfg.AllowedHost == "" {
-		cfg.AllowedHost = getEnv("ALLOWED_SHAREBRIDGE_HOST", "")
+		cfg.SignalingURL = "ws://localhost:8080"
 	}
 	if cfg.UIPort == 0 {
-		cfg.UIPort = getEnvInt("UI_PORT", 7878)
-	}
-	if cfg.UIPassword == "" {
-		cfg.UIPassword = getEnv("UI_PASSWORD", "")
+		cfg.UIPort = 7878
 	}
 
 	return cfg, nil

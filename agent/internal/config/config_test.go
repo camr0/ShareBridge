@@ -100,7 +100,7 @@ func TestLoad_EnvVarFallback(t *testing.T) {
 	}
 }
 
-func TestLoad_FileTakesPrecedenceOverEnv(t *testing.T) {
+func TestLoad_EnvOverridesFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	homeDir := filepath.Join(tmpDir, "home")
 	configDir := filepath.Join(homeDir, ".sharebridge")
@@ -111,7 +111,7 @@ func TestLoad_FileTakesPrecedenceOverEnv(t *testing.T) {
 	os.Setenv("HOME", homeDir)
 	defer os.Unsetenv("HOME")
 
-	// Set env vars (these should be ignored when file has values)
+	// Set env vars (these should override file values)
 	os.Setenv("SIGNALING_SERVER", "ws://env.example.com")
 	os.Setenv("SHAREBRIDGE_API_KEY", "env-api-key")
 	os.Setenv("UI_PORT", "1111")
@@ -144,21 +144,22 @@ func TestLoad_FileTakesPrecedenceOverEnv(t *testing.T) {
 	}
 
 	cfg := m.Get()
-	// File values should be used
-	if cfg.SignalingURL != "ws://file.example.com:9090" {
-		t.Errorf("SignalingURL = %q, want %q", cfg.SignalingURL, "ws://file.example.com:9090")
+	// Env values should override the file
+	if cfg.SignalingURL != "ws://env.example.com" {
+		t.Errorf("SignalingURL = %q, want %q", cfg.SignalingURL, "ws://env.example.com")
 	}
-	if cfg.APIKey != "file-api-key" {
-		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "file-api-key")
+	if cfg.APIKey != "env-api-key" {
+		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "env-api-key")
 	}
+	// File-only values should still be kept
 	if cfg.DefaultExpiry != 48 {
 		t.Errorf("DefaultExpiry = %d, want 48", cfg.DefaultExpiry)
 	}
 	if cfg.DefaultMaxDownloads != 20 {
 		t.Errorf("DefaultMaxDownloads = %d, want 20", cfg.DefaultMaxDownloads)
 	}
-	if cfg.UIPort != 8888 {
-		t.Errorf("UIPort = %d, want 8888", cfg.UIPort)
+	if cfg.UIPort != 1111 {
+		t.Errorf("UIPort = %d, want 1111", cfg.UIPort)
 	}
 }
 
@@ -202,7 +203,7 @@ func TestLoad_PartialFileWithEnvFill(t *testing.T) {
 	}
 
 	cfg := m.Get()
-	// File values should be used
+	// File values should be used when there is no env override.
 	if cfg.UIPort != 7777 {
 		t.Errorf("UIPort = %d, want 7777", cfg.UIPort)
 	}
@@ -212,7 +213,7 @@ func TestLoad_PartialFileWithEnvFill(t *testing.T) {
 	if cfg.AllowedHost != "file.example.com" {
 		t.Errorf("AllowedHost = %q, want %q", cfg.AllowedHost, "file.example.com")
 	}
-	// Env vars should fill empty fields
+	// Env vars should fill empty fields.
 	if cfg.SignalingURL != "ws://env.example.com" {
 		t.Errorf("SignalingURL = %q, want %q", cfg.SignalingURL, "ws://env.example.com")
 	}
