@@ -19,3 +19,4 @@ pb_data/
 bin/
 dist/
 signaling-server/server
+agent/opencloudshare
