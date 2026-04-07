@@ -40,7 +40,7 @@ type prometheusResponse struct {
 
 // QueryAccountBytes queries Prometheus for the total turn_traffic_sent bytes for an account
 func (c *PrometheusClient) QueryAccountBytes(ctx context.Context, accountID string) (int64, error) {
-	query := fmt.Sprintf(`sum(turn_traffic_sent{account_id="%s"})`, accountID)
+	query := fmt.Sprintf(`sum(turn_traffic_sent{username=~"[0-9]+:%s"})`, accountID)
 
 	u, err := url.Parse(c.baseURL + "/api/v1/query")
 	if err != nil {
