@@ -54,3 +54,48 @@ func TestCreateCollections(t *testing.T) {
 	idx := sessionsCol.GetIndex("idx_sessions_code")
 	require.NotEmpty(t, idx)
 }
+
+func TestMigration3_AddQuotaFields(t *testing.T) {
+	testApp, err := tests.NewTestApp(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { testApp.Cleanup() })
+
+	// Bootstrap the app and run system migrations to create default collections (including users)
+	err = testApp.Bootstrap()
+	require.NoError(t, err)
+	err = testApp.RunSystemMigrations()
+	require.NoError(t, err)
+
+	// Run migrations 1 and 2 first
+	err = migrations.CreateCollections(testApp)
+	require.NoError(t, err)
+	err = migrations.AddAPIKeyTimestamps(testApp)
+	require.NoError(t, err)
+
+	// Run migration 3
+	err = migrations.AddQuotaFields(testApp)
+	require.NoError(t, err)
+
+	// users collection should have quota fields
+	usersCol, err := testApp.FindCollectionByNameOrId("users")
+	require.NoError(t, err)
+	require.NotNil(t, usersCol)
+
+	for _, fieldName := range []string{"relay_quota_gb", "current_period_usage_gb", "quota_period_start", "quota_period_end", "turn_baseline_bytes"} {
+		require.NotNil(t, usersCol.Fields.GetByName(fieldName), "users collection missing field %q", fieldName)
+	}
+
+	// bandwidth_usage collection should exist
+	bwCol, err := testApp.FindCollectionByNameOrId("bandwidth_usage")
+	require.NoError(t, err)
+	require.NotNil(t, bwCol)
+	require.True(t, bwCol.IsBase())
+
+	for _, fieldName := range []string{"account_id", "period_start", "period_end", "bytes_transferred"} {
+		require.NotNil(t, bwCol.Fields.GetByName(fieldName), "bandwidth_usage collection missing field %q", fieldName)
+	}
+
+	// Idempotent: running again should not error
+	err = migrations.AddQuotaFields(testApp)
+	require.NoError(t, err)
+}
