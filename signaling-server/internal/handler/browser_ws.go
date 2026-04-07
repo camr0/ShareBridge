@@ -80,24 +80,41 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 
 		log.Printf("browser connected to session %s (conn %s)", sessionCode, connID)
 
-		// Send ICE config immediately so the browser can set up RTCPeerConnection
-		// while the knock/nonce round-trip happens in parallel.
-		var turnCreds *turn.Credentials
-		if cfg.HasTurn() {
-			turnExpiry := time.Now().Add(24 * time.Hour)
-			// Use account-scoped TURN username to bound Prometheus label cardinality.
-			apiKeyRecord, err := app.FindRecordById("api_keys", sessionRecord.GetString("api_key_id"))
-			if err != nil {
-				http.Error(responseWriter, `{"error":"internal error"}`, http.StatusInternalServerError)
-				return
-			}
-			accountID := apiKeyRecord.GetString("account_id")
-			if accountID == "" {
-				log.Printf("browser_ws: api_key %s has empty account_id", sessionRecord.GetString("api_key_id"))
-				http.Error(responseWriter, `{"error":"internal error"}`, http.StatusInternalServerError)
-				return
-			}
+		// Look up the API key to get the account for quota checking
+		apiKeyID := sessionRecord.GetString("api_key_id")
+		apiKeyRecord, err := app.FindRecordById("api_keys", apiKeyID)
+		if err != nil {
+			log.Printf("browser_ws: error looking up api_key %s: %v", apiKeyID, err)
+			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
+			browserConn.Close(websocket.StatusInternalError, "internal error")
+			return
+		}
 
+		accountID := apiKeyRecord.GetString("account_id")
+		if accountID == "" {
+			log.Printf("browser_ws: api_key %s has empty account_id", apiKeyID)
+			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
+			browserConn.Close(websocket.StatusInternalError, "internal error")
+			return
+		}
+
+		// Look up the account for quota checking
+		accountRecord, err := app.FindRecordById("users", accountID)
+		if err != nil {
+			log.Printf("browser_ws: error looking up account %s: %v", accountID, err)
+			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
+			browserConn.Close(websocket.StatusInternalError, "internal error")
+			return
+		}
+
+		// Check quota
+		quotaExceeded, periodEnd := checkRelayQuota(accountRecord)
+
+		// Send ICE config - only include TURN if quota not exceeded
+		// Use account-scoped TURN username to bound Prometheus label cardinality.
+		var turnCreds *turn.Credentials
+		if cfg.HasTurn() && !quotaExceeded {
+			turnExpiry := time.Now().Add(24 * time.Hour)
 			generatedCreds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
 			turnCreds = &generatedCreds
 		}
@@ -106,12 +123,21 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			TurnURL:     cfg.TurnURL(),
 			Credentials: turnCreds,
 		})
-		hub.SendDirect(requestCtx, browserConn, map[string]any{
-			"type":        "ice_config",
-			"ice_servers": iceServers,
-		})
 
-		apiKeyID := sessionRecord.GetString("api_key_id")
+		if quotaExceeded {
+			hub.SendDirect(requestCtx, browserConn, map[string]any{
+				"type":                "ice_config",
+				"ice_servers":         iceServers,
+				"relay_quota_exceeded": true,
+				"quota_period_end":    periodEnd.Format(time.RFC3339),
+			})
+		} else {
+			hub.SendDirect(requestCtx, browserConn, map[string]any{
+				"type":        "ice_config",
+				"ice_servers": iceServers,
+			})
+		}
+
 
 		for {
 			_, data, err := browserConn.Read(requestCtx)
@@ -161,7 +187,14 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 	}
 }
 
-// generateConnID returns a random 32-char hex string for use as a connection ID.
+// checkRelayQuota checks if the account has exceeded their relay quota.
+// Returns (exceeded, periodEnd) where exceeded is true if usage >= limit.
+func checkRelayQuota(accountRecord *core.Record) (bool, time.Time) {
+	limitGB := accountRecord.GetFloat("relay_quota_gb")
+	usedGB := accountRecord.GetFloat("current_period_usage_gb")
+	periodEnd := accountRecord.GetDateTime("quota_period_end").Time()
+	return usedGB >= limitGB, periodEnd
+}
 func generateConnID() string {
 	randomBytes := make([]byte, 16)
 	rand.Read(randomBytes)

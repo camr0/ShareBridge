@@ -42,6 +42,12 @@ function join() {
       case 'ice_config':
         pc = new RTCPeerConnection({ iceServers: msg.ice_servers });
 
+        // Show quota exceeded warning if relay is unavailable
+        if (msg.relay_quota_exceeded) {
+          const periodEnd = msg.quota_period_end ? new Date(msg.quota_period_end).toLocaleDateString() : 'soon';
+          status(`Relay quota exceeded. Direct connection only. Quota resets ${periodEnd}.`);
+        }
+
         pc.onicecandidate = (e) => {
           if (e.candidate) {
             ws.send(JSON.stringify({
