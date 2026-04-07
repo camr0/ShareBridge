@@ -85,8 +85,21 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 		var turnCreds *turn.Credentials
 		if cfg.HasTurn() {
 			turnExpiry := time.Now().Add(24 * time.Hour)
-			creds := turn.GenerateCredentials(cfg.TurnSecret, sessionCode, turnExpiry)
-			turnCreds = &creds
+			// Use account-scoped TURN username to bound Prometheus label cardinality.
+			apiKeyRecord, err := app.FindRecordById("api_keys", sessionRecord.GetString("api_key_id"))
+			if err != nil {
+				http.Error(responseWriter, `{"error":"internal error"}`, http.StatusInternalServerError)
+				return
+			}
+			accountID := apiKeyRecord.GetString("account_id")
+			if accountID == "" {
+				log.Printf("browser_ws: api_key %s has empty account_id", sessionRecord.GetString("api_key_id"))
+				http.Error(responseWriter, `{"error":"internal error"}`, http.StatusInternalServerError)
+				return
+			}
+
+			generatedCreds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
+			turnCreds = &generatedCreds
 		}
 		iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
 			STUNURL:     cfg.STUNURL,

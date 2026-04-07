@@ -13,10 +13,10 @@ type Credentials struct {
 	Credential string `json:"credential"`
 }
 
-// GenerateCredentials creates HMAC-based TURN credentials for a session.
-// The username format is {timestamp}:{sessionID} and the credential is HMAC-SHA1 of the username.
-func GenerateCredentials(secret, sessionID string, expiry time.Time) Credentials {
-	username := fmt.Sprintf("%d:%s", expiry.Unix(), sessionID)
+// GenerateCredentials creates HMAC-based TURN credentials.
+// The username format is {timestamp}:{accountID} and the credential is HMAC-SHA1 of the username.
+func GenerateCredentials(secret, accountID string, expiry time.Time) Credentials {
+	username := fmt.Sprintf("%d:%s", expiry.Unix(), accountID)
 
 	mac := hmac.New(sha1.New, []byte(secret))
 	mac.Write([]byte(username))

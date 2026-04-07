@@ -10,12 +10,12 @@ import (
 
 func TestGenerateCredentials(t *testing.T) {
 	secret := "test-secret"
-	sessionID := "abc123"
+	accountID := "abc123"
 	expiry := time.Unix(1700000000, 0)
 
-	creds := GenerateCredentials(secret, sessionID, expiry)
+	creds := GenerateCredentials(secret, accountID, expiry)
 
-	// Username should be timestamp:sessionID
+	// Username should be timestamp:accountID
 	expectedUsername := "1700000000:abc123"
 	if creds.Username != expectedUsername {
 		t.Errorf("username = %q, want %q", creds.Username, expectedUsername)
@@ -31,8 +31,8 @@ func TestGenerateCredentials(t *testing.T) {
 }
 
 func TestGenerateCredentials_DifferentSecrets(t *testing.T) {
-	creds1 := GenerateCredentials("secret1", "abc", time.Now())
-	creds2 := GenerateCredentials("secret2", "abc", time.Now())
+	creds1 := GenerateCredentials("secret1", "account_abc", time.Now())
+	creds2 := GenerateCredentials("secret2", "account_abc", time.Now())
 
 	if creds1.Credential == creds2.Credential {
 		t.Error("different secrets should produce different credentials")
