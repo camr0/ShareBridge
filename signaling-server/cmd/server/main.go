@@ -94,6 +94,17 @@ func main() {
 			}
 		})
 
+		// Initialize quota fields when a new user registers.
+		app.OnRecordCreate("users").BindFunc(func(e *core.RecordEvent) error {
+			now := time.Now().UTC()
+			e.Record.Set("relay_quota_gb", cfg.DefaultQuotaGB)
+			e.Record.Set("current_period_usage_gb", 0.0)
+			e.Record.Set("quota_period_start", now)
+			e.Record.Set("quota_period_end", now.Add(30*24*time.Hour))
+			e.Record.Set("turn_baseline_bytes", 0.0)
+			return e.Next()
+		})
+
 		log.Printf("signaling server listening on :%s", cfg.Port)
 		log.Printf("pocketbase data dir: %s", cfg.DataDir)
 
