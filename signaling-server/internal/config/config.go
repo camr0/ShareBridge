@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -20,6 +22,11 @@ type Config struct {
 	SMTPPort     string
 	SMTPUser     string
 	SMTPPassword string
+
+	// Bandwidth quota — always enforced when TURN is configured (requires Prometheus)
+	DefaultQuotaGB     float64
+	PrometheusURL      string
+	QuotaCheckInterval time.Duration
 }
 
 func Load() *Config {
@@ -36,12 +43,36 @@ func Load() *Config {
 		SMTPPort:     getEnv("SMTP_PORT", "587"),
 		SMTPUser:     getEnv("SMTP_USER", ""),
 		SMTPPassword: getEnv("SMTP_PASSWORD", ""),
+
+		DefaultQuotaGB:     getEnvFloat("DEFAULT_QUOTA_GB", 50.0),
+		PrometheusURL:      getEnv("PROMETHEUS_URL", "http://prometheus:9090"),
+		QuotaCheckInterval: getEnvDuration("QUOTA_CHECK_INTERVAL", 5*time.Minute),
 	}
 }
 
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getEnvFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+func getEnvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
 	}
 	return def
 }
