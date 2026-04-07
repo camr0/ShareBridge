@@ -13,9 +13,9 @@ services:
       - SMTP_PASSWORD=${SMTP_PASSWORD}
       - TURN_PORT=3478
       - TURN_SECRET=${TURN_SECRET}
-      - DEFAULT_QUOTA_GB=${DEFAULT_QUOTA_GB:-100}
+      - DEFAULT_QUOTA_GB=${DEFAULT_QUOTA_GB:-50}
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
-      - QUOTA_CHECK_INTERVAL=${QUOTA_CHECK_INTERVAL:-60m}
+      - QUOTA_CHECK_INTERVAL=${QUOTA_CHECK_INTERVAL:-5m}
     volumes:
       - sharebridge-data:/data
     depends_on:

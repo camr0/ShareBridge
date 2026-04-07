@@ -24,7 +24,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 		expectedLimit  float64
 		expectedUsed   float64
 		expectedRemain float64
-		expectedPct    float64
+		expectedPct    int
 	}{
 		{
 			name:           "zero usage",
@@ -35,7 +35,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 			expectedLimit:  100.0,
 			expectedUsed:   0.0,
 			expectedRemain: 100.0,
-			expectedPct:    0.0,
+			expectedPct:    0,
 		},
 		{
 			name:           "50% usage",
@@ -46,7 +46,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 			expectedLimit:  100.0,
 			expectedUsed:   50.0,
 			expectedRemain: 50.0,
-			expectedPct:    50.0,
+			expectedPct:    50,
 		},
 		{
 			name:           "100% usage (at limit)",
@@ -57,7 +57,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 			expectedLimit:  100.0,
 			expectedUsed:   100.0,
 			expectedRemain: 0.0,
-			expectedPct:    100.0,
+			expectedPct:    100,
 		},
 		{
 			name:           "exceeded limit",
@@ -68,7 +68,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 			expectedLimit:  100.0,
 			expectedUsed:   150.0,
 			expectedRemain: 0.0,
-			expectedPct:    100.0,
+			expectedPct:    100,
 		},
 		{
 			name:           "unlimited quota (zero limit)",
@@ -79,7 +79,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 			expectedLimit:  0.0,
 			expectedUsed:   50.0,
 			expectedRemain: 0.0,
-			expectedPct:    0.0,
+			expectedPct:    0,
 		},
 		{
 			name:           "fractional usage",
@@ -90,7 +90,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 			expectedLimit:  10.0,
 			expectedUsed:   3.14159,
 			expectedRemain: 6.85841,
-			expectedPct:    31.42,
+			expectedPct:    31,
 		},
 	}
 
@@ -101,7 +101,7 @@ func TestBuildQuotaResponse(t *testing.T) {
 			require.InDelta(t, tt.expectedLimit, result.LimitGB, 0.001)
 			require.InDelta(t, tt.expectedUsed, result.UsedGB, 0.001)
 			require.InDelta(t, tt.expectedRemain, result.RemainingGB, 0.001)
-			require.InDelta(t, tt.expectedPct, result.PercentageUsed, 0.01)
+			require.Equal(t, tt.expectedPct, result.PercentageUsed)
 			require.WithinDuration(t, tt.periodStart, result.PeriodStart, time.Second)
 			require.WithinDuration(t, tt.periodEnd, result.PeriodEnd, time.Second)
 		})
@@ -210,7 +210,7 @@ func TestGetAccountQuota(t *testing.T) {
 	require.InDelta(t, 100.0, response.LimitGB, 0.001)
 	require.InDelta(t, 25.0, response.UsedGB, 0.001)
 	require.InDelta(t, 75.0, response.RemainingGB, 0.001)
-	require.InDelta(t, 25.0, response.PercentageUsed, 0.01)
+	require.Equal(t, 25, response.PercentageUsed)
 
 	// Verify API key was tracked
 	_ = apiKey

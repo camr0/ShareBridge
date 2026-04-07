@@ -797,11 +797,20 @@
     function renderQuota(account) {
       const container = document.getElementById('quota-container');
 
-      const bandwidthUsed = account.bandwidth_used_gb || 0;
-      const bandwidthLimit = account.bandwidth_limit_gb || 0;
-      const percentage = bandwidthLimit > 0 ? (bandwidthUsed / bandwidthLimit) * 100 : 0;
-      const daysRemaining = account.days_remaining || 0;
-      const periodEnd = account.period_end ? formatDate(account.period_end) : 'Unknown';
+      const quota = account.quota || {};
+      const bandwidthUsed = quota.used_gb || 0;
+      const bandwidthLimit = quota.limit_gb || 0;
+      const percentage = quota.percentage_used || 0;
+      const periodEnd = quota.period_end ? formatDate(quota.period_end) : 'Unknown';
+
+      // Calculate days remaining
+      let daysRemaining = 0;
+      if (quota.period_end) {
+        const endDate = new Date(quota.period_end);
+        const now = new Date();
+        const diffMs = endDate - now;
+        daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
+      }
 
       // Determine color class based on percentage
       let fillClass = '';
@@ -811,7 +820,7 @@
         fillClass = 'warning';
       }
 
-      const percentageText = bandwidthLimit > 0 ? `${percentage.toFixed(1)}%` : 'N/A';
+      const percentageText = bandwidthLimit > 0 ? `${Math.round(percentage)}%` : 'N/A';
 
       container.innerHTML = `
         <div class="quota-bar-track">

@@ -76,25 +76,37 @@ func (p *Poller) run() {
 
 // poll fetches bandwidth metrics for all accounts and updates their quota usage.
 func (p *Poller) poll() error {
-	// Fetch all users with quota fields
-	records, err := p.app.FindRecordsByFilter(
-		"users",
-		"relay_quota_gb != null",
-		"",
-		500,
-		0,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to fetch users: %w", err)
-	}
+	// Fetch all users with quota fields using pagination
+	offset := 0
+	const batchSize = 500
 
-	now := time.Now().UTC()
-
-	for _, record := range records {
-		if err := p.updateAccountQuota(record, now); err != nil {
-			log.Printf("quota poller: failed to update account %s: %v", record.Id, err)
-			// Continue with other accounts
+	for {
+		records, err := p.app.FindRecordsByFilter(
+			"users",
+			"relay_quota_gb != null",
+			"",
+			batchSize,
+			offset,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to fetch users: %w", err)
 		}
+
+		now := time.Now().UTC()
+
+		for _, record := range records {
+			if err := p.updateAccountQuota(record, now); err != nil {
+				log.Printf("quota poller: failed to update account %s: %v", record.Id, err)
+				// Continue with other accounts
+			}
+		}
+
+		// If we got fewer records than batch size, we've processed all users
+		if len(records) < batchSize {
+			break
+		}
+
+		offset += batchSize
 	}
 
 	return nil
@@ -130,10 +142,16 @@ func (p *Poller) updateAccountQuota(record *core.Record, now time.Time) error {
 	}
 
 	// Calculate net usage (current total minus baseline at period start)
+	// When Coturn restarts, Prometheus counters reset to 0, so totalBytes
+	// may be less than baselineBytes. We use the "virtual negative baseline"
+	// approach: update baseline to current total (resetting net to 0) so that
+	// quota consumption before the restart is preserved.
 	baselineBytes := record.GetFloat("turn_baseline_bytes")
 	netBytes := totalBytes - int64(baselineBytes)
 	if netBytes < 0 {
+		// Coturn restart detected - update baseline to current total
 		netBytes = 0
+		record.Set("turn_baseline_bytes", float64(totalBytes))
 	}
 
 	// Convert to GB

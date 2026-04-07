@@ -133,11 +133,13 @@ func main() {
 		log.Printf("signaling server listening on :%s", cfg.Port)
 		log.Printf("pocketbase data dir: %s", cfg.DataDir)
 
-		// Initialize and start the quota poller (metrics client connects to Prometheus)
-		metricsClient := metrics.NewPrometheusClient(cfg.PrometheusURL)
-		quotaPoller := quota.NewPoller(app, metricsClient, cfg)
-		quotaPoller.Start()
-		log.Printf("quota poller started with interval: %v", cfg.QuotaCheckInterval)
+		// Initialize and start the quota poller only when TURN is configured
+		if cfg.HasTurn() {
+			metricsClient := metrics.NewPrometheusClient(cfg.PrometheusURL)
+			quotaPoller := quota.NewPoller(app, metricsClient, cfg)
+			quotaPoller.Start()
+			log.Printf("quota poller started with interval: %v", cfg.QuotaCheckInterval)
+		}
 
 		return se.Next()
 	})

@@ -15,7 +15,7 @@ type QuotaInfo struct {
 	RemainingGB    float64   `json:"remaining_gb"`
 	PeriodStart    time.Time `json:"period_start"`
 	PeriodEnd      time.Time `json:"period_end"`
-	PercentageUsed float64   `json:"percentage_used"`
+	PercentageUsed int       `json:"percentage_used"`
 }
 
 // AccountResponse represents account information for the dashboard
@@ -55,11 +55,11 @@ func buildQuotaResponse(limitGB, usedGB float64, periodStart, periodEnd time.Tim
 		remainingGB = 0
 	}
 
-	percentageUsed := 0.0
+	percentageUsed := 0
 	if limitGB > 0 {
-		percentageUsed = (usedGB / limitGB) * 100.0
-		if percentageUsed > 100.0 {
-			percentageUsed = 100.0
+		percentageUsed = int((usedGB / limitGB) * 100.0)
+		if percentageUsed > 100 {
+			percentageUsed = 100
 		}
 	}
 

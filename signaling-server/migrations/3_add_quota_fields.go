@@ -2,6 +2,7 @@ package migrations
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/pocketbase/pocketbase/core"
 	m "github.com/pocketbase/pocketbase/migrations"
@@ -18,6 +19,10 @@ func AddQuotaFields(app core.App) error {
 		return err
 	}
 	if err := createBandwidthUsageCollection(app); err != nil {
+		return err
+	}
+	// Backfill existing users with default quota values
+	if err := backfillExistingUsers(app); err != nil {
 		return err
 	}
 	return nil
@@ -135,6 +140,42 @@ func createBandwidthUsageCollection(app core.App) error {
 
 	if err := app.Save(bwCol); err != nil {
 		return fmt.Errorf("failed to save bandwidth_usage collection: %w", err)
+	}
+
+	return nil
+}
+
+// backfillExistingUsers sets default quota values for existing users
+// who don't have quota fields set (upgrades from 10a).
+func backfillExistingUsers(app core.App) error {
+	// Find users without relay_quota_gb set
+	records, err := app.FindRecordsByFilter(
+		"users",
+		"relay_quota_gb = null || relay_quota_gb = 0",
+		"",
+		500,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to fetch users for backfill: %w", err)
+	}
+
+	now := time.Now().UTC()
+	periodEnd := now.Add(30 * 24 * time.Hour)
+
+	for _, record := range records {
+		// Only backfill if relay_quota_gb is not set or is 0
+		if record.GetFloat("relay_quota_gb") == 0 {
+			record.Set("relay_quota_gb", 50.0) // Default 50GB
+			record.Set("current_period_usage_gb", 0.0)
+			record.Set("quota_period_start", now)
+			record.Set("quota_period_end", periodEnd)
+			record.Set("turn_baseline_bytes", 0.0)
+
+			if err := app.Save(record); err != nil {
+				return fmt.Errorf("failed to backfill user %s: %w", record.Id, err)
+			}
+		}
 	}
 
 	return nil
