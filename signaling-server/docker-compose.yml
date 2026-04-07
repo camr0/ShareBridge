@@ -13,10 +13,14 @@ services:
       - SMTP_PASSWORD=${SMTP_PASSWORD}
       - TURN_PORT=3478
       - TURN_SECRET=${TURN_SECRET}
+      - DEFAULT_QUOTA_GB=${DEFAULT_QUOTA_GB:-100}
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
+      - QUOTA_CHECK_INTERVAL=${QUOTA_CHECK_INTERVAL:-60m}
     volumes:
       - sharebridge-data:/data
     depends_on:
       - coturn
+      - prometheus
 
   coturn:
     image: coturn/coturn:latest
@@ -29,7 +33,31 @@ services:
       --realm=sharebridge
       --use-auth-secret
       --static-auth-secret=${TURN_SECRET}
+      --prometheus
+      --prometheus-port=9641
+      --prometheus-username-labels
+      --denied-peer-ip=127.0.0.0-127.255.255.255
+      --denied-peer-ip=10.0.0.0-10.255.255.255
+      --denied-peer-ip=172.16.0.0-172.31.255.255
+      --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=169.254.0.0-169.254.255.255
+      --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=35d'
+      - '--storage.tsdb.path=/prometheus'
     restart: unless-stopped
 
 volumes:
   sharebridge-data:
+  prometheus-data:
