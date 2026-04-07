@@ -256,7 +256,7 @@ func TestPoller_ArchiveOnReset(t *testing.T) {
 
 	archived := bwRecords[0]
 	require.Equal(t, user.Id, archived.GetString("account_id"))
-	require.InDelta(t, int64(1.5*1024*1024*1024), archived.GetInt("bytes_transferred"), 1000000)
+	require.InDelta(t, int64(1.5*1e9), archived.GetInt("bytes_transferred"), 1000000)
 }
 
 func TestPoller_StartStop(t *testing.T) {
@@ -322,4 +322,60 @@ func TestPoller_MultipleAccounts(t *testing.T) {
 	usage2 := updatedUser2.GetFloat("current_period_usage_gb")
 	require.Greater(t, usage2, 0.4)
 	require.Less(t, usage2, 0.6)
+}
+
+func TestPoller_CoturnRestart_PreservesPreRestartUsage(t *testing.T) {
+	// Scenario: Coturn restarted mid-period.
+	//   - turn_baseline_bytes = 10 GB  (set at last period reset — traffic before this period)
+	//   - current_period_usage_gb = 5 GB  (accumulated during current period before restart)
+	//   - Prometheus counter after restart = 3 GB  (counter reset to 0, then 3 GB of new traffic)
+	//
+	// Detection: totalBytes (3 GB) < baselineBytes (10 GB) → restart
+	//
+	// Fix: virtual negative baseline
+	//   newBaseline = totalBytes - preRestartBytes = 3 GB - 5 GB = -2 GB
+	//   netBytes    = totalBytes - newBaseline     = 3 GB - (-2 GB) = 5 GB  ← preserved ✓
+	//
+	// On subsequent polls (e.g., totalBytes = 4 GB):
+	//   netBytes = 4 GB - (-2 GB) = 6 GB  ← 5 GB pre-restart + 1 GB post-restart ✓
+	mockPrometheus := createMockPrometheusServerWithValue(3_000_000_000) // 3 GB post-restart
+	defer mockPrometheus.Close()
+
+	testApp := setupTestApp(t)
+
+	usersCol, err := testApp.FindCollectionByNameOrId("users")
+	require.NoError(t, err)
+
+	user := core.NewRecord(usersCol)
+	user.Set("email", fmt.Sprintf("test%d@example.com", time.Now().UnixNano()))
+	user.Set("password", "testpassword123")
+	user.Set("relay_quota_gb", 50.0)
+	user.Set("current_period_usage_gb", 5.0)
+	user.Set("quota_period_start", types.NowDateTime().Add(-15*24*time.Hour))
+	user.Set("quota_period_end", types.NowDateTime().Add(15*24*time.Hour))
+	user.Set("turn_baseline_bytes", 10_000_000_000.0) // 10 GB baseline from last period reset
+
+	err = testApp.Save(user)
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		DefaultQuotaGB:     50.0,
+		QuotaCheckInterval: 1 * time.Minute,
+	}
+	metricsClient := metrics.NewPrometheusClient(mockPrometheus.URL)
+	poller := NewPoller(testApp, metricsClient, cfg)
+
+	err = poller.poll()
+	require.NoError(t, err)
+
+	updated, err := testApp.FindRecordById("users", user.Id)
+	require.NoError(t, err)
+
+	// Usage must remain ~5 GB — pre-restart traffic is preserved, not lost.
+	usage := updated.GetFloat("current_period_usage_gb")
+	require.InDelta(t, 5.0, usage, 0.01, "pre-restart usage should be preserved")
+
+	// Baseline should be negative: 3 GB - 5 GB = -2 GB
+	baseline := updated.GetFloat("turn_baseline_bytes")
+	require.InDelta(t, -2_000_000_000.0, baseline, 1000.0, "baseline should be virtual negative to encode pre-restart offset")
 }

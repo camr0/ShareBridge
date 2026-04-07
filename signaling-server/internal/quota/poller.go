@@ -141,21 +141,39 @@ func (p *Poller) updateAccountQuota(record *core.Record, now time.Time) error {
 		return fmt.Errorf("failed to query prometheus: %w", err)
 	}
 
-	// Calculate net usage (current total minus baseline at period start)
-	// When Coturn restarts, Prometheus counters reset to 0, so totalBytes
-	// may be less than baselineBytes. We use the "virtual negative baseline"
-	// approach: update baseline to current total (resetting net to 0) so that
-	// quota consumption before the restart is preserved.
-	baselineBytes := record.GetFloat("turn_baseline_bytes")
-	netBytes := totalBytes - int64(baselineBytes)
-	if netBytes < 0 {
-		// Coturn restart detected - update baseline to current total
-		netBytes = 0
-		record.Set("turn_baseline_bytes", float64(totalBytes))
+	// Calculate net usage (current total minus baseline at period start).
+	//
+	// When Coturn restarts, its Prometheus counter resets to 0 and starts
+	// climbing again. The DB baseline is from before the restart, so it is now
+	// larger than totalBytes (totalBytes < baselineBytes).
+	//
+	// Fix: set baseline to a negative number that encodes the pre-restart usage
+	// as a permanent offset. Because subtracting a negative adds:
+	//
+	//   usageGB = (totalBytes - baseline) / 1e9
+	//
+	// Setting baseline = totalBytes - preRestartBytes (negative when
+	// preRestartBytes > totalBytes) means:
+	//
+	//   usageGB = (totalBytes - (totalBytes - preRestartBytes)) / 1e9
+	//           = preRestartBytes / 1e9   ← pre-restart usage preserved ✓
+	//
+	// Every subsequent poll uses the same formula with no special cases —
+	// the negative baseline keeps adding the pre-restart offset automatically.
+	//
+	// Example: 10 GB used before restart, counter resets to 3 GB
+	//   baseline = 3 GB - 10 GB = -7 GB
+	//   next poll at 5 GB: (5 GB - (-7 GB)) / 1e9 = 12 GB ✓
+	baselineBytes := int64(record.GetFloat("turn_baseline_bytes"))
+	if totalBytes < baselineBytes {
+		preRestartBytes := int64(record.GetFloat("current_period_usage_gb") * 1e9)
+		baselineBytes = totalBytes - preRestartBytes
+		record.Set("turn_baseline_bytes", float64(baselineBytes))
 	}
+	netBytes := totalBytes - baselineBytes
 
 	// Convert to GB
-	netGB := float64(netBytes) / (1024 * 1024 * 1024)
+	netGB := float64(netBytes) / 1e9
 
 	// Update current period usage
 	record.Set("current_period_usage_gb", netGB)
@@ -177,7 +195,7 @@ func (p *Poller) resetQuotaPeriod(record *core.Record, now time.Time) error {
 	// Only archive if we have valid period data
 	if !periodStart.IsZero() && !periodEnd.IsZero() {
 		// Convert GB to bytes for archival
-		bytesTransferred := int64(currentUsage * 1024 * 1024 * 1024)
+		bytesTransferred := int64(currentUsage * 1e9)
 
 		// Create bandwidth_usage record
 		bwCol, err := p.app.FindCollectionByNameOrId("bandwidth_usage")
