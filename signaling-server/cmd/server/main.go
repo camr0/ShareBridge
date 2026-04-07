@@ -89,6 +89,29 @@ func main() {
 		apiKeys.POST("/{id}/rotate", handler.RotateAPIKey(app, h))
 		apiKeys.DELETE("/{id}", handler.RevokeAPIKey(app, h))
 
+		// Account endpoints
+		// GET /api/account - JWT auth for browser account dashboard
+		accountGroup := router.Group("/api/account")
+		accountGroup.Bind(apis.RequireAuth())
+		accountGroup.GET("", handler.GetAccount(app))
+
+		// GET /api/account/quota - API key auth for agent to fetch quota info
+		router.GET("/api/account/quota", func(e *core.RequestEvent) error {
+			authMiddleware := middleware.APIKeyAuth(app)
+			handlerFunc := handler.GetAccountQuota(app)
+			authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestEvent := new(core.RequestEvent)
+				requestEvent.App = app
+				requestEvent.Request = r
+				requestEvent.Response = w
+				err := handlerFunc(requestEvent)
+				if err != nil {
+					_ = err
+				}
+			})).ServeHTTP(e.Response, e.Request)
+			return nil
+		})
+
 		// Cron: clean up expired sessions every 5 minutes
 		app.Cron().MustAdd("expiry_cleanup", "*/5 * * * *", func() {
 			if err := deleteExpiredSessions(app); err != nil {
