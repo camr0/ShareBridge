@@ -1,11 +1,11 @@
 package handler
 
 import (
-	"context"
 	"net/http"
 	"time"
 
 	"github.com/pocketbase/pocketbase/core"
+	"sharebridge/server/internal/middleware"
 )
 
 // QuotaInfo represents quota information for an account
@@ -23,28 +23,6 @@ type AccountResponse struct {
 	ID    string    `json:"id"`
 	Email string    `json:"email"`
 	Quota QuotaInfo `json:"quota"`
-}
-
-// contextKey is a private type for context keys to avoid collisions
-type accountContextKey string
-
-const (
-	accountIDContextKey accountContextKey = "account_id"
-)
-
-// withAccountID returns a new context with the account ID.
-// This mirrors the same function in middleware package for test compatibility.
-func withAccountID(ctx context.Context, accountID string) context.Context {
-	return context.WithValue(ctx, accountIDContextKey, accountID)
-}
-
-// getAccountID retrieves the account ID from the request context.
-// Returns empty string if not found.
-func getAccountID(ctx context.Context) string {
-	if id, ok := ctx.Value(accountIDContextKey).(string); ok {
-		return id
-	}
-	return ""
 }
 
 // buildQuotaResponse constructs a QuotaInfo from raw quota data.
@@ -115,7 +93,7 @@ func GetAccount(app core.App) func(*core.RequestEvent) error {
 func GetAccountQuota(app core.App) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		// Extract account_id from context (set by APIKeyAuth middleware)
-		accountID := getAccountID(e.Request.Context())
+		accountID := middleware.GetAccountID(e.Request.Context())
 		if accountID == "" {
 			return e.JSON(http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 		}

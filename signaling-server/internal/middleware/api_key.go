@@ -70,7 +70,7 @@ func APIKeyAuth(app core.App) func(http.Handler) http.Handler {
 			// Store api_key_id and account_id in request context
 			ctx := r.Context()
 			ctx = withAPIKeyID(ctx, record.Id)
-			ctx = withAccountID(ctx, accountID)
+			ctx = WithAccountID(ctx, accountID)
 
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -100,8 +100,8 @@ func withAPIKeyID(ctx context.Context, apiKeyID string) context.Context {
 	return context.WithValue(ctx, apiKeyIDContextKey, apiKeyID)
 }
 
-// withAccountID returns a new context with the account ID.
-func withAccountID(ctx context.Context, accountID string) context.Context {
+// WithAccountID returns a new context with the account ID.
+func WithAccountID(ctx context.Context, accountID string) context.Context {
 	return context.WithValue(ctx, accountIDContextKey, accountID)
 }
 

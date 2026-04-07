@@ -9,6 +9,7 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/stretchr/testify/require"
+	"sharebridge/server/internal/middleware"
 )
 
 func TestBuildQuotaResponse(t *testing.T) {
@@ -197,7 +198,7 @@ func TestGetAccountQuota(t *testing.T) {
 
 	// Simulate API key auth by setting account_id in context
 	ctx := request.Context()
-	ctx = withAccountID(ctx, user.Id)
+	ctx = middleware.WithAccountID(ctx, user.Id)
 	requestEvent.Request = request.WithContext(ctx)
 
 	err = GetAccountQuota(app)(requestEvent)
@@ -248,7 +249,7 @@ func TestGetAccountQuota_UserNotFound(t *testing.T) {
 
 	// Set non-existent account_id
 	ctx := request.Context()
-	ctx = withAccountID(ctx, "non-existent-user-id")
+	ctx = middleware.WithAccountID(ctx, "non-existent-user-id")
 	requestEvent.Request = request.WithContext(ctx)
 
 	err := GetAccountQuota(app)(requestEvent)
