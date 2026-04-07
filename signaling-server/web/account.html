@@ -222,6 +222,50 @@
 
     .hidden { display: none; }
 
+    /* Quota styles */
+    .quota-bar-track {
+      width: 100%;
+      height: 12px;
+      background: #1e1e2e;
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 16px 0;
+    }
+    .quota-bar-fill {
+      height: 100%;
+      background: #a6e3a1;
+      border-radius: 6px;
+      transition: width 0.3s ease, background 0.3s ease;
+    }
+    .quota-bar-fill.warning {
+      background: #fab387;
+    }
+    .quota-bar-fill.danger {
+      background: #f38ba8;
+    }
+    .quota-stats {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.9rem;
+      color: #cdd6f4;
+    }
+    .quota-stats .usage {
+      font-weight: 500;
+    }
+    .quota-stats .percentage {
+      font-weight: 600;
+    }
+    .quota-reset {
+      font-size: 0.85rem;
+      color: #6c7086;
+      margin-top: 8px;
+    }
+    .quota-error {
+      color: #f38ba8;
+      font-size: 0.9rem;
+    }
+
     /* Confirmation dialog */
     .confirm-text {
       margin-bottom: 16px;
@@ -243,6 +287,17 @@
 
   <h1>Account</h1>
   <p class="subtitle">Manage your API keys for agent authentication</p>
+
+  <div class="section" id="quota-section">
+    <div class="section-header">
+      <span class="section-title">Bandwidth Quota</span>
+    </div>
+    <div id="quota-container">
+      <div class="empty-state">
+        <p>Loading quota...</p>
+      </div>
+    </div>
+  </div>
 
   <div class="section">
     <div class="section-header">
@@ -707,7 +762,70 @@
     });
 
     // Load keys on page load
-    document.addEventListener('DOMContentLoaded', loadKeys);
+    document.addEventListener('DOMContentLoaded', () => {
+      loadKeys();
+      loadQuota();
+    });
+
+    // Load quota information
+    async function loadQuota() {
+      if (!checkAuth()) return;
+
+      const container = document.getElementById('quota-container');
+      container.innerHTML = '<div class="empty-state"><p>Loading quota...</p></div>';
+
+      try {
+        const response = await apiRequest('/account');
+        if (!response) return;
+
+        if (!response.ok) {
+          throw new Error('Failed to load quota');
+        }
+
+        const account = await response.json();
+        renderQuota(account);
+      } catch (error) {
+        container.innerHTML = `
+          <div class="quota-error">
+            Error loading quota: ${escapeHtml(error.message)}
+          </div>
+        `;
+      }
+    }
+
+    // Render quota progress bar
+    function renderQuota(account) {
+      const container = document.getElementById('quota-container');
+
+      const bandwidthUsed = account.bandwidth_used_gb || 0;
+      const bandwidthLimit = account.bandwidth_limit_gb || 0;
+      const percentage = bandwidthLimit > 0 ? (bandwidthUsed / bandwidthLimit) * 100 : 0;
+      const daysRemaining = account.days_remaining || 0;
+      const periodEnd = account.period_end ? formatDate(account.period_end) : 'Unknown';
+
+      // Determine color class based on percentage
+      let fillClass = '';
+      if (percentage >= 90) {
+        fillClass = 'danger';
+      } else if (percentage >= 70) {
+        fillClass = 'warning';
+      }
+
+      const percentageText = bandwidthLimit > 0 ? `${percentage.toFixed(1)}%` : 'N/A';
+
+      container.innerHTML = `
+        <div class="quota-bar-track">
+          <div class="quota-bar-fill ${fillClass}" style="width: ${Math.min(percentage, 100).toFixed(1)}%;"></div>
+        </div>
+        <div class="quota-stats">
+          <span class="usage">${bandwidthUsed.toFixed(2)} GB / ${bandwidthLimit.toFixed(0)} GB used</span>
+          <span class="percentage ${fillClass}">${percentageText}</span>
+        </div>
+        <div class="quota-reset">
+          Resets on ${periodEnd} (${daysRemaining} day${daysRemaining !== 1 ? 's' : ''} remaining)
+        </div>
+      `;
+    }
   </script>
 </body>
 </html>
