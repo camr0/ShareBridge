@@ -145,6 +145,9 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 
 	// Settings
 	mux.HandleFunc("PUT /api/settings", ws.csrfMiddleware(ws.saveSettingsHandler))
+
+	// Relay quota endpoint
+	mux.HandleFunc("GET /api/relay-quota", ws.relayQuotaHandler)
 }
 
 // csrfMiddleware verifies a browser-set request header on non-GET requests.

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -308,4 +309,74 @@ func formatExpiry(expiresAt time.Time) string {
 		return "<1 min"
 	}
 	return fmt.Sprintf("%d min", minutes)
+}
+
+// relayQuotaHandler fetches quota info from the signaling server.
+// Returns 204 if daemon not ready, no API key, or no signaling URL.
+// Returns quota JSON on success, or 204 on error.
+func (ws *WebServer) relayQuotaHandler(w http.ResponseWriter, r *http.Request) {
+	// Check daemon is ready
+	if ws.daemon == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	cfg := ws.daemon.GetConfig()
+
+	// Need signaling URL and API key to fetch quota
+	if cfg.SignalingURL == "" || cfg.APIKey == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Convert ws:// to http://, wss:// to https://
+	quotaURL := cfg.SignalingURL
+	if strings.HasPrefix(quotaURL, "wss://") {
+		quotaURL = "https://" + strings.TrimPrefix(quotaURL, "wss://")
+	} else if strings.HasPrefix(quotaURL, "ws://") {
+		quotaURL = "http://" + strings.TrimPrefix(quotaURL, "ws://")
+	}
+	quotaURL = strings.TrimSuffix(quotaURL, "/") + "/api/account/quota"
+
+	// Create request to signaling server
+	req, err := http.NewRequestWithContext(r.Context(), "GET", quotaURL, nil)
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	req.Header.Set("X-API-Key", cfg.APIKey)
+
+	// Make the request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Parse and forward the quota response
+	var quotaResp struct {
+		LimitGB        float64   `json:"limit_gb"`
+		UsedGB         float64   `json:"used_gb"`
+		RemainingGB    float64   `json:"remaining_gb"`
+		PeriodStart    time.Time `json:"period_start"`
+		PeriodEnd      time.Time `json:"period_end"`
+		PercentageUsed float64   `json:"percentage_used"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&quotaResp); err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(quotaResp); err != nil {
+		w.WriteHeader(http.StatusNoContent)
+	}
 }

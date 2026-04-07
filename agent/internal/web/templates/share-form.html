@@ -31,7 +31,7 @@
                         </div>
                     </div>
                     <div class="mode-option-warning amber">
-                        ⚠️ Your IP address will be visible to recipients if direct connection succeeds
+                        Warning: Your IP address will be visible to recipients if direct connection succeeds
                     </div>
                 </div>
 
@@ -44,7 +44,19 @@
                         </div>
                     </div>
                     <div class="mode-option-warning red">
-                        ⚠️ Requires TURN server. Connection will fail if TURN is not configured.
+                        Warning: Requires TURN server. Connection will fail if TURN is not configured.
+                    </div>
+                    <div id="quota-info" class="quota-info" style="display: none;">
+                        <div class="quota-bar-container">
+                            <div class="quota-bar-used" id="quota-bar-used"></div>
+                        </div>
+                        <div class="quota-text">
+                            <span id="quota-remaining"></span> GB remaining of <span id="quota-limit"></span> GB monthly quota
+                        </div>
+                        <div class="quota-period">Resets <span id="quota-reset"></span></div>
+                    </div>
+                    <div id="quota-unavailable" class="quota-unavailable" style="display: none;">
+                        Unable to load quota information
                     </div>
                 </div>
             </fieldset>
@@ -92,10 +104,65 @@
         var relayOption  = dlg.querySelector('#relay-option');
         var modeDirect   = dlg.querySelector('#mode-direct');
         var modeRelay    = dlg.querySelector('#mode-relay');
+        var quotaInfo    = dlg.querySelector('#quota-info');
+        var quotaUnavailable = dlg.querySelector('#quota-unavailable');
 
         function setMode(direct) {
             directOption.classList.toggle('selected', direct);
             relayOption.classList.toggle('selected', !direct);
+            if (!direct) {
+                showQuotaInfo();
+            } else {
+                hideQuotaInfo();
+            }
+        }
+
+        function hideQuotaInfo() {
+            if (quotaInfo) quotaInfo.style.display = 'none';
+            if (quotaUnavailable) quotaUnavailable.style.display = 'none';
+        }
+
+        function showQuotaInfo() {
+            if (!quotaInfo) return;
+            // Fetch quota info from agent API
+            fetch('/api/relay-quota')
+                .then(function(resp) {
+                    if (!resp.ok) {
+                        throw new Error('Quota unavailable');
+                    }
+                    return resp.json();
+                })
+                .then(function(data) {
+                    if (data.remaining_gb !== undefined) {
+                        document.getElementById('quota-remaining').textContent = data.remaining_gb.toFixed(2);
+                        document.getElementById('quota-limit').textContent = data.limit_gb.toFixed(0);
+
+                        var bar = document.getElementById('quota-bar-used');
+                        if (bar) {
+                            bar.style.width = data.percentage_used + '%';
+                            bar.className = 'quota-bar-used';
+                            if (data.percentage_used >= 90) {
+                                bar.classList.add('quota-bar-critical');
+                            } else if (data.percentage_used >= 75) {
+                                bar.classList.add('quota-bar-warning');
+                            }
+                        }
+
+                        if (data.period_end) {
+                            var resetDate = new Date(data.period_end);
+                            document.getElementById('quota-reset').textContent = resetDate.toLocaleDateString();
+                        }
+
+                        quotaInfo.style.display = 'block';
+                        if (quotaUnavailable) quotaUnavailable.style.display = 'none';
+                    } else {
+                        throw new Error('Invalid quota data');
+                    }
+                })
+                .catch(function() {
+                    quotaInfo.style.display = 'none';
+                    if (quotaUnavailable) quotaUnavailable.style.display = 'block';
+                });
         }
 
         directOption.addEventListener('click', function(e) {
