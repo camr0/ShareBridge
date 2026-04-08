@@ -6,7 +6,7 @@
         </header>
 
         <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend"
-              hx-on::after-request="if(event.detail.successful) this.closest('dialog').close()">
+              hx-on::after-request="if(event.detail.successful && event.target === this) this.closest('dialog').close()">
             <label for="share-url">
                 OpenCloud Share URL
                 <input type="url" id="share-url" name="share_url"
