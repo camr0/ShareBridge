@@ -144,8 +144,9 @@ func (p *Poller) updateAccountQuota(record *core.Record, now time.Time) error {
 	// Calculate net usage (current total minus baseline at period start).
 	//
 	// When Coturn restarts, its Prometheus counter resets to 0 and starts
-	// climbing again. The DB baseline is from before the restart, so it is now
-	// larger than totalBytes (totalBytes < baselineBytes).
+	// climbing again. We detect a restart by comparing totalBytes against the
+	// expected total (baseline + previous usage). If totalBytes is less than
+	// expected, the counter was reset.
 	//
 	// Fix: set baseline to a negative number that encodes the pre-restart usage
 	// as a permanent offset. Because subtracting a negative adds:
@@ -164,10 +165,15 @@ func (p *Poller) updateAccountQuota(record *core.Record, now time.Time) error {
 	// Example: 10 GB used before restart, counter resets to 3 GB
 	//   baseline = 3 GB - 10 GB = -7 GB
 	//   next poll at 5 GB: (5 GB - (-7 GB)) / 1e9 = 12 GB ✓
+	//
+	// This also handles the baseline=0 case (new accounts): if 1 GB was used
+	// and the counter resets to 0, expectedTotal=1 GB so 0 < 1 GB triggers
+	// the restart logic correctly.
 	baselineBytes := int64(record.GetFloat("turn_baseline_bytes"))
-	if totalBytes < baselineBytes {
-		preRestartBytes := int64(record.GetFloat("current_period_usage_gb") * 1e9)
-		baselineBytes = totalBytes - preRestartBytes
+	previousUsageBytes := int64(record.GetFloat("current_period_usage_gb") * 1e9)
+	expectedTotal := baselineBytes + previousUsageBytes
+	if totalBytes < expectedTotal {
+		baselineBytes = totalBytes - previousUsageBytes
 		record.Set("turn_baseline_bytes", float64(baselineBytes))
 	}
 	netBytes := totalBytes - baselineBytes
