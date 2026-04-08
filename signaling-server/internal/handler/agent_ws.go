@@ -83,7 +83,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 
 			switch msg.Type {
 			case "hello":
-				handleHello(ctx, conn, h, apiKeyID, msg.AgentID, cfg)
+				handleHello(ctx, conn, h, apiKeyID, accountID, msg.AgentID, cfg)
 				agentID = msg.AgentID
 
 			case "register_share":
@@ -151,7 +151,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 }
 
 // handleHello processes the hello message and sends welcome response
-func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID string, agentID string, cfg *config.Config) {
+func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID string, accountID string, agentID string, cfg *config.Config) {
 	if agentID == "" {
 		hub.SendDirect(ctx, conn, map[string]string{
 			"type":    "error",
@@ -168,7 +168,7 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	var turnCreds *turn.Credentials
 	if cfg.HasTurn() {
 		turnExpiry := time.Now().Add(24 * time.Hour)
-		creds := turn.GenerateCredentials(cfg.TurnSecret, apiKeyID, turnExpiry)
+		creds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
 		turnCreds = &creds
 	}
 
