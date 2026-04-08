@@ -1,6 +1,8 @@
 let pc, ws, dc;
 let pendingCandidates = [];
 let remoteDescSet = false;
+let relayQuotaExceeded = false;
+let quotaPeriodEnd = null;
 
 // Download state
 let currentFile = null;
@@ -33,6 +35,10 @@ function join() {
   if (!code) return;
   status('Connecting...');
 
+  // Reset quota state for new connection
+  relayQuotaExceeded = false;
+  quotaPeriodEnd = null;
+
   ws = new WebSocket(`ws://${location.host}/ws/client?session=${code}`);
 
   ws.onmessage = async (event) => {
@@ -42,10 +48,10 @@ function join() {
       case 'ice_config':
         pc = new RTCPeerConnection({ iceServers: msg.ice_servers });
 
-        // Show quota exceeded warning if relay is unavailable
+        // Store quota state for use if connection fails
         if (msg.relay_quota_exceeded) {
-          const periodEnd = msg.quota_period_end ? new Date(msg.quota_period_end).toLocaleDateString() : 'soon';
-          status(`Relay quota exceeded. Direct connection only. Quota resets ${periodEnd}.`);
+          relayQuotaExceeded = true;
+          quotaPeriodEnd = msg.quota_period_end;
         }
 
         pc.onicecandidate = (e) => {
@@ -64,7 +70,12 @@ function join() {
 
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-            status('Connection lost');
+            if (relayQuotaExceeded) {
+              const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon';
+              status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`);
+            } else {
+              status('Connection lost');
+            }
             resetUI();
           }
         };
