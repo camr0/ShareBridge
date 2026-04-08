@@ -298,6 +298,84 @@ dialog fieldset legend {
   margin-bottom: 0.4rem;
 }
 
+/* ===== Quota display ===== */
+.quota-widget {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.quota-widget-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.quota-widget-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.quota-widget-title small {
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+.quota-bar-container {
+  width: 100%;
+  height: 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.quota-bar-used {
+  height: 100%;
+  background: var(--success);
+  border-radius: 4px;
+  transition: width 0.3s ease, background 0.3s ease;
+}
+
+.quota-bar-warning {
+  background: var(--warning);
+}
+
+.quota-bar-critical {
+  background: var(--error);
+}
+
+.quota-text {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.quota-remaining {
+  font-weight: 500;
+}
+
+.quota-period {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  margin-top: 0.35rem;
+}
+
+.quota-unavailable {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 0.5rem;
+}
+
+.quota-info {
+  margin-top: 0.5rem;
+}
+
 /* ===== Success/Error messages ===== */
 .success {
   padding: 0.75rem 1rem;

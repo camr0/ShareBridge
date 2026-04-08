@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sharebridge/agent/internal/config"
 )
 
 // listSharesHandler renders share cards for all active sessions.
@@ -45,12 +47,12 @@ func (ws *WebServer) listSharesHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, session := range sessions {
 		data := sessionData{
-			Code:              session.Code,
-			ShareURL:          session.ShareURL,
-			PublicURL:         derivePublicURL(signalingURL, session.Code),
-			Downloads:         session.Downloads,
-			MaxDownloads:      session.MaxDownloads,
-			RelayOnly:         session.RelayOnly,
+			Code:               session.Code,
+			ShareURL:           session.ShareURL,
+			PublicURL:          derivePublicURL(signalingURL, session.Code),
+			Downloads:          session.Downloads,
+			MaxDownloads:       session.MaxDownloads,
+			RelayOnly:          session.RelayOnly,
 			ExpiresAtFormatted: formatExpiry(session.ExpiresAt),
 		}
 
@@ -133,12 +135,12 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 
 	// Render the card
 	data := sessionData{
-		Code:              session.Code,
-		ShareURL:          session.ShareURL,
-		PublicURL:         derivePublicURL(signalingURL, session.Code),
-		Downloads:         session.Downloads,
-		MaxDownloads:      session.MaxDownloads,
-		RelayOnly:         session.RelayOnly,
+		Code:               session.Code,
+		ShareURL:           session.ShareURL,
+		PublicURL:          derivePublicURL(signalingURL, session.Code),
+		Downloads:          session.Downloads,
+		MaxDownloads:       session.MaxDownloads,
+		RelayOnly:          session.RelayOnly,
 		ExpiresAtFormatted: formatExpiry(session.ExpiresAt),
 	}
 
@@ -311,6 +313,150 @@ func formatExpiry(expiresAt time.Time) string {
 	return fmt.Sprintf("%d min", minutes)
 }
 
+// quotaInlineHandler returns inline quota HTML for the share form.
+// Simpler than the dashboard widget - no outer wrapper.
+func (ws *WebServer) quotaInlineHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	if ws.daemon == nil {
+		w.Write([]byte(`<div class="quota-unavailable">Agent not ready</div>`))
+		return
+	}
+
+	cfg := ws.daemon.GetConfig()
+	if cfg.SignalingURL == "" || cfg.APIKey == "" {
+		w.Write([]byte(`<div class="quota-unavailable">No signaling server or API key configured</div>`))
+		return
+	}
+
+	quota, err := ws.fetchQuotaFromSignalingServer(cfg)
+	if err != nil {
+		w.Write([]byte(`<div class="quota-unavailable">Unable to load quota</div>`))
+		return
+	}
+
+	remainingPercent := 100.0 - quota.PercentageUsed
+	barClass := ""
+	if remainingPercent <= 10 {
+		barClass = "quota-bar-critical"
+	} else if remainingPercent <= 30 {
+		barClass = "quota-bar-warning"
+	}
+
+	periodEndStr := quota.PeriodEnd.Format("Jan 7")
+	if quota.PeriodEnd.Year() != time.Now().Year() {
+		periodEndStr = quota.PeriodEnd.Format("Jan 7, 2006")
+	}
+
+	html := fmt.Sprintf(`
+<div class="quota-info">
+    <div class="quota-bar-container">
+        <div class="quota-bar-used %s" style="width: %.1f%%;"></div>
+    </div>
+    <div class="quota-text">
+        <span class="quota-remaining">%.1f GB remaining / %.0f GB quota</span>
+        <span>%.0f%%</span>
+    </div>
+    <div class="quota-period">Resets %s</div>
+</div>
+`, barClass, remainingPercent, quota.RemainingGB, quota.LimitGB, remainingPercent, periodEndStr)
+
+	w.Write([]byte(html))
+}
+
+// fetchQuotaFromSignalingServer is a helper that fetches quota from the signaling server.
+func (ws *WebServer) fetchQuotaFromSignalingServer(cfg *config.Config) (*quotaResponse, error) {
+	quotaURL := cfg.SignalingURL
+	if strings.HasPrefix(quotaURL, "wss://") {
+		quotaURL = "https://" + strings.TrimPrefix(quotaURL, "wss://")
+	} else if strings.HasPrefix(quotaURL, "ws://") {
+		quotaURL = "http://" + strings.TrimPrefix(quotaURL, "ws://")
+	}
+	quotaURL = strings.TrimSuffix(quotaURL, "/") + "/api/account/quota?api_key=" + cfg.APIKey
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(quotaURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	var quota quotaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&quota); err != nil {
+		return nil, err
+	}
+
+	return &quota, nil
+}
+
+type quotaResponse struct {
+	LimitGB        float64   `json:"limit_gb"`
+	UsedGB         float64   `json:"used_gb"`
+	RemainingGB    float64   `json:"remaining_gb"`
+	PeriodStart    time.Time `json:"period_start"`
+	PeriodEnd      time.Time `json:"period_end"`
+	PercentageUsed float64   `json:"percentage_used"`
+}
+
+// quotaWidgetHandler returns an HTML quota widget for the dashboard.
+// Uses HTMX polling to refresh every 30s.
+func (ws *WebServer) quotaWidgetHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	if ws.daemon == nil {
+		w.Write([]byte(`<div class="quota-widget"><div class="quota-unavailable">Agent not ready</div></div>`))
+		return
+	}
+
+	cfg := ws.daemon.GetConfig()
+	if cfg.SignalingURL == "" || cfg.APIKey == "" {
+		w.Write([]byte(`<div class="quota-widget"><div class="quota-unavailable">No signaling server or API key configured</div></div>`))
+		return
+	}
+
+	quota, err := ws.fetchQuotaFromSignalingServer(cfg)
+	if err != nil {
+		w.Write([]byte(`<div class="quota-widget"><div class="quota-unavailable">Unable to load quota</div></div>`))
+		return
+	}
+
+	remainingPercent := 100.0 - quota.PercentageUsed
+	barClass := ""
+	if remainingPercent <= 10 {
+		barClass = "quota-bar-critical"
+	} else if remainingPercent <= 30 {
+		barClass = "quota-bar-warning"
+	}
+
+	periodEndStr := quota.PeriodEnd.Format("Jan 7")
+	if quota.PeriodEnd.Year() != time.Now().Year() {
+		periodEndStr = quota.PeriodEnd.Format("Jan 7, 2006")
+	}
+
+	// Render HTML widget
+	html := fmt.Sprintf(`
+<div class="quota-widget">
+    <div class="quota-widget-header">
+        <span class="quota-widget-title">Relay Quota <small>(TURN bandwidth)</small></span>
+    </div>
+    <div class="quota-bar-container">
+        <div class="quota-bar-used %s" style="width: %.1f%%;"></div>
+    </div>
+    <div class="quota-text">
+        <span class="quota-remaining">%.1f GB remaining / %.0f GB quota</span>
+        <span>%.0f%%</span>
+    </div>
+    <div class="quota-period">Resets %s</div>
+</div>
+`, barClass, remainingPercent, quota.RemainingGB, quota.LimitGB, remainingPercent, periodEndStr)
+
+	w.Write([]byte(html))
+}
+
 // relayQuotaHandler fetches quota info from the signaling server.
 // Returns 204 if daemon not ready, no API key, or no signaling URL.
 // Returns quota JSON on success, or 204 on error.
@@ -336,15 +482,10 @@ func (ws *WebServer) relayQuotaHandler(w http.ResponseWriter, r *http.Request) {
 	} else if strings.HasPrefix(quotaURL, "ws://") {
 		quotaURL = "http://" + strings.TrimPrefix(quotaURL, "ws://")
 	}
-	quotaURL = strings.TrimSuffix(quotaURL, "/") + "/api/account/quota"
+	quotaURL = strings.TrimSuffix(quotaURL, "/") + "/api/account/quota?api_key=" + cfg.APIKey
 
 	// Create request to signaling server
 	req, err := http.NewRequestWithContext(r.Context(), "GET", quotaURL, nil)
-	if err != nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	req.Header.Set("X-API-Key", cfg.APIKey)
 
 	// Make the request
 	client := &http.Client{Timeout: 10 * time.Second}

@@ -10,7 +10,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// APIKeyAuth extracts and validates API key from query parameter using PocketBase.
+// APIKeyAuth extracts and validates API key from query parameter.
 // The API key format is: <record_id>.<secret>
 // Returns 401 if the key is missing, invalid, inactive, or the bcrypt comparison fails.
 func APIKeyAuth(app core.App) func(http.Handler) http.Handler {

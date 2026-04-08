@@ -1,4 +1,13 @@
 {{define "content"}}
+<div id="quota-widget" hx-get="/api/quota-widget" hx-trigger="load, every 30s">
+    <div class="quota-widget">
+        <div class="quota-widget-header">
+            <span class="quota-widget-title">Relay Quota <small>(TURN bandwidth)</small></span>
+        </div>
+        <div class="quota-unavailable">Loading...</div>
+    </div>
+</div>
+
 <div class="page-header">
     <h2>Active Shares</h2>
     <button class="primary"

@@ -290,7 +290,7 @@
 
   <div class="section" id="quota-section">
     <div class="section-header">
-      <span class="section-title">Bandwidth Quota</span>
+      <span class="section-title">Relay Quota</span>
     </div>
     <div id="quota-container">
       <div class="empty-state">
@@ -793,14 +793,16 @@
       }
     }
 
-    // Render quota progress bar
+    // Render quota progress bar (fuel gauge style: full = good, empty = warning)
     function renderQuota(account) {
       const container = document.getElementById('quota-container');
 
       const quota = account.quota || {};
       const bandwidthUsed = quota.used_gb || 0;
       const bandwidthLimit = quota.limit_gb || 0;
-      const percentage = quota.percentage_used || 0;
+      const bandwidthRemaining = Math.max(0, bandwidthLimit - bandwidthUsed);
+      const usedPercent = quota.percentage_used || 0;
+      const remainingPercent = bandwidthLimit > 0 ? Math.max(0, 100 - usedPercent) : 0;
       const periodEnd = quota.period_end ? formatDate(quota.period_end) : 'Unknown';
 
       // Calculate days remaining
@@ -812,22 +814,22 @@
         daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
       }
 
-      // Determine color class based on percentage
+      // Determine color class based on remaining (inverted: low remaining = danger)
       let fillClass = '';
-      if (percentage >= 90) {
+      if (remainingPercent <= 10) {
         fillClass = 'danger';
-      } else if (percentage >= 70) {
+      } else if (remainingPercent <= 30) {
         fillClass = 'warning';
       }
 
-      const percentageText = bandwidthLimit > 0 ? `${Math.round(percentage)}%` : 'N/A';
+      const percentageText = bandwidthLimit > 0 ? `${Math.round(remainingPercent)}%` : 'N/A';
 
       container.innerHTML = `
         <div class="quota-bar-track">
-          <div class="quota-bar-fill ${fillClass}" style="width: ${Math.min(percentage, 100).toFixed(1)}%;"></div>
+          <div class="quota-bar-fill ${fillClass}" style="width: ${Math.min(remainingPercent, 100).toFixed(1)}%;"></div>
         </div>
         <div class="quota-stats">
-          <span class="usage">${bandwidthUsed.toFixed(2)} GB / ${bandwidthLimit.toFixed(0)} GB used</span>
+          <span class="usage">${bandwidthRemaining.toFixed(1)} GB remaining / ${bandwidthLimit.toFixed(0)} GB quota</span>
           <span class="percentage ${fillClass}">${percentageText}</span>
         </div>
         <div class="quota-reset">

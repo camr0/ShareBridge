@@ -109,7 +109,7 @@ func (ws *WebServer) Stop() error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := ws.server.Shutdown(ctx); err != nil {
@@ -148,6 +148,12 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 
 	// Relay quota endpoint
 	mux.HandleFunc("GET /api/relay-quota", ws.relayQuotaHandler)
+
+	// Quota widget for dashboard (returns HTML)
+	mux.HandleFunc("GET /api/quota-widget", ws.quotaWidgetHandler)
+
+	// Inline quota for share form (returns HTML, same style)
+	mux.HandleFunc("GET /api/quota-inline", ws.quotaInlineHandler)
 }
 
 // csrfMiddleware verifies a browser-set request header on non-GET requests.
