@@ -28,4 +28,4 @@ COPY --from=builder /app/web ./web
 
 EXPOSE 8080
 
-CMD ["./server"]
+CMD ["./server", "serve"]

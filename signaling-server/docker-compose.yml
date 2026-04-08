@@ -25,26 +25,26 @@ services:
   coturn:
     image: coturn/coturn:latest
     network_mode: host
-    command: >
-      -n
-      --log-file=stdout
-      --min-port=49152
-      --max-port=65535
-      --realm=sharebridge
-      --use-auth-secret
-      --static-auth-secret=${TURN_SECRET}
-      --prometheus
-      --prometheus-port=9641
-      --prometheus-username-labels
-      --no-dtls
-      --no-tls
-      --denied-peer-ip=127.0.0.0-127.255.255.255
-      --denied-peer-ip=10.0.0.0-10.255.255.255
-      --denied-peer-ip=172.16.0.0-172.31.255.255
-      --denied-peer-ip=192.168.0.0-192.168.255.255
-      --denied-peer-ip=169.254.0.0-169.254.255.255
-      --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-      --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+    command:
+      - -n
+      - --log-file=stdout
+      - --min-port=49152
+      - --max-port=65535
+      - --realm=sharebridge
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET}
+      - --prometheus
+      - --prometheus-port=9641
+      - --prometheus-username-labels
+      - --no-dtls
+      - --no-tls
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
     restart: unless-stopped
 
   prometheus:
