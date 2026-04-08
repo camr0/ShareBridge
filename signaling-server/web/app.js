@@ -143,7 +143,14 @@ function join() {
     }
   };
 
-  ws.onerror = () => status('WebSocket error');
+  ws.onerror = () => {
+    if (relayQuotaExceeded) {
+      const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon';
+      status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`);
+    } else {
+      status('WebSocket error');
+    }
+  };
   ws.onclose = () => {
     if (pc) pc.close();
     resetUI();
