@@ -387,7 +387,7 @@ async function completeDownload() {
           ? 'SHA-1: ' + downloadedFile.sha1.toLowerCase()
           : 'expected ' + downloadedFile.sha1.slice(0, 8) + '… got ' + computed.slice(0, 8) + '…';
       }
-    } catch (_) {
+    } catch (e) {
       markFileDone(fileItem, downloadedFile, avgSpeed);
     }
   } else {
@@ -403,6 +403,9 @@ function markFileDone(fileItem, file, avgSpeed) {
   fileItem.querySelector('.file-status').className = 'file-status ok';
   fileItem.querySelector('.file-size').textContent =
     formatBytes(file.size) + ' · avg ' + avgSpeed;
+  if (file.sha1) {
+    fileItem.querySelector('.file-hash').textContent = 'SHA-1: ' + file.sha1.toLowerCase();
+  }
 }
 
 function renderBreadcrumb() {
