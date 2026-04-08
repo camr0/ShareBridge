@@ -38,10 +38,11 @@ type prometheusResponse struct {
 	} `json:"data"`
 }
 
-// QueryAccountBytes queries Prometheus for the total TURN traffic bytes for an account.
-// Uses turn_traffic_rcvb which measures bytes received by TURN from the client (agent uploads).
+// QueryAccountBytes queries Prometheus for total TURN egress bytes for an account.
+// Uses turn_traffic_peer_sentb which measures bytes sent by TURN to peers (browser downloads).
+// This is the egress bandwidth that VPS providers charge for.
 func (c *PrometheusClient) QueryAccountBytes(ctx context.Context, accountID string) (int64, error) {
-	query := fmt.Sprintf(`sum(turn_traffic_rcvb{user=~"[0-9]+:%s"})`, accountID)
+	query := fmt.Sprintf(`sum(turn_traffic_peer_sentb{user=~"[0-9]+:%s"})`, accountID)
 
 	u, err := url.Parse(c.baseURL + "/api/v1/query")
 	if err != nil {
