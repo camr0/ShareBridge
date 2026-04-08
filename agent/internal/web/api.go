@@ -354,7 +354,7 @@ func (ws *WebServer) quotaInlineHandler(w http.ResponseWriter, r *http.Request) 
         <div class="quota-bar-used %s" style="width: %.1f%%;"></div>
     </div>
     <div class="quota-text">
-        <span class="quota-remaining">%.1f GB remaining / %.0f GB quota</span>
+        <span class="quota-remaining">%.2f GB remaining / %.0f GB quota</span>
         <span>%.0f%%</span>
     </div>
     <div class="quota-period">Resets %s</div>
@@ -447,7 +447,7 @@ func (ws *WebServer) quotaWidgetHandler(w http.ResponseWriter, r *http.Request) 
         <div class="quota-bar-used %s" style="width: %.1f%%;"></div>
     </div>
     <div class="quota-text">
-        <span class="quota-remaining">%.1f GB remaining / %.0f GB quota</span>
+        <span class="quota-remaining">%.2f GB remaining / %.0f GB quota</span>
         <span>%.0f%%</span>
     </div>
     <div class="quota-period">Resets %s</div>
