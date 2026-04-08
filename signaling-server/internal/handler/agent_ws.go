@@ -36,6 +36,7 @@ type agentMsg struct {
 	ConnID      string          `json:"conn_id,omitempty"`
 	Value       string          `json:"value,omitempty"`
 	HasPassword bool            `json:"has_password,omitempty"`
+	RelayOnly   bool            `json:"relay_only,omitempty"`
 }
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
@@ -255,7 +256,7 @@ func handleRegisterShare(
 		// Try to create with collision retry (5 attempts)
 		created := false
 		for i := 0; i < 5; i++ {
-			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt)
+			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, msg.RelayOnly)
 			if err == nil {
 				created = true
 				break
@@ -290,7 +291,7 @@ func handleRegisterShare(
 			return
 		}
 
-		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt)
+		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt, msg.RelayOnly)
 		if err != nil {
 			if errors.Is(err, errCodeAlreadyInUse) {
 				hub.SendDirect(ctx, conn, map[string]string{
@@ -353,7 +354,7 @@ func handleRegisterShare(
 
 // createSession creates a new session record in PocketBase.
 // share_url and max_downloads are intentionally not stored — the server is untrusted.
-func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time) error {
+func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time, relayOnly bool) error {
 	col, err := app.FindCollectionByNameOrId("sessions")
 	if err != nil {
 		return err
@@ -363,6 +364,7 @@ func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time
 	record.Set("code", code)
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", agentID)
+	record.Set("relay_only", relayOnly)
 
 	if expiresAt != nil {
 		dt, _ := types.ParseDateTime(*expiresAt)
@@ -392,7 +394,7 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 }
 
 // claimSessionCode atomically creates or reassigns a custom code.
-func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time) (*core.Record, bool, error) {
+func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly bool) (*core.Record, bool, error) {
 	var claimed *core.Record
 	reconnected := false
 
@@ -416,7 +418,7 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 			if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt); err != nil {
+			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, relayOnly); err != nil {
 				return err
 			}
 			record, getErr := getSessionByCode(txApp, code)

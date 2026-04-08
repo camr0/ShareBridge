@@ -56,7 +56,7 @@ type StoreInterface interface {
 // SignalingClientInterface defines the interface for signaling client.
 type SignalingClientInterface interface {
 	Connect(ctx context.Context) error
-	RegisterShare(ctx context.Context, shareURL, preferredCode string) (string, bool, error)
+	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
 	DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error
 	Send(ctx context.Context, msg any) error
 	GetICEServers() []webrtc.ICEServer
@@ -90,10 +90,10 @@ type Daemon struct {
 	sessions  map[string]*Session // code -> Session
 	mu        sync.RWMutex
 
-	webServer       WebServer
-	startTime       time.Time
+	webServer          WebServer
+	startTime          time.Time
 	signalingConnected bool // true once welcome received
-	hasTURN         bool
+	hasTURN            bool
 
 	// Nonce store for HMAC pre-challenge (connID -> nonce)
 	nonces   map[string]nonceEntry
@@ -242,7 +242,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 	}
 
 	// Register with signaling server (no preferred code for new sessions)
-	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "")
+	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly)
 	if err != nil {
 		return "", fmt.Errorf("register share: %w", err)
 	}
@@ -666,7 +666,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		}
 
 		// Re-register with signaling server
-		code, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code)
+		code, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly)
 		if err != nil {
 			log.Printf("warning: could not re-register session %s: %v", entry.Code, err)
 			continue

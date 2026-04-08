@@ -25,11 +25,11 @@ func (m *mockConfigManager) Get() *config.Config {
 
 // mockStore implements StoreInterface for testing.
 type mockStore struct {
-	mu         sync.Mutex
-	agentID    string
-	sessions   map[string]store.SessionEntry
-	downloads  map[string]int
-	saveError  error
+	mu        sync.Mutex
+	agentID   string
+	sessions  map[string]store.SessionEntry
+	downloads map[string]int
+	saveError error
 }
 
 func newMockStore() *mockStore {
@@ -110,7 +110,7 @@ type mockSignalingClient struct {
 	connected     bool
 	onMessage     func(signaling.Message)
 	iceServers    []webrtc.ICEServer
-	registerShare func(ctx context.Context, shareURL, preferredCode string) (string, bool, error)
+	registerShare func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
 	sendMessages  []map[string]any
 	codeCounter   int // Counter for generating unique codes
 }
@@ -131,11 +131,11 @@ func (m *mockSignalingClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, preferredCode string) (string, bool, error) {
+func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.registerShare != nil {
-		return m.registerShare(ctx, shareURL, preferredCode)
+		return m.registerShare(ctx, shareURL, preferredCode, relayOnly)
 	}
 	// Default: generate a unique code
 	if preferredCode != "" {
@@ -465,11 +465,11 @@ func TestPruneExpiredSessions(t *testing.T) {
 
 	// Create an expired session manually
 	expiredSession := &Session{
-		Code:         "expired-code",
-		ShareURL:     "https://opencloud.example.com/s/expired",
-		ExpiresAt:    time.Now().Add(-1 * time.Hour), // Expired 1 hour ago
-		CreatedAt:    time.Now().Add(-2 * time.Hour),
-		peers:        make(map[string]*peer.Peer),
+		Code:      "expired-code",
+		ShareURL:  "https://opencloud.example.com/s/expired",
+		ExpiresAt: time.Now().Add(-1 * time.Hour), // Expired 1 hour ago
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		peers:     make(map[string]*peer.Peer),
 	}
 	d.mu.Lock()
 	d.sessions["expired-code"] = expiredSession
@@ -482,11 +482,11 @@ func TestPruneExpiredSessions(t *testing.T) {
 
 	// Create an active session manually
 	activeSession := &Session{
-		Code:         "active-code",
-		ShareURL:     "https://opencloud.example.com/s/active",
-		ExpiresAt:    time.Now().Add(24 * time.Hour), // Expires in 24 hours
-		CreatedAt:    time.Now(),
-		peers:        make(map[string]*peer.Peer),
+		Code:      "active-code",
+		ShareURL:  "https://opencloud.example.com/s/active",
+		ExpiresAt: time.Now().Add(24 * time.Hour), // Expires in 24 hours
+		CreatedAt: time.Now(),
+		peers:     make(map[string]*peer.Peer),
 	}
 	d.mu.Lock()
 	d.sessions["active-code"] = activeSession
@@ -683,7 +683,7 @@ func TestLoadSessionsFromStore(t *testing.T) {
 	})
 
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string) (string, bool, error) {
+	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
 		return preferredCode, true, nil
 	}
 

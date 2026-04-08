@@ -110,6 +110,18 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 		// Check quota
 		quotaExceeded, periodEnd := checkRelayQuota(accountRecord)
 
+		// Check relay_only - if session requires relay and quota exceeded, reject immediately
+		relayOnly := sessionRecord.GetBool("relay_only")
+		if relayOnly && quotaExceeded {
+			log.Printf("browser_ws: relay_only session %s with quota exceeded, rejecting", sessionCode)
+			hub.SendDirect(requestCtx, browserConn, map[string]string{
+				"type":    "error",
+				"message": "file host's relay quota exceeded - this share requires TURN relay which is unavailable",
+			})
+			browserConn.Close(websocket.StatusNormalClosure, "relay quota exceeded")
+			return
+		}
+
 		// Send ICE config - only include TURN if quota not exceeded
 		// Use account-scoped TURN username to bound Prometheus label cardinality.
 		var turnCreds *turn.Credentials

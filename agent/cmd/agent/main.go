@@ -302,7 +302,7 @@ func runShareSingle(shareURL string) error {
 		default:
 		}
 
-		code, err := runSession(ctx, cfg, webdavClient, shareURL, st, preferredCode, agentID)
+		code, err := runSession(ctx, cfg, webdavClient, shareURL, st, preferredCode, agentID, relayOnly)
 		if err != nil {
 			log.Printf("session ended: %v", err)
 		} else {
@@ -334,7 +334,7 @@ func runShareSingle(shareURL string) error {
 	}
 }
 
-func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, st *store.Store, preferredCode string, agentID string) (string, error) {
+func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, st *store.Store, preferredCode string, agentID string, relayOnly bool) (string, error) {
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
 	if err := sig.Connect(ctx); err != nil {
@@ -343,7 +343,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud
 	log.Printf("connected to signaling server at %s", cfg.SignalingURL)
 
 	// Use new RegisterShare instead of CreateSession
-	code, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode)
+	code, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode, relayOnly)
 	if err != nil {
 		return "", fmt.Errorf("register share: %w", err)
 	}

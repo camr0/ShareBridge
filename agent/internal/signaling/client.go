@@ -22,8 +22,8 @@ type ICEServer struct {
 // Message is any message received from the signaling server.
 type Message struct {
 	Type        string          `json:"type"`
-	SessionID   string          `json:"session_id,omitempty"`  // Share code
-	PeerID      string          `json:"peer_id,omitempty"`     // Unique peer connection ID
+	SessionID   string          `json:"session_id,omitempty"` // Share code
+	PeerID      string          `json:"peer_id,omitempty"`    // Unique peer connection ID
 	SDP         string          `json:"sdp,omitempty"`
 	Candidate   json.RawMessage `json:"candidate,omitempty"`
 	Err         string          `json:"message,omitempty"`
@@ -89,7 +89,7 @@ func (c *Client) Connect(ctx context.Context) error {
 // RegisterShare sends register_share message and waits for the response.
 // It must not call conn.Read directly — all reads go through Listen.
 // The response is delivered via pendingReg, which Listen feeds.
-func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string) (string, bool, error) {
+func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
 	responseCh := make(chan Message, 1)
 	c.pendingRegMu.Lock()
 	c.pendingReg = responseCh
@@ -100,9 +100,10 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 		c.pendingRegMu.Unlock()
 	}()
 
-	msg := map[string]string{
-		"type":      "register_share",
-		"share_url": shareURL,
+	msg := map[string]any{
+		"type":       "register_share",
+		"share_url":  shareURL,
+		"relay_only": relayOnly,
 	}
 	if preferredCode != "" {
 		msg["code"] = preferredCode
