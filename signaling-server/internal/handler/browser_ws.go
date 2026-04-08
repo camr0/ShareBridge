@@ -124,20 +124,25 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			Credentials: turnCreds,
 		})
 
+		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s TURN=%s", sessionCode, cfg.STUNURL, cfg.TurnURL())
+
 		if quotaExceeded {
-			hub.SendDirect(requestCtx, browserConn, map[string]any{
-				"type":                "ice_config",
-				"ice_servers":         iceServers,
+			msg := map[string]any{
+				"type":                 "ice_config",
+				"ice_servers":          iceServers,
 				"relay_quota_exceeded": true,
-				"quota_period_end":    periodEnd.Format(time.RFC3339),
-			})
+				"quota_period_end":     periodEnd.Format(time.RFC3339),
+			}
+			log.Printf("browser_ws: sending ice_config (quota exceeded): %+v", msg)
+			hub.SendDirect(requestCtx, browserConn, msg)
 		} else {
-			hub.SendDirect(requestCtx, browserConn, map[string]any{
+			msg := map[string]any{
 				"type":        "ice_config",
 				"ice_servers": iceServers,
-			})
+			}
+			log.Printf("browser_ws: sending ice_config: %+v", msg)
+			hub.SendDirect(requestCtx, browserConn, msg)
 		}
-
 
 		for {
 			_, data, err := browserConn.Read(requestCtx)

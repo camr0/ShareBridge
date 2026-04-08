@@ -14,7 +14,7 @@ services:
       - TURN_PORT=3478
       - TURN_SECRET=${TURN_SECRET}
       - DEFAULT_QUOTA_GB=${DEFAULT_QUOTA_GB:-50}
-      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://localhost:9090}
       - QUOTA_CHECK_INTERVAL=${QUOTA_CHECK_INTERVAL:-5m}
     volumes:
       - sharebridge-data:/data
@@ -49,8 +49,7 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
+    network_mode: host
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -58,8 +57,6 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.retention.time=35d'
       - '--storage.tsdb.path=/prometheus'
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
 volumes:
