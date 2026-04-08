@@ -38,9 +38,10 @@ type prometheusResponse struct {
 	} `json:"data"`
 }
 
-// QueryAccountBytes queries Prometheus for the total turn_traffic_sent bytes for an account
+// QueryAccountBytes queries Prometheus for the total TURN traffic bytes for an account.
+// Uses turn_traffic_rcvb which measures bytes received by TURN from the client (agent uploads).
 func (c *PrometheusClient) QueryAccountBytes(ctx context.Context, accountID string) (int64, error) {
-	query := fmt.Sprintf(`sum(turn_traffic_sent{username=~"[0-9]+:%s"})`, accountID)
+	query := fmt.Sprintf(`sum(turn_traffic_rcvb{user=~"[0-9]+:%s"})`, accountID)
 
 	u, err := url.Parse(c.baseURL + "/api/v1/query")
 	if err != nil {
