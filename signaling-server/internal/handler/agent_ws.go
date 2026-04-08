@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -65,6 +66,24 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 		ctx := r.Context()
 		var agentID string
 
+		// Cached quota state - refreshed at most once per minute to avoid
+		// a DB lookup on every ICE candidate while staying current after quota resets.
+		var quotaExceeded bool
+		var quotaCheckedAt time.Time
+
+		refreshQuota := func() {
+			if time.Since(quotaCheckedAt) < time.Minute {
+				return
+			}
+			accountRecord, err := app.FindRecordById("users", accountID)
+			if err != nil {
+				log.Printf("agent_ws: quota refresh for account %s: %v", accountID, err)
+				return
+			}
+			quotaExceeded, _ = checkRelayQuota(accountRecord)
+			quotaCheckedAt = time.Now()
+		}
+
 		// Main message loop
 		for {
 			_, data, err := conn.Read(ctx)
@@ -107,6 +126,13 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 
 			case "ice_candidate":
 				if agentID == "" {
+					continue
+				}
+				if cfg.HasTurn() {
+					refreshQuota()
+				}
+				if quotaExceeded && isRelayCandidate(msg.Candidate) {
+					log.Printf("agent_ws: dropping relay candidate for over-quota account %s", accountID)
 					continue
 				}
 				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
@@ -164,7 +190,9 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
 	log.Printf("agent hello received: api_key_id=%s agent_id=%s", apiKeyID, agentID)
 
-	// Build ICE config for agent
+	// Build ICE config for agent - always include TURN credentials.
+	// Quota enforcement happens in the ice_candidate forwarding path instead,
+	// where relay candidates are stripped when the account is over quota.
 	var turnCreds *turn.Credentials
 	if cfg.HasTurn() {
 		turnExpiry := time.Now().Add(24 * time.Hour)
@@ -182,6 +210,18 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 		"type":        "welcome",
 		"ice_servers": iceServers,
 	})
+}
+
+// isRelayCandidate reports whether a raw ICE candidate JSON is a TURN relay candidate.
+// The candidate field is a webrtc.ICECandidateInit object with a "candidate" string.
+func isRelayCandidate(raw json.RawMessage) bool {
+	var init struct {
+		Candidate string `json:"candidate"`
+	}
+	if err := json.Unmarshal(raw, &init); err != nil {
+		return false
+	}
+	return strings.Contains(init.Candidate, " typ relay")
 }
 
 // handleRegisterShare processes share registration (new or reconnect)
