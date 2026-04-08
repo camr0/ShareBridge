@@ -4,4 +4,4 @@ global:
 scrape_configs:
   - job_name: 'coturn'
     static_configs:
-      - targets: ['coturn:9641']
+      - targets: ['host.docker.internal:9641']

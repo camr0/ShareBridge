@@ -36,6 +36,8 @@ services:
       --prometheus
       --prometheus-port=9641
       --prometheus-username-labels
+      --no-dtls
+      --no-tls
       --denied-peer-ip=127.0.0.0-127.255.255.255
       --denied-peer-ip=10.0.0.0-10.255.255.255
       --denied-peer-ip=172.16.0.0-172.31.255.255
@@ -56,6 +58,8 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.retention.time=35d'
       - '--storage.tsdb.path=/prometheus'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
 volumes:
