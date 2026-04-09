@@ -215,7 +215,30 @@ cd extensions/opencloud && npm install
 
 Expected: packages installed without errors. `node_modules/@opencloud-eu/web-pkg` exists.
 
-- [ ] **Step 9: Verify build succeeds**
+- [ ] **Step 9: Verify SDK API surface after install**
+
+These two checks resolve the two "verify against SDK version" comments in later tasks. Run them now while `node_modules` is fresh.
+
+**Check `clientService.ocs` exists (Task 4):**
+```bash
+grep -n "ocs" node_modules/@opencloud-eu/web-pkg/dist/index.d.ts | head -20
+```
+
+If `ocs` doesn't appear, look for the authenticated HTTP client instead:
+```bash
+grep -n "httpAuthenticated\|post(" node_modules/@opencloud-eu/web-pkg/dist/index.d.ts | head -20
+```
+
+Update the mock in `useOpenCloudAPI.test.ts` (Task 4) and the implementation to match the real method name before writing those files.
+
+**Check `isVisible` context shape (Task 5):**
+```bash
+grep -n "isVisible\|SidebarPanelExtension\|items\|resources" node_modules/@opencloud-eu/web-pkg/dist/index.d.ts | head -30
+```
+
+If the field is `resources` instead of `items`, update the `isVisible` implementation and test in Task 5 to use `resources?.length`.
+
+- [ ] **Step 10: Verify build succeeds**
 
 ```bash
 cd extensions/opencloud && npm run build
@@ -223,7 +246,7 @@ cd extensions/opencloud && npm run build
 
 Expected: `dist/web-app-sharebridge.js` created. No TypeScript errors.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git add extensions/opencloud/
@@ -1158,6 +1181,24 @@ describe('CreateShareModal', () => {
       'Failed to create ShareBridge share'
     )
   })
+
+  it('shows TURN warning when relay-only checked and turnAvailable is false', async () => {
+    const wrapper = mount(CreateShareModal, {
+      props: { filePath: '/file.pdf', turnAvailable: false },
+    })
+    await wrapper.find('[data-testid="relay-only-input"]').setValue(true)
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('[data-testid="turn-warning"]').exists()).toBe(true)
+  })
+
+  it('hides TURN warning when turnAvailable is true', async () => {
+    const wrapper = mount(CreateShareModal, {
+      props: { filePath: '/file.pdf', turnAvailable: true },
+    })
+    await wrapper.find('[data-testid="relay-only-input"]').setValue(true)
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('[data-testid="turn-warning"]').exists()).toBe(false)
+  })
 })
 ```
 
@@ -1207,6 +1248,14 @@ Expected: FAIL — `Cannot find module './CreateShareModal.vue'`
         Relay mode only
       </label>
 
+      <div
+        v-if="form.relayOnly && !turnAvailable"
+        data-testid="turn-warning"
+        class="warning"
+      >
+        Warning: Relay mode requires a TURN server. Shares may not connect without one.
+      </div>
+
       <div v-if="error" data-testid="error-msg" class="error">{{ error }}</div>
 
       <div class="actions">
@@ -1227,7 +1276,10 @@ import { useOpenCloudAPI } from '../composables/useOpenCloudAPI'
 import { useAgentClient } from '../composables/useAgentClient'
 import type { CreateShareResult } from '../types'
 
-const props = defineProps<{ filePath: string }>()
+const props = defineProps<{
+  filePath: string
+  turnAvailable?: boolean  // from parent (ShareBridgePanel fetches settings)
+}>()
 const emit = defineEmits<{
   close: []
   created: [result: CreateShareResult]
@@ -1290,7 +1342,7 @@ const submit = async () => {
 cd extensions/opencloud && npm test
 ```
 
-Expected: all 8 tests PASS
+Expected: all 10 tests PASS
 
 - [ ] **Step 5: Commit**
 
@@ -1329,7 +1381,7 @@ vi.mock('../composables/useAgentClient', () => ({
   useAgentClient: () => ({
     listShares: mockListShares,
     revokeShare: mockRevokeShare,
-    getSettings: mockGetSettings,
+    getSettings: mockGetSettings,  // called in onMounted for turnAvailable
   }),
 }))
 vi.mock('./ShareCard.vue', () => ({ default: { template: '<div data-testid="share-card">{{ share.code }}</div>', props: ['share'] } }))
@@ -1524,6 +1576,7 @@ Expected: FAIL — `Cannot find module './ShareBridgePanel.vue'`
       <CreateShareModal
         v-if="showModal"
         :file-path="resource.path"
+        :turn-available="turnAvailable"
         @close="showModal = false"
         @created="handleCreated"
       />
@@ -1551,12 +1604,13 @@ const props = defineProps<{
 }>()
 
 const settings = useSettingsStore()
-const { listShares, revokeShare } = useAgentClient()
+const { listShares, revokeShare, getSettings } = useAgentClient()
 
 const shares = ref<Share[]>([])
 const loading = ref(false)
 const error = ref('')
 const showModal = ref(false)
+const turnAvailable = ref(false)
 
 const loadShares = async () => {
   loading.value = true
@@ -1580,9 +1634,16 @@ const handleCreated = async (_result: CreateShareResult) => {
   await loadShares()
 }
 
-onMounted(() => {
+onMounted(async () => {
   if (settings.isConfigured) {
     loadShares()
+    // Fetch settings for TURN availability (best-effort; non-fatal if it fails)
+    try {
+      const agentSettings = await getSettings()
+      turnAvailable.value = agentSettings.turn_available
+    } catch {
+      // leave turnAvailable as false — TURN warning will show if relay-only selected
+    }
   }
 })
 </script>
