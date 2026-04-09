@@ -339,6 +339,47 @@ func TestCORSMiddleware_HandlesOptionsPreflight(t *testing.T) {
 		t.Errorf("OPTIONS preflight: expected 204, got %d", rec.Code)
 	}
 }
+
+func TestCORSMiddleware_Returns503WhenAllowedHostEmpty(t *testing.T) {
+	cfg := &config.Config{AllowedHost: "", AgentAPIKey: "key"}
+	ws := newMiddlewareTestServer(cfg)
+
+	handler := ws.corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("GET", "/api/v1/shares", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 when AllowedHost empty, got %d", rec.Code)
+	}
+}
+
+func TestV1Chain_CORSHeadersPresentOn401(t *testing.T) {
+	// Verifies CORS headers are set even when auth fails.
+	// Browsers inspect CORS headers on all responses including error ones.
+	cfg := &config.Config{AllowedHost: "opencloud.example.com", AgentAPIKey: "sb_agent_correct"}
+	ws := newMiddlewareTestServer(cfg)
+
+	chain := ws.corsMiddleware(ws.apiKeyMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("GET", "/api/v1/shares", nil)
+	req.Header.Set("X-API-Key", "wrong-key")
+	rec := httptest.NewRecorder()
+	chain(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rec.Code)
+	}
+	origin := rec.Header().Get("Access-Control-Allow-Origin")
+	if origin != "https://opencloud.example.com" {
+		t.Errorf("CORS origin missing on 401 response: got %q", origin)
+	}
+}
 ```
 
 - [ ] **Step 2: Run tests to confirm they fail**
@@ -400,15 +441,27 @@ func (ws *WebServer) SetDaemon(d *daemon.Daemon) {
 ```go
 // corsMiddleware sets CORS headers for /api/v1/ endpoints.
 // The allowed origin is "https://" + AllowedHost from config.
+// Returns 503 if daemon is not ready or AllowedHost is not configured —
+// the extension cannot function without a known origin to restrict CORS to.
 // Handles OPTIONS preflight by returning 204 without calling next.
 func (ws *WebServer) corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if ws.daemon != nil {
-			cfg := ws.daemon.GetConfig()
-			if cfg.AllowedHost != "" {
-				w.Header().Set("Access-Control-Allow-Origin", "https://"+cfg.AllowedHost)
-			}
+		if ws.daemon == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"Service unavailable","code":"UNAVAILABLE"}`))
+			return
 		}
+		cfg := ws.daemon.GetConfig()
+		if cfg.AllowedHost == "" {
+			// Without AllowedHost we cannot set a safe CORS origin.
+			// Reject rather than use a wildcard.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"AllowedHost not configured","code":"MISCONFIGURED"}`))
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "https://"+cfg.AllowedHost)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 		if r.Method == http.MethodOptions {
@@ -1080,6 +1133,8 @@ git commit -m "feat(11b): extract oc:fileid in CreateSession, propagate through 
 ---
 
 ### Task 7: Implement v1 JSON handlers
+
+**Note:** The handlers call `derivePublicURL(signalingURL, code)` — this function already exists in `agent/internal/web/handlers.go:177`. It is in the same `web` package, so it can be called directly from `api_v1.go` without any import.
 
 **Files:**
 - Modify: `agent/internal/web/api_v1.go`
