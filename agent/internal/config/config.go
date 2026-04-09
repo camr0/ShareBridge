@@ -32,8 +32,9 @@ type Config struct {
 
 // Manager handles configuration persistence.
 type Manager struct {
-	filePath string
-	config   *Config
+	filePath           string
+	config             *Config
+	agentAPIKeyFromEnv bool // if true, don't persist AgentAPIKey to disk
 }
 
 // NewManager creates a new config manager, loading from the config file.
@@ -126,6 +127,7 @@ func (m *Manager) load() (*Config, error) {
 	}
 	if v := os.Getenv("SHAREBRIDGE_AGENT_API_KEY"); v != "" {
 		cfg.AgentAPIKey = v
+		m.agentAPIKeyFromEnv = true
 	}
 	if v := os.Getenv("UI_PORT"); v != "" {
 		cfg.UIPort = getEnvInt("UI_PORT", cfg.UIPort)
@@ -152,8 +154,16 @@ func (m *Manager) save() error {
 		return err
 	}
 
+	// Copy config to avoid modifying the in-memory value
+	cfg := *m.config
+
+	// Don't persist AgentAPIKey if it came from env var (allows temporary overrides)
+	if m.agentAPIKeyFromEnv {
+		cfg.AgentAPIKey = ""
+	}
+
 	// Marshal with indentation for readability
-	data, err := json.MarshalIndent(m.config, "", "  ")
+	data, err := json.MarshalIndent(&cfg, "", "  ")
 	if err != nil {
 		return err
 	}

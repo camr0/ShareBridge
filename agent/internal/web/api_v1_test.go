@@ -199,6 +199,37 @@ func TestV1CreateShare_RequiresShareURL(t *testing.T) {
 	}
 }
 
+func TestV1CreateShare_UsesDefaultExpiryWhenZero(t *testing.T) {
+	cfg := &config.Config{
+		AgentAPIKey:   "key",
+		SignalingURL:  "wss://share.example.com",
+		DefaultExpiry: 72, // 72 hours default
+	}
+	ws, mock := newV1TestServer(cfg)
+
+	// Send expiry_hours: 0, should fall back to DefaultExpiry (72h)
+	body := `{"share_url":"https://oc.example.com/s/xyz","expiry_hours":0}`
+	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	ws.v1CreateShareHandler(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify the session was created with 72h expiry (within tolerance)
+	session := mock.GetSession("code-1")
+	if session == nil {
+		t.Fatal("session not created")
+	}
+	// Allow 1 minute tolerance for test execution time
+	expectedExpiry := time.Now().Add(72 * time.Hour)
+	if session.ExpiresAt.Before(expectedExpiry.Add(-time.Minute)) || session.ExpiresAt.After(expectedExpiry.Add(time.Minute)) {
+		t.Errorf("ExpiresAt = %v, want ~%v (72h from now)", session.ExpiresAt, expectedExpiry)
+	}
+}
+
 func TestV1RevokeShare_DeletesSession(t *testing.T) {
 	cfg := &config.Config{AgentAPIKey: "key"}
 	ws, mock := newV1TestServer(cfg)

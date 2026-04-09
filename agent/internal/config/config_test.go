@@ -408,3 +408,41 @@ func TestNewManager_EnvOverridesAgentAPIKey(t *testing.T) {
 		t.Errorf("AgentAPIKey = %q, want my-custom-key", m.Get().AgentAPIKey)
 	}
 }
+
+func TestNewManager_EnvAgentAPIKeyNotPersisted(t *testing.T) {
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("HOME", homeDir)
+	defer os.Unsetenv("HOME")
+	os.Setenv("SHAREBRIDGE_AGENT_API_KEY", "temp-key")
+	defer os.Unsetenv("SHAREBRIDGE_AGENT_API_KEY")
+
+	// Create manager with env override
+	m1, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	// Save config (simulating settings page save)
+	cfg := m1.Get()
+	cfg.DefaultExpiry = 48 // modify something to trigger save
+	if err := m1.Save(cfg); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Read the file directly to verify AgentAPIKey was NOT persisted
+	configPath := filepath.Join(homeDir, ".sharebridge", "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config file: %v", err)
+	}
+	if strings.Contains(string(data), "temp-key") {
+		t.Errorf("config file contains env-provided AgentAPIKey 'temp-key', should not be persisted")
+	}
+	if strings.Contains(string(data), "agent_api_key") {
+		t.Errorf("config file contains agent_api_key field, should be omitted when from env")
+	}
+}
