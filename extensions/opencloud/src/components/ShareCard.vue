@@ -22,13 +22,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onUnmounted } from 'vue'
 import type { Share } from '../types'
 
 const props = defineProps<{ share: Share }>()
 const emit = defineEmits<{ revoke: [code: string] }>()
 
 const copied = ref(false)
+let copyTimer: ReturnType<typeof setTimeout> | null = null
+
 const formattedExpiry = computed(() =>
   new Date(props.share.expires_at).toLocaleDateString()
 )
@@ -36,6 +38,11 @@ const formattedExpiry = computed(() =>
 const copyLink = async () => {
   await navigator.clipboard.writeText(props.share.public_url)
   copied.value = true
-  setTimeout(() => { copied.value = false }, 2000)
+  if (copyTimer) clearTimeout(copyTimer)
+  copyTimer = setTimeout(() => { copied.value = false }, 2000)
 }
+
+onUnmounted(() => {
+  if (copyTimer) clearTimeout(copyTimer)
+})
 </script>
