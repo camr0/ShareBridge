@@ -311,29 +311,38 @@ Build an OpenCloud web extension that adds a ShareBridge panel to the right side
 5. Extension calls agent to create ShareBridge share
 6. Panel shows new share with copyable link
 
-### Extension Architecture
+### Repository Structure
+
+ShareBridge is a monorepo. The OpenCloud extension lives in a dedicated `extensions/` directory:
 
 ```
-web-app-sharebridge/
-├── src/
-│   ├── index.ts              # App registration
-│   ├── App.vue               # Main component
-│   ├── components/
-│   │   ├── ShareBridgePanel.vue    # Sidebar panel
-│   │   ├── ShareCard.vue           # Individual share display
-│   │   └── CreateShareModal.vue    # Share creation form
-│   ├── composables/
-│   │   ├── useAgentClient.ts       # Agent API client
-│   │   ├── useOpenCloudAPI.ts      # OCS Share API client
-│   │   └── useShareBridgeExtension.ts # Main extension logic
-│   └── stores/
-│       └── settings.ts             # Agent URL + API key (localStorage)
-├── l10n/
-│   └── translations.json
-├── package.json
-├── vite.config.ts
-└── manifest.json
+ShareBridge/
+├── agent/                    # Go agent (existing)
+├── signaling-server/         # Go signaling server (existing)
+├── extensions/
+│   └── opencloud/           # OpenCloud web extension (Slice 11c)
+│       ├── src/
+│       │   ├── index.ts              # App registration
+│       │   ├── App.vue               # Main component
+│       │   ├── components/
+│       │   │   ├── ShareBridgePanel.vue    # Sidebar panel
+│       │   │   ├── ShareCard.vue           # Individual share display
+│       │   │   └── CreateShareModal.vue    # Share creation form
+│       │   ├── composables/
+│       │   │   ├── useAgentClient.ts       # Agent API client
+│       │   │   ├── useOpenCloudAPI.ts      # OCS Share API client
+│       │   │   └── useShareBridgeExtension.ts # Main extension logic
+│       │   └── stores/
+│       │       └── settings.ts             # Agent URL + API key (localStorage)
+│       ├── l10n/
+│       │   └── translations.json
+│       ├── package.json
+│       ├── vite.config.ts
+│       └── manifest.json
+└── docs/
 ```
+
+Future extensions (e.g., Nextcloud, Immich) would go in `extensions/nextcloud/`, `extensions/immich/`, etc.
 
 ### Extension Registration
 
