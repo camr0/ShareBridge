@@ -45,7 +45,7 @@ Add a simple API key auth mechanism for JSON endpoints, separate from the existi
 
 **Generation:**
 - On first run, agent generates a random 32-character API key
-- Stored in `~/.opencloudshare/config.json` (or via `SHAREBRIDGE_AGENT_API_KEY` env var)
+- Stored in `~/.sharebridge/config.json` (or via `SHAREBRIDGE_AGENT_API_KEY` env var)
 - Displayed in Agent UI settings page for user to copy
 
 **Format:**
