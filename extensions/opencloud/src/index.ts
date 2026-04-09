@@ -1,3 +1,4 @@
+import { ref } from 'vue'
 import { defineWebApplication } from '@opencloud-eu/web-pkg'
 
 export default defineWebApplication({
@@ -7,7 +8,7 @@ export default defineWebApplication({
         name: 'ShareBridge',
         id: 'web-app-sharebridge',
       },
-      extensions: [],
+      extensions: ref([]),
     }
   },
 })
