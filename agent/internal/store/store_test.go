@@ -505,3 +505,33 @@ func TestAgentID_GeneratedOnFirstLoad(t *testing.T) {
 		t.Fatalf("AgentID changed after restart: %q -> %q", id1, id2)
 	}
 }
+
+func TestSaveSession_PersistsFileID(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
+
+	st, err := New()
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	session := SessionEntry{
+		Code:         "test-code",
+		ShareURL:     "https://opencloud.example.com/s/abc",
+		FileID:       "storage-users-1$abc!def",
+		ExpiresAt:    time.Now().Add(24 * time.Hour),
+		MaxDownloads: 5,
+		CreatedAt:    time.Now(),
+	}
+	if err := st.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession() error: %v", err)
+	}
+
+	loaded := st.GetSession("test-code")
+	if loaded == nil {
+		t.Fatal("GetSession() returned nil")
+	}
+	if loaded.FileID != "storage-users-1$abc!def" {
+		t.Errorf("FileID = %q, want storage-users-1$abc!def", loaded.FileID)
+	}
+}
