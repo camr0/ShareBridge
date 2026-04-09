@@ -740,6 +740,46 @@ func TestLoadSessionsFromStoreFiltersExpired(t *testing.T) {
 	}
 }
 
+// TestLoadSessionsFromStore_PreservesFileID tests that FileID is loaded from store.
+func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
+	cfg := &config.Config{
+		SignalingURL: "ws://localhost:8080",
+		APIKey:       "test-api-key",
+		AllowedHost:  "opencloud.example.com",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+
+	st.SaveSession(store.SessionEntry{
+		Code:         "file-code",
+		ShareURL:     "https://opencloud.example.com/s/abc123",
+		FileID:       "storage-1$foo!bar",
+		ExpiresAt:    time.Now().Add(24 * time.Hour),
+		MaxDownloads: 10,
+		CreatedAt:    time.Now().Add(-1 * time.Hour),
+	})
+
+	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
+		return preferredCode, true, nil
+	}
+
+	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	if err != nil {
+		t.Fatalf("NewWithSignaling() error: %v", err)
+	}
+
+	d.loadSessionsFromStore(context.Background())
+
+	session := d.GetSession("file-code")
+	if session == nil {
+		t.Fatal("session not found after loadSessionsFromStore")
+	}
+	if session.FileID != "storage-1$foo!bar" {
+		t.Errorf("FileID = %q, want storage-1$foo!bar", session.FileID)
+	}
+}
+
 // TestSetWebServer tests setting the web server.
 func TestSetWebServer(t *testing.T) {
 	cfg := &config.Config{

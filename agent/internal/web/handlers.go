@@ -22,13 +22,14 @@ type pageData struct {
 
 // configData holds configuration data for templates.
 type configData struct {
-	SignalingURL      string
-	APIKey            string
-	AllowedHost       string
-	DefaultExpiry     int
+	SignalingURL        string
+	APIKey              string
+	AllowedHost         string
+	AgentAPIKey         string
+	DefaultExpiry       int
 	DefaultMaxDownloads int
-	DefaultRelayOnly  bool
-	UIPort            int
+	DefaultRelayOnly    bool
+	UIPort              int
 }
 
 type envManagedData struct {
@@ -103,13 +104,14 @@ func (ws *WebServer) settingsHandler(w http.ResponseWriter, r *http.Request) {
 	if ws.daemon != nil {
 		c := ws.daemon.GetConfig()
 		cfg = configData{
-			SignalingURL:      c.SignalingURL,
-			APIKey:            c.APIKey,
-			AllowedHost:       c.AllowedHost,
-			DefaultExpiry:     c.DefaultExpiry,
+			SignalingURL:        c.SignalingURL,
+			APIKey:              c.APIKey,
+			AllowedHost:         c.AllowedHost,
+			AgentAPIKey:         c.AgentAPIKey,
+			DefaultExpiry:       c.DefaultExpiry,
 			DefaultMaxDownloads: c.DefaultMaxDownloads,
-			DefaultRelayOnly:  c.DefaultRelayOnly,
-			UIPort:            c.UIPort,
+			DefaultRelayOnly:    c.DefaultRelayOnly,
+			UIPort:              c.UIPort,
 		}
 	}
 

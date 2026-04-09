@@ -12,17 +12,33 @@ import (
 	"strings"
 	"time"
 
+	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/daemon"
 )
 
 //go:embed static/* templates/*
 var embeddedFS embed.FS
 
+// daemonProvider is the set of Daemon methods used by web handlers.
+// Using an interface allows web package tests to inject a mock.
+type daemonProvider interface {
+	ListSessions() []*daemon.Session
+	GetSession(code string) *daemon.Session
+	GetConfig() *config.Config
+	CreateSession(ctx context.Context, shareURL, password string, expiry time.Duration, maxDownloads int, relayOnly bool) (string, error)
+	RevokeSession(code string) error
+	HasTURN() bool
+	IsConnected() bool
+	GetUptime() time.Duration
+	GetConfigPath() string
+	SaveConfig(cfg *config.Config) error
+}
+
 // WebServer provides the HTTP server for the agent admin UI.
 // It serves embedded static assets and templates, with CSRF protection
 // and optional basic auth.
 type WebServer struct {
-	daemon     *daemon.Daemon
+	daemon     daemonProvider
 	port       int
 	password   string
 	server     *http.Server
@@ -33,7 +49,7 @@ type WebServer struct {
 // NewWebServer creates a new web server instance.
 // It parses the layout template and creates a static file sub-filesystem.
 // The daemon reference may be nil initially and set later via SetDaemon.
-func NewWebServer(d *daemon.Daemon, port int, password string) (*WebServer, error) {
+func NewWebServer(d daemonProvider, port int, password string) (*WebServer, error) {
 	// Parse the layout template
 	layoutTmpl, err := template.ParseFS(embeddedFS, "templates/layout.html")
 	if err != nil {
@@ -154,6 +170,19 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 
 	// Inline quota for share form (returns HTML, same style)
 	mux.HandleFunc("GET /api/quota-inline", ws.quotaInlineHandler)
+
+	// v1 JSON API — CORS headers + API key auth on every request
+	v1 := func(h http.HandlerFunc) http.HandlerFunc {
+		return ws.corsMiddleware(ws.apiKeyMiddleware(h))
+	}
+	mux.HandleFunc("GET /api/v1/shares", v1(ws.v1ListSharesHandler))
+	mux.HandleFunc("POST /api/v1/shares", v1(ws.v1CreateShareHandler))
+	mux.HandleFunc("DELETE /api/v1/shares/{code}", v1(ws.v1RevokeShareHandler))
+	mux.HandleFunc("GET /api/v1/settings", v1(ws.v1SettingsHandler))
+	// OPTIONS preflight — CORS only, no auth (browsers don't send auth on preflight)
+	mux.HandleFunc("OPTIONS /api/v1/{path...}", ws.corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
 }
 
 // csrfMiddleware verifies a browser-set request header on non-GET requests.
@@ -193,4 +222,59 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 		// Password validated - username ignored
 		next.ServeHTTP(w, r)
 	})
+}
+
+// corsMiddleware sets CORS headers for /api/v1/ endpoints.
+// The allowed origin is "https://" + AllowedHost from config.
+// Returns 503 if daemon is not ready or AllowedHost is not configured —
+// the extension cannot function without a known origin to restrict CORS to.
+// Handles OPTIONS preflight by returning 204 without calling next.
+func (ws *WebServer) corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if ws.daemon == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"Service unavailable","code":"UNAVAILABLE"}`))
+			return
+		}
+		cfg := ws.daemon.GetConfig()
+		if cfg.AllowedHost == "" {
+			// Without AllowedHost we cannot set a safe CORS origin.
+			// Reject rather than use a wildcard.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"AllowedHost not configured","code":"MISCONFIGURED"}`))
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "https://"+cfg.AllowedHost)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// apiKeyMiddleware checks X-API-Key against AgentAPIKey in config.
+// Returns 401 JSON on mismatch; 503 JSON if daemon is not ready.
+func (ws *WebServer) apiKeyMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if ws.daemon == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"Service unavailable","code":"UNAVAILABLE"}`))
+			return
+		}
+		cfg := ws.daemon.GetConfig()
+		provided := r.Header.Get("X-API-Key")
+		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.AgentAPIKey)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"Invalid API key","code":"UNAUTHORIZED"}`))
+			return
+		}
+		next(w, r)
+	}
 }

@@ -16,14 +16,15 @@ import (
 
 // SessionEntry represents a single share session with full metadata.
 type SessionEntry struct {
-	Code        string    `json:"code"`
-	ShareURL    string    `json:"share_url"`
-	Password    string    `json:"password,omitempty"`
-	ExpiresAt   time.Time `json:"expires_at"`
-	MaxDownloads int      `json:"max_downloads,omitempty"` // 0 = unlimited
-	Downloads   int       `json:"downloads"`
-	RelayOnly   bool      `json:"relay_only"`
-	CreatedAt   time.Time `json:"created_at"`
+	Code         string    `json:"code"`
+	ShareURL     string    `json:"share_url"`
+	FileID       string    `json:"file_id,omitempty"`
+	Password     string    `json:"password,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	MaxDownloads int       `json:"max_downloads,omitempty"` // 0 = unlimited
+	Downloads    int       `json:"downloads"`
+	RelayOnly    bool      `json:"relay_only"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type storeData struct {

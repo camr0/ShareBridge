@@ -110,4 +110,31 @@
         </tbody>
     </table>
 </article>
+
+<article>
+    <header>
+        <hgroup>
+            <h2>Extension Configuration</h2>
+            <p>Use these values to configure the ShareBridge OpenCloud extension</p>
+        </hgroup>
+    </header>
+    <table>
+        <tbody>
+            <tr>
+                <th>Agent URL</th>
+                <td><code>http://localhost:{{.Config.UIPort}}</code></td>
+            </tr>
+            <tr>
+                <th>API Key</th>
+                <td>
+                    <span id="ext-api-key">{{.Config.AgentAPIKey}}</span>
+                    <button type="button"
+                        onclick="navigator.clipboard.writeText(document.getElementById('ext-api-key').textContent).then(() => { this.textContent='Copied!'; setTimeout(() => this.textContent='Copy', 2000); })">
+                        Copy
+                    </button>
+                </td>
+            </tr>
+        </tbody>
+    </table>
+</article>
 {{end}}

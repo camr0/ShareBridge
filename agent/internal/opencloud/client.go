@@ -20,6 +20,7 @@ const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
     <D:getcontenttype/>
     <D:resourcetype/>
     <oc:checksums/>
+    <oc:fileid/>
   </D:prop>
 </D:propfind>`
 
@@ -146,6 +147,44 @@ func (c *Client) GetFile(name string, w io.Writer) (int64, error) {
 	return io.Copy(w, resp.Body)
 }
 
+// GetRootFileID returns the oc:fileid of the share root via a Depth:0 PROPFIND.
+// Returns empty string without error if oc:fileid is absent (graceful degradation
+// for older OpenCloud versions or non-OpenCloud WebDAV servers).
+func (c *Client) GetRootFileID() (string, error) {
+	req, err := http.NewRequest("PROPFIND", c.baseURL, strings.NewReader(propfindBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Depth", "0")
+	req.Header.Set("Authorization", c.authHeader())
+	req.Header.Set("Content-Type", "application/xml")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("PROPFIND request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		return "", fmt.Errorf("PROPFIND returned %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	var ms multistatus
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		return "", fmt.Errorf("parse XML: %w", err)
+	}
+
+	if len(ms.Response) == 0 {
+		return "", nil
+	}
+	return ms.Response[0].Propstat.Prop.FileID, nil
+}
+
 // PROPFIND response parsing types
 type multistatus struct {
 	XMLName  xml.Name   `xml:"multistatus"`
@@ -164,6 +203,7 @@ type response struct {
 			Checksums struct {
 				Checksum string `xml:"checksum"`
 			} `xml:"checksums"`
+			FileID string `xml:"fileid"` // oc:fileid, matched by local name
 		} `xml:"prop"`
 	} `xml:"propstat"`
 }
