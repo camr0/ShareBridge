@@ -84,17 +84,18 @@ Existing HTMX endpoints (`/api/shares`, `/api/share-form`, etc.) remain unchange
 
 ### CORS Configuration
 
-Allow all origins for simplicity (agent is localhost-only in most cases):
+Restrict to the configured OpenCloud origin using `AllowedHost`:
 
 ```go
-w.Header().Set("Access-Control-Allow-Origin", "*")
+origin := "https://" + cfg.AllowedHost
+w.Header().Set("Access-Control-Allow-Origin", origin)
 w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 ```
 
 Handle OPTIONS preflight requests.
 
-**Alternative:** For stricter security, restrict to the configured OpenCloud origin (requires agent to know the OpenCloud host). This could be added later if needed.
+This reuses the existing `AllowedHost` config already used for SSRF protection.
 
 ### Error Responses
 
