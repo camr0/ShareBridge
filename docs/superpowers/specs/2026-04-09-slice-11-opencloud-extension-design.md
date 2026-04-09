@@ -154,7 +154,7 @@ We need to track which OpenCloud file each share belongs to.
 
 ### Solution
 
-Extract `oc:fileid` from OpenCloud WebDAV PROPFIND and store it with each session.
+Agent extracts `oc:fileid` from OpenCloud WebDAV PROPFIND on the share root and stores it with each session.
 
 ### FileID Tracking
 
@@ -165,10 +165,35 @@ storage-users-1$some-admin-user-id-0000-000000000000!d7f8a9b2-c3e4-5f6a-7b8c-9d0
 
 This is a globally unique identifier for each file/folder.
 
-**Where it comes from:**
-- The extension has access to `oc:fileid` from OpenCloud's internal resource state
-- Extension passes `file_id` when creating a share
-- Agent stores it with the session
+**How the agent extracts it:**
+1. When creating a session, the agent does a PROPFIND on the share root
+2. The response includes `oc:fileid` for the shared item
+3. Agent extracts and stores it with the session
+
+**Why this approach:**
+- Works for both Agent UI (manual share URL entry) and extension
+- User never needs to know or enter fileID
+- Single source of truth (the PROPFIND response)
+
+**PROPFIND update:**
+
+The agent's PROPFIND body needs to request `oc:fileid`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <D:prop>
+    <D:getcontentlength/>
+    <D:getcontenttype/>
+    <D:resourcetype/>
+    <oc:checksums/>
+    <oc:fileid/>
+  </D:prop>
+</D:propfind>
+```
+
+**Graceful degradation:**
+If `oc:fileid` is not returned (e.g., older OpenCloud versions), the agent stores an empty `file_id`. Shares without fileID won't be filtered per-file, but will still appear in the "all shares" list.
 
 ### API Endpoints
 
@@ -204,14 +229,12 @@ If `file_id` is omitted, returns all active shares.
 
 #### POST /api/v1/shares
 
-Create a new ShareBridge share.
+Create a new ShareBridge share. The agent extracts `file_id` and `file_name` from the share URL via WebDAV PROPFIND.
 
 **Request:**
 ```json
 {
   "share_url": "https://opencloud.example.com/s/XYZ789",
-  "file_id": "storage-users-1$...",
-  "file_name": "report.pdf",
   "password": "optional",
   "expiry_hours": 24,
   "max_downloads": 10,
@@ -224,6 +247,7 @@ Create a new ShareBridge share.
 {
   "code": "abc123",
   "public_url": "https://share.example.com/s/abc123",
+  "file_name": "report.pdf",
   "expires_at": "2026-04-10T12:00:00Z"
 }
 ```
@@ -279,9 +303,10 @@ type Session struct {
 ### Changes to Agent
 
 **Files to modify:**
+- `agent/internal/opencloud/client.go` - Update PROPFIND body to include `oc:fileid`, parse and return FileID from response
 - `agent/internal/store/store.go` - Add `FileID`, `FileName` to Session struct
-- `agent/internal/daemon/daemon.go` - Update CreateSession to accept file_id/file_name
-- `agent/internal/web/api_v1.go` - Implement JSON handlers
+- `agent/internal/daemon/daemon.go` - Extract FileID/FileName from PROPFIND response, store with session
+- `agent/internal/web/api_v1.go` - Implement JSON handlers (file_id/file_name not in request, extracted by agent)
 
 ---
 
