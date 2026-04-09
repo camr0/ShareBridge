@@ -1683,6 +1683,76 @@ git commit -m "feat: add ShareBridgePanel sidebar component (11c)"
 
 ---
 
+## Task 9: Installation Instructions
+
+**Files:**
+- Create: `extensions/opencloud/INSTALL.md`
+
+- [ ] **Step 1: Create INSTALL.md**
+
+```markdown
+# ShareBridge OpenCloud Extension — Installation
+
+## Prerequisites
+
+- OpenCloud instance (v5.0+)
+- ShareBridge agent running (see agent setup)
+- Agent URL and API key from the agent settings page (`http://localhost:7878/settings`)
+
+## Build
+
+```bash
+cd extensions/opencloud
+npm install
+npm run build
+```
+
+Output: `dist/web-app-sharebridge.js`
+
+## Install in OpenCloud
+
+1. Copy `dist/web-app-sharebridge.js` to your OpenCloud web apps directory:
+
+   ```bash
+   cp dist/web-app-sharebridge.js /path/to/opencloud/apps/web-app-sharebridge.js
+   ```
+
+   The exact path depends on your OpenCloud deployment. For Docker:
+   ```bash
+   docker cp dist/web-app-sharebridge.js <container>:/var/lib/opencloud/web/apps/
+   ```
+
+2. Register the app in OpenCloud's `web.yaml` (or equivalent config):
+
+   ```yaml
+   web:
+     apps:
+       - web-app-sharebridge
+   ```
+
+3. Restart OpenCloud web service.
+
+## Configure the Extension
+
+1. Open OpenCloud and select any file.
+2. Click the ShareBridge panel in the right sidebar.
+3. Enter your agent URL (e.g. `http://localhost:7878`) and API key.
+4. Click Save. The panel will load your existing shares.
+
+## Verify
+
+Select a file → ShareBridge panel appears → "Create ShareBridge Share" button is visible.
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add extensions/opencloud/INSTALL.md
+git commit -m "docs: add OpenCloud extension installation instructions (11c)"
+```
+
+---
+
 ## Self-Review
 
 ### Spec coverage
@@ -1708,6 +1778,7 @@ git commit -m "feat: add ShareBridgePanel sidebar component (11c)"
 | Error: agent unreachable | Task 8 |
 | Error: invalid API key | Not explicitly tested — covered by 401 from agent (UI gets error state) |
 | `manifest.json` | Task 1 |
+| Installation instructions | Task 9 |
 
 **Gap:** The spec mentions an error for "Invalid API key" distinct from "agent unreachable". Both map to fetch errors from the agent client. The panel currently lumps all errors as "Cannot connect to ShareBridge agent". To exactly match the spec, `listShares` could inspect the HTTP status code (401 vs network error) and return a typed error. This is an enhancement; the current implementation is safe and functional. Add this refinement if needed.
 
