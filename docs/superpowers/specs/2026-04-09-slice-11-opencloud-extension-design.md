@@ -429,22 +429,23 @@ export const useShareBridgeExtension = () => {
 export const useAgentClient = () => {
   const settings = useSettingsStore()
 
-  const headers = {
+  // Use getter to ensure fresh API key after settings changes
+  const getHeaders = () => ({
     'Content-Type': 'application/json',
     'X-API-Key': settings.apiKey,
-  }
+  })
 
   const listShares = async (fileId?: string) => {
     const url = new URL(`${settings.agentUrl}/api/v1/shares`)
     if (fileId) url.searchParams.set('file_id', fileId)
-    const response = await fetch(url.toString(), { headers })
+    const response = await fetch(url.toString(), { headers: getHeaders() })
     return response.json()
   }
 
   const createShare = async (params: CreateShareParams) => {
     const response = await fetch(`${settings.agentUrl}/api/v1/shares`, {
       method: 'POST',
-      headers,
+      headers: getHeaders(),
       body: JSON.stringify(params),
     })
     return response.json()
@@ -453,12 +454,12 @@ export const useAgentClient = () => {
   const revokeShare = async (code: string) => {
     await fetch(`${settings.agentUrl}/api/v1/shares/${code}`, {
       method: 'DELETE',
-      headers,
+      headers: getHeaders(),
     })
   }
 
   const getSettings = async () => {
-    const response = await fetch(`${settings.agentUrl}/api/v1/settings`, { headers })
+    const response = await fetch(`${settings.agentUrl}/api/v1/settings`, { headers: getHeaders() })
     return response.json()
   }
 
@@ -507,13 +508,19 @@ export const useOpenCloudAPI = () => {
     path: string,
     options: { password?: string; expireDate?: string } = {}
   ): Promise<string> => {
+    // Build params, filtering out undefined values
+    const params = new URLSearchParams({
+      shareType: '3',
+      path,
+      ...(options.password ? { password: options.password } : {}),
+      ...(options.expireDate ? { expireDate: options.expireDate } : {}),
+    })
+
+    // Note: verify exact SDK call signature against @opencloud-eu/web-pkg
+    // May be clientService.httpAuthenticated.post() or similar
     const response = await clientService.ocs.post(
       '/apps/files_sharing/api/v1/shares',
-      new URLSearchParams({
-        shareType: '3',
-        path,
-        ...options
-      })
+      params
     )
     // Extract share URL from OCS response
     return response.ocs.data.url
