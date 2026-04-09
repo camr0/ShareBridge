@@ -3,8 +3,32 @@
     <!-- Not configured -->
     <div v-if="!settings.isConfigured" data-testid="configure-prompt" class="configure-prompt">
       <p>Configure ShareBridge to get started.</p>
-      <p>
-        Add your Agent URL and API Key in the OpenCloud extension settings.<br />
+      <label>
+        Agent URL
+        <input
+          data-testid="agent-url-input"
+          v-model="configForm.agentUrl"
+          type="url"
+          placeholder="http://localhost:7878"
+        />
+      </label>
+      <label>
+        API Key
+        <input
+          data-testid="api-key-input"
+          v-model="configForm.apiKey"
+          type="password"
+          placeholder="sb_agent_..."
+        />
+      </label>
+      <button
+        data-testid="save-config-btn"
+        @click="saveConfig"
+        :disabled="!configForm.agentUrl || !configForm.apiKey"
+      >
+        Save
+      </button>
+      <p class="hint">
         Find these values in the ShareBridge agent settings page.
       </p>
     </div>
@@ -54,16 +78,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import { useSettingsStore } from '../stores/settings'
 import { useAgentClient } from '../composables/useAgentClient'
 import ShareCard from './ShareCard.vue'
 import CreateShareModal from './CreateShareModal.vue'
 import type { Share, CreateShareResult } from '../types'
 
-// The resource prop comes from OpenCloud's sidebar context.
-// Field name 'resource' should be verified against your @opencloud-eu/web-pkg version.
-// It may be passed differently depending on how the SidebarPanelExtension mounts the component.
 const props = defineProps<{
   resource: {
     id: string    // OpenCloud fileId (oc:fileid)
@@ -80,6 +101,25 @@ const loading = ref(false)
 const error = ref('')
 const showModal = ref(false)
 const turnAvailable = ref(false)
+
+const configForm = reactive({
+  agentUrl: '',
+  apiKey: '',
+})
+
+const saveConfig = async () => {
+  if (!configForm.agentUrl || !configForm.apiKey) return
+  settings.setAgentUrl(configForm.agentUrl)
+  settings.setApiKey(configForm.apiKey)
+  // Load shares and fetch settings after saving config
+  await loadShares()
+  try {
+    const agentSettings = await getSettings()
+    turnAvailable.value = agentSettings.turn_available
+  } catch {
+    // leave turnAvailable as false
+  }
+}
 
 const loadShares = async () => {
   loading.value = true

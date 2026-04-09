@@ -60,6 +60,45 @@ describe('ShareBridgePanel', () => {
     expect(wrapper.find('[data-testid="configure-prompt"]').exists()).toBe(true)
   })
 
+  it('renders agent URL and API key inputs in configure prompt', async () => {
+    const wrapper = mount(ShareBridgePanel, { props: defaultProps })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('[data-testid="agent-url-input"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="api-key-input"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="save-config-btn"]').exists()).toBe(true)
+  })
+
+  it('save button is disabled when fields are empty', async () => {
+    const wrapper = mount(ShareBridgePanel, { props: defaultProps })
+    await wrapper.vm.$nextTick()
+    const saveBtn = wrapper.find('[data-testid="save-config-btn"]')
+    expect((saveBtn.element as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('save button is enabled when both fields are filled', async () => {
+    const wrapper = mount(ShareBridgePanel, { props: defaultProps })
+    await wrapper.vm.$nextTick()
+    await wrapper.find('[data-testid="agent-url-input"]').setValue('http://localhost:7878')
+    await wrapper.find('[data-testid="api-key-input"]').setValue('sb_agent_test')
+    const saveBtn = wrapper.find('[data-testid="save-config-btn"]')
+    expect((saveBtn.element as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('save config persists to localStorage and loads shares', async () => {
+    mockListShares.mockResolvedValue([makeShare('abc123')])
+    const wrapper = mount(ShareBridgePanel, { props: defaultProps })
+    await wrapper.vm.$nextTick()
+    await wrapper.find('[data-testid="agent-url-input"]').setValue('http://localhost:7878')
+    await wrapper.find('[data-testid="api-key-input"]').setValue('sb_agent_test')
+    await wrapper.find('[data-testid="save-config-btn"]').trigger('click')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await wrapper.vm.$nextTick()
+
+    expect(localStorage.getItem('sharebridge_agent_url')).toBe('http://localhost:7878')
+    expect(localStorage.getItem('sharebridge_api_key')).toBe('sb_agent_test')
+    expect(wrapper.find('[data-testid="share-list"]').exists()).toBe(true)
+  })
+
   it('shows share list when configured', async () => {
     localStorage.setItem('sharebridge_agent_url', 'http://localhost:7878')
     localStorage.setItem('sharebridge_api_key', 'sb_agent_key')
