@@ -52,18 +52,119 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// v1ListSharesHandler returns all active sessions as JSON.
+// Optional ?file_id= query param filters by oc:fileid.
 func (ws *WebServer) v1ListSharesHandler(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	if ws.daemon == nil {
+		writeJSON(w, http.StatusServiceUnavailable, v1ErrorResponse{"Service unavailable", "UNAVAILABLE"})
+		return
+	}
+
+	fileID := r.URL.Query().Get("file_id")
+	cfg := ws.daemon.GetConfig()
+
+	shares := []v1ShareResponse{}
+	for _, session := range ws.daemon.ListSessions() {
+		if fileID != "" && session.FileID != fileID {
+			continue
+		}
+		shares = append(shares, v1ShareResponse{
+			Code:         session.Code,
+			PublicURL:    derivePublicURL(cfg.SignalingURL, session.Code),
+			ShareURL:     session.ShareURL,
+			FileID:       session.FileID,
+			Downloads:    session.Downloads,
+			MaxDownloads: session.MaxDownloads,
+			RelayOnly:    session.RelayOnly,
+			ExpiresAt:    session.ExpiresAt,
+			CreatedAt:    session.CreatedAt,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, shares)
 }
 
+// v1CreateShareHandler creates a new ShareBridge share from a JSON request body.
 func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	if ws.daemon == nil {
+		writeJSON(w, http.StatusServiceUnavailable, v1ErrorResponse{"Service unavailable", "UNAVAILABLE"})
+		return
+	}
+
+	var req v1CreateShareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"Invalid request body", "BAD_REQUEST"})
+		return
+	}
+	if req.ShareURL == "" {
+		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"share_url is required", "BAD_REQUEST"})
+		return
+	}
+
+	expiryHours := req.ExpiryHours
+	if expiryHours <= 0 {
+		expiryHours = ws.daemon.GetConfig().DefaultExpiry
+	}
+
+	code, err := ws.daemon.CreateSession(
+		r.Context(),
+		req.ShareURL,
+		req.Password,
+		time.Duration(expiryHours)*time.Hour,
+		req.MaxDownloads,
+		req.RelayOnly,
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, v1ErrorResponse{err.Error(), "INTERNAL_ERROR"})
+		return
+	}
+
+	session := ws.daemon.GetSession(code)
+	if session == nil {
+		writeJSON(w, http.StatusInternalServerError, v1ErrorResponse{"Session not found after creation", "INTERNAL_ERROR"})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, v1CreateShareResponse{
+		Code:      session.Code,
+		PublicURL: derivePublicURL(ws.daemon.GetConfig().SignalingURL, session.Code),
+		ExpiresAt: session.ExpiresAt,
+	})
 }
 
+// v1RevokeShareHandler revokes a share by code, returning 204 on success.
 func (ws *WebServer) v1RevokeShareHandler(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	if ws.daemon == nil {
+		writeJSON(w, http.StatusServiceUnavailable, v1ErrorResponse{"Service unavailable", "UNAVAILABLE"})
+		return
+	}
+
+	code := r.PathValue("code")
+	if code == "" {
+		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"Missing share code", "BAD_REQUEST"})
+		return
+	}
+
+	if err := ws.daemon.RevokeSession(code); err != nil {
+		writeJSON(w, http.StatusNotFound, v1ErrorResponse{"Share not found", "NOT_FOUND"})
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
+// v1SettingsHandler returns the agent's default share configuration for the extension form.
 func (ws *WebServer) v1SettingsHandler(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	if ws.daemon == nil {
+		writeJSON(w, http.StatusServiceUnavailable, v1ErrorResponse{"Service unavailable", "UNAVAILABLE"})
+		return
+	}
+
+	cfg := ws.daemon.GetConfig()
+	writeJSON(w, http.StatusOK, v1SettingsResponse{
+		DefaultExpiryHours:  cfg.DefaultExpiry,
+		DefaultMaxDownloads: cfg.DefaultMaxDownloads,
+		DefaultRelayOnly:    cfg.DefaultRelayOnly,
+		TURNAvailable:       ws.daemon.HasTURN(),
+	})
 }
