@@ -9,7 +9,8 @@
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
-    "@opencloud-eu/web-pkg": "^6.1.0"
+    "@opencloud-eu/web-pkg": "^6.1.0",
+    "vue3-gettext": "4.0.0-beta.1"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.0",

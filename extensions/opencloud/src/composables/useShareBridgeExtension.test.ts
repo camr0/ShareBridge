@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { useShareBridgeExtension } from './useShareBridgeExtension'
 
-vi.mock('@opencloud-eu/web-pkg', () => ({
+vi.mock('vue3-gettext', () => ({
   useGettext: () => ({ $gettext: (s: string) => s }),
 }))
 
@@ -28,7 +28,7 @@ describe('useShareBridgeExtension', () => {
   it('isVisible returns true for single file selection', () => {
     const { extension } = useShareBridgeExtension()
     const { isVisible } = extension.value.panel
-    expect(isVisible({ items: [{ id: '1', path: '/file.txt' }] })).toBe(true)
+    expect(isVisible({ items: [{ id: '1' }] })).toBe(true)
   })
 
   it('isVisible returns false for multiple file selection', () => {
@@ -51,6 +51,6 @@ describe('useShareBridgeExtension', () => {
 
   it('isRoot returns true', () => {
     const { extension } = useShareBridgeExtension()
-    expect(extension.value.panel.isRoot()).toBe(true)
+    expect(extension.value.panel.isRoot?.({})).toBe(true)
   })
 })
