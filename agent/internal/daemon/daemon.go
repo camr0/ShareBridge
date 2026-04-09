@@ -68,6 +68,7 @@ type SignalingClientInterface interface {
 type Session struct {
 	Code         string
 	ShareURL     string
+	FileID       string // oc:fileid extracted via WebDAV PROPFIND on share root
 	Password     string
 	ExpiresAt    time.Time
 	MaxDownloads int
@@ -241,6 +242,13 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 		return "", fmt.Errorf("create WebDAV client: %w", err)
 	}
 
+	// Extract oc:fileid from share root — best-effort; empty string on failure.
+	fileID, err := webdavClient.GetRootFileID()
+	if err != nil {
+		log.Printf("warning: could not extract fileID for %s: %v", shareURL, err)
+		fileID = ""
+	}
+
 	// Register with signaling server (no preferred code for new sessions)
 	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly)
 	if err != nil {
@@ -251,6 +259,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 	session := &Session{
 		Code:         code,
 		ShareURL:     shareURL,
+		FileID:       fileID,
 		Password:     password,
 		ExpiresAt:    now.Add(expiryDuration),
 		MaxDownloads: maxDownloads,
@@ -270,6 +279,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 	if err := d.store.SaveSession(store.SessionEntry{
 		Code:         code,
 		ShareURL:     shareURL,
+		FileID:       fileID,
 		Password:     password,
 		ExpiresAt:    session.ExpiresAt,
 		MaxDownloads: maxDownloads,
@@ -676,6 +686,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		session := &Session{
 			Code:         code,
 			ShareURL:     entry.ShareURL,
+			FileID:       entry.FileID,
 			Password:     entry.Password,
 			ExpiresAt:    entry.ExpiresAt,
 			MaxDownloads: entry.MaxDownloads,
