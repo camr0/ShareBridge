@@ -850,19 +850,33 @@ export default defineWebApplication({
 })
 ```
 
-- [ ] **Step 6: Verify build still passes**
+- [ ] **Step 6: Create placeholder ShareBridgePanel.vue to satisfy the import**
+
+```vue
+<!-- extensions/opencloud/src/components/ShareBridgePanel.vue -->
+<template>
+  <div class="sharebridge-panel" />
+</template>
+
+<script setup lang="ts">
+// Placeholder — full implementation in Task 8
+</script>
+```
+
+- [ ] **Step 7: Verify build still passes**
 
 ```bash
 cd extensions/opencloud && npm run build
 ```
 
-Expected: builds successfully (will warn about missing ShareBridgePanel.vue — that's expected, create an empty placeholder if needed)
+Expected: builds successfully, no TypeScript errors, no missing module warnings.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add extensions/opencloud/src/composables/useShareBridgeExtension.ts \
         extensions/opencloud/src/composables/useShareBridgeExtension.test.ts \
+        extensions/opencloud/src/components/ShareBridgePanel.vue \
         extensions/opencloud/src/index.ts
 git commit -m "feat: register OpenCloud sidebar panel extension (11c)"
 ```
@@ -1319,7 +1333,7 @@ vi.mock('../composables/useAgentClient', () => ({
   }),
 }))
 vi.mock('./ShareCard.vue', () => ({ default: { template: '<div data-testid="share-card">{{ share.code }}</div>', props: ['share'] } }))
-vi.mock('./CreateShareModal.vue', () => ({ default: { template: '<div data-testid="create-modal" />', props: ['filePath'], emits: ['close', 'created'] } }))
+vi.mock('./CreateShareModal.vue', () => ({ default: { name: 'CreateShareModal', template: '<div data-testid="create-modal" />', props: ['filePath'], emits: ['close', 'created'] } }))
 
 const makeShare = (code = 'abc123'): Share => ({
   code,
