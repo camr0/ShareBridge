@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -37,19 +38,10 @@ func TestNewManager_CreatesConfigDir(t *testing.T) {
 		t.Errorf("UIPort = %d, want 7878", cfg.UIPort)
 	}
 
-	// Directory is created on save, not on load
-	// Verify it doesn't exist yet
+	// AgentAPIKey auto-generation saves config during NewManager(), creating the directory.
 	configDir := filepath.Join(homeDir, ".sharebridge")
-	if _, err := os.Stat(configDir); !os.IsNotExist(err) {
-		t.Error("config directory should not exist before save")
-	}
-
-	// After save, directory should exist
-	if err := m.Save(cfg); err != nil {
-		t.Fatalf("Save() error = %v", err)
-	}
 	if _, err := os.Stat(configDir); os.IsNotExist(err) {
-		t.Error("config directory was not created after save")
+		t.Error("config directory should be created by AgentAPIKey auto-generation during NewManager()")
 	}
 }
 
@@ -346,5 +338,73 @@ func TestGetEnvInt(t *testing.T) {
 				t.Errorf("getEnvInt() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNewManager_GeneratesAgentAPIKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("HOME", homeDir)
+	defer os.Unsetenv("HOME")
+
+	m, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	key := m.Get().AgentAPIKey
+	if !strings.HasPrefix(key, "sb_agent_") {
+		t.Errorf("AgentAPIKey %q does not start with sb_agent_", key)
+	}
+	// "sb_agent_" (9) + 32 hex chars from 16 random bytes
+	if len(key) != 41 {
+		t.Errorf("AgentAPIKey %q: expected length 41, got %d", key, len(key))
+	}
+}
+
+func TestNewManager_PersistsAgentAPIKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("HOME", homeDir)
+	defer os.Unsetenv("HOME")
+
+	m1, err := NewManager()
+	if err != nil {
+		t.Fatalf("first NewManager() error = %v", err)
+	}
+	key1 := m1.Get().AgentAPIKey
+
+	m2, err := NewManager()
+	if err != nil {
+		t.Fatalf("second NewManager() error = %v", err)
+	}
+	if m2.Get().AgentAPIKey != key1 {
+		t.Errorf("AgentAPIKey changed across restarts: %q -> %q", key1, m2.Get().AgentAPIKey)
+	}
+}
+
+func TestNewManager_EnvOverridesAgentAPIKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("HOME", homeDir)
+	defer os.Unsetenv("HOME")
+	os.Setenv("SHAREBRIDGE_AGENT_API_KEY", "my-custom-key")
+	defer os.Unsetenv("SHAREBRIDGE_AGENT_API_KEY")
+
+	m, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	if m.Get().AgentAPIKey != "my-custom-key" {
+		t.Errorf("AgentAPIKey = %q, want my-custom-key", m.Get().AgentAPIKey)
 	}
 }
