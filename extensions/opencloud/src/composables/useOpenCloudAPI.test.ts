@@ -5,7 +5,7 @@ import { useOpenCloudAPI } from './useOpenCloudAPI'
 const mockOcsPost = vi.fn()
 vi.mock('@opencloud-eu/web-pkg', () => ({
   useClientService: () => ({
-    ocs: { post: mockOcsPost },
+    httpAuthenticated: { post: mockOcsPost },
   }),
 }))
 
@@ -16,7 +16,7 @@ describe('useOpenCloudAPI', () => {
 
   it('createPublicShare POSTs to OCS shares endpoint with shareType=3 and path', async () => {
     mockOcsPost.mockResolvedValue({
-      ocs: { data: { url: 'https://opencloud.example.com/s/XYZ789' } },
+      data: { ocs: { data: { url: 'https://opencloud.example.com/s/XYZ789' } } },
     })
 
     const { createPublicShare } = useOpenCloudAPI()
@@ -34,7 +34,7 @@ describe('useOpenCloudAPI', () => {
 
   it('createPublicShare includes password when provided', async () => {
     mockOcsPost.mockResolvedValue({
-      ocs: { data: { url: 'https://opencloud.example.com/s/ABC' } },
+      data: { ocs: { data: { url: 'https://opencloud.example.com/s/ABC' } } },
     })
 
     const { createPublicShare } = useOpenCloudAPI()
@@ -46,7 +46,7 @@ describe('useOpenCloudAPI', () => {
 
   it('createPublicShare includes expireDate when provided', async () => {
     mockOcsPost.mockResolvedValue({
-      ocs: { data: { url: 'https://opencloud.example.com/s/ABC' } },
+      data: { ocs: { data: { url: 'https://opencloud.example.com/s/ABC' } } },
     })
 
     const { createPublicShare } = useOpenCloudAPI()
@@ -58,7 +58,7 @@ describe('useOpenCloudAPI', () => {
 
   it('createPublicShare omits password and expireDate when not provided', async () => {
     mockOcsPost.mockResolvedValue({
-      ocs: { data: { url: 'https://opencloud.example.com/s/ABC' } },
+      data: { ocs: { data: { url: 'https://opencloud.example.com/s/ABC' } } },
     })
 
     const { createPublicShare } = useOpenCloudAPI()
