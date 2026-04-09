@@ -215,7 +215,6 @@ X-API-Key: sb_agent_xxx
     "public_url": "https://share.example.com/s/abc123",
     "share_url": "https://opencloud.example.com/s/XYZ789",
     "file_id": "storage-users-1$...",
-    "file_name": "report.pdf",
     "downloads": 3,
     "max_downloads": 10,
     "relay_only": false,
@@ -229,7 +228,7 @@ If `file_id` is omitted, returns all active shares.
 
 #### POST /api/v1/shares
 
-Create a new ShareBridge share. The agent extracts `file_id` and `file_name` from the share URL via WebDAV PROPFIND.
+Create a new ShareBridge share. The agent extracts `file_id` from the share URL via WebDAV PROPFIND.
 
 **Request:**
 ```json
@@ -247,7 +246,6 @@ Create a new ShareBridge share. The agent extracts `file_id` and `file_name` fro
 {
   "code": "abc123",
   "public_url": "https://share.example.com/s/abc123",
-  "file_name": "report.pdf",
   "expires_at": "2026-04-10T12:00:00Z"
 }
 ```
@@ -283,14 +281,13 @@ Get default settings for the share form.
 
 ### Session Storage Changes
 
-Add `file_id` and `file_name` to session struct:
+Add `file_id` to session struct:
 
 ```go
 type Session struct {
     Code          string        `json:"code"`
     ShareURL      string        `json:"share_url"`
     FileID        string        `json:"file_id"`
-    FileName      string        `json:"file_name"`
     Password      string        `json:"password,omitempty"`
     Downloads     int           `json:"downloads"`
     MaxDownloads  int           `json:"max_downloads"`
@@ -300,13 +297,15 @@ type Session struct {
 }
 ```
 
+Note: `file_name` is not stored — it's derived dynamically from the share when needed.
+
 ### Changes to Agent
 
 **Files to modify:**
 - `agent/internal/opencloud/client.go` - Update PROPFIND body to include `oc:fileid`, parse and return FileID from response
-- `agent/internal/store/store.go` - Add `FileID`, `FileName` to Session struct
-- `agent/internal/daemon/daemon.go` - Extract FileID/FileName from PROPFIND response, store with session
-- `agent/internal/web/api_v1.go` - Implement JSON handlers (file_id/file_name not in request, extracted by agent)
+- `agent/internal/store/store.go` - Add `FileID` to Session struct
+- `agent/internal/daemon/daemon.go` - Extract FileID from PROPFIND response, store with session
+- `agent/internal/web/api_v1.go` - Implement JSON handlers
 
 ---
 
