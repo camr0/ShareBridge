@@ -84,7 +84,7 @@ Existing HTMX endpoints (`/api/shares`, `/api/share-form`, etc.) remain unchange
 
 ### CORS Configuration
 
-Allow all origins for flexibility (agent is localhost-only in most cases):
+Allow all origins for simplicity (agent is localhost-only in most cases):
 
 ```go
 w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -93,6 +93,8 @@ w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 ```
 
 Handle OPTIONS preflight requests.
+
+**Alternative:** For stricter security, restrict to the configured OpenCloud origin (requires agent to know the OpenCloud host). This could be added later if needed.
 
 ### Error Responses
 
@@ -464,7 +466,18 @@ export const useAgentClient = () => {
 
 ### OpenCloud OCS API Integration
 
-The extension uses OpenCloud's internal OCS Share API to create public shares.
+The extension uses OpenCloud's OCS Share API to create public shares.
+
+**Endpoint:**
+```
+POST /ocs/v2.php/apps/files_sharing/api/v1/shares
+```
+
+**Parameters:**
+- `shareType`: `3` (public link)
+- `path`: The file/folder path (obtained from the selected resource)
+- `password`: Optional share password
+- `expireDate`: Optional expiration date (format: `YYYY-MM-DD`)
 
 ```typescript
 // composables/useOpenCloudAPI.ts
@@ -472,18 +485,26 @@ export const useOpenCloudAPI = () => {
   const clientService = useClientService()
 
   const createPublicShare = async (
-    fileId: string,
+    path: string,
     options: { password?: string; expireDate?: string } = {}
   ): Promise<string> => {
-    // Use OpenCloud's Graph API or OCS Share API
-    // Returns the public share URL
+    const response = await clientService.ocs.post(
+      '/apps/files_sharing/api/v1/shares',
+      {
+        shareType: 3, // Public link
+        path,
+        ...options
+      }
+    )
+    // Response contains share URL in ocs.data.url
+    return response.ocs.data.url
   }
 
   return { createPublicShare }
 }
 ```
 
-**Note:** OpenCloud extensions have access to the authenticated client service, so they can call internal APIs without separate auth.
+**Note:** OpenCloud extensions have access to the authenticated `clientService`, so they can call internal APIs without separate auth.
 
 ### Settings Storage
 
