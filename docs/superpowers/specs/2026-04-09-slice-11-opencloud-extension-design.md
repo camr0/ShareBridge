@@ -412,6 +412,7 @@ export const useShareBridgeExtension = () => {
       isRoot: () => true,
       isVisible: ({ items }) => {
         // Only show for single file/folder selection
+        // Note: verify field name against SDK version (may be 'resources' instead of 'items')
         return items?.length === 1
       },
     },
@@ -474,11 +475,28 @@ The extension uses OpenCloud's OCS Share API to create public shares.
 POST /ocs/v2.php/apps/files_sharing/api/v1/shares
 ```
 
-**Parameters:**
-- `shareType`: `3` (public link)
-- `path`: The file/folder path (obtained from the selected resource)
-- `password`: Optional share password
-- `expireDate`: Optional expiration date (format: `YYYY-MM-DD`)
+**Request body:**
+```
+shareType=3&path=/Documents/report.pdf&password=optional&expireDate=2026-04-10
+```
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `shareType` | Yes | `3` for public link |
+| `path` | Yes | File/folder path from selected resource |
+| `password` | No | Share password |
+| `expireDate` | No | Expiration date (`YYYY-MM-DD` format) |
+
+**Response:**
+```json
+{
+  "ocs": {
+    "data": {
+      "url": "https://opencloud.example.com/s/XYZ789"
+    }
+  }
+}
+```
 
 ```typescript
 // composables/useOpenCloudAPI.ts
@@ -491,13 +509,13 @@ export const useOpenCloudAPI = () => {
   ): Promise<string> => {
     const response = await clientService.ocs.post(
       '/apps/files_sharing/api/v1/shares',
-      {
-        shareType: 3, // Public link
+      new URLSearchParams({
+        shareType: '3',
         path,
         ...options
-      }
+      })
     )
-    // Response contains share URL in ocs.data.url
+    // Extract share URL from OCS response
     return response.ocs.data.url
   }
 
