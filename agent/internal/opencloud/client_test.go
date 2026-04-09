@@ -1,6 +1,9 @@
 package opencloud
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -218,5 +221,76 @@ func TestParsePROPFIND_EmptyFolder(t *testing.T) {
 	}
 	if len(files) != 0 {
 		t.Fatalf("expected 0 entries for empty folder, got %d", len(files))
+	}
+}
+
+func TestGetRootFileID_ReturnsFileID(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "PROPFIND" {
+			t.Errorf("expected PROPFIND, got %s", r.Method)
+		}
+		if r.Header.Get("Depth") != "0" {
+			t.Errorf("expected Depth: 0, got %q", r.Header.Get("Depth"))
+		}
+		w.WriteHeader(http.StatusMultiStatus)
+		w.Write([]byte(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/public-files/testtoken/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <oc:fileid>storage-users-1$abc!def</oc:fileid>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`))
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New(srv.URL+"/s/testtoken", host, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	fileID, err := c.GetRootFileID()
+	if err != nil {
+		t.Fatalf("GetRootFileID() error: %v", err)
+	}
+	if fileID != "storage-users-1$abc!def" {
+		t.Errorf("FileID = %q, want storage-users-1$abc!def", fileID)
+	}
+}
+
+func TestGetRootFileID_EmptyWhenMissing(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMultiStatus)
+		w.Write([]byte(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/public-files/testtoken/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`))
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New(srv.URL+"/s/testtoken", host, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	fileID, err := c.GetRootFileID()
+	if err != nil {
+		t.Fatalf("GetRootFileID() should not error when oc:fileid is absent: %v", err)
+	}
+	if fileID != "" {
+		t.Errorf("expected empty fileID for missing oc:fileid, got %q", fileID)
 	}
 }
