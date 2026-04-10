@@ -1,10 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { useShareBridgeExtension } from './useShareBridgeExtension'
 
-vi.mock('vue3-gettext', () => ({
-  useGettext: () => ({ $gettext: (s: string) => s }),
-}))
-
 // ShareBridgePanel imported inside the composable; mock it as a placeholder
 vi.mock('../components/ShareBridgePanel.vue', () => ({ default: {} }))
 
