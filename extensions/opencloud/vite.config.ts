@@ -11,7 +11,7 @@ export default defineConfig({
       fileName: () => 'web-app-sharebridge.js',
     },
     rollupOptions: {
-      external: ['vue', '@opencloud-eu/web-pkg', 'pinia'],
+      external: ['vue', '@opencloud-eu/web-pkg', 'pinia', 'vue3-gettext'],
     },
   },
   test: {
