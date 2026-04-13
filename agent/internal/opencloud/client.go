@@ -147,15 +147,42 @@ func (c *Client) GetFile(name string, w io.Writer) (int64, error) {
 	return io.Copy(w, resp.Body)
 }
 
-// GetRootFileID returns the oc:fileid of the share root via a Depth:0 PROPFIND.
+// GetRootFileID returns the oc:fileid of the shared resource (file or folder).
+//
+// OpenCloud 6 behaves differently depending on share type:
+//   - Folder share: Depth:0 root entry has oc:fileid directly.
+//   - Single-file share: Depth:0 root is a virtual collection with no oc:fileid;
+//     oc:fileid is only available on the child file at Depth:1.
+//
+// Algorithm: try Depth:0 first; if the root has a fileid it's a folder share and
+// we return immediately. Otherwise fall back to Depth:1 and return the first
+// non-collection child's fileid.
+//
 // Returns empty string without error if oc:fileid is absent (graceful degradation
 // for older OpenCloud versions or non-OpenCloud WebDAV servers).
 func (c *Client) GetRootFileID() (string, error) {
+	// Step 1: Depth:0 — covers folder shares.
+	fileID, err := c.propfindFileID("0")
+	if err != nil {
+		return "", err
+	}
+	if fileID != "" {
+		return fileID, nil
+	}
+
+	// Step 2: Depth:1 — covers single-file shares; skip root, read first child.
+	return c.propfindFileID("1")
+}
+
+// propfindFileID issues a PROPFIND with the given Depth and returns the first
+// non-empty oc:fileid found. For Depth:0 it checks the root entry; for Depth:1
+// it skips hrefs ending in "/" and returns the first child's fileid.
+func (c *Client) propfindFileID(depth string) (string, error) {
 	req, err := http.NewRequest("PROPFIND", c.baseURL, strings.NewReader(propfindBody))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Depth", "0")
+	req.Header.Set("Depth", depth)
 	req.Header.Set("Authorization", c.authHeader())
 	req.Header.Set("Content-Type", "application/xml")
 
@@ -179,10 +206,16 @@ func (c *Client) GetRootFileID() (string, error) {
 		return "", fmt.Errorf("parse XML: %w", err)
 	}
 
-	if len(ms.Response) == 0 {
-		return "", nil
+	for _, r := range ms.Response {
+		href, _ := url.PathUnescape(r.Href)
+		if depth == "1" && strings.HasSuffix(href, "/") {
+			continue // skip collection root when scanning children
+		}
+		if fileID := r.Propstat.Prop.FileID; fileID != "" {
+			return fileID, nil
+		}
 	}
-	return ms.Response[0].Propstat.Prop.FileID, nil
+	return "", nil
 }
 
 // PROPFIND response parsing types

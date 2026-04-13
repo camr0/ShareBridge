@@ -1,0 +1,229 @@
+<template>
+  <Teleport to="body">
+  <div class="sb-modal-overlay" @click.self="emit('close')">
+      <div class="sb-modal">
+        <h2>Create ShareBridge Share</h2>
+
+        <label>
+          Expiry
+          <select data-testid="expiry-select" v-model.number="form.expiryHours">
+            <option :value="1">1 hour</option>
+            <option :value="24">24 hours</option>
+            <option :value="168">7 days</option>
+            <option :value="720">30 days</option>
+          </select>
+        </label>
+
+        <label>
+          Password (optional)
+          <input data-testid="password-input" v-model="form.password" type="password" />
+        </label>
+
+        <label>
+          Max Downloads (0 = unlimited)
+          <input
+            data-testid="max-downloads-input"
+            v-model.number="form.maxDownloads"
+            type="number"
+            min="0"
+          />
+        </label>
+
+        <label>
+          <input data-testid="relay-only-input" v-model="form.relayOnly" type="checkbox" />
+          Relay mode only
+        </label>
+
+        <div
+          v-if="form.relayOnly && !turnAvailable"
+          data-testid="turn-warning"
+          class="sb-warning"
+        >
+          Warning: Relay mode requires a TURN server. Shares may not connect without one.
+        </div>
+
+        <div v-if="error" data-testid="error-msg" class="sb-error">{{ error }}</div>
+
+        <div class="sb-actions">
+          <button data-testid="cancel-btn" @click="emit('close')" :disabled="loading">
+            Cancel
+          </button>
+          <button data-testid="create-btn" @click="submit" :disabled="loading">
+            {{ loading ? 'Creating...' : 'Create Share' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+</template>
+
+<script setup lang="ts">
+import { ref, reactive, computed } from 'vue'
+import { useClientService } from '@opencloud-eu/web-pkg'
+import { useAgentClient } from '../composables/useAgentClient'
+import type { Resource } from '@opencloud-eu/web-client'
+import type { CreateShareResult } from '../types'
+
+const props = defineProps<{
+  resource: Resource
+  turnAvailable?: boolean  // from parent (ShareBridgePanel fetches settings)
+}>()
+const emit = defineEmits<{
+  close: []
+  created: [result: CreateShareResult]
+}>()
+
+const clientService = useClientService()
+const { createShare } = useAgentClient()
+
+const loading = ref(false)
+const error = ref('')
+const form = reactive({
+  expiryHours: 24,
+  password: '',
+  maxDownloads: 0,
+  relayOnly: false,
+})
+
+const expiryDate = computed(() => {
+  const date = new Date()
+  date.setHours(date.getHours() + form.expiryHours)
+  return date.toISOString() // full ISO 8601 e.g. "2026-04-12T10:30:00.000Z"
+})
+
+const submit = async () => {
+  loading.value = true
+  error.value = ''
+
+  const driveId = props.resource.storageId!
+  const itemId = props.resource.id
+  const tempPassword = 'ShareBridge123$'
+
+  let shareUrl: string
+  let permId: string
+  try {
+    // Step 1: create the link with a temporary password (server enforces password on creation)
+    const linkShare = await clientService.graphAuthenticated.permissions.createLink(
+      driveId,
+      itemId,
+      {
+        type: 'view',
+        password: tempPassword,
+        expirationDateTime: expiryDate.value,
+      }
+    )
+    shareUrl = linkShare.webUrl
+    permId = linkShare.id
+  } catch (err: unknown) {
+    const axiosErr = err as { response?: { data?: unknown; status?: number } }
+    const msg = (axiosErr?.response?.data as { error?: { message?: string } })?.error?.message
+    error.value = msg ? `OpenCloud: ${msg}` : 'Failed to create OpenCloud share.'
+    loading.value = false
+    return
+  }
+
+  try {
+    // Step 2: remove the temporary password so the link is public
+    await clientService.graphAuthenticated.permissions.setPermissionPassword(
+      driveId,
+      itemId,
+      permId,
+      { password: '' }
+    )
+  } catch {
+    // Non-fatal: link still works but has a temp password. Continue.
+  }
+
+  try {
+    const result = await createShare({
+      share_url: shareUrl,
+      password: form.password || undefined,
+      expiry_hours: form.expiryHours,
+      max_downloads: form.maxDownloads,
+      relay_only: form.relayOnly,
+})
+    loading.value = false
+    emit('created', result)
+  } catch {
+    error.value = 'Failed to create ShareBridge share. Please try again.'
+    loading.value = false
+  }
+}
+
+</script>
+
+<style>
+.sb-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+.sb-modal {
+  background: var(--oc-color-background-default, #1e1e1e);
+  border: 1px solid var(--oc-color-border, #444);
+  border-radius: 8px;
+  padding: 24px;
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sb-modal h2 {
+  margin: 0 0 4px;
+  font-size: 1.1em;
+}
+.sb-modal label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.9em;
+}
+.sb-modal input, .sb-modal select {
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--oc-color-border, #555);
+  background: var(--oc-color-background-muted, #2a2a2a);
+  color: var(--oc-color-text-default, #fff);
+}
+.sb-warning {
+  background: rgba(255, 180, 0, 0.15);
+  border: 1px solid rgba(255, 180, 0, 0.4);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 0.85em;
+  color: #ffb400;
+}
+.sb-error {
+  background: rgba(220, 50, 50, 0.15);
+  border: 1px solid rgba(220, 50, 50, 0.4);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 0.85em;
+  color: #ff6b6b;
+}
+.sb-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.sb-actions button {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--oc-color-border, #555);
+  background: var(--oc-color-background-muted, #333);
+  color: var(--oc-color-text-default, #fff);
+  cursor: pointer;
+}
+.sb-actions button:last-child {
+  background: var(--oc-color-swatch-primary-default, #0070f3);
+  border-color: var(--oc-color-swatch-primary-default, #0070f3);
+}
+.sb-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+</style>
