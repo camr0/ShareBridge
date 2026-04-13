@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShareBridge — A secure bridge for your private cloud</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      line-height: 1.6;
+    }
+    a { color: #89b4fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* Hero */
+    .hero {
+      padding: 80px 20px 60px;
+      text-align: center;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    .hero-logo { font-size: 48px; margin-bottom: 20px; }
+    .hero h1 {
+      font-size: 2.8rem;
+      font-weight: 700;
+      margin-bottom: 16px;
+      line-height: 1.2;
+    }
+    .hero p {
+      font-size: 1.25rem;
+      color: #a6adc8;
+      margin-bottom: 40px;
+    }
+    .hero-buttons {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      padding: 14px 32px;
+      font-size: 1.1rem;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+    }
+    .btn-primary {
+      background: #89b4fa;
+      color: #1e1e2e;
+    }
+    .btn-primary:hover { opacity: 0.9; }
+    .btn-secondary {
+      background: transparent;
+      color: #89b4fa;
+      border: 2px solid #89b4fa;
+    }
+    .btn-secondary:hover { background: rgba(137, 180, 250, 0.1); }
+
+    /* Trust badges */
+    .trust-badges {
+      padding: 40px 20px;
+      text-align: center;
+      border-top: 1px solid #313244;
+      border-bottom: 1px solid #313244;
+    }
+    .trust-badges-inner {
+      display: flex;
+      justify-content: center;
+      gap: 40px;
+      flex-wrap: wrap;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    .trust-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Sections */
+    section { padding: 80px 20px; }
+    section h2 {
+      font-size: 2rem;
+      text-align: center;
+      margin-bottom: 60px;
+    }
+    .container {
+      max-width: 1000px;
+      margin: 0 auto;
+    }
+
+    /* How it works */
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 32px;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .step {
+      text-align: center;
+      padding: 32px;
+      background: #313244;
+      border-radius: 12px;
+    }
+    .step-icon { font-size: 2.5rem; margin-bottom: 16px; }
+    .step h3 { margin-bottom: 12px; }
+    .step p { color: #a6adc8; font-size: 0.95rem; }
+
+    /* Architecture */
+    .arch-section {
+      background: #181825;
+      padding: 60px 20px;
+    }
+    .arch-section h2 { margin-bottom: 40px; }
+    .arch-mode { margin-bottom: 48px; }
+    .arch-mode h3 {
+      font-size: 1.2rem;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    .arch-mode.direct h3 { color: #a6e3a1; }
+    .arch-mode.relay h3 { color: #fab387; }
+
+    .arch-flow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding: 32px;
+      background: #1e1e2e;
+      border-radius: 16px;
+      overflow-x: auto;
+    }
+    .arch-flow.direct { border: 2px solid #a6e3a1; }
+    .arch-flow.relay { border: 2px solid #fab387; }
+
+    .arch-node {
+      text-align: center;
+      flex-shrink: 0;
+    }
+    .arch-node .icon { font-size: 2.5rem; }
+    .arch-node .label {
+      font-size: 0.85rem;
+      color: #a6adc8;
+      margin-top: 8px;
+    }
+
+    .arch-arrow {
+      color: #a6e3a1;
+      font-size: 1rem;
+      font-weight: 500;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+    .arch-flow.relay .arch-arrow { color: #fab387; font-size: 0.9rem; }
+
+    .arch-note {
+      text-align: center;
+      margin-top: 16px;
+      padding: 12px 24px;
+      background: rgba(250, 179, 135, 0.1);
+      border-radius: 8px;
+    }
+    .arch-note span { color: #fab387; font-size: 0.9rem; }
+
+    .arch-signaling {
+      padding: 16px;
+      margin-top: 8px;
+    }
+    .arch-signaling-inner {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .arch-signaling .node { opacity: 0.5; }
+    .arch-signaling .node .icon { font-size: 1.5rem; }
+    .arch-signaling .node .label { font-size: 0.7rem; color: #6c7086; margin-top: 4px; }
+    .arch-signaling .line {
+      color: #6c7086;
+      font-size: 0.8rem;
+      border-bottom: 2px dashed #6c7086;
+      padding-bottom: 4px;
+    }
+
+    .arch-summary {
+      text-align: center;
+      color: #a6e3a1;
+      margin-top: 48px;
+      font-size: 0.95rem;
+    }
+
+    /* Features */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 24px;
+    }
+    .feature-card {
+      padding: 24px;
+      background: #313244;
+      border-radius: 12px;
+    }
+    .feature-card h3 {
+      color: #89b4fa;
+      margin-bottom: 12px;
+    }
+    .feature-card.relay h3 { color: #fab387; }
+    .feature-card p { color: #a6adc8; font-size: 0.95rem; }
+
+    /* FAQ */
+    .faq-section { background: #181825; }
+    .faq-section h2 { margin-bottom: 40px; }
+    .faq-list {
+      max-width: 700px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .faq-item {
+      padding: 20px 24px;
+      background: #313244;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .faq-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .faq-item span { font-weight: 500; }
+
+    /* Footer */
+    footer {
+      padding: 80px 20px;
+      text-align: center;
+      border-top: 1px solid #313244;
+    }
+    footer h2 {
+      font-size: 1.8rem;
+      margin-bottom: 24px;
+    }
+    .footer-links {
+      color: #6c7086;
+      font-size: 0.9rem;
+      margin-top: 40px;
+    }
+    .footer-links a { margin: 0 12px; }
+    .footer-copy {
+      color: #6c7086;
+      font-size: 0.85rem;
+      margin-top: 24px;
+    }
+
+    @media (max-width: 600px) {
+      .hero h1 { font-size: 2rem; }
+      .arch-flow { padding: 20px; gap: 8px; }
+      .arch-node .icon { font-size: 2rem; }
+      .arch-arrow { font-size: 0.8rem; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Hero Section -->
+  <header class="hero">
+    <div class="hero-logo">🌉</div>
+    <h1>A secure bridge for your private cloud</h1>
+    <p>ShareBridge connects your devices directly to your OpenCloud or Nextcloud — your files never touch our servers.</p>
+    <div class="hero-buttons">
+      <a href="/join" class="btn btn-primary">Join a Share</a>
+      <a href="/login" class="btn btn-secondary">Start Sharing</a>
+    </div>
+  </header>
+
+  <!-- Trust Badges -->
+  <section class="trust-badges">
+    <div class="trust-badges-inner">
+      <div class="trust-badge" style="color: #a6e3a1;">
+        <span>🔒</span>
+        <span>Privacy First</span>
+      </div>
+      <div class="trust-badge" style="color: #89b4fa;">
+        <span>⚡</span>
+        <span>Direct Transfer</span>
+      </div>
+      <div class="trust-badge" style="color: #fab387;">
+        <span>📖</span>
+        <span>Open Source</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- How It Works -->
+  <section>
+    <h2>How It Works</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-icon">1️⃣</div>
+        <h3>Install the Agent</h3>
+        <p>Run the agent on your home server and connect it to your OpenCloud</p>
+      </div>
+      <div class="step">
+        <div class="step-icon">2️⃣</div>
+        <h3>Create a Share</h3>
+        <p>Select files from your cloud, get a share link</p>
+      </div>
+      <div class="step">
+        <div class="step-icon">3️⃣</div>
+        <h3>Recipients Join</h3>
+        <p>Direct P2P transfer — files never leave your infrastructure</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture Diagrams -->
+  <section class="arch-section">
+    <h2>Your Data Stays Yours</h2>
+    <div class="container">
+
+      <!-- Direct Mode -->
+      <div class="arch-mode direct">
+        <h3>⚡ Direct Mode (Preferred)</h3>
+        <div class="arch-flow direct">
+          <div class="arch-node">
+            <div class="icon">💻</div>
+            <div class="label">Your Device</div>
+          </div>
+          <div class="arch-arrow">← WebRTC →</div>
+          <div class="arch-node">
+            <div class="icon">🌉</div>
+            <div class="label">Your Agent</div>
+          </div>
+          <div class="arch-arrow" style="color: #89b4fa;">← WebDAV →</div>
+          <div class="arch-node">
+            <div class="icon">☁️</div>
+            <div class="label">Your OpenCloud</div>
+          </div>
+        </div>
+        <div class="arch-signaling">
+          <div class="arch-signaling-inner">
+            <div class="node">
+              <div class="icon">💻</div>
+            </div>
+            <div class="line">WebSocket (negotiation only)</div>
+            <div class="node">
+              <div class="icon">📡</div>
+              <div class="label">Signaling</div>
+            </div>
+            <div class="line">WebSocket (negotiation only)</div>
+            <div class="node">
+              <div class="icon">🌉</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Relay Mode -->
+      <div class="arch-mode relay">
+        <h3>🔄 Relay Mode (Fallback)</h3>
+        <p style="text-align: center; color: #a6adc8; font-size: 0.9rem; margin-bottom: 20px;">When direct connection isn't possible — data is encrypted end-to-end, agent IP stays hidden</p>
+        <div class="arch-flow relay">
+          <div class="arch-node">
+            <div class="icon">💻</div>
+            <div class="label">Your Device</div>
+          </div>
+          <div class="arch-arrow">← E2EE →</div>
+          <div class="arch-node">
+            <div class="icon">🔄</div>
+            <div class="label" style="color: #fab387;">TURN Relay</div>
+          </div>
+          <div class="arch-arrow">← E2EE →</div>
+          <div class="arch-node">
+            <div class="icon">🌉</div>
+            <div class="label">Your Agent</div>
+          </div>
+          <div class="arch-arrow" style="color: #89b4fa;">← WebDAV →</div>
+          <div class="arch-node">
+            <div class="icon">☁️</div>
+            <div class="label">Your OpenCloud</div>
+          </div>
+        </div>
+        <div class="arch-note">
+          <span>✓ Your agent's IP address is never exposed to recipients</span>
+        </div>
+      </div>
+
+      <p class="arch-summary">✓ In both modes, no third-party server can read your files — all data is end-to-end encrypted</p>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section>
+    <div class="container">
+      <h2>Features</h2>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h3>⚡ Direct P2P Transfer</h3>
+          <p>WebRTC DataChannel for direct device-to-device transfer with no server bottlenecks</p>
+        </div>
+        <div class="feature-card relay">
+          <h3>🔄 Relay Mode</h3>
+          <p>Automatic fallback when direct connection fails. Your agent's IP stays hidden from recipients.</p>
+        </div>
+        <div class="feature-card">
+          <h3>☁️ Private Cloud Native</h3>
+          <p>Works seamlessly with OpenCloud, Nextcloud, and any WebDAV-compatible storage</p>
+        </div>
+        <div class="feature-card">
+          <h3>👤 No Account Needed</h3>
+          <p>Recipients can join shares with just a link — no registration required</p>
+        </div>
+        <div class="feature-card">
+          <h3>🔐 End-to-End Security</h3>
+          <p>Passwords validated on your agent only — signaling server never sees your secrets</p>
+        </div>
+        <div class="feature-card">
+          <h3>🏠 Self-Hosted</h3>
+          <p>Agent runs on your server — you control your data, your keys, your infrastructure</p>
+        </div>
+        <div class="feature-card">
+          <h3>📖 Open Source</h3>
+          <p>GPLv3 licensed. Audit the code, contribute, or fork it for your needs</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ Preview -->
+  <section class="faq-section">
+    <div class="container">
+      <h2>Common Questions</h2>
+      <div class="faq-list">
+        <div class="faq-item">
+          <div class="faq-item-header">
+            <span>Where are my files stored?</span>
+            <span style="color: #89b4fa;">▼</span>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-item-header">
+            <span>Do I need an account?</span>
+            <span style="color: #89b4fa;">▼</span>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-item-header">
+            <span>Is it free?</span>
+            <span style="color: #89b4fa;">▼</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer CTA -->
+  <footer>
+    <h2>Ready to bridge your cloud?</h2>
+    <div class="hero-buttons" style="margin-bottom: 40px;">
+      <a href="/join" class="btn btn-primary">Join a Share</a>
+      <a href="/login" class="btn btn-secondary">Start Sharing</a>
+    </div>
+    <div class="footer-links">
+      <a href="https://github.com/camr0/ShareBridge">GitHub</a>
+      <a href="/docs">Docs</a>
+      <a href="mailto:ali@sharebridge.app">ali@sharebridge.app</a>
+    </div>
+    <p class="footer-copy">© 2025 ShareBridge · Built by Ali Aslam</p>
+  </footer>
+</body>
+</html>

@@ -68,11 +68,16 @@ func main() {
 		// Public session info endpoint
 		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
 
-		// Direct link route - serves index.html; JS reads code from window.location
+		// Direct link route - serves file client; JS reads code from window.location
 		router.GET("/s/{code}", handler.ServeFile("./web/index.html"))
 
-		// Static web files
-		router.GET("/", handler.ServeFile("./web/index.html"))
+		// Homepage (marketing)
+		router.GET("/", handler.ServeFile("./web/home.html"))
+
+		// File transfer client (manual join)
+		router.GET("/join", handler.ServeFile("./web/index.html"))
+
+		// Static assets for file client
 		router.GET("/app.js", handler.ServeFile("./web/app.js"))
 
 		// User-facing pages (placeholders - full implementation in Task 10)
