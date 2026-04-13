@@ -147,7 +147,10 @@ func (c *Client) GetFile(name string, w io.Writer) (int64, error) {
 	return io.Copy(w, resp.Body)
 }
 
-// GetRootFileID returns the oc:fileid of the share root via a Depth:0 PROPFIND.
+// GetRootFileID returns the oc:fileid of the shared file via a Depth:1 PROPFIND.
+// In OpenCloud 6, the public share root is a virtual collection with no oc:fileid;
+// the file ID is only available on child resources. Depth:1 lists the children,
+// and we return the fileid from the first non-collection response.
 // Returns empty string without error if oc:fileid is absent (graceful degradation
 // for older OpenCloud versions or non-OpenCloud WebDAV servers).
 func (c *Client) GetRootFileID() (string, error) {
@@ -155,7 +158,7 @@ func (c *Client) GetRootFileID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Depth", "0")
+	req.Header.Set("Depth", "1")
 	req.Header.Set("Authorization", c.authHeader())
 	req.Header.Set("Content-Type", "application/xml")
 
@@ -179,10 +182,18 @@ func (c *Client) GetRootFileID() (string, error) {
 		return "", fmt.Errorf("parse XML: %w", err)
 	}
 
-	if len(ms.Response) == 0 {
-		return "", nil
+	// Skip the collection root (href ends with "/") — it has no oc:fileid in OpenCloud 6.
+	// Return the first child file's fileid.
+	for _, r := range ms.Response {
+		href, _ := url.PathUnescape(r.Href)
+		if strings.HasSuffix(href, "/") {
+			continue
+		}
+		if fileID := r.Propstat.Prop.FileID; fileID != "" {
+			return fileID, nil
+		}
 	}
-	return ms.Response[0].Propstat.Prop.FileID, nil
+	return "", nil
 }
 
 // PROPFIND response parsing types

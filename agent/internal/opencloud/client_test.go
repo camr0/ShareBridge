@@ -229,17 +229,25 @@ func TestGetRootFileID_ReturnsFileID(t *testing.T) {
 		if r.Method != "PROPFIND" {
 			t.Errorf("expected PROPFIND, got %s", r.Method)
 		}
-		if r.Header.Get("Depth") != "0" {
-			t.Errorf("expected Depth: 0, got %q", r.Header.Get("Depth"))
+		if r.Header.Get("Depth") != "1" {
+			t.Errorf("expected Depth: 1, got %q", r.Header.Get("Depth"))
 		}
 		w.WriteHeader(http.StatusMultiStatus)
+		// Root collection has no fileid (OpenCloud 6 behaviour); child file has it.
 		w.Write([]byte(`<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
   <d:response>
     <d:href>/remote.php/dav/public-files/testtoken/</d:href>
     <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/public-files/testtoken/photo.jpg</d:href>
+    <d:propstat>
       <d:prop>
-        <d:resourcetype><d:collection/></d:resourcetype>
+        <d:getcontentlength>2291384</d:getcontentlength>
+        <d:getcontenttype>image/jpeg</d:getcontenttype>
         <oc:fileid>storage-users-1$abc!def</oc:fileid>
       </d:prop>
     </d:propstat>
