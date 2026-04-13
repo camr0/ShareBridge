@@ -224,17 +224,28 @@ func TestParsePROPFIND_EmptyFolder(t *testing.T) {
 	}
 }
 
-func TestGetRootFileID_ReturnsFileID(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "PROPFIND" {
-			t.Errorf("expected PROPFIND, got %s", r.Method)
-		}
-		if r.Header.Get("Depth") != "1" {
-			t.Errorf("expected Depth: 1, got %q", r.Header.Get("Depth"))
-		}
+// singleFileShareHandler returns a server that simulates a single-file share:
+// Depth:0 returns no fileid; Depth:1 returns the child file with fileid.
+func singleFileShareHandler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMultiStatus)
-		// Root collection has no fileid (OpenCloud 6 behaviour); child file has it.
-		w.Write([]byte(`<?xml version="1.0"?>
+		switch r.Header.Get("Depth") {
+		case "0":
+			// Virtual collection root — no fileid (single-file share behaviour)
+			w.Write([]byte(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/public-files/testtoken/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`))
+		case "1":
+			// Child file has fileid
+			w.Write([]byte(`<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
   <d:response>
     <d:href>/remote.php/dav/public-files/testtoken/</d:href>
@@ -250,10 +261,16 @@ func TestGetRootFileID_ReturnsFileID(t *testing.T) {
         <d:getcontenttype>image/jpeg</d:getcontenttype>
         <oc:fileid>storage-users-1$abc!def</oc:fileid>
       </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
     </d:propstat>
   </d:response>
 </d:multistatus>`))
-	}))
+		}
+	}
+}
+
+func TestGetRootFileID_SingleFileShare(t *testing.T) {
+	srv := httptest.NewTLSServer(singleFileShareHandler(t))
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
@@ -272,9 +289,49 @@ func TestGetRootFileID_ReturnsFileID(t *testing.T) {
 	}
 }
 
+func TestGetRootFileID_FolderShare(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Depth") != "0" {
+			t.Errorf("folder share should be resolved at Depth:0, got %q", r.Header.Get("Depth"))
+		}
+		w.WriteHeader(http.StatusMultiStatus)
+		// Folder share root exposes oc:fileid directly at Depth:0
+		w.Write([]byte(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/public-files/foldertoken/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <oc:fileid>storage-users-1$abc!folder123</oc:fileid>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`))
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New(srv.URL+"/s/foldertoken", host, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	fileID, err := c.GetRootFileID()
+	if err != nil {
+		t.Fatalf("GetRootFileID() error: %v", err)
+	}
+	if fileID != "storage-users-1$abc!folder123" {
+		t.Errorf("FileID = %q, want storage-users-1$abc!folder123", fileID)
+	}
+}
+
 func TestGetRootFileID_EmptyWhenMissing(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMultiStatus)
+		// Neither depth returns a fileid
 		w.Write([]byte(`<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:">
   <d:response>
