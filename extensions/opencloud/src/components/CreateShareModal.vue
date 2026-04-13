@@ -63,7 +63,7 @@ import { useAgentClient } from '../composables/useAgentClient'
 import type { Resource } from '@opencloud-eu/web-client'
 import type { CreateShareResult } from '../types'
 
-const PRESET_EXPIRY_OPTIONS = [1, 6, 12, 24, 72, 168] // hours: 1h, 6h, 12h, 24h, 3d, 7d (matches agent UI)
+const PRESET_EXPIRY_OPTIONS = [1, 6, 12, 24, 72, 168, 720] // hours: 1h, 6h, 12h, 24h, 3d, 7d, 30d (matches agent UI)
 
 const props = defineProps<{
   resource: Resource
@@ -105,6 +105,7 @@ const formatExpiryLabel = (hours: number): string => {
   if (hours === 24) return '24 hours'
   if (hours === 72) return '3 days'
   if (hours === 168) return '7 days'
+  if (hours === 720) return '30 days'
   return `${hours} hours`
 }
 
