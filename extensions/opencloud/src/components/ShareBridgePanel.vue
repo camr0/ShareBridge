@@ -78,7 +78,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, watch } from 'vue'
 import { useSettingsStore } from '../stores/settings'
 import { useAgentClient } from '../composables/useAgentClient'
 import ShareCard from './ShareCard.vue'
@@ -142,9 +142,18 @@ const handleCreated = async (_result: CreateShareResult) => {
   await loadShares()
 }
 
+// Watch for resource.id becoming available — OpenCloud's sidebar may set the
+// resource prop after the component mounts, so onMounted alone is not reliable.
+watch(
+  () => props.resource?.id,
+  (id) => {
+    if (id && settings.isConfigured) loadShares()
+  },
+  { immediate: true }
+)
+
 onMounted(async () => {
   if (settings.isConfigured) {
-    loadShares()
     // Fetch settings for TURN availability (best-effort; non-fatal if it fails)
     try {
       const agentSettings = await getSettings()
