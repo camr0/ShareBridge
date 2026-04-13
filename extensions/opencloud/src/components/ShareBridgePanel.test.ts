@@ -3,6 +3,7 @@ import { mount } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import ShareBridgePanel from './ShareBridgePanel.vue'
 import type { Share } from '../types'
+import type { Resource } from '@opencloud-eu/web-client'
 
 const mockListShares = vi.fn()
 const mockRevokeShare = vi.fn()
@@ -16,7 +17,7 @@ vi.mock('../composables/useAgentClient', () => ({
   }),
 }))
 vi.mock('./ShareCard.vue', () => ({ default: { template: '<div data-testid="share-card">{{ share.code }}</div>', props: ['share'] } }))
-vi.mock('./CreateShareModal.vue', () => ({ default: { name: 'CreateShareModal', template: '<div data-testid="create-modal" />', props: ['filePath'], emits: ['close', 'created'] } }))
+vi.mock('./CreateShareModal.vue', () => ({ default: { name: 'CreateShareModal', template: '<div data-testid="create-modal" />', props: ['resource', 'turnAvailable'], emits: ['close', 'created'] } }))
 
 const makeShare = (code = 'abc123'): Share => ({
   code,
@@ -32,10 +33,12 @@ const makeShare = (code = 'abc123'): Share => ({
 
 const defaultProps = {
   resource: {
-    id: 'storage-users-1$abc!def',
+    id: '30e77cc8-3577-4c59-975a-166c5651f85d$abc!def',
+    storageId: '30e77cc8-3577-4c59-975a-166c5651f85d',
+    fileId: 'abc!def',
     path: '/Documents/report.pdf',
     name: 'report.pdf',
-  },
+  } as Resource,
 }
 
 describe('ShareBridgePanel', () => {

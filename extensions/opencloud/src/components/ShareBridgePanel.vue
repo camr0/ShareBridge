@@ -68,7 +68,7 @@
       <!-- Create modal -->
       <CreateShareModal
         v-if="showModal"
-        :file-path="resource.path"
+        :resource="resource"
         :turn-available="turnAvailable"
         @close="showModal = false"
         @created="handleCreated"
@@ -83,14 +83,11 @@ import { useSettingsStore } from '../stores/settings'
 import { useAgentClient } from '../composables/useAgentClient'
 import ShareCard from './ShareCard.vue'
 import CreateShareModal from './CreateShareModal.vue'
+import type { Resource } from '@opencloud-eu/web-client'
 import type { Share, CreateShareResult } from '../types'
 
 const props = defineProps<{
-  resource: {
-    id: string    // OpenCloud fileId (oc:fileid)
-    path: string  // File path, used for OCS share creation
-    name: string
-  }
+  resource: Resource
 }>()
 
 const settings = useSettingsStore()
@@ -125,8 +122,10 @@ const loadShares = async () => {
   loading.value = true
   error.value = ''
   try {
-    shares.value = await listShares(props.resource.id)
-  } catch {
+    console.log('[ShareBridge] loadShares resource:', props.resource)
+    shares.value = await listShares(props.resource?.id)
+  } catch (err) {
+    console.error('[ShareBridge] loadShares error:', err)
     error.value = 'Cannot connect to ShareBridge agent. Check the agent URL and ensure it\'s running.'
   } finally {
     loading.value = false
@@ -156,3 +155,82 @@ onMounted(async () => {
   }
 })
 </script>
+
+<style scoped>
+.sharebridge-panel {
+  padding: 12px;
+}
+.configure-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.configure-prompt p {
+  margin: 0;
+  font-size: 0.9em;
+}
+.configure-prompt label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.9em;
+}
+.configure-prompt input {
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--oc-color-border, #555);
+  background: var(--oc-color-background-muted, #2a2a2a);
+  color: var(--oc-color-text-default, #fff);
+}
+.configure-prompt button {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--oc-color-border, #555);
+  background: var(--oc-color-swatch-primary-default, #0070f3);
+  color: #fff;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.configure-prompt button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.hint {
+  margin: 0;
+  font-size: 0.8em;
+  color: var(--oc-color-text-muted, #aaa);
+}
+.error {
+  padding: 8px 10px;
+  background: rgba(220, 50, 50, 0.15);
+  border: 1px solid rgba(220, 50, 50, 0.4);
+  border-radius: 4px;
+  font-size: 0.85em;
+  color: #ff6b6b;
+}
+.loading {
+  font-size: 0.9em;
+  color: var(--oc-color-text-muted, #aaa);
+}
+.empty-state {
+  font-size: 0.9em;
+  color: var(--oc-color-text-muted, #aaa);
+  margin-bottom: 12px;
+}
+.share-list {
+  margin-bottom: 12px;
+}
+.create-btn {
+  width: 100%;
+  padding: 8px;
+  border-radius: 4px;
+  border: 1px solid var(--oc-color-border, #555);
+  background: var(--oc-color-swatch-primary-default, #0070f3);
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+.create-btn:hover {
+  opacity: 0.9;
+}
+</style>

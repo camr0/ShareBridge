@@ -46,3 +46,42 @@ onUnmounted(() => {
   if (copyTimer) clearTimeout(copyTimer)
 })
 </script>
+
+<style scoped>
+.share-card {
+  border: 1px solid var(--oc-color-border, #444);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.share-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  font-size: 0.85em;
+}
+.share-code {
+  font-family: monospace;
+  font-weight: bold;
+}
+.share-downloads, .share-expiry {
+  color: var(--oc-color-text-muted, #aaa);
+}
+.share-actions {
+  display: flex;
+  gap: 8px;
+}
+.share-actions button {
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--oc-color-border, #555);
+  background: var(--oc-color-background-muted, #333);
+  color: var(--oc-color-text-default, #fff);
+  cursor: pointer;
+  font-size: 0.85em;
+}
+.share-actions button:hover {
+  background: var(--oc-color-background-hover, #444);
+}
+</style>

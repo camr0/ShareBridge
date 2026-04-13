@@ -13,6 +13,9 @@ export const useShareBridgeExtension = () => {
       icon: 'share',
       title: () => 'ShareBridge',
       component: ShareBridgePanel,
+      componentAttrs: (context: SideBarPanelContext<Item, Item, Item>) => ({
+        resource: context.items?.[0],
+      }),
       isRoot: () => true,
       isVisible: (context: SideBarPanelContext<Item, Item, Item>) =>
         (context.items?.length ?? 0) === 1,
