@@ -7,10 +7,9 @@
         <label>
           Expiry
           <select data-testid="expiry-select" v-model.number="form.expiryHours">
-            <option :value="1">1 hour</option>
-            <option :value="24">24 hours</option>
-            <option :value="168">7 days</option>
-            <option :value="720">30 days</option>
+            <option v-for="opt in expiryOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
           </select>
         </label>
 
@@ -64,9 +63,14 @@ import { useAgentClient } from '../composables/useAgentClient'
 import type { Resource } from '@opencloud-eu/web-client'
 import type { CreateShareResult } from '../types'
 
+const PRESET_EXPIRY_OPTIONS = [1, 6, 12, 24, 72, 168] // hours: 1h, 6h, 12h, 24h, 3d, 7d (matches agent UI)
+
 const props = defineProps<{
   resource: Resource
-  turnAvailable?: boolean  // from parent (ShareBridgePanel fetches settings)
+  turnAvailable?: boolean
+  defaultExpiryHours?: number
+  defaultMaxDownloads?: number
+  defaultRelayOnly?: boolean
 }>()
 const emit = defineEmits<{
   close: []
@@ -79,11 +83,30 @@ const { createShare } = useAgentClient()
 const loading = ref(false)
 const error = ref('')
 const form = reactive({
-  expiryHours: 24,
+  expiryHours: props.defaultExpiryHours ?? 24,
   password: '',
-  maxDownloads: 0,
-  relayOnly: false,
+  maxDownloads: props.defaultMaxDownloads ?? 0,
+  relayOnly: props.defaultRelayOnly ?? false,
 })
+
+// Include agent default in expiry options if it's not a preset
+const expiryOptions = computed(() => {
+  const options = PRESET_EXPIRY_OPTIONS.map(h => ({ value: h, label: formatExpiryLabel(h) }))
+  if (props.defaultExpiryHours && !PRESET_EXPIRY_OPTIONS.includes(props.defaultExpiryHours)) {
+    options.push({ value: props.defaultExpiryHours, label: `${props.defaultExpiryHours} hours` })
+  }
+  return options.sort((a, b) => a.value - b.value)
+})
+
+const formatExpiryLabel = (hours: number): string => {
+  if (hours === 1) return '1 hour'
+  if (hours === 6) return '6 hours'
+  if (hours === 12) return '12 hours'
+  if (hours === 24) return '24 hours'
+  if (hours === 72) return '3 days'
+  if (hours === 168) return '7 days'
+  return `${hours} hours`
+}
 
 const expiryDate = computed(() => {
   const date = new Date()

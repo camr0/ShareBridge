@@ -70,6 +70,9 @@
         v-if="showModal"
         :resource="resource"
         :turn-available="turnAvailable"
+        :default-expiry-hours="defaultExpiryHours"
+        :default-max-downloads="defaultMaxDownloads"
+        :default-relay-only="defaultRelayOnly"
         @close="showModal = false"
         @created="handleCreated"
       />
@@ -98,6 +101,9 @@ const loading = ref(false)
 const error = ref('')
 const showModal = ref(false)
 const turnAvailable = ref(false)
+const defaultExpiryHours = ref(24)
+const defaultMaxDownloads = ref(0)
+const defaultRelayOnly = ref(false)
 
 const configForm = reactive({
   agentUrl: '',
@@ -110,11 +116,18 @@ const saveConfig = async () => {
   settings.setApiKey(configForm.apiKey)
   // Load shares and fetch settings after saving config
   await loadShares()
+  applyAgentSettings()
+}
+
+const applyAgentSettings = async () => {
   try {
     const agentSettings = await getSettings()
     turnAvailable.value = agentSettings.turn_available
+    defaultExpiryHours.value = agentSettings.default_expiry_hours
+    defaultMaxDownloads.value = agentSettings.default_max_downloads
+    defaultRelayOnly.value = agentSettings.default_relay_only
   } catch {
-    // leave turnAvailable as false
+    // leave defaults as initial values
   }
 }
 
@@ -154,13 +167,8 @@ watch(
 
 onMounted(async () => {
   if (settings.isConfigured) {
-    // Fetch settings for TURN availability (best-effort; non-fatal if it fails)
-    try {
-      const agentSettings = await getSettings()
-      turnAvailable.value = agentSettings.turn_available
-    } catch {
-      // leave turnAvailable as false — TURN warning will show if relay-only selected
-    }
+    // Fetch settings for form defaults and TURN availability
+    applyAgentSettings()
   }
 })
 </script>

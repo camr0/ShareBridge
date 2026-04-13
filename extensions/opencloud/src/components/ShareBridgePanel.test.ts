@@ -17,7 +17,7 @@ vi.mock('../composables/useAgentClient', () => ({
   }),
 }))
 vi.mock('./ShareCard.vue', () => ({ default: { template: '<div data-testid="share-card">{{ share.code }}</div>', props: ['share'] } }))
-vi.mock('./CreateShareModal.vue', () => ({ default: { name: 'CreateShareModal', template: '<div data-testid="create-modal" />', props: ['resource', 'turnAvailable'], emits: ['close', 'created'] } }))
+vi.mock('./CreateShareModal.vue', () => ({ default: { name: 'CreateShareModal', template: '<div data-testid="create-modal" />', props: ['resource', 'turnAvailable', 'defaultExpiryHours', 'defaultMaxDownloads', 'defaultRelayOnly'], emits: ['close', 'created'] } }))
 
 const makeShare = (code = 'abc123'): Share => ({
   code,
