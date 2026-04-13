@@ -31,9 +31,19 @@ const emit = defineEmits<{ revoke: [code: string] }>()
 const copied = ref(false)
 let copyTimer: ReturnType<typeof setTimeout> | null = null
 
-const formattedExpiry = computed(() =>
-  new Date(props.share.expires_at).toLocaleDateString()
-)
+const formattedExpiry = computed(() => {
+  const expires = new Date(props.share.expires_at)
+  const now = new Date()
+  if (expires <= now) return 'Expired'
+  const hours = Math.floor((expires.getTime() - now.getTime()) / 3600000)
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24)
+    return days === 1 ? '1 day' : `${days} days`
+  }
+  if (hours >= 1) return hours === 1 ? '1 hour' : `${hours} hours`
+  const minutes = Math.floor((expires.getTime() - now.getTime()) / 60000)
+  return minutes <= 1 ? '<1 min' : `${minutes} min`
+})
 
 const copyLink = async () => {
   await navigator.clipboard.writeText(props.share.public_url)
