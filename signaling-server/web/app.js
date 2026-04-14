@@ -39,7 +39,8 @@ function join() {
   relayQuotaExceeded = false;
   quotaPeriodEnd = null;
 
-  ws = new WebSocket(`ws://${location.host}/ws/client?session=${code}`);
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${location.host}/ws/client?session=${code}`);
 
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data);

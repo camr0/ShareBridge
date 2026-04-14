@@ -137,7 +137,7 @@ func (m *Manager) load() (*Config, error) {
 	}
 
 	if cfg.SignalingURL == "" {
-		cfg.SignalingURL = "ws://localhost:8080"
+		cfg.SignalingURL = "wss://sharebridge.app"
 	}
 	if cfg.UIPort == 0 {
 		cfg.UIPort = 7878
@@ -185,7 +185,7 @@ func Load() *Config {
 	if err != nil {
 		// Fallback to env-only config on error
 		return &Config{
-			SignalingURL: getEnv("SIGNALING_SERVER", "ws://localhost:8080"),
+			SignalingURL: getEnv("SIGNALING_SERVER", "wss://sharebridge.app"),
 			APIKey:       getEnv("SHAREBRIDGE_API_KEY", ""),
 			AllowedHost:  getEnv("ALLOWED_SHAREBRIDGE_HOST", ""),
 			UIPort:       getEnvInt("UI_PORT", 7878),
