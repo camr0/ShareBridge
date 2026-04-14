@@ -194,7 +194,10 @@
         const data = await response.json();
 
         if (!response.ok) {
-          const message = data.message || 'Login failed. Please check your credentials.';
+          let message = data.message || 'Login failed. Please check your credentials.';
+          if (message.includes("doesn't satisfy the collection requirements")) {
+            message = 'Please verify your email before signing in. Check your inbox for a verification link.';
+          }
           throw new Error(message);
         }
 

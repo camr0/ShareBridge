@@ -368,17 +368,14 @@
         const data = await response.json();
 
         if (response.ok) {
-          // Registration successful
-          // Check if email verification is required
-          const isVerified = data.verified === true;
+          // Registration successful — request verification email
+          await fetch('/api/collections/users/request-verification', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: emailInput.value.trim() }),
+          });
 
-          if (isVerified) {
-            // Email verified immediately (no SMTP configured), redirect to login
-            window.location.href = '/login?registered=true&verified=true';
-          } else {
-            // Email verification required, redirect to login with notice
-            window.location.href = '/login?registered=true&verify=true';
-          }
+          window.location.href = '/login?registered=true&verify=true';
         } else {
           // Registration failed
           const message = data.message || 'Registration failed. Please try again.';

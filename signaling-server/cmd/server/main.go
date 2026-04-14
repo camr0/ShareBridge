@@ -47,10 +47,6 @@ func main() {
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
 		router := se.Router
 
-		// Do not expose /_/ on the public reverse-proxied site.
-		// Enforce the primary deny rule in nginx/Caddy/Traefik; a same-host reverse
-		// proxy makes RemoteAddr appear local, so an app-only localhost check is not enough.
-
 		// WebSocket endpoints
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
@@ -181,3 +177,4 @@ func deleteExpiredSessions(app core.App) error {
 		}
 	}
 }
+
