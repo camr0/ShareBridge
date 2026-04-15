@@ -22,7 +22,10 @@ export const useAgentClient = () => {
 
     const createShare = async (params: CreateShareParams): Promise<CreateShareResult> => {
         const url = generateUrl('/apps/sharebridge/api/agent/shares')
-        const response = await axios.post(url, params)
+        const response = await axios.post(url, {
+            ...params,
+            share_type: 'nextcloud',
+        })
         return response.data
     }
 

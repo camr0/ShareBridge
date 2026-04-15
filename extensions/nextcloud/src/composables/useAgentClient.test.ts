@@ -67,6 +67,26 @@ describe('useAgentClient', () => {
         expect(result).toEqual(mockResult)
     })
 
+    it('createShare sends share_type: nextcloud', async () => {
+        const mockResult = { code: 'abc123', public_url: 'https://share.example.com/s/abc123', expires_at: '2026-04-15T00:00:00Z' }
+        vi.mocked(axios.post).mockResolvedValue({ data: mockResult } as never)
+
+        const { createShare } = useAgentClient()
+        await createShare({
+            share_url: 'https://nextcloud.example.com/s/XYZ789',
+            expiry_hours: 24,
+            max_downloads: 0,
+            relay_only: false,
+        })
+
+        expect(axios.post).toHaveBeenCalledWith(
+            expect.any(String),
+            expect.objectContaining({
+                share_type: 'nextcloud',
+            }),
+        )
+    })
+
     it('revokeShare sends DELETE to the Nextcloud proxy shares endpoint', async () => {
         vi.mocked(axios.delete).mockResolvedValue({} as never)
 
