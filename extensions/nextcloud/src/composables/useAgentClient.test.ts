@@ -1,100 +1,93 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { setActivePinia, createPinia } from 'pinia'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import axios from '@nextcloud/axios'
 import { useAgentClient } from './useAgentClient'
-import { useSettingsStore } from '../stores/settings'
+
+vi.mock('@nextcloud/axios', () => ({
+    default: {
+        get: vi.fn(),
+        post: vi.fn(),
+        delete: vi.fn(),
+    },
+}))
+
+vi.mock('@nextcloud/router', () => ({
+    generateUrl: (path: string) => `https://nc.example.com${path}`,
+}))
 
 describe('useAgentClient', () => {
-	let mockFetch: ReturnType<typeof vi.fn>
+    beforeEach(() => {
+        vi.clearAllMocks()
+    })
 
-	beforeEach(() => {
-		setActivePinia(createPinia())
-		mockFetch = vi.fn()
-		vi.stubGlobal('fetch', mockFetch)
-	})
+    it('listShares fetches the Nextcloud proxy shares endpoint', async () => {
+        vi.mocked(axios.get).mockResolvedValue({ data: [] } as never)
 
-	afterEach(() => {
-		vi.unstubAllGlobals()
-	})
+        const { listShares } = useAgentClient()
+        await listShares()
 
-	const setupStore = (url = 'http://localhost:7878', key = 'sb_agent_testkey') => {
-		const store = useSettingsStore()
-		store.$patch({ agentUrl: url, apiKey: key })
-		return store
-	}
+        expect(axios.get).toHaveBeenCalledWith(
+            'https://nc.example.com/apps/sharebridge/api/agent/shares',
+            { params: {} }
+        )
+    })
 
-	it('listShares fetches /api/v1/shares with X-API-Key header', async () => {
-		setupStore()
-		mockFetch.mockResolvedValue({ json: () => Promise.resolve([]) })
+    it('listShares appends file_id query param when provided', async () => {
+        vi.mocked(axios.get).mockResolvedValue({ data: [] } as never)
 
-		const { listShares } = useAgentClient()
-		await listShares()
+        const { listShares } = useAgentClient()
+        await listShares('12345')
 
-		expect(mockFetch).toHaveBeenCalledWith(
-			'http://localhost:7878/api/v1/shares',
-			expect.objectContaining({
-				headers: expect.objectContaining({ 'X-API-Key': 'sb_agent_testkey' }),
-			})
-		)
-	})
+        expect(axios.get).toHaveBeenCalledWith(
+            'https://nc.example.com/apps/sharebridge/api/agent/shares',
+            { params: { file_id: '12345' } }
+        )
+    })
 
-	it('listShares appends file_id query param when provided', async () => {
-		setupStore()
-		mockFetch.mockResolvedValue({ json: () => Promise.resolve([]) })
+    it('createShare POSTs JSON to the Nextcloud proxy shares endpoint', async () => {
+        const mockResult = { code: 'abc123', public_url: 'https://share.example.com/s/abc123', expires_at: '2026-04-15T00:00:00Z' }
+        vi.mocked(axios.post).mockResolvedValue({ data: mockResult } as never)
 
-		const { listShares } = useAgentClient()
-		await listShares('12345')
+        const { createShare } = useAgentClient()
+        const result = await createShare({
+            share_url: 'https://nextcloud.example.com/s/XYZ789',
+            expiry_hours: 24,
+            max_downloads: 0,
+            relay_only: false,
+        })
 
-		expect(mockFetch).toHaveBeenCalledWith(
-			'http://localhost:7878/api/v1/shares?file_id=12345',
-			expect.anything()
-		)
-	})
+        expect(axios.post).toHaveBeenCalledWith(
+            'https://nc.example.com/apps/sharebridge/api/agent/shares',
+            expect.objectContaining({
+                share_url: 'https://nextcloud.example.com/s/XYZ789',
+                expiry_hours: 24,
+                max_downloads: 0,
+                relay_only: false,
+            })
+        )
+        expect(result).toEqual(mockResult)
+    })
 
-	it('createShare POSTs JSON to /api/v1/shares', async () => {
-		setupStore()
-		const mockResult = { code: 'abc123', public_url: 'https://share.example.com/s/abc123', expires_at: '2026-04-15T00:00:00Z' }
-		mockFetch.mockResolvedValue({ json: () => Promise.resolve(mockResult) })
+    it('revokeShare sends DELETE to the Nextcloud proxy shares endpoint', async () => {
+        vi.mocked(axios.delete).mockResolvedValue({} as never)
 
-		const { createShare } = useAgentClient()
-		const result = await createShare({
-			share_url: 'https://nextcloud.example.com/s/XYZ789',
-			expiry_hours: 24,
-			max_downloads: 0,
-			relay_only: false,
-		})
+        const { revokeShare } = useAgentClient()
+        await revokeShare('abc123')
 
-		expect(mockFetch).toHaveBeenCalledWith(
-			'http://localhost:7878/api/v1/shares',
-			expect.objectContaining({ method: 'POST' })
-		)
-		expect(result).toEqual(mockResult)
-	})
+        expect(axios.delete).toHaveBeenCalledWith(
+            'https://nc.example.com/apps/sharebridge/api/agent/shares/abc123'
+        )
+    })
 
-	it('revokeShare sends DELETE to /api/v1/shares/{code}', async () => {
-		setupStore()
-		mockFetch.mockResolvedValue({})
+    it('getSettings fetches the Nextcloud proxy settings endpoint', async () => {
+        const mockSettings = { default_expiry_hours: 24, default_max_downloads: 0, default_relay_only: false, turn_available: true }
+        vi.mocked(axios.get).mockResolvedValue({ data: mockSettings } as never)
 
-		const { revokeShare } = useAgentClient()
-		await revokeShare('abc123')
+        const { getSettings } = useAgentClient()
+        const result = await getSettings()
 
-		expect(mockFetch).toHaveBeenCalledWith(
-			'http://localhost:7878/api/v1/shares/abc123',
-			expect.objectContaining({ method: 'DELETE' })
-		)
-	})
-
-	it('getSettings fetches /api/v1/settings with X-API-Key', async () => {
-		setupStore()
-		const mockSettings = { default_expiry_hours: 24, default_max_downloads: 0, default_relay_only: false, turn_available: true }
-		mockFetch.mockResolvedValue({ json: () => Promise.resolve(mockSettings) })
-
-		const { getSettings } = useAgentClient()
-		const result = await getSettings()
-
-		expect(mockFetch).toHaveBeenCalledWith(
-			'http://localhost:7878/api/v1/settings',
-			expect.objectContaining({ headers: expect.objectContaining({ 'X-API-Key': 'sb_agent_testkey' }) })
-		)
-		expect(result).toEqual(mockSettings)
-	})
+        expect(axios.get).toHaveBeenCalledWith(
+            'https://nc.example.com/apps/sharebridge/api/agent/settings'
+        )
+        expect(result).toEqual(mockSettings)
+    })
 })

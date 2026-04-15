@@ -1,40 +1,49 @@
 <template>
-    <NcSettingsSection name="ShareBridge" description="Configure your ShareBridge agent connection.">
+    <div class="sb-personal-settings">
         <div v-if="settings.loading" class="sb-settings-loading">
-            <NcLoadingIcon />
+            Loading…
         </div>
         <template v-else>
-            <NcTextField
-                data-testid="agent-url-input"
-                :value="settings.agentUrl"
-                label="Agent URL"
-                placeholder="http://localhost:7878"
-                @update:model-value="settings.agentUrl = $event"
-            />
-            <NcTextField
-                data-testid="api-key-input"
-                :value="settings.apiKey"
-                label="API Key"
-                type="password"
-                placeholder="sb_agent_..."
-                @update:model-value="settings.apiKey = $event"
-            />
+            <div class="sb-field">
+                <label for="sb-agent-url">Agent URL</label>
+                <input
+                    id="sb-agent-url"
+                    data-testid="agent-url-input"
+                    type="text"
+                    :value="settings.agentUrl"
+                    placeholder="http://localhost:7878"
+                    class="sb-input"
+                    @input="settings.agentUrl = ($event.target as HTMLInputElement).value"
+                />
+            </div>
+            <div class="sb-field">
+                <label for="sb-api-key">API Key</label>
+                <input
+                    id="sb-api-key"
+                    data-testid="api-key-input"
+                    type="password"
+                    :value="settings.apiKey"
+                    placeholder="sb_agent_..."
+                    class="sb-input"
+                    @input="settings.apiKey = ($event.target as HTMLInputElement).value"
+                />
+            </div>
             <div class="sb-settings-actions">
-                <NcButton data-testid="save-btn" @click="save" :disabled="saving">
+                <button data-testid="save-btn" class="button-vue" :disabled="saving" @click="save">
                     {{ saving ? 'Saving…' : 'Save' }}
-                </NcButton>
+                </button>
                 <span v-if="saved" class="sb-saved-msg">Saved</span>
             </div>
             <p class="sb-settings-hint">
                 Find the Agent URL and API key in your ShareBridge agent settings page.
             </p>
         </template>
-    </NcSettingsSection>
+    </div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { NcSettingsSection, NcTextField, NcButton, NcLoadingIcon } from '@nextcloud/vue'
+
 import { useSettingsStore } from '../stores/settings'
 
 const settings = useSettingsStore()

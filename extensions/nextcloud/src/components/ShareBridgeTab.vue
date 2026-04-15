@@ -1,11 +1,7 @@
 <template>
     <div class="sb-tab">
-        <!-- Fetching settings -->
-        <div v-if="settings.loading" class="sb-loading">
-            <NcLoadingIcon />
-        </div>
+        <div v-if="settings.loading" class="sb-loading">Loading…</div>
 
-        <!-- Not configured -->
         <div v-else-if="!settings.isConfigured" data-testid="configure-prompt" class="sb-configure-prompt">
             <p>
                 Configure ShareBridge in your
@@ -14,17 +10,14 @@
             </p>
         </div>
 
-        <!-- Configured -->
         <template v-else>
             <div v-if="error" data-testid="error-msg" class="sb-error">{{ error }}</div>
 
-            <div v-else-if="loadingShares" class="sb-loading">
-                <NcLoadingIcon />
-            </div>
+            <div v-else-if="loadingShares" class="sb-loading">Loading…</div>
 
             <template v-else>
                 <div v-if="shares.length === 0" data-testid="empty-state" class="sb-empty">
-                    <NcEmptyContent name="No shares" description="No ShareBridge shares for this file." />
+                    <p>No ShareBridge shares for this file.</p>
                 </div>
 
                 <div v-else data-testid="share-list">
@@ -37,9 +30,9 @@
                     />
                 </div>
 
-                <NcButton data-testid="create-share-btn" @click="showModal = true">
+                <button data-testid="create-share-btn" class="button-vue" @click="showModal = true">
                     Create ShareBridge Share
-                </NcButton>
+                </button>
             </template>
 
             <CreateShareModal
@@ -58,7 +51,6 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted } from 'vue'
-import { NcButton, NcLoadingIcon, NcEmptyContent } from '@nextcloud/vue'
 import { useSettingsStore } from '../stores/settings'
 import { useAgentClient } from '../composables/useAgentClient'
 import { useNextcloudOCS } from '../composables/useNextcloudOCS'
@@ -66,10 +58,6 @@ import ShareCard from './ShareCard.vue'
 import CreateShareModal from './CreateShareModal.vue'
 import type { Share, CreateShareResult } from '../types'
 
-// Props injected by the registration path.
-// v3 (OCA.Files.Sidebar / manual createApp): passed as { id: String(fileInfo.id), path: fileInfo.path }
-// v4 (defineCustomElement):                  INode from @nextcloud/files — use .id (string),
-//   NOT .fileid (deprecated, returns undefined for snowflake IDs on NC 33+)
 const props = defineProps<{
     node: { id?: string; path: string }
 }>()
@@ -119,7 +107,6 @@ const handleRevoke = async (code: string) => {
     } catch {
         error.value = 'Failed to fully revoke share. The Nextcloud link may still be accessible.'
     }
-    // Only reload shares if revoke succeeded — keep the error visible on failure
     if (!error.value) {
         await loadShares()
     }
@@ -130,8 +117,6 @@ const handleCreated = async (_result: CreateShareResult) => {
     await loadShares()
 }
 
-// Load shares whenever the file or configured state changes.
-// node.id is a string ('0', '12345', or snowflake) — truthy check is safe.
 watch(
     [() => props.node?.id, () => settings.isConfigured],
     ([nodeId, isConfigured]) => {

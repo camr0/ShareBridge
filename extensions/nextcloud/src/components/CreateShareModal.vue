@@ -1,5 +1,5 @@
 <template>
-    <NcModal name="Create ShareBridge Share" @close="emit('close')">
+    <div class="sb-modal-overlay" @click.self="emit('close')">
         <div class="sb-modal-body">
             <h2>Create ShareBridge Share</h2>
 
@@ -44,20 +44,19 @@
             <div v-if="error" data-testid="error-msg" class="sb-error">{{ error }}</div>
 
             <div class="sb-modal-actions">
-                <NcButton data-testid="cancel-btn" @click="emit('close')" :disabled="loading">
+                <button data-testid="cancel-btn" class="button-vue" :disabled="loading" @click="emit('close')">
                     Cancel
-                </NcButton>
-                <NcButton data-testid="create-btn" @click="submit" :disabled="loading">
+                </button>
+                <button data-testid="create-btn" class="button-vue primary" :disabled="loading" @click="submit">
                     {{ loading ? 'Creating…' : 'Create Share' }}
-                </NcButton>
+                </button>
             </div>
         </div>
-    </NcModal>
+    </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, computed } from 'vue'
-import { NcModal, NcButton } from '@nextcloud/vue'
 import { useNextcloudOCS } from '../composables/useNextcloudOCS'
 import { useAgentClient } from '../composables/useAgentClient'
 import type { CreateShareResult } from '../types'
@@ -65,7 +64,7 @@ import type { CreateShareResult } from '../types'
 const PRESET_EXPIRY_HOURS = [1, 6, 12, 24, 72, 168, 720]
 
 const props = defineProps<{
-    filePath: string           // node.path from @nextcloud/files Node
+    filePath: string
     turnAvailable?: boolean
     defaultExpiryHours?: number
     defaultMaxDownloads?: number
@@ -82,10 +81,10 @@ const { createShare }                   = useAgentClient()
 const loading = ref(false)
 const error   = ref('')
 const form    = reactive({
-    expiryHours: props.defaultExpiryHours  ?? 24,
-    password:    '',
+    expiryHours:  props.defaultExpiryHours  ?? 24,
+    password:     '',
     maxDownloads: props.defaultMaxDownloads ?? 0,
-    relayOnly:   props.defaultRelayOnly    ?? false,
+    relayOnly:    props.defaultRelayOnly    ?? false,
 })
 
 const expiryOptions = computed(() => {
@@ -105,12 +104,8 @@ const formatExpiry = (hours: number): string => {
 const submit = async () => {
     loading.value = true
     error.value   = ''
-
     try {
-        // Step 1: Create Nextcloud public share via OCS (no password needed)
         const { shareUrl, shareId } = await createOCSShare(props.filePath, form.expiryHours)
-
-        // Step 2: Register the share with the agent
         const result = await createShare({
             share_url:     shareUrl,
             password:      form.password || undefined,
@@ -118,10 +113,7 @@ const submit = async () => {
             max_downloads: form.maxDownloads,
             relay_only:    form.relayOnly,
         })
-
-        // Step 3: Save the code→ncShareId mapping for future revocation
         await saveNcShareId(result.code, shareId)
-
         emit('created', result)
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : ''
@@ -137,3 +129,25 @@ const submit = async () => {
     }
 }
 </script>
+
+<style scoped>
+.sb-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+}
+.sb-modal-body {
+    background: var(--color-main-background);
+    border-radius: var(--border-radius-large);
+    padding: 24px;
+    min-width: 320px;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+</style>

@@ -10,7 +10,7 @@ class PersonalSection implements ISettings {
     }
 
     public function getSection(): string {
-        return 'personal';
+        return 'personal-info';
     }
 
     public function getPriority(): int {

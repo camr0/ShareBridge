@@ -12,12 +12,13 @@ describe('PersonalSettings', () => {
         store.$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
     })
 
-    it('shows loading indicator while settings are being fetched', async () => {
+    it('shows loading state while settings are being fetched', () => {
         const store = useSettingsStore()
         store.$patch({ loaded: false, loading: true })
 
         const wrapper = mount(PersonalSettings)
-        expect(wrapper.find('.nc-loading-icon').exists()).toBe(true)
+        expect(wrapper.find('.sb-settings-loading').exists()).toBe(true)
+        expect(wrapper.text()).toContain('Loading')
     })
 
     it('renders agentUrl and apiKey fields when loaded', () => {

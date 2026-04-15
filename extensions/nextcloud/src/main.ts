@@ -1,5 +1,5 @@
 import { createApp, defineCustomElement, h, ref } from 'vue'
-import { createPinia, setActivePinia } from 'pinia'
+import { createPinia } from 'pinia'
 import { getSidebar } from '@nextcloud/files'
 import type { ISidebarTab } from '@nextcloud/files'
 import { t } from '@nextcloud/l10n'
@@ -9,7 +9,6 @@ import PersonalSettings from './components/PersonalSettings.vue'
 // Shared pinia instance. setActivePinia makes it available to stores accessed
 // inside defineCustomElement-created apps (which have their own Vue app context).
 const pinia = createPinia()
-setActivePinia(pinia)
 
 // ─── Personal Settings ───────────────────────────────────────────────────────
 // PersonalSection.php renders <div id="sharebridge-personal-settings"> in the
@@ -88,7 +87,10 @@ if (window.OCA?.Files?.Sidebar) {
         tagName:       'sharebridge-files-sidebar-tab' as `${string}-${string}`,
         enabled() { return true },
         async onInit() {
-            const SidebarTabEl = defineCustomElement(ShareBridgeTab, { shadowRoot: false })
+            const SidebarTabEl = defineCustomElement(ShareBridgeTab, {
+                shadowRoot: false,
+                configureApp(app) { app.use(pinia) },
+            })
             customElements.define('sharebridge-files-sidebar-tab', SidebarTabEl)
         },
     }

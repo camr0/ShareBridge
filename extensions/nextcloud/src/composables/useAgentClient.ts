@@ -1,43 +1,41 @@
+import axios from '@nextcloud/axios'
+import { generateUrl } from '@nextcloud/router'
 import type { CreateShareParams, CreateShareResult, Share, AgentSettings } from '../types'
-import { useSettingsStore } from '../stores/settings'
 
+/**
+ * Calls the NC PHP proxy endpoints instead of the agent directly.
+ *
+ * Two reasons for the proxy:
+ *  1. NC's CSP (connect-src 'self') blocks direct browser→agent requests.
+ *  2. Mixed content: NC is HTTPS but the agent may be HTTP on the local network.
+ *
+ * The proxy uses PHP curl (not IClientService) to reach local IPs without
+ * requiring allow_local_remote_servers. The API key stays server-side.
+ */
 export const useAgentClient = () => {
-	const settings = useSettingsStore()
+    const listShares = async (fileId?: string): Promise<Share[]> => {
+        const url = generateUrl('/apps/sharebridge/api/agent/shares')
+        const params = fileId ? { file_id: fileId } : {}
+        const response = await axios.get(url, { params })
+        return response.data
+    }
 
-	const getHeaders = (): Record<string, string> => ({
-		'Content-Type': 'application/json',
-		'X-API-Key': settings.apiKey,
-	})
+    const createShare = async (params: CreateShareParams): Promise<CreateShareResult> => {
+        const url = generateUrl('/apps/sharebridge/api/agent/shares')
+        const response = await axios.post(url, params)
+        return response.data
+    }
 
-	const listShares = async (fileId?: string): Promise<Share[]> => {
-		const url = new URL(`${settings.agentUrl}/api/v1/shares`)
-		if (fileId) url.searchParams.set('file_id', fileId)
-		const response = await fetch(url.toString(), { headers: getHeaders() })
-		return response.json()
-	}
+    const revokeShare = async (code: string): Promise<void> => {
+        const url = generateUrl(`/apps/sharebridge/api/agent/shares/${encodeURIComponent(code)}`)
+        await axios.delete(url)
+    }
 
-	const createShare = async (params: CreateShareParams): Promise<CreateShareResult> => {
-		const response = await fetch(`${settings.agentUrl}/api/v1/shares`, {
-			method: 'POST',
-			headers: getHeaders(),
-			body: JSON.stringify(params),
-		})
-		return response.json()
-	}
+    const getSettings = async (): Promise<AgentSettings> => {
+        const url = generateUrl('/apps/sharebridge/api/agent/settings')
+        const response = await axios.get(url)
+        return response.data
+    }
 
-	const revokeShare = async (code: string): Promise<void> => {
-		await fetch(`${settings.agentUrl}/api/v1/shares/${code}`, {
-			method: 'DELETE',
-			headers: getHeaders(),
-		})
-	}
-
-	const getSettings = async (): Promise<AgentSettings> => {
-		const response = await fetch(`${settings.agentUrl}/api/v1/settings`, {
-			headers: getHeaders(),
-		})
-		return response.json()
-	}
-
-	return { listShares, createShare, revokeShare, getSettings }
+    return { listShares, createShare, revokeShare, getSettings }
 }

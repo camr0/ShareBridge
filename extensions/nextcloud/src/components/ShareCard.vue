@@ -8,19 +8,18 @@
             <span class="sb-share-expiry">Expires: {{ formattedExpiry }}</span>
         </div>
         <div class="sb-share-actions">
-            <NcButton data-testid="copy-btn" @click="copyLink">
+            <button data-testid="copy-btn" class="button-vue" @click="copyLink">
                 {{ copied ? 'Copied!' : 'Copy Link' }}
-            </NcButton>
-            <NcButton data-testid="revoke-btn" @click="emit('revoke', share.code)">
+            </button>
+            <button data-testid="revoke-btn" class="button-vue" @click="emit('revoke', share.code)">
                 Revoke
-            </NcButton>
+            </button>
         </div>
     </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onUnmounted } from 'vue'
-import { NcButton } from '@nextcloud/vue'
 import type { Share } from '../types'
 
 const props = defineProps<{ share: Share }>()

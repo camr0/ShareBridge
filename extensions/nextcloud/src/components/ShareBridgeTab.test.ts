@@ -70,11 +70,12 @@ describe('ShareBridgeTab', () => {
         expect(wrapper.find('[data-testid="configure-prompt"]').exists()).toBe(true)
     })
 
-    it('shows loading icon while settings are being fetched', () => {
+    it('shows loading state while settings are being fetched', () => {
         useSettingsStore().$patch({ loaded: false, loading: true })
 
         const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
-        expect(wrapper.find('.nc-loading-icon').exists()).toBe(true)
+        expect(wrapper.find('.sb-loading').exists()).toBe(true)
+        expect(wrapper.text()).toContain('Loading')
     })
 
     it('calls listShares with node fileid when configured', async () => {

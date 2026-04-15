@@ -1,7 +1,6 @@
 <?php
 namespace OCA\ShareBridge\AppInfo;
 
-use OCA\ShareBridge\Settings\PersonalSection;
 use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
@@ -16,7 +15,6 @@ class Application extends App implements IBootstrap {
     }
 
     public function register(IRegistrationContext $context): void {
-        $context->registerSetting(PersonalSection::class);
     }
 
     public function boot(IBootContext $context): void {
