@@ -56,7 +56,23 @@
                     Managed by environment variable <code>{{.EnvManaged.AllowedHost}}</code>. Remove it to edit this in the UI.
                 </small>
                 {{end}}
-                <small>SSRF protection — only shares from this host are allowed</small>
+                <small>Hostname of your OpenCloud instance (used for CORS)</small>
+            </label>
+        </fieldset>
+
+        <fieldset>
+            <legend>Nextcloud</legend>
+            <label for="nc-allowed-host">
+                Allowed Host
+                <input type="text" id="nc-allowed-host" name="nc_allowed_host"
+                    placeholder="nextcloud.example.com" value="{{.Config.NCAllowedHost}}"
+                    {{if .EnvManaged.NCAllowedHost}}disabled aria-describedby="nc-allowed-host-managed"{{end}}>
+                {{if .EnvManaged.NCAllowedHost}}
+                <small id="nc-allowed-host-managed" class="env-managed-note">
+                    Managed by environment variable <code>{{.EnvManaged.NCAllowedHost}}</code>. Remove it to edit this in the UI.
+                </small>
+                {{end}}
+                <small>Hostname of your Nextcloud instance (used for CORS)</small>
             </label>
         </fieldset>
 

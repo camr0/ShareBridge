@@ -39,6 +39,7 @@ type daemonProvider interface {
 // and optional basic auth.
 type WebServer struct {
 	daemon     daemonProvider
+	addr       string
 	port       int
 	password   string
 	server     *http.Server
@@ -49,7 +50,8 @@ type WebServer struct {
 // NewWebServer creates a new web server instance.
 // It parses the layout template and creates a static file sub-filesystem.
 // The daemon reference may be nil initially and set later via SetDaemon.
-func NewWebServer(d daemonProvider, port int, password string) (*WebServer, error) {
+// addr is the bind address (e.g. "127.0.0.1" or "0.0.0.0").
+func NewWebServer(d daemonProvider, addr string, port int, password string) (*WebServer, error) {
 	// Parse the layout template
 	layoutTmpl, err := template.ParseFS(embeddedFS, "templates/layout.html")
 	if err != nil {
@@ -64,6 +66,7 @@ func NewWebServer(d daemonProvider, port int, password string) (*WebServer, erro
 
 	return &WebServer{
 		daemon:     d,
+		addr:       addr,
 		port:       port,
 		password:   password,
 		layoutTmpl: layoutTmpl,
@@ -93,8 +96,9 @@ func (ws *WebServer) Start(ctx context.Context) error {
 		handler = ws.authMiddleware(handler)
 	}
 
+	listenAddr := fmt.Sprintf("%s:%d", ws.addr, ws.port)
 	ws.server = &http.Server{
-		Addr:         fmt.Sprintf("127.0.0.1:%d", ws.port),
+		Addr:         listenAddr,
 		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -103,7 +107,7 @@ func (ws *WebServer) Start(ctx context.Context) error {
 	// Start server in background
 	errChan := make(chan error, 1)
 	go func() {
-		log.Printf("web server starting on http://127.0.0.1:%d", ws.port)
+		log.Printf("web server starting on http://%s", listenAddr)
 		if err := ws.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errChan <- err
 		}
@@ -225,9 +229,8 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 }
 
 // corsMiddleware sets CORS headers for /api/v1/ endpoints.
-// The allowed origin is "https://" + AllowedHost from config.
-// Returns 503 if daemon is not ready or AllowedHost is not configured —
-// the extension cannot function without a known origin to restrict CORS to.
+// The Origin request header is matched against AllowedHost (OpenCloud) and NCAllowedHost (Nextcloud);
+// the matching origin is reflected back. Returns 503 if AllowedHost is not configured.
 // Handles OPTIONS preflight by returning 204 without calling next.
 func (ws *WebServer) corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -246,7 +249,16 @@ func (ws *WebServer) corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			w.Write([]byte(`{"error":"AllowedHost not configured","code":"MISCONFIGURED"}`))
 			return
 		}
-		w.Header().Set("Access-Control-Allow-Origin", "https://"+cfg.AllowedHost)
+		// Match incoming Origin against each configured host.
+		origin := r.Header.Get("Origin")
+		allowedOrigin := "https://" + cfg.AllowedHost // default to first configured host
+		for _, host := range []string{cfg.AllowedHost, cfg.NCAllowedHost} {
+			if host != "" && origin == "https://"+host {
+				allowedOrigin = origin
+				break
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 		if r.Method == http.MethodOptions {

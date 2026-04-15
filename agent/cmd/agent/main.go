@@ -109,13 +109,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create web server
+	uiAddr := cfg.UIAddr
 	uiPort := cfg.UIPort
 	uiPassword := cfg.UIPassword
 	if uiPassword == "" {
 		uiPassword = password // Allow CLI override
 	}
 
-	webServer, err := web.NewWebServer(nil, uiPort, uiPassword)
+	webServer, err := web.NewWebServer(nil, uiAddr, uiPort, uiPassword)
 	if err != nil {
 		return fmt.Errorf("create web server: %w", err)
 	}
@@ -131,7 +132,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Start daemon
 	errChan := d.Start(ctx)
 
-	log.Printf("daemon started — web UI at http://127.0.0.1:%d", uiPort)
+	log.Printf("daemon started — web UI at http://%s:%d", uiAddr, uiPort)
 
 	// Wait for interrupt or error
 	select {

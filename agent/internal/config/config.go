@@ -16,12 +16,14 @@ import (
 type Config struct {
 	SignalingURL       string `json:"signaling_url"`
 	APIKey             string `json:"api_key,omitempty"`
-	AllowedHost        string `json:"allowed_host,omitempty"`
+	AllowedHost        string `json:"allowed_host,omitempty"`    // OpenCloud hostname for CORS
+	NCAllowedHost      string `json:"nc_allowed_host,omitempty"` // Nextcloud hostname for CORS
 	AgentAPIKey        string `json:"agent_api_key,omitempty"` // auth key for /api/v1/ JSON endpoints
 	DefaultExpiry      int    `json:"default_expiry"`          // hours, default: 24
 	DefaultMaxDownloads int    `json:"default_max_downloads"`   // 0 = unlimited, default: 10
 	DefaultRelayOnly   bool   `json:"default_relay_only"`
 	UIPort             int    `json:"ui_port"` // default: 7878
+	UIAddr             string `json:"ui_addr,omitempty"` // default: 0.0.0.0
 	UIPassword         string `json:"ui_password,omitempty"`
 
 	// Legacy fields for backward compatibility
@@ -125,6 +127,9 @@ func (m *Manager) load() (*Config, error) {
 	if v := os.Getenv("ALLOWED_SHAREBRIDGE_HOST"); v != "" {
 		cfg.AllowedHost = v
 	}
+	if v := os.Getenv("NC_ALLOWED_SHAREBRIDGE_HOST"); v != "" {
+		cfg.NCAllowedHost = v
+	}
 	if v := os.Getenv("SHAREBRIDGE_AGENT_API_KEY"); v != "" {
 		cfg.AgentAPIKey = v
 		m.agentAPIKeyFromEnv = true
@@ -135,12 +140,18 @@ func (m *Manager) load() (*Config, error) {
 	if v := os.Getenv("UI_PASSWORD"); v != "" {
 		cfg.UIPassword = v
 	}
+	if v := os.Getenv("UI_ADDR"); v != "" {
+		cfg.UIAddr = v
+	}
 
 	if cfg.SignalingURL == "" {
 		cfg.SignalingURL = "wss://sharebridge.app"
 	}
 	if cfg.UIPort == 0 {
 		cfg.UIPort = 7878
+	}
+	if cfg.UIAddr == "" {
+		cfg.UIAddr = "0.0.0.0"
 	}
 
 	return cfg, nil

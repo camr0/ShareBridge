@@ -248,6 +248,9 @@ func (ws *WebServer) saveSettingsHandler(w http.ResponseWriter, r *http.Request)
 	if os.Getenv("ALLOWED_SHAREBRIDGE_HOST") == "" {
 		currentCfg.AllowedHost = r.FormValue("allowed_host")
 	}
+	if os.Getenv("NC_ALLOWED_SHAREBRIDGE_HOST") == "" {
+		currentCfg.NCAllowedHost = r.FormValue("nc_allowed_host")
+	}
 
 	// Parse default expiry hours
 	if val := r.FormValue("default_expiry_hours"); val != "" {

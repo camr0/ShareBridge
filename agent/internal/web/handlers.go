@@ -25,6 +25,7 @@ type configData struct {
 	SignalingURL        string
 	APIKey              string
 	AllowedHost         string
+	NCAllowedHost       string
 	AgentAPIKey         string
 	DefaultExpiry       int
 	DefaultMaxDownloads int
@@ -33,9 +34,10 @@ type configData struct {
 }
 
 type envManagedData struct {
-	SignalingURL string
-	APIKey       string
-	AllowedHost  string
+	SignalingURL   string
+	APIKey         string
+	AllowedHost    string
+	NCAllowedHost  string
 }
 
 // sessionData holds session data for templates.
@@ -107,6 +109,7 @@ func (ws *WebServer) settingsHandler(w http.ResponseWriter, r *http.Request) {
 			SignalingURL:        c.SignalingURL,
 			APIKey:              c.APIKey,
 			AllowedHost:         c.AllowedHost,
+			NCAllowedHost:       c.NCAllowedHost,
 			AgentAPIKey:         c.AgentAPIKey,
 			DefaultExpiry:       c.DefaultExpiry,
 			DefaultMaxDownloads: c.DefaultMaxDownloads,
@@ -125,9 +128,10 @@ func (ws *WebServer) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		ActivePage: "settings",
 		Config:     cfg,
 		EnvManaged: envManagedData{
-			SignalingURL: envVarNameIfSet("SIGNALING_SERVER"),
-			APIKey:       envVarNameIfSet("SHAREBRIDGE_API_KEY"),
-			AllowedHost:  envVarNameIfSet("ALLOWED_SHAREBRIDGE_HOST"),
+			SignalingURL:  envVarNameIfSet("SIGNALING_SERVER"),
+			APIKey:        envVarNameIfSet("SHAREBRIDGE_API_KEY"),
+			AllowedHost:   envVarNameIfSet("ALLOWED_SHAREBRIDGE_HOST"),
+			NCAllowedHost: envVarNameIfSet("NC_ALLOWED_SHAREBRIDGE_HOST"),
 		},
 		GoVersion:  runtime.Version(),
 		ConfigPath: configPath,
