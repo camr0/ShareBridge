@@ -37,6 +37,7 @@ var (
 	maxDownloads int
 	expiryHours  int
 	relayOnly    bool
+	shareType    string
 )
 
 // nonceEntry holds a per-connection nonce for HMAC pre-challenge (standalone mode).
@@ -53,6 +54,7 @@ func init() {
 	shareCmd.Flags().IntVarP(&maxDownloads, "max-downloads", "n", 0, "Maximum number of downloads (0=unlimited)")
 	shareCmd.Flags().IntVarP(&expiryHours, "expiry", "e", 24, "Expiry time in hours")
 	shareCmd.Flags().BoolVarP(&relayOnly, "relay", "r", false, "Force relay-only mode (TURN required)")
+	shareCmd.Flags().StringVarP(&shareType, "share-type", "t", "", "Share backend type: 'opencloud' or 'nextcloud' (required)")
 
 	daemonCmd.Flags().StringVarP(&password, "password", "p", "", "Password for web UI (optional)")
 }
@@ -155,6 +157,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 func runShare(cmd *cobra.Command, args []string) error {
 	shareURL := args[0]
 
+	// Validate explicit share_type is provided (per spec: no auto-detection)
+	if shareType == "" {
+		return fmt.Errorf("--share-type is required (opencloud or nextcloud)")
+	}
+	if shareType != "opencloud" && shareType != "nextcloud" {
+		return fmt.Errorf("--share-type must be 'opencloud' or 'nextcloud', got '%s'", shareType)
+	}
+
 	// Check if daemon is running
 	daemonURL := "http://127.0.0.1:7878/api/status"
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -175,23 +185,10 @@ func runShare(cmd *cobra.Command, args []string) error {
 
 // runShareClient sends a create-share request to the running daemon.
 func runShareClient(shareURL string) error {
-	// Load config to get allowed hosts for share type derivation
-	cfg := config.Load()
-
-	// Derive share type from URL host matching
-	// CLI cannot accept an explicit share_type flag without breaking the single-argument UX,
-	// so we derive it from configured allowed hosts (same logic as daemon)
-	var shareType string
-	if cfg.NCAllowedHost != "" && strings.Contains(shareURL, cfg.NCAllowedHost) {
-		shareType = "nextcloud"
-	} else {
-		shareType = "opencloud"
-	}
-
 	// Build form data
 	formData := url.Values{}
 	formData.Set("share_url", shareURL)
-	formData.Set("share_type", shareType)
+	formData.Set("share_type", shareType) // Use explicit flag (validated in runShare)
 	if password != "" {
 		formData.Set("password", password)
 	}
@@ -282,15 +279,7 @@ func runShareSingle(shareURL string) error {
 		return fmt.Errorf("SHAREBRIDGE_API_KEY environment variable required")
 	}
 
-	// Determine share type from URL host
-	// TODO: Task 4 will add explicit shareType parameter to CLI
-	var shareType string
-	if cfg.NCAllowedHost != "" && strings.Contains(shareURL, cfg.NCAllowedHost) {
-		shareType = "nextcloud"
-	} else {
-		shareType = "opencloud"
-	}
-
+	// Use explicit share_type (validated in runShare)
 	webdavClient, err := cloudwebdav.New(shareType, shareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, password)
 	if err != nil {
 		return fmt.Errorf("create WebDAV client: %w", err)
@@ -383,6 +372,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	session := store.SessionEntry{
 		Code:         code,
 		ShareURL:     shareURL,
+		ShareType:    shareType,
 		Password:     password,
 		ExpiresAt:    now.Add(time.Duration(expiryHours) * time.Hour),
 		MaxDownloads: maxDownloads,
