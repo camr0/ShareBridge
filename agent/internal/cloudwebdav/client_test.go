@@ -9,7 +9,7 @@ import (
 )
 
 func TestNew_ValidURL(t *testing.T) {
-	c, err := New("https://cloud.example.com/s/AbCdEfGh", []string{"cloud.example.com"}, "")
+	c, err := New("opencloud", "https://cloud.example.com/s/AbCdEfGh", []string{"cloud.example.com"}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -19,16 +19,46 @@ func TestNew_ValidURL(t *testing.T) {
 }
 
 func TestNew_InvalidURL(t *testing.T) {
-	_, err := New("://invalid-url", []string{"cloud.example.com"}, "")
+	_, err := New("opencloud", "://invalid-url", []string{"cloud.example.com"}, "")
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
 }
 
 func TestNew_SSRF(t *testing.T) {
-	_, err := New("https://evil.com/s/token", []string{"cloud.example.com"}, "")
+	_, err := New("opencloud", "https://evil.com/s/token", []string{"cloud.example.com"}, "")
 	if err == nil {
 		t.Error("expected SSRF error for mismatched host")
+	}
+}
+
+func TestNewOpenCloud_UsesPublicFilesEndpoint(t *testing.T) {
+	c, err := New("opencloud", "https://cloud.example.com/s/token", []string{"cloud.example.com"}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if got := c.BaseURL(); got != "https://cloud.example.com/remote.php/dav/public-files/token" {
+		t.Fatalf("BaseURL() = %q, want https://cloud.example.com/remote.php/dav/public-files/token", got)
+	}
+}
+
+func TestNewNextcloud_UsesPublicDAVEndpoint(t *testing.T) {
+	c, err := New("nextcloud", "https://nc.example.com/s/token", []string{"nc.example.com"}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if got := c.BaseURL(); got != "https://nc.example.com/public.php/dav/files/token" {
+		t.Fatalf("BaseURL() = %q, want https://nc.example.com/public.php/dav/files/token", got)
+	}
+}
+
+func TestNew_UnsupportedShareType(t *testing.T) {
+	_, err := New("unsupported", "https://cloud.example.com/s/token", []string{"cloud.example.com"}, "")
+	if err == nil {
+		t.Fatal("expected error for unsupported share type")
+	}
+	if !strings.Contains(err.Error(), "unsupported share type") {
+		t.Errorf("error should mention unsupported share type, got: %v", err)
 	}
 }
 
@@ -334,7 +364,7 @@ func TestGetRootFileID_SingleFileShare(t *testing.T) {
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/testtoken", []string{host}, "")
+	c, err := New("opencloud", srv.URL+"/s/testtoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -373,7 +403,7 @@ func TestGetRootFileID_FolderShare(t *testing.T) {
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/foldertoken", []string{host}, "")
+	c, err := New("opencloud", srv.URL+"/s/foldertoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -405,7 +435,7 @@ func TestGetRootFileID_EmptyWhenMissing(t *testing.T) {
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/testtoken", []string{host}, "")
+	c, err := New("opencloud", srv.URL+"/s/testtoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -420,21 +450,19 @@ func TestGetRootFileID_EmptyWhenMissing(t *testing.T) {
 	}
 }
 
-func TestGetRootFileID_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
+func TestGetRootFileID_NextcloudEndpoint(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/remote.php/dav/public-files/nctoken":
-			http.Error(w, "wrong endpoint", http.StatusUnauthorized)
-			return
-		case "/public.php/dav/files/nctoken":
-			if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
-				t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
-			}
-			if got := r.Header.Get("Depth"); got != "0" {
-				t.Fatalf("Depth = %q, want 0", got)
-			}
-			w.WriteHeader(http.StatusMultiStatus)
-			w.Write([]byte(`<?xml version="1.0"?>
+		if r.URL.Path != "/public.php/dav/files/nctoken" {
+			t.Fatalf("unexpected path %q, want /public.php/dav/files/nctoken", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
+			t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
+		}
+		if got := r.Header.Get("Depth"); got != "0" {
+			t.Fatalf("Depth = %q, want 0", got)
+		}
+		w.WriteHeader(http.StatusMultiStatus)
+		w.Write([]byte(`<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
   <d:response>
     <d:href>/public.php/dav/files/nctoken/</d:href>
@@ -447,15 +475,11 @@ func TestGetRootFileID_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
     </d:propstat>
   </d:response>
 </d:multistatus>`))
-			return
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
 	}))
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/nctoken", []string{host}, "")
+	c, err := New("nextcloud", srv.URL+"/s/nctoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -470,21 +494,19 @@ func TestGetRootFileID_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
 	}
 }
 
-func TestListFiles_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
+func TestListFiles_NextcloudEndpoint(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/remote.php/dav/public-files/nctoken":
-			http.Error(w, "wrong endpoint", http.StatusUnauthorized)
-			return
-		case "/public.php/dav/files/nctoken":
-			if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
-				t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
-			}
-			if got := r.Header.Get("Depth"); got != "1" {
-				t.Fatalf("Depth = %q, want 1", got)
-			}
-			w.WriteHeader(http.StatusMultiStatus)
-			w.Write([]byte(`<?xml version="1.0"?>
+		if r.URL.Path != "/public.php/dav/files/nctoken" {
+			t.Fatalf("unexpected path %q, want /public.php/dav/files/nctoken", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
+			t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
+		}
+		if got := r.Header.Get("Depth"); got != "1" {
+			t.Fatalf("Depth = %q, want 1", got)
+		}
+		w.WriteHeader(http.StatusMultiStatus)
+		w.Write([]byte(`<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:">
   <d:response>
     <d:href>/public.php/dav/files/nctoken/</d:href>
@@ -502,15 +524,11 @@ func TestListFiles_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
     </d:propstat>
   </d:response>
 </d:multistatus>`))
-			return
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
 	}))
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/nctoken", []string{host}, "")
+	c, err := New("nextcloud", srv.URL+"/s/nctoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -528,27 +546,21 @@ func TestListFiles_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
 	}
 }
 
-func TestGetFile_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
+func TestGetFile_NextcloudEndpoint(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/remote.php/dav/public-files/nctoken/report.pdf":
-			http.Error(w, "wrong endpoint", http.StatusUnauthorized)
-			return
-		case "/public.php/dav/files/nctoken/report.pdf":
-			if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
-				t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
-			}
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("hello from nextcloud"))
-			return
-		default:
-			t.Fatalf("unexpected path %q", r.URL.Path)
+		if r.URL.Path != "/public.php/dav/files/nctoken/report.pdf" {
+			t.Fatalf("unexpected path %q, want /public.php/dav/files/nctoken/report.pdf", r.URL.Path)
 		}
+		if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
+			t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("hello from nextcloud"))
 	}))
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/nctoken", []string{host}, "")
+	c, err := New("nextcloud", srv.URL+"/s/nctoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}

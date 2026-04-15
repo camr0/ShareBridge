@@ -268,7 +268,16 @@ func runShareSingle(shareURL string) error {
 		return fmt.Errorf("SHAREBRIDGE_API_KEY environment variable required")
 	}
 
-	webdavClient, err := cloudwebdav.New(shareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, password)
+	// Determine share type from URL host
+	// TODO: Task 4 will add explicit shareType parameter to CLI
+	var shareType string
+	if cfg.NCAllowedHost != "" && strings.Contains(shareURL, cfg.NCAllowedHost) {
+		shareType = "nextcloud"
+	} else {
+		shareType = "opencloud"
+	}
+
+	webdavClient, err := cloudwebdav.New(shareType, shareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, password)
 	if err != nil {
 		return fmt.Errorf("create WebDAV client: %w", err)
 	}

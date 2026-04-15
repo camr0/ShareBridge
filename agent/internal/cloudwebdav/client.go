@@ -25,6 +25,14 @@ const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
   </D:prop>
 </D:propfind>`
 
+// Backend represents the type of WebDAV backend server.
+type Backend string
+
+const (
+	BackendOpenCloud Backend = "opencloud"
+	BackendNextcloud Backend = "nextcloud"
+)
+
 // FileInfo describes a file or directory in a public WebDAV share.
 type FileInfo struct {
 	Name        string `json:"name"`
@@ -35,24 +43,26 @@ type FileInfo struct {
 	RequestPath string `json:"-"` // relative GET path; empty means the root shared file
 }
 
-type davEndpoint struct {
-	baseURL  string
-	selfPath string
-}
-
 // Client provides WebDAV access to public shares exposed by
 // ownCloud-lineage servers such as OpenCloud and Nextcloud.
 type Client struct {
-	endpoints  []davEndpoint
+	baseURL    string
+	selfPath   string
 	token      string
 	password   string // OpenCloud share password (empty if share is unprotected)
 	httpClient *http.Client
 }
 
+// BaseURL returns the WebDAV endpoint URL for testing purposes.
+func (c *Client) BaseURL() string {
+	return c.baseURL
+}
+
 // New creates a WebDAV client for the given public share URL.
+// shareType must be "opencloud" or "nextcloud" to select the correct WebDAV endpoint.
 // password is the public share password; pass empty string for unprotected shares.
 // allowedHosts lists permitted hostnames (SSRF protection); pass all configured cloud hosts.
-func New(shareURL string, allowedHosts []string, password string) (*Client, error) {
+func New(shareType, shareURL string, allowedHosts []string, password string) (*Client, error) {
 	u, err := url.Parse(shareURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
@@ -75,21 +85,23 @@ func New(shareURL string, allowedHosts []string, password string) (*Client, erro
 		return nil, fmt.Errorf("could not extract token from URL")
 	}
 
-	endpoints := []davEndpoint{
-		{
-			baseURL:  fmt.Sprintf("https://%s/remote.php/dav/public-files/%s", u.Host, token),
-			selfPath: "/remote.php/dav/public-files/" + token,
-		},
-		{
-			baseURL:  fmt.Sprintf("https://%s/public.php/dav/files/%s", u.Host, token),
-			selfPath: "/public.php/dav/files/" + token,
-		},
+	var baseURL, selfPath string
+	switch Backend(shareType) {
+	case BackendOpenCloud:
+		baseURL = fmt.Sprintf("https://%s/remote.php/dav/public-files/%s", u.Host, token)
+		selfPath = "/remote.php/dav/public-files/" + token
+	case BackendNextcloud:
+		baseURL = fmt.Sprintf("https://%s/public.php/dav/files/%s", u.Host, token)
+		selfPath = "/public.php/dav/files/" + token
+	default:
+		return nil, fmt.Errorf("unsupported share type %q", shareType)
 	}
 
 	return &Client{
-		endpoints: endpoints,
-		token:     token,
-		password:  password,
+		baseURL:  baseURL,
+		selfPath: selfPath,
+		token:    token,
+		password: password,
 		httpClient: &http.Client{
 			// No global Timeout: large file bodies take minutes to stream.
 			// Use transport-level timeouts only (dial, TLS, headers).
@@ -114,32 +126,35 @@ func (c *Client) authHeader() string {
 // ListFiles returns file and directory info for the share at the given subpath.
 // Pass "" for the share root. Pass "docs/reports" for a nested subfolder.
 func (c *Client) ListFiles(subpath string) ([]FileInfo, error) {
-	resp, endpoint, err := c.doRequestWithFallback(func(ep davEndpoint) (*http.Request, error) {
-		requestURL := ep.baseURL
-		if subpath != "" {
-			requestURL += "/" + subpath
-		}
+	requestURL := c.baseURL
+	if subpath != "" {
+		requestURL += "/" + subpath
+	}
 
-		req, err := http.NewRequest("PROPFIND", requestURL, strings.NewReader(propfindBody))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Depth", "1")
-		req.Header.Set("Authorization", c.authHeader())
-		req.Header.Set("Content-Type", "application/xml")
-		return req, nil
-	}, http.StatusMultiStatus)
+	req, err := http.NewRequest("PROPFIND", requestURL, strings.NewReader(propfindBody))
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Depth", "1")
+	req.Header.Set("Authorization", c.authHeader())
+	req.Header.Set("Content-Type", "application/xml")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("PROPFIND request failed: %w", err)
+	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		return nil, fmt.Errorf("PROPFIND returned %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	selfPath := endpoint.selfPath
+	selfPath := c.selfPath
 	if subpath != "" {
 		selfPath += "/" + subpath
 	}
@@ -149,22 +164,26 @@ func (c *Client) ListFiles(subpath string) ([]FileInfo, error) {
 // GetFile streams the named file to the writer.
 // Returns number of bytes written.
 func (c *Client) GetFile(name string, w io.Writer) (int64, error) {
-	resp, _, err := c.doRequestWithFallback(func(ep davEndpoint) (*http.Request, error) {
-		requestURL := ep.baseURL
-		if name != "" {
-			requestURL += "/" + name
-		}
-		req, err := http.NewRequest("GET", requestURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", c.authHeader())
-		return req, nil
-	}, http.StatusOK)
+	requestURL := c.baseURL
+	if name != "" {
+		requestURL += "/" + name
+	}
+
+	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {
 		return 0, err
 	}
+	req.Header.Set("Authorization", c.authHeader())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("GET request failed: %w", err)
+	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("GET returned %s", resp.Status)
+	}
 
 	return io.Copy(w, resp.Body)
 }
@@ -200,20 +219,23 @@ func (c *Client) GetRootFileID() (string, error) {
 // non-empty oc:fileid found. For Depth:0 it checks the root entry; for Depth:1
 // it skips hrefs ending in "/" and returns the first child's fileid.
 func (c *Client) propfindFileID(depth string) (string, error) {
-	resp, _, err := c.doRequestWithFallback(func(ep davEndpoint) (*http.Request, error) {
-		req, err := http.NewRequest("PROPFIND", ep.baseURL, strings.NewReader(propfindBody))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Depth", depth)
-		req.Header.Set("Authorization", c.authHeader())
-		req.Header.Set("Content-Type", "application/xml")
-		return req, nil
-	}, http.StatusMultiStatus)
+	req, err := http.NewRequest("PROPFIND", c.baseURL, strings.NewReader(propfindBody))
 	if err != nil {
 		return "", err
 	}
+	req.Header.Set("Depth", depth)
+	req.Header.Set("Authorization", c.authHeader())
+	req.Header.Set("Content-Type", "application/xml")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("PROPFIND request failed: %w", err)
+	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMultiStatus {
+		return "", fmt.Errorf("PROPFIND returned %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -235,37 +257,6 @@ func (c *Client) propfindFileID(depth string) (string, error) {
 		}
 	}
 	return "", nil
-}
-
-func (c *Client) doRequestWithFallback(buildReq func(davEndpoint) (*http.Request, error), wantStatus int) (*http.Response, davEndpoint, error) {
-	var lastStatus int
-
-	for _, endpoint := range c.endpoints {
-		req, err := buildReq(endpoint)
-		if err != nil {
-			return nil, davEndpoint{}, err
-		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, davEndpoint{}, fmt.Errorf("%s request failed: %w", req.Method, err)
-		}
-		if resp.StatusCode == wantStatus {
-			return resp, endpoint, nil
-		}
-
-		lastStatus = resp.StatusCode
-		resp.Body.Close()
-		if !shouldTryNextEndpoint(resp.StatusCode) {
-			break
-		}
-	}
-
-	return nil, davEndpoint{}, fmt.Errorf("%s returned %d", http.StatusText(wantStatus), lastStatus)
-}
-
-func shouldTryNextEndpoint(status int) bool {
-	return status == http.StatusUnauthorized || status == http.StatusNotFound
 }
 
 // PROPFIND response parsing types

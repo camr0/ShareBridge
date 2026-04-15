@@ -231,16 +231,25 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 
 	allowedHosts := []string{cfg.AllowedHost, cfg.NCAllowedHost}
 
+	// Determine share type from URL host
+	// TODO: Task 4 will make shareType an explicit parameter to this function
+	var shareType string
+	if cfg.NCAllowedHost != "" && strings.Contains(shareURL, cfg.NCAllowedHost) {
+		shareType = "nextcloud"
+	} else {
+		shareType = "opencloud"
+	}
+
 	// Validate share URL against allowed hosts
 	if cfg.AllowedHost != "" || cfg.NCAllowedHost != "" {
-		_, err := cloudwebdav.New(shareURL, allowedHosts, password)
+		_, err := cloudwebdav.New(shareType, shareURL, allowedHosts, password)
 		if err != nil {
 			return "", fmt.Errorf("validate share URL: %w", err)
 		}
 	}
 
 	// Create WebDAV client
-	webdavClient, err := cloudwebdav.New(shareURL, allowedHosts, password)
+	webdavClient, err := cloudwebdav.New(shareType, shareURL, allowedHosts, password)
 	if err != nil {
 		return "", fmt.Errorf("create WebDAV client: %w", err)
 	}
@@ -262,7 +271,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 	session := &Session{
 		Code:         code,
 		ShareURL:     shareURL,
-		ShareType:    "opencloud",
+		ShareType:    shareType,
 		FileID:       fileID,
 		Password:     password,
 		ExpiresAt:    now.Add(expiryDuration),
@@ -679,7 +688,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		}
 
 		// Create WebDAV client
-		webdavClient, err := cloudwebdav.New(entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
+		webdavClient, err := cloudwebdav.New(entry.ShareType, entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
 		if err != nil {
 			log.Printf("warning: could not create WebDAV client for %s: %v", entry.Code, err)
 			continue
