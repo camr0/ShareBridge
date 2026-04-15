@@ -11,7 +11,7 @@ const makeShare = (overrides: Partial<Share> = {}): Share => ({
     downloads:     2,
     max_downloads: 5,
     relay_only:    false,
-    expires_at:    new Date(Date.now() + 3600 * 1000 * 48).toISOString(), // 2 days from now
+    expires_at:    new Date(Date.now() + 3600 * 1000 * 50).toISOString(), // ~50 hours = clearly 2 days
     created_at:    new Date().toISOString(),
     ...overrides,
 })
