@@ -109,9 +109,10 @@ class AgentProxyController extends Controller {
 
     /** @NoAdminRequired */
     public function createShare(): JSONResponse {
+        $body = json_decode(file_get_contents('php://input'), true) ?? [];
         return $this->curlPost(
             $this->agentUrl() . '/api/v1/shares',
-            $this->request->getParams()
+            $body
         );
     }
 
