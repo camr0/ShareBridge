@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 )
@@ -125,6 +126,7 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 		req.RelayOnly,
 	)
 	if err != nil {
+		log.Printf("ERROR v1CreateShare: shareURL=%q shareType=%q err=%v", req.ShareURL, req.ShareType, err)
 		writeJSON(w, http.StatusInternalServerError, v1ErrorResponse{err.Error(), "INTERNAL_ERROR"})
 		return
 	}
