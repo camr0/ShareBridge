@@ -18,6 +18,7 @@ import (
 type SessionEntry struct {
 	Code         string    `json:"code"`
 	ShareURL     string    `json:"share_url"`
+	ShareType    string    `json:"share_type"`
 	FileID       string    `json:"file_id,omitempty"`
 	Password     string    `json:"password,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at"`

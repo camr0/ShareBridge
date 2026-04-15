@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -675,6 +678,7 @@ func TestLoadSessionsFromStore(t *testing.T) {
 	st.SaveSession(store.SessionEntry{
 		Code:         "persisted-code",
 		ShareURL:     "https://opencloud.example.com/s/persisted",
+		ShareType:    "opencloud",
 		ExpiresAt:    time.Now().Add(24 * time.Hour),
 		MaxDownloads: 10,
 		Downloads:    3,
@@ -720,6 +724,7 @@ func TestLoadSessionsFromStoreFiltersExpired(t *testing.T) {
 	st.SaveSession(store.SessionEntry{
 		Code:      "expired-code",
 		ShareURL:  "https://opencloud.example.com/s/expired",
+		ShareType: "opencloud",
 		ExpiresAt: time.Now().Add(-1 * time.Hour), // Expired
 	})
 
@@ -753,6 +758,7 @@ func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
 	st.SaveSession(store.SessionEntry{
 		Code:         "file-code",
 		ShareURL:     "https://opencloud.example.com/s/abc123",
+		ShareType:    "opencloud",
 		FileID:       "storage-1$foo!bar",
 		ExpiresAt:    time.Now().Add(24 * time.Hour),
 		MaxDownloads: 10,
@@ -777,6 +783,52 @@ func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
 	}
 	if session.FileID != "storage-1$foo!bar" {
 		t.Errorf("FileID = %q, want storage-1$foo!bar", session.FileID)
+	}
+}
+
+// TestLoadSessionsFromStore_LegacyMissingShareType skips legacy sessions that
+// were persisted before ShareType existed.
+func TestLoadSessionsFromStore_LegacyMissingShareType(t *testing.T) {
+	cfg := &config.Config{
+		SignalingURL: "ws://localhost:8080",
+		APIKey:       "test-api-key",
+		AllowedHost:  "opencloud.example.com",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+
+	st.SaveSession(store.SessionEntry{
+		Code:      "legacy-code",
+		ShareURL:  "https://opencloud.example.com/s/legacy",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	})
+
+	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	if err != nil {
+		t.Fatalf("NewWithSignaling() error: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	originalOutput := log.Writer()
+	originalFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(originalOutput)
+		log.SetFlags(originalFlags)
+	})
+
+	d.loadSessionsFromStore(context.Background())
+
+	if session := d.GetSession("legacy-code"); session != nil {
+		t.Fatalf("legacy session should have been skipped, got %+v", session)
+	}
+
+	if !strings.Contains(logBuf.String(), "warning") || !strings.Contains(logBuf.String(), "legacy-code") {
+		t.Fatalf("expected warning about legacy session, got logs: %s", logBuf.String())
 	}
 }
 

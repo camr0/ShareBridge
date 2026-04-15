@@ -77,14 +77,14 @@ func TestSaveSession_GetSession_RoundTrip(t *testing.T) {
 
 	now := time.Now()
 	session := SessionEntry{
-		Code:        "xyz123",
-		ShareURL:    "https://example.com/share/abc",
-		Password:    "secret",
-		ExpiresAt:   now.Add(1 * time.Hour),
+		Code:         "xyz123",
+		ShareURL:     "https://example.com/share/abc",
+		Password:     "secret",
+		ExpiresAt:    now.Add(1 * time.Hour),
 		MaxDownloads: 5,
-		Downloads:   0,
-		RelayOnly:   true,
-		CreatedAt:   now,
+		Downloads:    0,
+		RelayOnly:    true,
+		CreatedAt:    now,
 	}
 
 	if err := store.SaveSession(session); err != nil {
@@ -113,6 +113,37 @@ func TestSaveSession_GetSession_RoundTrip(t *testing.T) {
 	}
 	if gotSession.RelayOnly != session.RelayOnly {
 		t.Errorf("RelayOnly: got %v, expected %v", gotSession.RelayOnly, session.RelayOnly)
+	}
+}
+
+// TestSaveSession_GetSession_RoundTripShareType verifies that ShareType is
+// persisted and returned unchanged.
+func TestSaveSession_GetSession_RoundTripShareType(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
+
+	store, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	session := SessionEntry{
+		Code:      "sharetype-code",
+		ShareURL:  "https://example.com/share/sharetype",
+		ShareType: "cloudwebdav",
+		CreatedAt: time.Now(),
+	}
+
+	if err := store.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	gotSession := store.GetSession("sharetype-code")
+	if gotSession == nil {
+		t.Fatalf("GetSession returned nil")
+	}
+	if gotSession.ShareType != session.ShareType {
+		t.Errorf("ShareType: got %q, expected %q", gotSession.ShareType, session.ShareType)
 	}
 }
 

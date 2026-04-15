@@ -68,6 +68,7 @@ type SignalingClientInterface interface {
 type Session struct {
 	Code         string
 	ShareURL     string
+	ShareType    string
 	FileID       string // oc:fileid extracted via WebDAV PROPFIND on share root
 	Password     string
 	ExpiresAt    time.Time
@@ -261,6 +262,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 	session := &Session{
 		Code:         code,
 		ShareURL:     shareURL,
+		ShareType:    "opencloud",
 		FileID:       fileID,
 		Password:     password,
 		ExpiresAt:    now.Add(expiryDuration),
@@ -281,6 +283,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 	if err := d.store.SaveSession(store.SessionEntry{
 		Code:         code,
 		ShareURL:     shareURL,
+		ShareType:    session.ShareType,
 		FileID:       fileID,
 		Password:     password,
 		ExpiresAt:    session.ExpiresAt,
@@ -670,6 +673,11 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 
 	cfg := d.GetConfig()
 	for _, entry := range sessions {
+		if entry.ShareType == "" {
+			log.Printf("warning: skipping legacy session %s: missing share_type", entry.Code)
+			continue
+		}
+
 		// Create WebDAV client
 		webdavClient, err := cloudwebdav.New(entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
 		if err != nil {
@@ -688,6 +696,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		session := &Session{
 			Code:         code,
 			ShareURL:     entry.ShareURL,
+			ShareType:    entry.ShareType,
 			FileID:       entry.FileID,
 			Password:     entry.Password,
 			ExpiresAt:    entry.ExpiresAt,
