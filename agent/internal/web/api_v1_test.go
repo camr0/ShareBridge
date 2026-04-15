@@ -57,13 +57,14 @@ func (m *mockDaemonV1) GetSession(code string) *daemon.Session {
 
 func (m *mockDaemonV1) GetConfig() *config.Config { return m.cfg }
 
-func (m *mockDaemonV1) CreateSession(_ context.Context, shareURL, _ string, expiry time.Duration, maxDownloads int, relayOnly bool) (string, error) {
+func (m *mockDaemonV1) CreateSession(_ context.Context, shareURL, shareType, _ string, expiry time.Duration, maxDownloads int, relayOnly bool) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	code := fmt.Sprintf("code-%d", len(m.sessions)+1)
 	m.sessions[code] = &daemon.Session{
 		Code:         code,
 		ShareURL:     shareURL,
+		ShareType:    shareType,
 		FileID:       "storage-1$extracted!id",
 		Downloads:    0,
 		MaxDownloads: maxDownloads,

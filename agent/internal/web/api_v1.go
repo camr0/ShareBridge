@@ -118,6 +118,7 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 	code, err := ws.daemon.CreateSession(
 		r.Context(),
 		req.ShareURL,
+		req.ShareType,
 		req.Password,
 		time.Duration(expiryHours)*time.Hour,
 		req.MaxDownloads,

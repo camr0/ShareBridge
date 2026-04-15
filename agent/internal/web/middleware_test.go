@@ -19,7 +19,7 @@ type mockDaemonMiddleware struct {
 func (m *mockDaemonMiddleware) ListSessions() []*daemon.Session              { return nil }
 func (m *mockDaemonMiddleware) GetSession(string) *daemon.Session            { return nil }
 func (m *mockDaemonMiddleware) GetConfig() *config.Config                    { return m.cfg }
-func (m *mockDaemonMiddleware) CreateSession(_ context.Context, _, _ string, _ time.Duration, _ int, _ bool) (string, error) {
+func (m *mockDaemonMiddleware) CreateSession(_ context.Context, _, _, _ string, _ time.Duration, _ int, _ bool) (string, error) {
 	return "", nil
 }
 func (m *mockDaemonMiddleware) RevokeSession(string) error              { return nil }

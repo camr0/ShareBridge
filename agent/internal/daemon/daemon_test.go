@@ -283,7 +283,7 @@ func TestCreateSession(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "", 24*time.Hour, 10, false)
+	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
 	if err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestCreateSessionWithInvalidHost(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err = d.CreateSession(ctx, "https://evil.example.com/s/abc123", "", 24*time.Hour, 10, false)
+	_, err = d.CreateSession(ctx, "https://evil.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
 	if err == nil {
 		t.Errorf("expected error for invalid host")
 	}
@@ -355,7 +355,7 @@ func TestRevokeSession(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "", 24*time.Hour, 10, false)
+	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
 	if err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}
@@ -420,11 +420,11 @@ func TestListSessions(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	code1, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "", 24*time.Hour, 10, false)
+	code1, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
 	if err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}
-	code2, err := d.CreateSession(ctx, "https://opencloud.example.com/s/def456", "", 24*time.Hour, 5, true)
+	code2, err := d.CreateSession(ctx, "https://opencloud.example.com/s/def456", "opencloud", "", 24*time.Hour, 5, true)
 	if err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestOnSessionCallbacks(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "", 24*time.Hour, 10, false)
+	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
 	if err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}

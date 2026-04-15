@@ -225,20 +225,12 @@ func (d *Daemon) Stop() error {
 }
 
 // CreateSession creates a new share session and registers it with the
-// signaling server.
-func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
+// signaling server. The shareType must be explicitly provided by the caller
+// ("opencloud" or "nextcloud") - it is not derived from the URL.
+func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
 	cfg := d.GetConfig()
 
 	allowedHosts := []string{cfg.AllowedHost, cfg.NCAllowedHost}
-
-	// Determine share type from URL host
-	// TODO: Task 4 will make shareType an explicit parameter to this function
-	var shareType string
-	if cfg.NCAllowedHost != "" && strings.Contains(shareURL, cfg.NCAllowedHost) {
-		shareType = "nextcloud"
-	} else {
-		shareType = "opencloud"
-	}
 
 	// Validate share URL against allowed hosts
 	if cfg.AllowedHost != "" || cfg.NCAllowedHost != "" {
