@@ -78,6 +78,17 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 
 	shareURL := r.FormValue("share_url")
 	password := r.FormValue("password")
+	shareType := r.FormValue("share_type")
+
+	// Validate share_type
+	if shareType == "" {
+		http.Error(w, "share_type is required", http.StatusBadRequest)
+		return
+	}
+	if shareType != "opencloud" && shareType != "nextcloud" {
+		http.Error(w, "share_type must be 'opencloud' or 'nextcloud'", http.StatusBadRequest)
+		return
+	}
 
 	// Parse expiry hours
 	expiryHours := 24

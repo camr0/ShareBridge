@@ -165,7 +165,7 @@ func TestV1CreateShare_CreatesSession(t *testing.T) {
 	}
 	ws, _ := newV1TestServer(cfg)
 
-	body := `{"share_url":"https://oc.example.com/s/xyz","expiry_hours":48,"max_downloads":5}`
+	body := `{"share_url":"https://oc.example.com/s/xyz","share_type":"opencloud","expiry_hours":48,"max_downloads":5}`
 	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -186,6 +186,26 @@ func TestV1CreateShare_CreatesSession(t *testing.T) {
 	}
 }
 
+func TestV1CreateShare_AcceptsNextcloudShareType(t *testing.T) {
+	cfg := &config.Config{
+		AgentAPIKey:         "key",
+		SignalingURL:        "wss://share.example.com",
+		DefaultExpiry:       24,
+		DefaultMaxDownloads: 10,
+	}
+	ws, _ := newV1TestServer(cfg)
+
+	body := `{"share_url":"https://nc.example.com/s/xyz","share_type":"nextcloud","expiry_hours":48}`
+	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	ws.v1CreateShareHandler(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestV1CreateShare_RequiresShareURL(t *testing.T) {
 	cfg := &config.Config{AgentAPIKey: "key", DefaultExpiry: 24}
 	ws, _ := newV1TestServer(cfg)
@@ -199,6 +219,54 @@ func TestV1CreateShare_RequiresShareURL(t *testing.T) {
 	}
 }
 
+func TestV1CreateShare_RequiresShareType(t *testing.T) {
+	cfg := &config.Config{AgentAPIKey: "key", DefaultExpiry: 24}
+	ws, _ := newV1TestServer(cfg)
+
+	body := `{"share_url":"https://oc.example.com/s/xyz"}`
+	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	ws.v1CreateShareHandler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+
+	var resp v1ErrorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Code != "BAD_REQUEST" {
+		t.Errorf("error code = %q, want BAD_REQUEST", resp.Code)
+	}
+}
+
+func TestV1CreateShare_RejectsInvalidShareType(t *testing.T) {
+	cfg := &config.Config{AgentAPIKey: "key", DefaultExpiry: 24}
+	ws, _ := newV1TestServer(cfg)
+
+	body := `{"share_url":"https://oc.example.com/s/xyz","share_type":"invalid"}`
+	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	ws.v1CreateShareHandler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+
+	var resp v1ErrorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Code != "BAD_REQUEST" {
+		t.Errorf("error code = %q, want BAD_REQUEST", resp.Code)
+	}
+}
+
 func TestV1CreateShare_UsesDefaultExpiryWhenZero(t *testing.T) {
 	cfg := &config.Config{
 		AgentAPIKey:   "key",
@@ -208,7 +276,7 @@ func TestV1CreateShare_UsesDefaultExpiryWhenZero(t *testing.T) {
 	ws, mock := newV1TestServer(cfg)
 
 	// Send expiry_hours: 0, should fall back to DefaultExpiry (72h)
-	body := `{"share_url":"https://oc.example.com/s/xyz","expiry_hours":0}`
+	body := `{"share_url":"https://oc.example.com/s/xyz","share_type":"opencloud","expiry_hours":0}`
 	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

@@ -175,9 +175,23 @@ func runShare(cmd *cobra.Command, args []string) error {
 
 // runShareClient sends a create-share request to the running daemon.
 func runShareClient(shareURL string) error {
+	// Load config to get allowed hosts for share type derivation
+	cfg := config.Load()
+
+	// Derive share type from URL host matching
+	// CLI cannot accept an explicit share_type flag without breaking the single-argument UX,
+	// so we derive it from configured allowed hosts (same logic as daemon)
+	var shareType string
+	if cfg.NCAllowedHost != "" && strings.Contains(shareURL, cfg.NCAllowedHost) {
+		shareType = "nextcloud"
+	} else {
+		shareType = "opencloud"
+	}
+
 	// Build form data
 	formData := url.Values{}
 	formData.Set("share_url", shareURL)
+	formData.Set("share_type", shareType)
 	if password != "" {
 		formData.Set("password", password)
 	}

@@ -8,9 +8,17 @@
         <form hx-post="/api/shares" hx-target="#shares-list" hx-swap="beforeend"
               hx-on::after-request="if(event.detail.successful && event.target === this) this.closest('dialog').close()">
             <label for="share-url">
-                OpenCloud Share URL
+                Share URL
                 <input type="url" id="share-url" name="share_url"
                     placeholder="https://opencloud.example.com/s/xyz789" required autofocus>
+            </label>
+
+            <label for="share-type">
+                Share Type
+                <select id="share-type" name="share_type" required>
+                    <option value="opencloud" selected>OpenCloud</option>
+                    <option value="nextcloud">Nextcloud</option>
+                </select>
             </label>
 
             <label for="password">

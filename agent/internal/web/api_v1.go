@@ -21,6 +21,7 @@ type v1ShareResponse struct {
 
 type v1CreateShareRequest struct {
 	ShareURL     string `json:"share_url"`
+	ShareType    string `json:"share_type"`
 	Password     string `json:"password"`
 	ExpiryHours  int    `json:"expiry_hours"`
 	MaxDownloads int    `json:"max_downloads"`
@@ -98,6 +99,14 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 	}
 	if req.ShareURL == "" {
 		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"share_url is required", "BAD_REQUEST"})
+		return
+	}
+	if req.ShareType == "" {
+		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"share_type is required", "BAD_REQUEST"})
+		return
+	}
+	if req.ShareType != "opencloud" && req.ShareType != "nextcloud" {
+		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"share_type must be 'opencloud' or 'nextcloud'", "BAD_REQUEST"})
 		return
 	}
 
