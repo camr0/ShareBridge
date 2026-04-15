@@ -2152,8 +2152,8 @@ vi.mock('../composables/useNextcloudOCS', () => ({
     }),
 }))
 
-const makeNode = (fileid = 12345, path = '/Documents/report.pdf') => ({ fileid, path })
-// Used as: mount(ShareBridgeTab, { props: { node: makeNode() } })
+// id is always a string — String(fileid) for v3 path, INode.id for v4 path
+const makeNode = (fileid = 12345, path = '/Documents/report.pdf') => ({ id: String(fileid), path })
 
 const makeShare = (code = 'ABC123'): Share => ({
     code,
@@ -2198,7 +2198,7 @@ describe('ShareBridgeTab', () => {
         mount(ShareBridgeTab, { props: { node: makeNode(99999) } })
         await flushPromises()
 
-        expect(vi.mocked(listShares)).toHaveBeenCalledWith('99999')
+        expect(vi.mocked(listShares)).toHaveBeenCalledWith('99999') // String(99999)
     })
 
     it('shows empty state when no shares exist for this file', async () => {
@@ -2370,10 +2370,11 @@ import CreateShareModal from './CreateShareModal.vue'
 import type { Share, CreateShareResult } from '../types'
 
 // Props injected by the registration path.
-// v3 (OCA.Files.Sidebar / manual createApp): passed as { fileid: fileInfo.id, path: fileInfo.path }
-// v4 (defineCustomElement):                  INode from @nextcloud/files (has .fileid and .path)
+// v3 (OCA.Files.Sidebar / manual createApp): passed as { id: String(fileInfo.id), path: fileInfo.path }
+// v4 (defineCustomElement):                  INode from @nextcloud/files — use .id (string),
+//   NOT .fileid (deprecated, returns undefined for snowflake IDs on NC 33+)
 const props = defineProps<{
-    node: { fileid: number; path: string }
+    node: { id?: string; path: string }
 }>()
 
 const settings = useSettingsStore()
@@ -2393,7 +2394,7 @@ const loadShares = async () => {
     loadingShares.value = true
     error.value         = ''
     try {
-        shares.value = await listShares(String(props.node.fileid))
+        shares.value = await listShares(props.node.id!)
     } catch {
         error.value = "Cannot connect to ShareBridge agent. Check the agent URL and ensure it's running."
     } finally {
@@ -2430,11 +2431,11 @@ const handleCreated = async (_result: CreateShareResult) => {
 }
 
 // Load shares whenever the file or configured state changes.
-// Use != null (not truthiness) so fileid=0 is handled correctly.
+// node.id is a string ('0', '12345', or snowflake) — truthy check is safe.
 watch(
-    [() => props.node?.fileid, () => settings.isConfigured],
-    ([fileid, isConfigured]) => {
-        if (fileid != null && isConfigured) {
+    [() => props.node?.id, () => settings.isConfigured],
+    ([nodeId, isConfigured]) => {
+        if (nodeId && isConfigured) {
             loadShares()
             applyAgentSettings()
         }
@@ -2528,7 +2529,7 @@ if (window.OCA?.Files?.Sidebar) {
     // ── NC 26-32: OCA.Files.Sidebar legacy global ─────────────────────────
     // fileInfo.id is the numeric fileid; fileInfo.path is the NC path.
     let app: ReturnType<typeof createApp> | null = null
-    const currentNode = ref({ fileid: 0, path: '' })
+    const currentNode = ref({ id: '', path: '' })
 
     window.OCA.Files.Sidebar.registerTab(
         new window.OCA.Files.Sidebar.Tab({
@@ -2536,12 +2537,13 @@ if (window.OCA?.Files?.Sidebar) {
             name:         t('sharebridge', 'ShareBridge'),
             iconSvgInline: ICON_SVG,
             mount(el: HTMLElement, fileInfo: { id: number; path: string }) {
-                currentNode.value = { fileid: fileInfo.id, path: fileInfo.path }
+                // Convert legacy numeric id to string to match INode.id contract
+                currentNode.value = { id: String(fileInfo.id), path: fileInfo.path }
                 app = createApp({ render: () => h(ShareBridgeTab, { node: currentNode.value }) })
                 app.use(pinia).mount(el)
             },
             update(fileInfo: { id: number; path: string }) {
-                currentNode.value = { fileid: fileInfo.id, path: fileInfo.path }
+                currentNode.value = { id: String(fileInfo.id), path: fileInfo.path }
             },
             destroy() {
                 app?.unmount()

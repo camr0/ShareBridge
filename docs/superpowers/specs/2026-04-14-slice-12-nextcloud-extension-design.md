@@ -152,8 +152,8 @@ setActivePinia(pinia) // makes pinia available inside defineCustomElement-create
 
 if (window.OCA?.Files?.Sidebar) {
   // NC 26-32: legacy OCA.Files.Sidebar global
-  // fileInfo.id is the fileid (number)
-  const currentNode = ref({ fileid: 0, path: '' })
+  // fileInfo.id is numeric — convert to string to match INode.id contract
+  const currentNode = ref({ id: '', path: '' })
   let app: ReturnType<typeof createApp> | null = null
 
   window.OCA.Files.Sidebar.registerTab(new window.OCA.Files.Sidebar.Tab({
@@ -161,11 +161,11 @@ if (window.OCA?.Files?.Sidebar) {
     name: t('sharebridge', 'ShareBridge'),
     iconSvgInline: ICON_SVG,
     mount(el, fileInfo) {
-      currentNode.value = { fileid: fileInfo.id, path: fileInfo.path }
+      currentNode.value = { id: String(fileInfo.id), path: fileInfo.path }
       app = createApp({ render: () => h(ShareBridgeTab, { node: currentNode.value }) })
       app.use(pinia).mount(el)
     },
-    update(fileInfo) { currentNode.value = { fileid: fileInfo.id, path: fileInfo.path } },
+    update(fileInfo) { currentNode.value = { id: String(fileInfo.id), path: fileInfo.path } },
     destroy() { app?.unmount(); app = null },
   }))
 } else {
@@ -199,9 +199,9 @@ Nextcloud passes the selected file as a `Node` object from `@nextcloud/files`. T
 
 `ShareBridgeTab` receives the node as a prop and passes `node.fileid.toString()` to `listShares()`. The agent API call is unchanged.
 
-**Props**: `ShareBridgeTab.vue` declares `node: { fileid: number; path: string }`. Both code paths provide this:
-- v3 (manual `createApp`): `{ fileid: fileInfo.id, path: fileInfo.path }`
-- v4 (custom element): `INode` from `@nextcloud/files` which exposes `fileid` and `path`
+**Props**: `ShareBridgeTab.vue` declares `node: { id?: string; path: string }`. Use `node.id` (string), not `node.fileid` — `fileid` is deprecated in `@nextcloud/files` v4 and returns `undefined` for snowflake IDs on NC 33+. Both code paths normalise to a string ID:
+- v3 (manual `createApp`): `{ id: String(fileInfo.id), path: fileInfo.path }`
+- v4 (custom element): `INode.id` is always `string | undefined` — use it directly
 
 **Agent PROPFIND unchanged**: The agent always does PROPFIND when creating a share (to extract file ID from the share URL). We do NOT pass `file_id` in `CreateShareParams` even though we have it — keeping the agent's PROPFIND path always exercised avoids hiding potential breakage in that code path.
 
@@ -238,7 +238,7 @@ All three components rewritten using `@nextcloud/vue` for native look and feel. 
 
 | Component | `@nextcloud/vue` components used | Notes |
 |-----------|----------------------------------|-------|
-| `ShareBridgeTab.vue` | `NcLoadingIcon`, `NcEmptyContent`, `NcButton` | Receives `node: { fileid, path }` prop; shows prompt to visit Settings if not configured |
+| `ShareBridgeTab.vue` | `NcLoadingIcon`, `NcEmptyContent`, `NcButton` | Receives `node: { id?, path }` prop; uses `node.id` (string) not deprecated `fileid` |
 | `ShareCard.vue` | `NcButton`, `NcBadge` | Same logic as OpenCloud version |
 | `CreateShareModal.vue` | `NcModal`, `NcSelect`, `NcTextField`, `NcCheckboxRadioSwitch` | Same fields as OpenCloud version |
 | `PersonalSettings.vue` | `NcSettingsSection`, `NcTextField`, `NcButton` | Agent URL + API key form; always accessible for updates |
