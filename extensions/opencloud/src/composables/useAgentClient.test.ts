@@ -75,6 +75,27 @@ describe('useAgentClient', () => {
     expect(result).toEqual(mockResult)
   })
 
+  it('createShare includes share_type: opencloud in request body', async () => {
+    setupStore()
+    const mockResult = { code: 'abc123', public_url: 'https://share.example.com/s/abc123', expires_at: '2026-04-10T12:00:00Z' }
+    mockFetch.mockResolvedValue({ json: () => Promise.resolve(mockResult) })
+
+    const { createShare } = useAgentClient()
+    await createShare({
+      share_url: 'https://opencloud.example.com/s/XYZ789',
+      expiry_hours: 24,
+      max_downloads: 10,
+      relay_only: false,
+    })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      'http://localhost:7878/api/v1/shares',
+      expect.objectContaining({
+        body: expect.stringContaining('"share_type":"opencloud"'),
+      })
+    )
+  })
+
   it('revokeShare sends DELETE to /api/v1/shares/{code}', async () => {
     setupStore()
     mockFetch.mockResolvedValue({})

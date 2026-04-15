@@ -20,7 +20,10 @@ export const useAgentClient = () => {
     const response = await fetch(`${settings.agentUrl}/api/v1/shares`, {
       method: 'POST',
       headers: getHeaders(),
-      body: JSON.stringify(params),
+      body: JSON.stringify({
+        ...params,
+        share_type: 'opencloud',
+      }),
     })
     return response.json()
   }
