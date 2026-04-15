@@ -1,0 +1,25 @@
+{
+    "name": "sharebridge/nextcloud-app",
+    "description": "ShareBridge Nextcloud app",
+    "require": {},
+    "require-dev": {
+        "nextcloud/ocp": "dev-stable27",
+        "phpunit/phpunit": "^10.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "OCA\\ShareBridge\\": "lib/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "OCA\\ShareBridge\\Tests\\": "tests/"
+        }
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/nextcloud/ocp"
+        }
+    ]
+}
