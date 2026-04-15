@@ -2,7 +2,7 @@
 
 ## Summary
 
-Replace runtime WebDAV backend fallback with an explicit `share_type` chosen at share creation time and persisted with each session.
+Replace runtime WebDAV backend fallback and endpoint-preference caching with an explicit `share_type` chosen at share creation time and persisted with each session.
 
 Allowed values:
 - `opencloud`
@@ -21,6 +21,7 @@ The fallback approach started as a convenience but now creates real product risk
 - It can generate repeated bad requests against the wrong DAV endpoint
 - It makes protocol errors and server errors harder to distinguish
 - It already contributed to Nextcloud rate limiting (`429`) because the wrong endpoint was probed repeatedly before the right one was used
+- The later endpoint-preference cache reduced repeated bad probes, but it still preserved fallback semantics that hide real backend mismatches
 
 Because the project is still pre-public, this is the right time to make a breaking cleanup rather than carry forward migration complexity.
 
@@ -47,7 +48,9 @@ This field is part of the canonical session identity and is required to reconstr
 
 ### WebDAV Client Behavior
 
-Remove normal-operation fallback between backend-specific paths.
+Remove both:
+- backend fallback between server-specific paths
+- endpoint-preference caching added to soften that fallback behavior
 
 Instead:
 - OpenCloud sessions use the OpenCloud public WebDAV pathing behavior
@@ -66,7 +69,7 @@ Add an explicit backend selector in the agent layer:
 
 Construction should fail fast if the value is missing or invalid.
 
-The WebDAV package should expose an explicit way to build the correct backend behavior instead of probing both.
+The WebDAV package should expose an explicit way to build the correct backend behavior instead of probing both. Once `share_type` is known, the client should use exactly one backend-specific path strategy.
 
 ## API Changes
 
@@ -152,6 +155,7 @@ This is a design goal, not a downside: wrong configuration should fail clearly.
 - [ ] sessions without `share_type` are skipped on load
 - [ ] persisted sessions with valid `share_type` reload correctly
 - [ ] no fallback probing remains in normal operations
+- [ ] no endpoint-preference caching remains in the WebDAV client
 
 ### OpenCloud Extension
 
