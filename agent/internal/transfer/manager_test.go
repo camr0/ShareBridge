@@ -94,6 +94,8 @@ func (m *mockOpenCloudClient) GetFile(filePath string, w io.Writer) (int64, erro
 	return 0, m.getFileErr
 }
 
+func (m *mockOpenCloudClient) GetSHA1(subpath string) string { return "" }
+
 // TestHandleOpen_SendsHello verifies hello is sent without password_required
 func TestHandleOpen_SendsHello(t *testing.T) {
 	dc := &mockDC{}

@@ -25,10 +25,11 @@ type DataChannel interface {
 	Close() error
 }
 
-// openCloudClient abstracts the OpenCloud WebDAV client for testability.
+// openCloudClient abstracts the WebDAV client for testability.
 type openCloudClient interface {
 	ListFiles(subpath string) ([]cloudwebdav.FileInfo, error)
 	GetFile(filePath string, w io.Writer) (int64, error)
+	GetSHA1(subpath string) string
 }
 
 // Manager handles file transfer state and backpressure.
@@ -171,6 +172,13 @@ func (m *Manager) handleFileRequest(filePath string) {
 		return
 	}
 
+	sha1 := fileInfo.SHA1
+	if sha1 == "" {
+		// Nextcloud public shares don't expose oc:checksums in PROPFIND.
+		// Fall back to the ShareBridge NC extension endpoint.
+		sha1 = m.client.GetSHA1(filePath)
+	}
+
 	header := struct {
 		Type     string `json:"type"`
 		Name     string `json:"name"`
@@ -182,7 +190,7 @@ func (m *Manager) handleFileRequest(filePath string) {
 		Name:     fileInfo.Name,
 		Size:     fileInfo.Size,
 		MimeType: fileInfo.ContentType,
-		SHA1:     fileInfo.SHA1,
+		SHA1:     sha1,
 	}
 	headerData, _ := json.Marshal(header)
 	if err := m.dc.SendText(string(headerData)); err != nil {

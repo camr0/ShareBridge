@@ -2,6 +2,7 @@ package cloudwebdav
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -49,7 +50,8 @@ type Client struct {
 	baseURL    string
 	selfPath   string
 	token      string
-	password   string // OpenCloud share password (empty if share is unprotected)
+	password   string  // OpenCloud share password (empty if share is unprotected)
+	backend    Backend // opencloud or nextcloud
 	httpClient *http.Client
 }
 
@@ -102,6 +104,7 @@ func New(shareType, shareURL string, allowedHosts []string, password string) (*C
 		selfPath: selfPath,
 		token:    token,
 		password: password,
+		backend:  Backend(shareType),
 		httpClient: &http.Client{
 			// No global Timeout: large file bodies take minutes to stream.
 			// Use transport-level timeouts only (dial, TLS, headers).
@@ -257,6 +260,50 @@ func (c *Client) propfindFileID(depth string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// GetSHA1 fetches the SHA1 checksum for a file in a Nextcloud public share
+// from the ShareBridge NC extension endpoint. Returns empty string for
+// OpenCloud backends (checksums arrive via PROPFIND there) or when the NC
+// extension has no checksum stored for the file.
+//
+// subpath is the file path relative to the share root (e.g. "docs/report.pdf").
+// Pass empty string for single-file shares.
+func (c *Client) GetSHA1(subpath string) string {
+	if c.backend != BackendNextcloud {
+		return ""
+	}
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return ""
+	}
+	params := url.Values{}
+	params.Set("token", c.token)
+	if subpath != "" {
+		params.Set("path", subpath)
+	}
+	endpoint := fmt.Sprintf("https://%s/apps/sharebridge/api/public/share-checksum?%s", u.Host, params.Encode())
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	var result struct {
+		SHA1 string `json:"sha1"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ""
+	}
+	return result.SHA1
 }
 
 // PROPFIND response parsing types

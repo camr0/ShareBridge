@@ -546,6 +546,63 @@ func TestListFiles_NextcloudEndpoint(t *testing.T) {
 	}
 }
 
+func TestGetSHA1_Nextcloud(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apps/sharebridge/api/public/share-checksum" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("token"); got != "nctoken" {
+			t.Errorf("token = %q, want nctoken", got)
+		}
+		if got := r.URL.Query().Get("path"); got != "docs/report.pdf" {
+			t.Errorf("path = %q, want docs/report.pdf", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"sha1":"a7e0206e573edbef0c4d8107a151271fbeccf2fe"}`))
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New("nextcloud", srv.URL+"/s/nctoken", []string{host}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	got := c.GetSHA1("docs/report.pdf")
+	if got != "a7e0206e573edbef0c4d8107a151271fbeccf2fe" {
+		t.Errorf("GetSHA1() = %q, want a7e0206e...", got)
+	}
+}
+
+func TestGetSHA1_OpenCloud_Noop(t *testing.T) {
+	c, err := New("opencloud", "https://cloud.example.com/s/token", []string{"cloud.example.com"}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if got := c.GetSHA1("file.pdf"); got != "" {
+		t.Errorf("GetSHA1() for OpenCloud should return empty, got %q", got)
+	}
+}
+
+func TestGetSHA1_ServerError_ReturnsEmpty(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New("nextcloud", srv.URL+"/s/nctoken", []string{host}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	if got := c.GetSHA1("file.pdf"); got != "" {
+		t.Errorf("GetSHA1() on error should return empty, got %q", got)
+	}
+}
+
 func TestGetFile_NextcloudEndpoint(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/public.php/dav/files/nctoken/report.pdf" {

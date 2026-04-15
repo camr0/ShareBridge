@@ -8,6 +8,9 @@ return [
         ['name' => 'settings#getNcShareId',    'url' => '/api/shares/{code}/nc-share-id', 'verb' => 'GET'],
         ['name' => 'settings#deleteNcShareId', 'url' => '/api/shares/{code}/nc-share-id', 'verb' => 'DELETE'],
 
+        // Public checksum lookup — no NC auth required, share token is the credential
+        ['name' => 'share_checksum#get', 'url' => '/api/public/share-checksum', 'verb' => 'GET'],
+
         // Agent proxy — bypasses CSP and mixed-content restrictions
         ['name' => 'agent_proxy#list_shares',   'url' => '/api/agent/shares',        'verb' => 'GET'],
         ['name' => 'agent_proxy#create_share',  'url' => '/api/agent/shares',        'verb' => 'POST'],
