@@ -10,9 +10,9 @@ export const NcModal = {
 }
 
 export const NcTextField = {
-	props: ['modelValue', 'label'],
+	props: ['modelValue', 'label', 'type', 'placeholder'],
 	emits: ['update:modelValue'],
-	template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', ($event.target as HTMLInputElement).value)" />',
+	template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" :data-testid="$attrs[\'data-testid\']" />',
 }
 
 export const NcLoadingIcon = {
@@ -43,7 +43,7 @@ export const NcSelect = {
 	props: ['modelValue', 'options'],
 	emits: ['update:modelValue'],
 	template: `
-		<select :value="modelValue" @change="$emit('update:modelValue', ($event.target as HTMLSelectElement).value)">
+		<select :value="modelValue" @change="$emit('update:modelValue', $event.target.value)">
 			<option v-for="opt in options" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
 		</select>
 	`,
