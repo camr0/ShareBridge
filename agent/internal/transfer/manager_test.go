@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"sharebridge/agent/internal/publicshare"
+	"sharebridge/agent/internal/cloudwebdav"
 )
 
 // mockDC implements DataChannel for testing
@@ -74,12 +74,12 @@ func (m *mockDC) reset() {
 type mockOpenCloudClient struct {
 	mu              sync.Mutex
 	listFilesPath   string
-	listFilesResult []publicshare.FileInfo
+	listFilesResult []cloudwebdav.FileInfo
 	listFilesErr    error
 	getFilePath     string
 }
 
-func (m *mockOpenCloudClient) ListFiles(subpath string) ([]publicshare.FileInfo, error) {
+func (m *mockOpenCloudClient) ListFiles(subpath string) ([]cloudwebdav.FileInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.listFilesPath = subpath
@@ -197,7 +197,7 @@ func TestHandleFileRequest_PathTraversal(t *testing.T) {
 func TestHandleListRequest_Subpath(t *testing.T) {
 	dc := &mockDC{}
 	mc := &mockOpenCloudClient{
-		listFilesResult: []publicshare.FileInfo{
+		listFilesResult: []cloudwebdav.FileInfo{
 			{Name: "report.pdf", Size: 1024, ContentType: "application/pdf"},
 		},
 	}
@@ -223,7 +223,7 @@ func TestHandleListRequest_Subpath(t *testing.T) {
 func TestHandleFileRequest_NestedPath(t *testing.T) {
 	dc := &mockDC{}
 	mc := &mockOpenCloudClient{
-		listFilesResult: []publicshare.FileInfo{
+		listFilesResult: []cloudwebdav.FileInfo{
 			{Name: "file.txt", Size: 512, ContentType: "text/plain"},
 		},
 	}

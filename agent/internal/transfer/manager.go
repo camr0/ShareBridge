@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"sharebridge/agent/internal/publicshare"
+	"sharebridge/agent/internal/cloudwebdav"
 )
 
 const (
@@ -27,7 +27,7 @@ type DataChannel interface {
 
 // openCloudClient abstracts the OpenCloud WebDAV client for testability.
 type openCloudClient interface {
-	ListFiles(subpath string) ([]publicshare.FileInfo, error)
+	ListFiles(subpath string) ([]cloudwebdav.FileInfo, error)
 	GetFile(filePath string, w io.Writer) (int64, error)
 }
 
@@ -103,7 +103,7 @@ func (m *Manager) handleListRequest(subpath string) {
 
 	resp := struct {
 		Type  string                 `json:"type"`
-		Files []publicshare.FileInfo `json:"files"`
+		Files []cloudwebdav.FileInfo `json:"files"`
 	}{
 		Type:  "file_list",
 		Files: files,
@@ -158,7 +158,7 @@ func (m *Manager) handleFileRequest(filePath string) {
 		return
 	}
 
-	var fileInfo *publicshare.FileInfo
+	var fileInfo *cloudwebdav.FileInfo
 	for _, f := range files {
 		if f.Name == name {
 			fi := f

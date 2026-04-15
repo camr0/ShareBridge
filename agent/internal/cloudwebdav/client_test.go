@@ -1,4 +1,4 @@
-package publicshare
+package cloudwebdav
 
 import (
 	"bytes"

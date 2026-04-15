@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/peer"
-	"sharebridge/agent/internal/publicshare"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 	"sharebridge/agent/internal/transfer"
@@ -76,7 +76,7 @@ type Session struct {
 	RelayOnly    bool
 	CreatedAt    time.Time
 
-	webdavClient *publicshare.Client
+	webdavClient *cloudwebdav.Client
 	peers        map[string]*peer.Peer // peerID -> Peer
 	mu           sync.Mutex
 }
@@ -232,14 +232,14 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, e
 
 	// Validate share URL against allowed hosts
 	if cfg.AllowedHost != "" || cfg.NCAllowedHost != "" {
-		_, err := publicshare.New(shareURL, allowedHosts, password)
+		_, err := cloudwebdav.New(shareURL, allowedHosts, password)
 		if err != nil {
 			return "", fmt.Errorf("validate share URL: %w", err)
 		}
 	}
 
 	// Create WebDAV client
-	webdavClient, err := publicshare.New(shareURL, allowedHosts, password)
+	webdavClient, err := cloudwebdav.New(shareURL, allowedHosts, password)
 	if err != nil {
 		return "", fmt.Errorf("create WebDAV client: %w", err)
 	}
@@ -671,7 +671,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	cfg := d.GetConfig()
 	for _, entry := range sessions {
 		// Create WebDAV client
-		webdavClient, err := publicshare.New(entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
+		webdavClient, err := cloudwebdav.New(entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
 		if err != nil {
 			log.Printf("warning: could not create WebDAV client for %s: %v", entry.Code, err)
 			continue
