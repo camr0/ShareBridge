@@ -1,6 +1,7 @@
-package opencloud
+package publicshare
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -357,5 +358,152 @@ func TestGetRootFileID_EmptyWhenMissing(t *testing.T) {
 	}
 	if fileID != "" {
 		t.Errorf("expected empty fileID for missing oc:fileid, got %q", fileID)
+	}
+}
+
+func TestGetRootFileID_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/remote.php/dav/public-files/nctoken":
+			http.Error(w, "wrong endpoint", http.StatusUnauthorized)
+			return
+		case "/public.php/dav/files/nctoken":
+			if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
+				t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
+			}
+			if got := r.Header.Get("Depth"); got != "0" {
+				t.Fatalf("Depth = %q, want 0", got)
+			}
+			w.WriteHeader(http.StatusMultiStatus)
+			w.Write([]byte(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/public.php/dav/files/nctoken/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <oc:fileid>nc-file-id-123</oc:fileid>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`))
+			return
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New(srv.URL+"/s/nctoken", []string{host}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	fileID, err := c.GetRootFileID()
+	if err != nil {
+		t.Fatalf("GetRootFileID() error: %v", err)
+	}
+	if fileID != "nc-file-id-123" {
+		t.Errorf("FileID = %q, want nc-file-id-123", fileID)
+	}
+}
+
+func TestListFiles_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/remote.php/dav/public-files/nctoken":
+			http.Error(w, "wrong endpoint", http.StatusUnauthorized)
+			return
+		case "/public.php/dav/files/nctoken":
+			if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
+				t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
+			}
+			if got := r.Header.Get("Depth"); got != "1" {
+				t.Fatalf("Depth = %q, want 1", got)
+			}
+			w.WriteHeader(http.StatusMultiStatus)
+			w.Write([]byte(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/public.php/dav/files/nctoken/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/public.php/dav/files/nctoken/report.pdf</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getcontentlength>42</d:getcontentlength>
+        <d:getcontenttype>application/pdf</d:getcontenttype>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`))
+			return
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New(srv.URL+"/s/nctoken", []string{host}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	files, err := c.ListFiles("")
+	if err != nil {
+		t.Fatalf("ListFiles() error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+	if files[0].Name != "report.pdf" {
+		t.Errorf("Name = %q, want report.pdf", files[0].Name)
+	}
+}
+
+func TestGetFile_FallsBackToNextcloudPublicDAVEndpoint(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/remote.php/dav/public-files/nctoken/report.pdf":
+			http.Error(w, "wrong endpoint", http.StatusUnauthorized)
+			return
+		case "/public.php/dav/files/nctoken/report.pdf":
+			if got := r.Header.Get("Authorization"); got != "Basic bmN0b2tlbjo=" {
+				t.Fatalf("Authorization = %q, want Basic bmN0b2tlbjo=", got)
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("hello from nextcloud"))
+			return
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	c, err := New(srv.URL+"/s/nctoken", []string{host}, "")
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	c.httpClient = srv.Client()
+
+	var buf bytes.Buffer
+	n, err := c.GetFile("report.pdf", &buf)
+	if err != nil {
+		t.Fatalf("GetFile() error: %v", err)
+	}
+	if n != int64(len("hello from nextcloud")) {
+		t.Errorf("bytes written = %d, want %d", n, len("hello from nextcloud"))
+	}
+	if buf.String() != "hello from nextcloud" {
+		t.Errorf("body = %q, want %q", buf.String(), "hello from nextcloud")
 	}
 }

@@ -24,8 +24,8 @@ import (
 	"github.com/spf13/cobra"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/daemon"
-	"sharebridge/agent/internal/opencloud"
 	"sharebridge/agent/internal/peer"
+	"sharebridge/agent/internal/publicshare"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 	"sharebridge/agent/internal/transfer"
@@ -268,7 +268,7 @@ func runShareSingle(shareURL string) error {
 		return fmt.Errorf("SHAREBRIDGE_API_KEY environment variable required")
 	}
 
-	webdavClient, err := opencloud.New(shareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, password)
+	webdavClient, err := publicshare.New(shareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, password)
 	if err != nil {
 		return fmt.Errorf("create WebDAV client: %w", err)
 	}
@@ -335,7 +335,7 @@ func runShareSingle(shareURL string) error {
 	}
 }
 
-func runSession(ctx context.Context, cfg *config.Config, webdavClient *opencloud.Client, shareURL string, st *store.Store, preferredCode string, agentID string, relayOnly bool) (string, error) {
+func runSession(ctx context.Context, cfg *config.Config, webdavClient *publicshare.Client, shareURL string, st *store.Store, preferredCode string, agentID string, relayOnly bool) (string, error) {
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
 	if err := sig.Connect(ctx); err != nil {

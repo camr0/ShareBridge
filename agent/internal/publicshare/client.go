@@ -1,4 +1,4 @@
-package opencloud
+package publicshare
 
 import (
 	"encoding/base64"
@@ -24,7 +24,7 @@ const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
   </D:prop>
 </D:propfind>`
 
-// FileInfo describes a file or directory in an OpenCloud share.
+// FileInfo describes a file or directory in a public WebDAV share.
 type FileInfo struct {
 	Name        string `json:"name"`
 	Size        int64  `json:"size"`
@@ -33,16 +33,22 @@ type FileInfo struct {
 	SHA1        string `json:"-"` // not sent in file_list; passed separately in file_header
 }
 
-// Client provides WebDAV access to OpenCloud public shares.
+type davEndpoint struct {
+	baseURL  string
+	selfPath string
+}
+
+// Client provides WebDAV access to public shares exposed by
+// ownCloud-lineage servers such as OpenCloud and Nextcloud.
 type Client struct {
-	baseURL    string // https://host/remote.php/dav/public-files/{token}
+	endpoints  []davEndpoint
 	token      string
 	password   string // OpenCloud share password (empty if share is unprotected)
 	httpClient *http.Client
 }
 
 // New creates a WebDAV client for the given public share URL.
-// password is the OpenCloud share password; pass empty string for unprotected shares.
+// password is the public share password; pass empty string for unprotected shares.
 // allowedHosts lists permitted hostnames (SSRF protection); pass all configured cloud hosts.
 func New(shareURL string, allowedHosts []string, password string) (*Client, error) {
 	u, err := url.Parse(shareURL)
@@ -67,13 +73,21 @@ func New(shareURL string, allowedHosts []string, password string) (*Client, erro
 		return nil, fmt.Errorf("could not extract token from URL")
 	}
 
-	// Build WebDAV base URL
-	baseURL := fmt.Sprintf("https://%s/remote.php/dav/public-files/%s", u.Host, token)
+	endpoints := []davEndpoint{
+		{
+			baseURL:  fmt.Sprintf("https://%s/remote.php/dav/public-files/%s", u.Host, token),
+			selfPath: "/remote.php/dav/public-files/" + token,
+		},
+		{
+			baseURL:  fmt.Sprintf("https://%s/public.php/dav/files/%s", u.Host, token),
+			selfPath: "/public.php/dav/files/" + token,
+		},
+	}
 
 	return &Client{
-		baseURL:  baseURL,
-		token:    token,
-		password: password,
+		endpoints: endpoints,
+		token:     token,
+		password:  password,
 		httpClient: &http.Client{
 			// No global Timeout: large file bodies take minutes to stream.
 			// Use transport-level timeouts only (dial, TLS, headers).
@@ -89,7 +103,7 @@ func New(shareURL string, allowedHosts []string, password string) (*Client, erro
 }
 
 // authHeader returns the Basic Auth header for WebDAV requests.
-// OpenCloud public shares use the token as username, share password (or empty) as password.
+// Public WebDAV shares use the token as username, share password (or empty) as password.
 func (c *Client) authHeader() string {
 	auth := base64.StdEncoding.EncodeToString([]byte(c.token + ":" + c.password))
 	return "Basic " + auth
@@ -98,65 +112,60 @@ func (c *Client) authHeader() string {
 // ListFiles returns file and directory info for the share at the given subpath.
 // Pass "" for the share root. Pass "docs/reports" for a nested subfolder.
 func (c *Client) ListFiles(subpath string) ([]FileInfo, error) {
-	requestURL := c.baseURL
-	selfPath := "/remote.php/dav/public-files/" + c.token
-	if subpath != "" {
-		requestURL = c.baseURL + "/" + subpath
-		selfPath += "/" + subpath
-	}
+	resp, endpoint, err := c.doRequestWithFallback(func(ep davEndpoint) (*http.Request, error) {
+		requestURL := ep.baseURL
+		if subpath != "" {
+			requestURL += "/" + subpath
+		}
 
-	req, err := http.NewRequest("PROPFIND", requestURL, strings.NewReader(propfindBody))
+		req, err := http.NewRequest("PROPFIND", requestURL, strings.NewReader(propfindBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Depth", "1")
+		req.Header.Set("Authorization", c.authHeader())
+		req.Header.Set("Content-Type", "application/xml")
+		return req, nil
+	}, http.StatusMultiStatus)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Depth", "1")
-	req.Header.Set("Authorization", c.authHeader())
-	req.Header.Set("Content-Type", "application/xml")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("PROPFIND request failed: %w", err)
-	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusMultiStatus {
-		return nil, fmt.Errorf("PROPFIND returned %d", resp.StatusCode)
-	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
+	selfPath := endpoint.selfPath
+	if subpath != "" {
+		selfPath += "/" + subpath
+	}
 	return parsePROPFIND(body, selfPath)
 }
 
 // GetFile streams the named file to the writer.
 // Returns number of bytes written.
 func (c *Client) GetFile(name string, w io.Writer) (int64, error) {
-	url := c.baseURL + "/" + name
-	req, err := http.NewRequest("GET", url, nil)
+	resp, _, err := c.doRequestWithFallback(func(ep davEndpoint) (*http.Request, error) {
+		req, err := http.NewRequest("GET", ep.baseURL+"/"+name, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", c.authHeader())
+		return req, nil
+	}, http.StatusOK)
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("Authorization", c.authHeader())
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("GET request failed: %w", err)
-	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("GET returned %d", resp.StatusCode)
-	}
 
 	return io.Copy(w, resp.Body)
 }
 
 // GetRootFileID returns the oc:fileid of the shared resource (file or folder).
 //
-// OpenCloud 6 behaves differently depending on share type:
+// ownCloud-lineage servers behave differently depending on share type:
 //   - Folder share: Depth:0 root entry has oc:fileid directly.
 //   - Single-file share: Depth:0 root is a virtual collection with no oc:fileid;
 //     oc:fileid is only available on the child file at Depth:1.
@@ -166,7 +175,7 @@ func (c *Client) GetFile(name string, w io.Writer) (int64, error) {
 // non-collection child's fileid.
 //
 // Returns empty string without error if oc:fileid is absent (graceful degradation
-// for older OpenCloud versions or non-OpenCloud WebDAV servers).
+// for older servers or non-ownCloud-lineage WebDAV servers).
 func (c *Client) GetRootFileID() (string, error) {
 	// Step 1: Depth:0 — covers folder shares.
 	fileID, err := c.propfindFileID("0")
@@ -185,23 +194,20 @@ func (c *Client) GetRootFileID() (string, error) {
 // non-empty oc:fileid found. For Depth:0 it checks the root entry; for Depth:1
 // it skips hrefs ending in "/" and returns the first child's fileid.
 func (c *Client) propfindFileID(depth string) (string, error) {
-	req, err := http.NewRequest("PROPFIND", c.baseURL, strings.NewReader(propfindBody))
+	resp, _, err := c.doRequestWithFallback(func(ep davEndpoint) (*http.Request, error) {
+		req, err := http.NewRequest("PROPFIND", ep.baseURL, strings.NewReader(propfindBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Depth", depth)
+		req.Header.Set("Authorization", c.authHeader())
+		req.Header.Set("Content-Type", "application/xml")
+		return req, nil
+	}, http.StatusMultiStatus)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Depth", depth)
-	req.Header.Set("Authorization", c.authHeader())
-	req.Header.Set("Content-Type", "application/xml")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("PROPFIND request failed: %w", err)
-	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusMultiStatus {
-		return "", fmt.Errorf("PROPFIND returned %d", resp.StatusCode)
-	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -223,6 +229,37 @@ func (c *Client) propfindFileID(depth string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func (c *Client) doRequestWithFallback(buildReq func(davEndpoint) (*http.Request, error), wantStatus int) (*http.Response, davEndpoint, error) {
+	var lastStatus int
+
+	for _, endpoint := range c.endpoints {
+		req, err := buildReq(endpoint)
+		if err != nil {
+			return nil, davEndpoint{}, err
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, davEndpoint{}, fmt.Errorf("%s request failed: %w", req.Method, err)
+		}
+		if resp.StatusCode == wantStatus {
+			return resp, endpoint, nil
+		}
+
+		lastStatus = resp.StatusCode
+		resp.Body.Close()
+		if !shouldTryNextEndpoint(resp.StatusCode) {
+			break
+		}
+	}
+
+	return nil, davEndpoint{}, fmt.Errorf("%s returned %d", http.StatusText(wantStatus), lastStatus)
+}
+
+func shouldTryNextEndpoint(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusNotFound
 }
 
 // PROPFIND response parsing types
@@ -305,7 +342,7 @@ func parseInt64(s string) (int64, error) {
 	return n, err
 }
 
-// extractSHA1 parses the first SHA1 value from an OpenCloud checksum string.
+// extractSHA1 parses the first SHA1 value from a public-share checksum string.
 // Input format: "SHA1:<hex> MD5:<hex> ADLER32:<hex>" (space-separated, any order).
 // Returns empty string if no SHA1 token is found.
 func extractSHA1(checksumStr string) string {

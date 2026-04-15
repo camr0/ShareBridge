@@ -14,17 +14,17 @@ import (
 // Config holds all agent configuration settings.
 // JSON tags use snake_case for file persistence.
 type Config struct {
-	SignalingURL       string `json:"signaling_url"`
-	APIKey             string `json:"api_key,omitempty"`
-	AllowedHost        string `json:"allowed_host,omitempty"`    // OpenCloud hostname for CORS
-	NCAllowedHost      string `json:"nc_allowed_host,omitempty"` // Nextcloud hostname for CORS
-	AgentAPIKey        string `json:"agent_api_key,omitempty"` // auth key for /api/v1/ JSON endpoints
-	DefaultExpiry      int    `json:"default_expiry"`          // hours, default: 24
-	DefaultMaxDownloads int    `json:"default_max_downloads"`   // 0 = unlimited, default: 10
-	DefaultRelayOnly   bool   `json:"default_relay_only"`
-	UIPort             int    `json:"ui_port"` // default: 7878
-	UIAddr             string `json:"ui_addr,omitempty"` // default: 0.0.0.0
-	UIPassword         string `json:"ui_password,omitempty"`
+	SignalingURL        string `json:"signaling_url"`
+	APIKey              string `json:"api_key,omitempty"`
+	AllowedHost         string `json:"allowed_host,omitempty"`    // OpenCloud hostname for CORS
+	NCAllowedHost       string `json:"nc_allowed_host,omitempty"` // Nextcloud hostname for CORS
+	AgentAPIKey         string `json:"agent_api_key,omitempty"`   // auth key for /api/v1/ JSON endpoints
+	DefaultExpiry       int    `json:"default_expiry"`            // hours, default: 24
+	DefaultMaxDownloads int    `json:"default_max_downloads"`     // 0 = unlimited, default: 10
+	DefaultRelayOnly    bool   `json:"default_relay_only"`
+	UIPort              int    `json:"ui_port"`           // default: 7878
+	UIAddr              string `json:"ui_addr,omitempty"` // default: 0.0.0.0
+	UIPassword          string `json:"ui_password,omitempty"`
 
 	// Legacy fields for backward compatibility
 	SignalingServer string `json:"-"` // Deprecated: use SignalingURL
