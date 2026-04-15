@@ -108,7 +108,7 @@ describe('CreateShareModal', () => {
     })
 
     it('shows loading state while creating share', async () => {
-        let resolveCreate: () => void
+        let resolveCreate: (value: unknown) => void
         mockCreateOCSShare.mockImplementation(() => new Promise(resolve => { resolveCreate = resolve }))
 
         const wrapper = mountModal()
@@ -123,7 +123,7 @@ describe('CreateShareModal', () => {
         expect(createBtn.attributes('disabled')).toBeDefined()
 
         // Resolve the promise
-        resolveCreate!()
+        resolveCreate!(undefined)
         await flushPromises()
 
         // Loading state should be cleared
