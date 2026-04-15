@@ -268,7 +268,7 @@ func runShareSingle(shareURL string) error {
 		return fmt.Errorf("SHAREBRIDGE_API_KEY environment variable required")
 	}
 
-	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost, password)
+	webdavClient, err := opencloud.New(shareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, password)
 	if err != nil {
 		return fmt.Errorf("create WebDAV client: %w", err)
 	}

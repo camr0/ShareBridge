@@ -43,13 +43,20 @@ type Client struct {
 
 // New creates a WebDAV client for the given public share URL.
 // password is the OpenCloud share password; pass empty string for unprotected shares.
-// allowedHost restricts which hosts are permitted (SSRF protection).
-func New(shareURL string, allowedHost string, password string) (*Client, error) {
+// allowedHosts lists permitted hostnames (SSRF protection); pass all configured cloud hosts.
+func New(shareURL string, allowedHosts []string, password string) (*Client, error) {
 	u, err := url.Parse(shareURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
-	if u.Host != allowedHost {
+	allowed := false
+	for _, host := range allowedHosts {
+		if host != "" && u.Host == host {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
 		return nil, fmt.Errorf("host %q not in allowed list", u.Host)
 	}
 

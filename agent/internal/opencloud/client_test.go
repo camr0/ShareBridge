@@ -8,7 +8,7 @@ import (
 )
 
 func TestNew_ValidURL(t *testing.T) {
-	c, err := New("https://cloud.example.com/s/AbCdEfGh", "cloud.example.com", "")
+	c, err := New("https://cloud.example.com/s/AbCdEfGh", []string{"cloud.example.com"}, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -18,14 +18,14 @@ func TestNew_ValidURL(t *testing.T) {
 }
 
 func TestNew_InvalidURL(t *testing.T) {
-	_, err := New("://invalid-url", "cloud.example.com", "")
+	_, err := New("://invalid-url", []string{"cloud.example.com"}, "")
 	if err == nil {
 		t.Error("expected error for invalid URL")
 	}
 }
 
 func TestNew_SSRF(t *testing.T) {
-	_, err := New("https://evil.com/s/token", "cloud.example.com", "")
+	_, err := New("https://evil.com/s/token", []string{"cloud.example.com"}, "")
 	if err == nil {
 		t.Error("expected SSRF error for mismatched host")
 	}
@@ -274,7 +274,7 @@ func TestGetRootFileID_SingleFileShare(t *testing.T) {
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/testtoken", host, "")
+	c, err := New(srv.URL+"/s/testtoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestGetRootFileID_FolderShare(t *testing.T) {
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/foldertoken", host, "")
+	c, err := New(srv.URL+"/s/foldertoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestGetRootFileID_EmptyWhenMissing(t *testing.T) {
 	defer srv.Close()
 
 	host := strings.TrimPrefix(srv.URL, "https://")
-	c, err := New(srv.URL+"/s/testtoken", host, "")
+	c, err := New(srv.URL+"/s/testtoken", []string{host}, "")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}

@@ -228,16 +228,18 @@ func (d *Daemon) Stop() error {
 func (d *Daemon) CreateSession(ctx context.Context, shareURL, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
 	cfg := d.GetConfig()
 
-	// Validate share URL against allowed host
-	if cfg.AllowedHost != "" {
-		_, err := opencloud.New(shareURL, cfg.AllowedHost, password)
+	allowedHosts := []string{cfg.AllowedHost, cfg.NCAllowedHost}
+
+	// Validate share URL against allowed hosts
+	if cfg.AllowedHost != "" || cfg.NCAllowedHost != "" {
+		_, err := opencloud.New(shareURL, allowedHosts, password)
 		if err != nil {
 			return "", fmt.Errorf("validate share URL: %w", err)
 		}
 	}
 
 	// Create WebDAV client
-	webdavClient, err := opencloud.New(shareURL, cfg.AllowedHost, password)
+	webdavClient, err := opencloud.New(shareURL, allowedHosts, password)
 	if err != nil {
 		return "", fmt.Errorf("create WebDAV client: %w", err)
 	}
@@ -669,7 +671,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	cfg := d.GetConfig()
 	for _, entry := range sessions {
 		// Create WebDAV client
-		webdavClient, err := opencloud.New(entry.ShareURL, cfg.AllowedHost, entry.Password)
+		webdavClient, err := opencloud.New(entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
 		if err != nil {
 			log.Printf("warning: could not create WebDAV client for %s: %v", entry.Code, err)
 			continue
