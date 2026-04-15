@@ -190,7 +190,7 @@ func (m *Manager) handleFileRequest(filePath string) {
 	}
 
 	m.transfer.Store(true)
-	go m.streamFile(filePath)
+	go m.streamFile(resolveRequestPath(dir, fileInfo))
 }
 
 func (m *Manager) streamFile(filePath string) {
@@ -205,6 +205,7 @@ func (m *Manager) streamFile(filePath string) {
 	}()
 
 	var totalBytes int64
+	var transferErr error
 	buf := make([]byte, chunkSize)
 	for {
 		n, err := pr.Read(buf)
@@ -216,10 +217,15 @@ func (m *Manager) streamFile(filePath string) {
 		}
 		if err != nil {
 			if err != io.EOF {
+				transferErr = err
 				m.sendError("transfer failed: " + err.Error())
 			}
 			break
 		}
+	}
+
+	if transferErr != nil {
+		return
 	}
 
 	end := struct {
@@ -232,6 +238,16 @@ func (m *Manager) streamFile(filePath string) {
 	if m.OnDownloadComplete != nil {
 		m.OnDownloadComplete(totalBytes)
 	}
+}
+
+func resolveRequestPath(dir string, fileInfo *cloudwebdav.FileInfo) string {
+	if fileInfo.RequestPath == "" {
+		return ""
+	}
+	if dir == "" {
+		return fileInfo.RequestPath
+	}
+	return path.Join(dir, fileInfo.RequestPath)
 }
 
 func (m *Manager) sendWithBackpressure(data []byte) error {

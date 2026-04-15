@@ -16,6 +16,7 @@ import (
 const propfindBody = `<?xml version="1.0" encoding="UTF-8"?>
 <D:propfind xmlns:D="DAV:" xmlns:oc="http://owncloud.org/ns">
   <D:prop>
+    <D:displayname/>
     <D:getcontentlength/>
     <D:getcontenttype/>
     <D:resourcetype/>
@@ -31,6 +32,7 @@ type FileInfo struct {
 	ContentType string `json:"mimeType"`
 	IsDir       bool   `json:"isDir"`
 	SHA1        string `json:"-"` // not sent in file_list; passed separately in file_header
+	RequestPath string `json:"-"` // relative GET path; empty means the root shared file
 }
 
 type davEndpoint struct {
@@ -148,7 +150,11 @@ func (c *Client) ListFiles(subpath string) ([]FileInfo, error) {
 // Returns number of bytes written.
 func (c *Client) GetFile(name string, w io.Writer) (int64, error) {
 	resp, _, err := c.doRequestWithFallback(func(ep davEndpoint) (*http.Request, error) {
-		req, err := http.NewRequest("GET", ep.baseURL+"/"+name, nil)
+		requestURL := ep.baseURL
+		if name != "" {
+			requestURL += "/" + name
+		}
+		req, err := http.NewRequest("GET", requestURL, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -272,12 +278,14 @@ type response struct {
 	Href     string `xml:"href"`
 	Propstat struct {
 		Prop struct {
+			DisplayName   string `xml:"displayname"`
 			ContentLength string `xml:"getcontentlength"`
 			ContentType   string `xml:"getcontenttype"`
 			ResourceType  struct {
 				Collection *struct{} `xml:"collection"`
 			} `xml:"resourcetype"`
 			Checksums struct {
+				Value    string `xml:",chardata"`
 				Checksum string `xml:"checksum"`
 			} `xml:"checksums"`
 			FileID string `xml:"fileid"` // oc:fileid, matched by local name
@@ -315,6 +323,14 @@ func parsePROPFIND(data []byte, selfPath string) ([]FileInfo, error) {
 
 		// Extract filename from href
 		name := path.Base(href)
+		requestPath := strings.TrimPrefix(path.Clean(href), path.Clean(selfPath))
+		requestPath = strings.TrimPrefix(requestPath, "/")
+		if path.Clean(href) == path.Clean(selfPath) {
+			requestPath = ""
+			if r.Propstat.Prop.DisplayName != "" {
+				name = r.Propstat.Prop.DisplayName
+			}
+		}
 		if name == "" || name == "." {
 			continue
 		}
@@ -329,7 +345,8 @@ func parsePROPFIND(data []byte, selfPath string) ([]FileInfo, error) {
 			Size:        size,
 			ContentType: r.Propstat.Prop.ContentType,
 			IsDir:       false,
-			SHA1:        extractSHA1(r.Propstat.Prop.Checksums.Checksum),
+			SHA1:        extractSHA1(checksumString(r.Propstat.Prop.Checksums)),
+			RequestPath: requestPath,
 		})
 	}
 
@@ -352,4 +369,14 @@ func extractSHA1(checksumStr string) string {
 		}
 	}
 	return ""
+}
+
+func checksumString(checksums struct {
+	Value    string `xml:",chardata"`
+	Checksum string `xml:"checksum"`
+}) string {
+	if checksums.Checksum != "" {
+		return checksums.Checksum
+	}
+	return strings.TrimSpace(checksums.Value)
 }

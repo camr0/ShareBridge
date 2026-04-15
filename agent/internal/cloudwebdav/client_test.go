@@ -225,6 +225,65 @@ func TestParsePROPFIND_EmptyFolder(t *testing.T) {
 	}
 }
 
+func TestParsePROPFIND_SingleFileShareUsesDisplayNameAndRootRequestPath(t *testing.T) {
+	xmlData := `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/public.php/dav/files/token</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Quarterly Report.pdf</d:displayname>
+        <d:getcontentlength>1048576</d:getcontentlength>
+        <d:getcontenttype>application/pdf</d:getcontenttype>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`
+
+	files, err := parsePROPFIND([]byte(xmlData), "/public.php/dav/files/token")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+	if files[0].Name != "Quarterly Report.pdf" {
+		t.Errorf("expected display name, got %q", files[0].Name)
+	}
+	if files[0].RequestPath != "" {
+		t.Errorf("expected empty request path for root single-file share, got %q", files[0].RequestPath)
+	}
+}
+
+func TestParsePROPFIND_SingleFileShareParsesInlineChecksums(t *testing.T) {
+	xmlData := `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/public.php/dav/files/token</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Nextcloud Manual.pdf</d:displayname>
+        <d:getcontentlength>256</d:getcontentlength>
+        <d:getcontenttype>application/pdf</d:getcontenttype>
+        <oc:checksums>SHA1:a7e0206e573edbef0c4d8107a151271fbeccf2fe MD5:f77a740d02cc96689a87a9e8f71cf8f1</oc:checksums>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>`
+
+	files, err := parsePROPFIND([]byte(xmlData), "/public.php/dav/files/token")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+	want := "a7e0206e573edbef0c4d8107a151271fbeccf2fe"
+	if files[0].SHA1 != want {
+		t.Errorf("expected SHA1 %s, got %q", want, files[0].SHA1)
+	}
+}
+
 // singleFileShareHandler returns a server that simulates a single-file share:
 // Depth:0 returns no fileid; Depth:1 returns the child file with fileid.
 func singleFileShareHandler(t *testing.T) http.HandlerFunc {

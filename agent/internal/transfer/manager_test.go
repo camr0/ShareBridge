@@ -77,6 +77,7 @@ type mockOpenCloudClient struct {
 	listFilesResult []cloudwebdav.FileInfo
 	listFilesErr    error
 	getFilePath     string
+	getFileErr      error
 }
 
 func (m *mockOpenCloudClient) ListFiles(subpath string) ([]cloudwebdav.FileInfo, error) {
@@ -90,7 +91,7 @@ func (m *mockOpenCloudClient) GetFile(filePath string, w io.Writer) (int64, erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getFilePath = filePath
-	return 0, nil
+	return 0, m.getFileErr
 }
 
 // TestHandleOpen_SendsHello verifies hello is sent without password_required
@@ -254,6 +255,80 @@ func TestHandleFileRequest_NestedPath(t *testing.T) {
 	dc.mu.Unlock()
 	if headerName != "file.txt" {
 		t.Errorf("expected file_header name 'file.txt', got %q", headerName)
+	}
+}
+
+func TestHandleFileRequest_UsesRequestPathFromFileInfo(t *testing.T) {
+	dc := &mockDC{}
+	mc := &mockOpenCloudClient{
+		listFilesResult: []cloudwebdav.FileInfo{
+			{Name: "Quarterly Report.pdf", RequestPath: "", Size: 512, ContentType: "application/pdf"},
+		},
+	}
+	mgr := NewManager(dc, mc, 0)
+
+	req, _ := json.Marshal(map[string]string{
+		"type": "file_request",
+		"path": "Quarterly Report.pdf",
+	})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	mc.mu.Lock()
+	gotPath := mc.getFilePath
+	mc.mu.Unlock()
+	if gotPath != "" {
+		t.Errorf("expected GetFile called with root path, got %q", gotPath)
+	}
+}
+
+func TestStreamFile_DoesNotSendChunkEndOrCountDownloadOnGetFailure(t *testing.T) {
+	dc := &mockDC{}
+	mc := &mockOpenCloudClient{
+		listFilesResult: []cloudwebdav.FileInfo{
+			{Name: "broken.pdf", RequestPath: "broken.pdf", Size: 512, ContentType: "application/pdf"},
+		},
+		getFileErr: io.ErrUnexpectedEOF,
+	}
+	mgr := NewManager(dc, mc, 0)
+
+	var completedBytes int64 = -1
+	mgr.OnDownloadComplete = func(bytesTransferred int64) {
+		completedBytes = bytesTransferred
+	}
+
+	req, _ := json.Marshal(map[string]string{
+		"type": "file_request",
+		"path": "broken.pdf",
+	})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	foundChunkEnd := false
+	foundTransferFailed := false
+	for _, msg := range dc.textMessages {
+		if strings.Contains(msg, `"type":"chunk_end"`) {
+			foundChunkEnd = true
+		}
+		if strings.Contains(msg, "transfer failed") {
+			foundTransferFailed = true
+		}
+	}
+
+	if !foundTransferFailed {
+		t.Fatal("expected transfer failed error message")
+	}
+	if foundChunkEnd {
+		t.Fatal("did not expect chunk_end after GetFile failure")
+	}
+	if completedBytes != -1 {
+		t.Fatalf("expected OnDownloadComplete not to fire, got %d", completedBytes)
+	}
+	if got := mgr.downloads.Load(); got != 0 {
+		t.Fatalf("expected downloads to remain 0, got %d", got)
 	}
 }
 
