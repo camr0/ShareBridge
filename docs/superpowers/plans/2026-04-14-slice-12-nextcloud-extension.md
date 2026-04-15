@@ -4,9 +4,9 @@
 
 **Goal:** Build a native Nextcloud app that adds a ShareBridge panel to the Files sidebar and a Personal Settings section for per-user agent configuration.
 
-**Architecture:** A PHP backend (`SettingsController`) stores per-user settings and the `code→ncShareId` mapping via Nextcloud's `IConfig` API (no DB migrations). A JS frontend (Vue 3 + Pinia + `@nextcloud/vue`) registers a Files sidebar tab via `registerTab` and a settings section via `registerPersonalSettings`. On share creation the extension calls the Nextcloud OCS API to create a public link, then the ShareBridge agent to create a code. On revoke it deletes both in parallel.
+**Architecture:** A PHP backend (`SettingsController` + `PersonalSection`) stores per-user settings and the `code→ncShareId` mapping via Nextcloud's `IConfig` API (no DB migrations). Personal Settings are registered via PHP's `ISettings` interface — `main.ts` mounts the Vue component onto a PHP-rendered `<div>`. The Files sidebar tab uses a hybrid registration: legacy `OCA.Files.Sidebar` global for NC 26-32, `getSidebar().registerTab()` with `defineCustomElement` for NC 33+. On share creation the extension calls the Nextcloud OCS API to create a public link, then the ShareBridge agent to create a code. On revoke it deletes both in parallel.
 
-**Tech Stack:** PHP 8.1, PHPUnit 10, `nextcloud/ocp` (for NC interfaces in tests); TypeScript, Vue 3, Pinia, `@nextcloud/files`, `@nextcloud/settings`, `@nextcloud/vue`, `@nextcloud/axios`, `@nextcloud/router`, `@nextcloud/l10n`, `@nextcloud/webpack-vue-config`, Vitest, `@vue/test-utils`, `happy-dom`.
+**Tech Stack:** PHP 8.1, PHPUnit 10, `nextcloud/ocp` (for NC interfaces in tests); TypeScript, Vue 3, Pinia, `@nextcloud/files` v4, `@nextcloud/vue`, `@nextcloud/axios`, `@nextcloud/router`, `@nextcloud/l10n`, `@nextcloud/webpack-vue-config`, Vitest, `@vue/test-utils`, `happy-dom`.
 
 ---
 
@@ -14,9 +14,11 @@
 
 **New files — PHP:**
 - `extensions/nextcloud/appinfo/info.xml` — app metadata, min NC 27, declares `files` dependency
-- `extensions/nextcloud/appinfo/routes.php` — declares 4 API routes
-- `extensions/nextcloud/lib/AppInfo/Application.php` — IBootstrap, loads JS bundle on every page
-- `extensions/nextcloud/lib/Controller/SettingsController.php` — 4 endpoints: GET/PUT settings, PUT/GET ncShareId
+- `extensions/nextcloud/appinfo/routes.php` — declares 5 API routes (settings + ncShareId CRUD)
+- `extensions/nextcloud/lib/AppInfo/Application.php` — IBootstrap, loads JS bundle + registers PersonalSection
+- `extensions/nextcloud/lib/Controller/SettingsController.php` — 5 endpoints: GET/PUT settings, PUT/GET/DELETE ncShareId
+- `extensions/nextcloud/lib/Settings/PersonalSection.php` — ISettings impl, returns TemplateResponse for Personal Settings page
+- `extensions/nextcloud/templates/personal_settings.php` — renders `<div id="sharebridge-personal-settings">`
 - `extensions/nextcloud/composer.json` — phpunit + nextcloud/ocp as dev deps
 - `extensions/nextcloud/tests/Controller/SettingsControllerTest.php` — PHPUnit unit tests
 
@@ -31,8 +33,8 @@
 - `extensions/nextcloud/src/test/mocks/nextcloud-router.ts` — mock for `@nextcloud/router`
 - `extensions/nextcloud/src/test/mocks/nextcloud-l10n.ts` — mock for `@nextcloud/l10n`
 - `extensions/nextcloud/src/test/mocks/nextcloud-vue.ts` — stub components for `@nextcloud/vue`
-- `extensions/nextcloud/src/test/mocks/nextcloud-files.ts` — mock for `@nextcloud/files`
-- `extensions/nextcloud/src/test/mocks/nextcloud-settings.ts` — mock for `@nextcloud/settings`
+- `extensions/nextcloud/src/test/mocks/nextcloud-files.ts` — mock for `@nextcloud/files` (exports `getSidebar` vi.fn)
+- `extensions/nextcloud/src/test/mocks/nextcloud-settings.ts` — empty module (no JS registerPersonalSettings)
 - `extensions/nextcloud/src/types.ts` — copied unchanged from `extensions/opencloud/src/types.ts`
 - `extensions/nextcloud/src/composables/useAgentClient.ts` — copied unchanged from opencloud
 - `extensions/nextcloud/src/composables/useAgentClient.test.ts` — adapted from opencloud
@@ -48,7 +50,7 @@
 - `extensions/nextcloud/src/components/CreateShareModal.test.ts`
 - `extensions/nextcloud/src/components/ShareBridgeTab.vue` — sidebar tab root
 - `extensions/nextcloud/src/components/ShareBridgeTab.test.ts`
-- `extensions/nextcloud/src/main.ts` — entry: `registerTab` + `registerPersonalSettings`
+- `extensions/nextcloud/src/main.ts` — entry: hybrid sidebar tab (v3 OCA.Files.Sidebar / v4 getSidebar) + PersonalSettings DOM mount
 
 ---
 
@@ -71,6 +73,8 @@
 mkdir -p extensions/nextcloud/appinfo
 mkdir -p extensions/nextcloud/lib/AppInfo
 mkdir -p extensions/nextcloud/lib/Controller
+mkdir -p extensions/nextcloud/lib/Settings
+mkdir -p extensions/nextcloud/templates
 mkdir -p extensions/nextcloud/src/components
 mkdir -p extensions/nextcloud/src/composables
 mkdir -p extensions/nextcloud/src/stores
@@ -117,12 +121,13 @@ return [
 
 - [ ] **Step 4: Create `lib/AppInfo/Application.php`**
 
-This loads `js/sharebridge-main.js` on every page. `registerTab` and `registerPersonalSettings` are no-ops on pages where their containers don't exist, so loading everywhere is safe.
+Loads `js/sharebridge-main.js` on every page (sidebar tab code is a no-op on non-Files pages) and registers the PHP `PersonalSection` so NC shows it under Personal Settings.
 
 ```php
 <?php
 namespace OCA\ShareBridge\AppInfo;
 
+use OCA\ShareBridge\Settings\PersonalSection;
 use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
@@ -136,7 +141,9 @@ class Application extends App implements IBootstrap {
         parent::__construct(self::APP_ID);
     }
 
-    public function register(IRegistrationContext $context): void {}
+    public function register(IRegistrationContext $context): void {
+        $context->registerSetting(PersonalSection::class);
+    }
 
     public function boot(IBootContext $context): void {
         Util::addScript(self::APP_ID, 'sharebridge-main');
@@ -144,11 +151,44 @@ class Application extends App implements IBootstrap {
 }
 ```
 
-- [ ] **Step 5: Create `composer.json`**
+- [ ] **Step 5: Create `lib/Settings/PersonalSection.php`**
+
+Registers the ShareBridge section in NC Personal Settings. `getForm()` renders the PHP template; `main.ts` mounts the Vue component into the `<div>` it contains.
+
+```php
+<?php
+namespace OCA\ShareBridge\Settings;
+
+use OCP\AppFramework\Http\TemplateResponse;
+use OCP\Settings\ISettings;
+
+class PersonalSection implements ISettings {
+    public function getForm(): TemplateResponse {
+        return new TemplateResponse('sharebridge', 'personal_settings', [], 'blank');
+    }
+
+    public function getSection(): string {
+        return 'personal';
+    }
+
+    public function getPriority(): int {
+        return 50;
+    }
+}
+```
+
+- [ ] **Step 5b: Create `templates/personal_settings.php`**
+
+```html
+<div id="sharebridge-personal-settings"></div>
+```
+
+- [ ] **Step 6: Create `composer.json`**
 
 ```json
 {
     "name": "sharebridge/nextcloud-app",
+
     "description": "ShareBridge Nextcloud app",
     "require": {},
     "require-dev": {
@@ -174,7 +214,7 @@ class Application extends App implements IBootstrap {
 }
 ```
 
-- [ ] **Step 6: Create `package.json`**
+- [ ] **Step 7: Create `package.json`**
 
 ```json
 {
@@ -190,10 +230,9 @@ class Application extends App implements IBootstrap {
     },
     "devDependencies": {
         "@nextcloud/axios": "^2.5.0",
-        "@nextcloud/files": "^3.0.0",
+        "@nextcloud/files": "^4.0.0",
         "@nextcloud/l10n": "^3.1.0",
         "@nextcloud/router": "^3.0.0",
-        "@nextcloud/settings": "^1.0.0",
         "@nextcloud/vue": "^8.23.0",
         "@nextcloud/webpack-vue-config": "^6.1.0",
         "@vitejs/plugin-vue": "^5.0.0",
@@ -209,7 +248,7 @@ class Application extends App implements IBootstrap {
 }
 ```
 
-- [ ] **Step 7: Create `webpack.config.js`**
+- [ ] **Step 8: Create `webpack.config.js`**
 
 ```js
 const path = require('path')
@@ -223,7 +262,7 @@ module.exports = {
 }
 ```
 
-- [ ] **Step 8: Create `vite.config.ts`** (used only by Vitest — build uses webpack)
+- [ ] **Step 9: Create `vite.config.ts`** (used only by Vitest — build uses webpack)
 
 ```typescript
 import { defineConfig } from 'vite'
@@ -234,12 +273,11 @@ export default defineConfig({
     plugins: [vue()],
     resolve: {
         alias: {
-            '@nextcloud/axios':    path.resolve(__dirname, 'src/test/mocks/nextcloud-axios.ts'),
-            '@nextcloud/router':   path.resolve(__dirname, 'src/test/mocks/nextcloud-router.ts'),
-            '@nextcloud/l10n':     path.resolve(__dirname, 'src/test/mocks/nextcloud-l10n.ts'),
-            '@nextcloud/vue':      path.resolve(__dirname, 'src/test/mocks/nextcloud-vue.ts'),
-            '@nextcloud/files':    path.resolve(__dirname, 'src/test/mocks/nextcloud-files.ts'),
-            '@nextcloud/settings': path.resolve(__dirname, 'src/test/mocks/nextcloud-settings.ts'),
+            '@nextcloud/axios':  path.resolve(__dirname, 'src/test/mocks/nextcloud-axios.ts'),
+            '@nextcloud/router': path.resolve(__dirname, 'src/test/mocks/nextcloud-router.ts'),
+            '@nextcloud/l10n':   path.resolve(__dirname, 'src/test/mocks/nextcloud-l10n.ts'),
+            '@nextcloud/vue':    path.resolve(__dirname, 'src/test/mocks/nextcloud-vue.ts'),
+            '@nextcloud/files':  path.resolve(__dirname, 'src/test/mocks/nextcloud-files.ts'),
         },
     },
     test: {
@@ -250,7 +288,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **Step 9: Create `tsconfig.json`**
+- [ ] **Step 10: Create `tsconfig.json`**
 
 ```json
 {
@@ -274,7 +312,7 @@ export default defineConfig({
 }
 ```
 
-- [ ] **Step 10: Create `.gitignore`**
+- [ ] **Step 11: Create `.gitignore`**
 
 ```
 node_modules/
@@ -283,7 +321,7 @@ js/
 *.js.map
 ```
 
-- [ ] **Step 11: Install dependencies**
+- [ ] **Step 12: Install dependencies**
 
 ```bash
 cd extensions/nextcloud
@@ -293,11 +331,11 @@ npm install
 
 Expected: both complete without errors. (Note: `nextcloud/ocp dev-stable27` requires the repository entry in composer.json to pull from GitHub.)
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 13: Commit**
 
 ```bash
 cd extensions/nextcloud
-git add appinfo/ lib/AppInfo/ composer.json composer.lock package.json package-lock.json webpack.config.js vite.config.ts tsconfig.json .gitignore
+git add appinfo/ lib/ templates/ composer.json composer.lock package.json package-lock.json webpack.config.js vite.config.ts tsconfig.json .gitignore
 git commit -m "feat(slice-12): scaffold Nextcloud extension"
 ```
 
@@ -694,18 +732,22 @@ export const NcSelect = {
 
 - [ ] **Step 6: Create `src/test/mocks/nextcloud-files.ts`**
 
+`getSidebar` is mocked so any test file that imports `@nextcloud/files` doesn't crash. `main.ts` is never imported in tests so neither path is exercised.
+
 ```typescript
 import { vi } from 'vitest'
 
-export const registerTab = vi.fn()
+export const getSidebar = vi.fn(() => ({
+    registerTab: vi.fn(),
+}))
 ```
 
 - [ ] **Step 7: Create `src/test/mocks/nextcloud-settings.ts`**
 
-```typescript
-import { vi } from 'vitest'
+Empty module — `@nextcloud/settings` is not used in any JS/TS source file (personal settings registration is PHP-only).
 
-export const registerPersonalSettings = vi.fn()
+```typescript
+// intentionally empty — personal settings are registered via PHP ISettings
 ```
 
 - [ ] **Step 8: Copy `src/types.ts` from opencloud**
@@ -2010,55 +2052,54 @@ git commit -m "feat(slice-12): CreateShareModal — OCS share creation + agent r
 
 ## ⚠️ STOP — Live Nextcloud Instance Required
 
-**Do not proceed to Task 9 without a running Nextcloud 27+ instance.**
+**Do not proceed to Task 9 without a running Nextcloud instance.**
 
-Tasks 1–8 are fully unit-testable against mocks. Task 9 onwards requires verifying two things against a live NC instance before writing code that depends on them.
+Tasks 1–8 are fully unit-testable against mocks. Before Task 9, verify the following against a live NC instance.
 
 ### Step A: Spin up Nextcloud
 
 ```bash
-docker run -d \
-  -p 8080:80 \
-  --name nextcloud-dev \
-  nextcloud:27
+# Run both NC 33 (primary) and NC 27 (legacy fallback) to test both paths.
+# NC 33 (primary — getSidebar() path):
+docker run -d -p 8080:80 --name nextcloud-33 nextcloud:33
+
+# NC 27 (legacy — OCA.Files.Sidebar path):
+docker run -d -p 8081:80 --name nextcloud-27 nextcloud:27
 ```
 
-Go to `http://localhost:8080` and complete the setup wizard (SQLite is fine for dev).
+Go to each URL and complete the setup wizard (SQLite is fine for dev).
 
-### Step B: Verify the `registerTab` prop name
+### Step B: Verify which hybrid path fires on each version
 
-Build the extension and install it:
+Build and install the extension in both containers:
 
 ```bash
 cd extensions/nextcloud
 npm run build
-# Copy the built app into the NC container
-docker cp . nextcloud-dev:/var/www/html/apps/sharebridge
-docker exec nextcloud-dev chown -R www-data:www-data /var/www/html/apps/sharebridge
+docker cp . nextcloud-33:/var/www/html/apps/sharebridge
+docker exec nextcloud-33 chown -R www-data:www-data /var/www/html/apps/sharebridge
+
+docker cp . nextcloud-27:/var/www/html/apps/sharebridge
+docker exec nextcloud-27 chown -R www-data:www-data /var/www/html/apps/sharebridge
 ```
 
-Enable the app in NC admin → Apps, then temporarily replace `ShareBridgeTab.vue` with a
-stub that logs its props:
+Enable the app in admin → Apps on each instance. Open the browser console on each and check:
 
-```vue
-<template><div>check console</div></template>
-<script setup lang="ts">
-const props = defineProps<Record<string, unknown>>()
-console.log('[ShareBridge] tab props:', JSON.stringify(Object.keys(props)))
-</script>
+```javascript
+// NC 27 should print: true (OCA.Files.Sidebar exists)
+// NC 33 should print: false or undefined (OCA.Files.Sidebar removed)
+console.log('sidebar global:', !!window.OCA?.Files?.Sidebar)
 ```
 
-Open the Files app, select a file, open the sidebar ShareBridge tab, and check the
-browser console. **Record the prop name here before continuing.**
+On NC 27: confirm the sidebar tab appears via the legacy path (you should see `[ShareBridge]` log from the `OCA.Files.Sidebar.Tab` mount call if you add a temporary `console.log` there).
 
-Expected in NC 27+ (`@nextcloud/files` v3): `files` (array of `Node`)
-May differ in older NC 27 builds: `node` (single `Node`) or `activeFiles`
+On NC 33: confirm the tab appears via `getSidebar().registerTab()` (the custom element `sharebridge-files-sidebar-tab` should be in the DOM when the tab is open).
 
-**Update the `defineProps` in Task 9's `ShareBridgeTab.vue` to match what you observe.**
+**Also verify on NC 33: the `INode` prop received by the custom element has `fileid` (number) and `path` (string). Add a temporary `console.log(props)` in `ShareBridgeTab.vue` to confirm.**
+
+If `fileid` is named differently on either version, update `ShareBridgeTab.vue` prop definition and the watch accordingly before proceeding.
 
 ### Step C: Verify OCS `expireDate` behaviour
-
-In the NC browser console (or via curl with a session cookie), create a test share with today's date as `expireDate` and confirm whether the link is immediately expired or valid until end of day:
 
 ```bash
 curl -u admin:password \
@@ -2069,9 +2110,11 @@ curl -u admin:password \
 
 Check the returned share URL in a browser. **If it's already expired, update `ocsExpireDate()` in `useNextcloudOCS.ts` (Task 5) to add 1 day to the expiry date.**
 
-### Step D: Confirm `registerPersonalSettings` section appears
+### Step D: Verify PHP PersonalSection renders
 
-With the app enabled, go to user avatar → Settings → Personal and confirm a ShareBridge section appears. If it does not, the script may need to be loaded only on the personal settings page — investigate `Util::addScript` with a page check in `Application.php`.
+With the app enabled on NC 33, go to user avatar → Settings → Personal. Confirm a ShareBridge section appears (rendered by `PersonalSection.php` + `templates/personal_settings.php`). Confirm `<div id="sharebridge-personal-settings">` is present in the DOM and `main.ts` successfully mounts `PersonalSettings.vue` into it.
+
+If the section does not appear, check: `composer.json` autoload includes `lib/Settings/`, `PersonalSection.php` namespace matches `OCA\ShareBridge\Settings`, and `Application.php` calls `$context->registerSetting(PersonalSection::class)`.
 
 ---
 
@@ -2083,7 +2126,7 @@ With the app enabled, go to user avatar → Settings → Personal and confirm a 
 
 - [ ] **Step 1: Write `src/components/ShareBridgeTab.test.ts`**
 
-> **Note on the `files` prop:** Nextcloud 27+ injects a `files: Node[]` prop into registered tab components (verified against `@nextcloud/files` v3 source). If running on NC 27 (older v2 API), the prop name may be `node: Node`. Verify against your live instance and adjust the prop name in `ShareBridgeTab.vue` if needed.
+> **Note on the `node` prop:** `ShareBridgeTab.vue` declares `node: { fileid: number; path: string }`. Both runtime paths provide this shape — the v3 manual `createApp` passes `{ fileid: fileInfo.id, path: fileInfo.path }` and the v4 custom element receives `INode` which has `.fileid` and `.path`. Tests mount the component directly with this prop.
 
 ```typescript
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -2110,6 +2153,7 @@ vi.mock('../composables/useNextcloudOCS', () => ({
 }))
 
 const makeNode = (fileid = 12345, path = '/Documents/report.pdf') => ({ fileid, path })
+// Used as: mount(ShareBridgeTab, { props: { node: makeNode() } })
 
 const makeShare = (code = 'ABC123'): Share => ({
     code,
@@ -2131,7 +2175,7 @@ describe('ShareBridgeTab', () => {
     it('shows "Configure in Personal Settings" prompt when not configured', async () => {
         useSettingsStore().$patch({ loaded: true, agentUrl: '', apiKey: '' })
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         await flushPromises()
 
         expect(wrapper.text()).toContain('Personal Settings')
@@ -2141,7 +2185,7 @@ describe('ShareBridgeTab', () => {
     it('shows loading icon while settings are being fetched', () => {
         useSettingsStore().$patch({ loaded: false, loading: true })
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         expect(wrapper.find('.nc-loading-icon').exists()).toBe(true)
     })
 
@@ -2151,7 +2195,7 @@ describe('ShareBridgeTab', () => {
         const { useAgentClient } = await import('../composables/useAgentClient')
         const { listShares }     = useAgentClient()
 
-        mount(ShareBridgeTab, { props: { files: [makeNode(99999)] } })
+        mount(ShareBridgeTab, { props: { node: makeNode(99999) } })
         await flushPromises()
 
         expect(vi.mocked(listShares)).toHaveBeenCalledWith('99999')
@@ -2160,7 +2204,7 @@ describe('ShareBridgeTab', () => {
     it('shows empty state when no shares exist for this file', async () => {
         useSettingsStore().$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         await flushPromises()
 
         expect(wrapper.find('[data-testid="empty-state"]').exists()).toBe(true)
@@ -2172,7 +2216,7 @@ describe('ShareBridgeTab', () => {
         const { useAgentClient } = await import('../composables/useAgentClient')
         vi.mocked(useAgentClient().listShares).mockResolvedValue([makeShare('ABC'), makeShare('XYZ')])
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         await flushPromises()
 
         expect(wrapper.findAll('[data-testid="share-card"]').length).toBe(2)
@@ -2181,7 +2225,7 @@ describe('ShareBridgeTab', () => {
     it('shows Create button when configured', async () => {
         useSettingsStore().$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         await flushPromises()
 
         expect(wrapper.find('[data-testid="create-share-btn"]').exists()).toBe(true)
@@ -2193,7 +2237,7 @@ describe('ShareBridgeTab', () => {
         const { useAgentClient } = await import('../composables/useAgentClient')
         vi.mocked(useAgentClient().listShares).mockRejectedValueOnce(new Error('Network error'))
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         await flushPromises()
 
         expect(wrapper.find('[data-testid="error-msg"]').exists()).toBe(true)
@@ -2208,7 +2252,7 @@ describe('ShareBridgeTab', () => {
         vi.mocked(useAgentClient().listShares).mockResolvedValue([makeShare('ABC123')])
         vi.mocked(useNextcloudOCS().deleteOCSShare).mockRejectedValueOnce(new Error('OCS error'))
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         await flushPromises()
 
         wrapper.findComponent({ name: 'ShareCard' }).vm.$emit('revoke', 'ABC123')
@@ -2228,7 +2272,7 @@ describe('ShareBridgeTab', () => {
         const { getNcShareId, deleteOCSShare, deleteNcShareId } = useNextcloudOCS()
         const { revokeShare, listShares }                       = useAgentClient()
 
-        const wrapper = mount(ShareBridgeTab, { props: { files: [makeNode()] } })
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
         await flushPromises()
 
         // Trigger revoke from the first ShareCard
@@ -2303,7 +2347,7 @@ Expected: `Cannot find module './ShareBridgeTab.vue'`
 
             <CreateShareModal
                 v-if="showModal"
-                :file-path="node.path"
+                :file-path="props.node.path"
                 :turn-available="turnAvailable"
                 :default-expiry-hours="defaultExpiryHours"
                 :default-max-downloads="defaultMaxDownloads"
@@ -2316,7 +2360,7 @@ Expected: `Cannot find module './ShareBridgeTab.vue'`
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { NcButton, NcLoadingIcon, NcEmptyContent } from '@nextcloud/vue'
 import { useSettingsStore } from '../stores/settings'
 import { useAgentClient } from '../composables/useAgentClient'
@@ -2325,33 +2369,31 @@ import ShareCard from './ShareCard.vue'
 import CreateShareModal from './CreateShareModal.vue'
 import type { Share, CreateShareResult } from '../types'
 
-// Props injected by registerTab.
-// @nextcloud/files v3: prop name is `files` (Node[]).
-// Verify against your live NC instance — older versions may use `node: Node`.
+// Props injected by the registration path.
+// v3 (OCA.Files.Sidebar / manual createApp): passed as { fileid: fileInfo.id, path: fileInfo.path }
+// v4 (defineCustomElement):                  INode from @nextcloud/files (has .fileid and .path)
 const props = defineProps<{
-    files: Array<{ fileid: number; path: string }>
+    node: { fileid: number; path: string }
 }>()
 
-const node = computed(() => props.files[0])
-
-const settings     = useSettingsStore()
+const settings = useSettingsStore()
 const { listShares, revokeShare, getSettings } = useAgentClient()
 const { getNcShareId, deleteOCSShare, deleteNcShareId } = useNextcloudOCS()
 
-const shares         = ref<Share[]>([])
-const loadingShares  = ref(false)
-const error          = ref('')
-const showModal      = ref(false)
-const turnAvailable  = ref(false)
-const defaultExpiryHours   = ref(24)
-const defaultMaxDownloads  = ref(0)
-const defaultRelayOnly     = ref(false)
+const shares        = ref<Share[]>([])
+const loadingShares = ref(false)
+const error         = ref('')
+const showModal     = ref(false)
+const turnAvailable       = ref(false)
+const defaultExpiryHours  = ref(24)
+const defaultMaxDownloads = ref(0)
+const defaultRelayOnly    = ref(false)
 
 const loadShares = async () => {
     loadingShares.value = true
     error.value         = ''
     try {
-        shares.value = await listShares(String(node.value.fileid))
+        shares.value = await listShares(String(props.node.fileid))
     } catch {
         error.value = "Cannot connect to ShareBridge agent. Check the agent URL and ensure it's running."
     } finally {
@@ -2390,7 +2432,7 @@ const handleCreated = async (_result: CreateShareResult) => {
 // Load shares whenever the file or configured state changes.
 // Use != null (not truthiness) so fileid=0 is handled correctly.
 watch(
-    [() => node.value?.fileid, () => settings.isConfigured],
+    [() => props.node?.fileid, () => settings.isConfigured],
     ([fileid, isConfigured]) => {
         if (fileid != null && isConfigured) {
             loadShares()
@@ -2430,29 +2472,101 @@ git commit -m "feat(slice-12): ShareBridgeTab — Files sidebar tab with share l
 - [ ] **Step 1: Write `src/main.ts`**
 
 ```typescript
-import { registerTab } from '@nextcloud/files'
-import { registerPersonalSettings } from '@nextcloud/settings'
+import { createApp, defineCustomElement, h, ref } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
+import { getSidebar } from '@nextcloud/files'
+import type { ISidebarTab } from '@nextcloud/files'
 import { t } from '@nextcloud/l10n'
 import ShareBridgeTab from './components/ShareBridgeTab.vue'
 import PersonalSettings from './components/PersonalSettings.vue'
 
-// Register sidebar tab in Files app.
-// Tab is hidden for multi-file selections.
-registerTab({
-    id:        'sharebridge',
-    name:      t('sharebridge', 'ShareBridge'),
-    component: ShareBridgeTab,
-    // `nodes` is Node[] from @nextcloud/files
-    enabled:   (nodes: unknown[]) => nodes.length === 1,
+// Shared pinia instance. setActivePinia makes it available to stores accessed
+// inside defineCustomElement-created apps (which have their own Vue app context).
+const pinia = createPinia()
+setActivePinia(pinia)
+
+// ─── Personal Settings ───────────────────────────────────────────────────────
+// PersonalSection.php renders <div id="sharebridge-personal-settings"> in the
+// NC Personal Settings page. Mount the Vue component there when that page is active.
+document.addEventListener('DOMContentLoaded', () => {
+    const el = document.getElementById('sharebridge-personal-settings')
+    if (el) {
+        createApp(PersonalSettings).use(pinia).mount(el)
+    }
 })
 
-// Register settings section under user avatar → Settings → Personal → ShareBridge
-registerPersonalSettings({
-    id:        'sharebridge',
-    section:   'sharebridge',
-    name:      t('sharebridge', 'ShareBridge'),
-    component: PersonalSettings,
-})
+// ─── Sidebar Tab ─────────────────────────────────────────────────────────────
+// Hybrid registration: NC 26-32 exposes window.OCA.Files.Sidebar (legacy global).
+// NC 33+ removed that global and uses getSidebar() from @nextcloud/files v4.
+// We bundle @nextcloud/files v4; on NC 26-32 we skip getSidebar() entirely and
+// fall back to the OCA.Files.Sidebar global that NC provides natively.
+
+const ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>'
+
+// TypeScript type for the NC 26-32 global (not in any @types package).
+declare global {
+    interface Window {
+        OCA?: {
+            Files?: {
+                Sidebar?: {
+                    registerTab: (tab: unknown) => void
+                    Tab: new (options: {
+                        id: string
+                        name: string
+                        iconSvgInline?: string
+                        mount: (el: HTMLElement, fileInfo: { id: number; path: string }) => void
+                        update: (fileInfo: { id: number; path: string }) => void
+                        destroy: () => void
+                    }) => unknown
+                }
+            }
+        }
+    }
+}
+
+if (window.OCA?.Files?.Sidebar) {
+    // ── NC 26-32: OCA.Files.Sidebar legacy global ─────────────────────────
+    // fileInfo.id is the numeric fileid; fileInfo.path is the NC path.
+    let app: ReturnType<typeof createApp> | null = null
+    const currentNode = ref({ fileid: 0, path: '' })
+
+    window.OCA.Files.Sidebar.registerTab(
+        new window.OCA.Files.Sidebar.Tab({
+            id:           'sharebridge',
+            name:         t('sharebridge', 'ShareBridge'),
+            iconSvgInline: ICON_SVG,
+            mount(el: HTMLElement, fileInfo: { id: number; path: string }) {
+                currentNode.value = { fileid: fileInfo.id, path: fileInfo.path }
+                app = createApp({ render: () => h(ShareBridgeTab, { node: currentNode.value }) })
+                app.use(pinia).mount(el)
+            },
+            update(fileInfo: { id: number; path: string }) {
+                currentNode.value = { fileid: fileInfo.id, path: fileInfo.path }
+            },
+            destroy() {
+                app?.unmount()
+                app = null
+            },
+        })
+    )
+} else {
+    // ── NC 33+: @nextcloud/files v4 getSidebar() + web component ──────────
+    // defineCustomElement wraps ShareBridgeTab as a custom element.
+    // shadowRoot: false allows NC global CSS (theming) to reach the component.
+    const tab: ISidebarTab = {
+        id:            'sharebridge',
+        displayName:   t('sharebridge', 'ShareBridge'),
+        iconSvgInline: ICON_SVG,
+        order:         50,
+        tagName:       'sharebridge-files-sidebar-tab' as `${string}-${string}`,
+        enabled({ node }) { return true },
+        async onInit() {
+            const SidebarTabEl = defineCustomElement(ShareBridgeTab, { shadowRoot: false })
+            customElements.define('sharebridge-files-sidebar-tab', SidebarTabEl)
+        },
+    }
+    getSidebar().registerTab(tab)
+}
 ```
 
 - [ ] **Step 2: Run typecheck**
@@ -2486,7 +2600,7 @@ Expected: all tests pass.
 
 ```bash
 git add src/main.ts js/sharebridge-main.js
-git commit -m "feat(slice-12): entry point main.ts — registerTab + registerPersonalSettings"
+git commit -m "feat(slice-12): main.ts — hybrid sidebar registration + PersonalSettings mount"
 ```
 
 ---
@@ -2495,8 +2609,9 @@ git commit -m "feat(slice-12): entry point main.ts — registerTab + registerPer
 
 | Spec requirement | Covered by |
 |---|---|
-| `registerTab` + `registerPersonalSettings` in `main.ts` | Task 10 |
-| Tab hidden for multi-file selection (`enabled`) | Task 10 `main.ts` |
+| Hybrid sidebar registration (v3 OCA.Files.Sidebar + v4 getSidebar) | Task 10 |
+| Personal Settings PHP registration via `ISettings` | Task 1 (PersonalSection.php) |
+| `main.ts` mounts PersonalSettings Vue component onto PHP `<div>` | Task 10 |
 | PHP GET/PUT settings via `IConfig` | Task 2 |
 | PHP PUT/GET `nc_share_ids` mapping | Task 2 |
 | `stores/settings.ts` async fetch from PHP endpoint | Task 4 |
@@ -2526,4 +2641,4 @@ git commit -m "feat(slice-12): entry point main.ts — registerTab + registerPer
 
 ---
 
-> **Prop name verification reminder:** The `files` prop name in `ShareBridgeTab.vue` must be verified against your live NC 27+ instance. Check with: `registerTab({ ..., component: { setup(props) { console.log(props) } } })` and open the Files sidebar.
+> **Live verification reminder:** Use the STOP checkpoint (between Tasks 8 and 9) to confirm the hybrid detection works on both NC 27 and NC 33, and that `INode.fileid` matches the prop shape in `ShareBridgeTab.vue`.

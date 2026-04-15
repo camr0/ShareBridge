@@ -30,8 +30,12 @@ extensions/nextcloud/
 │   ├── info.xml                    # App metadata (id, name, version, min/max NC version)
 │   └── routes.php                  # Declares settings API routes
 ├── lib/
-│   └── Controller/
-│       └── SettingsController.php  # GET/PUT per-user settings via IConfig
+│   ├── Controller/
+│   │   └── SettingsController.php  # GET/PUT per-user settings via IConfig
+│   └── Settings/
+│       └── PersonalSection.php     # PHP ISettings impl — registers NC Personal Settings section
+├── templates/
+│   └── personal_settings.php       # Renders <div id="sharebridge-personal-settings">
 ├── src/
 │   ├── main.ts                     # Entry: registerTab + registerPersonalSettings
 │   ├── components/
@@ -104,33 +108,88 @@ return [
 
 ## Sidebar Registration & Personal Settings
 
-`src/main.ts` registers both the sidebar tab and the personal settings section:
+### Personal Settings — PHP registration
 
+`registerPersonalSettings` **does not exist** as a JS API. Personal Settings sections must be registered via PHP's `OCP\Settings\ISettings` interface.
+
+`lib/Settings/PersonalSection.php` implements `ISettings`:
+- `getForm()` → returns `TemplateResponse('sharebridge', 'personal_settings', [], 'blank')`
+- `getSection()` → `'personal'`
+- `getPriority()` → `50`
+
+`templates/personal_settings.php` renders a mount point:
+```html
+<div id="sharebridge-personal-settings"></div>
+```
+
+`lib/AppInfo/Application.php` registers it in `register()`:
+```php
+$context->registerSetting(PersonalSection::class);
+```
+
+`main.ts` mounts the Vue component when the mount point exists (Settings page only):
 ```typescript
-import { registerTab } from '@nextcloud/files'
-import { registerPersonalSettings } from '@nextcloud/settings'
-import ShareBridgeTab from './components/ShareBridgeTab.vue'
-import PersonalSettings from './components/PersonalSettings.vue'
-
-registerTab({
-  id: 'sharebridge',
-  name: t('sharebridge', 'ShareBridge'),
-  component: ShareBridgeTab,
-  enabled: (nodes) => nodes.length === 1,
-})
-
-registerPersonalSettings({
-  id: 'sharebridge',
-  section: 'sharebridge',
-  name: t('sharebridge', 'ShareBridge'),
-  component: PersonalSettings,
+document.addEventListener('DOMContentLoaded', () => {
+    const el = document.getElementById('sharebridge-personal-settings')
+    if (el) createApp(PersonalSettings).use(pinia).mount(el)
 })
 ```
 
-- Tab is hidden for multi-file selections (`enabled` returns false)
-- Personal Settings section appears under user avatar → Settings → Personal → ShareBridge
-- Both components share the same Pinia settings store — changes in Personal Settings are immediately reflected in the sidebar tab
-- Nextcloud auto-injects the script bundle when the app is enabled — no manual script tag needed
+### Sidebar Tab — hybrid v3/v4
+
+`@nextcloud/files` v3 (NC 26-32) and v4 (NC 33+) use different APIs. NC removed `OCA.Files.Sidebar` global in NC 33 and replaced it with `getSidebar()` from `@nextcloud/files` v4 with web components.
+
+`main.ts` detects which API is available at runtime:
+
+```typescript
+import { createApp, defineCustomElement, h, ref } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
+import { getSidebar } from '@nextcloud/files'
+import type { ISidebarTab } from '@nextcloud/files'
+
+const pinia = createPinia()
+setActivePinia(pinia) // makes pinia available inside defineCustomElement-created apps
+
+if (window.OCA?.Files?.Sidebar) {
+  // NC 26-32: legacy OCA.Files.Sidebar global
+  // fileInfo.id is the fileid (number)
+  const currentNode = ref({ fileid: 0, path: '' })
+  let app: ReturnType<typeof createApp> | null = null
+
+  window.OCA.Files.Sidebar.registerTab(new window.OCA.Files.Sidebar.Tab({
+    id: 'sharebridge',
+    name: t('sharebridge', 'ShareBridge'),
+    iconSvgInline: ICON_SVG,
+    mount(el, fileInfo) {
+      currentNode.value = { fileid: fileInfo.id, path: fileInfo.path }
+      app = createApp({ render: () => h(ShareBridgeTab, { node: currentNode.value }) })
+      app.use(pinia).mount(el)
+    },
+    update(fileInfo) { currentNode.value = { fileid: fileInfo.id, path: fileInfo.path } },
+    destroy() { app?.unmount(); app = null },
+  }))
+} else {
+  // NC 33+: @nextcloud/files v4 getSidebar() + web component
+  const tab: ISidebarTab = {
+    id: 'sharebridge',
+    displayName: t('sharebridge', 'ShareBridge'),
+    iconSvgInline: ICON_SVG,
+    order: 50,
+    tagName: 'sharebridge-files-sidebar-tab',
+    enabled({ node }) { return true },
+    async onInit() {
+      const el = defineCustomElement(ShareBridgeTab, { shadowRoot: false })
+      customElements.define('sharebridge-files-sidebar-tab', el)
+    },
+  }
+  getSidebar().registerTab(tab)
+}
+```
+
+- `shadowRoot: false` allows NC global CSS (theming) to apply to the web component
+- `setActivePinia(pinia)` makes the shared store available inside custom elements without `app.use(pinia)` in each element app
+- `package.json` targets `@nextcloud/files@^4.0.0`; on NC 26-32 the `getSidebar()` branch is never entered so the bundled v4 code is unused there
+- Tab is enabled for all single-file selections; multi-file is handled by NC's sidebar which won't open the tab for multiple selections
 
 ---
 
@@ -140,7 +199,9 @@ Nextcloud passes the selected file as a `Node` object from `@nextcloud/files`. T
 
 `ShareBridgeTab` receives the node as a prop and passes `node.fileid.toString()` to `listShares()`. The agent API call is unchanged.
 
-**Note**: The exact prop name injected by `registerTab` (`node`, `activeNode`, or similar) must be verified against the live Nextcloud instance during implementation.
+**Props**: `ShareBridgeTab.vue` declares `node: { fileid: number; path: string }`. Both code paths provide this:
+- v3 (manual `createApp`): `{ fileid: fileInfo.id, path: fileInfo.path }`
+- v4 (custom element): `INode` from `@nextcloud/files` which exposes `fileid` and `path`
 
 **Agent PROPFIND unchanged**: The agent always does PROPFIND when creating a share (to extract file ID from the share URL). We do NOT pass `file_id` in `CreateShareParams` even though we have it — keeping the agent's PROPFIND path always exercised avoids hiding potential breakage in that code path.
 
@@ -177,7 +238,7 @@ All three components rewritten using `@nextcloud/vue` for native look and feel. 
 
 | Component | `@nextcloud/vue` components used | Notes |
 |-----------|----------------------------------|-------|
-| `ShareBridgeTab.vue` | `NcLoadingIcon`, `NcEmptyContent`, `NcButton` | Receives `node` prop; shows prompt to visit Settings if not configured |
+| `ShareBridgeTab.vue` | `NcLoadingIcon`, `NcEmptyContent`, `NcButton` | Receives `node: { fileid, path }` prop; shows prompt to visit Settings if not configured |
 | `ShareCard.vue` | `NcButton`, `NcBadge` | Same logic as OpenCloud version |
 | `CreateShareModal.vue` | `NcModal`, `NcSelect`, `NcTextField`, `NcCheckboxRadioSwitch` | Same fields as OpenCloud version |
 | `PersonalSettings.vue` | `NcSettingsSection`, `NcTextField`, `NcButton` | Agent URL + API key form; always accessible for updates |
@@ -186,7 +247,9 @@ All three components rewritten using `@nextcloud/vue` for native look and feel. 
 
 ### ShareBridgeTab.vue behaviour
 
-1. Mount → fetch settings from PHP endpoint
+1. Mount → fetch settings from PHP endpoint (via `settings.fetchSettings()`)
+   - v3 path: triggered by `onMounted` in the manually-mounted Vue app
+   - v4 path: triggered by `onMounted` in the custom element
 2. If not configured → show prompt: *"Configure ShareBridge in your Personal Settings to get started."*
 3. If configured → load shares for `node.fileid` from agent
 4. Shows `NcLoadingIcon` while settings or shares are fetching
