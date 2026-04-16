@@ -1,12 +1,19 @@
 <template>
 	<div class="sb-share-card">
-		<div class="sb-share-info">
+		<div class="sb-share-header">
 			<span class="sb-share-code" data-testid="share-code">{{ share.code }}</span>
-			<span class="sb-share-meta">
-				{{ share.downloads }} / {{ share.max_downloads === 0 ? '∞' : share.max_downloads }} downloads
-				·
-				{{ formattedExpiry }}
+			<span
+				class="sb-connection-badge"
+				:class="share.relay_only ? 'sb-connection-badge--relay' : 'sb-connection-badge--direct'"
+				data-testid="connection-badge"
+			>
+				{{ share.relay_only ? 'Relay' : 'Direct' }}
 			</span>
+		</div>
+		<div class="sb-share-meta" data-testid="share-meta">
+			<span>{{ share.downloads }} / {{ share.max_downloads === 0 ? '∞' : share.max_downloads }} downloads</span>
+			<span>·</span>
+			<span>{{ formattedExpiry }}</span>
 		</div>
 		<div class="sb-share-actions">
 			<NcButton data-testid="copy-btn" @click="copyLink">
@@ -57,25 +64,56 @@ onUnmounted(() => { if (copyTimer) clearTimeout(copyTimer) })
 <style scoped>
 .sb-share-card {
 	display: flex;
-	align-items: center;
-	justify-content: space-between;
+	flex-direction: column;
 	gap: 8px;
+	padding: 12px;
+	border-radius: var(--border-radius-large, 8px);
+	border: 1px solid var(--color-border);
+	background: var(--color-background-hover);
 }
 
-.sb-share-info {
+.sb-share-header {
 	display: flex;
-	flex-direction: column;
-	gap: 2px;
-	min-width: 0;
+	align-items: center;
+	gap: 8px;
 }
 
 .sb-share-code {
 	font-weight: 600;
 	font-size: 14px;
 	font-family: var(--font-face-monospace, monospace);
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sb-connection-badge {
+	display: inline-flex;
+	align-items: center;
+	padding: 2px 8px;
+	border-radius: 100px;
+	font-size: 11px;
+	font-weight: 600;
+	flex-shrink: 0;
+}
+
+.sb-connection-badge--direct {
+	background: color-mix(in srgb, var(--color-success) 15%, transparent);
+	color: var(--color-success);
+	border: 1px solid color-mix(in srgb, var(--color-success) 40%, transparent);
+}
+
+.sb-connection-badge--relay {
+	background: color-mix(in srgb, var(--color-warning) 15%, transparent);
+	color: var(--color-warning-text, var(--color-warning));
+	border: 1px solid color-mix(in srgb, var(--color-warning) 40%, transparent);
 }
 
 .sb-share-meta {
+	display: flex;
+	gap: 6px;
 	font-size: 12px;
 	color: var(--color-text-maxcontrast);
 }
@@ -83,6 +121,5 @@ onUnmounted(() => { if (copyTimer) clearTimeout(copyTimer) })
 .sb-share-actions {
 	display: flex;
 	gap: 4px;
-	flex-shrink: 0;
 }
 </style>
