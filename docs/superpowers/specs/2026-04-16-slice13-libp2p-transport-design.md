@@ -5,7 +5,7 @@
 
 ## Problem
 
-WebRTC TURN relay throughput is capped by the SCTP 128 KiB window limit. Throughput = window / RTT, so at 50ms latency the ceiling is ~2.5 MB/s regardless of available bandwidth. The fix requires replacing the relay transport with something that uses TCP window scaling.
+WebRTC TURN relay throughput is capped by the SCTP receive window (browser-dependent: Chrome 256 KiB, Firefox 1 MiB, pion default 1 MiB but agent-side is untuned). Throughput = window / RTT, so at 50ms latency the Chrome ceiling is ~5 MB/s regardless of available bandwidth. The fix requires replacing the relay transport with something that uses TCP window scaling.
 
 ---
 
@@ -14,7 +14,7 @@ WebRTC TURN relay throughput is capped by the SCTP 128 KiB window limit. Through
 - Replace the WebRTC + coturn stack with libp2p as the underlying transport
 - Fix relay throughput (TCP window scaling eliminates the SCTP ceiling)
 - Gain E2E encryption via Noise protocol (battle-tested, same as WireGuard/Signal) — nothing to implement
-- Gain stream multiplexing via yamux (parallel downloads in a future slice nearly free)
+- Gain stream multiplexing via yamux on the relay path (parallel downloads in a future slice nearly free on relay — direct mode still shares one SCTP window across streams, so parallel benefit there would require multiple PeerConnections; see Future)
 - Establish a clear upgrade path to WebTransport/QUIC via a dependency bump when Safari adoption is solid
 - Change nothing above the transport layer (file protocol, auth, quota, UI, extensions)
 
@@ -62,7 +62,7 @@ coturn is removed entirely. STUN is still needed for DCUtR ICE gathering — use
 
 ### Keepalive
 
-The agent's persistent WebSocket connection to the relay must send a ping every 30 seconds to prevent Cloudflare's 100s idle WebSocket timeout from dropping it. Same pattern as the existing keepalive in `signaling/client.go`.
+The existing 30s keepalive ping in `signaling/client.go` (for the signaling server WebSocket) stays — `sharebridge.app` is behind Cloudflare which has a 100s idle WebSocket timeout. The relay connection (`relay.sharebridge.app`) bypasses Cloudflare (DNS-only), so no keepalive is needed there — Caddy's default WebSocket idle timeout is 30 minutes.
 
 ### coturn
 
@@ -84,7 +84,7 @@ Decommissioned as part of 13a.
 **Agent (`agent/`)**
 
 - **Removed: `internal/peer/`** — WebRTC PeerConnection and DataChannel gone
-- **New: `internal/transport/`** — go-libp2p Host, outbound-only connection to relay (`wss://relay.sharebridge.app`), stream handler that wires into `transfer.Manager` via the existing `DataChannel` interface (thin adapter), keepalive ping every 30s on relay connection
+- **New: `internal/transport/`** — go-libp2p Host, outbound-only connection to relay (`wss://relay.sharebridge.app`), stream handler that wires into `transfer.Manager` via the existing `DataChannel` interface (thin adapter)
 - **Changed: `internal/signaling/client.go`** — remove ICE server handling; receive relay multiaddr on welcome message
 - **Unchanged: `internal/transfer/manager.go`** — zero logic changes; gets a libp2p stream adapter that satisfies the existing `DataChannel` interface
 
@@ -147,12 +147,17 @@ relay_only=true (dcutr_allowed=false in JWT):
    → relay refuses to forward DCUtR messages → step 4 skipped → traffic stays on relay
    → agent IP never revealed to browser (agent connects outbound only, browser sees relay IP)
 
-Quota exhausted:
+Quota exhausted (direct-capable share):
    → signaling server issues JWT with relay_allowed=false, dcutr_allowed=true
    → relay allows DCUtR coordination only, refuses to forward data bytes
    → if hole punch succeeds → direct connection works fine, no relay bandwidth consumed
    → if hole punch fails → connection fails, no relay fallback
    → consistent with Slice 10c: direct mode is always free
+
+Quota exhausted + relay_only=true (complete block):
+   → both relay_allowed and dcutr_allowed would be false — no JWT issued
+   → signaling server rejects immediately with error: "file host's relay quota exceeded - this share requires relay which is unavailable"
+   → same behaviour as current code in browser_ws.go
 ```
 
 ---
@@ -233,4 +238,4 @@ Deliverable: full browser→relay→agent file transfer over libp2p. DCUtR direc
 
 When WebTransport has broad browser support (Safari 18.4 just landed it but rollout takes time, and server-side QUIC setup adds complexity to 13a), configure the relay to also listen on WebTransport and js-libp2p will automatically prefer it. Essentially a dependency bump and Caddy config addition — no protocol changes.
 
-yamux stream multiplexing is included automatically with go-libp2p / js-libp2p. Parallel downloads (Slice 15) become a protocol-level feature with no transport work required.
+yamux stream multiplexing is included automatically with go-libp2p / js-libp2p. Parallel downloads (Slice 15) become a protocol-level feature with no transport work required **on the relay path**. On the direct path (DCUtR → WebRTC), all yamux streams share a single SCTP association and thus one receive window — parallel streams won't multiply throughput. Addressing direct-mode throughput is tracked separately: (1) agent-side pion SCTP buffer tuning via `SettingEngine.SetSCTPMaxReceiveBufferSize` (quick win, verify go-libp2p passthrough), then (2) multiple independent PeerConnections with JWT `max_uses` if tuning is insufficient. See `memory/future_parallel_webrtc_channels.md`.
