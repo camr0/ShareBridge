@@ -1,50 +1,68 @@
-export const NcButton = {
+import type { DefineComponent } from 'vue'
+
+export const NcButton: DefineComponent = {
 	template: '<button @click="$emit(\'click\')"><slot /></button>',
 	emits: ['click'],
-}
+} as unknown as DefineComponent
 
-export const NcModal = {
+export const NcModal: DefineComponent = {
 	props: ['name', 'show'],
 	emits: ['close'],
-	template: '<div v-if="show !== false" class="nc-modal"><slot /></div>',
-}
+	template: '<div v-if="show !== false" class="nc-modal" :data-testid="$attrs[\'data-testid\']"><slot /></div>',
+} as unknown as DefineComponent
 
-export const NcTextField = {
+export const NcDialog: DefineComponent = {
+	props: ['name', 'size', 'open'],
+	emits: ['closing', 'update:open'],
+	template: '<div v-if="open !== false" class="nc-dialog"><slot /><div class="nc-dialog__actions"><slot name="actions" /></div></div>',
+} as unknown as DefineComponent
+
+export const NcTextField: DefineComponent = {
 	props: ['modelValue', 'label', 'type', 'placeholder'],
 	emits: ['update:modelValue'],
 	template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" :data-testid="$attrs[\'data-testid\']" />',
-}
+} as unknown as DefineComponent
 
-export const NcLoadingIcon = {
+export const NcPasswordField: DefineComponent = {
+	props: ['modelValue', 'label', 'placeholder'],
+	emits: ['update:modelValue'],
+	template: '<input type="password" :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" :data-testid="$attrs[\'data-testid\']" />',
+} as unknown as DefineComponent
+
+export const NcLoadingIcon: DefineComponent = {
+	props: ['size'],
 	template: '<div class="nc-loading-icon" />',
-}
+} as unknown as DefineComponent
 
-export const NcEmptyContent = {
+export const NcEmptyContent: DefineComponent = {
 	props: ['name', 'description'],
-	template: '<div class="nc-empty-content"><slot /></div>',
-}
+	template: '<div class="nc-empty-content" :data-testid="$attrs[\'data-testid\']"><p class="nc-empty-content__name">{{ name }}</p><p class="nc-empty-content__desc">{{ description }}</p></div>',
+} as unknown as DefineComponent
 
-export const NcSettingsSection = {
+export const NcSettingsSection: DefineComponent = {
 	props: ['name', 'description'],
-	template: '<section><slot /></section>',
-}
+	template: '<section class="nc-settings-section"><slot /></section>',
+} as unknown as DefineComponent
 
-export const NcCheckboxRadioSwitch = {
-	props: ['checked'],
-	emits: ['update:checked'],
-	template: '<input type="checkbox" :checked="checked" @change="$emit(\'update:checked\', !checked)" />',
-}
+export const NcCheckboxRadioSwitch: DefineComponent = {
+	props: { modelValue: { type: Boolean, default: false } },
+	emits: ['update:modelValue'],
+	template: '<label class="nc-checkbox"><input type="checkbox" :checked="modelValue" @change="$emit(\'update:modelValue\', $event.target.checked)" :data-testid="$attrs[\'data-testid\']" /><slot /></label>',
+} as unknown as DefineComponent
 
-export const NcBadge = {
-	template: '<span class="nc-badge"><slot /></span>',
-}
+export const NcNoteCard: DefineComponent = {
+	props: ['type'],
+	template: '<div class="nc-note-card" :data-testid="$attrs[\'data-testid\']"><slot /></div>',
+} as unknown as DefineComponent
 
-export const NcSelect = {
-	props: ['modelValue', 'options'],
+export const NcSelect: DefineComponent = {
+	props: ['options', 'modelValue', 'clearable', 'label', 'reduce'],
 	emits: ['update:modelValue'],
 	template: `
-		<select :value="modelValue" @change="$emit('update:modelValue', $event.target.value)">
-			<option v-for="opt in options" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-		</select>
+		<div class="nc-select-wrapper" :data-testid="$attrs['data-testid']">
+			<select>
+				<option v-for="opt in options" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+			</select>
+		</div>
 	`,
-}
+} as unknown as DefineComponent

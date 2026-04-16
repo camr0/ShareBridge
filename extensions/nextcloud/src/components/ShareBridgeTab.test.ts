@@ -74,8 +74,7 @@ describe('ShareBridgeTab', () => {
         useSettingsStore().$patch({ loaded: false, loading: true })
 
         const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
-        expect(wrapper.find('.sb-loading').exists()).toBe(true)
-        expect(wrapper.text()).toContain('Loading')
+        expect(wrapper.find('.nc-loading-icon').exists()).toBe(true)
     })
 
     it('calls listShares with node fileid when configured', async () => {

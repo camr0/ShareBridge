@@ -64,4 +64,14 @@ describe('ShareCard', () => {
         await wrapper.find('[data-testid="copy-btn"]').trigger('click')
         expect(mockWriteText).toHaveBeenCalledWith('https://share.example.com/s/ABC123')
     })
+
+    it('shows "Direct" badge when relay_only is false', () => {
+        const wrapper = mount(ShareCard, { props: { share: makeShare({ relay_only: false }) } })
+        expect(wrapper.find('[data-testid="connection-badge"]').text()).toBe('Direct')
+    })
+
+    it('shows "Relay" badge when relay_only is true', () => {
+        const wrapper = mount(ShareCard, { props: { share: makeShare({ relay_only: true }) } })
+        expect(wrapper.find('[data-testid="connection-badge"]').text()).toBe('Relay')
+    })
 })
