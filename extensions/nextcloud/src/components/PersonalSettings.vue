@@ -37,13 +37,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { NcSettingsSection, NcTextField, NcPasswordField, NcButton, NcLoadingIcon } from '@nextcloud/vue'
 import { useSettingsStore } from '../stores/settings'
 
 const settings = useSettingsStore()
 const saving = ref(false)
 const saved = ref(false)
+let savedTimer: ReturnType<typeof setTimeout> | null = null
 
 const save = async () => {
 	saving.value = true
@@ -51,13 +52,15 @@ const save = async () => {
 	try {
 		await settings.saveSettings()
 		saved.value = true
-		setTimeout(() => { saved.value = false }, 3000)
+		if (savedTimer) clearTimeout(savedTimer)
+		savedTimer = setTimeout(() => { saved.value = false }, 3000)
 	} finally {
 		saving.value = false
 	}
 }
 
 onMounted(() => settings.fetchSettings())
+onUnmounted(() => { if (savedTimer) clearTimeout(savedTimer) })
 </script>
 
 <style scoped>

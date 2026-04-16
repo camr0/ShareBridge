@@ -100,7 +100,7 @@ const applyAgentSettings = async () => {
 		defaultMaxDownloads.value = s.default_max_downloads
 		defaultRelayOnly.value = s.default_relay_only
 	} catch {
-		// leave defaults
+		// agent unreachable — form defaults stay as-is
 	}
 }
 
@@ -126,8 +126,7 @@ watch(
 	[() => props.node?.id, () => settings.isConfigured],
 	([nodeId, isConfigured]) => {
 		if (nodeId && isConfigured) {
-			loadShares()
-			applyAgentSettings()
+			Promise.all([loadShares(), applyAgentSettings()])
 		}
 	},
 	{ immediate: true }
