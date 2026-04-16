@@ -24,14 +24,14 @@ declare module '@nextcloud/vue' {
 	}, {}, {}>
 
 	export const NcTextField: DefineComponent<{
-		value?: string
+		modelValue?: string | number
 		label?: string
 		type?: string
 		placeholder?: string
 	}, {}, {}>
 
 	export const NcPasswordField: DefineComponent<{
-		value?: string
+		modelValue?: string
 		label?: string
 		placeholder?: string
 	}, {}, {}>

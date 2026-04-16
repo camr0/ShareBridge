@@ -19,15 +19,15 @@ export const NcDialog: DefineComponent = {
 } as unknown as DefineComponent
 
 export const NcTextField: DefineComponent = {
-	props: ['value', 'label', 'type', 'placeholder'],
-	emits: ['update:value'],
-	template: '<input :value="value" @input="$emit(\'update:value\', $event.target.value)" :data-testid="$attrs[\'data-testid\']" />',
+	props: ['modelValue', 'label', 'type', 'placeholder'],
+	emits: ['update:modelValue'],
+	template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" :data-testid="$attrs[\'data-testid\']" />',
 } as unknown as DefineComponent
 
 export const NcPasswordField: DefineComponent = {
-	props: ['value', 'label', 'placeholder'],
-	emits: ['update:value'],
-	template: '<input type="password" :value="value" @input="$emit(\'update:value\', $event.target.value)" :data-testid="$attrs[\'data-testid\']" />',
+	props: ['modelValue', 'label', 'placeholder'],
+	emits: ['update:modelValue'],
+	template: '<input type="password" :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" :data-testid="$attrs[\'data-testid\']" />',
 } as unknown as DefineComponent
 
 export const NcLoadingIcon: DefineComponent = {

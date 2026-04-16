@@ -9,17 +9,17 @@
 			<NcTextField
 				data-testid="agent-url-input"
 				label="Agent URL"
-				:value="settings.agentUrl"
+				:model-value="settings.agentUrl"
 				placeholder="http://localhost:7878"
-				@update:value="settings.agentUrl = $event"
+				@update:model-value="settings.agentUrl = $event"
 			/>
 
 			<NcPasswordField
 				data-testid="api-key-input"
 				label="API Key"
-				:value="settings.apiKey"
+				:model-value="settings.apiKey"
 				placeholder="sb_agent_..."
-				@update:value="settings.apiKey = $event"
+				@update:model-value="settings.apiKey = $event"
 			/>
 
 			<div class="sb-settings-actions">

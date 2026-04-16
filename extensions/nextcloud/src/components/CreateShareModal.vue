@@ -1,29 +1,28 @@
 <template>
 	<NcDialog name="Create ShareBridge Share" size="small" @closing="emit('close')">
 		<div class="sb-modal-content">
-			<NcSelect
-				data-testid="expiry-select"
-				:options="expiryOptions"
-				:model-value="selectedExpiryOption"
-				:clearable="false"
-				label="label"
-				:reduce="(opt: ExpiryOption) => opt.value"
-				@update:model-value="form.expiryHours = Number($event)"
-			/>
+			<label class="sb-select-label">
+				Expiry
+				<select data-testid="expiry-select" v-model.number="form.expiryHours" class="sb-select">
+					<option v-for="opt in expiryOptions" :key="opt.value" :value="opt.value">
+						{{ opt.label }}
+					</option>
+				</select>
+			</label>
 
 			<NcPasswordField
 				data-testid="password-input"
 				label="Password (optional)"
-				:value="form.password"
-				@update:value="form.password = $event"
+				:model-value="form.password"
+				@update:model-value="form.password = $event"
 			/>
 
 			<NcTextField
 				data-testid="max-downloads-input"
 				label="Max Downloads (0 = unlimited)"
 				type="number"
-				:value="String(form.maxDownloads)"
-				@update:value="form.maxDownloads = Number($event)"
+				:model-value="String(form.maxDownloads)"
+				@update:model-value="form.maxDownloads = Number($event)"
 			/>
 
 			<NcCheckboxRadioSwitch
@@ -54,17 +53,12 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed } from 'vue'
-import { NcDialog, NcSelect, NcPasswordField, NcTextField, NcCheckboxRadioSwitch, NcNoteCard, NcButton } from '@nextcloud/vue'
+import { NcDialog, NcPasswordField, NcTextField, NcCheckboxRadioSwitch, NcNoteCard, NcButton } from '@nextcloud/vue'
 import { useNextcloudOCS } from '../composables/useNextcloudOCS'
 import { useAgentClient } from '../composables/useAgentClient'
 import type { CreateShareResult } from '../types'
 
 const PRESET_EXPIRY_HOURS = [1, 6, 12, 24, 72, 168, 720]
-
-interface ExpiryOption {
-	value: number
-	label: string
-}
 
 const props = defineProps<{
 	filePath: string
@@ -96,10 +90,6 @@ const expiryOptions = computed(() => {
 		opts.push({ value: props.defaultExpiryHours, label: `${props.defaultExpiryHours} hours` })
 	}
 	return opts.sort((a, b) => a.value - b.value)
-})
-
-const selectedExpiryOption = computed(() => {
-	return expiryOptions.value.find(opt => opt.value === form.expiryHours) ?? expiryOptions.value[0]
 })
 
 const formatExpiry = (hours: number): string => {
@@ -142,5 +132,31 @@ const submit = async () => {
 	display: flex;
 	flex-direction: column;
 	gap: 16px;
+}
+
+.sb-select-label {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	font-size: var(--default-font-size, 15px);
+	color: var(--color-main-text);
+}
+
+.sb-select {
+	width: 100%;
+	height: 44px;
+	padding: 0 12px;
+	border-radius: var(--border-radius-large, 8px);
+	border: 2px solid var(--color-border-maxcontrast);
+	background-color: var(--color-main-background);
+	color: var(--color-main-text);
+	font-size: var(--default-font-size, 15px);
+	cursor: pointer;
+}
+
+.sb-select:focus {
+	border-color: var(--color-primary-element);
+	outline: none;
+	box-shadow: 0 0 0 2px var(--color-primary-element-light);
 }
 </style>
