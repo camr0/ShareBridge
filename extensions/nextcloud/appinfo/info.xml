@@ -10,7 +10,7 @@
     <author>ShareBridge</author>
     <namespace>ShareBridge</namespace>
     <dependencies>
-        <nextcloud min-version="27"/>
+        <nextcloud min-version="31"/>
         <app>files</app>
     </dependencies>
     <settings>

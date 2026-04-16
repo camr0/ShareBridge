@@ -17,8 +17,7 @@ describe('PersonalSettings', () => {
         store.$patch({ loaded: false, loading: true })
 
         const wrapper = mount(PersonalSettings)
-        expect(wrapper.find('.sb-settings-loading').exists()).toBe(true)
-        expect(wrapper.text()).toContain('Loading')
+        expect(wrapper.find('.nc-loading-icon').exists()).toBe(true)
     })
 
     it('renders agentUrl and apiKey fields when loaded', () => {

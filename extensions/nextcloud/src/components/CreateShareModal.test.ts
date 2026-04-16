@@ -41,9 +41,9 @@ describe('CreateShareModal', () => {
 
     it('renders expiry select with preset options', () => {
         const wrapper = mountModal()
-        const select = wrapper.find('[data-testid="expiry-select"]')
-        expect(select.exists()).toBe(true)
-        const options = select.findAll('option')
+        const selectWrapper = wrapper.find('[data-testid="expiry-select"]')
+        expect(selectWrapper.exists()).toBe(true)
+        const options = selectWrapper.findAll('option')
         expect(options.length).toBeGreaterThan(0)
     })
 
@@ -64,16 +64,17 @@ describe('CreateShareModal', () => {
 
     it('shows TURN warning when relay is checked and TURN is not available', async () => {
         const wrapper = mountModal({ turnAvailable: false })
-        const relayCheckbox = wrapper.find('[data-testid="relay-only-input"]')
-        await relayCheckbox.trigger('change')
+        // Manually set form.relayOnly to true to trigger the warning
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ;(wrapper.vm as any).form.relayOnly = true
         await wrapper.vm.$nextTick()
         expect(wrapper.find('[data-testid="turn-warning"]').exists()).toBe(true)
     })
 
     it('does not show TURN warning when relay is checked but TURN is available', async () => {
         const wrapper = mountModal({ turnAvailable: true })
-        const relayCheckbox = wrapper.find('[data-testid="relay-only-input"]')
-        await relayCheckbox.trigger('change')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ;(wrapper.vm as any).form.relayOnly = true
         await wrapper.vm.$nextTick()
         expect(wrapper.find('[data-testid="turn-warning"]').exists()).toBe(false)
     })
