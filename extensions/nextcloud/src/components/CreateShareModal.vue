@@ -27,7 +27,7 @@
 
 			<NcCheckboxRadioSwitch
 				data-testid="relay-only-input"
-				v-model:checked="form.relayOnly"
+				v-model="form.relayOnly"
 			>
 				Relay mode only
 			</NcCheckboxRadioSwitch>

@@ -1,5 +1,4 @@
 import type { DefineComponent } from 'vue'
-import { ref } from 'vue'
 
 export const NcButton: DefineComponent = {
 	template: '<button @click="$emit(\'click\')"><slot /></button>',
@@ -46,16 +45,9 @@ export const NcSettingsSection: DefineComponent = {
 } as unknown as DefineComponent
 
 export const NcCheckboxRadioSwitch: DefineComponent = {
-	props: { checked: { type: Boolean, default: false } },
-	emits: ['update:checked'],
-	setup(props: { checked: boolean }) {
-		const localChecked = ref(props.checked)
-		const toggle = () => {
-			localChecked.value = !localChecked.value
-		}
-		return { localChecked, toggle }
-	},
-	template: '<label class="nc-checkbox"><input type="checkbox" :checked="localChecked" @change="toggle" :data-testid="$attrs[\'data-testid\']" /><slot /></label>',
+	props: { modelValue: { type: Boolean, default: false } },
+	emits: ['update:modelValue'],
+	template: '<label class="nc-checkbox"><input type="checkbox" :checked="modelValue" @change="$emit(\'update:modelValue\', $event.target.checked)" :data-testid="$attrs[\'data-testid\']" /><slot /></label>',
 } as unknown as DefineComponent
 
 export const NcNoteCard: DefineComponent = {

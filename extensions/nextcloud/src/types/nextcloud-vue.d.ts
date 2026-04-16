@@ -46,7 +46,7 @@ declare module '@nextcloud/vue' {
 	}, {}, {}>
 
 	export const NcCheckboxRadioSwitch: DefineComponent<{
-		checked?: boolean
+		modelValue?: boolean
 	}, {}, {}>
 
 	export const NcNoteCard: DefineComponent<{
