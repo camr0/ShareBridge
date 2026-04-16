@@ -100,15 +100,15 @@ onUnmounted(() => { if (copyTimer) clearTimeout(copyTimer) })
 }
 
 .sb-connection-badge--direct {
-	background: color-mix(in srgb, var(--color-success) 15%, transparent);
-	color: var(--color-success);
-	border: 1px solid color-mix(in srgb, var(--color-success) 40%, transparent);
+	background: rgba(70, 186, 97, 0.15);
+	color: #46ba61;
+	border: 1px solid rgba(70, 186, 97, 0.5);
 }
 
 .sb-connection-badge--relay {
-	background: color-mix(in srgb, var(--color-warning) 15%, transparent);
-	color: var(--color-warning-text, var(--color-warning));
-	border: 1px solid color-mix(in srgb, var(--color-warning) 40%, transparent);
+	background: rgba(255, 180, 0, 0.15);
+	color: #ffb400;
+	border: 1px solid rgba(255, 180, 0, 0.5);
 }
 
 .sb-share-meta {
