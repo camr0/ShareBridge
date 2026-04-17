@@ -79,7 +79,12 @@ async function expectAck(stream) {
     const bytes = chunk.subarray ? chunk.subarray() : chunk;
     for (const frame of decoder.push(bytes)) {
       if (frame.kind !== FRAME_TEXT) throw new Error('relay ack not text frame');
-      const msg = JSON.parse(new TextDecoder().decode(frame.payload));
+      let msg;
+      try {
+        msg = JSON.parse(new TextDecoder().decode(frame.payload));
+      } catch {
+        throw new Error('relay sent malformed JSON in auth response');
+      }
       if (msg.type === 'auth_ok') return;
       if (msg.type === 'error') throw new Error(`relay auth rejected: ${msg.message || 'unknown'}`);
       throw new Error(`unexpected relay message: ${msg.type}`);
