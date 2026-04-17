@@ -90,6 +90,8 @@ type relayInfoMsg struct {
     RelayMultiaddr string `json:"relay_multiaddr"`
     AgentPeerID    string `json:"agent_peer_id"`
     JWT            string `json:"jwt"`
+    RelayAllowed   bool   `json:"relay_allowed"`   // if false, relay data transfer blocked (quota exceeded)
+    DCUtRAllowed   bool   `json:"dcutr_allowed"`   // if false, direct connection upgrade disabled
 }
 ```
 
@@ -675,7 +677,7 @@ let sessionPassword = '';
 let pendingNonce = null;
 
 // Connection info received from the signaling server after auth_ok.
-let pendingConnInfo = null; // { relay_multiaddr, agent_peer_id, jwt, conn_id, share_code }
+let pendingConnInfo = null; // { relay_multiaddr, agent_peer_id, jwt, conn_id, share_code, relay_allowed, dcutr_allowed }
 
 function status(msg) {
   document.getElementById('status').textContent = msg;
@@ -758,7 +760,14 @@ async function join() {
           jwt: msg.jwt,
           shareCode: code,
           connId: msg.conn_id,
+          relayAllowed: msg.relay_allowed,
+          dcutrAllowed: msg.dcutr_allowed,
         };
+        // If relay is not allowed and DCUtR is not allowed, we cannot transfer.
+        if (!pendingConnInfo.relayAllowed && !pendingConnInfo.dcutrAllowed) {
+          status('Connection failed: relay quota exceeded and direct connection unavailable.');
+          return;
+        }
         await startTransport();
         break;
 
@@ -999,6 +1008,8 @@ resp := map[string]any{
     "agent_peer_id":   session.AgentPeerID,
     "jwt":             token,
     "conn_id":         connID,
+    "relay_allowed":   !quotaExceeded,
+    "dcutr_allowed":   !relayOnly,
 }
 if err := ws.WriteJSON(resp); err != nil { ... }
 ```
