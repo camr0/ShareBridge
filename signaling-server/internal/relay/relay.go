@@ -12,6 +12,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/metrics"
+	"github.com/libp2p/go-libp2p/core/network"
+	circuitv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -26,11 +28,14 @@ type Config struct {
 
 // Relay wraps a libp2p Host configured as a ShareBridge relay.
 type Relay struct {
-	h      host.Host
-	bwc    *metrics.BandwidthCounter
-	issuer *Issuer
-	jtis   *JTIStore
-	agents *AgentRegistry
+	h          host.Host
+	bwc        *metrics.BandwidthCounter
+	acl        *CircuitACL
+	circuitSvc *circuitv2.Relay
+	issuer     *Issuer
+	jtis       *JTIStore
+	agents     *AgentRegistry
+	handler    Handler
 
 	// OnCircuitClosed is called with quota bytes when a browser peer disconnects.
 	OnCircuitClosed func(apiKeyID, shareCode string, bytesIn, bytesOut int64)
@@ -73,13 +78,38 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 		return nil, fmt.Errorf("new libp2p host: %w", err)
 	}
 
-	return &Relay{
-		h:      h,
-		bwc:    bwc,
-		issuer: NewIssuer(cfg.JWTSecret, cfg.JWTTTL),
-		jtis:   NewJTIStore(cfg.JWTTTL),
-		agents: NewAgentRegistry(),
-	}, nil
+	acl := newCircuitACL(cfg.JWTTTL)
+
+	// Start the circuit relay v2 service. This is what provides E2E Noise encryption:
+	// the relay forwards ciphertext between browser and agent without being able to read it.
+	// DCUtR hole-punching flows through this service automatically.
+	circuitSvc, err := circuitv2.New(h, circuitv2.WithACL(acl))
+	if err != nil {
+		h.Close()
+		return nil, fmt.Errorf("circuit relay v2: %w", err)
+	}
+
+	issuer := NewIssuer(cfg.JWTSecret, cfg.JWTTTL)
+	jtis := NewJTIStore(cfg.JWTTTL)
+	agents := NewAgentRegistry()
+
+	r := &Relay{
+		h:          h,
+		bwc:        bwc,
+		acl:        acl,
+		circuitSvc: circuitSvc,
+		issuer:     issuer,
+		jtis:       jtis,
+		agents:     agents,
+	}
+	r.handler = Handler{
+		Issuer:  issuer,
+		JTIs:    jtis,
+		Agents:  agents,
+		ACL:     acl,
+		AuthTTL: cfg.JWTTTL,
+	}
+	return r, nil
 }
 
 // Host returns the underlying libp2p Host.
@@ -91,9 +121,41 @@ func (r *Relay) Issuer() *Issuer { return r.issuer }
 // Agents returns the agent registry (populated in 13b when agents connect).
 func (r *Relay) Agents() *AgentRegistry { return r.agents }
 
-// Close stops the Host and releases resources.
+// SetCodeResolver wires the share_code → api_key_id lookup after construction.
+func (r *Relay) SetCodeResolver(f func(shareCode string) (apiKeyID string, ok bool)) {
+	r.handler.CodeToAPIKey = f
+}
+
+// Start registers the /sharebridge/relay/1.0.0 auth handler and the bandwidth notifier.
+// Returns the relay's listen multiaddrs.
+func (r *Relay) Start() []multiaddr.Multiaddr {
+	r.h.SetStreamHandler(ProtocolID, r.handler.Handle)
+
+	// When a browser peer disconnects, read their cumulative bandwidth and
+	// report it to the quota accumulator. Browser peer IDs are ephemeral
+	// (new Ed25519 key per page load), so cumulative == per-circuit.
+	r.h.Network().Notify(&network.NotifyBundle{
+		DisconnectedF: func(_ network.Network, conn network.Conn) {
+			peerID := conn.RemotePeer()
+			entry, ok := r.acl.GetEntry(peerID)
+			if !ok {
+				return
+			}
+			stat := r.bwc.GetBandwidthForPeer(peerID)
+			if r.OnCircuitClosed != nil {
+				r.OnCircuitClosed(entry.APIKeyID, entry.ShareCode, stat.TotalIn, stat.TotalOut)
+			}
+			r.acl.Remove(peerID)
+		},
+	})
+
+	return r.h.Addrs()
+}
+
+// Close stops the circuit relay service, the Host, and the JTI prune goroutine.
 func (r *Relay) Close() error {
 	r.jtis.Close()
+	r.circuitSvc.Close()
 	return r.h.Close()
 }
 
