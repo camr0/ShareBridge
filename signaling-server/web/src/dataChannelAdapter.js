@@ -29,7 +29,7 @@ export class LibP2PDataChannel {
     this.readyState = 'open';
     queueMicrotask(() => { if (this.onopen) this.onopen(); });
     try {
-      for await (const chunk of this._stream.source) {
+      for await (const chunk of this._stream) {
         const bytes = chunk.subarray ? chunk.subarray() : chunk;
         inflight += bytes.length;
         if (inflight > MAX_INFLIGHT_BYTES) {
@@ -65,14 +65,14 @@ export class LibP2PDataChannel {
   async send(text) {
     if (this.readyState !== 'open') throw new Error('data channel not open');
     const payload = new TextEncoder().encode(text);
-    await this._stream.sink([writeFrame(FRAME_TEXT, payload)]);
+    await this._stream.send(writeFrame(FRAME_TEXT, payload));
   }
 
   // sendBinary: bytes message (unused by the current browser but kept for
   // parity). Present so the shim is symmetric with the agent-side adapter.
   async sendBinary(bytes) {
     if (this.readyState !== 'open') throw new Error('data channel not open');
-    await this._stream.sink([writeFrame(FRAME_BINARY, bytes)]);
+    await this._stream.send(writeFrame(FRAME_BINARY, bytes));
   }
 
   close() {

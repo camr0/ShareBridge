@@ -41,7 +41,7 @@ export function getLocalPeerId(node) {
 //   3. dial agent via the circuit
 //   4. open /sharebridge/file/1.0.0 on the agent
 //   5. send the open envelope as the first text frame
-//   6. return a LibP2PDataChannel wrapping the stream (readyState='open')
+//   6. return a LibP2PDataChannel wrapping the stream; caller starts read pump
 //
 // Throws on any failure. The caller handles UI feedback.
 export async function connect(node, { relayMultiaddr, agentPeerId, jwt, shareCode, connId }) {
@@ -51,7 +51,7 @@ export async function connect(node, { relayMultiaddr, agentPeerId, jwt, shareCod
   // Step 2: JWT handshake on the relay.
   const authStream = await node.dialProtocol(relayAddr, RELAY_AUTH_PROTOCOL);
   const jwtBytes = new TextEncoder().encode(JSON.stringify({ type: 'jwt', token: jwt }));
-  await authStream.sink([writeFrame(FRAME_TEXT, jwtBytes)]);
+  await authStream.send(writeFrame(FRAME_TEXT, jwtBytes));
   await expectAck(authStream);
   // leave authStream open — closing it would tear the circuit on some relay
   // implementations. Relay will close it on token expiry or session end.
@@ -64,18 +64,15 @@ export async function connect(node, { relayMultiaddr, agentPeerId, jwt, shareCod
 
   // Step 5: open envelope.
   const envelope = JSON.stringify({ type: 'open', share_code: shareCode, conn_id: connId });
-  await fileStream.sink([writeFrame(FRAME_TEXT, new TextEncoder().encode(envelope))]);
+  await fileStream.send(writeFrame(FRAME_TEXT, new TextEncoder().encode(envelope)));
 
-  // Step 6: wrap and return. Caller starts the read pump.
-  const channel = new LibP2PDataChannel(fileStream);
-  // Intentionally no await — the pump runs for the lifetime of the channel.
-  channel.start();
-  return channel;
+  // Step 6: wrap and return. The caller wires handlers, then starts the pump.
+  return new LibP2PDataChannel(fileStream);
 }
 
 async function expectAck(stream) {
   const decoder = new FrameDecoder();
-  for await (const chunk of stream.source) {
+  for await (const chunk of stream) {
     const bytes = chunk.subarray ? chunk.subarray() : chunk;
     for (const frame of decoder.push(bytes)) {
       if (frame.kind !== FRAME_TEXT) throw new Error('relay ack not text frame');

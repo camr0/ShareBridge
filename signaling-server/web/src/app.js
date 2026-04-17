@@ -143,6 +143,7 @@ async function startTransport() {
     status('Connecting to relay...');
     dc = await connect(node, pendingConnInfo);
     setupDataChannel();
+    void dc.start();
   } catch (err) {
     console.error(err);
     status('Transport error: ' + (err.message || err));
