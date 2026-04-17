@@ -54,3 +54,30 @@ func TestValidate_rejectsExpired(t *testing.T) {
 		t.Fatal("expected expiry error")
 	}
 }
+
+func TestJTIStore_firstUseAcceptedSecondRejected(t *testing.T) {
+	store := NewJTIStore(5 * time.Minute)
+	defer store.Close()
+	if !store.ConsumeOnce("jti-A") {
+		t.Fatal("first use should be accepted")
+	}
+	if store.ConsumeOnce("jti-A") {
+		t.Fatal("second use should be rejected")
+	}
+}
+
+func TestJTIStore_expiredEntriesPruned(t *testing.T) {
+	store := &JTIStore{
+		entries: make(map[string]time.Time),
+		ttl:     20 * time.Millisecond,
+		stop:    make(chan struct{}),
+	}
+	store.ConsumeOnce("jti-B")
+	time.Sleep(40 * time.Millisecond)
+	store.prune()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if _, ok := store.entries["jti-B"]; ok {
+		t.Fatal("expected jti-B to be pruned")
+	}
+}

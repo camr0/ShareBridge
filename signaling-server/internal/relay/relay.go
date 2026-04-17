@@ -123,10 +123,3 @@ func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
 	return priv, nil
 }
 
-// Stub placeholders for later tasks
-
-type JTIStore struct{}
-
-func NewJTIStore(time.Duration) *JTIStore { return &JTIStore{} }
-func (s *JTIStore) Close()                 {}
-
