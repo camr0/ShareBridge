@@ -7,7 +7,6 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/multiformats/go-multiaddr v0.16.0
-	github.com/pion/webrtc/v4 v4.2.11
 	github.com/spf13/cobra v1.10.2
 )
 
@@ -68,6 +67,7 @@ require (
 	github.com/pion/stun/v3 v3.1.1 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/pion/turn/v4 v4.1.4 // indirect
+	github.com/pion/webrtc/v4 v4.2.11 // indirect
 	github.com/prometheus/client_golang v1.22.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.64.0 // indirect

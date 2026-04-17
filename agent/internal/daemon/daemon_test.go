@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/webrtc/v4"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"sharebridge/agent/internal/config"
-	"sharebridge/agent/internal/peer"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
+	"sharebridge/agent/internal/transport"
 )
 
 // mockConfigManager implements ConfigManagerInterface for testing.
@@ -104,6 +104,56 @@ func (m *mockStore) IncrementDownloads(code string) (int, error) {
 	return m.downloads[code], nil
 }
 
+func (m *mockStore) GetOrCreatePrivKey() (crypto.PrivKey, error) {
+	// Return a deterministic test key for tests
+	privKey, _, err := crypto.GenerateEd25519Key(nil)
+	if err != nil {
+		return nil, err
+	}
+	return privKey, nil
+}
+
+// mockTransport implements TransportInterface for testing.
+type mockTransport struct {
+	peerID      string
+	onStream    transport.StreamHandler
+	dialRelay   func(ctx context.Context, relayMultiaddr string) error
+	dialRelayed bool
+	mu          sync.Mutex
+}
+
+func newMockTransport() *mockTransport {
+	return &mockTransport{
+		peerID: "12D3KooTestPeerID",
+	}
+}
+
+func (m *mockTransport) DialRelay(ctx context.Context, relayMultiaddr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dialRelay != nil {
+		return m.dialRelay(ctx, relayMultiaddr)
+	}
+	m.dialRelayed = true
+	return nil
+}
+
+func (m *mockTransport) OnStream(h transport.StreamHandler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onStream = h
+}
+
+func (m *mockTransport) PeerID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.peerID
+}
+
+func (m *mockTransport) Close() error {
+	return nil
+}
+
 // mockSignalingClient implements SignalingClientInterface for testing.
 type mockSignalingClient struct {
 	mu            sync.Mutex
@@ -112,7 +162,7 @@ type mockSignalingClient struct {
 	agentID       string
 	connected     bool
 	onMessage     func(signaling.Message)
-	iceServers    []webrtc.ICEServer
+	relayMultiaddr string
 	registerShare func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
 	sendMessages  []map[string]any
 	codeCounter   int // Counter for generating unique codes
@@ -120,10 +170,10 @@ type mockSignalingClient struct {
 
 func newMockSignalingClient(serverURL, apiKey, agentID string) *mockSignalingClient {
 	return &mockSignalingClient{
-		serverURL:  serverURL,
-		apiKey:     apiKey,
-		agentID:    agentID,
-		iceServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.cloudflare.com:3478"}}},
+		serverURL:      serverURL,
+		apiKey:         apiKey,
+		agentID:        agentID,
+		relayMultiaddr: "/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooTest",
 	}
 }
 
@@ -169,10 +219,10 @@ func (m *mockSignalingClient) Send(ctx context.Context, msg any) error {
 	return nil
 }
 
-func (m *mockSignalingClient) GetICEServers() []webrtc.ICEServer {
+func (m *mockSignalingClient) GetRelayMultiaddr() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.iceServers
+	return m.relayMultiaddr
 }
 
 func (m *mockSignalingClient) Listen(ctx context.Context) error {
@@ -226,8 +276,9 @@ func TestNew(t *testing.T) {
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
+	tr := newMockTransport()
 
-	d, err := New(cfgMgr, st)
+	d, err := New(cfgMgr, st, tr)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -252,8 +303,9 @@ func TestNewWithSignaling(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -276,8 +328,9 @@ func TestCreateSession(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -325,8 +378,9 @@ func TestCreateSessionWithInvalidHost(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -348,8 +402,9 @@ func TestRevokeSession(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -391,8 +446,9 @@ func TestRevokeNonexistentSession(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -413,8 +469,9 @@ func TestListSessions(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -460,8 +517,9 @@ func TestPruneExpiredSessions(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -472,7 +530,7 @@ func TestPruneExpiredSessions(t *testing.T) {
 		ShareURL:  "https://opencloud.example.com/s/expired",
 		ExpiresAt: time.Now().Add(-1 * time.Hour), // Expired 1 hour ago
 		CreatedAt: time.Now().Add(-2 * time.Hour),
-		peers:     make(map[string]*peer.Peer),
+		streams:   make(map[string]*transport.StreamAdapter),
 	}
 	d.mu.Lock()
 	d.sessions["expired-code"] = expiredSession
@@ -489,7 +547,7 @@ func TestPruneExpiredSessions(t *testing.T) {
 		ShareURL:  "https://opencloud.example.com/s/active",
 		ExpiresAt: time.Now().Add(24 * time.Hour), // Expires in 24 hours
 		CreatedAt: time.Now(),
-		peers:     make(map[string]*peer.Peer),
+		streams:   make(map[string]*transport.StreamAdapter),
 	}
 	d.mu.Lock()
 	d.sessions["active-code"] = activeSession
@@ -520,53 +578,6 @@ func TestPruneExpiredSessions(t *testing.T) {
 	}
 }
 
-// TestHasTURNServer tests TURN server detection.
-func TestHasTURNServer(t *testing.T) {
-	tests := []struct {
-		name     string
-		servers  []webrtc.ICEServer
-		expected bool
-	}{
-		{
-			name:     "empty servers",
-			servers:  []webrtc.ICEServer{},
-			expected: false,
-		},
-		{
-			name:     "STUN only",
-			servers:  []webrtc.ICEServer{{URLs: []string{"stun:stun.cloudflare.com:3478"}}},
-			expected: false,
-		},
-		{
-			name:     "TURN only",
-			servers:  []webrtc.ICEServer{{URLs: []string{"turn:turn.example.com:3478"}}},
-			expected: true,
-		},
-		{
-			name:     "TURNs only",
-			servers:  []webrtc.ICEServer{{URLs: []string{"turns:turn.example.com:5349"}}},
-			expected: true,
-		},
-		{
-			name: "STUN and TURN",
-			servers: []webrtc.ICEServer{
-				{URLs: []string{"stun:stun.cloudflare.com:3478"}},
-				{URLs: []string{"turn:turn.example.com:3478"}},
-			},
-			expected: true,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			result := hasTURNServer(test.servers)
-			if result != test.expected {
-				t.Errorf("hasTURNServer() = %v, expected %v", result, test.expected)
-			}
-		})
-	}
-}
-
 // TestHandleSignalingMessage tests message dispatch.
 func TestHandleSignalingMessage(t *testing.T) {
 	cfg := &config.Config{
@@ -576,19 +587,17 @@ func TestHandleSignalingMessage(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-	sigClient.iceServers = []webrtc.ICEServer{
-		{URLs: []string{"turn:turn.example.com:3478"}},
-	}
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
 
-	// Test welcome message sets hasTURN
-	d.handleSignalingMessage(signaling.Message{Type: "welcome"})
-	if !d.hasTURN {
-		t.Errorf("hasTURN should be true after welcome with TURN server")
+	// Test welcome message sets signalingConnected
+	d.handleSignalingMessage(signaling.Message{Type: "welcome", RelayMultiaddr: "/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooTest"})
+	if !d.signalingConnected {
+		t.Errorf("signalingConnected should be true after welcome")
 	}
 
 	// Test error message
@@ -606,8 +615,9 @@ func TestOnSessionCallbacks(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -651,7 +661,7 @@ func TestSessionDownloads(t *testing.T) {
 		Code:         "test-code",
 		Downloads:    0,
 		MaxDownloads: 5,
-		peers:        make(map[string]*peer.Peer),
+		streams:      make(map[string]*transport.StreamAdapter),
 	}
 
 	// Increment downloads manually
@@ -691,7 +701,9 @@ func TestLoadSessionsFromStore(t *testing.T) {
 		return preferredCode, true, nil
 	}
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	tr := newMockTransport()
+
+		d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -729,8 +741,9 @@ func TestLoadSessionsFromStoreFiltersExpired(t *testing.T) {
 	})
 
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -770,7 +783,9 @@ func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
 		return preferredCode, true, nil
 	}
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	tr := newMockTransport()
+
+		d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -805,8 +820,9 @@ func TestLoadSessionsFromStore_LegacyMissingShareType(t *testing.T) {
 	})
 
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -841,8 +857,9 @@ func TestSetWebServer(t *testing.T) {
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	tr := newMockTransport()
 
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -852,32 +869,5 @@ func TestSetWebServer(t *testing.T) {
 
 	if d.webServer != ws {
 		t.Errorf("web server not set correctly")
-	}
-}
-
-// TestHasTURN tests HasTURN method.
-func TestHasTURN(t *testing.T) {
-	cfg := &config.Config{
-		SignalingURL: "ws://localhost:8080",
-		APIKey:       "test-api-key",
-	}
-	cfgMgr := &mockConfigManager{cfg: cfg}
-	st := newMockStore()
-	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
-	if err != nil {
-		t.Fatalf("NewWithSignaling() error: %v", err)
-	}
-
-	// Initially false
-	if d.HasTURN() {
-		t.Errorf("HasTURN should be false initially")
-	}
-
-	// Set hasTURN manually
-	d.hasTURN = true
-	if !d.HasTURN() {
-		t.Errorf("HasTURN should be true after setting")
 	}
 }
