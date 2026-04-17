@@ -4,9 +4,9 @@
 
 **Goal:** Replace the agent's WebRTC PeerConnection/DataChannel transport with a go-libp2p stream transport that dials the 13a relay, so file transfer flows over a libp2p stream using the existing binary protocol.
 
-**Architecture:** The agent becomes a go-libp2p `Host` with a stable Ed25519 identity persisted to disk. At startup it dials the relay multiaddr advertised in the signaling server's `welcome` message and registers a stream handler for protocol `/sharebridge/file/1.0.0`. When a browser completes the 13a knock/HMAC flow, the agent sends `auth_ok` to the signaling server (triggering JWT issuance), then waits for the browser's inbound libp2p stream via the relay circuit. The first frame on each stream carries `{share_code, conn_id}`; the agent looks up the session, builds a `DataChannel` adapter over the stream, and hands it to the existing unchanged `transfer.Manager`. The `internal/peer/` package and `github.com/pion/webrtc/v4` dependency are removed entirely.
+**Architecture:** The agent becomes a go-libp2p `Host` with a stable Ed25519 identity persisted to disk. At startup it dials the relay multiaddr advertised in the signaling server's `welcome` message, reserves a circuit relay v2 slot, and registers a stream handler for protocol `/sharebridge/file/1.0.0`. The Host is configured with WebRTC transport for DCUtR direct-path upgrades — when a relay circuit is established, libp2p automatically attempts hole-punching; if successful, the connection upgrades to direct WebRTC without interrupting the transfer. When a browser completes the 13a knock/HMAC flow, the agent sends `auth_ok` to the signaling server (triggering JWT issuance), then waits for the browser's inbound libp2p stream via the relay circuit. The first frame on each stream carries `{share_code, conn_id}`; the agent looks up the session, builds a `DataChannel` adapter over the stream, and hands it to the existing unchanged `transfer.Manager`. The `internal/peer/` package and `github.com/pion/webrtc/v4` dependency are removed entirely.
 
-**Tech Stack:** Go 1.26, `github.com/libp2p/go-libp2p`, libp2p transports: `websocket` (outbound relay connection), `webrtc` (direct path via DCUtR). Noise and yamux come by default.
+**Tech Stack:** Go 1.26, `github.com/libp2p/go-libp2p`, libp2p transports: `websocket` (outbound relay connection), `webrtc` (direct path via DCUtR). Noise and yamux come by default. Circuit relay v2 client (`circuitv2client`) for reservation. DCUtR hole-punching enabled automatically when relay circuit is established.
 
 **Prerequisites:** Slice 13a complete — relay is listening, welcome message carries `relay_multiaddr`, JWT issuance is gated on an `auth_ok` agent message (13a R2/R3).
 
@@ -663,6 +663,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	circuitv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	webrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -691,9 +693,10 @@ type Transport struct {
 	onStream StreamHandler
 }
 
-// New creates a libp2p Host with the given identity. It does not dial the
-// relay — call DialRelay afterwards. The Host listens on no addresses because
-// the agent is outbound-only.
+// New creates a libp2p Host with the given identity and WebRTC transport for
+// DCUtR direct-path upgrades. It does not dial the relay — call DialRelay afterwards.
+// The Host uses NoListenAddrs for traditional transports (tcp/ws) since the agent
+// is outbound-only, but WebRTC is enabled for hole-punching via DCUtR.
 func New(ctx context.Context, opts Options) (*Transport, error) {
 	if opts.PrivKey == nil {
 		return nil, errors.New("transport: PrivKey is required")
@@ -701,7 +704,8 @@ func New(ctx context.Context, opts Options) (*Transport, error) {
 
 	h, err := libp2p.New(
 		libp2p.Identity(opts.PrivKey),
-		libp2p.NoListenAddrs, // agent does not accept inbound direct dials
+		libp2p.NoListenAddrs,           // no tcp/ws listening — agent is outbound via relay
+		libp2p.Transport(webrtc.New()), // WebRTC transport for DCUtR direct-path upgrade
 	)
 	if err != nil {
 		return nil, fmt.Errorf("libp2p.New: %w", err)
@@ -737,8 +741,9 @@ func (t *Transport) handleStream(s network.Stream) {
 	h(StreamInfo{Stream: s, Peer: s.Conn().RemotePeer()})
 }
 
-// DialRelay dials the relay multiaddr and keeps a persistent connection open.
-// relayMultiaddr must include the relay's /p2p/<peer-id> component.
+// DialRelay dials the relay multiaddr, reserves a circuit relay v2 slot, and keeps
+// a persistent connection open. relayMultiaddr must include the relay's /p2p/<peer-id>
+// component. Without reservation, browsers cannot open circuits to this agent.
 func (t *Transport) DialRelay(ctx context.Context, relayMultiaddr string) error {
 	addr, err := multiaddr.NewMultiaddr(relayMultiaddr)
 	if err != nil {
@@ -750,6 +755,10 @@ func (t *Transport) DialRelay(ctx context.Context, relayMultiaddr string) error 
 	}
 	if err := t.host.Connect(ctx, *info); err != nil {
 		return fmt.Errorf("connect to relay: %w", err)
+	}
+	_, err = circuitv2client.Reserve(ctx, t.host, *info)
+	if err != nil {
+		return fmt.Errorf("reserve circuit relay slot: %w", err)
 	}
 	return nil
 }
@@ -769,19 +778,21 @@ func (t *Transport) Close() error { return t.host.Close() }
 Run: `go test ./internal/transport/...`
 Expected: PASS. The two Transport tests plus all earlier frame + adapter tests.
 
-- [ ] **Step 6: Add the relay-dial integration test**
+- [ ] **Step 6: Add the relay-dial test (connection-only, reservation tested in e2e)**
 
 Append to `transport_test.go`:
 
 ```go
-func TestTransport_DialsRelayAndAcceptsCircuitStream(t *testing.T) {
-	// This test exercises DialRelay against a real libp2p host acting as
-	// a plain listener (no circuit) — it validates the dial path.
+func TestTransport_DialRelayConnectsToRelay(t *testing.T) {
+	// This test validates that DialRelay establishes a libp2p connection.
+	// Circuit reservation cannot be tested here because a plain listener host
+	// lacks the circuit relay v2 service. Reservation is verified in Task 10's
+	// end-to-end test against the real 13a relay.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Build a listener host (stands in for the relay — no relay protocol needed
-	// here; we only verify that DialRelay establishes a connection).
+	// Build a listener host (no relay protocol, so Reserve() will fail —
+	// we catch that error and only verify connection succeeded).
 	listenerHost, err := libp2p.New(
 		libp2p.Identity(newTestPrivKey(t)),
 		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
@@ -797,7 +808,6 @@ func TestTransport_DialsRelayAndAcceptsCircuitStream(t *testing.T) {
 	}
 	defer tr.Close()
 
-	// Build a /p2p/... multiaddr for the listener.
 	var ma string
 	for _, a := range listenerHost.Addrs() {
 		ma = a.String() + "/p2p/" + listenerHost.ID().String()
@@ -807,14 +817,24 @@ func TestTransport_DialsRelayAndAcceptsCircuitStream(t *testing.T) {
 		t.Fatal("listener has no addrs")
 	}
 
-	if err := tr.DialRelay(ctx, ma); err != nil {
-		t.Fatalf("DialRelay: %v", err)
+	// DialRelay will fail on Reserve() because listenerHost lacks relay service.
+	// That's expected — we only verify the connection path works.
+	err = tr.DialRelay(ctx, ma)
+	if err == nil {
+		t.Fatal("expected Reserve() error against non-relay host")
 	}
+	// The error should be from Reserve, not from Connect.
+	if !strings.Contains(err.Error(), "reserve") {
+		t.Fatalf("expected reserve error, got: %v", err)
+	}
+	// Connection should still have been established before Reserve failed.
 	if len(tr.Host().Network().ConnsToPeer(listenerHost.ID())) == 0 {
-		t.Fatal("no connection to listener after DialRelay")
+		t.Fatal("no connection established before Reserve failed")
 	}
 }
 ```
+
+Add `"strings"` to the test file imports. Run `go test ./internal/transport/...` — expect PASS.
 
 Add the `"github.com/libp2p/go-libp2p"` import to the test file. Run `go test ./internal/transport/...` — expect PASS.
 
@@ -1434,6 +1454,7 @@ git commit -m "feat(agent): wire libp2p transport + identity in main"
 - [ ] Agent identity key appears at `~/.sharebridge/agent_identity.key` with mode 0600.
 - [ ] Kill and restart agent; peer ID in logs is unchanged.
 - [ ] `grep -R "pion" agent/` returns nothing except possibly go.sum if tidy missed it (then re-run tidy).
+- [ ] `grep -R "webrtc.New" agent/internal/transport/` returns one result — DCUtR is wired.
 - [ ] `go vet ./...` clean.
 - [ ] `go test ./...` clean.
 
@@ -1446,7 +1467,7 @@ git push -u origin slice-13b-agent
 PR description must flag these known limitations:
 
 > - End-to-end browser download is **not** yet possible: 13c still ships the legacy WebRTC browser. E2E coverage in this PR is via the go-libp2p test client in `signaling-server/internal/relay/`.
-> - DCUtR direct-path upgrade is not yet exercised — the agent Host is configured for outbound-only and doesn't register the webrtc transport. A follow-up in 13c wires DCUtR.
+> - DCUtR direct-path upgrade is wired on the agent side (WebRTC transport enabled), but cannot complete until 13c adds WebRTC transport to the browser. Relay-mode transfers work fully; direct-mode will activate automatically once 13c ships.
 > - The first-frame `open` envelope (`share_code`, `conn_id`) is a 13b↔13c contract — the 13c browser plan must match it exactly.
 
 ---
@@ -1459,9 +1480,15 @@ PR description must flag these known limitations:
 - ✅ `signaling/client.go` receives relay multiaddr, no ICE (Task 6).
 - ✅ `transfer/manager.go` unchanged (confirmed — no modification step for it).
 - ✅ DataChannel adapter satisfies the existing interface (Task 4).
+- ✅ Agent reserves circuit relay v2 slot in DialRelay (Task 5) — required for browsers to reach agent via `/p2p-circuit`.
+
+**Circuit reservation + DCUtR verification:**
+- Search for `circuitv2client.Reserve` in `transport.go` — must be present.
+- Search for `webrtc.New()` in `transport.go` — must be present (DCUtR direct-path enabled).
+- End-to-end test in Task 10 proves reservation works by successfully opening a circuit stream.
 
 **Known follow-ups handled elsewhere:**
 - 13b agent-side: `auth_ok` send is implemented (Task 7 Step 4), resolving 13a R2/R3.
-- DCUtR transport is deliberately deferred to 13c (Task 11 PR note) — the agent Host in Task 5 uses `NoListenAddrs`, which means direct mode won't work even if the browser requests it. This is correct for 13b because only the browser (13c) drives the DCUtR handshake.
+- DCUtR WebRTC transport is wired on the agent (Task 5) — direct-mode will activate when 13c adds browser-side WebRTC transport. The hole-punch runs automatically through the relay circuit once both sides have WebRTC available.
 
 **Framing contract:** the open envelope `{"type":"open","share_code","conn_id"}` is not in the spec but is a direct consequence of libp2p streams not carrying session context. Document this in the 13c plan so the browser writes an identical envelope.
