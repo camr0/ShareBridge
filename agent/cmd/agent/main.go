@@ -24,6 +24,7 @@ import (
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/daemon"
+	"sharebridge/agent/internal/identity"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 	"sharebridge/agent/internal/transfer"
@@ -104,13 +105,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get or create libp2p private key
-	privKey, err := st.GetOrCreatePrivKey()
+	priv, err := identity.LoadOrCreate(cfg.RelayIdentityPath)
 	if err != nil {
-		return fmt.Errorf("get private key: %w", err)
+		return fmt.Errorf("load identity: %w", err)
 	}
 
 	// Create transport
-	tr, err := transport.New(context.Background(), transport.Options{PrivKey: privKey})
+	tr, err := transport.New(context.Background(), transport.Options{PrivKey: priv})
 	if err != nil {
 		return fmt.Errorf("create transport: %w", err)
 	}
@@ -362,13 +363,13 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
 	// Get or create libp2p private key
-	privKey, err := st.GetOrCreatePrivKey()
+	priv, err := identity.LoadOrCreate(cfg.RelayIdentityPath)
 	if err != nil {
-		return "", fmt.Errorf("get private key: %w", err)
+		return "", fmt.Errorf("load identity: %w", err)
 	}
 
 	// Create transport
-	tr, err := transport.New(ctx, transport.Options{PrivKey: privKey})
+	tr, err := transport.New(ctx, transport.Options{PrivKey: priv})
 	if err != nil {
 		return "", fmt.Errorf("create transport: %w", err)
 	}
