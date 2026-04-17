@@ -1779,9 +1779,9 @@ import (
 )
 
 type browserMsg struct {
-	Type   string `json:"type"`
-	HMAC   string `json:"hmac,omitempty"`
-	PeerID string `json:"peer_id,omitempty"` // browser's libp2p peer ID
+	Type          string `json:"type"`
+	HMAC          string `json:"hmac,omitempty"`
+	BrowserPeerID string `json:"browser_peer_id,omitempty"` // browser's libp2p peer ID
 }
 
 func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay.Relay) http.HandlerFunc {
@@ -1868,15 +1868,15 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay
 			}
 			switch msg.Type {
 			case "knock":
-				if msg.PeerID != "" {
-					sessionHub.RememberBrowserPeerID(connID, msg.PeerID)
+				if msg.BrowserPeerID != "" {
+					sessionHub.RememberBrowserPeerID(connID, msg.BrowserPeerID)
 				}
 				sessionHub.SendToAgent(ctx, apiKeyID, map[string]any{
 					"type": "knock", "conn_id": connID, "code": sessionCode,
 				})
 			case "join":
-				if msg.PeerID != "" {
-					sessionHub.RememberBrowserPeerID(connID, msg.PeerID)
+				if msg.BrowserPeerID != "" {
+					sessionHub.RememberBrowserPeerID(connID, msg.BrowserPeerID)
 				}
 				sessionHub.SendToAgent(ctx, apiKeyID, map[string]any{
 					"type": "join", "conn_id": connID, "code": sessionCode, "hmac": msg.HMAC,
@@ -1942,7 +1942,7 @@ func TestBrowserWS_knockForwardedToAgent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(BrowserWS(app, h, cfg, rly)))
 	defer server.Close()
 
-	// Connect as browser, send knock with peer_id, assert hub received knock for agent.
+	// Connect as browser, send knock with browser_peer_id, assert hub received knock for agent.
 }
 ```
 
@@ -1959,7 +1959,7 @@ git add signaling-server/internal/hub/hub.go \
         signaling-server/internal/handler/browser_ws.go \
         signaling-server/internal/handler/browser_ws_test.go \
         signaling-server/internal/handler/handler_testhelpers_test.go
-git commit -m "feat(slice-13a): browser_ws drops ICE/SDP, forwards peer_id on knock/join"
+git commit -m "feat(slice-13a): browser_ws drops ICE/SDP, forwards browser_peer_id on knock/join"
 ```
 
 ---
