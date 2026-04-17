@@ -24,6 +24,38 @@ let pendingNonce = null;
 // Connection info received from the signaling server after auth_ok.
 let pendingConnInfo = null; // { relay_multiaddr, agent_peer_id, jwt, conn_id, share_code, relay_allowed, dcutr_allowed }
 
+function debugEnabled() {
+  if (window.SHAREBRIDGE_DEBUG === true) return true;
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('debug') === '1') return true;
+  try {
+    return window.localStorage.getItem('sharebridge:debug') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function debug(...args) {
+  if (debugEnabled()) {
+    console.log('[sharebridge]', ...args);
+  }
+}
+
+function summarizeMessage(msg) {
+  if (!msg || typeof msg !== 'object') return msg;
+  const summary = { ...msg };
+  if ('jwt' in summary) {
+    summary.jwt = '<redacted>';
+  }
+  if ('value' in summary && typeof summary.value === 'string') {
+    summary.value = `<nonce:${summary.value.length}>`;
+  }
+  if ('token' in summary) {
+    summary.token = '<redacted>';
+  }
+  return summary;
+}
+
 function status(msg) {
   document.getElementById('status').textContent = msg;
 }
@@ -40,6 +72,7 @@ async function join() {
   const code = document.getElementById('code').value.trim();
   if (!code) return;
   status('Starting libp2p...');
+  debug('join:start', { code });
 
   relayQuotaExceeded = false;
   quotaPeriodEnd = null;
@@ -47,22 +80,31 @@ async function join() {
   // 1. Start the libp2p node so we have a peer ID before the knock.
   if (!node) {
     node = await createNode();
+    debug('libp2p:node-created');
   }
   const browserPeerId = getLocalPeerId(node);
+  debug('libp2p:peer-id', browserPeerId);
 
   // 2. Open the signaling WebSocket.
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${location.host}/ws/client?session=${code}`);
+  const wsURL = `${protocol}//${location.host}/ws/client?session=${code}`;
+  debug('ws:create', wsURL);
+  ws = new WebSocket(wsURL);
 
   ws.onopen = () => {
+    debug('ws:open');
     status('Connecting...');
     // Send knock with our browser peer id up-front so the server has it
     // available when it later mints the JWT.
-    ws.send(JSON.stringify({ type: 'knock', browser_peer_id: browserPeerId }));
+    const knock = { type: 'knock', browser_peer_id: browserPeerId };
+    debug('ws:send', summarizeMessage(knock));
+    ws.send(JSON.stringify(knock));
   };
 
   ws.onmessage = async (event) => {
+    debug('ws:message:raw', event.data);
     const msg = JSON.parse(event.data);
+    debug('ws:message', summarizeMessage(msg));
     switch (msg.type) {
       case 'quota_status':
         if (msg.relay_quota_exceeded) {
@@ -77,6 +119,7 @@ async function join() {
           showSection('password-section');
           document.getElementById('password-input').focus();
         } else {
+          debug('ws:nonce -> sendJoin');
           await sendJoin(browserPeerId, code);
         }
         break;
@@ -113,16 +156,19 @@ async function join() {
           status('Connection failed: relay quota exceeded and direct connection unavailable.');
           return;
         }
+        debug('ws:relay-info -> startTransport', summarizeMessage(pendingConnInfo));
         await startTransport();
         break;
 
       case 'error':
+        debug('ws:error-message', summarizeMessage(msg));
         status('Error: ' + msg.message);
         break;
     }
   };
 
-  ws.onerror = () => {
+  ws.onerror = (event) => {
+    debug('ws:error-event', event);
     if (relayQuotaExceeded) {
       const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon';
       status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`);
@@ -131,7 +177,8 @@ async function join() {
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    debug('ws:close', { code: event.code, reason: event.reason, wasClean: event.wasClean });
     // Keep libp2p node alive across signaling disconnects so reconnect is fast.
     if (dc) dc.close();
     resetUI();
@@ -141,11 +188,15 @@ async function join() {
 async function startTransport() {
   try {
     status('Connecting to relay...');
+    debug('transport:start', summarizeMessage(pendingConnInfo));
     dc = await connect(node, pendingConnInfo);
+    debug('transport:connected');
     setupDataChannel();
+    debug('transport:pump-start');
     void dc.start();
   } catch (err) {
     console.error(err);
+    debug('transport:error', err);
     status('Transport error: ' + (err.message || err));
   }
 }
@@ -168,16 +219,19 @@ async function computeHMAC(password, nonce) {
 async function sendJoin(browserPeerId, shareCode) {
   if (!pendingNonce) return;
   const hmac = sessionPassword ? await computeHMAC(sessionPassword, pendingNonce) : '';
-  ws.send(JSON.stringify({
+  const joinMsg = {
     type: 'join',
     hmac,
     browser_peer_id: browserPeerId,
-  }));
+  };
+  debug('ws:send', { type: 'join', hmac: hmac ? '<redacted>' : '', browser_peer_id: browserPeerId });
+  ws.send(JSON.stringify(joinMsg));
   pendingNonce = null;
 }
 
 function setupDataChannel() {
   dc.onopen = () => {
+    debug('dc:open');
     status('Connection open');
     hideSection('join-section');
     hideSection('password-section');
@@ -187,11 +241,14 @@ function setupDataChannel() {
 
   dc.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
+      debug('dc:message:binary', { bytes: event.data.byteLength });
       const bytes = new Uint8Array(event.data);
       appendChunk(bytes);
       return;
     }
+    debug('dc:message:text:raw', event.data);
     const msg = JSON.parse(event.data);
+    debug('dc:message:text', summarizeMessage(msg));
     switch (msg.type) {
       case 'file_list':   renderFileList(msg.files); break;
       case 'file_header': startDownload(msg); break;
@@ -201,6 +258,7 @@ function setupDataChannel() {
   };
 
   dc.onclose = () => {
+    debug('dc:close');
     status('Connection closed');
     resetUI();
   };
@@ -273,6 +331,7 @@ function requestFile(name) {
     return;
   }
   const fullPath = [...currentPath, name].join('/');
+  debug('dc:send:file_request', { path: fullPath });
   dc.send(JSON.stringify({ type: 'file_request', path: fullPath }));
 }
 
@@ -441,6 +500,7 @@ function submitPassword() {
 }
 
 function requestFileList(subpath) {
+  debug('dc:send:list_request', { path: subpath });
   dc.send(JSON.stringify({ type: 'list_request', path: subpath }));
 }
 
@@ -539,6 +599,10 @@ function initFromURL() {
     sessionPassword = decodeURIComponent(window.location.hash.slice(1));
     history.replaceState(null, '', window.location.pathname);
   }
+  debug('init', {
+    code: document.getElementById('code').value,
+    debug: debugEnabled(),
+  });
 }
 
 // Expose functions used by inline HTML onclick handlers.
