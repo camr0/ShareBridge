@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,5 +42,42 @@ func TestRegisterStaticRoutes_ServesBundleAsJavaScript(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "window.join") {
 		t.Fatalf("bundle body missing expected script contents")
+	}
+}
+
+func TestEffectiveHTTPArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		port string
+		want []string
+	}{
+		{
+			name: "appends default http flag when absent",
+			args: []string{"server", "serve"},
+			port: "8080",
+			want: []string{"server", "serve", "--http=0.0.0.0:8080"},
+		},
+		{
+			name: "keeps explicit http flag",
+			args: []string{"server", "serve", "--http=127.0.0.1:8080"},
+			port: "8080",
+			want: []string{"server", "serve", "--http=127.0.0.1:8080"},
+		},
+		{
+			name: "keeps split explicit http flag",
+			args: []string{"server", "serve", "--http", "127.0.0.1:8080"},
+			port: "8080",
+			want: []string{"server", "serve", "--http", "127.0.0.1:8080"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := effectiveHTTPArgs(tt.args, tt.port)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("effectiveHTTPArgs() = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }

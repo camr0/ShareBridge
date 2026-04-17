@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pocketbase/pocketbase"
@@ -160,12 +161,24 @@ func main() {
 		return se.Next()
 	})
 
-	// Set the listen address explicitly from config.
-	os.Args = append(os.Args, "--http=0.0.0.0:"+cfg.Port)
+	// Preserve an explicit CLI --http flag; otherwise add the default listen addr.
+	os.Args = effectiveHTTPArgs(os.Args, cfg.Port)
 
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func effectiveHTTPArgs(args []string, port string) []string {
+	for i, arg := range args {
+		if arg == "--http" && i+1 < len(args) {
+			return args
+		}
+		if strings.HasPrefix(arg, "--http=") {
+			return args
+		}
+	}
+	return append(args, "--http=0.0.0.0:"+port)
 }
 
 func registerStaticRoutes(router *pbrouter.Router[*core.RequestEvent], webRoot string) {
