@@ -24,13 +24,22 @@ export class LibP2PDataChannel {
   // start: begin the read pump. Call once from libp2pClient after the first
   // non-handshake frame is expected. Resolves when the stream ends.
   async start() {
+    const MAX_INFLIGHT_BYTES = 32 * 1024 * 1024; // 32 MiB
+    let inflight = 0;
     this.readyState = 'open';
     queueMicrotask(() => { if (this.onopen) this.onopen(); });
     try {
       for await (const chunk of this._stream.source) {
         const bytes = chunk.subarray ? chunk.subarray() : chunk;
+        inflight += bytes.length;
+        if (inflight > MAX_INFLIGHT_BYTES) {
+          console.warn('inflight bytes exceeded cap; aborting');
+          this.close();
+          break;
+        }
         for (const frame of this._decoder.push(bytes)) {
           this._dispatch(frame);
+          inflight -= (5 + frame.payload.length);
         }
       }
     } catch (err) {
