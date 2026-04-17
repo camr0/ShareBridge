@@ -124,15 +124,9 @@ func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
 }
 
 // Stub placeholders for later tasks
-type Issuer struct{}
-
-func NewIssuer([]byte, time.Duration) *Issuer { return &Issuer{} }
 
 type JTIStore struct{}
 
 func NewJTIStore(time.Duration) *JTIStore { return &JTIStore{} }
 func (s *JTIStore) Close()                 {}
 
-type AgentRegistry struct{}
-
-func NewAgentRegistry() *AgentRegistry { return &AgentRegistry{} }
