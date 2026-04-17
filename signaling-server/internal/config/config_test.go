@@ -24,6 +24,14 @@ func TestLoad_jwtSecretFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoad_debugWSFromEnv(t *testing.T) {
+	t.Setenv("DEBUG_WS", "true")
+	cfg := Load()
+	if !cfg.DebugWS {
+		t.Fatal("DebugWS should be true when DEBUG_WS=true")
+	}
+}
+
 func TestLoad_smtpAbsentByDefault(t *testing.T) {
 	t.Setenv("SMTP_HOST", "")
 	cfg := Load()

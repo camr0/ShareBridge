@@ -9,6 +9,7 @@ import (
 type Config struct {
 	Port    string
 	DataDir string
+	DebugWS bool
 
 	// Relay (libp2p Host)
 	RelayListenAddr     string        // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
@@ -33,6 +34,7 @@ func Load() *Config {
 	return &Config{
 		Port:                getEnv("PORT", "8080"),
 		DataDir:             getEnv("DATA_DIR", "./pb_data"),
+		DebugWS:             getEnvBool("DEBUG_WS", false),
 		RelayListenAddr:     getEnv("RELAY_LISTEN_ADDR", "/ip4/127.0.0.1/tcp/9001/ws"),
 		RelayAnnounceAddr:   getEnv("RELAY_ANNOUNCE_ADDR", ""),
 		RelayPrivateKeyPath: getEnv("RELAY_PRIVATE_KEY_PATH", ""),
@@ -70,6 +72,15 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func getEnvBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def
