@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,7 +89,7 @@ func createTestAPIKeyForUser(app core.App, userID string, secret string) (*core.
 	return record, nil
 }
 
-func createTestSessionWithAPIKey(app core.App, apiKeyID, agentID, code string) (*core.Record, error) {
+func createTestSessionWithAPIKey(app core.App, apiKeyID, agentID, code string, relayOnly bool) (*core.Record, error) {
 	sessionsCol, err := app.FindCollectionByNameOrId("sessions")
 	if err != nil {
 		return nil, err
@@ -98,6 +99,7 @@ func createTestSessionWithAPIKey(app core.App, apiKeyID, agentID, code string) (
 	record.Set("code", code)
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", agentID)
+	record.Set("relay_only", relayOnly)
 
 	if err := app.Save(record); err != nil {
 		return nil, err
@@ -116,7 +118,7 @@ func TestCheckRelayQuota_Exceeded(t *testing.T) {
 	apiKey, err := createTestAPIKeyForUser(app, user.Id, "testsecret")
 	require.NoError(t, err)
 
-	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "test-agent", "EXCEEDED01")
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "test-agent", "EXCEEDED01", false)
 	require.NoError(t, err)
 
 	// Get the user record and check quota
@@ -139,7 +141,7 @@ func TestCheckRelayQuota_NotExceeded(t *testing.T) {
 	apiKey, err := createTestAPIKeyForUser(app, user.Id, "testsecret2")
 	require.NoError(t, err)
 
-	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "test-agent-2", "NOTEXCEED01")
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "test-agent-2", "NOTEXCEED01", false)
 	require.NoError(t, err)
 
 	// Get the user record and check quota
@@ -151,30 +153,36 @@ func TestCheckRelayQuota_NotExceeded(t *testing.T) {
 	assert.True(t, periodEnd.After(time.Now()), "Period end should be in the future")
 }
 
-func TestBrowserWS_QuotaExceeded_SendsSTUNOnly(t *testing.T) {
+func TestBrowserWS_RelayOnly_QuotaExceeded_Rejected(t *testing.T) {
 	app, cleanup := setupBrowserTestApp(t)
 	defer cleanup()
 
 	// Create test user with exceeded quota
-	user, err := createTestAccountWithQuota(app, "quotauser@example.com", 5.0, 6.0)
+	user, err := createTestAccountWithQuota(app, "relayonly@example.com", 5.0, 6.0)
 	require.NoError(t, err)
 
-	apiKey, err := createTestAPIKeyForUser(app, user.Id, "quotasecret")
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "relayonlysecret")
 	require.NoError(t, err)
 
-	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "quota-agent", "QUOTA001")
+	// Create relay_only session
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "relay-agent", "RELAYONLY", true)
 	require.NoError(t, err)
 
 	h := hub.New()
-	cfg := config.Load()
+	rly := newTestRelay(t)
+	cfg := &config.Config{
+		RelayAnnounceAddr: "/ip4/127.0.0.1/tcp/9001/ws",
+		JWTSecret:         []byte("test-secret-do-not-use-in-prod-abcd1234"),
+		JWTTTL:            time.Minute,
+	}
 
 	// First connect an agent to the hub
-	fullKey := apiKey.Id + ".quotasecret"
+	fullKey := apiKey.Id + ".relayonlysecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, cfg)
+	agentHandler := AgentWS(app, h, cfg, rly)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
-	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg, rly)))
 
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -187,7 +195,7 @@ func TestBrowserWS_QuotaExceeded_SendsSTUNOnly(t *testing.T) {
 	defer agentConn.CloseNow()
 
 	// Send hello from agent
-	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","version":"1.0","agent_id":"quota-agent"}`))
+	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","version":"1.0","agent_id":"relay-agent"}`))
 	require.NoError(t, err)
 
 	// Read welcome
@@ -195,54 +203,57 @@ func TestBrowserWS_QuotaExceeded_SendsSTUNOnly(t *testing.T) {
 	require.NoError(t, err)
 
 	// Register the share code
-	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://test.com","code":"QUOTA001"}`))
+	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://test.com","code":"RELAYONLY"}`))
 	require.NoError(t, err)
 	_, data, err := agentConn.Read(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), `"type":"share_registered"`)
 
-	// Now connect browser
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=QUOTA001", nil)
+	// Now connect browser - should be rejected because relay_only + quota exceeded
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=RELAYONLY", nil)
 	require.NoError(t, err)
 	defer conn.CloseNow()
 
-	// First message should be ice_config
+	// Should receive error message about quota exceeded
 	_, data, err = conn.Read(ctx)
 	require.NoError(t, err)
 
-	// Should receive ice_config with only STUN servers (no TURN)
-	assert.Contains(t, string(data), `"type":"ice_config"`)
-	assert.Contains(t, string(data), `"ice_servers"`)
-	assert.Contains(t, string(data), `"relay_quota_exceeded"`)
+	var resp map[string]string
+	err = json.Unmarshal(data, &resp)
+	require.NoError(t, err)
+	assert.Equal(t, "error", resp["type"])
+	assert.Contains(t, resp["message"], "relay quota exceeded")
 }
 
-func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
+func TestBrowserWS_KnockForwardedToAgent(t *testing.T) {
 	app, cleanup := setupBrowserTestApp(t)
 	defer cleanup()
 
 	// Create test user with available quota
-	user, err := createTestAccountWithQuota(app, "normaluser@example.com", 100.0, 5.0)
+	user, err := createTestAccountWithQuota(app, "knock@example.com", 100.0, 5.0)
 	require.NoError(t, err)
 
-	apiKey, err := createTestAPIKeyForUser(app, user.Id, "normalsecret")
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "knocksecret")
 	require.NoError(t, err)
 
-	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "normal-agent", "NORMAL001")
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "knock-agent", "KNOCK001", false)
 	require.NoError(t, err)
 
 	h := hub.New()
-	cfg := config.Load()
-	// Enable TURN for this test
-	cfg.TurnSecret = "test-turn-secret-for-testing-only"
-	cfg.TurnHost = "turn.example.com"
+	rly := newTestRelay(t)
+	cfg := &config.Config{
+		RelayAnnounceAddr: "/ip4/127.0.0.1/tcp/9001/ws",
+		JWTSecret:         []byte("test-secret-do-not-use-in-prod-abcd1234"),
+		JWTTTL:            time.Minute,
+	}
 
 	// First connect an agent to the hub
-	fullKey := apiKey.Id + ".normalsecret"
+	fullKey := apiKey.Id + ".knocksecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, cfg)
+	agentHandler := AgentWS(app, h, cfg, rly)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
-	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg, rly)))
 
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -255,7 +266,7 @@ func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
 	defer agentConn.CloseNow()
 
 	// Send hello from agent
-	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","version":"1.0","agent_id":"normal-agent"}`))
+	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","version":"1.0","agent_id":"knock-agent"}`))
 	require.NoError(t, err)
 
 	// Read welcome
@@ -263,26 +274,125 @@ func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
 	require.NoError(t, err)
 
 	// Register the share code
-	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://test.com","code":"NORMAL001"}`))
+	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://test.com","code":"KNOCK001"}`))
 	require.NoError(t, err)
 	_, data, err := agentConn.Read(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), `"type":"share_registered"`)
 
 	// Now connect browser
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=NORMAL001", nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=KNOCK001", nil)
 	require.NoError(t, err)
 	defer conn.CloseNow()
 
-	// First message should be ice_config
-	_, data, err = conn.Read(ctx)
+	// Send knock with browser_peer_id
+	browserPeerID := "12D3KooWTestBrowserPeerID"
+	knockMsg := map[string]string{"type": "knock", "browser_peer_id": browserPeerID}
+	knockJSON, _ := json.Marshal(knockMsg)
+	err = conn.Write(ctx, websocket.MessageText, knockJSON)
 	require.NoError(t, err)
 
-	// Should receive ice_config with TURN servers
-	assert.Contains(t, string(data), `"type":"ice_config"`)
-	assert.Contains(t, string(data), `"ice_servers"`)
-	// Should NOT have relay_quota_exceeded
-	assert.NotContains(t, string(data), `"relay_quota_exceeded"`)
-	// Should have TURN credentials (indicated by username field in ice_servers)
-	assert.Contains(t, string(data), `"username"`)
+	// Read from agent - should receive the knock with conn_id
+	_, data, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	var knockReceived map[string]any
+	err = json.Unmarshal(data, &knockReceived)
+	require.NoError(t, err)
+	assert.Equal(t, "knock", knockReceived["type"])
+	assert.Equal(t, "KNOCK001", knockReceived["code"])
+	assert.NotEmpty(t, knockReceived["conn_id"])
+
+	// Verify browser_peer_id was stored in hub
+	connID := knockReceived["conn_id"].(string)
+	storedPeerID, ok := h.GetBrowserPeerID(connID)
+	assert.True(t, ok)
+	assert.Equal(t, browserPeerID, storedPeerID)
+}
+
+func TestBrowserWS_JoinForwardedToAgent(t *testing.T) {
+	app, cleanup := setupBrowserTestApp(t)
+	defer cleanup()
+
+	// Create test user with available quota
+	user, err := createTestAccountWithQuota(app, "join@example.com", 100.0, 5.0)
+	require.NoError(t, err)
+
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "joinsecret")
+	require.NoError(t, err)
+
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "join-agent", "JOIN001", false)
+	require.NoError(t, err)
+
+	h := hub.New()
+	rly := newTestRelay(t)
+	cfg := &config.Config{
+		RelayAnnounceAddr: "/ip4/127.0.0.1/tcp/9001/ws",
+		JWTSecret:         []byte("test-secret-do-not-use-in-prod-abcd1234"),
+		JWTTTL:            time.Minute,
+	}
+
+	// First connect an agent to the hub
+	fullKey := apiKey.Id + ".joinsecret"
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, cfg, rly)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg, rly)))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	// Connect agent first
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer agentConn.CloseNow()
+
+	// Send hello from agent
+	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","version":"1.0","agent_id":"join-agent"}`))
+	require.NoError(t, err)
+
+	// Read welcome
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	// Register the share code
+	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://test.com","code":"JOIN001"}`))
+	require.NoError(t, err)
+	_, data, err := agentConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"type":"share_registered"`)
+
+	// Now connect browser
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=JOIN001", nil)
+	require.NoError(t, err)
+	defer conn.CloseNow()
+
+	// Send join with browser_peer_id and hmac
+	browserPeerID := "12D3KooWTestBrowserJoinPeerID"
+	hmac := "test-hmac-value"
+	joinMsg := map[string]string{"type": "join", "browser_peer_id": browserPeerID, "hmac": hmac}
+	joinJSON, _ := json.Marshal(joinMsg)
+	err = conn.Write(ctx, websocket.MessageText, joinJSON)
+	require.NoError(t, err)
+
+	// Read from agent - should receive the join with conn_id and hmac
+	_, data, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	var joinReceived map[string]any
+	err = json.Unmarshal(data, &joinReceived)
+	require.NoError(t, err)
+	assert.Equal(t, "join", joinReceived["type"])
+	assert.Equal(t, "JOIN001", joinReceived["code"])
+	assert.NotEmpty(t, joinReceived["conn_id"])
+	assert.Equal(t, hmac, joinReceived["hmac"])
+
+	// Verify browser_peer_id was stored in hub
+	connID := joinReceived["conn_id"].(string)
+	storedPeerID, ok := h.GetBrowserPeerID(connID)
+	assert.True(t, ok)
+	assert.Equal(t, browserPeerID, storedPeerID)
 }

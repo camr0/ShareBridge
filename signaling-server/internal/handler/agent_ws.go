@@ -10,7 +10,6 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -20,23 +19,22 @@ import (
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/middleware"
-	"sharebridge/server/internal/turn"
+	"sharebridge/server/internal/relay"
 )
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type        string          `json:"type"`
-	AgentID     string          `json:"agent_id,omitempty"`
-	Code        string          `json:"code,omitempty"`
-	ShareURL    string          `json:"share_url,omitempty"` // received for protocol compat, not stored
-	ExpiresAt   *time.Time      `json:"expires_at,omitempty"`
-	SessionID   string          `json:"session_id,omitempty"`
-	SDP         string          `json:"sdp,omitempty"`
-	Candidate   json.RawMessage `json:"candidate,omitempty"`
-	ConnID      string          `json:"conn_id,omitempty"`
-	Value       string          `json:"value,omitempty"`
-	HasPassword bool            `json:"has_password,omitempty"`
-	RelayOnly   bool            `json:"relay_only,omitempty"`
+	Type        string     `json:"type"`
+	AgentID     string     `json:"agent_id,omitempty"`
+	Code        string     `json:"code,omitempty"`
+	ShareURL    string     `json:"share_url,omitempty"` // received for protocol compat, not stored
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	SessionID   string     `json:"session_id,omitempty"`
+	ConnID      string     `json:"conn_id,omitempty"`
+	Value       string     `json:"value,omitempty"`
+	HasPassword bool       `json:"has_password,omitempty"`
+	RelayOnly   bool       `json:"relay_only,omitempty"`
+	// SDP and Candidate removed — libp2p handles connection establishment.
 }
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
@@ -46,7 +44,7 @@ var errCodeAlreadyInUse = errors.New("code already in use")
 
 // AgentWS handles WebSocket connections from agents.
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
-func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
+func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, rly *relay.Relay) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
 		apiKeyID := middleware.GetAPIKeyID(r.Context())
@@ -67,24 +65,6 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 		ctx := r.Context()
 		var agentID string
 
-		// Cached quota state - refreshed at most once per minute to avoid
-		// a DB lookup on every ICE candidate while staying current after quota resets.
-		var quotaExceeded bool
-		var quotaCheckedAt time.Time
-
-		refreshQuota := func() {
-			if time.Since(quotaCheckedAt) < time.Minute {
-				return
-			}
-			accountRecord, err := app.FindRecordById("users", accountID)
-			if err != nil {
-				log.Printf("agent_ws: quota refresh for account %s: %v", accountID, err)
-				return
-			}
-			quotaExceeded, _ = checkRelayQuota(accountRecord)
-			quotaCheckedAt = time.Now()
-		}
-
 		// Main message loop
 		for {
 			_, data, err := conn.Read(ctx)
@@ -103,7 +83,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 
 			switch msg.Type {
 			case "hello":
-				handleHello(ctx, conn, h, apiKeyID, accountID, msg.AgentID, cfg)
+				handleHello(ctx, conn, h, apiKeyID, accountID, msg.AgentID, cfg, rly)
 				agentID = msg.AgentID
 
 			case "register_share":
@@ -116,29 +96,60 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 				}
 				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg)
 
-			case "offer":
+			case "auth_ok":
+				// Agent has verified the browser's HMAC (or there was no password —
+				// agent sends auth_ok unconditionally for password-free shares too).
+				// Issue a JWT and forward relay_info to the browser.
 				if agentID == "" {
 					continue
 				}
-				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
-					"type": "offer",
-					"sdp":  msg.SDP,
-				})
+				peerID, ok := h.GetBrowserPeerID(msg.ConnID)
+				if !ok {
+					log.Printf("agent_ws: auth_ok for unknown connID %s", msg.ConnID)
+					continue
+				}
 
-			case "ice_candidate":
-				if agentID == "" {
+				// Look up relay_only + quota for this session.
+				records, _ := app.FindRecordsByFilter("sessions", "code = {:code}", "", 1, 0, map[string]any{"code": msg.Code})
+				relayOnly := false
+				if len(records) > 0 {
+					relayOnly = records[0].GetBool("relay_only")
+				}
+				accountRecord, err := app.FindRecordById("users", accountID)
+				if err != nil {
+					log.Printf("agent_ws: auth_ok lookup account %s: %v", accountID, err)
 					continue
 				}
-				if cfg.HasTurn() {
-					refreshQuota()
-				}
-				if quotaExceeded && isRelayCandidate(msg.Candidate) {
-					log.Printf("agent_ws: dropping relay candidate for over-quota account %s", accountID)
+				quotaExceeded, _ := checkRelayQuota(accountRecord)
+				if relayOnly && quotaExceeded {
+					h.CloseBrowserConnWithError(ctx, msg.ConnID, "file host's relay quota exceeded")
 					continue
 				}
-				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
-					"type":      "ice_candidate",
-					"candidate": msg.Candidate,
+
+				// Look up agent peer ID from the relay registry.
+				agentPeerID, ok := rly.Agents().Lookup(apiKeyID)
+				if !ok {
+					log.Printf("agent_ws: auth_ok but agent %s not registered with relay", apiKeyID)
+					continue
+				}
+
+				tok, err := rly.Issuer().Issue(relay.Claims{
+					ShareCode:     msg.Code,
+					BrowserPeerID: peerID,
+					RelayAllowed:  !quotaExceeded,
+					DCUtRAllowed:  !relayOnly,
+				})
+				if err != nil {
+					log.Printf("agent_ws: issue JWT: %v", err)
+					continue
+				}
+				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+					"type":            "relay_info",
+					"relay_multiaddr": cfg.RelayAnnounceAddr + "/p2p/" + rly.Host().ID().String(),
+					"agent_peer_id":   agentPeerID.String(),
+					"jwt":             tok,
+					"relay_allowed":   !quotaExceeded,
+					"dcutr_allowed":   !relayOnly,
 				})
 
 			case "nonce":
@@ -178,7 +189,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 }
 
 // handleHello processes the hello message and sends welcome response
-func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID string, accountID string, agentID string, cfg *config.Config) {
+func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID string, accountID string, agentID string, cfg *config.Config, rly *relay.Relay) {
 	if agentID == "" {
 		hub.SendDirect(ctx, conn, map[string]string{
 			"type":    "error",
@@ -191,38 +202,11 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
 	log.Printf("agent hello received: api_key_id=%s agent_id=%s", apiKeyID, agentID)
 
-	// Build ICE config for agent - always include TURN credentials.
-	// Quota enforcement happens in the ice_candidate forwarding path instead,
-	// where relay candidates are stripped when the account is over quota.
-	var turnCreds *turn.Credentials
-	if cfg.HasTurn() {
-		turnExpiry := time.Now().Add(24 * time.Hour)
-		creds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
-		turnCreds = &creds
-	}
-
-	iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-		STUNURL:     cfg.STUNURL,
-		TurnURL:     cfg.TurnURL(),
-		Credentials: turnCreds,
-	})
-
 	hub.SendDirect(ctx, conn, map[string]any{
-		"type":        "welcome",
-		"ice_servers": iceServers,
+		"type":            "welcome",
+		"relay_multiaddr": cfg.RelayAnnounceAddr + "/p2p/" + rly.Host().ID().String(),
+		"stun_servers":    []string{"stun:stun.cloudflare.com:3478"},
 	})
-}
-
-// isRelayCandidate reports whether a raw ICE candidate JSON is a TURN relay candidate.
-// The candidate field is a webrtc.ICECandidateInit object with a "candidate" string.
-func isRelayCandidate(raw json.RawMessage) bool {
-	var init struct {
-		Candidate string `json:"candidate"`
-	}
-	if err := json.Unmarshal(raw, &init); err != nil {
-		return false
-	}
-	return strings.Contains(init.Candidate, " typ relay")
 }
 
 // handleRegisterShare processes share registration (new or reconnect)

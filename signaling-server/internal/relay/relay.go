@@ -126,6 +126,11 @@ func (r *Relay) SetCodeResolver(f func(shareCode string) (apiKeyID string, ok bo
 	r.handler.CodeToAPIKey = f
 }
 
+// SetCircuitClosedHook sets the byte-count callback fired at browser disconnect.
+func (r *Relay) SetCircuitClosedHook(f func(apiKeyID, shareCode string, bytesIn, bytesOut int64)) {
+	r.OnCircuitClosed = f
+}
+
 // Start registers the /sharebridge/relay/1.0.0 auth handler and the bandwidth notifier.
 // Returns the relay's listen multiaddrs.
 func (r *Relay) Start() []multiaddr.Multiaddr {

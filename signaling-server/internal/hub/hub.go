@@ -22,6 +22,7 @@ type Hub struct {
 	pairs        map[string]*pair           // sessionID → pair
 	connBrowsers map[string]*websocket.Conn // connID → browser conn
 	connFails    map[string]int             // connID → auth failure count
+	connPeerIDs  map[string]string          // connID → browser libp2p peer ID
 }
 
 func New() *Hub {
@@ -31,6 +32,7 @@ func New() *Hub {
 		pairs:        make(map[string]*pair),
 		connBrowsers: make(map[string]*websocket.Conn),
 		connFails:    make(map[string]int),
+		connPeerIDs:  make(map[string]string),
 	}
 }
 
@@ -190,6 +192,23 @@ func (h *Hub) UnregisterBrowserConn(connID string) {
 	defer h.mu.Unlock()
 	delete(h.connBrowsers, connID)
 	delete(h.connFails, connID)
+	delete(h.connPeerIDs, connID)
+}
+
+// RememberBrowserPeerID stores the browser's libp2p peer ID for connID.
+// Called by browser_ws when the browser sends its peer ID with knock or join.
+func (h *Hub) RememberBrowserPeerID(connID, peerID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.connPeerIDs[connID] = peerID
+}
+
+// GetBrowserPeerID retrieves the stored peer ID for connID.
+func (h *Hub) GetBrowserPeerID(connID string) (string, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	peerID, ok := h.connPeerIDs[connID]
+	return peerID, ok
 }
 
 // ForwardToBrowserByConnID sends msg to the browser identified by connID.

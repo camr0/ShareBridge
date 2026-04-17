@@ -12,208 +12,122 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/hub"
-	"sharebridge/server/internal/turn"
+	"sharebridge/server/internal/relay"
 )
 
 type browserMsg struct {
-	Type      string          `json:"type"`
-	SDP       string          `json:"sdp,omitempty"`
-	Candidate json.RawMessage `json:"candidate,omitempty"`
-	HMAC      string          `json:"hmac,omitempty"`
+	Type          string `json:"type"`
+	HMAC          string `json:"hmac,omitempty"`
+	BrowserPeerID string `json:"browser_peer_id,omitempty"` // browser's libp2p peer ID
 }
 
-func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.HandlerFunc {
-	return func(responseWriter http.ResponseWriter, request *http.Request) {
-		sessionCode := request.URL.Query().Get("session")
-
-		records, err := app.FindRecordsByFilter(
-			"sessions",
-			"code = {:code}",
-			"",
-			1,
-			0,
-			map[string]any{"code": sessionCode},
-		)
-		if err != nil {
-			log.Printf("browser_ws: db error looking up session: %v", err)
-			http.Error(responseWriter, `{"error":"database error"}`, http.StatusInternalServerError)
-			return
-		}
-		if len(records) == 0 {
-			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
+func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay.Relay) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionCode := r.URL.Query().Get("session")
+		records, err := app.FindRecordsByFilter("sessions", "code = {:code}", "", 1, 0, map[string]any{"code": sessionCode})
+		if err != nil || len(records) == 0 {
+			http.Error(w, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
 		sessionRecord := records[0]
-
 		expiresAt := sessionRecord.GetDateTime("expires_at")
 		if !expiresAt.IsZero() && time.Now().After(expiresAt.Time()) {
-			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
+			http.Error(w, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
 
-		browserConn, err := websocket.Accept(responseWriter, request, nil)
+		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			log.Printf("browser_ws accept: %v", err)
 			return
 		}
-		defer browserConn.CloseNow()
-
-		requestCtx := request.Context()
+		defer conn.CloseNow()
+		ctx := r.Context()
 
 		_, agentConnected := sessionHub.GetAgentConn(sessionCode)
 		if !agentConnected {
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
-			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
+			conn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
-
-		if err := sessionHub.PairSession(sessionCode, browserConn); err != nil {
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
-			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
+		if err := sessionHub.PairSession(sessionCode, conn); err != nil {
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "agent not connected"})
+			conn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
 		defer sessionHub.UnpairSession(sessionCode)
 
 		connID := generateConnID()
-		sessionHub.RegisterBrowserConn(connID, browserConn)
+		sessionHub.RegisterBrowserConn(connID, conn)
 		defer sessionHub.UnregisterBrowserConn(connID)
 
-		log.Printf("browser connected to session %s (conn %s)", sessionCode, connID)
-
-		// Look up the API key to get the account for quota checking
 		apiKeyID := sessionRecord.GetString("api_key_id")
 		apiKeyRecord, err := app.FindRecordById("api_keys", apiKeyID)
 		if err != nil {
-			log.Printf("browser_ws: error looking up api_key %s: %v", apiKeyID, err)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
-			browserConn.Close(websocket.StatusInternalError, "internal error")
+			log.Printf("browser_ws: lookup api_key %s: %v", apiKeyID, err)
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "internal error"})
 			return
 		}
-
 		accountID := apiKeyRecord.GetString("account_id")
-		if accountID == "" {
-			log.Printf("browser_ws: api_key %s has empty account_id", apiKeyID)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
-			browserConn.Close(websocket.StatusInternalError, "internal error")
-			return
-		}
-
-		// Look up the account for quota checking
 		accountRecord, err := app.FindRecordById("users", accountID)
 		if err != nil {
-			log.Printf("browser_ws: error looking up account %s: %v", accountID, err)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
-			browserConn.Close(websocket.StatusInternalError, "internal error")
+			log.Printf("browser_ws: lookup account %s: %v", accountID, err)
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "internal error"})
 			return
 		}
 
-		// Check quota
-		quotaExceeded, periodEnd := checkRelayQuota(accountRecord)
-
-		// Check relay_only - if session requires relay and quota exceeded, reject immediately
+		// Relay-only + quota exceeded: reject immediately.
+		// JWT issuance (and the non-relay_only quota check) happens in agent_ws on auth_ok.
 		relayOnly := sessionRecord.GetBool("relay_only")
+		quotaExceeded, _ := checkRelayQuota(accountRecord)
 		if relayOnly && quotaExceeded {
-			log.Printf("browser_ws: relay_only session %s with quota exceeded, rejecting", sessionCode)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{
+			hub.SendDirect(ctx, conn, map[string]string{
 				"type":    "error",
-				"message": "file host's relay quota exceeded - this share requires TURN relay which is unavailable",
+				"message": "file host's relay quota exceeded - this share requires relay which is unavailable",
 			})
-			browserConn.Close(websocket.StatusNormalClosure, "relay quota exceeded")
+			conn.Close(websocket.StatusNormalClosure, "relay quota exceeded")
 			return
 		}
 
-		// Send ICE config - only include TURN if quota not exceeded
-		// Use account-scoped TURN username to bound Prometheus label cardinality.
-		var turnCreds *turn.Credentials
-		if cfg.HasTurn() && !quotaExceeded {
-			turnExpiry := time.Now().Add(24 * time.Hour)
-			generatedCreds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
-			turnCreds = &generatedCreds
-		}
-		iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-			STUNURL:     cfg.STUNURL,
-			TurnURL:     cfg.TurnURL(),
-			Credentials: turnCreds,
-		})
+		log.Printf("browser connected to session %s (conn %s)", sessionCode, connID)
 
-		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s TURN=%s", sessionCode, cfg.STUNURL, cfg.TurnURL())
-
-		if quotaExceeded {
-			msg := map[string]any{
-				"type":                 "ice_config",
-				"ice_servers":          iceServers,
-				"relay_quota_exceeded": true,
-				"quota_period_end":     periodEnd.Format(time.RFC3339),
-			}
-			log.Printf("browser_ws: sending ice_config (quota exceeded): %+v", msg)
-			hub.SendDirect(requestCtx, browserConn, msg)
-		} else {
-			msg := map[string]any{
-				"type":        "ice_config",
-				"ice_servers": iceServers,
-			}
-			log.Printf("browser_ws: sending ice_config: %+v", msg)
-			hub.SendDirect(requestCtx, browserConn, msg)
-		}
-
+		// Main message loop.
+		// JWT is NOT issued here — the server does not know whether a share has
+		// a password (that knowledge lives on the agent only). JWT issuance happens
+		// in agent_ws when the agent sends auth_ok.
 		for {
-			_, data, err := browserConn.Read(requestCtx)
+			_, data, err := conn.Read(ctx)
 			if err != nil {
 				log.Printf("browser disconnected from session %s (conn %s)", sessionCode, connID)
 				return
 			}
-
 			var msg browserMsg
 			if err := json.Unmarshal(data, &msg); err != nil {
 				continue
 			}
-
 			switch msg.Type {
 			case "knock":
-				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
-					"type":    "knock",
-					"conn_id": connID,
-					"code":    sessionCode,
+				if msg.BrowserPeerID != "" {
+					sessionHub.RememberBrowserPeerID(connID, msg.BrowserPeerID)
+				}
+				sessionHub.SendToAgent(ctx, apiKeyID, map[string]any{
+					"type": "knock", "conn_id": connID, "code": sessionCode,
 				})
 
 			case "join":
-				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
-					"type":    "join",
-					"conn_id": connID,
-					"code":    sessionCode,
-					"hmac":    msg.HMAC,
-				})
-
-			case "answer":
-				sessionHub.ForwardToAgent(requestCtx, sessionCode, map[string]any{
-					"type":       "answer",
-					"session_id": sessionCode,
-					"peer_id":    connID,
-					"sdp":        msg.SDP,
-				})
-
-			case "ice_candidate":
-				sessionHub.ForwardToAgent(requestCtx, sessionCode, map[string]any{
-					"type":       "ice_candidate",
-					"session_id": sessionCode,
-					"peer_id":    connID,
-					"candidate":  msg.Candidate,
+				if msg.BrowserPeerID != "" {
+					sessionHub.RememberBrowserPeerID(connID, msg.BrowserPeerID)
+				}
+				sessionHub.SendToAgent(ctx, apiKeyID, map[string]any{
+					"type": "join", "conn_id": connID, "code": sessionCode, "hmac": msg.HMAC,
 				})
 			}
 		}
 	}
 }
 
-// checkRelayQuota checks if the account has exceeded their relay quota.
-// Returns (exceeded, periodEnd) where exceeded is true if usage >= limit.
-func checkRelayQuota(accountRecord *core.Record) (bool, time.Time) {
-	limitGB := accountRecord.GetFloat("relay_quota_gb")
-	usedGB := accountRecord.GetFloat("current_period_usage_gb")
-	periodEnd := accountRecord.GetDateTime("quota_period_end").Time()
-	return usedGB >= limitGB, periodEnd
-}
 func generateConnID() string {
-	randomBytes := make([]byte, 16)
-	rand.Read(randomBytes)
-	return hex.EncodeToString(randomBytes)
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }

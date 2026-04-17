@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,9 +15,9 @@ import (
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/handler"
 	"sharebridge/server/internal/hub"
-	"sharebridge/server/internal/metrics"
 	"sharebridge/server/internal/middleware"
 	"sharebridge/server/internal/quota"
+	"sharebridge/server/internal/relay"
 	_ "sharebridge/server/migrations"
 )
 
@@ -47,17 +48,48 @@ func main() {
 	app.OnServe().BindFunc(func(se *core.ServeEvent) error {
 		router := se.Router
 
+		// Construct and start the libp2p relay host.
+		ctx := context.Background()
+		rly, err := relay.New(ctx, relay.Config{
+			ListenAddr:     cfg.RelayListenAddr,
+			AnnounceAddr:   cfg.RelayAnnounceAddr,
+			PrivateKeyPath: cfg.RelayPrivateKeyPath,
+			JWTSecret:      cfg.JWTSecret,
+			JWTTTL:         cfg.JWTTTL,
+		})
+		if err != nil {
+			log.Fatalf("relay: %v", err)
+		}
+
+		// Wire share_code -> api_key_id resolver for relay auth.
+		rly.SetCodeResolver(func(code string) (string, bool) {
+			records, err := app.FindRecordsByFilter("sessions", "code = {:code}", "", 1, 0, map[string]any{"code": code})
+			if err != nil || len(records) == 0 {
+				return "", false
+			}
+			return records[0].GetString("api_key_id"), true
+		})
+
+		// Wire quota accumulator to relay's circuit-closed hook.
+		acc := quota.NewAccumulator(app, cfg)
+		acc.Start()
+		rly.SetCircuitClosedHook(func(apiKeyID, _ string, bytesIn, bytesOut int64) {
+			acc.Record(apiKeyID, bytesIn, bytesOut)
+		})
+		rly.Start()
+		log.Printf("relay host %s listening on %v", rly.Host().ID(), rly.Host().Addrs())
+
 		// WebSocket endpoints
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
 			authMiddleware := middleware.APIKeyAuth(app)
-			handlerFunc := handler.AgentWS(app, h, cfg)
+			handlerFunc := handler.AgentWS(app, h, cfg, rly)
 			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
 			return nil
 		})
 
 		router.GET("/ws/client", func(e *core.RequestEvent) error {
-			handler.BrowserWS(app, h, cfg)(e.Response, e.Request)
+			handler.BrowserWS(app, h, cfg, rly)(e.Response, e.Request)
 			return nil
 		})
 
@@ -127,20 +159,17 @@ func main() {
 			e.Record.Set("current_period_usage_gb", 0.0)
 			e.Record.Set("quota_period_start", now)
 			e.Record.Set("quota_period_end", now.Add(30*24*time.Hour))
-			e.Record.Set("turn_baseline_bytes", 0.0)
 			return e.Next()
+		})
+
+		// Shutdown cleanup: stop accumulator and close relay.
+		app.OnTerminate().BindFunc(func(_ *core.TerminateEvent) error {
+			acc.Stop()
+			return rly.Close()
 		})
 
 		log.Printf("signaling server listening on :%s", cfg.Port)
 		log.Printf("pocketbase data dir: %s", cfg.DataDir)
-
-		// Initialize and start the quota poller only when TURN is configured
-		if cfg.HasTurn() {
-			metricsClient := metrics.NewPrometheusClient(cfg.PrometheusURL)
-			quotaPoller := quota.NewPoller(app, metricsClient, cfg)
-			quotaPoller.Start()
-			log.Printf("quota poller started with interval: %v", cfg.QuotaCheckInterval)
-		}
 
 		return se.Next()
 	})
@@ -177,4 +206,3 @@ func deleteExpiredSessions(app core.App) error {
 		}
 	}
 }
-
