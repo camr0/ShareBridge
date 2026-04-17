@@ -321,7 +321,7 @@ func TestBrowserWS_JoinForwardedToAgent(t *testing.T) {
 	apiKey, err := createTestAPIKeyForUser(app, user.Id, "joinsecret")
 	require.NoError(t, err)
 
-	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "join-agent", "JOIN001", false)
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "join-agent", "JOIN0001", false)
 	require.NoError(t, err)
 
 	h := hub.New()
@@ -359,14 +359,14 @@ func TestBrowserWS_JoinForwardedToAgent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Register the share code
-	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://test.com","code":"JOIN001"}`))
+	err = agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://test.com","code":"JOIN0001"}`))
 	require.NoError(t, err)
 	_, data, err := agentConn.Read(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, string(data), `"type":"share_registered"`)
 
 	// Now connect browser
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=JOIN001", nil)
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=JOIN0001", nil)
 	require.NoError(t, err)
 	defer conn.CloseNow()
 
@@ -386,7 +386,7 @@ func TestBrowserWS_JoinForwardedToAgent(t *testing.T) {
 	err = json.Unmarshal(data, &joinReceived)
 	require.NoError(t, err)
 	assert.Equal(t, "join", joinReceived["type"])
-	assert.Equal(t, "JOIN001", joinReceived["code"])
+	assert.Equal(t, "JOIN0001", joinReceived["code"])
 	assert.NotEmpty(t, joinReceived["conn_id"])
 	assert.Equal(t, hmac, joinReceived["hmac"])
 
