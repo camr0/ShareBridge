@@ -782,58 +782,6 @@ import (
 	"sync/atomic"
 )
 
-// CountingReader wraps an io.Reader and atomically counts bytes read.
-type CountingReader struct {
-	R io.Reader
-	n int64
-}
-
-func (c *CountingReader) Read(p []byte) (int, error) {
-	n, err := c.R.Read(p)
-	atomic.AddInt64(&c.n, int64(n))
-	return n, err
-}
-
-// N returns the current byte count. Exposed as a field for tests and as a
-// method for concurrent callers.
-func (c *CountingReader) Count() int64 { return atomic.LoadInt64(&c.n) }
-
-// Field access for tests — mirrors the atomic value after the goroutine exits.
-func (c *CountingReader) setN(v int64) { atomic.StoreInt64(&c.n, v) }
-
-// Public field view for the simple test above.
-var _ = (*CountingReader)(nil).Count
-
-// N is a convenience field name used in tests; keep Count() for concurrent reads.
-// To minimize API surface, the test uses cr.N via this accessor.
-type countingReaderView = CountingReader
-
-// CountingWriter wraps an io.Writer and atomically counts bytes written.
-type CountingWriter struct {
-	W io.Writer
-	n int64
-}
-
-func (c *CountingWriter) Write(p []byte) (int, error) {
-	n, err := c.W.Write(p)
-	atomic.AddInt64(&c.n, int64(n))
-	return n, err
-}
-
-func (c *CountingWriter) Count() int64 { return atomic.LoadInt64(&c.n) }
-```
-
-Note: the test accesses `cr.N` directly. Simplify: rename the atomic field to `N` exposed as `int64` and use `atomic.LoadInt64(&c.N)` / `atomic.AddInt64(&c.N, ...)` instead. Replace the whole file with:
-
-```go
-// signaling-server/internal/relay/counter.go
-package relay
-
-import (
-	"io"
-	"sync/atomic"
-)
-
 type CountingReader struct {
 	R io.Reader
 	N int64 // atomic
@@ -1009,10 +957,12 @@ Expected: FAIL — `Handler` undefined.
 package relay
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"log"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -1065,7 +1015,9 @@ func (h *Handler) Handle(s network.Stream) {
 	}
 
 	// Open the agent-bound stream.
-	agentStream, err := h.Host.NewStream(s.Conn().RequestStreamContext(), agentPID, ProtocolID)
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
+	agentStream, err := h.Host.NewStream(dialCtx, agentPID, ProtocolID)
 	if err != nil {
 		log.Printf("relay: dial agent %s: %v", agentPID, err)
 		return
@@ -1274,22 +1226,7 @@ func TestProtocol_rejectsJTIReplay(t *testing.T) {
 Run: `go test ./internal/relay/ -run TestProtocol_rejectsJTIReplay -v`
 Expected: PASS.
 
-- [ ] **Step 5: Fix `Handle` ctx call site**
-
-The draft used `s.Conn().RequestStreamContext()` which doesn't exist. Replace with a context from the handler's host lifecycle. Add `ctx context.Context` field to `Handler` or use `context.Background()` with a timeout. Simplify:
-
-Replace the agent-dial line in `protocol.go`:
-```go
-dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-agentStream, err := h.Host.NewStream(dialCtx, agentPID, ProtocolID)
-```
-Add `"context"` and `"time"` to imports.
-
-Run: `go test ./internal/relay/ -v`
-Expected: all tests PASS.
-
-- [ ] **Step 6: Wire handler registration into `Relay.New`**
+- [ ] **Step 5: Wire handler registration into `Relay.New`**
 
 Modify `relay.go`. Update `Relay` struct and `New`:
 
@@ -1380,7 +1317,7 @@ JWTTTL:    time.Minute,
 
 Run tests again. Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add signaling-server/internal/relay/
@@ -1504,39 +1441,36 @@ git commit -m "refactor(slice-13a): replace TURN config with relay config"
 Run: `cat signaling-server/internal/handler/browser_ws_test.go | head -200`
 Identify tests that assert on `ice_config` messages or `answer`/`ice_candidate` forwarding. Those tests must be rewritten or deleted.
 
-- [ ] **Step 2: Add a minimal test for JWT issuance on no-password share**
+- [ ] **Step 2: Add a test asserting knock is forwarded to the agent**
 
 Replace or add in `browser_ws_test.go` (keep existing helpers):
 ```go
-func TestBrowserWS_sendsRelayInfoAfterKnock_noPasswordShare(t *testing.T) {
-	// Setup: in-memory PB app with a session, no password.
-	// Dial /ws/client?session=<code>, send knock.
-	// Assert the *next* message from the server has type="relay_info"
-	//   with non-empty `relay_multiaddr` and a valid JWT.
-	//
-	// The test should use the same PocketBase test harness as existing tests.
-	// Pseudocode follows — adapt to the existing test helpers in this file.
-
-	app := newTestApp(t)         // existing helper
+func TestBrowserWS_knockForwardedToAgent(t *testing.T) {
+	// Setup: in-memory PB app with a session (no-password — server can't know
+	// either way, so behaviour is identical).
+	app := tests.NewTestApp(t.TempDir())
 	defer app.Cleanup()
-	seedSession(t, app, "abc12345", /*hasPassword=*/false, /*relayOnly=*/false)
+	// seed the session and agent connection inline using PocketBase record API:
+	// app.Dao().SaveRecord(...)
 
 	hub := hub.New()
-	relay := newTestRelay(t)     // see helper below
+	rly := newTestRelay(t) // in-memory relay for tests
 	cfg := &config.Config{
 		RelayAnnounceAddr: "/ip4/127.0.0.1/tcp/9001/ws",
 		JWTSecret:         []byte("test-secret-do-not-use-in-prod-abcd1234"),
 		JWTTTL:            time.Minute,
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(handler.BrowserWS(app, hub, cfg, relay)))
+	server := httptest.NewServer(http.HandlerFunc(handler.BrowserWS(app, hub, cfg, rly)))
 	defer server.Close()
 
-	// … dial WS, send knock, read message, assert relay_info
+	// Dial WS, send knock with browser_peer_id.
+	// Assert the hub received a knock message destined for the agent.
+	// Do NOT assert relay_info here — that only arrives after auth_ok from the agent (Task 10).
 }
 ```
 
-Note: this test requires `BrowserWS` to accept a `*relay.Relay` argument — the function signature will change in Step 3. A helper `newTestRelay` constructs an in-memory relay for tests.
+Note: JWT issuance is **not** tested here — it happens in `agent_ws.go` on receipt of `auth_ok` (Task 10). A helper `newTestRelay` constructs an in-memory relay for tests.
 
 - [ ] **Step 3: Change `BrowserWS` signature and message flow**
 
@@ -1617,8 +1551,9 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay
 			return
 		}
 
-		// Main message loop. JWT is issued AFTER knock (and after HMAC join for password shares).
-		var jwtIssued bool
+		// Main message loop. JWT is issued in agent_ws when the agent sends auth_ok —
+		// not here. The server does not know whether the share has a password; that
+		// knowledge lives on the agent only.
 		for {
 			_, data, err := conn.Read(ctx)
 			if err != nil {
@@ -1631,22 +1566,11 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay
 
 			switch msg.Type {
 			case "knock":
-				// For no-password shares, knock can include the browser peer ID and we issue immediately.
-				// For password shares, we forward knock to the agent; JWT is issued on "join" after HMAC verification.
-				hasPassword := agentHasPasswordForSession(app, sessionRecord)
-				if !hasPassword {
-					if msg.PeerID == "" {
-						hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "peer_id required"})
-						continue
-					}
-					if err := issueAndSend(ctx, conn, rly, cfg, sessionCode, msg.PeerID, relayOnly, quotaExceeded); err != nil {
-						log.Printf("browser_ws: issue: %v", err)
-						return
-					}
-					jwtIssued = true
-					continue
+				// Remember browser peer ID so we can bind it into the JWT when auth_ok arrives.
+				if msg.PeerID != "" {
+					sessionHub.RememberBrowserPeerID(connID, msg.PeerID)
 				}
-				// Forward knock to agent to trigger nonce issuance.
+				// Forward unconditionally to agent to trigger nonce → join → auth_ok flow.
 				sessionHub.SendToAgent(ctx, apiKeyID, map[string]any{
 					"type":    "knock",
 					"conn_id": connID,
@@ -1654,13 +1578,10 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay
 				})
 
 			case "join":
-				// Forward HMAC to agent for verification. If agent returns auth_ok (new msg type we need to add), issue JWT.
-				if msg.PeerID == "" {
-					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "peer_id required"})
-					continue
+				// Forward HMAC to agent for verification. JWT is issued when agent replies auth_ok.
+				if msg.PeerID != "" {
+					sessionHub.RememberBrowserPeerID(connID, msg.PeerID)
 				}
-				// Remember peer_id for this connID so we can issue when auth_ok arrives.
-				sessionHub.RememberBrowserPeerID(connID, msg.PeerID)
 				sessionHub.SendToAgent(ctx, apiKeyID, map[string]any{
 					"type":    "join",
 					"conn_id": connID,
@@ -1668,40 +1589,22 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay
 					"hmac":    msg.HMAC,
 				})
 			}
-			_ = jwtIssued
 		}
 	}
 }
 
-func issueAndSend(ctx context.Context, conn *websocket.Conn, rly *relay.Relay, cfg *config.Config, shareCode, browserPeerID string, relayOnly, quotaExceeded bool) error {
-	claims := relay.Claims{
-		ShareCode:     shareCode,
-		BrowserPeerID: browserPeerID,
-		RelayAllowed:  !quotaExceeded,
-		DCUtRAllowed:  !relayOnly, // relay_only suppresses DCUtR so agent IP stays hidden
-	}
-	tok, err := rly.Issuer().Issue(claims)
-	if err != nil {
-		return err
-	}
-	return hub.SendDirect(ctx, conn, map[string]any{
-		"type":             "relay_info",
-		"relay_multiaddr":  cfg.RelayAnnounceAddr + "/p2p/" + rly.Host().ID().String(),
-		"jwt":              tok,
-		"relay_allowed":    claims.RelayAllowed,
-		"dcutr_allowed":    claims.DCUtRAllowed,
-	})
-}
+// issueAndSend is NOT in browser_ws.go. JWT issuance lives in agent_ws.go
+// inside the auth_ok handler (Task 10) — the server does not know whether a
+// share has a password and therefore cannot issue a JWT at knock time.
 ```
 
-This sketch references three helpers that don't exist yet:
+This sketch references helpers that don't exist yet:
 - `loadValidSession(app, code)` — factor out the existing session lookup + expiry check.
 - `lookupAccountForAPIKey(app, apiKeyID)` — factor out the api_keys → users join.
-- `agentHasPasswordForSession(app, record)` — read `password_hash` field presence; verify exact field by reading the sessions collection schema in `migrations/`.
 - `sessionHub.RememberBrowserPeerID(connID, peerID)` — new hub method added in Step 4.
 - `rly.Host()` — add this accessor on `relay.Relay`.
 
-Extract the helpers first (they're simple, inline in the current file). Read `migrations/1_create_collections.go` to find the session password field name — likely `password_hash`.
+Extract `loadValidSession` and `lookupAccountForAPIKey` from inline code in the current file.
 
 Run: `go build ./...`
 Expected: compile errors identifying missing pieces — fix them in Step 4.
@@ -2013,7 +1916,7 @@ import (
 )
 
 func TestAccumulator_flushesToAccount(t *testing.T) {
-	app := newTestApp(t) // existing test helper somewhere in the repo
+	app := tests.NewTestApp(t.TempDir()) // from github.com/pocketbase/pocketbase/tests
 	defer app.Cleanup()
 	apiKeyID, accountID := seedAPIKeyAndAccount(t, app)
 
@@ -2149,10 +2052,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
 
 	"sharebridge/server/internal/relay"
 )
@@ -2263,9 +2163,6 @@ func TestIntegration_browserRelayAgent(t *testing.T) {
 	if closed.fromAgent != int64(len(payload)) {
 		t.Errorf("fromAgent bytes: got %d want %d", closed.fromAgent, len(payload))
 	}
-	_ = multiaddr.NewMultiaddr
-	_ = peer.ID("")
-	_ = host.Host(nil)
 }
 ```
 
@@ -2362,81 +2259,6 @@ Before marking 13a done, re-confirm:
 - [ ] The JWT spec matches `## JWT Structure` in the design doc (jti, share_code, browser_peer_id, relay_allowed, dcutr_allowed, exp).
 - [ ] JTI store is in-memory only; 5-minute TTL; pruned in a goroutine.
 - [ ] Agent and browser code are unchanged in 13a (they break until 13b/13c ship — acceptable because this is a clean-cutover).
-
----
-
-## Plan review notes and corrections
-
-The following rough edges were identified after the first-draft plan was written. Resolve these **before or during** the referenced task.
-
-### R1 — Task 7, Step 5: collapse the `dialCtx` fix back into Step 2
-
-Step 2 draft calls `s.Conn().RequestStreamContext()` which does not exist on `network.Stream`. Step 5 later fixes this by replacing the call with `context.WithTimeout(context.Background(), 10*time.Second)`. When executing the task, **skip the broken draft in Step 2 and write the corrected version directly**:
-
-```go
-dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-agentStream, err := h.Host.NewStream(dialCtx, agentPID, ProtocolID)
-if err != nil { /* ... */ }
-defer cancel()
-```
-
-Imports: `"context"`, `"time"` from the start. Step 5 becomes a no-op once merged in.
-
-### R2 — Task 9: the server does NOT know whether a share has a password
-
-This is a load-bearing correction to the entire knock/join flow, not a small fix.
-
-**Server trust model:** passwords live on the agent only. The server has no `password_hash` or `has_password` column on `sessions`. Looking at the current code ([signaling-server/internal/handler/agent_ws.go:38](signaling-server/internal/handler/agent_ws.go#L38)), `has_password` is only ever set by the agent on outbound `nonce` messages. The server cannot branch on it at knock time.
-
-**Correct flow:**
-
-1. Browser sends `knock { peer_id }` to signaling server.
-2. Server stores `peer_id` (via `RememberBrowserPeerID`) and forwards `knock { conn_id, code }` to the agent — unconditionally.
-3. Agent looks up the share locally, sends `nonce { conn_id, value, has_password }` to the server. Server forwards to the correct browser.
-4. Browser either sends `join { conn_id, hmac }` (password share) or the browser may proceed directly — in which case the agent also skips auth.
-5. Agent verifies HMAC (or skips for no-password) and sends the new `auth_ok { conn_id, code }` message.
-6. Server sees `auth_ok`, looks up stored `peer_id`, issues JWT, sends `relay_info` to the browser.
-
-**Changes to Task 9:**
-- Delete the `hasPassword := agentHasPasswordForSession(...)` branch in Step 3. The `knock` case should only forward to the agent and store the peer_id (via `RememberBrowserPeerID`). Do **not** issue a JWT on knock.
-- The `join` case still forwards the HMAC to the agent.
-- Delete the `agentHasPasswordForSession` helper from the helper list in Step 3.
-- Delete `issueAndSend` from `browser_ws.go` entirely — JWT issuance moves to the `auth_ok` handler in `agent_ws.go` (already drafted in Task 10).
-
-**Coupling to 13b:** this means no-password shares also require the agent to send `auth_ok` after responding to `knock`/`nonce`. Today the no-password agent flow goes nonce → SDP directly; in 13b the agent must send `auth_ok` even when there is no password. Flag this in the 13b plan when it's written.
-
-**Tests:** the new `TestBrowserWS_sendsRelayInfoAfterKnock_noPasswordShare` test in Step 2 becomes invalid — no `relay_info` ever comes from `browser_ws` directly. Replace with a test asserting `knock` is forwarded to the agent (and peer_id is stored). The `relay_info` assertion lives in `agent_ws_test.go` under `TestAgentWS_authOkIssuesRelayInfoToBrowser` (Task 10).
-
-### R3 — Task 10: this task depends on a 13b-side agent change
-
-The `auth_ok` server-side handler is useless until the agent sends that message. 13a can land and test the handler with a synthetic `auth_ok` payload (the test in Task 10 Step 2 does exactly this), but **end-to-end flow does not work with the current agent code** between 13a merge and 13b merge.
-
-This is intentional per the spec's clean-cutover design (13a+13b+13c ship as one release). Flag it explicitly in the PR description when 13a is proposed.
-
-### R4 — Task 9 & 12: test helper is `setupTestApp`, not `newTestApp`
-
-The plan refers to `newTestApp(t)` as an existing helper. The actual name is `setupTestApp(t)` (in `internal/quota/poller_test.go:21` and `internal/middleware/api_key_test.go:18`) and it wraps `tests.NewTestApp(t.TempDir())` from `github.com/pocketbase/pocketbase/tests`.
-
-**Rewrite:** every test skeleton that says `newTestApp(t)` should say `tests.NewTestApp(t.TempDir())` directly, or use the package-local `setupTestApp` helper if the test lives in a package that already has one. For `internal/quota/poller_test.go`, reuse the existing `setupTestApp` — do not introduce a second helper.
-
-`seedAPIKeyAndAccount` and `seedSession` are also not existing helpers. Either factor them out of the inline setup in `browser_ws_test.go`/`agent_ws_test.go`, or inline the PocketBase record creation in each new test.
-
-### R5 — Task 2, Step 1: `PrivateKeyPath: ""` test case
-
-`TestNewHost_startsAndStops` in Task 1 Step 2 passes `PrivateKeyPath: ""` (ephemeral key). After Task 7 Step 6 modifies `New` to require `JWTSecret >= 32 bytes`, this test needs `JWTSecret` added. The plan notes this at the end of Task 7 Step 6 — **make sure to do it** or `go test ./internal/relay/` will fail with `JWTSecret must be >= 32 bytes` across every test that predates Task 7.
-
-### R6 — Task 6: remove the stray scaffold types
-
-The first draft of `counter.go` in Task 6 Step 2 contains `countingReaderView`, `setN`, and a package-level `var _ = (*CountingReader)(nil).Count`. These are dead code from iteration. **Use only the final simplified version at the end of Step 2** — just two structs (`CountingReader`, `CountingWriter`) with a public atomic `N` field and one `Read`/`Write` method each.
-
-### R7 — Task 14: remove unused-import silencers
-
-The integration test uses `_ = multiaddr.NewMultiaddr`, `_ = peer.ID("")`, `_ = host.Host(nil)` at the end. These are scaffolding from writing. If those imports end up unused after the real test body, **remove the imports** rather than silencing them. `go vet` will complain either way.
-
-### R8 — Caddy WSS path
-
-Task 15 Step 1 shows `reverse_proxy localhost:9001`. The relay listens on `/ip4/127.0.0.1/tcp/9001/ws` — that's a plain WebSocket endpoint served over HTTP by libp2p. Caddy terminates TLS and speaks HTTP upstream. The reverse proxy config is correct as-is; but the browser must dial `/dns4/relay.sharebridge.app/tcp/443/wss` (note `/wss`, not `/ws`). The `cfg.RelayAnnounceAddr` env in Step 4 is already `/dns4/relay.sharebridge.app/tcp/443/wss` — verify this matches before deploying. Mismatch would manifest as a client dial failure with "no transport" in logs.
 
 ---
 
