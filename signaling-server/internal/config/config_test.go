@@ -24,6 +24,14 @@ func TestLoad_jwtSecretFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoad_jwtSecretDefaultsForDev(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+	cfg := Load()
+	if len(cfg.JWTSecret) < 32 {
+		t.Fatalf("default JWTSecret len: %d", len(cfg.JWTSecret))
+	}
+}
+
 func TestLoad_smtpAbsentByDefault(t *testing.T) {
 	t.Setenv("SMTP_HOST", "")
 	cfg := Load()

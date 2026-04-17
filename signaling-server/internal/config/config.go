@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const defaultDevJWTSecret = "sharebridge-dev-jwt-secret-not-for-production-2026"
+
 type Config struct {
 	Port    string
 	DataDir string
@@ -36,7 +38,7 @@ func Load() *Config {
 		RelayListenAddr:     getEnv("RELAY_LISTEN_ADDR", "/ip4/127.0.0.1/tcp/9001/ws"),
 		RelayAnnounceAddr:   getEnv("RELAY_ANNOUNCE_ADDR", ""),
 		RelayPrivateKeyPath: getEnv("RELAY_PRIVATE_KEY_PATH", ""),
-		JWTSecret:           []byte(getEnv("JWT_SECRET", "")),
+		JWTSecret:           []byte(getEnv("JWT_SECRET", defaultDevJWTSecret)),
 		JWTTTL:              ttl,
 		SMTPHost:            getEnv("SMTP_HOST", ""),
 		SMTPPort:            getEnv("SMTP_PORT", "587"),
