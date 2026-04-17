@@ -1,49 +1,33 @@
 package config
 
 import (
-	"os"
 	"testing"
 	"time"
 )
 
-func TestLoad_Defaults(t *testing.T) {
-	// Unset any env vars that might interfere
-	os.Unsetenv("DEFAULT_QUOTA_GB")
-	os.Unsetenv("PROMETHEUS_URL")
-	os.Unsetenv("QUOTA_CHECK_INTERVAL")
-
+func TestLoad_relayDefaults(t *testing.T) {
+	t.Setenv("RELAY_LISTEN_ADDR", "")
 	cfg := Load()
-
-	if cfg.DefaultQuotaGB != 50.0 {
-		t.Errorf("DefaultQuotaGB = %v, want 50.0", cfg.DefaultQuotaGB)
+	if cfg.RelayListenAddr != "/ip4/127.0.0.1/tcp/9001/ws" {
+		t.Fatalf("default RelayListenAddr: %q", cfg.RelayListenAddr)
 	}
-	if cfg.PrometheusURL != "http://prometheus:9090" {
-		t.Errorf("PrometheusURL = %q, want %q", cfg.PrometheusURL, "http://prometheus:9090")
-	}
-	if cfg.QuotaCheckInterval != 5*time.Minute {
-		t.Errorf("QuotaCheckInterval = %v, want 5m", cfg.QuotaCheckInterval)
+	if cfg.JWTTTL != 5*time.Minute {
+		t.Fatalf("default JWTTTL: %v", cfg.JWTTTL)
 	}
 }
 
-func TestLoad_QuotaOverride(t *testing.T) {
-	os.Setenv("DEFAULT_QUOTA_GB", "100")
-	os.Setenv("PROMETHEUS_URL", "http://prom.internal:9090")
-	os.Setenv("QUOTA_CHECK_INTERVAL", "2m")
-	defer func() {
-		os.Unsetenv("DEFAULT_QUOTA_GB")
-		os.Unsetenv("PROMETHEUS_URL")
-		os.Unsetenv("QUOTA_CHECK_INTERVAL")
-	}()
-
+func TestLoad_jwtSecretFromEnv(t *testing.T) {
+	t.Setenv("JWT_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	cfg := Load()
+	if len(cfg.JWTSecret) < 32 {
+		t.Fatalf("JWTSecret len: %d", len(cfg.JWTSecret))
+	}
+}
 
-	if cfg.DefaultQuotaGB != 100.0 {
-		t.Errorf("DefaultQuotaGB = %v, want 100.0", cfg.DefaultQuotaGB)
-	}
-	if cfg.PrometheusURL != "http://prom.internal:9090" {
-		t.Errorf("PrometheusURL = %q", cfg.PrometheusURL)
-	}
-	if cfg.QuotaCheckInterval != 2*time.Minute {
-		t.Errorf("QuotaCheckInterval = %v, want 2m", cfg.QuotaCheckInterval)
+func TestLoad_smtpAbsentByDefault(t *testing.T) {
+	t.Setenv("SMTP_HOST", "")
+	cfg := Load()
+	if cfg.HasSMTP() {
+		t.Fatal("HasSMTP() should be false with no SMTP_HOST")
 	}
 }
