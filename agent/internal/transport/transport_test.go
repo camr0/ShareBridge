@@ -9,6 +9,9 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	circuitv2relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 )
 
 func newTestPrivKey(t *testing.T) crypto.PrivKey {
@@ -34,6 +37,25 @@ func TestTransport_NewStartsAndStops(t *testing.T) {
 	if err := tr.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+}
+
+func TestTransport_NewAdvertisesWebRTCDirectAddress(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tr, err := New(ctx, Options{PrivKey: newTestPrivKey(t)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	for _, addr := range tr.Host().Addrs() {
+		if strings.Contains(addr.String(), "/webrtc-direct") {
+			return
+		}
+	}
+
+	t.Fatalf("expected transport to advertise a /webrtc-direct address, got %v", tr.Host().Addrs())
 }
 
 func TestTransport_StreamHandlerReceivesBytes(t *testing.T) {
@@ -143,4 +165,115 @@ func TestTransport_DialRelayConnectsToRelay(t *testing.T) {
 	if !strings.Contains(err.Error(), "connect") && !strings.Contains(err.Error(), "reserve") {
 		t.Fatalf("expected connect or reserve error, got: %v", err)
 	}
+}
+
+func TestTransport_DialRelayViaWebsocketReachesRelayBeforeReserve(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	relayHost, err := libp2p.New(
+		libp2p.Identity(newTestPrivKey(t)),
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0/ws"),
+		libp2p.Transport(ws.New),
+	)
+	if err != nil {
+		t.Fatalf("relay host: %v", err)
+	}
+	defer relayHost.Close()
+
+	tr, err := New(ctx, Options{PrivKey: newTestPrivKey(t)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	var relayAddr string
+	for _, addr := range relayHost.Addrs() {
+		if strings.Contains(addr.String(), "/ws") {
+			relayAddr = addr.String() + "/p2p/" + relayHost.ID().String()
+			break
+		}
+	}
+	if relayAddr == "" {
+		t.Fatal("relay host missing websocket address")
+	}
+
+	err = tr.DialRelay(ctx, relayAddr)
+	if err == nil {
+		t.Fatal("expected reserve error")
+	}
+	if !strings.Contains(err.Error(), "reserve") {
+		t.Fatalf("expected reserve error after websocket connect, got: %v", err)
+	}
+}
+
+func TestTransport_ReconnectsAndReReservesAfterRelayDrop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	relayPriv := newTestPrivKey(t)
+	relayAddr := "/ip4/127.0.0.1/tcp/42433/ws"
+
+	startRelay := func() func() {
+		relayHost, err := libp2p.New(
+			libp2p.Identity(relayPriv),
+			libp2p.ListenAddrStrings(relayAddr),
+			libp2p.Transport(ws.New),
+		)
+		if err != nil {
+			t.Fatalf("relay host: %v", err)
+		}
+		relaySvc, err := circuitv2relay.New(relayHost)
+		if err != nil {
+			relayHost.Close()
+			t.Fatalf("relay service: %v", err)
+		}
+		return func() {
+			relaySvc.Close()
+			relayHost.Close()
+		}
+	}
+
+	stopRelay := startRelay()
+	defer stopRelay()
+
+	tr, err := New(ctx, Options{PrivKey: newTestPrivKey(t)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer tr.Close()
+
+	relayPeerAddr := relayAddr + "/p2p/" + trMustPeerID(t, relayPriv)
+	if err := tr.DialRelay(ctx, relayPeerAddr); err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	waitForTransportReady(t, tr, true)
+
+	stopRelay()
+	waitForTransportReady(t, tr, false)
+
+	stopRelay = startRelay()
+	waitForTransportReady(t, tr, true)
+}
+
+func waitForTransportReady(t *testing.T, tr *Transport, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		if tr.Ready() == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("transport readiness = %v, want %v", tr.Ready(), want)
+}
+
+func trMustPeerID(t *testing.T, priv crypto.PrivKey) string {
+	t.Helper()
+	pub := priv.GetPublic()
+	pid, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		t.Fatalf("peer id: %v", err)
+	}
+	return pid.String()
 }

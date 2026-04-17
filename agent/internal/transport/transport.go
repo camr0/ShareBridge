@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -14,6 +16,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	circuitv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	webrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -40,6 +43,11 @@ type Transport struct {
 
 	mu       sync.Mutex
 	onStream StreamHandler
+	relay    *peer.AddrInfo
+	ctx      context.Context
+	cancel   context.CancelFunc
+	ensureCh chan struct{}
+	ready    atomic.Bool
 }
 
 // New creates a libp2p Host with the given identity and WebRTC transport for
@@ -53,15 +61,39 @@ func New(ctx context.Context, opts Options) (*Transport, error) {
 
 	h, err := libp2p.New(
 		libp2p.Identity(opts.PrivKey),
-		libp2p.NoListenAddrs,          // no tcp/ws listening — agent is outbound via relay
-		libp2p.Transport(webrtc.New), // WebRTC transport for DCUtR direct-path upgrade
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/udp/0/webrtc-direct",
+			"/ip6/::/udp/0/webrtc-direct",
+		),
+		libp2p.Transport(ws.New),     // outbound relay connection over ws/wss
+		libp2p.Transport(webrtc.New), // direct WebRTC path for DCUtR upgrades
 	)
 	if err != nil {
 		return nil, fmt.Errorf("libp2p.New: %w", err)
 	}
 
-	t := &Transport{host: h}
+	transportCtx := context.Background()
+	if ctx != nil {
+		transportCtx = ctx
+	}
+	transportCtx, cancel := context.WithCancel(transportCtx)
+
+	t := &Transport{
+		host:     h,
+		ctx:      transportCtx,
+		cancel:   cancel,
+		ensureCh: make(chan struct{}, 1),
+	}
 	h.SetStreamHandler(FileProtocolID, t.handleStream)
+	h.Network().Notify(&network.NotifyBundle{
+		DisconnectedF: func(_ network.Network, conn network.Conn) {
+			if t.isRelayPeer(conn.RemotePeer()) {
+				t.ready.Store(false)
+				t.triggerEnsure()
+			}
+		},
+	})
+	go t.ensureRelayLoop()
 	return t, nil
 }
 
@@ -70,6 +102,9 @@ func (t *Transport) Host() host.Host { return t.host }
 
 // PeerID returns the libp2p peer ID string.
 func (t *Transport) PeerID() string { return t.host.ID().String() }
+
+// Ready reports whether the relay connection is established and has an active reservation.
+func (t *Transport) Ready() bool { return t.ready.Load() }
 
 // OnStream sets the callback for each inbound file stream. Must be called
 // before any stream can arrive; typically wired during daemon init.
@@ -102,12 +137,14 @@ func (t *Transport) DialRelay(ctx context.Context, relayMultiaddr string) error 
 	if err != nil {
 		return fmt.Errorf("extract peer info: %w", err)
 	}
-	if err := t.host.Connect(ctx, *info); err != nil {
-		return fmt.Errorf("connect to relay: %w", err)
-	}
-	_, err = circuitv2client.Reserve(ctx, t.host, *info)
-	if err != nil {
-		return fmt.Errorf("reserve circuit relay slot: %w", err)
+	t.mu.Lock()
+	t.relay = info
+	t.mu.Unlock()
+
+	if err := t.connectAndReserve(ctx, *info); err != nil {
+		t.ready.Store(false)
+		t.triggerEnsure()
+		return err
 	}
 	return nil
 }
@@ -119,4 +156,74 @@ func (t *Transport) ConnectDirect(ctx context.Context, addrs []multiaddr.Multiad
 }
 
 // Close shuts down the Host.
-func (t *Transport) Close() error { return t.host.Close() }
+func (t *Transport) Close() error {
+	t.cancel()
+	return t.host.Close()
+}
+
+func (t *Transport) connectAndReserve(ctx context.Context, info peer.AddrInfo) error {
+	if err := t.host.Connect(ctx, info); err != nil {
+		return fmt.Errorf("connect to relay: %w", err)
+	}
+	if _, err := circuitv2client.Reserve(ctx, t.host, info); err != nil {
+		return fmt.Errorf("reserve circuit relay slot: %w", err)
+	}
+	t.ready.Store(true)
+	return nil
+}
+
+func (t *Transport) ensureRelayLoop() {
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-t.ensureCh:
+			backoff := 250 * time.Millisecond
+			for {
+				if t.ctx.Err() != nil || t.Ready() {
+					break
+				}
+				info, ok := t.relayInfo()
+				if !ok {
+					break
+				}
+				attemptCtx, cancel := context.WithTimeout(t.ctx, time.Second)
+				err := t.connectAndReserve(attemptCtx, info)
+				cancel()
+				if err == nil {
+					break
+				}
+				select {
+				case <-t.ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < 2*time.Second {
+					backoff *= 2
+				}
+			}
+		}
+	}
+}
+
+func (t *Transport) relayInfo() (peer.AddrInfo, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.relay == nil {
+		return peer.AddrInfo{}, false
+	}
+	return *t.relay, true
+}
+
+func (t *Transport) isRelayPeer(id peer.ID) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.relay != nil && t.relay.ID == id
+}
+
+func (t *Transport) triggerEnsure() {
+	select {
+	case t.ensureCh <- struct{}{}:
+	default:
+	}
+}
