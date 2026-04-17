@@ -30,6 +30,8 @@ type Config struct {
 	SignalingServer string `json:"-"` // Deprecated: use SignalingURL
 	Password        string `json:"-"` // Deprecated: use UIPassword
 	MaxDownloads    int    `json:"-"` // Deprecated: use DefaultMaxDownloads
+
+	RelayIdentityPath string `json:"relay_identity_path,omitempty"` // defaults to ~/.sharebridge/agent_identity.key
 }
 
 // Manager handles configuration persistence.
@@ -152,6 +154,12 @@ func (m *Manager) load() (*Config, error) {
 	}
 	if cfg.UIAddr == "" {
 		cfg.UIAddr = "0.0.0.0"
+	}
+	if cfg.RelayIdentityPath == "" {
+		homeDir, err := os.UserHomeDir()
+		if err == nil {
+			cfg.RelayIdentityPath = filepath.Join(homeDir, ".sharebridge", "agent_identity.key")
+		}
 	}
 
 	return cfg, nil
