@@ -373,6 +373,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	if err != nil {
 		return "", fmt.Errorf("create transport: %w", err)
 	}
+	sig.SetPeerID(tr.PeerID())
 
 	if err := sig.Connect(ctx); err != nil {
 		return "", fmt.Errorf("connect to signaling server: %w", err)

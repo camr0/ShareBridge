@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
@@ -106,15 +105,6 @@ func (m *mockStore) IncrementDownloads(code string) (int, error) {
 	defer m.mu.Unlock()
 	m.downloads[code]++
 	return m.downloads[code], nil
-}
-
-func (m *mockStore) GetOrCreatePrivKey() (crypto.PrivKey, error) {
-	// Return a deterministic test key for tests
-	privKey, _, err := crypto.GenerateEd25519Key(nil)
-	if err != nil {
-		return nil, err
-	}
-	return privKey, nil
 }
 
 // mockTransport implements TransportInterface for testing.
@@ -248,6 +238,8 @@ func (m *mockSignalingClient) SetOnMessage(handler func(signaling.Message)) {
 	defer m.mu.Unlock()
 	m.onMessage = handler
 }
+
+func (m *mockSignalingClient) SetPeerID(_ string) {}
 
 func (m *mockSignalingClient) sendMessage(msg signaling.Message) {
 	m.mu.Lock()

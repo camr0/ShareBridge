@@ -32,6 +32,7 @@ type Client struct {
 	serverURL string
 	apiKey    string
 	agentID   string
+	peerID    string // libp2p peer ID sent in hello so the server can register it in the relay registry
 	conn      *websocket.Conn
 	OnMessage func(msg Message)
 	mu        sync.Mutex
@@ -50,6 +51,12 @@ func New(serverURL, apiKey, agentID string) *Client {
 	}
 }
 
+// SetPeerID sets the libp2p peer ID to include in the hello message.
+// Must be called before Connect.
+func (c *Client) SetPeerID(peerID string) {
+	c.peerID = peerID
+}
+
 // Connect dials the signaling server with API key auth and sends hello.
 func (c *Client) Connect(ctx context.Context) error {
 	// WebSocket URL with api_key query param
@@ -63,12 +70,15 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	c.conn = conn
 
-	// Send hello message
-	if err := c.Send(ctx, map[string]string{
+	hello := map[string]string{
 		"type":     "hello",
 		"version":  "1.0",
 		"agent_id": c.agentID,
-	}); err != nil {
+	}
+	if c.peerID != "" {
+		hello["peer_id"] = c.peerID
+	}
+	if err := c.Send(ctx, hello); err != nil {
 		conn.CloseNow()
 		return fmt.Errorf("send hello: %w", err)
 	}

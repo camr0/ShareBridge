@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/signaling"
@@ -44,7 +43,6 @@ type ConfigManagerInterface interface {
 // StoreInterface defines the interface for session storage.
 type StoreInterface interface {
 	GetAgentID() string
-	GetOrCreatePrivKey() (crypto.PrivKey, error)
 	GetSession(code string) *store.SessionEntry
 	GetByShareURL(shareURL string) *store.SessionEntry
 	ListSessions(filterExpired bool) []store.SessionEntry
@@ -62,6 +60,7 @@ type SignalingClientInterface interface {
 	GetRelayMultiaddr() string
 	Listen(ctx context.Context) error
 	SetOnMessage(handler func(signaling.Message))
+	SetPeerID(peerID string)
 }
 
 // TransportInterface defines the subset of transport.Transport the daemon uses.
@@ -72,7 +71,7 @@ type TransportInterface interface {
 	Close() error
 }
 
-// Session represents an active share session with WebRTC peers.
+// Session represents an active share session with libp2p streams.
 type Session struct {
 	Code         string
 	ShareURL     string
@@ -120,6 +119,8 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface, tr TransportInterface
 	agentID := st.GetAgentID()
 
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
+
+	sig.SetPeerID(tr.PeerID())
 
 	d := &Daemon{
 		config:    cfg,
@@ -465,9 +466,9 @@ func (d *Daemon) handleKnock(connID, sessionCode string) {
 	log.Printf("nonce sent for session %s conn %s", sessionCode, connID)
 }
 
-// handleJoin verifies the HMAC from the browser. If valid, creates a WebRTC
-// peer. If invalid, notifies the signaling server (which tracks failures and
-// closes the browser WS after 3 strikes).
+// handleJoin verifies the HMAC from the browser. If valid, sends auth_ok to
+// the signaling server. If invalid, notifies the signaling server (which
+// tracks failures and closes the browser WS after 3 strikes).
 func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
 	d.mu.RLock()
 	session, ok := d.sessions[sessionCode]
@@ -576,10 +577,11 @@ func (d *Daemon) handleIncomingStream(info transport.StreamInfo) {
 	adapter := transport.NewStreamAdapter(stream)
 	session.mu.Lock()
 	session.streams[env.ConnID] = adapter
+	downloads := session.Downloads
 	session.mu.Unlock()
 
 	tm := transfer.NewManager(adapter, session.webdavClient, session.MaxDownloads)
-	tm.SetDownloadCount(session.Downloads)
+	tm.SetDownloadCount(downloads)
 	tm.OnSessionExpired = func() {
 		d.signaling.Send(context.Background(), map[string]any{
 			"type":       "session_expired",
