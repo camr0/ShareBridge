@@ -6,12 +6,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
+	pbrouter "github.com/pocketbase/pocketbase/tools/router"
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/handler"
 	"sharebridge/server/internal/hub"
@@ -95,23 +97,7 @@ func main() {
 
 		// Public session info endpoint
 		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
-
-		// Direct link route - serves file client; JS reads code from window.location
-		router.GET("/s/{code}", handler.ServeFile("./web/index.html"))
-
-		// Homepage (marketing)
-		router.GET("/", handler.ServeFile("./web/home.html"))
-
-		// File transfer client (manual join)
-		router.GET("/join", handler.ServeFile("./web/index.html"))
-
-		// Static assets for file client
-		router.GET("/app.js", handler.ServeFile("./web/app.js"))
-
-		// User-facing pages (placeholders - full implementation in Task 10)
-		router.GET("/register", handler.ServeFile("./web/register.html"))
-		router.GET("/login", handler.ServeFile("./web/login.html"))
-		router.GET("/account", handler.ServeFile("./web/account.html"))
+		registerStaticRoutes(router, "./web")
 
 		// User-scoped API key management (requires JWT auth)
 		// Uses Bind middleware for auth (apis.RequireAuth returns *hook.Handler)
@@ -180,6 +166,27 @@ func main() {
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func registerStaticRoutes(router *pbrouter.Router[*core.RequestEvent], webRoot string) {
+	// Direct link route - serves file client; JS reads code from window.location
+	router.GET("/s/{code}", handler.ServeFile(filepath.Join(webRoot, "index.html")))
+
+	// Homepage (marketing)
+	router.GET("/", handler.ServeFile(filepath.Join(webRoot, "home.html")))
+
+	// File transfer client (manual join)
+	router.GET("/join", handler.ServeFile(filepath.Join(webRoot, "index.html")))
+
+	// Static assets for file client
+	router.GET("/app.bundle.js", handler.ServeFile(filepath.Join(webRoot, "app.bundle.js")))
+	router.GET("/app.bundle.js.map", handler.ServeFile(filepath.Join(webRoot, "app.bundle.js.map")))
+	router.GET("/app.js", handler.ServeFile(filepath.Join(webRoot, "app.bundle.js")))
+
+	// User-facing pages (placeholders - full implementation in Task 10)
+	router.GET("/register", handler.ServeFile(filepath.Join(webRoot, "register.html")))
+	router.GET("/login", handler.ServeFile(filepath.Join(webRoot, "login.html")))
+	router.GET("/account", handler.ServeFile(filepath.Join(webRoot, "account.html")))
 }
 
 func deleteExpiredSessions(app core.App) error {
