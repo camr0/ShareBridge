@@ -65,10 +65,6 @@ ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 
-# Coturn TURN server
-ufw allow 3478/tcp
-ufw allow 3478/udp
-
 # Enable UFW (will prompt for confirmation - auto-confirm with --force)
 ufw --force enable
 
@@ -92,73 +88,42 @@ cd /opt/sharebridge/signaling-server
 
 # Generate secrets (save these!)
 echo -e "${YELLOW}Generating secrets...${NC}"
-COTURN_SECRET=$(openssl rand -base64 32)
-SIGNING_KEY=$(openssl rand -base64 32)
+JWT_SECRET=$(openssl rand -hex 32)
 
 # Create .env file
 cat > .env <<EOF
 # ShareBridge Signaling Server Configuration
-COTURN_SECRET=${COTURN_SECRET}
-SIGNING_KEY=${SIGNING_KEY}
-DB_PATH=/data/sharebridge.db
-MAX_SESSIONS=1000
-SESSION_TTL=24h
-LOG_LEVEL=info
+PORT=8080
+DATA_DIR=/data/pb_data
+RELAY_LISTEN_ADDR=/ip4/127.0.0.1/tcp/9001/ws
+RELAY_ANNOUNCE_ADDR=/dns4/relay.example.com/tcp/443/wss
+RELAY_PRIVATE_KEY_PATH=/data/relay.key
+JWT_SECRET=${JWT_SECRET}
+JWT_TTL=5m
+DEFAULT_QUOTA_GB=50
+QUOTA_CHECK_INTERVAL=5m
 EOF
 
 # Create docker-compose.yml
 cat > docker-compose.yml <<'EOF'
-version: '3.8'
-
 services:
   sharebridge-server:
     image: sharebridge/signaling-server:latest
     container_name: sharebridge-server
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:8080"
+    network_mode: host
     environment:
-      - SIGNING_KEY=${SIGNING_KEY}
-      - MAX_SESSIONS=${MAX_SESSIONS:-1000}
-      - SESSION_TTL=${SESSION_TTL:-24h}
-      - DB_PATH=/data/sharebridge.db
-      - COTURN_HOST=coturn
-      - COTURN_SECRET=${COTURN_SECRET}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - PORT=${PORT:-8080}
+      - DATA_DIR=${DATA_DIR:-/data/pb_data}
+      - RELAY_LISTEN_ADDR=${RELAY_LISTEN_ADDR:-/ip4/127.0.0.1/tcp/9001/ws}
+      - RELAY_ANNOUNCE_ADDR=${RELAY_ANNOUNCE_ADDR}
+      - RELAY_PRIVATE_KEY_PATH=${RELAY_PRIVATE_KEY_PATH:-/data/relay.key}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_TTL=${JWT_TTL:-5m}
+      - DEFAULT_QUOTA_GB=${DEFAULT_QUOTA_GB:-50}
+      - QUOTA_CHECK_INTERVAL=${QUOTA_CHECK_INTERVAL:-5m}
     volumes:
       - ./data:/data
-    depends_on:
-      - coturn
-    networks:
-      - sharebridge
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  coturn:
-    image: coturn/coturn:latest
-    container_name: coturn
-    restart: unless-stopped
-    network_mode: host
-    command: >
-      --use-auth-secret
-      --static-auth-secret=${COTURN_SECRET}
-      --realm=sharebridge
-      --listening-port=3478
-      --no-cli
-      --no-tls
-      --no-dtls
-      --stun-only=no
-      --fingerprint
-      --verbose
-    environment:
-      - COTURN_SECRET=${COTURN_SECRET}
-
-networks:
-  sharebridge:
-    driver: bridge
 EOF
 
 # Create data directory
@@ -167,15 +132,13 @@ mkdir -p data
 # Create Caddyfile (user will need to edit domain)
 cat > /etc/caddy/Caddyfile <<'EOF'
 # ShareBridge Signaling Server
-# EDIT THIS: Replace with your domain
+# EDIT THIS: Replace with your real domains
 share.example.com {
     reverse_proxy localhost:8080
 }
 
-# Health endpoint for monitoring (optional)
-:8080 {
-    bind 127.0.0.1
-    respond "OK" 200
+relay.example.com {
+    reverse_proxy localhost:9001
 }
 EOF
 
@@ -183,7 +146,7 @@ echo -e "${YELLOW}Setting correct permissions...${NC}"
 chown -R root:root /opt/sharebridge
 chmod 600 .env
 
-# Create systemd service for docker-compose
+# Create systemd service for Docker Compose
 cat > /etc/systemd/system/sharebridge-signaling.service <<'EOF'
 [Unit]
 Description=ShareBridge Signaling Server
@@ -195,8 +158,8 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/sharebridge/signaling-server
 Environment="COMPOSE_PROJECT_NAME=sharebridge"
-ExecStart=/usr/bin/docker-compose up -d
-ExecStop=/usr/bin/docker-compose down
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=0
 
 [Install]
@@ -207,7 +170,7 @@ EOF
 cat > /usr/local/bin/signaling-health.sh <<'EOF'
 #!/bin/bash
 # Quick health check script
-curl -s http://127.0.0.1:8080/healthz || echo "Health check failed"
+curl -fsS http://127.0.0.1:8080/ >/dev/null || echo "HTTP app check failed"
 EOF
 chmod +x /usr/local/bin/signaling-health.sh
 
@@ -219,9 +182,9 @@ systemctl enable sharebridge-signaling
 cat > /opt/sharebridge/SETUP.md <<EOF
 # ShareBridge Signaling Server - Post-Install Steps
 
-## 1. Configure your domain
+## 1. Configure your domains
 Edit /etc/caddy/Caddyfile:
-   Replace 'share.example.com' with your actual domain
+   Replace 'share.example.com' and 'relay.example.com' with your actual domains
 
 Reload Caddy:
    systemctl reload caddy
@@ -243,21 +206,20 @@ systemctl start sharebridge-signaling
 ## 4. Verify everything is running
 \`\`\`bash
 # Check containers
-docker-compose ps
+docker compose ps
 
 # Check logs
-docker-compose logs -f
+docker compose logs -f
 
 # Check Caddy (should show HTTPS certificate obtained)
 systemctl status caddy
 
-# Test health endpoint
-curl https://your-domain.com/healthz
+# Test the HTTP app
+curl https://your-domain.com/
 \`\`\`
 
 ## 5. Get your secrets (save these somewhere secure!)
-Coturn Secret: ${COTURN_SECRET}
-Signing Key: ${SIGNING_KEY}
+JWT Secret: ${JWT_SECRET}
 
 ## 6. Security checklist
 - [ ] SSH key-only auth (no passwords)
@@ -265,11 +227,13 @@ Signing Key: ${SIGNING_KEY}
 - [ ] fail2ban running
 - [ ] Docker rootless (optional but recommended)
 - [ ] Automatic security updates configured
+- [ ] Relay DNS record is DNS-only / not proxied through Cloudflare
+- [ ] Caddy relay route is not restricted to Cloudflare IP ranges
 
 ## Useful commands
 
 View logs:
-  docker-compose logs -f
+  docker compose logs -f
 
 Restart services:
   systemctl restart sharebridge-signaling
@@ -292,12 +256,11 @@ echo ""
 echo -e "${YELLOW}IMPORTANT: Read /opt/sharebridge/SETUP.md for next steps${NC}"
 echo ""
 echo "Your secrets (SAVE THESE):"
-echo "  Coturn Secret: ${COTURN_SECRET}"
-echo "  Signing Key:   ${SIGNING_KEY}"
+echo "  JWT Secret: ${JWT_SECRET}"
 echo ""
 echo "Next steps:"
-echo "  1. Configure your domain in /etc/caddy/Caddyfile"
-echo "  2. Point DNS to this server"
+echo "  1. Configure your domains in /etc/caddy/Caddyfile"
+echo "  2. Point both share and relay DNS to this server"
 echo "  3. Build/deploy your signaling server container"
 echo "  4. Start services: systemctl start sharebridge-signaling"
 echo ""

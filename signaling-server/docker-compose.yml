@@ -5,59 +5,20 @@ services:
     environment:
       - PORT=8080
       - DATA_DIR=/data/pb_data
-      - TURN_HOST=${TURN_HOST}
+      - RELAY_LISTEN_ADDR=${RELAY_LISTEN_ADDR:-/ip4/127.0.0.1/tcp/9001/ws}
+      - RELAY_ANNOUNCE_ADDR=${RELAY_ANNOUNCE_ADDR}
+      - RELAY_PRIVATE_KEY_PATH=${RELAY_PRIVATE_KEY_PATH:-/data/relay.key}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_TTL=${JWT_TTL:-5m}
       - SMTP_HOST=${SMTP_HOST}
       - SMTP_PORT=${SMTP_PORT}
       - SMTP_USER=${SMTP_USER}
       - SMTP_PASSWORD=${SMTP_PASSWORD}
-      - TURN_PORT=3478
-      - TURN_SECRET=${TURN_SECRET}
       - DEFAULT_QUOTA_GB=${DEFAULT_QUOTA_GB:-50}
-      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://localhost:9090}
       - QUOTA_CHECK_INTERVAL=${QUOTA_CHECK_INTERVAL:-5m}
     volumes:
       - sharebridge-data:/data
-    depends_on:
-      - coturn
-      - prometheus
-
-  coturn:
-    image: coturn/coturn:latest
-    network_mode: host
-    command:
-      - -n
-      - --log-file=stdout
-      - --min-port=49152
-      - --max-port=65535
-      - --realm=sharebridge
-      - --use-auth-secret
-      - --static-auth-secret=${TURN_SECRET}
-      - --prometheus
-      - --prometheus-port=9641
-      - --prometheus-username-labels
-      - --no-dtls
-      - --no-tls
-      - --denied-peer-ip=127.0.0.0-127.255.255.255
-      - --denied-peer-ip=10.0.0.0-10.255.255.255
-      - --denied-peer-ip=172.16.0.0-172.31.255.255
-      - --denied-peer-ip=192.168.0.0-192.168.255.255
-      - --denied-peer-ip=169.254.0.0-169.254.255.255
-      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-      - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-    restart: unless-stopped
-
-  prometheus:
-    image: prom/prometheus:latest
-    network_mode: host
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.retention.time=35d'
-      - '--storage.tsdb.path=/prometheus'
     restart: unless-stopped
 
 volumes:
   sharebridge-data:
-  prometheus-data:

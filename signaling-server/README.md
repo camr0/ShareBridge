@@ -1,16 +1,14 @@
 # ShareBridge Signaling Server
 
-WebSocket-based signaling server for WebRTC peer connection establishment.
+PocketBase-backed signaling server with an embedded libp2p relay for ShareBridge transfers.
 
-## TURN Server
+## Relay Deployment
 
-The docker-compose setup includes Coturn for TURN relay. Set the TURN_SECRET environment variable to a secure random value:
+Slice 13a removes Coturn and Prometheus from the Docker Compose setup. The server now runs:
+- the PocketBase HTTP app on `:8080`
+- an embedded libp2p relay on `127.0.0.1:9001` by default
 
-```bash
-openssl rand -hex 32
-```
-
-Users behind symmetric NAT (typically corporate/ISP firewalls) will automatically use TURN relay. Connection status in the browser shows "Connected (Relay)" when TURN is used.
+The relay should stay bound to loopback and be exposed through Caddy or another reverse proxy at a public WebSocket endpoint such as `relay.sharebridge.app`.
 
 ### Configuration
 
@@ -18,15 +16,24 @@ Users behind symmetric NAT (typically corporate/ISP firewalls) will automaticall
 |---------------------|-------------|---------|
 | `PORT` | Server port | `8080` |
 | `DATA_DIR` | PocketBase data directory | `./pb_data` |
-| `TURN_HOST` | Coturn public IP/domain | (optional) |
-| `TURN_PORT` | Coturn port | `3478` |
-| `TURN_SECRET` | HMAC shared secret for TURN | (optional) |
+| `RELAY_LISTEN_ADDR` | Relay listen multiaddr | `/ip4/127.0.0.1/tcp/9001/ws` |
+| `RELAY_ANNOUNCE_ADDR` | Public relay multiaddr advertised to clients | (required in production) |
+| `RELAY_PRIVATE_KEY_PATH` | Path to persisted relay private key | (optional) |
+| `JWT_SECRET` | Shared secret for relay JWT issuance/validation | (required in production) |
+| `JWT_TTL` | Relay JWT lifetime | `5m` |
 | `SMTP_HOST` | SMTP server hostname | (optional) |
 | `SMTP_PORT` | SMTP server port | `587` |
 | `SMTP_USER` | SMTP username | (optional) |
 | `SMTP_PASSWORD` | SMTP password | (optional) |
+| `DEFAULT_QUOTA_GB` | Default monthly relay quota per user | `50` |
+| `QUOTA_CHECK_INTERVAL` | Flush interval for relay quota usage | `5m` |
 
-**Important:** `TURN_HOST` must be your VPS's public IP or domain name. Browsers receive this in ICE config and connect directly to it. Do NOT use Docker hostnames like "coturn" - browsers cannot resolve them.
+### Production Notes
+
+- `RELAY_ANNOUNCE_ADDR` must be a public, dialable multiaddr such as `/dns4/relay.sharebridge.app/tcp/443/wss`.
+- `JWT_SECRET` should be a strong random secret. Generate one with `openssl rand -hex 32`.
+- `RELAY_PRIVATE_KEY_PATH` should point at persistent storage so the relay peer ID survives restarts.
+- The public relay endpoint should bypass Cloudflare proxying and terminate TLS at Caddy before forwarding to `127.0.0.1:9001`.
 
 ### Running with Docker Compose
 
