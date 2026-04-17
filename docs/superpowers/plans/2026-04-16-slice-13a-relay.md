@@ -895,9 +895,9 @@ git commit -m "feat(slice-13a): CircuitACL for JWT-gated circuit relay v2"
 
 ## Task 7: Auth protocol handler `/sharebridge/relay/1.0.0`
 
-This stream is **auth-only** — no data forwarding. The browser sends a length-prefixed JWT; the relay validates it, registers the authorized pair in the ACL, and responds with `{"ok":true}`. After this stream closes, the browser uses standard circuit relay v2 to dial the agent.
+This stream is **auth-only** — no data forwarding. The browser sends a JWT wrapped in a JSON envelope `{ type: 'jwt', token: '...' }` using the same 5-byte framing as the file protocol (1-byte kind `0x01` = text + 4-byte BE uint32 length + payload). The relay validates it, registers the authorized pair in the ACL, and responds with `{ type: 'auth_ok' }` (or `{ type: 'error', message: '...' }` on failure). After this stream closes, the browser uses standard circuit relay v2 to dial the agent.
 
-Frame format (both directions): 2-byte big-endian uint16 length + UTF-8 payload.
+Frame format (both directions): **Same 5-byte codec as `/sharebridge/file/1.0.0`** — 1-byte kind ∈ {0x01=text, 0x02=binary} + 4-byte BE uint32 length + payload. This keeps framing consistent across all ShareBridge protocols and lets 13b's `frame.go` be reused here.
 
 **Files:**
 - Create: `signaling-server/internal/relay/protocol.go`
@@ -920,7 +920,6 @@ import (
 	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
 func newLibp2pHost(t *testing.T) host.Host {
@@ -938,10 +937,15 @@ func connect(t *testing.T, dialer, target host.Host) {
 	dialer.Peerstore().AddAddrs(target.ID(), target.Addrs(), time.Minute)
 }
 
-// authFrame writes a 2-byte-length-prefixed string to the stream.
-func authFrame(t *testing.T, s network.Stream, payload string) {
+// writeTextFrame writes a 5-byte-framed text message (kind=0x01) to the stream.
+func writeTextFrame(t *testing.T, s network.Stream, payload string) {
 	t.Helper()
-	if err := binary.Write(s, binary.BigEndian, uint16(len(payload))); err != nil {
+	// kind byte (0x01 = text)
+	if _, err := s.Write([]byte{0x01}); err != nil {
+		t.Fatalf("write kind: %v", err)
+	}
+	// 4-byte BE length
+	if err := binary.Write(s, binary.BigEndian, uint32(len(payload))); err != nil {
 		t.Fatalf("write length: %v", err)
 	}
 	if _, err := s.Write([]byte(payload)); err != nil {
@@ -949,25 +953,37 @@ func authFrame(t *testing.T, s network.Stream, payload string) {
 	}
 }
 
-// readAuthResponse reads a 2-byte-length-prefixed JSON response from the stream.
-func readAuthResponse(t *testing.T, s network.Stream) map[string]any {
+// readTextFrame reads a 5-byte-framed text message from the stream and returns the JSON-decoded payload.
+func readTextFrame(t *testing.T, s network.Stream) map[string]any {
 	t.Helper()
-	var length uint16
+	// Read kind byte
+	kindBuf := make([]byte, 1)
+	if _, err := io.ReadFull(s, kindBuf); err != nil {
+		t.Fatalf("read kind: %v", err)
+	}
+	if kindBuf[0] != 0x01 {
+		t.Fatalf("expected text frame kind 0x01, got 0x%02x", kindBuf[0])
+	}
+	// Read 4-byte length
+	var length uint32
 	if err := binary.Read(s, binary.BigEndian, &length); err != nil {
-		t.Fatalf("read response length: %v", err)
+		t.Fatalf("read length: %v", err)
+	}
+	if length > 8*1024*1024 {
+		t.Fatalf("frame too large: %d bytes", length)
 	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(s, buf); err != nil {
-		t.Fatalf("read response body: %v", err)
+		t.Fatalf("read payload: %v", err)
 	}
 	var resp map[string]any
 	if err := json.Unmarshal(buf, &resp); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
+		t.Fatalf("unmarshal payload: %v", err)
 	}
 	return resp
 }
 
-func TestProtocol_rejectsZeroLengthFrame(t *testing.T) {
+func TestProtocol_rejectsInvalidKind(t *testing.T) {
 	relayHost := newLibp2pHost(t)
 	issuer := NewIssuer([]byte("test-secret-do-not-use-in-prod-abcd1234"), time.Minute)
 	jtis := NewJTIStore(time.Minute)
@@ -989,18 +1005,18 @@ func TestProtocol_rejectsZeroLengthFrame(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Send zero-length frame — handler should reject immediately.
-	binary.Write(s, binary.BigEndian, uint16(0))
+	// Send frame with invalid kind byte (0x99 instead of 0x01)
+	s.Write([]byte{0x99, 0, 0, 0, 0}) // kind + zero-length
 	s.CloseWrite()
 
-	resp := readAuthResponse(t, s)
-	if ok, _ := resp["ok"].(bool); ok {
-		t.Fatal("expected ok:false for zero-length JWT")
+	resp := readTextFrame(t, s)
+	if resp["type"] != "error" {
+		t.Fatal("expected error response for invalid frame kind")
 	}
 }
 ```
 
-Run: `go test ./internal/relay/ -run TestProtocol_rejectsZeroLengthFrame -v`
+Run: `go test ./internal/relay/ -run TestProtocol_rejectsInvalidKind -v`
 Expected: FAIL — `Handler`, `ProtocolID` undefined.
 
 - [ ] **Step 2: Implement `protocol.go`**
@@ -1010,7 +1026,6 @@ Expected: FAIL — `Handler`, `ProtocolID` undefined.
 package relay
 
 import (
-	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -1022,6 +1037,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+)
+
+// Frame constants — same as 13b's frame.go.
+const (
+	FrameText   = 0x01
+	FrameBinary = 0x02
+	MaxFrameLen = 8 * 1024 * 1024
 )
 
 // ProtocolID is the custom auth-handshake protocol.
@@ -1049,50 +1071,75 @@ func (h *Handler) Handle(s network.Stream) {
 	claims, err := readAndValidateJWT(s, h.Issuer, h.JTIs)
 	if err != nil {
 		log.Printf("relay auth: rejected from %s: %v", s.Conn().RemotePeer(), err)
-		writeAuthResponse(s, false, err.Error())
+		writeAuthResponse(s, err.Error())
 		return
 	}
 
 	if !claims.RelayAllowed && !claims.DCUtRAllowed {
-		writeAuthResponse(s, false, "relay and DCUtR both disabled in token")
+		writeAuthResponse(s, "relay and DCUtR both disabled in token")
 		return
 	}
 
 	apiKeyID, ok := h.CodeToAPIKey(claims.ShareCode)
 	if !ok {
-		writeAuthResponse(s, false, "unknown share code")
+		writeAuthResponse(s, "unknown share code")
 		return
 	}
 	agentPeerID, ok := h.Agents.Lookup(apiKeyID)
 	if !ok {
-		writeAuthResponse(s, false, "agent not connected")
+		writeAuthResponse(s, "agent not connected")
 		return
 	}
 
 	browserPeerID := s.Conn().RemotePeer()
 	h.ACL.Authorize(browserPeerID, agentPeerID, claims.ShareCode, apiKeyID, h.AuthTTL)
 
-	writeAuthResponse(s, true, "")
+	writeAuthOK(s)
 }
 
-// readAndValidateJWT reads a 2-byte-length-prefixed JWT, verifies signature,
-// checks expiry, and enforces single-use via the JTI store.
+// readAndValidateJWT reads a 5-byte-framed text frame containing
+// { type: 'jwt', token: '...' }, validates the JWT, and returns claims.
 func readAndValidateJWT(s network.Stream, iss *Issuer, jtis *JTIStore) (*Claims, error) {
 	_ = s.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer s.SetReadDeadline(time.Time{})
 
-	var length uint16
-	if err := binary.Read(s, binary.BigEndian, &length); err != nil {
+	// Read 5-byte header: kind + 4-byte length
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(s, header); err != nil {
 		return nil, err
 	}
-	if length == 0 || length > 4096 {
-		return nil, errors.New("invalid JWT frame length")
+	kind := header[0]
+	if kind != FrameText {
+		return nil, errors.New("expected text frame (kind 0x01)")
 	}
+	length := binary.BigEndian.Uint32(header[1:5])
+	if length == 0 || length > MaxFrameLen {
+		return nil, errors.New("invalid frame length")
+	}
+
+	// Read payload
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(s, buf); err != nil {
 		return nil, err
 	}
-	claims, err := iss.Validate(string(buf))
+
+	// Decode JSON envelope: { type: 'jwt', token: '...' }
+	var envelope struct {
+		Type  string `json:"type"`
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(buf, &envelope); err != nil {
+		return nil, errors.New("invalid JSON envelope")
+	}
+	if envelope.Type != "jwt" {
+		return nil, errors.New("expected type 'jwt' in envelope")
+	}
+	if envelope.Token == "" {
+		return nil, errors.New("empty JWT token")
+	}
+
+	// Validate the JWT
+	claims, err := iss.Validate(envelope.Token)
 	if err != nil {
 		return nil, err
 	}
@@ -1110,16 +1157,25 @@ func readAndValidateJWT(s network.Stream, iss *Issuer, jtis *JTIStore) (*Claims,
 	return claims, nil
 }
 
-// writeAuthResponse sends a 2-byte-length-prefixed JSON response.
-func writeAuthResponse(s network.Stream, ok bool, errMsg string) {
-	var payload []byte
-	if ok {
-		payload, _ = json.Marshal(map[string]any{"ok": true})
-	} else {
-		payload, _ = json.Marshal(map[string]any{"ok": false, "error": errMsg})
-	}
-	_ = binary.Write(s, binary.BigEndian, uint16(len(payload)))
-	_, _ = s.Write(payload)
+// writeAuthOK sends { type: 'auth_ok' } as a 5-byte-framed text frame.
+func writeAuthOK(s network.Stream) {
+	payload, _ := json.Marshal(map[string]string{"type": "auth_ok"})
+	writeFrame(s, FrameText, payload)
+}
+
+// writeAuthResponse sends { type: 'error', message: msg } as a 5-byte-framed text frame.
+func writeAuthResponse(s network.Stream, msg string) {
+	payload, _ := json.Marshal(map[string]string{"type": "error", "message": msg})
+	writeFrame(s, FrameText, payload)
+}
+
+// writeFrame writes a 5-byte-framed message to the stream.
+func writeFrame(s network.Stream, kind byte, payload []byte) {
+	header := make([]byte, 5)
+	header[0] = kind
+	binary.BigEndian.PutUint32(header[1:5], uint32(len(payload)))
+	s.Write(header)
+	s.Write(payload)
 }
 
 // SetCodeResolver wires the share_code → api_key_id lookup after construction.
@@ -1164,10 +1220,10 @@ r.handler = Handler{
 return r, nil
 ```
 
-Run: `go test ./internal/relay/ -run TestProtocol_rejectsZeroLengthFrame -v`
+Run: `go test ./internal/relay/ -run TestProtocol_rejectsInvalidKind -v`
 Expected: PASS.
 
-- [ ] **Step 3: Test — valid JWT registers ACL entry and returns ok**
+- [ ] **Step 3: Test — valid JWT registers ACL entry and returns auth_ok**
 
 Append to `protocol_test.go`:
 
@@ -1216,12 +1272,14 @@ func TestProtocol_validJWT_authorizesACL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStream: %v", err)
 	}
-	authFrame(t, s, tok)
+	// Send JWT wrapped in JSON envelope using 5-byte framing
+	envelope, _ := json.Marshal(map[string]string{"type": "jwt", "token": tok})
+	writeTextFrame(t, s, string(envelope))
 	s.CloseWrite()
 
-	resp := readAuthResponse(t, s)
-	if ok, _ := resp["ok"].(bool); !ok {
-		t.Fatalf("expected ok:true, got %v", resp)
+	resp := readTextFrame(t, s)
+	if resp["type"] != "auth_ok" {
+		t.Fatalf("expected type:auth_ok, got %v", resp)
 	}
 
 	// ACL should now allow browser → agent circuit.
@@ -1275,16 +1333,19 @@ func TestProtocol_rejectsJTIReplay(t *testing.T) {
 			t.Fatalf("NewStream: %v", err)
 		}
 		defer s.Close()
-		authFrame(t, s, tok)
+		envelope, _ := json.Marshal(map[string]string{"type": "jwt", "token": tok})
+		writeTextFrame(t, s, string(envelope))
 		s.CloseWrite()
-		return readAuthResponse(t, s)
+		return readTextFrame(t, s)
 	}
 
-	if ok, _ := dial()["ok"].(bool); !ok {
-		t.Fatal("first use should succeed")
+	first := dial()
+	if first["type"] != "auth_ok" {
+		t.Fatalf("first use should succeed, got %v", first)
 	}
-	if ok, _ := dial()["ok"].(bool); ok {
-		t.Fatal("second use (replay) should fail")
+	second := dial()
+	if second["type"] != "error" {
+		t.Fatalf("second use (replay) should fail, got %v", second)
 	}
 }
 ```
@@ -2488,27 +2549,27 @@ func TestIntegration_e2eCircuitRelay(t *testing.T) {
 		t.Fatalf("auth NewStream: %v", err)
 	}
 	if err := binary.Write(authStream, binary.BigEndian, uint16(len(tok))); err != nil {
-		t.Fatalf("write JWT length: %v", err)
-	}
-	if _, err := authStream.Write([]byte(tok)); err != nil {
-		t.Fatalf("write JWT: %v", err)
-	}
-	authStream.CloseWrite()
+			t.Fatalf("write JWT length: %v", err)
+		}
+		if _, err := authStream.Write([]byte(tok)); err != nil {
+			t.Fatalf("write JWT: %v", err)
+		}
+		authStream.CloseWrite()
 
-	var respLen uint16
-	if err := binary.Read(authStream, binary.BigEndian, &respLen); err != nil {
-		t.Fatalf("read auth response length: %v", err)
-	}
-	respBuf := make([]byte, respLen)
-	if _, err := io.ReadFull(authStream, respBuf); err != nil {
-		t.Fatalf("read auth response: %v", err)
-	}
-	var authResp map[string]any
-	json.Unmarshal(respBuf, &authResp)
-	if ok, _ := authResp["ok"].(bool); !ok {
-		t.Fatalf("auth failed: %v", authResp)
-	}
-	authStream.Close()
+		var respLen uint16
+		if err := binary.Read(authStream, binary.BigEndian, &respLen); err != nil {
+			t.Fatalf("read auth response length: %v", err)
+		}
+		respBuf := make([]byte, respLen)
+		if _, err := io.ReadFull(authStream, respBuf); err != nil {
+			t.Fatalf("read auth response: %v", err)
+		}
+		var authResp map[string]any
+		json.Unmarshal(respBuf, &authResp)
+		if ok, _ := authResp["ok"].(bool); !ok {
+			t.Fatalf("auth failed: %v", authResp)
+		}
+		authStream.Close()
 
 	// Step 2: Browser dials agent via circuit relay v2.
 	// Circuit address format: <relayTransport>/p2p/<relayID>/p2p-circuit/p2p/<agentID>
@@ -2666,6 +2727,9 @@ Before marking 13a done, confirm:
 - [ ] `TestIntegration_e2eCircuitRelay` passes and logs non-zero byte counts.
 - [ ] The relay host is constructed **without** `libp2p.DisableRelay()` — search the codebase: `grep -r "DisableRelay" signaling-server/` must return nothing.
 - [ ] `protocol.go` contains no `io.Copy` — the `/sharebridge/relay/1.0.0` handler is auth-only.
+- [ ] **Framing format matches 13b/13c**: `protocol.go` uses 5-byte framing (1-byte kind + 4-byte BE length), same as `frame.go`. Verify: `grep "FrameText" signaling-server/internal/relay/protocol.go`.
+- [ ] **JWT envelope matches 13c**: relay expects `{ type: 'jwt', token: '...' }`, not raw JWT. Verify: `grep '"jwt"' signaling-server/internal/relay/protocol.go`.
+- [ ] **Response format matches 13c**: relay sends `{ type: 'auth_ok' }` or `{ type: 'error', message: '...' }`. Verify: `grep "auth_ok" signaling-server/internal/relay/protocol.go`.
 - [ ] `relay_info` message contains `agent_peer_id` — grep confirms: `grep "agent_peer_id" signaling-server/internal/handler/agent_ws.go`.
 - [ ] JWT spec matches design doc: `jti`, `share_code`, `browser_peer_id`, `relay_allowed`, `dcutr_allowed`, `exp`.
 - [ ] Relay listen addr is loopback; Caddy TLS terminates + firewall blocks 9001 externally.
