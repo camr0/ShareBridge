@@ -2459,6 +2459,48 @@ import (
 
 const fileProto = "/sharebridge/file/1.0.0"
 
+// writeTextFrame writes a 5-byte-framed text message (kind=0x01) to the stream.
+func writeTextFrame(t *testing.T, s network.Stream, payload string) {
+	t.Helper()
+	if _, err := s.Write([]byte{0x01}); err != nil {
+		t.Fatalf("write kind: %v", err)
+	}
+	if err := binary.Write(s, binary.BigEndian, uint32(len(payload))); err != nil {
+		t.Fatalf("write length: %v", err)
+	}
+	if _, err := s.Write([]byte(payload)); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+}
+
+// readTextFrame reads a 5-byte-framed text message and returns JSON-decoded payload.
+func readTextFrame(t *testing.T, s network.Stream) map[string]any {
+	t.Helper()
+	kindBuf := make([]byte, 1)
+	if _, err := io.ReadFull(s, kindBuf); err != nil {
+		t.Fatalf("read kind: %v", err)
+	}
+	if kindBuf[0] != 0x01 {
+		t.Fatalf("expected text frame kind 0x01, got 0x%02x", kindBuf[0])
+	}
+	var length uint32
+	if err := binary.Read(s, binary.BigEndian, &length); err != nil {
+		t.Fatalf("read length: %v", err)
+	}
+	if length > 8*1024*1024 {
+		t.Fatalf("frame too large: %d bytes", length)
+	}
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(s, buf); err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(buf, &resp); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return resp
+}
+
 func TestIntegration_e2eCircuitRelay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -2548,28 +2590,17 @@ func TestIntegration_e2eCircuitRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth NewStream: %v", err)
 	}
-	if err := binary.Write(authStream, binary.BigEndian, uint16(len(tok))); err != nil {
-			t.Fatalf("write JWT length: %v", err)
-		}
-		if _, err := authStream.Write([]byte(tok)); err != nil {
-			t.Fatalf("write JWT: %v", err)
-		}
-		authStream.CloseWrite()
 
-		var respLen uint16
-		if err := binary.Read(authStream, binary.BigEndian, &respLen); err != nil {
-			t.Fatalf("read auth response length: %v", err)
-		}
-		respBuf := make([]byte, respLen)
-		if _, err := io.ReadFull(authStream, respBuf); err != nil {
-			t.Fatalf("read auth response: %v", err)
-		}
-		var authResp map[string]any
-		json.Unmarshal(respBuf, &authResp)
-		if ok, _ := authResp["ok"].(bool); !ok {
-			t.Fatalf("auth failed: %v", authResp)
-		}
-		authStream.Close()
+	// Send JWT using 5-byte framing (kind=0x01 + 4-byte BE length + JSON envelope)
+	envelope, _ := json.Marshal(map[string]string{"type": "jwt", "token": tok})
+	writeTextFrame(t, authStream, string(envelope))
+	authStream.CloseWrite()
+
+	resp := readTextFrame(t, authStream)
+	if resp["type"] != "auth_ok" {
+		t.Fatalf("auth failed: %v", resp)
+	}
+	authStream.Close()
 
 	// Step 2: Browser dials agent via circuit relay v2.
 	// Circuit address format: <relayTransport>/p2p/<relayID>/p2p-circuit/p2p/<agentID>
