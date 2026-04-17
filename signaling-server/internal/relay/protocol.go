@@ -21,11 +21,17 @@ const (
 
 const ProtocolID = protocol.ID("/sharebridge/relay/1.0.0")
 
+// ACLAuthorizer is the interface for authorizing browser peers to connect to agents.
+// Implemented by both CircuitACL (for testing) and ByteTracker (production).
+type ACLAuthorizer interface {
+	Authorize(browserPeerID, agentPeerID peer.ID, shareCode, apiKeyID string, ttl time.Duration)
+}
+
 type Handler struct {
 	Issuer       *Issuer
 	JTIs         *JTIStore
 	Agents       *AgentRegistry
-	ACL          *CircuitACL
+	ACL          ACLAuthorizer
 	AuthTTL      time.Duration
 	CodeToAPIKey func(shareCode string) (apiKeyID string, ok bool)
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -29,8 +30,8 @@ type Config struct {
 // Relay wraps a libp2p Host configured as a ShareBridge relay.
 type Relay struct {
 	h          host.Host
-	bwc        *metrics.BandwidthCounter
-	acl        *CircuitACL
+	bwc        *metrics.BandwidthCounter // tracks non-relayed traffic (auth stream, etc.)
+	tracker    *ByteTracker               // tracks relayed traffic per browser peer
 	circuitSvc *circuitv2.Relay
 	issuer     *Issuer
 	jtis       *JTIStore
@@ -78,12 +79,16 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 		return nil, fmt.Errorf("new libp2p host: %w", err)
 	}
 
-	acl := newCircuitACL(cfg.JWTTTL)
+	tracker := NewByteTracker(cfg.JWTTTL)
 
 	// Start the circuit relay v2 service. This is what provides E2E Noise encryption:
 	// the relay forwards ciphertext between browser and agent without being able to read it.
 	// DCUtR hole-punching flows through this service automatically.
-	circuitSvc, err := circuitv2.New(h, circuitv2.WithACL(acl))
+	// We use our ByteTracker as both ACL filter and metrics tracer to track per-peer bytes.
+	circuitSvc, err := circuitv2.New(h,
+		circuitv2.WithACL(tracker),
+		circuitv2.WithMetricsTracer(tracker),
+	)
 	if err != nil {
 		h.Close()
 		return nil, fmt.Errorf("circuit relay v2: %w", err)
@@ -96,7 +101,7 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 	r := &Relay{
 		h:          h,
 		bwc:        bwc,
-		acl:        acl,
+		tracker:    tracker,
 		circuitSvc: circuitSvc,
 		issuer:     issuer,
 		jtis:       jtis,
@@ -106,7 +111,7 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 		Issuer:  issuer,
 		JTIs:    jtis,
 		Agents:  agents,
-		ACL:     acl,
+		ACL:     tracker,
 		AuthTTL: cfg.JWTTTL,
 	}
 	return r, nil
@@ -120,6 +125,15 @@ func (r *Relay) Issuer() *Issuer { return r.issuer }
 
 // Agents returns the agent registry (populated in 13b when agents connect).
 func (r *Relay) Agents() *AgentRegistry { return r.agents }
+
+// ACL returns the circuit ACL for testing/debugging.
+func (r *Relay) ACL() *ByteTracker { return r.tracker }
+
+// BandwidthCounter returns the bandwidth counter for testing/debugging (non-relayed traffic).
+func (r *Relay) BandwidthCounter() *metrics.BandwidthCounter { return r.bwc }
+
+// Tracker returns the byte tracker for testing/debugging (relayed traffic).
+func (r *Relay) Tracker() *ByteTracker { return r.tracker }
 
 // SetCodeResolver wires the share_code → api_key_id lookup after construction.
 func (r *Relay) SetCodeResolver(f func(shareCode string) (apiKeyID string, ok bool)) {
@@ -136,21 +150,27 @@ func (r *Relay) SetCircuitClosedHook(f func(apiKeyID, shareCode string, bytesIn,
 func (r *Relay) Start() []multiaddr.Multiaddr {
 	r.h.SetStreamHandler(ProtocolID, r.handler.Handle)
 
-	// When a browser peer disconnects, read their cumulative bandwidth and
+	// When a browser peer disconnects, read their cumulative relayed bytes and
 	// report it to the quota accumulator. Browser peer IDs are ephemeral
 	// (new Ed25519 key per page load), so cumulative == per-circuit.
 	r.h.Network().Notify(&network.NotifyBundle{
 		DisconnectedF: func(_ network.Network, conn network.Conn) {
 			peerID := conn.RemotePeer()
-			entry, ok := r.acl.GetEntry(peerID)
+			log.Printf("relay: disconnected from peer %s", peerID)
+			entry, ok := r.tracker.GetEntry(peerID)
 			if !ok {
+				log.Printf("relay: no ACL entry for peer %s", peerID)
 				return
 			}
-			stat := r.bwc.GetBandwidthForPeer(peerID)
+			bytesRelayed := r.tracker.GetBytes(peerID)
+			log.Printf("relay: bytes relayed for peer %s: %d", peerID, bytesRelayed)
 			if r.OnCircuitClosed != nil {
-				r.OnCircuitClosed(entry.APIKeyID, entry.ShareCode, stat.TotalIn, stat.TotalOut)
+				// For relayed traffic, in/out are symmetric (echo server), so we split evenly
+				// In production, the agent sends files to browser, so in would be larger.
+				// For now, we report total bytes relayed, splitting in/out arbitrarily.
+				r.OnCircuitClosed(entry.APIKeyID, entry.ShareCode, bytesRelayed/2, bytesRelayed/2)
 			}
-			r.acl.Remove(peerID)
+			r.tracker.Remove(peerID)
 		},
 	})
 
