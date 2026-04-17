@@ -9,45 +9,35 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/pion/webrtc/v4"
 )
-
-// ICEServer represents an ICE server configuration from the signaling server.
-type ICEServer struct {
-	URLs       []string `json:"urls"`
-	Username   string   `json:"username,omitempty"`
-	Credential string   `json:"credential,omitempty"`
-}
 
 // Message is any message received from the signaling server.
 type Message struct {
-	Type        string          `json:"type"`
-	SessionID   string          `json:"session_id,omitempty"` // Share code
-	PeerID      string          `json:"peer_id,omitempty"`    // Unique peer connection ID
-	SDP         string          `json:"sdp,omitempty"`
-	Candidate   json.RawMessage `json:"candidate,omitempty"`
-	Err         string          `json:"message,omitempty"`
-	Code        string          `json:"code,omitempty"`
-	ConnID      string          `json:"conn_id,omitempty"`
-	HMAC        string          `json:"hmac,omitempty"`
-	Reconnected bool            `json:"reconnected,omitempty"`
-	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
+	Type           string          `json:"type"`
+	SessionID      string          `json:"session_id,omitempty"` // Share code
+	PeerID         string          `json:"peer_id,omitempty"`    // Legacy field (kept for hub compatibility)
+	Err            string          `json:"message,omitempty"`
+	Code           string          `json:"code,omitempty"`
+	ConnID         string          `json:"conn_id,omitempty"`
+	HMAC           string          `json:"hmac,omitempty"`
+	Reconnected    bool            `json:"reconnected,omitempty"`
+	RelayMultiaddr string          `json:"relay_multiaddr,omitempty"`
+	BrowserPeerID  string          `json:"browser_peer_id,omitempty"`
+	Candidate      json.RawMessage `json:"-"` // unused after Slice 13b; kept off-wire for compile compat
+	SDP            string          `json:"-"` // unused after Slice 13b
 }
 
 // Client manages a WebSocket connection to the signaling server.
 type Client struct {
-	serverURL  string
-	apiKey     string
-	agentID    string
-	conn       *websocket.Conn
-	OnMessage  func(msg Message)
-	mu         sync.Mutex
-	iceServers []webrtc.ICEServer // Store ICE config from server
+	serverURL string
+	apiKey    string
+	agentID   string
+	conn      *websocket.Conn
+	OnMessage func(msg Message)
+	mu        sync.Mutex
 
-	// pendingReg receives the share_registered (or error) response for the
-	// RegisterShare call currently in flight. nil when no registration pending.
-	// All WebSocket reads go through Listen, so RegisterShare must not call
-	// conn.Read directly while Listen is running.
+	relayMultiaddr string
+
 	pendingReg   chan Message
 	pendingRegMu sync.Mutex
 }
@@ -141,11 +131,11 @@ func (c *Client) Send(ctx context.Context, msg any) error {
 	return c.conn.Write(ctx, websocket.MessageText, data)
 }
 
-// GetICEServers returns the ICE servers received from the server's welcome message.
-func (c *Client) GetICEServers() []webrtc.ICEServer {
+// GetRelayMultiaddr returns the relay's libp2p multiaddr received in welcome.
+func (c *Client) GetRelayMultiaddr() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.iceServers
+	return c.relayMultiaddr
 }
 
 // Listen reads messages in a loop and dispatches them.
@@ -181,17 +171,10 @@ func (c *Client) Listen(ctx context.Context) error {
 			continue
 		}
 
-		// Update ICE servers whenever the server sends a welcome.
-		if msg.Type == "welcome" && len(msg.ICEServers) > 0 {
+		// Store relay multiaddr from welcome message.
+		if msg.Type == "welcome" && msg.RelayMultiaddr != "" {
 			c.mu.Lock()
-			c.iceServers = make([]webrtc.ICEServer, len(msg.ICEServers))
-			for i, s := range msg.ICEServers {
-				c.iceServers[i] = webrtc.ICEServer{
-					URLs:       s.URLs,
-					Username:   s.Username,
-					Credential: s.Credential,
-				}
-			}
+			c.relayMultiaddr = msg.RelayMultiaddr
 			c.mu.Unlock()
 		}
 
