@@ -46,8 +46,8 @@ func (h *Handler) Handle(s network.Stream) {
 		return
 	}
 
-	if !claims.RelayAllowed && !claims.DCUtRAllowed {
-		writeAuthResponse(s, "relay and DCUtR both disabled in token")
+	if !claims.RelayAllowed {
+		writeAuthResponse(s, "relay disabled in token")
 		return
 	}
 

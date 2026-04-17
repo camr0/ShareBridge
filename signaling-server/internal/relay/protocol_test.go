@@ -172,7 +172,7 @@ func TestProtocol_rejectsJTIReplay(t *testing.T) {
 	acl := newCircuitACL(time.Minute)
 
 	h := Handler{
-		Issuer:  issuer, JTIs: jtis, Agents: reg, ACL: acl, AuthTTL: time.Minute,
+		Issuer: issuer, JTIs: jtis, Agents: reg, ACL: acl, AuthTTL: time.Minute,
 		CodeToAPIKey: func(string) (string, bool) { return "k", true },
 	}
 	relayHost.SetStreamHandler(ProtocolID, h.Handle)
@@ -205,5 +205,63 @@ func TestProtocol_rejectsJTIReplay(t *testing.T) {
 	second := dial()
 	if second["type"] != "error" {
 		t.Fatalf("second use (replay) should fail, got %v", second)
+	}
+}
+
+func TestProtocol_rejectsRelayDisabledToken(t *testing.T) {
+	relayHost := newLibp2pHost(t)
+	agentHost := newLibp2pHost(t)
+	browserHost := newLibp2pHost(t)
+
+	issuer := NewIssuer([]byte("test-secret-do-not-use-in-prod-abcd1234"), time.Minute)
+	jtis := NewJTIStore(time.Minute)
+	defer jtis.Close()
+	reg := NewAgentRegistry()
+	reg.Register("k", agentHost.ID())
+	acl := newCircuitACL(time.Minute)
+
+	h := Handler{
+		Issuer:  issuer,
+		JTIs:    jtis,
+		Agents:  reg,
+		ACL:     acl,
+		AuthTTL: time.Minute,
+		CodeToAPIKey: func(string) (string, bool) {
+			return "k", true
+		},
+	}
+	relayHost.SetStreamHandler(ProtocolID, h.Handle)
+	connect(t, browserHost, relayHost)
+
+	tok, err := issuer.Issue(Claims{
+		ShareCode:     "abc12345",
+		BrowserPeerID: browserHost.ID().String(),
+		RelayAllowed:  false,
+		DCUtRAllowed:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	s, err := browserHost.NewStream(ctx, relayHost.ID(), ProtocolID)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	defer s.Close()
+
+	envelope, _ := json.Marshal(map[string]string{"type": "jwt", "token": tok})
+	writeTextFrame(t, s, string(envelope))
+	s.CloseWrite()
+
+	resp := readTextFrame(t, s)
+	if resp["type"] != "error" {
+		t.Fatalf("expected error response, got %v", resp)
+	}
+
+	addr, _ := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/9001")
+	if acl.AllowConnect(browserHost.ID(), addr, agentHost.ID()) {
+		t.Fatal("ACL should not authorize relay-disabled token")
 	}
 }

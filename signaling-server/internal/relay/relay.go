@@ -20,23 +20,24 @@ import (
 
 // Config configures the relay Host.
 type Config struct {
-	ListenAddr     string        // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
-	AnnounceAddr   string        // optional public multiaddr advertised to peers
-	PrivateKeyPath string        // PEM path; empty = ephemeral (dev/test only)
+	ListenAddr     string // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
+	AnnounceAddr   string // optional public multiaddr advertised to peers
+	PrivateKeyPath string // PEM path; empty = ephemeral (dev/test only)
 	JWTSecret      []byte
 	JWTTTL         time.Duration
 }
 
 // Relay wraps a libp2p Host configured as a ShareBridge relay.
 type Relay struct {
-	h          host.Host
-	bwc        *metrics.BandwidthCounter // tracks non-relayed traffic (auth stream, etc.)
-	tracker    *ByteTracker               // tracks relayed traffic per browser peer
-	circuitSvc *circuitv2.Relay
-	issuer     *Issuer
-	jtis       *JTIStore
-	agents     *AgentRegistry
-	handler    Handler
+	h            host.Host
+	announceAddr string
+	bwc          *metrics.BandwidthCounter // tracks non-relayed traffic (auth stream, etc.)
+	tracker      *ByteTracker              // tracks relayed traffic per browser peer
+	circuitSvc   *circuitv2.Relay
+	issuer       *Issuer
+	jtis         *JTIStore
+	agents       *AgentRegistry
+	handler      Handler
 
 	// OnCircuitClosed is called with quota bytes when a browser peer disconnects.
 	OnCircuitClosed func(apiKeyID, shareCode string, bytesIn, bytesOut int64)
@@ -99,13 +100,14 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 	agents := NewAgentRegistry()
 
 	r := &Relay{
-		h:          h,
-		bwc:        bwc,
-		tracker:    tracker,
-		circuitSvc: circuitSvc,
-		issuer:     issuer,
-		jtis:       jtis,
-		agents:     agents,
+		h:            h,
+		announceAddr: cfg.AnnounceAddr,
+		bwc:          bwc,
+		tracker:      tracker,
+		circuitSvc:   circuitSvc,
+		issuer:       issuer,
+		jtis:         jtis,
+		agents:       agents,
 	}
 	r.handler = Handler{
 		Issuer:  issuer,
@@ -134,6 +136,19 @@ func (r *Relay) BandwidthCounter() *metrics.BandwidthCounter { return r.bwc }
 
 // Tracker returns the byte tracker for testing/debugging (relayed traffic).
 func (r *Relay) Tracker() *ByteTracker { return r.tracker }
+
+// AdvertiseAddr returns the dialable relay multiaddr including this host's peer ID.
+func (r *Relay) AdvertiseAddr() string {
+	base := r.announceAddr
+	if base == "" {
+		addrs := r.h.Addrs()
+		if len(addrs) == 0 {
+			return ""
+		}
+		base = addrs[0].String()
+	}
+	return base + "/p2p/" + r.h.ID().String()
+}
 
 // SetCodeResolver wires the share_code → api_key_id lookup after construction.
 func (r *Relay) SetCodeResolver(f func(shareCode string) (apiKeyID string, ok bool)) {
@@ -209,4 +224,3 @@ func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
 	}
 	return priv, nil
 }
-

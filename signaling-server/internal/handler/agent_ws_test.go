@@ -355,6 +355,22 @@ func TestAgentWS_authOkIssuesRelayInfoToBrowser(t *testing.T) {
 	browserConn.CloseNow()
 }
 
+func TestRegisterRelayPeerID_registersDecodedPeerID(t *testing.T) {
+	reg := relay.NewAgentRegistry()
+
+	agentPrivKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	agentPeerID, err := peer.IDFromPrivateKey(agentPrivKey)
+	require.NoError(t, err)
+
+	err = registerRelayPeerID(reg, "api-key-123", agentPeerID.String())
+	require.NoError(t, err)
+
+	got, ok := reg.Lookup("api-key-123")
+	require.True(t, ok)
+	assert.Equal(t, agentPeerID, got)
+}
+
 // newTestRelay creates a relay instance for testing.
 func newTestRelay(t *testing.T) *relay.Relay {
 	t.Helper()

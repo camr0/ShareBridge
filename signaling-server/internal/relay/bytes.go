@@ -18,8 +18,10 @@ type ByteTracker struct {
 	// aclEntries maps browser peer ID to ACL entry (authorization info)
 	aclEntries map[peer.ID]*circuitEntry
 
-	// activeBrowser is the browser peer ID that currently has an open circuit.
-	// Only one circuit per browser at a time (browser is single-threaded).
+	// activeBrowser is the browser peer ID that currently has the only open
+	// relayed circuit. circuitv2's metrics callback reports bytes without peer
+	// context, so we refuse a second simultaneous browser circuit rather than
+	// smear quota usage across users.
 	activeBrowser peer.ID
 
 	// byteCounts maps browser peer ID to cumulative bytes transferred.
@@ -36,9 +38,9 @@ type ByteTracker struct {
 // NewByteTracker creates a new byte tracker with the given TTL.
 func NewByteTracker(ttl time.Duration) *ByteTracker {
 	return &ByteTracker{
-		aclEntries:  make(map[peer.ID]*circuitEntry),
-		byteCounts:  make(map[peer.ID]int64),
-		ttl:         ttl,
+		aclEntries: make(map[peer.ID]*circuitEntry),
+		byteCounts: make(map[peer.ID]int64),
+		ttl:        ttl,
 	}
 }
 
@@ -64,7 +66,11 @@ func (bt *ByteTracker) AllowConnect(src peer.ID, _ multiaddr.Multiaddr, dst peer
 		return false
 	}
 
-	// Record this browser as active for byte attribution
+	if bt.activeBrowser != "" && bt.activeBrowser != src {
+		return false
+	}
+
+	// Record this browser as active for byte attribution.
 	bt.activeBrowser = src
 
 	return entry.AgentPeerID == dst

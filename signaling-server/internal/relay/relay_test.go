@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,4 +93,26 @@ func TestRelay_startRegistersAuthHandler(t *testing.T) {
 		t.Fatalf("NewStream after Start: %v", err)
 	}
 	s.Close()
+}
+
+func TestRelay_advertiseAddrFallsBackToListenAddr(t *testing.T) {
+	rly, err := New(context.Background(), Config{
+		ListenAddr: "/ip4/127.0.0.1/tcp/0",
+		JWTSecret:  []byte("test-secret-do-not-use-in-prod-abcd1234"),
+		JWTTTL:     time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer rly.Close()
+
+	rly.Start()
+
+	got := rly.AdvertiseAddr()
+	if got == "" {
+		t.Fatal("AdvertiseAddr() returned empty string")
+	}
+	if !strings.HasPrefix(got, "/ip4") {
+		t.Fatalf("AdvertiseAddr() should fall back to a dialable host addr, got %q", got)
+	}
 }

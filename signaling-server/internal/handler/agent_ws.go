@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -26,6 +27,7 @@ import (
 type agentMsg struct {
 	Type        string     `json:"type"`
 	AgentID     string     `json:"agent_id,omitempty"`
+	PeerID      string     `json:"peer_id,omitempty"`
 	Code        string     `json:"code,omitempty"`
 	ShareURL    string     `json:"share_url,omitempty"` // received for protocol compat, not stored
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
@@ -72,6 +74,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, rly *relay.Relay) htt
 				if agentID != "" {
 					log.Printf("agent disconnected: %s (agent_id: %s)", apiKeyID, agentID)
 					h.UnregisterAgent(apiKeyID)
+					rly.Agents().Unregister(apiKeyID)
 				}
 				return
 			}
@@ -83,6 +86,13 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, rly *relay.Relay) htt
 
 			switch msg.Type {
 			case "hello":
+				if err := registerRelayPeerID(rly.Agents(), apiKeyID, msg.PeerID); err != nil {
+					hub.SendDirect(ctx, conn, map[string]string{
+						"type":    "error",
+						"message": err.Error(),
+					})
+					continue
+				}
 				handleHello(ctx, conn, h, apiKeyID, accountID, msg.AgentID, cfg, rly)
 				agentID = msg.AgentID
 
@@ -145,7 +155,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, rly *relay.Relay) htt
 				}
 				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
 					"type":            "relay_info",
-					"relay_multiaddr": cfg.RelayAnnounceAddr + "/p2p/" + rly.Host().ID().String(),
+					"relay_multiaddr": rly.AdvertiseAddr(),
 					"agent_peer_id":   agentPeerID.String(),
 					"jwt":             tok,
 					"relay_allowed":   !quotaExceeded,
@@ -204,9 +214,21 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 
 	hub.SendDirect(ctx, conn, map[string]any{
 		"type":            "welcome",
-		"relay_multiaddr": cfg.RelayAnnounceAddr + "/p2p/" + rly.Host().ID().String(),
+		"relay_multiaddr": rly.AdvertiseAddr(),
 		"stun_servers":    []string{"stun:stun.cloudflare.com:3478"},
 	})
+}
+
+func registerRelayPeerID(reg *relay.AgentRegistry, apiKeyID, peerID string) error {
+	if peerID == "" {
+		return nil
+	}
+	pid, err := peer.Decode(peerID)
+	if err != nil {
+		return errors.New("invalid peer_id")
+	}
+	reg.Register(apiKeyID, pid)
+	return nil
 }
 
 // handleRegisterShare processes share registration (new or reconnect)
