@@ -68,6 +68,7 @@ type TransportInterface interface {
 	DialRelay(ctx context.Context, relayMultiaddr string) error
 	OnStream(h transport.StreamHandler)
 	PeerID() string
+	Ready() bool
 	Close() error
 }
 
@@ -397,7 +398,9 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	switch msg.Type {
 	case "welcome":
 		log.Println("agent authenticated with signaling server")
+		d.mu.Lock()
 		d.signalingConnected = true
+		d.mu.Unlock()
 		relayMA := d.signaling.GetRelayMultiaddr()
 		if relayMA == "" {
 			log.Printf("welcome missing relay_multiaddr — transport will be unreachable")
@@ -539,7 +542,9 @@ func (d *Daemon) sendAuthOK(connID, sessionCode string) {
 
 // handleIncomingStream is invoked by Transport for each inbound file stream.
 // Framing: the first frame on the stream is a FrameText JSON envelope
-//   {"type":"open","share_code":"<code>","conn_id":"<id>"}
+//
+//	{"type":"open","share_code":"<code>","conn_id":"<id>"}
+//
 // The agent looks up the session, attaches a transfer.Manager, and serves.
 func (d *Daemon) handleIncomingStream(info transport.StreamInfo) {
 	stream := info.Stream
@@ -739,7 +744,10 @@ func (d *Daemon) pruneExpiredSessions() {
 
 // IsConnected returns whether the daemon has authenticated with the signaling server.
 func (d *Daemon) IsConnected() bool {
-	return d.signalingConnected
+	d.mu.RLock()
+	signalingConnected := d.signalingConnected
+	d.mu.RUnlock()
+	return signalingConnected && d.transport != nil && d.transport.Ready()
 }
 
 // GetConfig returns a copy of the current configuration.

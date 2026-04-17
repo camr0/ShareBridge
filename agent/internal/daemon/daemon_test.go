@@ -114,6 +114,7 @@ type mockTransport struct {
 	dialRelay   func(ctx context.Context, relayMultiaddr string) error
 	dialRelayed bool
 	dialedAddr  string
+	ready       bool
 	mu          sync.Mutex
 }
 
@@ -150,6 +151,12 @@ func (m *mockTransport) Close() error {
 	return nil
 }
 
+func (m *mockTransport) Ready() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ready
+}
+
 func (m *mockTransport) getOnStream() transport.StreamHandler {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -158,16 +165,16 @@ func (m *mockTransport) getOnStream() transport.StreamHandler {
 
 // mockSignalingClient implements SignalingClientInterface for testing.
 type mockSignalingClient struct {
-	mu            sync.Mutex
-	serverURL     string
-	apiKey        string
-	agentID       string
-	connected     bool
-	onMessage     func(signaling.Message)
+	mu             sync.Mutex
+	serverURL      string
+	apiKey         string
+	agentID        string
+	connected      bool
+	onMessage      func(signaling.Message)
 	relayMultiaddr string
-	registerShare func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
-	sendMessages  []map[string]any
-	codeCounter   int // Counter for generating unique codes
+	registerShare  func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
+	sendMessages   []map[string]any
+	codeCounter    int // Counter for generating unique codes
 }
 
 func newMockSignalingClient(serverURL, apiKey, agentID string) *mockSignalingClient {
@@ -805,7 +812,7 @@ func TestLoadSessionsFromStore(t *testing.T) {
 
 	tr := newMockTransport()
 
-		d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -887,7 +894,7 @@ func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
 
 	tr := newMockTransport()
 
-		d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
+	d, err := NewWithSignaling(cfgMgr, st, sigClient, tr)
 	if err != nil {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
@@ -1043,6 +1050,28 @@ func TestWelcome_DialsRelay(t *testing.T) {
 
 	if tr.dialedAddr != sig.relayMultiaddr {
 		t.Errorf("expected relay dial to %s, got %s", sig.relayMultiaddr, tr.dialedAddr)
+	}
+}
+
+func TestIsConnected_RequiresRelayReady(t *testing.T) {
+	sig := newMockSignalingClient("ws://localhost:8080", "test-key", "test-agent")
+	sig.relayMultiaddr = "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooRelayTest"
+	tr := newMockTransport()
+	d := newTestDaemon(t, sig, tr)
+
+	d.handleSignalingMessage(signaling.Message{Type: "welcome"})
+	time.Sleep(50 * time.Millisecond)
+
+	if d.IsConnected() {
+		t.Fatal("IsConnected should stay false until the relay reservation is ready")
+	}
+
+	tr.mu.Lock()
+	tr.ready = true
+	tr.mu.Unlock()
+
+	if !d.IsConnected() {
+		t.Fatal("IsConnected should be true once signaling and relay are both ready")
 	}
 }
 
