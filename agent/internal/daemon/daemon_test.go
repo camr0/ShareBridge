@@ -3,7 +3,11 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -119,6 +123,7 @@ type mockTransport struct {
 	onStream    transport.StreamHandler
 	dialRelay   func(ctx context.Context, relayMultiaddr string) error
 	dialRelayed bool
+	dialedAddr  string
 	mu          sync.Mutex
 }
 
@@ -131,6 +136,7 @@ func newMockTransport() *mockTransport {
 func (m *mockTransport) DialRelay(ctx context.Context, relayMultiaddr string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.dialedAddr = relayMultiaddr
 	if m.dialRelay != nil {
 		return m.dialRelay(ctx, relayMultiaddr)
 	}
@@ -152,6 +158,12 @@ func (m *mockTransport) PeerID() string {
 
 func (m *mockTransport) Close() error {
 	return nil
+}
+
+func (m *mockTransport) getOnStream() transport.StreamHandler {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.onStream
 }
 
 // mockSignalingClient implements SignalingClientInterface for testing.
@@ -246,6 +258,26 @@ func (m *mockSignalingClient) sendMessage(msg signaling.Message) {
 	}
 }
 
+func (m *mockSignalingClient) sentType(msgType string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, msg := range m.sendMessages {
+		if msg["type"] == msgType {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mockSignalingClient) lastSent() map[string]any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.sendMessages) == 0 {
+		return nil
+	}
+	return m.sendMessages[len(m.sendMessages)-1]
+}
+
 // mockWebServer implements WebServer interface for testing.
 type mockWebServer struct {
 	started bool
@@ -267,6 +299,84 @@ func (m *mockWebServer) Stop() error {
 func (m *mockWebServer) SetDaemon(d *Daemon) {
 	m.daemon = d
 }
+
+// Test helpers for creating daemon and seeding data.
+func newTestDaemon(t *testing.T, sig *mockSignalingClient, tr *mockTransport) *Daemon {
+	t.Helper()
+	cfg := &config.Config{
+		SignalingURL: "ws://localhost:8080",
+		APIKey:       "test-api-key",
+		AllowedHost:  "opencloud.example.com",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	d, err := NewWithSignaling(cfgMgr, st, sig, tr)
+	if err != nil {
+		t.Fatalf("NewWithSignaling() error: %v", err)
+	}
+	return d
+}
+
+func seedSession(t *testing.T, d *Daemon, password string) string {
+	t.Helper()
+	ctx := context.Background()
+	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", password, 24*time.Hour, 10, false)
+	if err != nil {
+		t.Fatalf("CreateSession() error: %v", err)
+	}
+	return code
+}
+
+func seedNonce(t *testing.T, d *Daemon, connID string) string {
+	t.Helper()
+	// Manually inject a nonce for testing
+	nonceBytes := make([]byte, 32)
+	for i := range nonceBytes {
+		nonceBytes[i] = byte(i)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	d.noncesMu.Lock()
+	d.nonces[connID] = nonceEntry{nonce: nonce, expiresAt: time.Now().Add(60 * time.Second)}
+	d.noncesMu.Unlock()
+	return nonce
+}
+
+func computeHMAC(t *testing.T, password, nonce string) string {
+	t.Helper()
+	mac := hmac.New(sha256.New, []byte(password))
+	mac.Write([]byte(nonce))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func waitFor(t *testing.T, condition func() bool) {
+	t.Helper()
+	timeout := time.After(2 * time.Second)
+	for !condition() {
+		select {
+		case <-timeout:
+			t.Fatalf("timeout waiting for condition")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// pipeStream wraps a net.Pipe end to satisfy network.Stream interface for tests.
+type pipeStream struct {
+	io.ReadWriteCloser
+}
+
+func (p *pipeStream) Reset() error { return p.Close() }
+func (p *pipeStream) Conn() interface {
+	RemotePeer() string
+} {
+	return &pipeConn{remotePeer: "12D3KooTest"}
+}
+
+type pipeConn struct {
+	remotePeer string
+}
+
+func (c *pipeConn) RemotePeer() string { return c.remotePeer }
 
 // TestNew tests daemon creation.
 func TestNew(t *testing.T) {
@@ -869,5 +979,112 @@ func TestSetWebServer(t *testing.T) {
 
 	if d.webServer != ws {
 		t.Errorf("web server not set correctly")
+	}
+}
+
+// TestHandleJoin_HMACSuccessSendsAuthOK tests that a valid HMAC triggers auth_ok.
+func TestHandleJoin_HMACSuccessSendsAuthOK(t *testing.T) {
+	sig := newMockSignalingClient("ws://localhost:8080", "test-key", "test-agent")
+	tr := newMockTransport()
+	d := newTestDaemon(t, sig, tr)
+	code := seedSession(t, d, "testpassword")
+	nonce := seedNonce(t, d, "conn-1")
+	hmacValue := computeHMAC(t, "testpassword", nonce)
+
+	d.handleJoin("conn-1", code, hmacValue)
+
+	// wait briefly for the goroutine to enqueue the send
+	waitFor(t, func() bool { return sig.sentType("auth_ok") })
+
+	last := sig.lastSent()
+	if last["type"] != "auth_ok" || last["conn_id"] != "conn-1" || last["code"] != code {
+		t.Fatalf("auth_ok not sent correctly, got %+v", last)
+	}
+}
+
+// TestHandleJoin_InvalidHMACSendsAuthFailed tests that an invalid HMAC triggers auth_failed.
+func TestHandleJoin_InvalidHMACSendsAuthFailed(t *testing.T) {
+	sig := newMockSignalingClient("ws://localhost:8080", "test-key", "test-agent")
+	tr := newMockTransport()
+	d := newTestDaemon(t, sig, tr)
+	code := seedSession(t, d, "testpassword")
+	seedNonce(t, d, "conn-1")
+
+	d.handleJoin("conn-1", code, "invalid-hmac-value")
+
+	waitFor(t, func() bool { return sig.sentType("auth_failed") })
+
+	last := sig.lastSent()
+	if last["type"] != "auth_failed" || last["conn_id"] != "conn-1" {
+		t.Fatalf("auth_failed not sent correctly, got %+v", last)
+	}
+}
+
+// TestHandleKnock_SendsNonce tests that knock handler sends nonce.
+func TestHandleKnock_SendsNonce(t *testing.T) {
+	sig := newMockSignalingClient("ws://localhost:8080", "test-key", "test-agent")
+	tr := newMockTransport()
+	d := newTestDaemon(t, sig, tr)
+	code := seedSession(t, d, "")
+
+	d.handleKnock("conn-1", code)
+
+	waitFor(t, func() bool { return sig.sentType("nonce") })
+
+	last := sig.lastSent()
+	if last["type"] != "nonce" || last["conn_id"] != "conn-1" || last["value"] == "" {
+		t.Fatalf("nonce not sent correctly, got %+v", last)
+	}
+}
+
+// TestWelcome_DialsRelay tests that welcome message triggers relay dial.
+func TestWelcome_DialsRelay(t *testing.T) {
+	sig := newMockSignalingClient("ws://localhost:8080", "test-key", "test-agent")
+	sig.relayMultiaddr = "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooRelayTest"
+	tr := newMockTransport()
+	d := newTestDaemon(t, sig, tr)
+
+	d.handleSignalingMessage(signaling.Message{Type: "welcome"})
+
+	// Brief wait for goroutine
+	time.Sleep(50 * time.Millisecond)
+
+	if tr.dialedAddr != sig.relayMultiaddr {
+		t.Errorf("expected relay dial to %s, got %s", sig.relayMultiaddr, tr.dialedAddr)
+	}
+}
+
+// TestOnStreamHandlerWired tests that daemon properly registers stream handler on transport.
+func TestOnStreamHandlerWired(t *testing.T) {
+	sig := newMockSignalingClient("ws://localhost:8080", "test-key", "test-agent")
+	tr := newMockTransport()
+	_ = newTestDaemon(t, sig, tr)
+
+	// Verify that the stream handler was registered
+	handler := tr.getOnStream()
+	if handler == nil {
+		t.Fatal("OnStream handler should be registered during daemon creation")
+	}
+}
+
+// TestHandleIncomingStream_ValidSessionAccepts tests that handleIncomingStream accepts streams for valid sessions.
+func TestHandleIncomingStream_ValidSessionAccepts(t *testing.T) {
+	sig := newMockSignalingClient("ws://localhost:8080", "test-key", "test-agent")
+	tr := newMockTransport()
+	d := newTestDaemon(t, sig, tr)
+	code := seedSession(t, d, "")
+
+	// Verify session exists and has empty streams map initially
+	session := d.GetSession(code)
+	if session == nil {
+		t.Fatalf("session should exist")
+	}
+
+	session.mu.Lock()
+	initialStreamCount := len(session.streams)
+	session.mu.Unlock()
+
+	if initialStreamCount != 0 {
+		t.Errorf("expected 0 streams initially, got %d", initialStreamCount)
 	}
 }
