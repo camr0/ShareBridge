@@ -10,9 +10,14 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy web package files and build frontend
+# Copy web package files and install dependencies
 COPY web/package.json web/package-lock.json ./web/
-RUN cd web && npm ci && npm run build
+RUN cd web && npm ci
+
+# Copy web source files and build frontend
+COPY web/build.mjs ./web/
+COPY web/src ./web/src
+RUN cd web && npm run build
 
 # Copy source code
 COPY . .
@@ -28,7 +33,8 @@ RUN apk --no-cache add ca-certificates sqlite
 WORKDIR /app
 
 COPY --from=builder /app/server .
-COPY --from=builder /app/web ./web
+COPY --from=builder /app/web/app.bundle.js /app/web/app.bundle.js.map ./web/
+COPY --from=builder /app/web/*.html ./web/
 
 EXPOSE 8080
 

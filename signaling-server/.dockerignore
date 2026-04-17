@@ -1,0 +1,4 @@
+web/node_modules/
+web/app.bundle.js
+web/app.bundle.js.map
+.git/

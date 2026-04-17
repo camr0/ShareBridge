@@ -1,4 +1,4 @@
-.PHONY: web-build web-watch build test clean
+.PHONY: web-build web-watch build test clean all
 
 # Build the web frontend bundle
 web-build:
