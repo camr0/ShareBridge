@@ -20,7 +20,6 @@ type mockDaemonV1 struct {
 	mu       sync.Mutex
 	cfg      *config.Config
 	sessions map[string]*daemon.Session
-	hasTURN  bool
 }
 
 func newMockDaemonV1(cfg *config.Config) *mockDaemonV1 {
@@ -85,7 +84,6 @@ func (m *mockDaemonV1) RevokeSession(code string) error {
 	return nil
 }
 
-func (m *mockDaemonV1) HasTURN() bool                           { return m.hasTURN }
 func (m *mockDaemonV1) IsConnected() bool                       { return true }
 func (m *mockDaemonV1) GetUptime() time.Duration                { return time.Hour }
 func (m *mockDaemonV1) GetConfigPath() string                   { return "" }

@@ -27,7 +27,6 @@ type daemonProvider interface {
 	GetConfig() *config.Config
 	CreateSession(ctx context.Context, shareURL, shareType, password string, expiry time.Duration, maxDownloads int, relayOnly bool) (string, error)
 	RevokeSession(code string) error
-	HasTURN() bool
 	IsConnected() bool
 	GetUptime() time.Duration
 	GetConfigPath() string

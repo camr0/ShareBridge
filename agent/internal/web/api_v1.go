@@ -177,6 +177,6 @@ func (ws *WebServer) v1SettingsHandler(w http.ResponseWriter, r *http.Request) {
 		DefaultExpiryHours:  cfg.DefaultExpiry,
 		DefaultMaxDownloads: cfg.DefaultMaxDownloads,
 		DefaultRelayOnly:    cfg.DefaultRelayOnly,
-		TURNAvailable:       ws.daemon.HasTURN(),
+		TURNAvailable:       ws.daemon.IsConnected(),
 	})
 }

@@ -20,15 +20,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/webrtc/v4"
 	"github.com/spf13/cobra"
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/daemon"
-	"sharebridge/agent/internal/peer"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 	"sharebridge/agent/internal/transfer"
+	"sharebridge/agent/internal/transport"
 	"sharebridge/agent/internal/web"
 )
 
@@ -104,8 +103,20 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("session store: %w", err)
 	}
 
+	// Get or create libp2p private key
+	privKey, err := st.GetOrCreatePrivKey()
+	if err != nil {
+		return fmt.Errorf("get private key: %w", err)
+	}
+
+	// Create transport
+	tr, err := transport.New(context.Background(), transport.Options{PrivKey: privKey})
+	if err != nil {
+		return fmt.Errorf("create transport: %w", err)
+	}
+
 	// Create daemon
-	d, err := daemon.New(cfgMgr, st)
+	d, err := daemon.New(cfgMgr, st, tr)
 	if err != nil {
 		return fmt.Errorf("create daemon: %w", err)
 	}
@@ -350,6 +361,18 @@ func runShareSingle(shareURL string) error {
 func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebdav.Client, shareURL string, st *store.Store, preferredCode string, agentID string, relayOnly bool) (string, error) {
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
+	// Get or create libp2p private key
+	privKey, err := st.GetOrCreatePrivKey()
+	if err != nil {
+		return "", fmt.Errorf("get private key: %w", err)
+	}
+
+	// Create transport
+	tr, err := transport.New(ctx, transport.Options{PrivKey: privKey})
+	if err != nil {
+		return "", fmt.Errorf("create transport: %w", err)
+	}
+
 	if err := sig.Connect(ctx); err != nil {
 		return "", fmt.Errorf("connect to signaling server: %w", err)
 	}
@@ -386,19 +409,120 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 
 	var (
 		mu       sync.Mutex
-		peers    = make(map[string]*peer.Peer) // peerID -> Peer
-		nonces   = make(map[string]nonceEntry) // connID -> nonce
+		streams  = make(map[string]*transport.StreamAdapter) // connID -> adapter
+		nonces   = make(map[string]nonceEntry)               // connID -> nonce
 		noncesMu sync.Mutex
 	)
+
+	// Set up stream handler
+	tr.OnStream(func(info transport.StreamInfo) {
+		stream := info.Stream
+		kind, payload, err := transport.ReadFrame(stream)
+		if err != nil {
+			log.Printf("read open frame from %s: %v", info.Peer, err)
+			stream.Reset()
+			return
+		}
+		if kind != transport.FrameText {
+			log.Printf("first frame from %s is binary; expected text open envelope", info.Peer)
+			stream.Reset()
+			return
+		}
+		var env struct {
+			Type      string `json:"type"`
+			ShareCode string `json:"share_code"`
+			ConnID    string `json:"conn_id"`
+		}
+		if err := json.Unmarshal(payload, &env); err != nil || env.Type != "open" {
+			log.Printf("bad open envelope from %s: %v (raw=%s)", info.Peer, err, string(payload))
+			stream.Reset()
+			return
+		}
+
+		if env.ShareCode != code {
+			log.Printf("open for unknown session %s from %s", env.ShareCode, info.Peer)
+			stream.Reset()
+			return
+		}
+
+		adapter := transport.NewStreamAdapter(stream)
+		mu.Lock()
+		streams[env.ConnID] = adapter
+		mu.Unlock()
+
+		// Get persisted download count from store
+		existingSession := st.GetSession(code)
+		downloadCount := 0
+		if existingSession != nil {
+			downloadCount = existingSession.Downloads
+		}
+
+		tm := transfer.NewManager(adapter, webdavClient, cfg.MaxDownloads)
+		tm.SetDownloadCount(downloadCount)
+		tm.OnSessionExpired = func() {
+			if err := sig.Send(ctx, map[string]any{
+				"type":       "session_expired",
+				"session_id": code,
+				"peer_id":    env.ConnID,
+			}); err != nil {
+				log.Printf("send session_expired: %v", err)
+			}
+		}
+		tm.OnDownloadComplete = func(bytesTransferred int64) {
+			// Persist download count
+			if _, err := st.IncrementDownloads(code); err != nil {
+				log.Printf("warning: could not persist download count: %v", err)
+			}
+			// Notify server for tier tracking
+			if err := sig.DownloadComplete(ctx, code, bytesTransferred); err != nil {
+				log.Printf("warning: could not send download_complete: %v", err)
+			}
+		}
+
+		log.Printf("file stream open: session=%s conn=%s peer=%s", env.ShareCode, env.ConnID, info.Peer)
+		tm.HandleOpen()
+
+		// Read loop: decode frames and route text frames to the manager.
+		go func() {
+			defer func() {
+				mu.Lock()
+				delete(streams, env.ConnID)
+				mu.Unlock()
+				stream.Close()
+			}()
+			for {
+				kind, payload, err := transport.ReadFrame(stream)
+				if err != nil {
+					return
+				}
+				if kind == transport.FrameText {
+					tm.HandleMessage(payload)
+				}
+			}
+		}()
+	})
 
 	sig.OnMessage = func(msg signaling.Message) {
 		switch msg.Type {
 		case "welcome":
 			log.Println("agent authenticated with signaling server")
+			relayMA := sig.GetRelayMultiaddr()
+			if relayMA == "" {
+				log.Printf("welcome missing relay_multiaddr — transport will be unreachable")
+				return
+			}
+			go func() {
+				dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := tr.DialRelay(dialCtx, relayMA); err != nil {
+					log.Printf("dial relay %s: %v", relayMA, err)
+				} else {
+					log.Printf("connected to relay %s", relayMA)
+				}
+			}()
 
 		case "knock":
 			connID := msg.ConnID
-			// msg.Code is the session code — not needed for knock handling
 
 			// Generate 32 random bytes → 64-char hex nonce
 			nonceBytes := make([]byte, 32)
@@ -466,121 +590,13 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 				}
 			}
 
-			log.Printf("browser joined session %s (conn %s) — starting WebRTC handshake", sessionCode, connID)
-
-			iceServers := sig.GetICEServers()
-			if len(iceServers) == 0 {
-				log.Printf("warning: no ICE servers received, using default STUN")
-				iceServers = []webrtc.ICEServer{
-					{URLs: []string{"stun:stun.cloudflare.com:3478"}},
-				}
-			}
-			p, err := peer.New(iceServers, relayOnly)
-			if err != nil {
-				log.Printf("create peer: %v", err)
-				return
-			}
-
-			mu.Lock()
-			peers[connID] = p
-			mu.Unlock()
-
-			p.OnClosed = func() {
-				log.Printf("peer closed (conn %s, session %s)", connID, sessionCode)
-				mu.Lock()
-				delete(peers, connID)
-				mu.Unlock()
-			}
-			p.OnICECandidate = func(init webrtc.ICECandidateInit) {
-				if err := sig.Send(ctx, map[string]any{
-					"type":       "ice_candidate",
-					"session_id": sessionCode,
-					"peer_id":    connID,
-					"candidate":  init,
-				}); err != nil {
-					log.Printf("send ICE candidate: %v", err)
-				}
-			}
-
-			// Get persisted download count from store
-			existingSession := st.GetSession(code)
-			downloadCount := 0
-			if existingSession != nil {
-				downloadCount = existingSession.Downloads
-			}
-
-			tm := transfer.NewManager(p, webdavClient, cfg.MaxDownloads)
-			tm.SetDownloadCount(downloadCount)
-
-			// Wire callbacks before CreateOffer to avoid any race with a fast peer
-			tm.OnSessionExpired = func() {
-				if err := sig.Send(ctx, map[string]any{
-					"type":       "session_expired",
-					"session_id": sessionCode,
-					"peer_id":    connID,
-				}); err != nil {
-					log.Printf("send session_expired: %v", err)
-				}
-			}
-			tm.OnDownloadComplete = func(bytesTransferred int64) {
-				// Persist download count
-				if _, err := st.IncrementDownloads(code); err != nil {
-					log.Printf("warning: could not persist download count: %v", err)
-				}
-				// Notify server for tier tracking
-				if err := sig.DownloadComplete(ctx, code, bytesTransferred); err != nil {
-					log.Printf("warning: could not send download_complete: %v", err)
-				}
-			}
-			p.OnOpen = func() {
-				log.Printf("DataChannel open! (conn %s, session %s)", connID, sessionCode)
-				tm.HandleOpen()
-			}
-
-			// CreateOffer creates the DataChannel internally — SetOnMessage must come after
-			sdp, err := p.CreateOffer()
-			if err != nil {
-				log.Printf("create offer: %v", err)
-				return
-			}
-			p.SetOnMessage(tm.HandleMessage)
-
+			log.Printf("HMAC verified for session %s conn %s — sending auth_ok", sessionCode, connID)
 			if err := sig.Send(ctx, map[string]any{
-				"type":       "offer",
-				"session_id": sessionCode,
-				"peer_id":    connID,
-				"sdp":        sdp,
+				"type":    "auth_ok",
+				"conn_id": connID,
+				"code":    sessionCode,
 			}); err != nil {
-				log.Printf("send offer: %v", err)
-			}
-
-		case "answer":
-			mu.Lock()
-			p, ok := peers[msg.PeerID]
-			mu.Unlock()
-			if !ok {
-				log.Printf("answer for unknown peer %s", msg.PeerID)
-				return
-			}
-			if err := p.SetAnswer(msg.SDP); err != nil {
-				log.Printf("set answer: %v", err)
-			}
-
-		case "ice_candidate":
-			mu.Lock()
-			p, ok := peers[msg.PeerID]
-			mu.Unlock()
-			if !ok {
-				log.Printf("ICE candidate for unknown peer %s", msg.PeerID)
-				return
-			}
-			var init webrtc.ICECandidateInit
-			if err := json.Unmarshal(msg.Candidate, &init); err != nil {
-				log.Printf("parse ICE candidate: %v", err)
-				return
-			}
-			if err := p.AddICECandidate(init); err != nil {
-				log.Printf("add ICE candidate: %v", err)
+				log.Printf("send auth_ok: %v", err)
 			}
 
 		case "error":
@@ -590,8 +606,20 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 
 	log.Println("waiting for browser connections (Ctrl-C to stop)...")
 	if err := sig.Listen(ctx); err != nil {
+		// Close transport before returning
+		tr.Close()
 		return code, fmt.Errorf("signaling disconnected: %w", err)
 	}
+
+	// Close all streams and transport
+	mu.Lock()
+	for connID, adapter := range streams {
+		if err := adapter.Close(); err != nil {
+			log.Printf("close stream %s: %v", connID, err)
+		}
+	}
+	mu.Unlock()
+	tr.Close()
 
 	return code, nil
 }

@@ -217,15 +217,17 @@ func (ws *WebServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// turnStatusHandler returns TURN server availability as JSON.
+// turnStatusHandler returns relay connection status as JSON.
+// Note: With libp2p transport, this now reports signaling connection status
+// which includes relay availability. The endpoint name is legacy.
 func (ws *WebServer) turnStatusHandler(w http.ResponseWriter, r *http.Request) {
-	hasTurn := false
+	connected := false
 	if ws.daemon != nil {
-		hasTurn = ws.daemon.HasTURN()
+		connected = ws.daemon.IsConnected()
 	}
 
 	response := map[string]bool{
-		"available": hasTurn,
+		"available": connected,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

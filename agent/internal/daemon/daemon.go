@@ -10,17 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/pion/webrtc/v4"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
-	"sharebridge/agent/internal/peer"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 	"sharebridge/agent/internal/transfer"
+	"sharebridge/agent/internal/transport"
 )
 
 // nonceEntry holds a per-connection nonce for HMAC pre-challenge.
@@ -45,6 +44,7 @@ type ConfigManagerInterface interface {
 // StoreInterface defines the interface for session storage.
 type StoreInterface interface {
 	GetAgentID() string
+	GetOrCreatePrivKey() (crypto.PrivKey, error)
 	GetSession(code string) *store.SessionEntry
 	GetByShareURL(shareURL string) *store.SessionEntry
 	ListSessions(filterExpired bool) []store.SessionEntry
@@ -59,9 +59,17 @@ type SignalingClientInterface interface {
 	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
 	DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error
 	Send(ctx context.Context, msg any) error
-	GetICEServers() []webrtc.ICEServer
+	GetRelayMultiaddr() string
 	Listen(ctx context.Context) error
 	SetOnMessage(handler func(signaling.Message))
+}
+
+// TransportInterface defines the subset of transport.Transport the daemon uses.
+type TransportInterface interface {
+	DialRelay(ctx context.Context, relayMultiaddr string) error
+	OnStream(h transport.StreamHandler)
+	PeerID() string
+	Close() error
 }
 
 // Session represents an active share session with WebRTC peers.
@@ -78,7 +86,7 @@ type Session struct {
 	CreatedAt    time.Time
 
 	webdavClient *cloudwebdav.Client
-	peers        map[string]*peer.Peer // peerID -> Peer
+	streams      map[string]*transport.StreamAdapter // connID → adapter
 	mu           sync.Mutex
 }
 
@@ -89,13 +97,13 @@ type Daemon struct {
 	configMgr ConfigManagerInterface
 	store     StoreInterface
 	signaling SignalingClientInterface
+	transport TransportInterface
 	sessions  map[string]*Session // code -> Session
 	mu        sync.RWMutex
 
 	webServer          WebServer
 	startTime          time.Time
 	signalingConnected bool // true once welcome received
-	hasTURN            bool
 
 	// Nonce store for HMAC pre-challenge (connID -> nonce)
 	nonces   map[string]nonceEntry
@@ -107,36 +115,42 @@ type Daemon struct {
 }
 
 // New creates a new Daemon with the given config manager and store.
-func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
+func New(cfgMgr ConfigManagerInterface, st StoreInterface, tr TransportInterface) (*Daemon, error) {
 	cfg := cfgMgr.Get()
 	agentID := st.GetAgentID()
 
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
-	return &Daemon{
+	d := &Daemon{
 		config:    cfg,
 		configMgr: cfgMgr,
 		store:     st,
 		signaling: sig,
+		transport: tr,
 		sessions:  make(map[string]*Session),
 		nonces:    make(map[string]nonceEntry),
 		startTime: time.Now(),
-	}, nil
+	}
+	tr.OnStream(d.handleIncomingStream)
+	return d, nil
 }
 
 // NewWithSignaling creates a new Daemon with a custom signaling client.
 // This is useful for testing or custom signaling implementations.
-func NewWithSignaling(cfgMgr ConfigManagerInterface, st StoreInterface, sig SignalingClientInterface) (*Daemon, error) {
+func NewWithSignaling(cfgMgr ConfigManagerInterface, st StoreInterface, sig SignalingClientInterface, tr TransportInterface) (*Daemon, error) {
 	cfg := cfgMgr.Get()
 
-	return &Daemon{
+	d := &Daemon{
 		config:    cfg,
 		configMgr: cfgMgr,
 		store:     st,
 		signaling: sig,
+		transport: tr,
 		sessions:  make(map[string]*Session),
 		nonces:    make(map[string]nonceEntry),
-	}, nil
+	}
+	tr.OnStream(d.handleIncomingStream)
+	return d, nil
 }
 
 // SetWebServer sets the web server instance. Called after web server creation
@@ -198,16 +212,21 @@ func (d *Daemon) Stop() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Close all peer connections
+	// Close all streams
 	for _, session := range d.sessions {
 		session.mu.Lock()
-		for peerID, peerConn := range session.peers {
-			if err := peerConn.Close(); err != nil {
-				log.Printf("close peer %s: %v", peerID, err)
+		for connID, adapter := range session.streams {
+			if err := adapter.Close(); err != nil {
+				log.Printf("close stream %s: %v", connID, err)
 			}
 		}
-		session.peers = make(map[string]*peer.Peer)
+		session.streams = make(map[string]*transport.StreamAdapter)
 		session.mu.Unlock()
+	}
+	if d.transport != nil {
+		if err := d.transport.Close(); err != nil {
+			log.Printf("close transport: %v", err)
+		}
 	}
 
 	// Stop web server
@@ -272,7 +291,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 		RelayOnly:    relayOnly,
 		CreatedAt:    now,
 		webdavClient: webdavClient,
-		peers:        make(map[string]*peer.Peer),
+		streams:      make(map[string]*transport.StreamAdapter),
 	}
 
 	// Add to in-memory map
@@ -311,7 +330,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 }
 
 // RevokeSession removes a session by code, deregistering it from the
-// signaling server and closing all peer connections.
+// signaling server and closing all streams.
 func (d *Daemon) RevokeSession(code string) error {
 	d.mu.Lock()
 	session, ok := d.sessions[code]
@@ -322,11 +341,11 @@ func (d *Daemon) RevokeSession(code string) error {
 	delete(d.sessions, code)
 	d.mu.Unlock()
 
-	// Close all peer connections
+	// Close all streams
 	session.mu.Lock()
-	for peerID, peerConn := range session.peers {
-		if err := peerConn.Close(); err != nil {
-			log.Printf("close peer %s: %v", peerID, err)
+	for connID, adapter := range session.streams {
+		if err := adapter.Close(); err != nil {
+			log.Printf("close stream %s: %v", connID, err)
 		}
 	}
 	session.mu.Unlock()
@@ -378,20 +397,26 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	case "welcome":
 		log.Println("agent authenticated with signaling server")
 		d.signalingConnected = true
-		iceServers := d.signaling.GetICEServers()
-		d.hasTURN = hasTURNServer(iceServers)
+		relayMA := d.signaling.GetRelayMultiaddr()
+		if relayMA == "" {
+			log.Printf("welcome missing relay_multiaddr — transport will be unreachable")
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := d.transport.DialRelay(ctx, relayMA); err != nil {
+				log.Printf("dial relay %s: %v", relayMA, err)
+			} else {
+				log.Printf("connected to relay %s", relayMA)
+			}
+		}()
 
 	case "knock":
 		go d.handleKnock(msg.ConnID, msg.Code)
 
 	case "join":
 		go d.handleJoin(msg.ConnID, msg.Code, msg.HMAC)
-
-	case "answer":
-		d.handleAnswer(msg.PeerID, msg.SDP)
-
-	case "ice_candidate":
-		d.handleICECandidate(msg.PeerID, msg.Candidate)
 
 	case "error":
 		log.Printf("signaling error: %s", msg.Err)
@@ -485,186 +510,117 @@ func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
 		}
 	}
 
-	log.Printf("HMAC verified for session %s conn %s — creating peer", sessionCode, connID)
-	go d.createPeer(connID, sessionCode)
+	log.Printf("HMAC verified for session %s conn %s — sending auth_ok", sessionCode, connID)
+	go d.sendAuthOK(connID, sessionCode)
 }
 
-// createPeer creates a WebRTC peer connection for a browser joining a session.
-func (d *Daemon) createPeer(connID, sessionCode string) {
+// sendAuthOK notifies the signaling server that a browser cleared the HMAC
+// pre-challenge. The server uses this as the trigger to issue a JWT and
+// return relay_multiaddr + token to the browser. The browser then dials the
+// relay, which validates the JWT and opens a circuit to this agent; the
+// stream arrives via handleIncomingStream.
+func (d *Daemon) sendAuthOK(connID, sessionCode string) {
 	d.mu.RLock()
-	session, ok := d.sessions[sessionCode]
+	_, ok := d.sessions[sessionCode]
 	d.mu.RUnlock()
-
 	if !ok {
-		log.Printf("join for unknown session %s", sessionCode)
+		log.Printf("sendAuthOK for unknown session %s", sessionCode)
 		return
 	}
-
-	log.Printf("browser joined session %s (conn %s) - starting WebRTC handshake", sessionCode, connID)
-
-	// Get ICE servers from signaling client
-	iceServers := d.signaling.GetICEServers()
-	if len(iceServers) == 0 {
-		log.Printf("warning: no ICE servers received, using default STUN")
-		iceServers = []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.cloudflare.com:3478"}},
-		}
+	if err := d.signaling.Send(context.Background(), map[string]any{
+		"type":    "auth_ok",
+		"conn_id": connID,
+		"code":    sessionCode,
+	}); err != nil {
+		log.Printf("send auth_ok for session %s conn %s: %v", sessionCode, connID, err)
 	}
+}
 
-	// Create new peer connection
-	p, err := peer.New(iceServers, session.RelayOnly)
+// handleIncomingStream is invoked by Transport for each inbound file stream.
+// Framing: the first frame on the stream is a FrameText JSON envelope
+//   {"type":"open","share_code":"<code>","conn_id":"<id>"}
+// The agent looks up the session, attaches a transfer.Manager, and serves.
+func (d *Daemon) handleIncomingStream(info transport.StreamInfo) {
+	stream := info.Stream
+	kind, payload, err := transport.ReadFrame(stream)
 	if err != nil {
-		log.Printf("create peer for session %s: %v", sessionCode, err)
+		log.Printf("read open frame from %s: %v", info.Peer, err)
+		stream.Reset()
+		return
+	}
+	if kind != transport.FrameText {
+		log.Printf("first frame from %s is binary; expected text open envelope", info.Peer)
+		stream.Reset()
+		return
+	}
+	var env struct {
+		Type      string `json:"type"`
+		ShareCode string `json:"share_code"`
+		ConnID    string `json:"conn_id"`
+	}
+	if err := json.Unmarshal(payload, &env); err != nil || env.Type != "open" {
+		log.Printf("bad open envelope from %s: %v (raw=%s)", info.Peer, err, string(payload))
+		stream.Reset()
 		return
 	}
 
-	// Add peer to session
+	d.mu.RLock()
+	session, ok := d.sessions[env.ShareCode]
+	d.mu.RUnlock()
+	if !ok {
+		log.Printf("open for unknown session %s from %s", env.ShareCode, info.Peer)
+		stream.Reset()
+		return
+	}
+
+	adapter := transport.NewStreamAdapter(stream)
 	session.mu.Lock()
-	session.peers[connID] = p
+	session.streams[env.ConnID] = adapter
 	session.mu.Unlock()
 
-	// Set up peer callbacks
-	p.OnClosed = func() {
-		log.Printf("peer %s closed (session %s)", connID, sessionCode)
-		session.mu.Lock()
-		delete(session.peers, connID)
-		session.mu.Unlock()
-	}
-
-	p.OnICECandidate = func(init webrtc.ICECandidateInit) {
-		d.signaling.Send(context.Background(), map[string]any{
-			"type":       "ice_candidate",
-			"session_id": sessionCode,
-			"peer_id":    connID,
-			"candidate":  init,
-		})
-	}
-
-	// Create transfer manager
-	tm := transfer.NewManager(p, session.webdavClient, session.MaxDownloads)
+	tm := transfer.NewManager(adapter, session.webdavClient, session.MaxDownloads)
 	tm.SetDownloadCount(session.Downloads)
-
-	// Wire transfer callbacks
 	tm.OnSessionExpired = func() {
 		d.signaling.Send(context.Background(), map[string]any{
 			"type":       "session_expired",
-			"session_id": sessionCode,
-			"peer_id":    connID,
+			"session_id": env.ShareCode,
+			"peer_id":    env.ConnID,
 		})
 	}
 	tm.OnDownloadComplete = func(bytesTransferred int64) {
-		// Update session download count
 		session.mu.Lock()
 		session.Downloads++
 		newCount := session.Downloads
 		session.mu.Unlock()
-
-		// Persist to store
-		if _, err := d.store.IncrementDownloads(sessionCode); err != nil {
+		if _, err := d.store.IncrementDownloads(env.ShareCode); err != nil {
 			log.Printf("warning: could not persist download count: %v", err)
 		}
-
-		// Notify server for tier tracking
-		d.signaling.DownloadComplete(context.Background(), sessionCode, bytesTransferred)
-
-		log.Printf("download complete for session %s (count: %d)", sessionCode, newCount)
+		d.signaling.DownloadComplete(context.Background(), env.ShareCode, bytesTransferred)
+		log.Printf("download complete for session %s (count: %d)", env.ShareCode, newCount)
 	}
 
-	p.OnOpen = func() {
-		log.Printf("DataChannel open for peer %s (session %s)", connID, sessionCode)
-		tm.HandleOpen()
-	}
+	log.Printf("file stream open: session=%s conn=%s peer=%s", env.ShareCode, env.ConnID, info.Peer)
+	tm.HandleOpen()
 
-	// Create offer and send to signaling server
-	sdp, err := p.CreateOffer()
-	if err != nil {
-		log.Printf("create offer for session %s: %v", sessionCode, err)
-		return
-	}
-	p.SetOnMessage(tm.HandleMessage)
-
-	d.signaling.Send(context.Background(), map[string]any{
-		"type":       "offer",
-		"session_id": sessionCode,
-		"peer_id":    connID,
-		"sdp":        sdp,
-	})
-}
-
-// handleAnswer applies the browser's SDP answer to the peer connection.
-func (d *Daemon) handleAnswer(peerID, sdp string) {
-	// Find the session containing this peer
-	d.mu.RLock()
-	var session *Session
-	for _, sess := range d.sessions {
-		sess.mu.Lock()
-		if _, ok := sess.peers[peerID]; ok {
-			session = sess
-			sess.mu.Unlock()
-			break
+	// Read loop: decode frames and route text frames to the manager.
+	go func() {
+		defer func() {
+			session.mu.Lock()
+			delete(session.streams, env.ConnID)
+			session.mu.Unlock()
+			stream.Close()
+		}()
+		for {
+			kind, payload, err := transport.ReadFrame(stream)
+			if err != nil {
+				return
+			}
+			if kind == transport.FrameText {
+				tm.HandleMessage(payload)
+			}
+			// Binary frames from browser are unexpected today; ignored.
 		}
-		sess.mu.Unlock()
-	}
-	d.mu.RUnlock()
-
-	if session == nil {
-		log.Printf("answer for unknown peer %s", peerID)
-		return
-	}
-
-	session.mu.Lock()
-	p, ok := session.peers[peerID]
-	session.mu.Unlock()
-
-	if !ok {
-		log.Printf("peer %s not found in session", peerID)
-		return
-	}
-
-	if err := p.SetAnswer(sdp); err != nil {
-		log.Printf("set answer for peer %s: %v", peerID, err)
-	}
-}
-
-// handleICECandidate adds an ICE candidate to the peer connection.
-func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
-	// Find the session containing this peer
-	d.mu.RLock()
-	var session *Session
-	for _, sess := range d.sessions {
-		sess.mu.Lock()
-		if _, ok := sess.peers[peerID]; ok {
-			session = sess
-			sess.mu.Unlock()
-			break
-		}
-		sess.mu.Unlock()
-	}
-	d.mu.RUnlock()
-
-	if session == nil {
-		log.Printf("ICE candidate for unknown peer %s", peerID)
-		return
-	}
-
-	session.mu.Lock()
-	p, ok := session.peers[peerID]
-	session.mu.Unlock()
-
-	if !ok {
-		log.Printf("peer %s not found in session", peerID)
-		return
-	}
-
-	var init webrtc.ICECandidateInit
-	if err := json.Unmarshal(candidate, &init); err != nil {
-		log.Printf("parse ICE candidate for peer %s: %v", peerID, err)
-		return
-	}
-
-	if err := p.AddICECandidate(init); err != nil {
-		log.Printf("add ICE candidate for peer %s: %v", peerID, err)
-	}
+	}()
 }
 
 // loadSessionsFromStore loads persisted sessions from the store and
@@ -706,7 +662,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			RelayOnly:    entry.RelayOnly,
 			CreatedAt:    entry.CreatedAt,
 			webdavClient: webdavClient,
-			peers:        make(map[string]*peer.Peer),
+			streams:      make(map[string]*transport.StreamAdapter),
 		}
 
 		d.mu.Lock()
@@ -748,11 +704,11 @@ func (d *Daemon) pruneExpiredSessions() {
 		if !session.ExpiresAt.IsZero() && session.ExpiresAt.Before(now) {
 			log.Printf("session %s expired at %s", code, session.ExpiresAt)
 
-			// Close all peer connections
+			// Close all streams
 			session.mu.Lock()
-			for peerID, peerConn := range session.peers {
-				if err := peerConn.Close(); err != nil {
-					log.Printf("close peer %s: %v", peerID, err)
+			for connID, adapter := range session.streams {
+				if err := adapter.Close(); err != nil {
+					log.Printf("close stream %s: %v", connID, err)
 				}
 			}
 			session.mu.Unlock()
@@ -782,11 +738,6 @@ func (d *Daemon) pruneExpiredSessions() {
 // IsConnected returns whether the daemon has authenticated with the signaling server.
 func (d *Daemon) IsConnected() bool {
 	return d.signalingConnected
-}
-
-// HasTURN returns whether TURN servers are available.
-func (d *Daemon) HasTURN() bool {
-	return d.hasTURN
 }
 
 // GetConfig returns a copy of the current configuration.
@@ -825,16 +776,4 @@ func (d *Daemon) SaveConfig(cfg *config.Config) error {
 		}
 	}
 	return nil
-}
-
-// hasTURNServer checks if any ICE server is a TURN server.
-func hasTURNServer(servers []webrtc.ICEServer) bool {
-	for _, server := range servers {
-		for _, url := range server.URLs {
-			if strings.HasPrefix(url, "turn:") || strings.HasPrefix(url, "turns:") {
-				return true
-			}
-		}
-	}
-	return false
 }

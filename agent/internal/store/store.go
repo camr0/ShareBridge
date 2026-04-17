@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/libp2p/go-libp2p/core/crypto"
 )
 
 // SessionEntry represents a single share session with full metadata.
@@ -29,8 +30,9 @@ type SessionEntry struct {
 }
 
 type storeData struct {
-	AgentID  string         `json:"agent_id"` // UUID for reconnection
-	Sessions []SessionEntry `json:"sessions"`
+	AgentID   string         `json:"agent_id"` // UUID for reconnection
+	PrivKey   []byte         `json:"priv_key,omitempty"` // libp2p identity key (marshaled)
+	Sessions  []SessionEntry `json:"sessions"`
 }
 
 type Store struct {
@@ -88,6 +90,38 @@ func (s *Store) GetAgentID() string {
 	}
 
 	return s.data.AgentID
+}
+
+// GetOrCreatePrivKey returns the libp2p private key, generating one if it doesn't exist.
+// The key is persisted to disk for reuse across restarts.
+func (s *Store) GetOrCreatePrivKey() (crypto.PrivKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.data.PrivKey != nil {
+		privKey, err := crypto.UnmarshalPrivateKey(s.data.PrivKey)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal private key: %w", err)
+		}
+		return privKey, nil
+	}
+
+	// Generate a new Ed25519 private key
+	privKey, _, err := crypto.GenerateEd25519Key(nil)
+	if err != nil {
+		return nil, fmt.Errorf("generate private key: %w", err)
+	}
+
+	keyBytes, err := crypto.MarshalPrivateKey(privKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshal private key: %w", err)
+	}
+	s.data.PrivKey = keyBytes
+	if err := s.save(); err != nil {
+		log.Printf("failed to persist private key: %v", err)
+	}
+
+	return privKey, nil
 }
 
 // GetSession returns the session for a given code, or nil if not found.

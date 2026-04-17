@@ -23,7 +23,6 @@ func (m *mockDaemonMiddleware) CreateSession(_ context.Context, _, _, _ string, 
 	return "", nil
 }
 func (m *mockDaemonMiddleware) RevokeSession(string) error              { return nil }
-func (m *mockDaemonMiddleware) HasTURN() bool                           { return false }
 func (m *mockDaemonMiddleware) IsConnected() bool                       { return false }
 func (m *mockDaemonMiddleware) GetUptime() time.Duration                { return 0 }
 func (m *mockDaemonMiddleware) GetConfigPath() string                   { return "" }
