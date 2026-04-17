@@ -28,3 +28,35 @@ func TestNewHost_startsAndStops(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestNewHost_persistsIdentity(t *testing.T) {
+	tmp := t.TempDir()
+	keyPath := tmp + "/relay.key"
+
+	r1, err := New(context.Background(), Config{
+		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
+		PrivateKeyPath: keyPath,
+		JWTSecret:      []byte("test-secret-do-not-use-in-prod-abcd1234"),
+		JWTTTL:         time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	firstID := r1.Host().ID()
+	r1.Close()
+
+	r2, err := New(context.Background(), Config{
+		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
+		PrivateKeyPath: keyPath,
+		JWTSecret:      []byte("test-secret-do-not-use-in-prod-abcd1234"),
+		JWTTTL:         time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	defer r2.Close()
+
+	if r2.Host().ID() != firstID {
+		t.Fatalf("peer ID changed across restart: %s != %s", firstID, r2.Host().ID())
+	}
+}
