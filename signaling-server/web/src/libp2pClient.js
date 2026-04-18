@@ -25,7 +25,26 @@ export async function createNode() {
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
     services: { identify: identify() },
+    connectionGater: createConnectionGater(globalThis.location?.hostname ?? ''),
   });
+}
+
+export function createConnectionGater(currentHostname) {
+  return {
+    denyDialMultiaddr(targetMultiaddr) {
+      const addr = targetMultiaddr.toString();
+
+      if (isLoopbackPage(currentHostname) && isLoopbackMultiaddr(addr)) {
+        return false;
+      }
+
+      if (isInsecureWebSocket(addr)) {
+        return true;
+      }
+
+      return isPrivateMultiaddr(addr);
+    },
+  };
 }
 
 // getLocalPeerId: call before knock/join so the browser can advertise its
@@ -49,7 +68,9 @@ export async function connect(node, { relayMultiaddr, agentPeerId, jwt, shareCod
   await node.dial(relayAddr);
 
   // Step 2: JWT handshake on the relay.
-  const authStream = await node.dialProtocol(relayAddr, RELAY_AUTH_PROTOCOL);
+  const authStream = await node.dialProtocol(relayAddr, RELAY_AUTH_PROTOCOL, {
+    runOnLimitedConnection: true,
+  });
   const jwtBytes = new TextEncoder().encode(JSON.stringify({ type: 'jwt', token: jwt }));
   await authStream.send(writeFrame(FRAME_TEXT, jwtBytes));
   await expectAck(authStream);
@@ -60,7 +81,9 @@ export async function connect(node, { relayMultiaddr, agentPeerId, jwt, shareCod
   const circuitAddr = multiaddr(
     `${relayMultiaddr}/p2p-circuit/p2p/${agentPeerId}`
   );
-  const fileStream = await node.dialProtocol(circuitAddr, FILE_PROTOCOL);
+  const fileStream = await node.dialProtocol(circuitAddr, FILE_PROTOCOL, {
+    runOnLimitedConnection: true,
+  });
 
   // Step 5: open envelope.
   const envelope = JSON.stringify({ type: 'open', share_code: shareCode, conn_id: connId });
@@ -88,4 +111,43 @@ async function expectAck(stream) {
     }
   }
   throw new Error('relay closed stream before ack');
+}
+
+function isLoopbackPage(hostname) {
+  return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1' || hostname === '[::1]';
+}
+
+function isLoopbackMultiaddr(addr) {
+  return (
+    addr.includes('/ip4/127.') ||
+    addr.includes('/dns4/localhost/') ||
+    addr.includes('/dns6/localhost/') ||
+    addr.includes('/dns/localhost/') ||
+    addr.includes('/ip6/::1/')
+  );
+}
+
+function isInsecureWebSocket(addr) {
+  return addr.includes('/ws') && !addr.includes('/wss');
+}
+
+function isPrivateMultiaddr(addr) {
+  return (
+    addr.includes('/ip4/127.') ||
+    addr.includes('/ip4/10.') ||
+    addr.includes('/ip4/192.168.') ||
+    is172Private(addr) ||
+    addr.includes('/dns4/localhost/') ||
+    addr.includes('/dns6/localhost/') ||
+    addr.includes('/ip6/::1/') ||
+    addr.includes('/ip6/fc') ||
+    addr.includes('/ip6/fd')
+  );
+}
+
+function is172Private(addr) {
+  const match = addr.match(/\/ip4\/172\.(\d+)\./);
+  if (!match) return false;
+  const octet = Number(match[1]);
+  return Number.isInteger(octet) && octet >= 16 && octet <= 31;
 }

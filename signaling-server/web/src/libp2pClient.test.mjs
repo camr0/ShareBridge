@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connect } from './libp2pClient.js';
+import { multiaddr } from '@multiformats/multiaddr';
+import { connect, createConnectionGater } from './libp2pClient.js';
 import { FRAME_TEXT, writeFrame } from './frame.js';
 
 function createReadableStream(chunks = []) {
@@ -50,11 +51,11 @@ test('connect writes handshake frames but does not start the read pump before ha
 
   const dialCalls = [];
   const node = {
-    async dial(addr) {
-      dialCalls.push(['dial', addr.toString()]);
+    async dial(addr, options) {
+      dialCalls.push(['dial', addr.toString(), options]);
     },
-    async dialProtocol(addr, protocol) {
-      dialCalls.push(['dialProtocol', addr.toString(), protocol]);
+    async dialProtocol(addr, protocol, options) {
+      dialCalls.push(['dialProtocol', addr.toString(), protocol, options]);
       if (protocol === '/sharebridge/relay/1.0.0') return authStream;
       if (protocol === '/sharebridge/file/1.0.0') return fileStream;
       throw new Error(`unexpected protocol ${protocol}`);
@@ -72,6 +73,11 @@ test('connect writes handshake frames but does not start the read pump before ha
   assert.equal(authStream.sent.length, 1);
   assert.equal(fileStream.sent.length, 1);
   assert.equal(channel.readyState, 'connecting');
+  assert.deepEqual(dialCalls, [
+    ['dial', '/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooRelay', undefined],
+    ['dialProtocol', '/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooRelay', '/sharebridge/relay/1.0.0', { runOnLimitedConnection: true }],
+    ['dialProtocol', '/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooAgent', '/sharebridge/file/1.0.0', { runOnLimitedConnection: true }],
+  ]);
 
   const messages = [];
   channel.onmessage = (event) => {
@@ -89,4 +95,30 @@ test('connect writes handshake frames but does not start the read pump before ha
 
   channel.close();
   await done;
+});
+
+test('browser connection gater allows loopback ws relay dials only on loopback pages', async () => {
+  const loopbackGater = createConnectionGater('127.0.0.1');
+  const remoteGater = createConnectionGater('sharebridge.test');
+
+  assert.equal(
+    await loopbackGater.denyDialMultiaddr(multiaddr('/ip4/127.0.0.1/tcp/9001/ws/p2p/12D3KooRelay')),
+    false,
+  );
+  assert.equal(
+    await loopbackGater.denyDialMultiaddr(multiaddr('/ip4/127.0.0.1/tcp/9001/p2p/12D3KooRelay')),
+    false,
+  );
+  assert.equal(
+    await loopbackGater.denyDialMultiaddr(multiaddr('/ip4/10.0.0.5/tcp/9001/ws/p2p/12D3KooRelay')),
+    true,
+  );
+  assert.equal(
+    await remoteGater.denyDialMultiaddr(multiaddr('/ip4/127.0.0.1/tcp/9001/ws/p2p/12D3KooRelay')),
+    true,
+  );
+  assert.equal(
+    await remoteGater.denyDialMultiaddr(multiaddr('/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooRelay')),
+    false,
+  );
 });
