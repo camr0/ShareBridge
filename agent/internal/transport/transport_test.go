@@ -10,8 +10,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	circuitv2relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -90,6 +90,20 @@ func TestTransport_NewEnablesHolePunchProtocolWhenPublicAddrsAdvertised(t *testi
 	}
 
 	t.Fatalf("expected host to register %q, got %v", holepunch.Protocol, tr.Host().Mux().Protocols())
+}
+
+func TestShareBridgeYamuxTransport_UsesLargeInitialWindow(t *testing.T) {
+	const want = uint32(16 * 1024 * 1024)
+
+	transport := shareBridgeYamuxTransport()
+	config := transport.Config()
+
+	if got := config.InitialStreamWindowSize; got != want {
+		t.Fatalf("InitialStreamWindowSize = %d, want %d", got, want)
+	}
+	if got := config.MaxStreamWindowSize; got != want {
+		t.Fatalf("MaxStreamWindowSize = %d, want %d", got, want)
+	}
 }
 
 func TestTransport_StreamHandlerReceivesBytes(t *testing.T) {

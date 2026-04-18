@@ -14,19 +14,22 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/metrics"
 	"github.com/libp2p/go-libp2p/core/network"
+	libp2pyamux "github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	circuitv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
 
 // Config configures the relay Host.
 type Config struct {
-	ListenAddr        string        // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
-	AnnounceAddr      string        // optional public multiaddr advertised to peers
-	PrivateKeyPath    string        // PEM path; empty = ephemeral (dev/test only)
-	JWTSecret         []byte
-	JWTTTL            time.Duration
-	MaxCircuitDataGB  float64       // max GiB per relay circuit (0 = unlimited)
+	ListenAddr       string // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
+	AnnounceAddr     string // optional public multiaddr advertised to peers
+	PrivateKeyPath   string // PEM path; empty = ephemeral (dev/test only)
+	JWTSecret        []byte
+	JWTTTL           time.Duration
+	MaxCircuitDataGB float64 // max GiB per relay circuit (0 = unlimited)
 }
+
+const shareBridgeYamuxWindowSize = uint32(16 * 1024 * 1024)
 
 // Relay wraps a libp2p Host configured as a ShareBridge relay.
 type Relay struct {
@@ -64,6 +67,7 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 		libp2p.Identity(priv),
 		libp2p.ListenAddrs(listenMA),
 		libp2p.BandwidthReporter(bwc),
+		libp2p.Muxer(libp2pyamux.ID, shareBridgeYamuxTransport()),
 		// NOTE: Do NOT add DisableRelay() — circuit relay v2 must remain active.
 	}
 	if cfg.AnnounceAddr != "" {
@@ -97,6 +101,7 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 		dataLimit = 1 << 40 // 1 TB — effectively unlimited but not zero
 	}
 	rc := circuitv2.DefaultResources()
+	rc.BufferSize = 8 * 1024 * 1024 // 8 MB relay buffer (critical for throughput)
 	rc.Limit = &circuitv2.RelayLimit{
 		Duration: 7 * 24 * time.Hour, // 1 week — effectively unlimited, bounded by data limit
 		Data:     dataLimit,
@@ -133,6 +138,13 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 		AuthTTL: cfg.JWTTTL,
 	}
 	return r, nil
+}
+
+func shareBridgeYamuxTransport() *libp2pyamux.Transport {
+	config := *libp2pyamux.DefaultTransport.Config()
+	config.InitialStreamWindowSize = shareBridgeYamuxWindowSize
+	config.MaxStreamWindowSize = shareBridgeYamuxWindowSize
+	return (*libp2pyamux.Transport)(&config)
 }
 
 // Host returns the underlying libp2p Host.

@@ -13,6 +13,130 @@ import { LibP2PDataChannel } from './dataChannelAdapter.js';
 const RELAY_AUTH_PROTOCOL = '/sharebridge/relay/1.0.0';
 const FILE_PROTOCOL = '/sharebridge/file/1.0.0';
 
+function yamuxDebugEnabled() {
+  if (globalThis.SHAREBRIDGE_DEBUG === true) return true;
+  try {
+    const params = new URLSearchParams(globalThis.location?.search ?? '');
+    if (params.get('debug') === '1') return true;
+  } catch {
+    // ignore
+  }
+  try {
+    return globalThis.localStorage?.getItem('sharebridge:debug') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function yamuxDebug(...args) {
+  if (yamuxDebugEnabled()) {
+    console.log('[sharebridge][yamux]', ...args);
+  }
+}
+
+function instrumentYamuxStream(stream, muxerDirection, muxer) {
+  if (stream == null || stream.__sharebridgeYamuxPatched === true) return;
+  stream.__sharebridgeYamuxPatched = true;
+
+  if (typeof stream.sendWindowUpdate === 'function') {
+    const originalSendWindowUpdate = stream.sendWindowUpdate.bind(stream);
+    stream.sendWindowUpdate = (...args) => {
+      const beforeCapacity = stream.recvWindowCapacity;
+      const beforeWindow = stream.recvWindow;
+      const result = originalSendWindowUpdate(...args);
+      const delta = stream.recvWindowCapacity - beforeCapacity;
+      const rtt = typeof muxer.getRTT === 'function' ? muxer.getRTT() : -1;
+
+      if (delta >= 256 * 1024 || stream.recvWindow !== beforeWindow) {
+        yamuxDebug('window-update:out', {
+          direction: muxerDirection,
+          streamId: stream.streamId,
+          delta,
+          recvWindow: stream.recvWindow,
+          recvWindowCapacity: stream.recvWindowCapacity,
+          rtt,
+        });
+      }
+
+      return result;
+    };
+  }
+
+  if (typeof stream.handleWindowUpdate === 'function') {
+    const originalHandleWindowUpdate = stream.handleWindowUpdate.bind(stream);
+    stream.handleWindowUpdate = (frame) => {
+      const before = stream.sendWindowCapacity;
+      const result = originalHandleWindowUpdate(frame);
+      const after = stream.sendWindowCapacity;
+
+      if (frame?.header?.length >= 256 * 1024 || before === 0 || after > 256 * 1024) {
+        yamuxDebug('window-update:in', {
+          direction: muxerDirection,
+          streamId: stream.streamId,
+          delta: frame?.header?.length,
+          sendWindowBefore: before,
+          sendWindowAfter: after,
+        });
+      }
+
+      return result;
+    };
+  }
+}
+
+function instrumentYamuxMuxer(muxer, direction) {
+  if (muxer == null || muxer.__sharebridgeYamuxPatched === true) return;
+  muxer.__sharebridgeYamuxPatched = true;
+  yamuxDebug('muxer:created', { direction });
+
+  if (typeof muxer.ping === 'function') {
+    const originalPing = muxer.ping.bind(muxer);
+    muxer.ping = async (...args) => {
+      const rtt = await originalPing(...args);
+      yamuxDebug('ping:rtt', { direction, rtt });
+      return rtt;
+    };
+  }
+
+  if (typeof muxer._newStream === 'function') {
+    const originalNewStream = muxer._newStream.bind(muxer);
+    muxer._newStream = (...args) => {
+      const stream = originalNewStream(...args);
+      instrumentYamuxStream(stream, direction, muxer);
+      yamuxDebug('stream:created', {
+        direction,
+        streamId: stream?.streamId,
+        state: stream?.state,
+      });
+      return stream;
+    };
+  }
+}
+
+export function createYamuxMuxer() {
+  const factory = yamux({
+    streamOptions: {
+      initialStreamWindowSize: 8 * 1024 * 1024,
+      maxStreamWindowSize: 16 * 1024 * 1024,
+    },
+  });
+
+  return () => {
+    const muxerFactory = factory();
+    if (!yamuxDebugEnabled() || typeof muxerFactory.createStreamMuxer !== 'function') {
+      return muxerFactory;
+    }
+
+    const originalCreateStreamMuxer = muxerFactory.createStreamMuxer.bind(muxerFactory);
+    muxerFactory.createStreamMuxer = (maConn) => {
+      const muxer = originalCreateStreamMuxer(maConn);
+      instrumentYamuxMuxer(muxer, maConn?.direction ?? 'unknown');
+      return muxer;
+    };
+    return muxerFactory;
+  };
+}
+
 // createNode: ephemeral libp2p node. We do NOT persist the peer identity —
 // the browser mints a fresh Ed25519 keypair every page load.
 export async function createNode() {
@@ -23,7 +147,7 @@ export async function createNode() {
       webRTC(),                      // DCUtR direct-path upgrade
     ],
     connectionEncrypters: [noise()],
-    streamMuxers: [yamux()],
+    streamMuxers: [createYamuxMuxer()],
     services: { identify: identify() },
     connectionGater: createConnectionGater(globalThis.location?.hostname ?? ''),
   });

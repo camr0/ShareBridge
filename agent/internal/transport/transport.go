@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	libp2pyamux "github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	circuitv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	webrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
@@ -22,6 +23,8 @@ import (
 
 // FileProtocolID is the libp2p protocol for ShareBridge file-transfer streams.
 const FileProtocolID protocol.ID = "/sharebridge/file/1.0.0"
+
+const shareBridgeYamuxWindowSize = uint32(16 * 1024 * 1024)
 
 // StreamInfo is what the daemon's stream handler receives.
 type StreamInfo struct {
@@ -69,6 +72,7 @@ func newTransportWithLibp2pOptions(ctx context.Context, opts Options, extraOpts 
 			"/ip4/0.0.0.0/udp/0/webrtc-direct",
 			"/ip6/::/udp/0/webrtc-direct",
 		),
+		libp2p.Muxer(libp2pyamux.ID, shareBridgeYamuxTransport()),
 		libp2p.Transport(ws.New),     // outbound relay connection over ws/wss
 		libp2p.Transport(webrtc.New), // direct WebRTC path for DCUtR upgrades
 		libp2p.EnableHolePunching(),  // relay-to-direct upgrade for local/NATed peers
@@ -103,6 +107,13 @@ func newTransportWithLibp2pOptions(ctx context.Context, opts Options, extraOpts 
 	})
 	go t.ensureRelayLoop()
 	return t, nil
+}
+
+func shareBridgeYamuxTransport() *libp2pyamux.Transport {
+	config := *libp2pyamux.DefaultTransport.Config()
+	config.InitialStreamWindowSize = shareBridgeYamuxWindowSize
+	config.MaxStreamWindowSize = shareBridgeYamuxWindowSize
+	return (*libp2pyamux.Transport)(&config)
 }
 
 // Host exposes the underlying libp2p Host (used in tests).

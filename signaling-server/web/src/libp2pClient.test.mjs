@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { multiaddr } from '@multiformats/multiaddr';
-import { connect, createConnectionGater } from './libp2pClient.js';
+import { connect, createConnectionGater, createYamuxMuxer } from './libp2pClient.js';
 import { FRAME_TEXT, writeFrame } from './frame.js';
 
 function createReadableStream(chunks = []) {
@@ -95,6 +95,18 @@ test('connect writes handshake frames but does not start the read pump before ha
 
   channel.close();
   await done;
+});
+
+test('createYamuxMuxer nests stream window sizing under streamOptions', () => {
+  const muxerFactory = createYamuxMuxer();
+  const muxer = muxerFactory();
+
+  assert.deepEqual(muxer._init.streamOptions, {
+    initialStreamWindowSize: 8 * 1024 * 1024,
+    maxStreamWindowSize: 16 * 1024 * 1024,
+  });
+  assert.equal(muxer._init.initialStreamWindowSize, undefined);
+  assert.equal(muxer._init.maxStreamWindowSize, undefined);
 });
 
 test('browser connection gater allows loopback ws relay dials only on loopback pages', async () => {

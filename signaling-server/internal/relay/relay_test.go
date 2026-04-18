@@ -116,3 +116,17 @@ func TestRelay_advertiseAddrFallsBackToListenAddr(t *testing.T) {
 		t.Fatalf("AdvertiseAddr() should fall back to a dialable host addr, got %q", got)
 	}
 }
+
+func TestShareBridgeYamuxTransport_UsesLargeInitialWindow(t *testing.T) {
+	const want = uint32(16 * 1024 * 1024)
+
+	transport := shareBridgeYamuxTransport()
+	config := transport.Config()
+
+	if got := config.InitialStreamWindowSize; got != want {
+		t.Fatalf("InitialStreamWindowSize = %d, want %d", got, want)
+	}
+	if got := config.MaxStreamWindowSize; got != want {
+		t.Fatalf("MaxStreamWindowSize = %d, want %d", got, want)
+	}
+}
