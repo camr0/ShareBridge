@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getConnectionBadgeType, shouldResetUiOnSignalingClose } from './appState.js';
+import { getConnectionBadgeType, getConnectionStatusInfo, shouldResetUiOnSignalingClose } from './appState.js';
 
 test('getConnectionBadgeType reflects the active libp2p transport', () => {
   assert.equal(getConnectionBadgeType({ agentPeerId: 'peer-a' }, []), 'relay');
@@ -24,6 +24,23 @@ test('getConnectionBadgeType reflects the active libp2p transport', () => {
       [{ remotePeer: { toString: () => 'peer-b' }, remoteAddr: { toString: () => '/ip4/127.0.0.1/udp/5000/webrtc-direct' } }],
     ),
     'relay',
+  );
+});
+
+test('getConnectionStatusInfo returns the matched connection address', () => {
+  assert.deepEqual(getConnectionStatusInfo({ agentPeerId: 'peer-a' }, []), {
+    type: 'relay',
+    addr: '',
+  });
+  assert.deepEqual(
+    getConnectionStatusInfo(
+      { agentPeerId: 'peer-a' },
+      [{ remotePeer: { toString: () => 'peer-a' }, remoteAddr: { toString: () => '/ip4/127.0.0.1/udp/5000/webrtc-direct/certhash/uEi...' } }],
+    ),
+    {
+      type: 'direct',
+      addr: '/ip4/127.0.0.1/udp/5000/webrtc-direct/certhash/uEi...',
+    },
   );
 });
 

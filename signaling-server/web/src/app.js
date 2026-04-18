@@ -1,6 +1,6 @@
 // src/app.js
 import { createNode, getLocalPeerId, connect } from './libp2pClient.js';
-import { getConnectionBadgeType, shouldResetUiOnSignalingClose } from './appState.js';
+import { getConnectionStatusInfo, shouldResetUiOnSignalingClose } from './appState.js';
 
 let ws;
 let dc;                 // LibP2PDataChannel (RTCDataChannel-shaped)
@@ -24,6 +24,7 @@ let pendingNonce = null;
 
 // Connection info received from the signaling server after auth_ok.
 let pendingConnInfo = null; // { relay_multiaddr, agent_peer_id, jwt, conn_id, share_code, relay_allowed, dcutr_allowed }
+let lastLoggedTransportSignature = '';
 
 function debugEnabled() {
   if (window.SHAREBRIDGE_DEBUG === true) return true;
@@ -534,6 +535,7 @@ function resetUI() {
   pendingNonce = null;
   currentPath = [];
   sessionPassword = '';
+  lastLoggedTransportSignature = '';
 }
 
 function escapeHtml(text) {
@@ -565,7 +567,13 @@ async function updateConnectionStatus() {
   statusEl.classList.remove('hidden');
   typeEl.classList.remove('connection-direct', 'connection-relay');
 
-  const type = detectConnectionType();
+  const { type, addr } = detectConnectionType();
+  const transportSignature = `${type}:${addr}`;
+  if (transportSignature !== lastLoggedTransportSignature) {
+    debug('transport:type', { type, addr: addr || '<none>' });
+    lastLoggedTransportSignature = transportSignature;
+  }
+
   if (type === 'direct') {
     typeEl.textContent = '● Connected (Direct)';
     typeEl.classList.add('connection-direct');
@@ -576,7 +584,7 @@ async function updateConnectionStatus() {
 }
 
 function detectConnectionType() {
-  return getConnectionBadgeType(pendingConnInfo, node?.getConnections?.() ?? []);
+  return getConnectionStatusInfo(pendingConnInfo, node?.getConnections?.() ?? []);
 }
 
 // Periodically re-check in case DCUtR upgrades the connection mid-session.
