@@ -1,5 +1,6 @@
 // src/app.js
 import { createNode, getLocalPeerId, connect } from './libp2pClient.js';
+import { getConnectionBadgeType, shouldResetUiOnSignalingClose } from './appState.js';
 
 let ws;
 let dc;                 // LibP2PDataChannel (RTCDataChannel-shaped)
@@ -179,8 +180,11 @@ async function join() {
 
   ws.onclose = (event) => {
     debug('ws:close', { code: event.code, reason: event.reason, wasClean: event.wasClean });
-    // Keep libp2p node alive across signaling disconnects so reconnect is fast.
-    if (dc) dc.close();
+    ws = null;
+    if (!shouldResetUiOnSignalingClose(dc)) {
+      debug('ws:close:transport-still-active', { readyState: dc.readyState });
+      return;
+    }
     resetUI();
   };
 }
@@ -572,17 +576,7 @@ async function updateConnectionStatus() {
 }
 
 function detectConnectionType() {
-  // If any open connection to the agent peer uses the webrtc transport, we
-  // hole-punched. Otherwise we are on the circuit relay.
-  if (!node || !pendingConnInfo) return 'relay';
-  const agentId = pendingConnInfo.agentPeerId;
-  const conns = node.getConnections().filter(c => c.remotePeer.toString() === agentId);
-  for (const c of conns) {
-    const addr = c.remoteAddr.toString();
-    // p2p-circuit in the addr → relay; webrtc transport component → direct.
-    if (addr.includes('/webrtc')) return 'direct';
-  }
-  return 'relay';
+  return getConnectionBadgeType(pendingConnInfo);
 }
 
 // Periodically re-check in case DCUtR upgrades the connection mid-session.
