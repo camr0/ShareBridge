@@ -576,7 +576,7 @@ async function updateConnectionStatus() {
 }
 
 function detectConnectionType() {
-  return getConnectionBadgeType(pendingConnInfo);
+  return getConnectionBadgeType(pendingConnInfo, node?.getConnections?.() ?? []);
 }
 
 // Periodically re-check in case DCUtR upgrades the connection mid-session.
