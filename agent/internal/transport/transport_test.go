@@ -10,8 +10,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	circuitv2relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	"github.com/multiformats/go-multiaddr"
 )
 
 func newTestPrivKey(t *testing.T) crypto.PrivKey {
@@ -56,6 +58,38 @@ func TestTransport_NewAdvertisesWebRTCDirectAddress(t *testing.T) {
 	}
 
 	t.Fatalf("expected transport to advertise a /webrtc-direct address, got %v", tr.Host().Addrs())
+}
+
+func TestTransport_NewEnablesHolePunchProtocolWhenPublicAddrsAdvertised(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	publicAddr, err := multiaddr.NewMultiaddr("/ip4/8.8.8.8/udp/4242/webrtc-direct")
+	if err != nil {
+		t.Fatalf("public multiaddr: %v", err)
+	}
+
+	tr, err := newTransportWithLibp2pOptions(ctx, Options{PrivKey: newTestPrivKey(t)},
+		libp2p.AddrsFactory(func([]multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			return []multiaddr.Multiaddr{publicAddr}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("newTransportWithLibp2pOptions: %v", err)
+	}
+	defer tr.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, proto := range tr.Host().Mux().Protocols() {
+			if proto == holepunch.Protocol {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	t.Fatalf("expected host to register %q, got %v", holepunch.Protocol, tr.Host().Mux().Protocols())
 }
 
 func TestTransport_StreamHandlerReceivesBytes(t *testing.T) {

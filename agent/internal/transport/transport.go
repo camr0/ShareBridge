@@ -55,11 +55,15 @@ type Transport struct {
 // The Host uses NoListenAddrs for traditional transports (tcp/ws) since the agent
 // is outbound-only, but WebRTC is enabled for hole-punching via DCUtR.
 func New(ctx context.Context, opts Options) (*Transport, error) {
+	return newTransportWithLibp2pOptions(ctx, opts)
+}
+
+func newTransportWithLibp2pOptions(ctx context.Context, opts Options, extraOpts ...libp2p.Option) (*Transport, error) {
 	if opts.PrivKey == nil {
 		return nil, errors.New("transport: PrivKey is required")
 	}
 
-	h, err := libp2p.New(
+	libp2pOpts := []libp2p.Option{
 		libp2p.Identity(opts.PrivKey),
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/udp/0/webrtc-direct",
@@ -67,7 +71,11 @@ func New(ctx context.Context, opts Options) (*Transport, error) {
 		),
 		libp2p.Transport(ws.New),     // outbound relay connection over ws/wss
 		libp2p.Transport(webrtc.New), // direct WebRTC path for DCUtR upgrades
-	)
+		libp2p.EnableHolePunching(),  // relay-to-direct upgrade for local/NATed peers
+	}
+	libp2pOpts = append(libp2pOpts, extraOpts...)
+
+	h, err := libp2p.New(libp2pOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("libp2p.New: %w", err)
 	}
