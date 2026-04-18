@@ -61,7 +61,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config, rly *relay
 		if cfg.DebugWS {
 			log.Printf("browser_ws: accepting code=%q relay_only=%t api_key_id=%s", sessionCode, sessionRecord.GetBool("relay_only"), sessionRecord.GetString("api_key_id"))
 		}
-		conn, err := websocket.Accept(w, r, nil)
+		conn, err := websocket.Accept(w, r, wsAcceptOptions())
 		if err != nil {
 			log.Printf("browser_ws accept: %v", err)
 			return
