@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -156,6 +157,79 @@ func TestProtocol_validJWT_authorizesACL(t *testing.T) {
 	addr, _ := multiaddr.NewMultiaddr("/ip4/127.0.0.1/tcp/9001")
 	if !acl.AllowConnect(browserHost.ID(), addr, agentHost.ID()) {
 		t.Fatal("ACL should allow browser to agent after successful auth")
+	}
+}
+
+func TestProtocol_validJWT_keepsAuthStreamOpen(t *testing.T) {
+	relayHost := newLibp2pHost(t)
+	agentHost := newLibp2pHost(t)
+	browserHost := newLibp2pHost(t)
+
+	issuer := NewIssuer([]byte("test-secret-do-not-use-in-prod-abcd1234"), time.Minute)
+	jtis := NewJTIStore(time.Minute)
+	defer jtis.Close()
+	reg := NewAgentRegistry()
+	reg.Register("api-key-xyz", agentHost.ID())
+	acl := newCircuitACL(time.Minute)
+
+	h := Handler{
+		Issuer:  issuer,
+		JTIs:    jtis,
+		Agents:  reg,
+		ACL:     acl,
+		AuthTTL: time.Minute,
+		CodeToAPIKey: func(code string) (string, bool) {
+			if code == "abc12345" {
+				return "api-key-xyz", true
+			}
+			return "", false
+		},
+	}
+	relayHost.SetStreamHandler(ProtocolID, h.Handle)
+	connect(t, browserHost, relayHost)
+
+	tok, err := issuer.Issue(Claims{
+		ShareCode:     "abc12345",
+		BrowserPeerID: browserHost.ID().String(),
+		RelayAllowed:  true,
+		DCUtRAllowed:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, err := browserHost.NewStream(ctx, relayHost.ID(), ProtocolID)
+	if err != nil {
+		t.Fatalf("NewStream: %v", err)
+	}
+	defer s.Close()
+
+	envelope, _ := json.Marshal(map[string]string{"type": "jwt", "token": tok})
+	writeTextFrame(t, s, string(envelope))
+	s.CloseWrite()
+
+	resp := readTextFrame(t, s)
+	if resp["type"] != "auth_ok" {
+		t.Fatalf("expected type:auth_ok, got %v", resp)
+	}
+
+	if err := s.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	defer s.SetReadDeadline(time.Time{})
+
+	buf := make([]byte, 1)
+	_, err = s.Read(buf)
+	if err == nil {
+		t.Fatal("expected auth stream read to block or timeout, got data")
+	}
+	if err == io.EOF {
+		t.Fatal("expected auth stream to remain open after auth_ok, got EOF")
+	}
+	if !os.IsTimeout(err) {
+		t.Fatalf("expected timeout while auth stream stayed open, got %T: %v", err, err)
 	}
 }
 

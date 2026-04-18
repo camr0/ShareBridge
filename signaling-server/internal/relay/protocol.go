@@ -37,7 +37,12 @@ type Handler struct {
 }
 
 func (h *Handler) Handle(s network.Stream) {
-	defer s.Close()
+	closeOnReturn := true
+	defer func() {
+		if closeOnReturn {
+			_ = s.Close()
+		}
+	}()
 
 	claims, err := readAndValidateJWT(s, h.Issuer, h.JTIs)
 	if err != nil {
@@ -66,6 +71,7 @@ func (h *Handler) Handle(s network.Stream) {
 	h.ACL.Authorize(browserPeerID, agentPeerID, claims.ShareCode, apiKeyID, h.AuthTTL)
 
 	writeAuthOK(s)
+	closeOnReturn = false
 }
 
 func readAndValidateJWT(s network.Stream, iss *Issuer, jtis *JTIStore) (*Claims, error) {
