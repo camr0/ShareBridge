@@ -30,7 +30,7 @@ func DebugWS(cfg *config.Config) http.HandlerFunc {
 			)
 		}
 
-		conn, err := websocket.Accept(w, r, wsAcceptOptions())
+		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			log.Printf("debug_ws accept: %v", err)
 			return
