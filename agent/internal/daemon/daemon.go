@@ -607,11 +607,60 @@ func (d *Daemon) handleIncomingStream(info transport.StreamInfo) {
 	}
 
 	log.Printf("file stream open: session=%s conn=%s peer=%s", env.ShareCode, env.ConnID, info.Peer)
+	var stopYamuxDebug chan struct{}
+	logYamuxState := func(string) {}
+	if transport.DebugTransportEnabled() {
+		logYamuxState = func(stage string) {
+			if state, ok := transport.DebugYamuxState(stream); ok {
+				log.Printf(
+					"yamux file stream %s: session=%s conn=%s peer=%s stream_id=%d send_window=%d recv_window=%d rtt=%s",
+					stage,
+					env.ShareCode,
+					env.ConnID,
+					info.Peer,
+					state.StreamID,
+					state.SendWindow,
+					state.RecvWindow,
+					state.RTT,
+				)
+				return
+			}
+			if stage == "open" {
+				log.Printf(
+					"yamux file stream %s: session=%s conn=%s peer=%s state unavailable stream=%T",
+					stage,
+					env.ShareCode,
+					env.ConnID,
+					info.Peer,
+					stream,
+				)
+			}
+		}
+		logYamuxState("open")
+
+		stopYamuxDebug = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopYamuxDebug:
+					return
+				case <-ticker.C:
+					logYamuxState("sample")
+				}
+			}
+		}()
+	}
 	tm.HandleOpen()
 
 	// Read loop: decode frames and route text frames to the manager.
 	go func() {
 		defer func() {
+			if stopYamuxDebug != nil {
+				logYamuxState("close")
+				close(stopYamuxDebug)
+			}
 			session.mu.Lock()
 			delete(session.streams, env.ConnID)
 			session.mu.Unlock()
