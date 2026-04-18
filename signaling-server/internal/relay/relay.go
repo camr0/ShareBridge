@@ -18,6 +18,11 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
+const (
+	relayCircuitDurationLimit = 6 * time.Hour
+	relayCircuitDataLimit     = 1 << 30 // 1 GiB per direction
+)
+
 // Config configures the relay Host.
 type Config struct {
 	ListenAddr     string // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
@@ -86,7 +91,13 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 	// the relay forwards ciphertext between browser and agent without being able to read it.
 	// DCUtR hole-punching flows through this service automatically.
 	// We use our ByteTracker as both ACL filter and metrics tracer to track per-peer bytes.
+	rc := circuitv2.DefaultResources()
+	rc.Limit = &circuitv2.RelayLimit{
+		Duration: relayCircuitDurationLimit,
+		Data:     relayCircuitDataLimit,
+	}
 	circuitSvc, err := circuitv2.New(h,
+		circuitv2.WithResources(rc),
 		circuitv2.WithACL(tracker),
 		circuitv2.WithMetricsTracer(tracker),
 	)

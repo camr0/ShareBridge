@@ -187,7 +187,7 @@ func TestIntegration_e2eCircuitRelay(t *testing.T) {
 		t.Fatalf("file NewStream: %v", err)
 	}
 
-	payload := make([]byte, 64*1024)
+	payload := make([]byte, 256*1024)
 	for i := range payload {
 		payload[i] = byte(i % 256)
 	}
