@@ -18,18 +18,14 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
-const (
-	relayCircuitDurationLimit = 6 * time.Hour
-	relayCircuitDataLimit     = 1 << 30 // 1 GiB per direction
-)
-
 // Config configures the relay Host.
 type Config struct {
-	ListenAddr     string // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
-	AnnounceAddr   string // optional public multiaddr advertised to peers
-	PrivateKeyPath string // PEM path; empty = ephemeral (dev/test only)
-	JWTSecret      []byte
-	JWTTTL         time.Duration
+	ListenAddr        string        // multiaddr, e.g. "/ip4/127.0.0.1/tcp/9001/ws"
+	AnnounceAddr      string        // optional public multiaddr advertised to peers
+	PrivateKeyPath    string        // PEM path; empty = ephemeral (dev/test only)
+	JWTSecret         []byte
+	JWTTTL            time.Duration
+	MaxCircuitDataGB  float64       // max GiB per relay circuit (0 = unlimited)
 }
 
 // Relay wraps a libp2p Host configured as a ShareBridge relay.
@@ -91,10 +87,19 @@ func New(_ context.Context, cfg Config) (*Relay, error) {
 	// the relay forwards ciphertext between browser and agent without being able to read it.
 	// DCUtR hole-punching flows through this service automatically.
 	// We use our ByteTracker as both ACL filter and metrics tracer to track per-peer bytes.
+	// Data limit is tied to account quota (default 50 GB, configurable for pro tiers).
+	// Note: Data=0 means "allow zero bytes" (reject all), so we use a very large value
+	// (1 TB) to effectively mean unlimited when MaxCircuitDataGB is 0.
+	var dataLimit int64
+	if cfg.MaxCircuitDataGB > 0 {
+		dataLimit = int64(cfg.MaxCircuitDataGB * float64(1<<30))
+	} else {
+		dataLimit = 1 << 40 // 1 TB — effectively unlimited but not zero
+	}
 	rc := circuitv2.DefaultResources()
 	rc.Limit = &circuitv2.RelayLimit{
-		Duration: relayCircuitDurationLimit,
-		Data:     relayCircuitDataLimit,
+		Duration: 7 * 24 * time.Hour, // 1 week — effectively unlimited, bounded by data limit
+		Data:     dataLimit,
 	}
 	circuitSvc, err := circuitv2.New(h,
 		circuitv2.WithResources(rc),

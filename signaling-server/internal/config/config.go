@@ -25,12 +25,14 @@ type Config struct {
 	SMTPPassword string
 
 	// Bandwidth quota
-	DefaultQuotaGB     float64
-	QuotaCheckInterval time.Duration
+	DefaultQuotaGB        float64       // default relay quota for new accounts
+	RelayMaxCircuitDataGB float64       // max bytes per relay circuit (0 = unlimited)
+	QuotaCheckInterval   time.Duration
 }
 
 func Load() *Config {
 	ttl, _ := time.ParseDuration(getEnv("JWT_TTL", "5m"))
+	defaultQuotaGB := getEnvFloat("DEFAULT_QUOTA_GB", 50.0)
 	return &Config{
 		Port:                getEnv("PORT", "8080"),
 		DataDir:             getEnv("DATA_DIR", "./pb_data"),
@@ -44,7 +46,8 @@ func Load() *Config {
 		SMTPPort:            getEnv("SMTP_PORT", "587"),
 		SMTPUser:            getEnv("SMTP_USER", ""),
 		SMTPPassword:        getEnv("SMTP_PASSWORD", ""),
-		DefaultQuotaGB:      getEnvFloat("DEFAULT_QUOTA_GB", 50.0),
+		DefaultQuotaGB:      defaultQuotaGB,
+		RelayMaxCircuitDataGB: getEnvFloat("RELAY_MAX_CIRCUIT_DATA_GB", defaultQuotaGB),
 		QuotaCheckInterval:  getEnvDuration("QUOTA_CHECK_INTERVAL", 5*time.Minute),
 	}
 }

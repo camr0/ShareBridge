@@ -54,11 +54,12 @@ func main() {
 		// Construct and start the libp2p relay host.
 		ctx := context.Background()
 		rly, err := relay.New(ctx, relay.Config{
-			ListenAddr:     cfg.RelayListenAddr,
-			AnnounceAddr:   cfg.RelayAnnounceAddr,
-			PrivateKeyPath: cfg.RelayPrivateKeyPath,
-			JWTSecret:      cfg.JWTSecret,
-			JWTTTL:         cfg.JWTTTL,
+			ListenAddr:        cfg.RelayListenAddr,
+			AnnounceAddr:      cfg.RelayAnnounceAddr,
+			PrivateKeyPath:    cfg.RelayPrivateKeyPath,
+			JWTSecret:         cfg.JWTSecret,
+			JWTTTL:            cfg.JWTTTL,
+			MaxCircuitDataGB:  cfg.RelayMaxCircuitDataGB,
 		})
 		if err != nil {
 			log.Fatalf("relay: %v", err)
