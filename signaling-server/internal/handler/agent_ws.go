@@ -158,6 +158,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, rly *relay.Relay) htt
 					"relay_multiaddr": rly.AdvertiseAddr(),
 					"agent_peer_id":   agentPeerID.String(),
 					"jwt":             tok,
+					"conn_id":         msg.ConnID,
 					"relay_allowed":   !quotaExceeded,
 					"dcutr_allowed":   !relayOnly,
 				})

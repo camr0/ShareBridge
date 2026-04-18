@@ -279,7 +279,8 @@ func TestAgentWS_authOkIssuesRelayInfoToBrowser(t *testing.T) {
 
 	// Create a fake browser WebSocket connection in the hub
 	browserConnID := "browser-conn-123"
-	browserCtx := context.Background()
+	browserCtx, cancelBrowser := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelBrowser()
 	browserServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -290,21 +291,7 @@ func TestAgentWS_authOkIssuesRelayInfoToBrowser(t *testing.T) {
 		h.RememberBrowserPeerID(browserConnID, browserPeerID.String())
 		defer h.UnregisterBrowserConn(browserConnID)
 
-		// Wait for relay_info message
-		_, data, err := conn.Read(browserCtx)
-		if err != nil {
-			return
-		}
-		var msg map[string]any
-		json.Unmarshal(data, &msg)
-
-		// Verify relay_info structure
-		assert.Equal(t, "relay_info", msg["type"])
-		assert.NotEmpty(t, msg["relay_multiaddr"])
-		assert.NotEmpty(t, msg["agent_peer_id"])
-		assert.NotEmpty(t, msg["jwt"])
-		assert.NotNil(t, msg["relay_allowed"])
-		assert.NotNil(t, msg["dcutr_allowed"])
+		<-browserCtx.Done()
 	}))
 	defer browserServer.Close()
 
@@ -348,8 +335,18 @@ func TestAgentWS_authOkIssuesRelayInfoToBrowser(t *testing.T) {
 	err = conn.Write(ctx, websocket.MessageText, authOkJSON)
 	require.NoError(t, err)
 
-	// Wait for browser to receive relay_info
-	time.Sleep(200 * time.Millisecond)
+	// Browser should receive relay_info with the original conn_id.
+	_, data, err := browserConn.Read(browserCtx)
+	require.NoError(t, err)
+	var msg map[string]any
+	require.NoError(t, json.Unmarshal(data, &msg))
+	assert.Equal(t, "relay_info", msg["type"])
+	assert.NotEmpty(t, msg["relay_multiaddr"])
+	assert.NotEmpty(t, msg["agent_peer_id"])
+	assert.NotEmpty(t, msg["jwt"])
+	assert.Equal(t, browserConnID, msg["conn_id"])
+	assert.NotNil(t, msg["relay_allowed"])
+	assert.NotNil(t, msg["dcutr_allowed"])
 
 	// Close browser connection to complete the test
 	browserConn.CloseNow()
