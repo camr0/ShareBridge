@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	pbrouter "github.com/pocketbase/pocketbase/tools/router"
+	"github.com/coder/websocket"
+	"sharebridge/server/internal/config"
+	"sharebridge/server/internal/handler"
 )
 
 func TestRegisterStaticRoutes_ServesBundleAsJavaScript(t *testing.T) {
@@ -79,5 +83,43 @@ func TestEffectiveHTTPArgs(t *testing.T) {
 				t.Fatalf("effectiveHTTPArgs() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDebugWSHandshakeResponds(t *testing.T) {
+	r := pbrouter.NewRouter(func(w http.ResponseWriter, req *http.Request) (*core.RequestEvent, pbrouter.EventCleanupFunc) {
+		return &core.RequestEvent{
+			Event: pbrouter.Event{
+				Response: w,
+				Request:  req,
+			},
+		}, nil
+	})
+	r.GET("/ws/debug", func(e *core.RequestEvent) error {
+		handler.DebugWS(&config.Config{})(e.Response, e.Request)
+		return nil
+	})
+
+	mux, err := r.BuildMux()
+	if err != nil {
+		t.Fatalf("build mux: %v", err)
+	}
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws/debug"
+	conn, _, err := websocket.Dial(context.Background(), wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial debug ws: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	_, data, err := conn.Read(context.Background())
+	if err != nil {
+		t.Fatalf("read hello: %v", err)
+	}
+	if !strings.Contains(string(data), `"type":"hello"`) {
+		t.Fatalf("hello payload = %q", string(data))
 	}
 }

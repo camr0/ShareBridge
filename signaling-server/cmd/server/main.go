@@ -96,6 +96,11 @@ func main() {
 			return nil
 		})
 
+		router.GET("/ws/debug", func(e *core.RequestEvent) error {
+			handler.DebugWS(cfg)(e.Response, e.Request)
+			return nil
+		})
+
 		// Public session info endpoint
 		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
 		registerStaticRoutes(router, "./web")
