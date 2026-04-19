@@ -106,3 +106,33 @@ func TestRelayWS_RejectsReplayedBrowserJTI(t *testing.T) {
 		t.Error("expected error for replayed JTI")
 	}
 }
+
+func TestRelayWS_HelloTimeout(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+	cfg := config.Load()
+	cfg.RelayJWTSecret = "secret"
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws/relay", handler.RelayWS(nil, reg, cfg))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Set a short timeout for testing (restore after test)
+	originalTimeout := handler.HelloTimeout()
+	defer handler.SetHelloTimeout(originalTimeout)
+	handler.SetHelloTimeout(500 * time.Millisecond)
+
+	ctx := context.Background()
+	// Client connects but never sends hello
+	conn, _, _ := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/relay", nil)
+	defer conn.CloseNow()
+
+	// Read should fail with timeout after helloTimeout
+	testCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	_, _, err := conn.Read(testCtx)
+	if err == nil {
+		t.Error("expected error due to hello timeout")
+	}
+}
