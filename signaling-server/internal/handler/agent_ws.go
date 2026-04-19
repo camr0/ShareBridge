@@ -14,12 +14,14 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/middleware"
+	"sharebridge/server/internal/relay"
 	"sharebridge/server/internal/turn"
 )
 
@@ -47,7 +49,8 @@ var errCodeAlreadyInUse = errors.New("code already in use")
 
 // AgentWS handles WebSocket connections from agents.
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
-func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
+// The registry parameter is optional - if nil, relay functionality is disabled.
+func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
 		apiKeyID := middleware.GetAPIKeyID(r.Context())
@@ -153,6 +156,78 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 					"value":        msg.Value,
 					"has_password": msg.HasPassword,
 				})
+
+			case "auth_ok":
+				// Browser authentication succeeded - prepare relay session if relay is configured.
+				if agentID == "" {
+					continue
+				}
+				if reg == nil || cfg.RelayJWTSecret == "" {
+					// Relay not configured - silently handle auth_ok without relay messages.
+					// Direct WebRTC flow continues normally.
+					continue
+				}
+
+				session, err := getSessionByCode(app, msg.Code)
+				if err != nil || session == nil {
+					continue
+				}
+
+				sid := relay.NewSID()
+				now := time.Now().UTC()
+
+				browserClaims := relay.BrowserPolicyClaims{
+					SID:               sid,
+					SessionCode:       msg.Code,
+					RelayAllowed:      true,
+					RelayOnly:         session.GetBool("relay_only"),
+					ExpectedStaticPub: session.GetString("relay_static_pub"),
+					RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
+				}
+				browserJWT, err := relay.SignBrowserPolicyJWT(cfg.RelayJWTSecret, browserClaims, now)
+				if err != nil {
+					log.Printf("agent_ws: failed to sign browser policy JWT: %v", err)
+					continue
+				}
+				agentJWT, err := relay.SignAgentRelayJWT(cfg.RelayJWTSecret, relay.AgentRelayClaims{SID: sid, AgentID: agentID}, now)
+				if err != nil {
+					log.Printf("agent_ws: failed to sign agent relay JWT: %v", err)
+					continue
+				}
+
+				err = reg.CreatePendingSession(relay.PendingSession{
+					SID:               sid,
+					AccountID:         accountID,
+					SessionCode:       msg.Code,
+					AgentID:           agentID,
+					RelayAllowed:      browserClaims.RelayAllowed,
+					RelayOnly:         browserClaims.RelayOnly,
+					ExpectedStaticPub: browserClaims.ExpectedStaticPub,
+					JTI:               browserClaims.RegisteredClaims.ID,
+					ExpiresAt:         now.Add(relay.TokenLifetime),
+				}, now)
+				if err != nil {
+					log.Printf("agent_ws: failed to create pending relay session: %v", err)
+					continue
+				}
+
+				// Send relay_prepare to agent
+				hub.SendDirect(ctx, conn, map[string]any{
+					"type":       "relay_prepare",
+					"sid":        sid,
+					"expires_at": now.Add(relay.TokenLifetime).Format(time.RFC3339),
+					"relay_jwt":  agentJWT,
+				})
+
+				// Send relay_policy to browser via hub
+				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+					"type":          "relay_policy",
+					"token":         browserJWT,
+					"relay_allowed": browserClaims.RelayAllowed,
+					"relay_only":    browserClaims.RelayOnly,
+				})
+
+				log.Printf("agent_ws: relay session prepared: sid=%s code=%s agent_id=%s", sid, msg.Code, agentID)
 
 			case "auth_failed":
 				// Track failures per connID. After 3, close the browser WebSocket.

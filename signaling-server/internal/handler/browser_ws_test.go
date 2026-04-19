@@ -17,6 +17,7 @@ import (
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/middleware"
+	"sharebridge/server/internal/relay"
 	"sharebridge/server/migrations"
 )
 
@@ -167,11 +168,12 @@ func TestBrowserWS_QuotaExceeded_SendsSTUNOnly(t *testing.T) {
 
 	h := hub.New()
 	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
 
 	// First connect an agent to the hub
 	fullKey := apiKey.Id + ".quotasecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
@@ -232,6 +234,7 @@ func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
 
 	h := hub.New()
 	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
 	// Enable TURN for this test
 	cfg.TurnSecret = "test-turn-secret-for-testing-only"
 	cfg.TurnHost = "turn.example.com"
@@ -239,7 +242,7 @@ func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
 	// First connect an agent to the hub
 	fullKey := apiKey.Id + ".normalsecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
@@ -285,4 +288,51 @@ func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
 	assert.NotContains(t, string(data), `"relay_quota_exceeded"`)
 	// Should have TURN credentials (indicated by username field in ice_servers)
 	assert.Contains(t, string(data), `"username"`)
+}
+
+func TestBrowserWS_DirectFlowStillSendsICEConfigFirst(t *testing.T) {
+	app, cleanup := setupBrowserTestApp(t)
+	defer cleanup()
+
+	user, err := createTestAccountWithQuota(app, "direct@example.com", 50.0, 0.0)
+	require.NoError(t, err)
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "directsecret")
+	require.NoError(t, err)
+
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "agent-direct", "DIRECT001")
+	require.NoError(t, err)
+
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+
+	fullKey := apiKey.Id + ".directsecret"
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer agentConn.CloseNow()
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-direct"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"DIRECT001"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	browserConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=DIRECT001", nil)
+	require.NoError(t, err)
+	defer browserConn.CloseNow()
+
+	_, firstMsg, err := browserConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(firstMsg), `"type":"ice_config"`)
 }

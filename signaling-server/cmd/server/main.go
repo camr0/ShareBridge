@@ -53,7 +53,7 @@ func main() {
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
 			authMiddleware := middleware.APIKeyAuth(app)
-			handlerFunc := handler.AgentWS(app, h, cfg)
+			handlerFunc := handler.AgentWS(app, h, reg, cfg)
 			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
 			return nil
 		})
