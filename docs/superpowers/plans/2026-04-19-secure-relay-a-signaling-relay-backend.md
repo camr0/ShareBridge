@@ -96,9 +96,10 @@ func TestAgentWS_RegisterShare_PersistsRelayStaticPub(t *testing.T) {
 
 	h := hub.New()
 	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
 
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 
@@ -174,6 +175,9 @@ func AddSessionRelayStaticPub(app core.App) error {
 
 ```go
 // signaling-server/internal/handler/agent_ws.go
+// in agent_ws_test.go, setupAgentTestApp must run the custom migration chain through AddSessionRelayStaticPub:
+// CreateCollections -> AddAPIKeyTimestamps -> AddQuotaFields -> AddRelayOnly -> AddSessionRelayStaticPub
+
 type agentMsg struct {
 	Type           string          `json:"type"`
 	AgentID        string          `json:"agent_id,omitempty"`
@@ -480,6 +484,39 @@ func TestRegistry_BrowserWaitsForAgentWithinPendingWindow(t *testing.T) {
 	require.Nil(t, <-waitDone)
 }
 
+func TestRegistry_AgentWaitsForBrowserWithinPendingWindow(t *testing.T) {
+	reg := NewRegistry(2 * time.Second)
+	now := time.Unix(1_800_000_000, 0)
+
+	require.NoError(t, reg.CreatePendingSession(PendingSession{
+		SID:          "sid-2",
+		AccountID:    "acct-1",
+		SessionCode:  "SHARE456",
+		AgentID:      "agent-1",
+		RelayAllowed: true,
+		JTI:          "jti-2",
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}, now))
+
+	agentStatePeer, agentState, err := reg.BindAgentSocket("sid-2", "agent-1", nil, now)
+	require.NoError(t, err)
+	require.Nil(t, agentStatePeer)
+	require.Equal(t, StatePendingAgent, agentState)
+
+	waitDone := make(chan *websocket.Conn, 1)
+	go func() {
+		peer, waitErr := reg.WaitForBrowser("sid-2", now)
+		require.NoError(t, waitErr)
+		waitDone <- peer
+	}()
+
+	browserStatePeer, browserState, err := reg.BindBrowserSocket("sid-2", "jti-2", nil, now.Add(500*time.Millisecond))
+	require.NoError(t, err)
+	require.Nil(t, browserStatePeer)
+	require.Equal(t, StateActive, browserState)
+	require.Nil(t, <-waitDone)
+}
+
 func TestRegistry_RejectsSpentJTIReplay(t *testing.T) {
 	reg := NewRegistry(2 * time.Second)
 	now := time.Unix(1_800_000_000, 0)
@@ -509,7 +546,7 @@ func TestRegistry_CleanupDirectSuccessRemovesPendingSession(t *testing.T) {
 Run:
 
 ```bash
-cd signaling-server && go test ./internal/relay -run 'TestRegistry_BrowserWaitsForAgentWithinPendingWindow|TestRegistry_RejectsSpentJTIReplay|TestRegistry_CleanupDirectSuccessRemovesPendingSession' -v
+cd signaling-server && go test ./internal/relay -run 'TestRegistry_BrowserWaitsForAgentWithinPendingWindow|TestRegistry_AgentWaitsForBrowserWithinPendingWindow|TestRegistry_RejectsSpentJTIReplay|TestRegistry_CleanupDirectSuccessRemovesPendingSession' -v
 ```
 
 Expected:
@@ -568,6 +605,8 @@ type sessionEntry struct {
 	browserSocket  *websocket.Conn
 	forwardedBytes int64
 	agentReady     chan struct{}
+	browserReady   chan struct{}
+	done           chan struct{}
 }
 
 func NewRegistry(pendingWindow time.Duration) *Registry {
@@ -582,8 +621,10 @@ func (r *Registry) CreatePendingSession(session PendingSession, now time.Time) e
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sessions[session.SID] = &sessionEntry{
-		session:    session,
-		agentReady: make(chan struct{}),
+		session:      session,
+		agentReady:   make(chan struct{}),
+		browserReady: make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 	return nil
 }
@@ -600,8 +641,15 @@ func (r *Registry) BindBrowserSocket(sid, jti string, conn *websocket.Conn, now 
 	}
 	r.spentJTI[jti] = now
 	entry.browserSocket = conn
-	if entry.agentSocket != nil {
+	select {
+	case <-entry.browserReady:
+	default:
+		close(entry.browserReady)
+	}
+	select {
+	case <-entry.agentReady:
 		return entry.agentSocket, StateActive, nil
+	default:
 	}
 	return nil, StatePendingBrowser, nil
 }
@@ -625,16 +673,14 @@ func (r *Registry) WaitForAgent(sid string, now time.Time) (*websocket.Conn, err
 	case <-time.After(time.Until(deadline)):
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if entry, ok := r.sessions[sid]; ok {
-			entry.browserSocket = nil
-		}
+		delete(r.sessions, sid)
 		return nil, errors.New("relay: pending wait window exceeded")
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry, ok = r.sessions[sid]
-	if !ok || entry.agentSocket == nil {
+	if !ok {
 		return nil, ErrUnknownSID
 	}
 	return entry.agentSocket, nil
@@ -656,10 +702,54 @@ func (r *Registry) BindAgentSocket(sid, agentID string, conn *websocket.Conn, no
 	default:
 		close(entry.agentReady)
 	}
-	if entry.browserSocket != nil {
+	select {
+	case <-entry.browserReady:
 		return entry.browserSocket, StateActive, nil
+	default:
 	}
 	return nil, StatePendingAgent, nil
+}
+
+func (r *Registry) WaitForBrowser(sid string, now time.Time) (*websocket.Conn, error) {
+	r.mu.Lock()
+	entry, ok := r.sessions[sid]
+	if !ok {
+		r.mu.Unlock()
+		return nil, ErrUnknownSID
+	}
+	deadline := now.Add(r.pendingWindow)
+	if entry.session.ExpiresAt.Before(deadline) {
+		deadline = entry.session.ExpiresAt
+	}
+	ready := entry.browserReady
+	r.mu.Unlock()
+
+	select {
+	case <-ready:
+	case <-time.After(time.Until(deadline)):
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		delete(r.sessions, sid)
+		return nil, errors.New("relay: pending wait window exceeded")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok = r.sessions[sid]
+	if !ok {
+		return nil, ErrUnknownSID
+	}
+	return entry.browserSocket, nil
+}
+
+func (r *Registry) WatchSession(sid string) (<-chan struct{}, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.sessions[sid]
+	if !ok {
+		return nil, ErrUnknownSID
+	}
+	return entry.done, nil
 }
 
 func (r *Registry) AddForwardedBytes(sid string, n int64) {
@@ -695,6 +785,11 @@ func (r *Registry) CloseSession(sid string) (string, int64, error) {
 	}
 	accountID := entry.session.AccountID
 	bytes := entry.forwardedBytes
+	select {
+	case <-entry.done:
+	default:
+		close(entry.done)
+	}
 	delete(r.sessions, sid)
 	return accountID, bytes, nil
 }
@@ -705,7 +800,7 @@ func (r *Registry) CloseSession(sid string) (string, int64, error) {
 Run:
 
 ```bash
-cd signaling-server && go test ./internal/relay -run 'TestRegistry_BrowserWaitsForAgentWithinPendingWindow|TestRegistry_RejectsSpentJTIReplay|TestRegistry_CleanupDirectSuccessRemovesPendingSession' -v
+cd signaling-server && go test ./internal/relay -run 'TestRegistry_BrowserWaitsForAgentWithinPendingWindow|TestRegistry_AgentWaitsForBrowserWithinPendingWindow|TestRegistry_RejectsSpentJTIReplay|TestRegistry_CleanupDirectSuccessRemovesPendingSession' -v
 ```
 
 Expected:
@@ -728,11 +823,42 @@ git commit -m "feat(relay): add pending relay session registry"
 - [ ] **Step 1: Write the failing accounting tests**
 
 ```go
+func setupRelayTestApp(t *testing.T) (core.App, func()) {
+	testApp, err := tests.NewTestApp(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, testApp.Bootstrap())
+	require.NoError(t, testApp.RunSystemMigrations())
+	require.NoError(t, migrations.CreateCollections(testApp))
+	require.NoError(t, migrations.AddAPIKeyTimestamps(testApp))
+	require.NoError(t, migrations.AddQuotaFields(testApp))
+	cleanup := func() { testApp.Cleanup() }
+	return testApp, cleanup
+}
+
+func createRelayTestAccountWithQuota(app core.App, email string, quotaGB float64, usageGB float64) (*core.Record, error) {
+	usersCol, err := app.FindCollectionByNameOrId("users")
+	if err != nil {
+		return nil, err
+	}
+	user := core.NewRecord(usersCol)
+	user.SetEmail(email)
+	user.SetPassword("testpassword123")
+	user.Set("relay_quota_gb", quotaGB)
+	user.Set("current_period_usage_gb", usageGB)
+	user.Set("quota_period_start", time.Now().UTC())
+	user.Set("quota_period_end", time.Now().UTC().Add(30*24*time.Hour))
+	user.Set("turn_baseline_bytes", 0.0)
+	if err := app.Save(user); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
 func TestApplyRelayBytes_IncrementsCurrentPeriodUsage(t *testing.T) {
-	app, cleanup := setupBrowserTestApp(t)
+	app, cleanup := setupRelayTestApp(t)
 	defer cleanup()
 
-	user, err := createTestAccountWithQuota(app, "acct@example.com", 50.0, 0.0)
+	user, err := createRelayTestAccountWithQuota(app, "acct@example.com", 50.0, 0.0)
 	require.NoError(t, err)
 
 	now := time.Now().UTC()
@@ -744,10 +870,10 @@ func TestApplyRelayBytes_IncrementsCurrentPeriodUsage(t *testing.T) {
 }
 
 func TestApplyRelayBytes_RollsExpiredPeriodAndArchivesOldUsage(t *testing.T) {
-	app, cleanup := setupBrowserTestApp(t)
+	app, cleanup := setupRelayTestApp(t)
 	defer cleanup()
 
-	user, err := createTestAccountWithQuota(app, "expired@example.com", 50.0, 3.25)
+	user, err := createRelayTestAccountWithQuota(app, "expired@example.com", 50.0, 3.25)
 	require.NoError(t, err)
 	user.Set("quota_period_start", time.Now().UTC().Add(-40*24*time.Hour))
 	user.Set("quota_period_end", time.Now().UTC().Add(-24*time.Hour))
@@ -1005,9 +1131,27 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 		}
 
 		if claims, err := relay.VerifyAgentRelayJWT(cfg.RelayJWTSecret, hello.Token, time.Now()); err == nil {
-			peer, _, bindErr := reg.BindAgentSocket(claims.SID, claims.AgentID, conn, time.Now())
+			peer, state, bindErr := reg.BindAgentSocket(claims.SID, claims.AgentID, conn, time.Now())
 			if bindErr != nil {
 				conn.Close(websocket.StatusPolicyViolation, bindErr.Error())
+				return
+			}
+			if state == relay.StatePendingAgent {
+				peer, bindErr = reg.WaitForBrowser(claims.SID, time.Now())
+				if bindErr != nil {
+					conn.Close(websocket.StatusPolicyViolation, bindErr.Error())
+					return
+				}
+				if peer != nil {
+					proxyRelayPair(ctx, app, reg, claims.SID, conn, peer)
+				}
+				return
+			}
+			if state == relay.StateActive {
+				done, watchErr := reg.WatchSession(claims.SID)
+				if watchErr == nil {
+					<-done
+				}
 				return
 			}
 			if peer != nil {
@@ -1027,6 +1171,17 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 					conn.Close(websocket.StatusPolicyViolation, bindErr.Error())
 					return
 				}
+				if peer != nil {
+					proxyRelayPair(ctx, app, reg, claims.SID, conn, peer)
+				}
+				return
+			}
+			if state == relay.StateActive {
+				done, watchErr := reg.WatchSession(claims.SID)
+				if watchErr == nil {
+					<-done
+				}
+				return
 			}
 			if peer != nil {
 				proxyRelayPair(ctx, app, reg, claims.SID, conn, peer)
@@ -1285,6 +1440,9 @@ case "auth_ok":
 
 // signaling-server/cmd/server/main.go
 reg := relay.NewRegistry(cfg.RelayPendingWaitWindow)
+if cfg.RelayJWTSecret == "" {
+	log.Fatal("RELAY_JWT_SECRET must be set when relay endpoints are enabled")
+}
 handlerFunc := handler.AgentWS(app, h, reg, cfg)
 ```
 
