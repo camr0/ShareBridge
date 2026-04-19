@@ -17,6 +17,10 @@ type Config struct {
 	TurnPort   string
 	TurnSecret string
 
+	// Relay configuration
+	RelayJWTSecret         string
+	RelayPendingWaitWindow time.Duration
+
 	// SMTP (optional - if absent, email verification is disabled and login is allowed immediately)
 	SMTPHost     string
 	SMTPPort     string
@@ -38,6 +42,9 @@ func Load() *Config {
 		TurnHost:   getEnv("TURN_HOST", ""),
 		TurnPort:   getEnv("TURN_PORT", "3478"),
 		TurnSecret: getEnv("TURN_SECRET", ""),
+
+		RelayJWTSecret:         getEnv("RELAY_JWT_SECRET", ""),
+		RelayPendingWaitWindow: getEnvDuration("RELAY_PENDING_WAIT_WINDOW", 2*time.Second),
 
 		SMTPHost:     getEnv("SMTP_HOST", ""),
 		SMTPPort:     getEnv("SMTP_PORT", "587"),
