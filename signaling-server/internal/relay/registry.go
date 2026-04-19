@@ -226,11 +226,13 @@ func (r *Registry) CloseSession(sid string) (string, int64, error) {
 	}
 	accountID := entry.session.AccountID
 	bytes := entry.forwardedBytes
+	jti := entry.session.JTI // capture JTI before delete
 	select {
 	case <-entry.done:
 	default:
 		close(entry.done)
 	}
 	delete(r.sessions, sid)
+	delete(r.spentJTI, jti) // cleanup spent JTI to prevent memory leak
 	return accountID, bytes, nil
 }

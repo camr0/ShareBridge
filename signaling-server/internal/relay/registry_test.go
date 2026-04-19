@@ -160,3 +160,129 @@ func TestRegistry_CleanupDirectSuccessRemovesPendingSession(t *testing.T) {
 		t.Errorf("expected ErrUnknownSID, got %v", err)
 	}
 }
+
+func TestRegistry_CloseSessionReturnsValues(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+	now := time.Unix(1_800_000_000, 0)
+
+	if err := reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-1",
+		AccountID:    "acct-42",
+		JTI:          "jti-1",
+		RelayAllowed: true,
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add some forwarded bytes
+	reg.AddForwardedBytes("sid-1", 100)
+	reg.AddForwardedBytes("sid-1", 250)
+
+	accountID, bytes, err := reg.CloseSession("sid-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accountID != "acct-42" {
+		t.Errorf("expected accountID 'acct-42', got %q", accountID)
+	}
+	if bytes != 350 {
+		t.Errorf("expected bytes 350, got %d", bytes)
+	}
+
+	// Session should be removed
+	_, err = reg.Get("sid-1")
+	if err != relay.ErrUnknownSID {
+		t.Errorf("expected ErrUnknownSID after close, got %v", err)
+	}
+}
+
+func TestRegistry_CloseSessionCleansUpSpentJTI(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+	now := time.Unix(1_800_000_000, 0)
+
+	if err := reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-1",
+		JTI:          "jti-1",
+		RelayAllowed: true,
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bind browser socket to mark JTI as spent
+	_, _, err := reg.BindBrowserSocket("sid-1", "jti-1", nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second bind with same JTI should fail (JTI is spent)
+	_, _, err = reg.BindBrowserSocket("sid-1", "jti-1", nil, now)
+	if err != relay.ErrReplay {
+		t.Errorf("expected ErrReplay for second bind, got %v", err)
+	}
+
+	// Close the session (should clean up JTI)
+	_, _, err = reg.CloseSession("sid-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a new session with same JTI (simulating replay after session close)
+	if err := reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-2",
+		JTI:          "jti-1", // same JTI
+		RelayAllowed: true,
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// JTI should no longer be marked as spent since CloseSession cleaned it up
+	_, _, err = reg.BindBrowserSocket("sid-2", "jti-1", nil, now)
+	if err != nil {
+		t.Errorf("expected JTI to be reusable after CloseSession, got error: %v", err)
+	}
+}
+
+func TestRegistry_CloseSessionUnknownSID(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+
+	_, _, err := reg.CloseSession("nonexistent")
+	if err != relay.ErrUnknownSID {
+		t.Errorf("expected ErrUnknownSID, got %v", err)
+	}
+}
+
+func TestRegistry_AddForwardedBytesAccumulates(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+	now := time.Unix(1_800_000_000, 0)
+
+	if err := reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-1",
+		RelayAllowed: true,
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Multiple additions should accumulate
+	reg.AddForwardedBytes("sid-1", 100)
+	reg.AddForwardedBytes("sid-1", 200)
+	reg.AddForwardedBytes("sid-1", 300)
+
+	_, bytes, err := reg.CloseSession("sid-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes != 600 {
+		t.Errorf("expected accumulated bytes 600, got %d", bytes)
+	}
+}
+
+func TestRegistry_AddForwardedBytesUnknownSID(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+
+	// Should not panic or error for unknown SID
+	reg.AddForwardedBytes("nonexistent", 100)
+}
