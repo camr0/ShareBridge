@@ -129,4 +129,8 @@ func TestMigration5_AddSessionRelayStaticPub(t *testing.T) {
 	sessionsCol, err := testApp.FindCollectionByNameOrId("sessions")
 	require.NoError(t, err)
 	require.NotNil(t, sessionsCol.Fields.GetByName("relay_static_pub"))
+
+	// Idempotent: running again should not error
+	err = migrations.AddSessionRelayStaticPub(testApp)
+	require.NoError(t, err)
 }
