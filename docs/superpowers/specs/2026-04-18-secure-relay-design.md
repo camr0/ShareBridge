@@ -36,7 +36,7 @@ If we integrate relay encryption ad hoc, transport details will leak into the br
 
 ## Design Principles Learned From `e2ecp`
 
-This design deliberately keeps several lessons from `e2ecp`, even though ShareBridge needs a different transport and policy model.
+This design deliberately keeps several lessons from [`e2ecp`](https://github.com/schollz/e2ecp), an external end-to-end encrypted relay file-transfer project, even though ShareBridge needs a different transport and policy model.
 
 - Keep the relay backend as dumb as possible.
 - Keep encrypted transport logic behind one small boundary instead of scattering it through app code.
@@ -164,6 +164,8 @@ The browser is not trusted to define what paths are allowed. It only executes co
 
 The transport-facing contract to the transfer layer stays aligned with the existing direct-mode design:
 
+This contract is referred to throughout the rest of the spec as `TransferChannel`.
+
 - `SendText(text)` for JSON control messages
 - `SendBinary(bytes)` for raw file chunks
 - `BufferedAmount()` for backpressure
@@ -171,6 +173,17 @@ The transport-facing contract to the transfer layer stays aligned with the exist
 - inbound delivery that preserves message boundaries
   - text arrives as text
   - binary arrives as binary
+
+Conceptually:
+
+```ts
+interface TransferChannel {
+  SendText(text: string): Promise<void> | void
+  SendBinary(bytes: Uint8Array): Promise<void> | void
+  BufferedAmount(): number
+  Close(): void
+}
+```
 
 This preserves the existing transfer protocol and minimizes changes to the transfer manager and browser app logic.
 
@@ -264,6 +277,7 @@ That notification contains at minimum:
 - `sid`
 - share/session identifier
 - session expiry
+- agent relay JWT
 
 The agent then opens or attaches an authenticated relay socket for that `sid`.
 
@@ -360,6 +374,7 @@ Concrete mechanism:
 - format: JWT
 - signature algorithm: **HMAC-SHA256 (HS256)**
 - signing key: signaling server secret, stored server-side only
+- lifetime: **120 seconds from issuance**
 
 Who verifies it:
 
@@ -367,6 +382,8 @@ Who verifies it:
 - relay backend: verifies the HS256 signature before allowing relay use
 
 TLS protects the policy in transit. The JWT signature protects it from client-side mutation after receipt.
+
+These JWTs are used only for relay/session setup and authorization. They do **not** need to remain valid for the duration of an already-established relay transfer.
 
 It carries:
 
@@ -420,7 +437,7 @@ Durability in v1:
 - relay/backend restart clears spent-token state
 - replay exposure after restart is therefore bounded by the remaining token `exp` window
 
-To keep that bounded, relay/session JWT lifetimes must stay short.
+To keep that bounded, relay/session JWT lifetimes stay short: **120 seconds from issuance** in v1.
 
 ### Policy Shape
 
