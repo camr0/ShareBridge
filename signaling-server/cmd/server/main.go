@@ -127,6 +127,13 @@ func main() {
 			}
 		})
 
+		// Relay registry entries are short-lived and in-memory only. Clean up
+		// expired pending sessions so direct-mode success does not leak them until
+		// process restart.
+		app.Cron().MustAdd("relay_registry_cleanup", "* * * * *", func() {
+			reg.CleanupExpired(time.Now().UTC())
+		})
+
 		// Initialize quota fields when a new user registers.
 		app.OnRecordCreate("users").BindFunc(func(e *core.RecordEvent) error {
 			now := time.Now().UTC()
@@ -184,4 +191,3 @@ func deleteExpiredSessions(app core.App) error {
 		}
 	}
 }
-

@@ -114,7 +114,7 @@ func (r *Registry) WaitForAgent(sid string, now time.Time) (*websocket.Conn, err
 	case <-time.After(time.Until(deadline)):
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		delete(r.sessions, sid)
+		r.cleanupSessionLocked(sid)
 		return nil, errors.New("relay: pending wait window exceeded")
 	}
 
@@ -170,7 +170,7 @@ func (r *Registry) WaitForBrowser(sid string, now time.Time) (*websocket.Conn, e
 	case <-time.After(time.Until(deadline)):
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		delete(r.sessions, sid)
+		r.cleanupSessionLocked(sid)
 		return nil, errors.New("relay: pending wait window exceeded")
 	}
 
@@ -214,7 +214,7 @@ func (r *Registry) Get(sid string) (PendingSession, error) {
 func (r *Registry) MarkDirectSuccess(sid string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.sessions, sid)
+	r.cleanupSessionLocked(sid)
 }
 
 func (r *Registry) CloseSession(sid string) (string, int64, error) {
@@ -226,13 +226,32 @@ func (r *Registry) CloseSession(sid string) (string, int64, error) {
 	}
 	accountID := entry.session.AccountID
 	bytes := entry.forwardedBytes
-	jti := entry.session.JTI // capture JTI before delete
-	select {
-	case <-entry.done:
-	default:
-		close(entry.done)
+	r.cleanupSessionLocked(sid)
+	return accountID, bytes, nil
+}
+
+func (r *Registry) CleanupExpired(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for sid, entry := range r.sessions {
+		if now.After(entry.session.ExpiresAt) {
+			r.cleanupSessionLocked(sid)
+		}
+	}
+}
+
+func (r *Registry) cleanupSessionLocked(sid string) {
+	entry, ok := r.sessions[sid]
+	if !ok {
+		return
+	}
+	for _, ch := range []chan struct{}{entry.agentReady, entry.browserReady, entry.done} {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
 	}
 	delete(r.sessions, sid)
-	delete(r.spentJTI, jti) // cleanup spent JTI to prevent memory leak
-	return accountID, bytes, nil
+	delete(r.spentJTI, entry.session.JTI)
 }

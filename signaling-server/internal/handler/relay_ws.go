@@ -40,11 +40,13 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 		}
 		defer conn.CloseNow()
 
-		// Use context with deadline for hello to prevent slowloris attacks
-		ctx, cancel := context.WithTimeout(r.Context(), helloTimeout)
+		// Only the hello read uses a short timeout. Relay sessions themselves must
+		// live on the request context, not the slowloris protection deadline.
+		helloCtx, cancel := context.WithTimeout(r.Context(), helloTimeout)
 		defer cancel()
+		sessionCtx := r.Context()
 
-		_, payload, err := conn.Read(ctx)
+		_, payload, err := conn.Read(helloCtx)
 		if err != nil {
 			log.Printf("relay_ws: hello read error: %v", err)
 			conn.Close(websocket.StatusPolicyViolation, "hello timeout")
@@ -76,10 +78,17 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 					conn.Close(websocket.StatusPolicyViolation, bindErr.Error())
 					return
 				}
-			}
-			if peer != nil {
 				log.Printf("relay_ws: relay pair connected sid=%s", claims.SID)
-				proxyRelayPair(ctx, app, reg, claims.SID, conn, peer)
+				proxyRelayPair(sessionCtx, app, reg, claims.SID, conn, peer)
+				return
+			}
+			if state == relay.StateActive {
+				done, watchErr := reg.WatchSession(claims.SID)
+				if watchErr != nil {
+					conn.Close(websocket.StatusPolicyViolation, watchErr.Error())
+					return
+				}
+				<-done
 			}
 			return
 		}
@@ -100,10 +109,17 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 					conn.Close(websocket.StatusPolicyViolation, bindErr.Error())
 					return
 				}
-			}
-			if peer != nil {
 				log.Printf("relay_ws: relay pair connected sid=%s", claims.SID)
-				proxyRelayPair(ctx, app, reg, claims.SID, conn, peer)
+				proxyRelayPair(sessionCtx, app, reg, claims.SID, conn, peer)
+				return
+			}
+			if state == relay.StateActive {
+				done, watchErr := reg.WatchSession(claims.SID)
+				if watchErr != nil {
+					conn.Close(websocket.StatusPolicyViolation, watchErr.Error())
+					return
+				}
+				<-done
 			}
 			return
 		}

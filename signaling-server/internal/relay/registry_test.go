@@ -286,3 +286,43 @@ func TestRegistry_AddForwardedBytesUnknownSID(t *testing.T) {
 	// Should not panic or error for unknown SID
 	reg.AddForwardedBytes("nonexistent", 100)
 }
+
+func TestRegistry_CleanupExpiredRemovesSessionAndSpentJTI(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+	now := time.Unix(1_800_000_000, 0)
+
+	if err := reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-expired",
+		JTI:          "jti-expired",
+		RelayAllowed: true,
+		ExpiresAt:    now.Add(100 * time.Millisecond),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := reg.BindBrowserSocket("sid-expired", "jti-expired", nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reg.CleanupExpired(now.Add(time.Second))
+
+	_, err = reg.Get("sid-expired")
+	if err != relay.ErrUnknownSID {
+		t.Fatalf("expected ErrUnknownSID after cleanup, got %v", err)
+	}
+
+	if err := reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-new",
+		JTI:          "jti-expired",
+		RelayAllowed: true,
+		ExpiresAt:    now.Add(2 * time.Minute),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = reg.BindBrowserSocket("sid-new", "jti-expired", nil, now)
+	if err != nil {
+		t.Fatalf("expected cleaned JTI to be reusable, got %v", err)
+	}
+}

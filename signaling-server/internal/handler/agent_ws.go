@@ -178,13 +178,21 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					continue
 				}
 
+				accountRecord, err := app.FindRecordById("users", accountID)
+				if err != nil {
+					log.Printf("agent_ws: auth_ok account lookup failed for account %s: %v", accountID, err)
+					continue
+				}
+				quotaExceeded, _ := checkRelayQuota(accountRecord)
+				relayAllowed := !quotaExceeded
+
 				sid := relay.NewSID()
 				now := time.Now().UTC()
 
 				browserClaims := relay.BrowserPolicyClaims{
 					SID:               sid,
 					SessionCode:       msg.Code,
-					RelayAllowed:      true,
+					RelayAllowed:      relayAllowed,
 					RelayOnly:         session.GetBool("relay_only"),
 					ExpectedStaticPub: session.GetString("relay_static_pub"),
 					RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
@@ -194,35 +202,37 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					log.Printf("agent_ws: failed to sign browser policy JWT: %v", err)
 					continue
 				}
-				agentJWT, err := relay.SignAgentRelayJWT(cfg.RelayJWTSecret, relay.AgentRelayClaims{SID: sid, AgentID: agentID}, now)
-				if err != nil {
-					log.Printf("agent_ws: failed to sign agent relay JWT: %v", err)
-					continue
-				}
+				if relayAllowed {
+					agentJWT, err := relay.SignAgentRelayJWT(cfg.RelayJWTSecret, relay.AgentRelayClaims{SID: sid, AgentID: agentID}, now)
+					if err != nil {
+						log.Printf("agent_ws: failed to sign agent relay JWT: %v", err)
+						continue
+					}
 
-				err = reg.CreatePendingSession(relay.PendingSession{
-					SID:               sid,
-					AccountID:         accountID,
-					SessionCode:       msg.Code,
-					AgentID:           agentID,
-					RelayAllowed:      browserClaims.RelayAllowed,
-					RelayOnly:         browserClaims.RelayOnly,
-					ExpectedStaticPub: browserClaims.ExpectedStaticPub,
-					JTI:               browserClaims.RegisteredClaims.ID,
-					ExpiresAt:         now.Add(relay.TokenLifetime),
-				}, now)
-				if err != nil {
-					log.Printf("agent_ws: failed to create pending relay session: %v", err)
-					continue
-				}
+					err = reg.CreatePendingSession(relay.PendingSession{
+						SID:               sid,
+						AccountID:         accountID,
+						SessionCode:       msg.Code,
+						AgentID:           agentID,
+						RelayAllowed:      browserClaims.RelayAllowed,
+						RelayOnly:         browserClaims.RelayOnly,
+						ExpectedStaticPub: browserClaims.ExpectedStaticPub,
+						JTI:               browserClaims.RegisteredClaims.ID,
+						ExpiresAt:         now.Add(relay.TokenLifetime),
+					}, now)
+					if err != nil {
+						log.Printf("agent_ws: failed to create pending relay session: %v", err)
+						continue
+					}
 
-				// Send relay_prepare to agent
-				hub.SendDirect(ctx, conn, map[string]any{
-					"type":       "relay_prepare",
-					"sid":        sid,
-					"expires_at": now.Add(relay.TokenLifetime).Format(time.RFC3339),
-					"relay_jwt":  agentJWT,
-				})
+					// Send relay_prepare to agent only when relay fallback is actually allowed.
+					hub.SendDirect(ctx, conn, map[string]any{
+						"type":       "relay_prepare",
+						"sid":        sid,
+						"expires_at": now.Add(relay.TokenLifetime).Format(time.RFC3339),
+						"relay_jwt":  agentJWT,
+					})
+				}
 
 				// Send relay_policy to browser via hub
 				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
