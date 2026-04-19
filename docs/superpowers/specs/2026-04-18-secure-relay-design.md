@@ -1,7 +1,7 @@
 # Secure Relay + Transfer Channel Design
 
 **Date:** 2026-04-18  
-**Status:** Drafted for review
+**Status:** Revised after review
 
 ## Problem
 
@@ -25,6 +25,7 @@ If we integrate relay encryption ad hoc, transport details will leak into the br
 - Make relay policy server-authoritative and tamper-evident
 - Replace TURN/Prometheus-era relay quota accounting with relay-native accounting
 - Remove Coturn from the new architecture
+- Specify a concrete relay authorization and routing protocol before implementation planning
 
 ## Non-Goals
 
@@ -43,6 +44,7 @@ The system is split into five layers:
    - `join(hmac)`
    - authorization outcome
    - signed connection policy issuance
+   - relay session creation and agent-side relay pre-registration
 
 2. **Connection Orchestration Layer**
    - browser-side `connectTransferChannel(...)`
@@ -177,6 +179,7 @@ Cloudflare STUN is the intended default:
 - uses `noise-p256` for the post-auth relay session
 - verifies the responder static public key against the server-issued expected value
 - exposes the same text/binary channel contract upward
+- owns session phase handling across handshake and post-handshake traffic
 
 It is implemented in:
 
@@ -185,6 +188,73 @@ It is implemented in:
 
 The relay itself remains transport-forwarding infrastructure. It does not participate in the Noise session beyond enforcing relay authorization and forwarding ciphertext.
 
+## Relay Transport and Routing Protocol
+
+The relay backend is a signaling-server-side WebSocket service. Relay traffic does not continue to flow through the public signaling message channel after auth succeeds.
+
+Transport:
+
+- browser ↔ relay backend: dedicated `wss` relay endpoint
+- agent ↔ relay backend: dedicated `wss` relay endpoint
+- relay backend forwards opaque framed bytes between paired browser and agent sockets for one authorized session
+
+The relay backend never decrypts Noise payloads. Its responsibilities are:
+
+- verify relay authorization
+- pair the correct browser and agent sockets for a session
+- forward opaque framed bytes
+- measure relay bytes for quota accounting
+
+### Relay Session ID
+
+Every post-auth secure relay attempt is bound to a server-issued opaque session ID:
+
+- `sid`
+
+`sid` binds together:
+
+- the authorized share/session context
+- the intended agent
+- the browser relay authorization
+- the agent-side relay pre-registration
+
+The relay backend routes strictly by `sid`. No bytes are forwarded until both sides have attached to the same valid session.
+
+### Agent Pre-Registration
+
+After signaling/auth succeeds and before relay fallback can be used, the signaling server creates an in-memory relay session record and notifies the authenticated agent over the existing signaling channel.
+
+That notification contains at minimum:
+
+- `sid`
+- share/session identifier
+- session expiry
+
+The agent then opens or attaches an authenticated relay socket for that `sid`.
+
+Concrete agent-side auth:
+
+- signaling server issues a short-lived server-signed agent relay token for `sid`
+- agent presents that token as the first application message on its relay WebSocket
+- relay backend verifies that token before binding the agent socket to `sid`
+
+This means the relay backend never guesses which agent should receive a browser relay session. The server creates the binding up front, and the agent explicitly registers its side of the relay session before forwarding begins.
+
+### Browser Relay Authorization
+
+The browser receives a signed connection policy containing `sid` and relay permissions. If the browser needs relay, it opens the relay WebSocket and sends that signed policy as the first application message.
+
+The relay backend verifies all of the following before forwarding any bytes:
+
+- policy signature valid
+- policy unexpired
+- `relayAllowed = true`
+- `sid` exists and is still pending
+- token replay check passes
+- the session is bound to a live authenticated agent-side relay socket
+
+Only then does the relay backend mark the session active and start forwarding framed bytes between browser and agent.
+
 ## Relay Framing
 
 WebRTC DataChannels already preserve message boundaries. Relay byte streams do not, so `SecureRelayChannel` must recreate them with internal framing.
@@ -192,6 +262,7 @@ WebRTC DataChannels already preserve message boundaries. Relay byte streams do n
 Relay frame format:
 
 - 1 byte frame kind
+  - `0x00` = Noise handshake
   - `0x01` = text
   - `0x02` = binary
 - 4 bytes big-endian payload length
@@ -199,12 +270,19 @@ Relay frame format:
 
 This is **internal transport framing**, not part of the file transfer protocol itself.
 
+Handshake rule:
+
+- during the pre-split phase, only `0x00` handshake frames are valid
+- after successful Noise split, only `0x01` text and `0x02` binary frames are valid
+
+Unknown frame kinds are fatal and close the relay session immediately.
+
 ### Frame Limits
 
 - The 4-byte length field has a theoretical maximum of `2^32 - 1` bytes.
 - The actual allowed maximum frame payload in ShareBridge is capped much lower.
 
-v1 cap:
+Current hard limit:
 
 - **8 MiB max frame payload**
 
@@ -214,20 +292,34 @@ This is more than sufficient for:
 - current 64 KiB binary chunks
 - modest future growth
 
-Malformed or oversized relay frames are fatal and close the relay session immediately.
+Malformed, oversized, out-of-phase, or unknown-kind relay frames are fatal and close the relay session immediately.
 
 ## Signed Connection Policy
 
 After signaling/auth succeeds, the signaling server issues a **signed connection policy**. This policy is authoritative and tamper-evident.
 
+Concrete mechanism:
+
+- format: JWT
+- signature algorithm: **HMAC-SHA256 (HS256)**
+- signing key: signaling server secret, stored server-side only
+
+Who verifies it:
+
+- browser: reads the policy fields and is constrained by them, but does not rely on local verification for trust
+- relay backend: verifies the HS256 signature before allowing relay use
+
+TLS protects the policy in transit. The JWT signature protects it from client-side mutation after receipt.
+
 It carries:
 
+- `sid`
 - session/share identifier
 - expiry
 - `relayAllowed`
 - `relayOnly`
 - expected agent static public key
-- relay authorization / anti-replay field if needed
+- `jti` anti-replay identifier
 
 ### Why this is separate from Noise
 
@@ -237,17 +329,33 @@ Noise provides:
 - transcript integrity
 - fresh session keys
 
-Noise does **not** by itself tell the browser:
+Noise does **not** by itself tell the browser or relay:
 
 - which agent static public key it was supposed to see
 - whether relay is allowed for this session
 - whether the authorization is expired
 - whether a relay authorization blob is being replayed
+- which relay session ID is authorized for routing
 
 So the system uses both:
 
 - **Noise** to authenticate the encrypted channel
 - **signed policy** to authenticate the authorized session context and transport permissions
+
+### Anti-Replay
+
+Anti-replay is required in v1.
+
+The signed policy includes:
+
+- `jti` — single-use unique token identifier
+
+Relay backend rule:
+
+- first successful relay authorization for a given `jti` marks it spent
+- any later reuse of the same `jti` is rejected
+
+Expiry alone is not sufficient, because an intercepted policy blob would otherwise be replayable for the remainder of its validity window.
 
 ### Policy Shape
 
@@ -270,6 +378,18 @@ Derived behavior:
 - `relayOnly = true`, `relayAllowed = false`  
   invalid, reject before connection setup
 
+### Agent-Side Browser Authentication Model
+
+The browser does not have a long-lived pinned identity in ShareBridge.
+
+So the agent-side acceptance rule is not “pin a browser public key.” Instead:
+
+- the relay backend verifies that the browser presented a valid, single-use server-issued policy for `sid`
+- the relay backend pairs that browser with the intended authenticated agent-side relay socket for the same `sid`
+- the agent then completes the Noise XX handshake with that initiator
+
+The browser’s Noise static key remains per-session ephemeral. The agent authenticates the **authorized session**, not a reusable browser identity.
+
 ## Connection Flow
 
 1. Signaling/auth completes as it does today.
@@ -283,12 +403,48 @@ Derived behavior:
    - otherwise fail
 5. Transfer layer receives one connected channel and runs unchanged.
 
+### Relay Path Detailed Flow
+
+1. Signaling/auth completes.
+2. Signaling server creates an in-memory relay session for `sid`.
+3. Signaling server notifies the authenticated agent to pre-register relay for `sid`.
+4. Signaling server returns a signed policy JWT to the browser containing:
+   - `sid`
+   - `relayAllowed`
+   - `relayOnly`
+   - expected agent static public key
+   - `exp`
+   - `jti`
+5. Browser opens the relay WebSocket and sends the policy JWT as the first application message.
+6. Relay backend verifies:
+   - HS256 signature
+   - `exp`
+   - `relayAllowed`
+   - `jti` unused
+   - `sid` exists
+   - matching authenticated agent relay socket is present for `sid`
+7. Relay backend marks `jti` spent and begins opaque byte forwarding.
+8. Browser and agent run the Noise XX handshake through the relay.
+9. Browser verifies the agent static public key from the Noise handshake matches the expected key from the signed policy.
+10. After handshake success, both sides switch to text/binary framed transfer traffic.
+
 ### First-Version Rules
 
 - Transport is selected **before** transfer starts.
 - There is **no mid-transfer migration** between direct and relay in v1.
 - Fallback happens before the transfer layer sees a connected session.
 - If both paths fail, the browser surfaces a connection error and transfer never starts.
+- Direct attempt timeout is explicit and bounded.
+
+### Direct Attempt Timeout
+
+Direct mode is attempted with a caller-configurable timeout.
+
+Default v1 value:
+
+- **5 seconds**
+
+This keeps fallback latency bounded while still allowing a reasonable ICE attempt window. If the direct path is not connected by then, orchestration treats that attempt as failed and proceeds according to policy.
 
 ## Connection Status Indicator
 
@@ -301,6 +457,26 @@ Derived behavior:
 - failed
 
 This keeps status logic close to the actual connection orchestration rather than scattering it through the UI.
+
+### `connectTransferChannel(...)` Sketch
+
+The exact implementation can stay lightweight, but the spec anchors it with a rough signature:
+
+```ts
+async function connectTransferChannel({
+  policy,
+  iceServers,
+  directTimeoutMs = 5000,
+  onStatusChange,
+}): Promise<DirectChannel | SecureRelayChannel>
+```
+
+Where:
+
+- `policy` is the server-issued signed connection policy
+- `iceServers` configures direct mode
+- `directTimeoutMs` bounds the direct attempt window
+- `onStatusChange` receives states such as `connecting-direct`, `falling-back-to-relay`, `connected-direct`, `connected-relay`, `failed`
 
 ## Quota Accounting
 
@@ -386,7 +562,7 @@ This is intentionally low-risk:
 
 - direct path remains stable
 - relay path gets hardened
-- old e2ecp-style logic collapses into one post-auth relay package instead of leaking into app code
+- old legacy encrypted relay-channel logic collapses into one post-auth relay package instead of leaking into app code
 
 ## Testing Strategy
 
