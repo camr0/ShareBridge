@@ -1,6 +1,7 @@
 package relay_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -154,5 +155,41 @@ func TestApplyRelayBytes_AccumulatesMultipleCalls(t *testing.T) {
 	expected := 0.6 // 100MB + 200MB + 300MB = 600MB = 0.6 GB
 	if usage < expected-0.0001 || usage > expected+0.0001 {
 		t.Errorf("usage = %v, expected ~%v", usage, expected)
+	}
+}
+
+func TestApplyRelayBytes_ConcurrentIncrements(t *testing.T) {
+	app, cleanup := setupRelayTestApp(t)
+	defer cleanup()
+
+	user, err := createRelayTestAccountWithQuota(app, "concurrent@example.com", 50.0, 0.0)
+	require.NoError(t, err)
+
+	// Launch 100 concurrent goroutines, each incrementing by 10MB
+	const numGoroutines = 100
+	const bytesPerCall = 10_000_000 // 10MB
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	now := time.Now().UTC()
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			if err := relay.ApplyRelayBytes(app, user.Id, bytesPerCall, now); err != nil {
+				t.Errorf("ApplyRelayBytes failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verify all increments were applied atomically (no lost updates)
+	updated, err := app.FindRecordById("users", user.Id)
+	require.NoError(t, err)
+	usage := updated.GetFloat("current_period_usage_gb")
+	expected := float64(numGoroutines*bytesPerCall) / relay.GB
+	// Allow small floating point tolerance
+	if usage < expected-0.0001 || usage > expected+0.0001 {
+		t.Errorf("usage = %v, expected ~%v (lost updates detected)", usage, expected)
 	}
 }
