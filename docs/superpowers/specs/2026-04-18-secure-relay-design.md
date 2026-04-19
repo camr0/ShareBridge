@@ -34,6 +34,26 @@ If we integrate relay encryption ad hoc, transport details will leak into the br
 - Supporting mid-transfer migration between direct and relay in v1
 - Making the Go relay/agent package a public reusable external Go dependency
 
+## Design Principles Learned From `e2ecp`
+
+This design deliberately keeps several lessons from `e2ecp`, even though ShareBridge needs a different transport and policy model.
+
+- Keep the relay backend as dumb as possible.
+- Keep encrypted transport logic behind one small boundary instead of scattering it through app code.
+- Keep the secure relay story easy to explain: authorized session, authenticated handshake, encrypted framed channel, relay cannot read payloads.
+- Avoid inventing extra browser identity or relay state unless it solves a real ShareBridge requirement.
+- Prefer operational simplicity over inherited TURN-era complexity.
+
+ShareBridge does **not** copy `e2ecp`'s protocol directly. ShareBridge still needs:
+
+- direct mode as a first-class path
+- explicit direct-to-relay fallback
+- signed relay policy and quota enforcement
+- expected agent static-key pinning
+- a formal Noise handshake instead of an ad hoc ECDH exchange
+
+So `e2ecp` is used here as a simplicity check, not as a protocol template.
+
 ## High-Level Architecture
 
 The system is split into five layers:
@@ -125,6 +145,12 @@ Browser-side orchestration boundary:
 
 This may begin life as a function plus helpers. Conceptually it is a small connection manager, but v1 does not require a heavy class abstraction.
 
+Boundary note:
+
+- the pre-auth signaling/auth websocket may already exist before authorization completes
+- neither `DirectChannel` nor `SecureRelayChannel` becomes a usable transfer channel until post-auth connection setup succeeds
+- both transport adapters are therefore post-auth transfer channels; only signaling exists pre-auth
+
 ## Ownership Rules
 
 - **Signaling server owns authorization and policy**
@@ -161,6 +187,8 @@ The system could have been raised to a generic `sendFrame/readFrame` abstraction
 
 Direct mode remains functionally unchanged from the transfer layer's point of view.
 
+Like relay mode, `DirectChannel` is only established after signaling/auth succeeds. This matches the current main-branch flow, where `join(hmac)` is verified before the agent creates the WebRTC peer and before the browser gets a usable transfer DataChannel.
+
 Direct mode still uses STUN for candidate gathering. In the new architecture:
 
 - **direct mode uses STUN only**
@@ -192,11 +220,18 @@ The relay itself remains transport-forwarding infrastructure. It does not partic
 
 The relay backend is a signaling-server-side WebSocket service. Relay traffic does not continue to flow through the public signaling message channel after auth succeeds.
 
+The relay backend runs in the same server trust boundary as the signaling server, so it is allowed to hold and verify the same HS256 signing secret used for relay/session tokens.
+
 Transport:
 
-- browser ↔ relay backend: dedicated `wss` relay endpoint
-- agent ↔ relay backend: dedicated `wss` relay endpoint
+- browser ↔ relay backend: dedicated relay WebSocket endpoint
+- agent ↔ relay backend: dedicated relay WebSocket endpoint
 - relay backend forwards opaque framed bytes between paired browser and agent sockets for one authorized session
+
+Scheme rule:
+
+- production deployments use `wss://`
+- local/non-TLS development may use `ws://`, matching current main-branch signaling behavior
 
 The relay backend never decrypts Noise payloads. Its responsibilities are:
 
@@ -234,7 +269,9 @@ The agent then opens or attaches an authenticated relay socket for that `sid`.
 
 Concrete agent-side auth:
 
-- signaling server issues a short-lived server-signed agent relay token for `sid`
+- signaling server issues a short-lived server-signed **JWT** for agent relay registration
+- token format: JWT
+- signature algorithm: **HMAC-SHA256 (HS256)**
 - agent presents that token as the first application message on its relay WebSocket
 - relay backend verifies that token before binding the agent socket to `sid`
 
@@ -251,9 +288,23 @@ The relay backend verifies all of the following before forwarding any bytes:
 - `relayAllowed = true`
 - `sid` exists and is still pending
 - token replay check passes
-- the session is bound to a live authenticated agent-side relay socket
+- the session is bound to a live authenticated agent-side relay socket, or one appears within the pending wait window
 
 Only then does the relay backend mark the session active and start forwarding framed bytes between browser and agent.
+
+### Pending Wait Window
+
+The browser must not fail immediately if it reaches the relay slightly before the agent-side relay socket finishes registering.
+
+Relay backend rule:
+
+- when the browser presents a valid relay policy for `sid`, the relay backend may hold that browser socket in a pending state for a short wait window while the matching agent-side relay socket appears
+
+Default v1 value:
+
+- **2 seconds**
+
+If no matching authenticated agent relay socket appears within that window, relay authorization fails and the browser sees a connection failure.
 
 ## Relay Framing
 
@@ -293,6 +344,12 @@ This is more than sufficient for:
 - modest future growth
 
 Malformed, oversized, out-of-phase, or unknown-kind relay frames are fatal and close the relay session immediately.
+
+Pre-split handshake frames use a tighter limit:
+
+- **4 KiB max payload for `0x00` handshake frames**
+
+Noise XX handshake messages in this design are only a few hundred bytes, so a smaller cap reduces pre-auth DoS surface without constraining real traffic.
 
 ## Signed Connection Policy
 
@@ -357,6 +414,14 @@ Relay backend rule:
 
 Expiry alone is not sufficient, because an intercepted policy blob would otherwise be replayable for the remainder of its validity window.
 
+Durability in v1:
+
+- spent `jti` state is held in memory only
+- relay/backend restart clears spent-token state
+- replay exposure after restart is therefore bounded by the remaining token `exp` window
+
+To keep that bounded, relay/session JWT lifetimes must stay short.
+
 ### Policy Shape
 
 Because direct mode is always free and not quota-restricted in the current ShareBridge model, the simplest policy is:
@@ -398,8 +463,8 @@ The browser’s Noise static key remains per-session ephemeral. The agent authen
 4. Browser executes:
    - if `relayOnly`, connect relay immediately
    - otherwise try direct first
-   - if direct succeeds, return `DirectChannel`
-   - if direct fails and `relayAllowed`, connect `SecureRelayChannel`
+   - if direct succeeds, return a connected `TransferChannel` with `mode = 'direct'`
+   - if direct fails and `relayAllowed`, connect relay and return a connected `TransferChannel` with `mode = 'relay'`
    - otherwise fail
 5. Transfer layer receives one connected channel and runs unchanged.
 
@@ -422,11 +487,29 @@ The browser’s Noise static key remains per-session ephemeral. The agent authen
    - `relayAllowed`
    - `jti` unused
    - `sid` exists
-   - matching authenticated agent relay socket is present for `sid`
+   - matching authenticated agent relay socket is present for `sid`, or appears within the pending wait window
 7. Relay backend marks `jti` spent and begins opaque byte forwarding.
 8. Browser and agent run the Noise XX handshake through the relay.
 9. Browser verifies the agent static public key from the Noise handshake matches the expected key from the signed policy.
 10. After handshake success, both sides switch to text/binary framed transfer traffic.
+
+### Relay Session Cleanup
+
+Pending relay session state must not linger indefinitely.
+
+The relay backend and/or signaling server cleans up relay session state when any of the following happens:
+
+- `sid` expires before activation
+- browser relay authorization fails
+- agent pre-registration never completes
+- direct path succeeds and relay was never activated
+- relay session closes after activation
+
+Cleanup includes:
+
+- pending session record for `sid`
+- any unactivated browser-side pending relay socket
+- any unactivated agent-side relay socket binding
 
 ### First-Version Rules
 
@@ -463,12 +546,19 @@ This keeps status logic close to the actual connection orchestration rather than
 The exact implementation can stay lightweight, but the spec anchors it with a rough signature:
 
 ```ts
+type TransferChannelMode = 'direct' | 'relay'
+
+type ConnectedTransferChannel = {
+  channel: TransferChannel
+  mode: TransferChannelMode
+}
+
 async function connectTransferChannel({
   policy,
   iceServers,
   directTimeoutMs = 5000,
   onStatusChange,
-}): Promise<DirectChannel | SecureRelayChannel>
+}): Promise<ConnectedTransferChannel>
 ```
 
 Where:
@@ -477,6 +567,8 @@ Where:
 - `iceServers` configures direct mode
 - `directTimeoutMs` bounds the direct attempt window
 - `onStatusChange` receives states such as `connecting-direct`, `falling-back-to-relay`, `connected-direct`, `connected-relay`, `failed`
+- `channel` is the shared transfer-facing interface
+- `mode` exposes the selected transport for UI/status/telemetry without leaking concrete transport classes into the transfer layer
 
 ## Quota Accounting
 
