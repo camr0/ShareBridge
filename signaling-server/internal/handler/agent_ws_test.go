@@ -32,6 +32,10 @@ func setupAgentTestApp(t *testing.T) (core.App, func()) {
 	// Run our custom migrations
 	err = migrations.CreateCollections(testApp)
 	require.NoError(t, err)
+	err = migrations.AddRelayOnly(testApp)
+	require.NoError(t, err)
+	err = migrations.AddSessionRelayStaticPub(testApp)
+	require.NoError(t, err)
 
 	cleanup := func() { testApp.Cleanup() }
 	return testApp, cleanup
@@ -216,4 +220,43 @@ func TestAgentWS_CodeOwnership(t *testing.T) {
 	assert.Contains(t, string(data), "error")
 	assert.Contains(t, string(data), "code already in use")
 	conn.CloseNow()
+}
+
+func TestAgentWS_RegisterShare_PersistsRelayStaticPub(t *testing.T) {
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
+
+	user, err := createTestUser(app, "relay@example.com")
+	require.NoError(t, err)
+	apiKey, err := createTestAPIKey(app, user.Id, "relaysecret")
+	require.NoError(t, err)
+
+	h := hub.New()
+	cfg := config.Load()
+
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+	fullKey := apiKey.Id + ".relaysecret"
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer conn.CloseNow()
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-1"}`)))
+	_, _, err = conn.Read(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"RELAYKEY1","relay_static_pub":"04abcd"}`)))
+	_, _, err = conn.Read(ctx)
+	require.NoError(t, err)
+
+	session, err := getSessionByCode(app, "RELAYKEY1")
+	require.NoError(t, err)
+	require.Equal(t, "04abcd", session.GetString("relay_static_pub"))
 }

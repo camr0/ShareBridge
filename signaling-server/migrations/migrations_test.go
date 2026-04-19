@@ -99,3 +99,34 @@ func TestMigration3_AddQuotaFields(t *testing.T) {
 	err = migrations.AddQuotaFields(testApp)
 	require.NoError(t, err)
 }
+
+func TestMigration4_AddRelayOnly(t *testing.T) {
+	testApp, err := tests.NewTestApp(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { testApp.Cleanup() })
+
+	require.NoError(t, testApp.Bootstrap())
+	require.NoError(t, testApp.RunSystemMigrations())
+	require.NoError(t, migrations.CreateCollections(testApp))
+	require.NoError(t, migrations.AddRelayOnly(testApp))
+
+	sessionsCol, err := testApp.FindCollectionByNameOrId("sessions")
+	require.NoError(t, err)
+	require.NotNil(t, sessionsCol.Fields.GetByName("relay_only"))
+}
+
+func TestMigration5_AddSessionRelayStaticPub(t *testing.T) {
+	testApp, err := tests.NewTestApp(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { testApp.Cleanup() })
+
+	require.NoError(t, testApp.Bootstrap())
+	require.NoError(t, testApp.RunSystemMigrations())
+	require.NoError(t, migrations.CreateCollections(testApp))
+	require.NoError(t, migrations.AddRelayOnly(testApp))
+	require.NoError(t, migrations.AddSessionRelayStaticPub(testApp))
+
+	sessionsCol, err := testApp.FindCollectionByNameOrId("sessions")
+	require.NoError(t, err)
+	require.NotNil(t, sessionsCol.Fields.GetByName("relay_static_pub"))
+}
