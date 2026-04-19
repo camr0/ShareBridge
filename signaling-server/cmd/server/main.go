@@ -17,12 +17,14 @@ import (
 	"sharebridge/server/internal/metrics"
 	"sharebridge/server/internal/middleware"
 	"sharebridge/server/internal/quota"
+	"sharebridge/server/internal/relay"
 	_ "sharebridge/server/migrations"
 )
 
 func main() {
 	cfg := config.Load()
 	h := hub.New()
+	reg := relay.NewRegistry(cfg.RelayPendingWaitWindow)
 
 	app := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir: cfg.DataDir,
@@ -58,6 +60,11 @@ func main() {
 
 		router.GET("/ws/client", func(e *core.RequestEvent) error {
 			handler.BrowserWS(app, h, cfg)(e.Response, e.Request)
+			return nil
+		})
+
+		router.GET("/ws/relay", func(e *core.RequestEvent) error {
+			handler.RelayWS(app, reg, cfg)(e.Response, e.Request)
 			return nil
 		})
 
