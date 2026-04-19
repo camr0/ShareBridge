@@ -1154,9 +1154,6 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 				}
 				return
 			}
-			if peer != nil {
-				proxyRelayPair(ctx, app, reg, claims.SID, conn, peer)
-			}
 			return
 		}
 		if claims, err := relay.VerifyBrowserPolicyJWT(cfg.RelayJWTSecret, hello.Token, time.Now()); err == nil {
@@ -1183,9 +1180,6 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 				}
 				return
 			}
-			if peer != nil {
-				proxyRelayPair(ctx, app, reg, claims.SID, conn, peer)
-			}
 			return
 		}
 
@@ -1206,8 +1200,8 @@ func proxyRelayPair(ctx context.Context, app core.App, reg *relay.Registry, sid 
 		})
 	}
 
-	go forwardRelayFrames(ctx, reg, sid, left, right, closeAndFlush)
 	go forwardRelayFrames(ctx, reg, sid, right, left, closeAndFlush)
+	forwardRelayFrames(ctx, reg, sid, left, right, closeAndFlush)
 }
 
 func forwardRelayFrames(ctx context.Context, reg *relay.Registry, sid string, src, dst *websocket.Conn, onClose func()) {
