@@ -56,6 +56,7 @@ func VerifyBrowserPolicyJWT(secret, token string, now time.Time) (*BrowserPolicy
 func SignAgentRelayJWT(secret string, claims AgentRelayClaims, issuedAt time.Time) (string, error) {
 	claims.Purpose = "agent_relay"
 	claims.RegisteredClaims = jwt.RegisteredClaims{
+		ID:        claims.RegisteredClaims.ID,
 		IssuedAt:  jwt.NewNumericDate(issuedAt),
 		ExpiresAt: jwt.NewNumericDate(issuedAt.Add(TokenLifetime)),
 	}

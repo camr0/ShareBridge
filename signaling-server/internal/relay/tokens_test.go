@@ -51,6 +51,20 @@ func TestVerifyBrowserPolicyJWT_RejectsExpiredToken(t *testing.T) {
 	}
 }
 
+func TestVerifyBrowserPolicyJWT_RejectsWrongPurpose(t *testing.T) {
+	// Create an agent_relay token and try to verify it as browser_policy
+	claims := relay.AgentRelayClaims{SID: "sid-123", AgentID: "agent-1"}
+	token, err := relay.SignAgentRelayJWT("test-secret", claims, time.Unix(1_800_000_000, 0))
+	if err != nil {
+		t.Fatalf("SignAgentRelayJWT failed: %v", err)
+	}
+
+	_, err = relay.VerifyBrowserPolicyJWT("test-secret", token, time.Unix(1_800_000_010, 0))
+	if err == nil {
+		t.Error("expected error for wrong purpose token")
+	}
+}
+
 func TestSignAndVerifyAgentRelayJWT(t *testing.T) {
 	claims := relay.AgentRelayClaims{SID: "sid-123", AgentID: "agent-1"}
 	token, err := relay.SignAgentRelayJWT("test-secret", claims, time.Unix(1_800_000_000, 0))
