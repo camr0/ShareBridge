@@ -23,7 +23,7 @@ test('interop: JS can decrypt Go-generated ciphertext (initiator->responder)', a
   const rRecv = new CipherState(k1)
 
   const ct = fromHex(vec.sample_ct_initiator)
-  const pt = await rRecv.decryptWithAd(new Uint8Array(0), ct)
+  const pt = await rRecv.decrypt(new Uint8Array(0), ct)
   assert.strictEqual(new TextDecoder().decode(pt), vec.sample_plaintext)
 })
 
@@ -33,7 +33,7 @@ test('interop: JS can decrypt Go-generated ciphertext (responder->initiator)', a
   const iRecv = new CipherState(k2)
 
   const ct = fromHex(vec.sample_ct_responder)
-  const pt = await iRecv.decryptWithAd(new Uint8Array(0), ct)
+  const pt = await iRecv.decrypt(new Uint8Array(0), ct)
   assert.strictEqual(new TextDecoder().decode(pt), vec.sample_plaintext)
 })
 

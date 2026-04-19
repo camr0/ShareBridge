@@ -31,13 +31,13 @@ test('full Noise_XX handshake: mutual encryption works in both directions', asyn
   const [rSend, rRecv] = await responder.split()
 
   const plaintext = new TextEncoder().encode('hello from browser')
-  const ct = await iSend.encryptWithAd(new Uint8Array(0), plaintext)
-  const pt = await rRecv.decryptWithAd(new Uint8Array(0), ct)
+  const ct = await iSend.encrypt(new Uint8Array(0), plaintext)
+  const pt = await rRecv.decrypt(new Uint8Array(0), ct)
   assert.deepStrictEqual(pt, plaintext)
 
   const reply = new TextEncoder().encode('hello from agent')
-  const ct2 = await rSend.encryptWithAd(new Uint8Array(0), reply)
-  const pt2 = await iRecv.decryptWithAd(new Uint8Array(0), ct2)
+  const ct2 = await rSend.encrypt(new Uint8Array(0), reply)
+  const pt2 = await iRecv.decrypt(new Uint8Array(0), ct2)
   assert.deepStrictEqual(pt2, reply)
 })
 

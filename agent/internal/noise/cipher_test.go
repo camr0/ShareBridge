@@ -58,6 +58,14 @@ func TestCipherStateWrongAdFails(t *testing.T) {
 	}
 }
 
+func TestCipherStateZeroKeyRejected(t *testing.T) {
+	cs := newCipherState([32]byte{})
+
+	if _, err := cs.encryptWithAd(nil, []byte("x")); err == nil {
+		t.Fatal("encrypt with zero key must fail")
+	}
+}
+
 func TestCipherStateNonceExhaustion(t *testing.T) {
 	var key [32]byte
 	copy(key[:], bytes.Repeat([]byte{0x55}, 32))

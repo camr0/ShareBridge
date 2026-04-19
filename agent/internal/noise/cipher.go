@@ -19,8 +19,21 @@ func newCipherState(key [32]byte) *CipherState {
 	return &CipherState{key: key}
 }
 
+// Encrypt encrypts plaintext with explicit associated data.
+func (cs *CipherState) Encrypt(ad, plaintext []byte) ([]byte, error) {
+	return cs.encryptWithAd(ad, plaintext)
+}
+
+// Decrypt decrypts ciphertext with explicit associated data.
+func (cs *CipherState) Decrypt(ad, ciphertext []byte) ([]byte, error) {
+	return cs.decryptWithAd(ad, ciphertext)
+}
+
 // encryptWithAd encrypts plaintext with AES-256-GCM using current nonce, then increments n.
 func (cs *CipherState) encryptWithAd(ad, plaintext []byte) ([]byte, error) {
+	if isZeroKey(cs.key) {
+		return nil, errors.New("noise: cipher key not initialized")
+	}
 	if cs.n == ^uint64(0) {
 		return nil, errors.New("noise: nonce exhausted")
 	}
@@ -35,6 +48,9 @@ func (cs *CipherState) encryptWithAd(ad, plaintext []byte) ([]byte, error) {
 
 // decryptWithAd decrypts ciphertext; increments n only on success.
 func (cs *CipherState) decryptWithAd(ad, ciphertext []byte) ([]byte, error) {
+	if isZeroKey(cs.key) {
+		return nil, errors.New("noise: cipher key not initialized")
+	}
 	if cs.n == ^uint64(0) {
 		return nil, errors.New("noise: nonce exhausted")
 	}
@@ -73,4 +89,9 @@ func nonceBytes(n uint64) []byte {
 	nonce := make([]byte, 12)
 	binary.BigEndian.PutUint64(nonce[4:], n)
 	return nonce
+}
+
+func isZeroKey(key [32]byte) bool {
+	var zero [32]byte
+	return key == zero
 }

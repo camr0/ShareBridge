@@ -10,11 +10,11 @@ test('CipherState: round-trip encrypt/decrypt', async () => {
   const plaintext = new TextEncoder().encode('hello sharebridge')
   const ad = new TextEncoder().encode('associated-data')
 
-  const ct = await cs.encryptWithAd(ad, plaintext)
+  const ct = await cs.encrypt(ad, plaintext)
   assert.strictEqual(ct.length, plaintext.length + 16)
 
   const cs2 = new CipherState(key)
-  const pt = await cs2.decryptWithAd(ad, ct)
+  const pt = await cs2.decrypt(ad, ct)
   assert.deepStrictEqual(pt, plaintext)
 })
 
@@ -22,17 +22,17 @@ test('CipherState: nonce increments — same plaintext gives different ciphertex
   const key = new Uint8Array(32).fill(0x11)
   const cs = new CipherState(key)
   const msg = new TextEncoder().encode('msg')
-  const ct1 = await cs.encryptWithAd(null, msg)
-  const ct2 = await cs.encryptWithAd(null, msg)
+  const ct1 = await cs.encrypt(new Uint8Array(0), msg)
+  const ct2 = await cs.encrypt(new Uint8Array(0), msg)
   assert.notDeepStrictEqual(ct1, ct2)
 })
 
 test('CipherState: wrong AD fails decryption', async () => {
   const key = new Uint8Array(32).fill(0x33)
   const cs = new CipherState(key)
-  const ct = await cs.encryptWithAd(new TextEncoder().encode('correct'), new TextEncoder().encode('data'))
+  const ct = await cs.encrypt(new TextEncoder().encode('correct'), new TextEncoder().encode('data'))
   const cs2 = new CipherState(key)
-  await assert.rejects(() => cs2.decryptWithAd(new TextEncoder().encode('wrong'), ct))
+  await assert.rejects(() => cs2.decrypt(new TextEncoder().encode('wrong'), ct))
 })
 
 test('splitKeys: returns two distinct 32-byte keys, deterministic', async () => {
@@ -51,5 +51,10 @@ test('CipherState: nonce exhaustion throws before wraparound', async () => {
   const key = new Uint8Array(32).fill(0x44)
   const cs = new CipherState(key)
   cs._setNonceForTest?.((2n ** 64n) - 1n)
-  await assert.rejects(() => cs.encryptWithAd(new Uint8Array(0), new Uint8Array([0x01])))
+  await assert.rejects(() => cs.encrypt(new Uint8Array(0), new Uint8Array([0x01])))
+})
+
+test('CipherState: zero key is rejected as uninitialized', async () => {
+  const cs = new CipherState(new Uint8Array(32))
+  await assert.rejects(() => cs.encrypt(new Uint8Array(0), new Uint8Array([0x01])))
 })

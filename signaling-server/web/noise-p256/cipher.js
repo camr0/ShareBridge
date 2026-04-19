@@ -9,7 +9,16 @@ export class CipherState {
     this.#key = key
   }
 
+  async encrypt(ad, plaintext) {
+    return this.encryptWithAd(ad, plaintext)
+  }
+
+  async decrypt(ad, ciphertext) {
+    return this.decryptWithAd(ad, ciphertext)
+  }
+
   async encryptWithAd(ad, plaintext) {
+    this.#assertInitializedKey()
     if (this.#n === (2n ** 64n) - 1n) {
       throw new Error('noise: nonce exhausted')
     }
@@ -22,6 +31,7 @@ export class CipherState {
   }
 
   async decryptWithAd(ad, ciphertext) {
+    this.#assertInitializedKey()
     if (this.#n === (2n ** 64n) - 1n) {
       throw new Error('noise: nonce exhausted')
     }
@@ -40,6 +50,12 @@ export class CipherState {
   // Expose key for interop test vector generation only
   get keyBytes() { return this.#key }
   _setNonceForTest(value) { this.#n = value }
+
+  #assertInitializedKey() {
+    if (isZeroKey(this.#key)) {
+      throw new Error('noise: cipher key not initialized')
+    }
+  }
 }
 
 // splitKeys: Noise Split using empty input (NOT zeros(32)).
@@ -54,4 +70,11 @@ function nonceBytes(n) {
   const view = new DataView(buf.buffer)
   view.setBigUint64(4, BigInt(n), false) // big-endian at offset 4
   return buf
+}
+
+function isZeroKey(key) {
+  for (const byte of key) {
+    if (byte !== 0) return false
+  }
+  return true
 }
