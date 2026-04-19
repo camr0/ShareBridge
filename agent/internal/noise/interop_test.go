@@ -60,8 +60,10 @@ func TestGenerateInteropVectors(t *testing.T) {
 
 	// Build initiator and responder with injected keys
 	h, ck := initialize()
+	h = mixHash(h, nil) // MixHash(prologue) - prologue is empty
 	initiator := &NoiseXX{role: roleInitiator, h: h, ck: ck, sPriv: iSPriv, sPub: iSPriv.PublicKey().Bytes()}
 	h2, ck2 := initialize()
+	h2 = mixHash(h2, nil) // MixHash(prologue) - prologue is empty
 	responder := &NoiseXX{role: roleResponder, h: h2, ck: ck2, sPriv: rSPriv, sPub: rSPriv.PublicKey().Bytes()}
 
 	// Inject deterministic ephemeral keys (override generateKeypair in WriteMessage1/2)
