@@ -169,7 +169,12 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				}
 
 				session, err := getSessionByCode(app, msg.Code)
-				if err != nil || session == nil {
+				if err != nil {
+					log.Printf("agent_ws: auth_ok session lookup failed for code %s: %v", msg.Code, err)
+					continue
+				}
+				if session == nil {
+					log.Printf("agent_ws: auth_ok session not found for code %s", msg.Code)
 					continue
 				}
 
