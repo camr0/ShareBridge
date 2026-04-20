@@ -147,8 +147,13 @@ mkdir -p data
 # Create Caddyfile (user will need to edit domain)
 cat > /etc/caddy/Caddyfile <<'EOF'
 # ShareBridge Signaling Server
-# EDIT THIS: Replace with your domain
+# EDIT THIS: Replace with your actual domain
 share.example.com {
+    reverse_proxy localhost:8080
+}
+
+# Relay subdomain - configure as DNS-only in Cloudflare to bypass TOS
+relay.share.example.com {
     reverse_proxy localhost:8080
 }
 
@@ -202,12 +207,18 @@ cat > /opt/sharebridge/SETUP.md <<EOF
 ## 1. Configure your domain
 Edit /etc/caddy/Caddyfile:
    Replace 'share.example.com' with your actual domain
+   Replace 'relay.share.example.com' with relay.youractualdomain.com
 
 Reload Caddy:
    systemctl reload caddy
 
 ## 2. Configure DNS
 Point your domain's A record to this server's IP address.
+
+**IMPORTANT - Relay Configuration:**
+The relay subdomain must be configured as DNS-only (grey cloud) in Cloudflare to bypass Cloudflare's TOS restrictions on large file transfers:
+   - Main domain (share.example.com): Orange cloud (proxied)
+   - Relay subdomain (relay.share.example.com): Grey cloud (DNS only)
 
 ## 3. Build and start the signaling server
 \`\`\`bash
