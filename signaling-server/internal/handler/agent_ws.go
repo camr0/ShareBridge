@@ -68,7 +68,9 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 		}
 		defer conn.CloseNow()
 
-		ctx := r.Context()
+			// coder/websocket recommends avoiding request.Context() for upgraded
+			// WebSocket lifetime.
+			ctx := context.Background()
 		var agentID string
 
 		// Cached quota state - refreshed at most once per minute to avoid
@@ -145,14 +147,14 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					"candidate": msg.Candidate,
 				})
 
-			case "nonce":
-				// Route nonce from agent to the specific browser identified by connID.
-				if agentID == "" {
-					continue
-				}
-				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-					"type":         "nonce",
-					"conn_id":      msg.ConnID,
+				case "nonce":
+					// Route nonce from agent to the specific browser identified by connID.
+					if agentID == "" {
+						continue
+					}
+					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+						"type":         "nonce",
+						"conn_id":      msg.ConnID,
 					"value":        msg.Value,
 					"has_password": msg.HasPassword,
 				})

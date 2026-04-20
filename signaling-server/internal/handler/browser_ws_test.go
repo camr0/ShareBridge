@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,6 +21,15 @@ import (
 	"sharebridge/server/internal/relay"
 	"sharebridge/server/migrations"
 )
+
+func extractJSONField(t *testing.T, data []byte, key string) string {
+	t.Helper()
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(data, &payload))
+	value, ok := payload[key].(string)
+	require.True(t, ok, "expected string field %q in payload %s", key, string(data))
+	return value
+}
 
 func setupBrowserTestApp(t *testing.T) (core.App, func()) {
 	testApp, err := tests.NewTestApp(t.TempDir())
@@ -335,4 +345,131 @@ func TestBrowserWS_DirectFlowStillSendsICEConfigFirst(t *testing.T) {
 	_, firstMsg, err := browserConn.Read(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, string(firstMsg), `"type":"ice_config"`)
+}
+
+func TestBrowserWS_RelayOnlyAnnotatesIceConfig(t *testing.T) {
+	app, cleanup := setupBrowserTestApp(t)
+	defer cleanup()
+
+	user, err := createTestAccountWithQuota(app, "relayonly@example.com", 50.0, 0.0)
+	require.NoError(t, err)
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "relayonlysecret")
+	require.NoError(t, err)
+
+	session, err := createTestSessionWithAPIKey(app, apiKey.Id, "agent-relayonly", "RELAYONLY1")
+	require.NoError(t, err)
+	session.Set("relay_only", true)
+	require.NoError(t, app.Save(session))
+
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+
+	fullKey := apiKey.Id + ".relayonlysecret"
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer agentConn.CloseNow()
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-relayonly"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"RELAYONLY1"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	browserConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=RELAYONLY1", nil)
+	require.NoError(t, err)
+	defer browserConn.CloseNow()
+
+	_, firstMsg, err := browserConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(firstMsg), `"type":"ice_config"`)
+	assert.Contains(t, string(firstMsg), `"relay_only":true`)
+
+	_, knockMsg, err := agentConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(knockMsg), `"type":"knock"`)
+	assert.Contains(t, string(knockMsg), `"code":"RELAYONLY1"`)
+
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"nonce","conn_id":"`+extractJSONField(t, knockMsg, "conn_id")+`","value":"relaynonce","has_password":false}`)))
+
+	_, nonceMsg, err := browserConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(nonceMsg), `"type":"nonce"`)
+	assert.Contains(t, string(nonceMsg), `"value":"relaynonce"`)
+}
+
+func TestBrowserWS_KnockSurvivesRequestContextCancellation(t *testing.T) {
+	app, cleanup := setupBrowserTestApp(t)
+	defer cleanup()
+
+	user, err := createTestAccountWithQuota(app, "ctxcancel@example.com", 50.0, 0.0)
+	require.NoError(t, err)
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "ctxcancelsecret")
+	require.NoError(t, err)
+
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "agent-ctxcancel", "CTXCANCEL1")
+	require.NoError(t, err)
+
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+
+	fullKey := apiKey.Id + ".ctxcancelsecret"
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg)
+	browserHandler := BrowserWS(app, h, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		r = r.WithContext(ctx)
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+		}()
+		browserHandler(w, r)
+	}))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer agentConn.CloseNow()
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-ctxcancel"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"CTXCANCEL1"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	browserConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=CTXCANCEL1", nil)
+	require.NoError(t, err)
+	defer browserConn.CloseNow()
+
+	_, _, err = browserConn.Read(ctx) // ice_config
+	require.NoError(t, err)
+
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, browserConn.Write(ctx, websocket.MessageText, []byte(`{"type":"knock"}`)))
+
+	readCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	_, knockMsg, err := agentConn.Read(readCtx)
+	require.NoError(t, err)
+	assert.Contains(t, string(knockMsg), `"type":"knock"`)
+	assert.Contains(t, string(knockMsg), `"code":"CTXCANCEL1"`)
 }

@@ -1,7 +1,7 @@
 // signaling-server/web/src/app.test.js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { installSessionMessageHandler, publishGlobalActions, applyConnectionBadge } from './app.js'
+import { installSessionMessageHandler, publishGlobalActions, applyConnectionBadge, initializeIceConfigTransport } from './app.js'
 
 test('publishGlobalActions preserves inline button handlers after the move to an ES module', () => {
   const globals = {}
@@ -94,4 +94,29 @@ test('relay_policy with relay_allowed false preserves the quota-exceeded user me
   }))
 
   assert.match(statuses.at(-1), /quota exceeded/i)
+})
+
+test('relay_only ice_config skips direct peer creation and leaves initial knock to the server', () => {
+  const sent = []
+  let createCalls = 0
+  const ws = {
+    send(payload) {
+      sent.push(payload)
+    },
+  }
+
+  const peer = initializeIceConfigTransport({
+    msg: { type: 'ice_config', ice_servers: [{ urls: ['stun:stun.cloudflare.com:3478'] }], relay_only: true },
+    ws,
+    createPeerConnection: () => {
+      createCalls += 1
+      return {}
+    },
+    onDirectChannel: () => {},
+    onDirectFailure: () => {},
+  })
+
+  assert.equal(peer, null)
+  assert.equal(createCalls, 0)
+  assert.deepEqual(sent, [])
 })

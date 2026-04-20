@@ -42,9 +42,9 @@ func RelayWS(app core.App, reg *relay.Registry, cfg *config.Config) http.Handler
 
 		// Only the hello read uses a short timeout. Relay sessions themselves must
 		// live on the request context, not the slowloris protection deadline.
-		helloCtx, cancel := context.WithTimeout(r.Context(), helloTimeout)
-		defer cancel()
-		sessionCtx := r.Context()
+			helloCtx, cancel := context.WithTimeout(context.Background(), helloTimeout)
+			defer cancel()
+			sessionCtx := context.Background()
 
 		_, payload, err := conn.Read(helloCtx)
 		if err != nil {

@@ -53,6 +53,47 @@ export function applyConnectionBadge({ statusContainer, badge, mode }) {
   }
 }
 
+export function initializeIceConfigTransport({
+  msg,
+  ws,
+  createPeerConnection = (config) => new RTCPeerConnection(config),
+  onDirectChannel,
+  onDirectFailure,
+}) {
+  if (msg.relay_only) {
+    return null
+  }
+
+  const peer = createPeerConnection({ iceServers: buildDirectIceServers(msg.ice_servers) })
+
+  peer.onicecandidate = (e) => {
+    if (e.candidate) {
+      ws.send(
+        JSON.stringify({
+          type: 'ice_candidate',
+          candidate: e.candidate.toJSON(),
+        })
+      )
+    }
+  }
+
+  peer.ondatachannel = (e) => {
+    dc = e.channel
+    dc.binaryType = 'arraybuffer'
+    const directChannel = new DirectChannel(dc)
+    onDirectChannel(directChannel)
+  }
+
+  peer.onconnectionstatechange = () => {
+    if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
+      onDirectFailure()
+    }
+  }
+
+  ws.send(JSON.stringify({ type: 'knock' }))
+  return peer
+}
+
 // Export for testing - creates a message handler with injected dependencies
 export function installSessionMessageHandler({
   status,
@@ -208,58 +249,43 @@ function join() {
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   ws = new WebSocket(`${protocol}//${location.host}/ws/client?session=${code}`)
+  ws.onopen = () => {}
 
   ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data)
+    let msg
+    try {
+      msg = JSON.parse(event.data)
+    } catch (err) {
+      throw err
+    }
 
     switch (msg.type) {
       case 'ice_config':
-        pc = new RTCPeerConnection({ iceServers: buildDirectIceServers(msg.ice_servers) })
-
         // Store quota state for use if connection fails
         if (msg.relay_quota_exceeded) {
           relayQuotaExceeded = true
           quotaPeriodEnd = msg.quota_period_end
         }
 
-        pc.onicecandidate = (e) => {
-          if (e.candidate) {
-            ws.send(
-              JSON.stringify({
-                type: 'ice_candidate',
-                candidate: e.candidate.toJSON(),
-              })
-            )
-          }
-        }
-
-        pc.ondatachannel = (e) => {
-          dc = e.channel
-          // Set up binary mode before wrapping
-          dc.binaryType = 'arraybuffer'
-          const directChannel = new DirectChannel(dc)
-          // Resolve the promise for connectTransferChannel
-          directChannelResolve(directChannel)
-        }
-
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        pc = initializeIceConfigTransport({
+          msg,
+          ws,
+          onDirectChannel: (directChannel) => {
+            directChannelResolve(directChannel)
+          },
+          onDirectFailure: () => {
             if (relayQuotaExceeded) {
               const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
               status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
             } else {
               status('Connection lost')
             }
-            // Reject the direct channel promise if not already resolved
             if (directChannelReject) {
               directChannelReject(new Error('PeerConnection failed'))
             }
             resetUI()
-          }
-        }
-
-        // Send knock immediately after ICE config received
-        ws.send(JSON.stringify({ type: 'knock' }))
+          },
+        })
         break
 
       case 'nonce':

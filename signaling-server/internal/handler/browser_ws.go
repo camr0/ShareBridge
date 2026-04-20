@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -58,7 +59,10 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 		}
 		defer browserConn.CloseNow()
 
-		requestCtx := request.Context()
+			// coder/websocket recommends not using request.Context() for upgraded
+			// connection lifetime, because it can be canceled surprisingly after
+			// the HTTP upgrade machinery completes.
+			requestCtx := context.Background()
 
 		_, agentConnected := sessionHub.GetAgentConn(sessionCode)
 		if !agentConnected {
@@ -138,30 +142,45 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 
 		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s TURN=%s", sessionCode, cfg.STUNURL, cfg.TurnURL())
 
-		if quotaExceeded {
-			msg := map[string]any{
-				"type":                 "ice_config",
-				"ice_servers":          iceServers,
-				"relay_quota_exceeded": true,
-				"quota_period_end":     periodEnd.Format(time.RFC3339),
+			if quotaExceeded {
+				msg := map[string]any{
+					"type":                 "ice_config",
+					"ice_servers":          iceServers,
+					"relay_only":           relayOnly,
+					"relay_quota_exceeded": true,
+					"quota_period_end":     periodEnd.Format(time.RFC3339),
+				}
+				log.Printf("browser_ws: sending ice_config (quota exceeded): %+v", msg)
+				hub.SendDirect(requestCtx, browserConn, msg)
+			} else {
+				msg := map[string]any{
+					"type":        "ice_config",
+					"ice_servers": iceServers,
+					"relay_only":  relayOnly,
+				}
+				log.Printf("browser_ws: sending ice_config: %+v", msg)
+				hub.SendDirect(requestCtx, browserConn, msg)
 			}
-			log.Printf("browser_ws: sending ice_config (quota exceeded): %+v", msg)
-			hub.SendDirect(requestCtx, browserConn, msg)
-		} else {
-			msg := map[string]any{
-				"type":        "ice_config",
-				"ice_servers": iceServers,
-			}
-			log.Printf("browser_ws: sending ice_config: %+v", msg)
-			hub.SendDirect(requestCtx, browserConn, msg)
-		}
 
-		for {
-			_, data, err := browserConn.Read(requestCtx)
-			if err != nil {
-				log.Printf("browser disconnected from session %s (conn %s)", sessionCode, connID)
-				return
+			// Relay-only sessions skip direct browser setup, so the server must kick
+			// off the initial HMAC challenge instead of waiting for a browser-side
+			// "knock" message.
+			if relayOnly {
+				if err := sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
+					"type":    "knock",
+					"conn_id": connID,
+					"code":    sessionCode,
+				}); err != nil {
+					log.Printf("browser_ws: initial relay-only knock send failed for session %s conn %s: %v", sessionCode, connID, err)
+				}
 			}
+
+			for {
+				_, data, err := browserConn.Read(requestCtx)
+				if err != nil {
+					log.Printf("browser disconnected from session %s (conn %s): %v", sessionCode, connID, err)
+					return
+				}
 
 			var msg browserMsg
 			if err := json.Unmarshal(data, &msg); err != nil {
