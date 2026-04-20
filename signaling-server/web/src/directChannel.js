@@ -31,3 +31,12 @@ export class DirectChannel {
     this._dc.close()
   }
 }
+
+// extend the adapter with a helper used by app.js and tests
+export function waitForDirectChannelOpen(channel) {
+  if (channel.readyState === 'open') return Promise.resolve(channel)
+  return new Promise((resolve, reject) => {
+    channel.onopen = () => resolve(channel)
+    channel.onclose = () => reject(new Error('direct channel closed before opening'))
+  })
+}
