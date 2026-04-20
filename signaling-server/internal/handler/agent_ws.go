@@ -152,6 +152,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					if agentID == "" {
 						continue
 					}
+					log.Printf("agent_ws: forwarding nonce to browser conn_id=%s has_password=%v", msg.ConnID, msg.HasPassword)
 					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
 						"type":         "nonce",
 						"conn_id":      msg.ConnID,

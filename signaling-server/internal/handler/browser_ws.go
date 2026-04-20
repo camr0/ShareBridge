@@ -166,6 +166,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			// off the initial HMAC challenge instead of waiting for a browser-side
 			// "knock" message.
 			if relayOnly {
+				log.Printf("browser_ws: relay_only session %s - server initiating nonce challenge for conn %s", sessionCode, connID)
 				if err := sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
 					"type":    "knock",
 					"conn_id": connID,

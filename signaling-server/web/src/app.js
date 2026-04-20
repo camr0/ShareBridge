@@ -33,6 +33,10 @@ let sessionPassword = '' // set from URL hash on load, or from password input
 // HMAC pre-challenge state
 let pendingNonce = null // nonce received from agent, consumed on join
 
+function debugLog(...args) {
+  console.log('[secure-relay]', ...args)
+}
+
 // Export for testing
 export function publishGlobalActions(globals, { join, submitPassword, navigateTo }) {
   globals.join = join
@@ -61,13 +65,16 @@ export function initializeIceConfigTransport({
   onDirectFailure,
 }) {
   if (msg.relay_only) {
+    debugLog('ice_config indicates relay_only; skipping RTCPeerConnection setup')
     return null
   }
 
   const peer = createPeerConnection({ iceServers: buildDirectIceServers(msg.ice_servers) })
+  debugLog('created RTCPeerConnection for direct path')
 
   peer.onicecandidate = (e) => {
     if (e.candidate) {
+      debugLog('sending ICE candidate to signaling server')
       ws.send(
         JSON.stringify({
           type: 'ice_candidate',
@@ -80,16 +87,19 @@ export function initializeIceConfigTransport({
   peer.ondatachannel = (e) => {
     dc = e.channel
     dc.binaryType = 'arraybuffer'
+    debugLog('received RTCDataChannel from direct peer')
     const directChannel = new DirectChannel(dc)
     onDirectChannel(directChannel)
   }
 
   peer.onconnectionstatechange = () => {
+    debugLog('RTCPeerConnection state change', peer.connectionState)
     if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
       onDirectFailure()
     }
   }
 
+  debugLog('sending initial knock from browser for non-relay_only session')
   ws.send(JSON.stringify({ type: 'knock' }))
   return peer
 }
@@ -249,18 +259,26 @@ function join() {
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   ws = new WebSocket(`${protocol}//${location.host}/ws/client?session=${code}`)
-  ws.onopen = () => {}
+  debugLog('opening browser signaling WebSocket', ws.url)
+
+  ws.onopen = () => {
+    debugLog('browser signaling WebSocket open')
+  }
 
   ws.onmessage = async (event) => {
+    debugLog('browser signaling WebSocket message received', event.data)
+
     let msg
     try {
       msg = JSON.parse(event.data)
     } catch (err) {
+      debugLog('failed to parse signaling message JSON', err)
       throw err
     }
 
     switch (msg.type) {
       case 'ice_config':
+        debugLog('handling ice_config', msg)
         // Store quota state for use if connection fails
         if (msg.relay_quota_exceeded) {
           relayQuotaExceeded = true
@@ -289,16 +307,20 @@ function join() {
         break
 
       case 'nonce':
+        debugLog('received nonce for browser challenge', { hasPassword: msg.has_password, connID: msg.conn_id })
         pendingNonce = msg.value
         if (msg.has_password && !sessionPassword) {
+          debugLog('nonce requires password input before join')
           showSection('password-section')
           document.getElementById('password-input').focus()
         } else {
+          debugLog('nonce can be consumed immediately; sending join')
           sendJoin()
         }
         break
 
       case 'auth_failed': {
+        debugLog('received auth_failed', msg)
         const errorDiv = document.getElementById('password-error')
         const attemptsRemaining = msg.attempts_remaining || 0
         if (attemptsRemaining <= 0) {
@@ -316,6 +338,7 @@ function join() {
       }
 
       case 'offer':
+        debugLog('received WebRTC offer')
         if (!pc) return
         await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp })
         remoteDescSet = true
@@ -332,6 +355,7 @@ function join() {
         break
 
       case 'ice_candidate':
+        debugLog('received ICE candidate from signaling server')
         if (!pc) return
         if (!remoteDescSet) {
           pendingCandidates.push(msg.candidate)
@@ -341,6 +365,7 @@ function join() {
         break
 
       case 'relay_policy': {
+        debugLog('received relay_policy', msg)
         status('Connecting to agent...')
         const relayPolicy = decodeRelayPolicyToken(msg.token)
 
@@ -380,6 +405,7 @@ function join() {
             },
           })
         } catch (err) {
+          debugLog('connectTransferChannel failed', err)
           status(err.message)
           throw err
         }
@@ -405,12 +431,14 @@ function join() {
       }
 
       case 'error':
+        debugLog('received signaling error message', msg)
         status('Error: ' + msg.message)
         break
     }
   }
 
-  ws.onerror = () => {
+  ws.onerror = (event) => {
+    debugLog('browser signaling WebSocket error', event)
     if (relayQuotaExceeded) {
       const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
       status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
@@ -418,7 +446,8 @@ function join() {
       status('WebSocket error')
     }
   }
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    debugLog('browser signaling WebSocket close', { code: event.code, reason: event.reason, wasClean: event.wasClean })
     if (pc) pc.close()
     resetUI()
   }
@@ -436,8 +465,13 @@ async function computeHMAC(password, nonce) {
 }
 
 async function sendJoin() {
-  if (!pendingNonce) return
+  if (!pendingNonce) {
+    debugLog('sendJoin called without a pending nonce; skipping')
+    return
+  }
+  debugLog('computing HMAC for join', { hasPassword: Boolean(sessionPassword), nonceLength: pendingNonce.length })
   const hmac = sessionPassword ? await computeHMAC(sessionPassword, pendingNonce) : ''
+  debugLog('sending join message to signaling server', { hmacLength: hmac.length })
   ws.send(JSON.stringify({ type: 'join', hmac }))
   pendingNonce = null
 }
