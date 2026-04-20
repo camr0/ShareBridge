@@ -229,6 +229,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					hub.SendDirect(ctx, conn, map[string]any{
 						"type":       "relay_prepare",
 						"sid":        sid,
+						"code":       msg.Code,
 						"expires_at": now.Add(relay.TokenLifetime).Format(time.RFC3339),
 						"relay_jwt":  agentJWT,
 					})

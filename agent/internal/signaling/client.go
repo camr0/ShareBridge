@@ -32,6 +32,9 @@ type Message struct {
 	HMAC        string          `json:"hmac,omitempty"`
 	Reconnected bool            `json:"reconnected,omitempty"`
 	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
+	SID         string          `json:"sid,omitempty"`
+	RelayJWT    string          `json:"relay_jwt,omitempty"`
+	ExpiresAt   string          `json:"expires_at,omitempty"`
 }
 
 // Client manages a WebSocket connection to the signaling server.

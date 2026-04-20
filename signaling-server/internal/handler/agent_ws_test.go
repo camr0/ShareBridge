@@ -537,3 +537,101 @@ func TestAgentWS_AuthOK_QuotaExceeded_DisablesRelayFallback(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "context deadline exceeded")
 }
+
+func TestAgentWS_AuthOK_RelayPrepareIncludesSessionCode(t *testing.T) {
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
+
+	user, err := createTestUser(app, "codecheck@example.com")
+	require.NoError(t, err)
+	apiKey, err := createTestAPIKey(app, user.Id, "codechecksecret")
+	require.NoError(t, err)
+
+	// Create test session with relay_static_pub
+	sessionsCol, err := app.FindCollectionByNameOrId("sessions")
+	require.NoError(t, err)
+	session := core.NewRecord(sessionsCol)
+	session.Set("code", "TESTCODE1")
+	session.Set("api_key_id", apiKey.Id)
+	session.Set("agent_id", "agent-codecheck")
+	session.Set("relay_static_pub", "04abcd")
+	require.NoError(t, app.Save(session))
+
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+	cfg.RelayJWTSecret = "secret"
+
+	fullKey := apiKey.Id + ".codechecksecret"
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg)
+	browserHandler := BrowserWS(app, h, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(browserHandler))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	// Agent connects and registers
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer agentConn.CloseNow()
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-codecheck"}`)))
+	_, _, err = agentConn.Read(ctx) // welcome
+	require.NoError(t, err)
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"TESTCODE1","relay_static_pub":"04abcd"}`)))
+	_, _, err = agentConn.Read(ctx) // registered
+	require.NoError(t, err)
+
+	// Browser connects and knocks
+	browserConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=TESTCODE1", nil)
+	require.NoError(t, err)
+	defer browserConn.CloseNow()
+	_, _, err = browserConn.Read(ctx) // ice_config
+	require.NoError(t, err)
+	require.NoError(t, browserConn.Write(ctx, websocket.MessageText, []byte(`{"type":"knock"}`)))
+
+	// Agent receives the knock forwarded from server
+	_, knockMsg, err := agentConn.Read(ctx)
+	require.NoError(t, err)
+	var knockPayload struct {
+		Type   string `json:"type"`
+		ConnID string `json:"conn_id"`
+		Code   string `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal(knockMsg, &knockPayload))
+	require.Equal(t, "knock", knockPayload.Type)
+	require.NotEmpty(t, knockPayload.ConnID)
+
+	// Agent sends nonce response
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"nonce","conn_id":"`+knockPayload.ConnID+`","value":"testnonce","has_password":false}`)))
+
+	// Browser receives nonce
+	_, nonceMsg, err := browserConn.Read(ctx)
+	require.NoError(t, err)
+	var nonceResp struct {
+		Type        string `json:"type"`
+		ConnID      string `json:"conn_id"`
+		Value       string `json:"value"`
+		HasPassword bool   `json:"has_password"`
+	}
+	require.NoError(t, json.Unmarshal(nonceMsg, &nonceResp))
+	require.Equal(t, "nonce", nonceResp.Type)
+
+	// Agent sends auth_ok
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"auth_ok","conn_id":"`+knockPayload.ConnID+`","code":"TESTCODE1"}`)))
+
+	// Agent receives relay_prepare
+	_, agentRelayPrepare, err := agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	var relayPrepare map[string]any
+	require.NoError(t, json.Unmarshal(agentRelayPrepare, &relayPrepare))
+	assert.Equal(t, "relay_prepare", relayPrepare["type"])
+	assert.Equal(t, "TESTCODE1", relayPrepare["code"])
+	assert.NotEmpty(t, relayPrepare["sid"])
+	assert.NotEmpty(t, relayPrepare["relay_jwt"])
+}
