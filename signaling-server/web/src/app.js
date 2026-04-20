@@ -128,6 +128,9 @@ export function installSessionMessageHandler({
         case 'relay_policy':
           status('Connecting to agent...')
           const relayPolicy = decodeToken(msg.token)
+          // Use relay_only from message (server's authoritative value), not from decoded token
+          relayPolicy.relayOnly = msg.relay_only
+          relayPolicy.relayAllowed = msg.relay_allowed
 
           const directConnect = async () => {
             const channel = await directChannelPromise
@@ -380,6 +383,10 @@ function join() {
         debugLog('received relay_policy', msg)
         status('Connecting to agent...')
         const relayPolicy = decodeRelayPolicyToken(msg.token)
+        // Use relay_only from message (server's authoritative value), not from decoded token
+        // Token may be empty when relay is not configured
+        relayPolicy.relayOnly = msg.relay_only
+        relayPolicy.relayAllowed = msg.relay_allowed
 
         const directConnect = async () => {
           const channel = await directChannelPromise
