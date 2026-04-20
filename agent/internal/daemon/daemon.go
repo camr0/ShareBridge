@@ -225,7 +225,7 @@ func (d *Daemon) Stop() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Close all peer connections
+	// Close all peer connections and relay channels
 	for _, session := range d.sessions {
 		session.mu.Lock()
 		for peerID, peerConn := range session.peers {
@@ -233,7 +233,11 @@ func (d *Daemon) Stop() error {
 				log.Printf("close peer %s: %v", peerID, err)
 			}
 		}
-		session.peers = make(map[string]*peer.Peer)
+		for sid, rc := range session.relayChannels {
+			if err := rc.Close(); err != nil {
+				log.Printf("close relay channel %s: %v", sid, err)
+			}
+		}
 		session.mu.Unlock()
 	}
 
@@ -364,6 +368,12 @@ func (d *Daemon) RevokeSession(code string) error {
 	for peerID, peerConn := range session.peers {
 		if err := peerConn.Close(); err != nil {
 			log.Printf("close peer %s: %v", peerID, err)
+		}
+	}
+	// Close all relay channels
+	for sid, rc := range session.relayChannels {
+		if err := rc.Close(); err != nil {
+			log.Printf("close relay channel %s: %v", sid, err)
 		}
 	}
 	session.mu.Unlock()
@@ -917,6 +927,12 @@ func (d *Daemon) pruneExpiredSessions() {
 			for peerID, peerConn := range session.peers {
 				if err := peerConn.Close(); err != nil {
 					log.Printf("close peer %s: %v", peerID, err)
+				}
+			}
+			// Close all relay channels
+			for sid, rc := range session.relayChannels {
+				if err := rc.Close(); err != nil {
+					log.Printf("close relay channel %s: %v", sid, err)
 				}
 			}
 			session.mu.Unlock()
