@@ -215,10 +215,16 @@ Reload Caddy:
 ## 2. Configure DNS
 Point your domain's A record to this server's IP address.
 
-**IMPORTANT - Relay Configuration:**
-The relay subdomain must be configured as DNS-only (grey cloud) in Cloudflare to bypass Cloudflare's TOS restrictions on large file transfers:
-   - Main domain (share.example.com): Orange cloud (proxied)
-   - Relay subdomain (relay.share.example.com): Grey cloud (DNS only)
+**Relay Security Considerations:**
+The relay subdomain uses a separate TLS certificate (not Cloudflare origin certificates) and exposes the VPS IP address. This is intentional and acceptable because:
+1. **Authentication required**: Relay connections require valid JWT tokens from the signaling server
+2. **Encrypted payload**: Relay traffic is encrypted end-to-end (Noise XX handshake); the relay server cannot read content
+3. **No origin exposure**: The main sharebridge.app site remains behind Cloudflare's orange cloud with origin certificates
+4. **Rate limiting**: JWT validation provides authentication gating; consider additional UFW rate limits if needed
+
+To add Cloudflare DDoS protection back to the relay (optional, costs $5/mo for Spectrum):
+   - Enable Cloudflare Spectrum for the relay subdomain (proxies TCP/WebSocket traffic)
+   - Update Caddy to use Cloudflare origin certificates for relay subdomain
 
 ## 3. Build and start the signaling server
 \`\`\`bash
