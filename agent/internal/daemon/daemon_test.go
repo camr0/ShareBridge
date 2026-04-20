@@ -1077,6 +1077,52 @@ func TestHandleJoin_SendsAuthOKAfterHMACVerification(t *testing.T) {
 	}
 }
 
+func TestHandleJoin_RelayOnlySkipsDirectPeerCreation(t *testing.T) {
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	d, err := NewWithSignaling(cfgMgr, st, sig)
+	if err != nil {
+		t.Fatalf("NewWithSignaling: %v", err)
+	}
+
+	session := &Session{
+		Code:      "SHARE123",
+		Password:  "secret",
+		RelayOnly: true,
+		CreatedAt: time.Now(),
+		peers:     make(map[string]*peer.Peer),
+	}
+	d.sessions["SHARE123"] = session
+
+	d.nonces["conn-1"] = nonceEntry{
+		nonce:     "abc123",
+		expiresAt: time.Now().Add(time.Minute),
+	}
+
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write([]byte("abc123"))
+	joinedHMAC := hex.EncodeToString(mac.Sum(nil))
+
+	d.handleJoin("conn-1", "SHARE123", joinedHMAC)
+	time.Sleep(100 * time.Millisecond)
+
+	if !hasSentMessage(sig.sendMessages, "auth_ok", map[string]any{
+		"conn_id": "conn-1",
+		"code":    "SHARE123",
+	}) {
+		t.Fatalf("expected auth_ok to be sent, got %#v", sig.sendMessages)
+	}
+	if hasSentMessage(sig.sendMessages, "offer", map[string]any{
+		"session_id": "SHARE123",
+		"peer_id":    "conn-1",
+	}) {
+		t.Fatalf("relay_only session should not create direct offer, got %#v", sig.sendMessages)
+	}
+}
+
 // TestHandleRelayPrepare_StartsRelayTransferChannel tests that relay_prepare
 // starts a relay channel and adds it to the session.
 func TestHandleRelayPrepare_StartsRelayTransferChannel(t *testing.T) {

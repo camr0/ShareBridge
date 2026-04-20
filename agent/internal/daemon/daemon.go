@@ -544,6 +544,11 @@ func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
 		"code":    sessionCode,
 	})
 
+	if session.RelayOnly {
+		log.Printf("relay-only session %s conn %s — skipping direct WebRTC peer", sessionCode, connID)
+		return
+	}
+
 	go d.createPeer(connID, sessionCode)
 }
 

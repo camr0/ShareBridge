@@ -46,6 +46,10 @@ type nonceEntry struct {
 	expiresAt time.Time
 }
 
+type relayStaticKeyStore interface {
+	GetRelayStaticPrivateKey() ([]byte, error)
+}
+
 func init() {
 	rootCmd.AddCommand(shareCmd)
 	rootCmd.AddCommand(daemonCmd)
@@ -348,6 +352,10 @@ func runShareSingle(shareURL string) error {
 }
 
 func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebdav.Client, shareURL string, st *store.Store, preferredCode string, agentID string, relayOnly bool) (string, error) {
+	if relayOnly {
+		return "", fmt.Errorf("relay-only mode requires daemon mode")
+	}
+
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
 	if err := sig.Connect(ctx); err != nil {
@@ -355,12 +363,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	}
 	log.Printf("connected to signaling server at %s", cfg.SignalingURL)
 
-	// Get relay static private key and derive public key
-	relayStaticPriv, err := st.GetRelayStaticPrivateKey()
-	if err != nil {
-		return "", fmt.Errorf("get relay static key: %w", err)
-	}
-	relayStaticPub, err := daemon.RelayStaticPubHex(relayStaticPriv)
+	relayStaticPub, err := registrationRelayStaticPub(false, st)
 	if err != nil {
 		return "", fmt.Errorf("derive relay static public key: %w", err)
 	}
@@ -477,6 +480,14 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 			}
 
 			log.Printf("browser joined session %s (conn %s) — starting WebRTC handshake", sessionCode, connID)
+
+			if err := sig.Send(ctx, map[string]any{
+				"type":    "auth_ok",
+				"conn_id": connID,
+				"code":    sessionCode,
+			}); err != nil {
+				log.Printf("send auth_ok: %v", err)
+			}
 
 			iceServers := sig.GetICEServers()
 			if len(iceServers) == 0 {
@@ -604,4 +615,20 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	}
 
 	return code, nil
+}
+
+func registrationRelayStaticPub(relayTransportEnabled bool, st relayStaticKeyStore) (string, error) {
+	if !relayTransportEnabled {
+		return "", nil
+	}
+
+	relayStaticPriv, err := st.GetRelayStaticPrivateKey()
+	if err != nil {
+		return "", fmt.Errorf("get relay static key: %w", err)
+	}
+	relayStaticPub, err := daemon.RelayStaticPubHex(relayStaticPriv)
+	if err != nil {
+		return "", fmt.Errorf("derive relay static public key: %w", err)
+	}
+	return relayStaticPub, nil
 }

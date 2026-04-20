@@ -184,7 +184,8 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					continue
 				}
 				quotaExceeded, _ := checkRelayQuota(accountRecord)
-				relayAllowed := !quotaExceeded
+				expectedStaticPub := session.GetString("relay_static_pub")
+				relayAllowed := !quotaExceeded && expectedStaticPub != ""
 
 				sid := relay.NewSID()
 				now := time.Now().UTC()
@@ -194,7 +195,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					SessionCode:       msg.Code,
 					RelayAllowed:      relayAllowed,
 					RelayOnly:         session.GetBool("relay_only"),
-					ExpectedStaticPub: session.GetString("relay_static_pub"),
+					ExpectedStaticPub: expectedStaticPub,
 					RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
 				}
 				browserJWT, err := relay.SignBrowserPolicyJWT(cfg.RelayJWTSecret, browserClaims, now)

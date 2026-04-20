@@ -44,7 +44,7 @@ func Load() *Config {
 		TurnSecret: getEnv("TURN_SECRET", ""),
 
 		RelayJWTSecret:         getEnv("RELAY_JWT_SECRET", ""),
-		RelayPendingWaitWindow: getEnvDuration("RELAY_PENDING_WAIT_WINDOW", 2*time.Second),
+		RelayPendingWaitWindow: getEnvDuration("RELAY_PENDING_WAIT_WINDOW", 7*time.Second),
 
 		SMTPHost:     getEnv("SMTP_HOST", ""),
 		SMTPPort:     getEnv("SMTP_PORT", "587"),

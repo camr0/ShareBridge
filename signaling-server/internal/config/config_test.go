@@ -11,6 +11,7 @@ func TestLoad_Defaults(t *testing.T) {
 	os.Unsetenv("DEFAULT_QUOTA_GB")
 	os.Unsetenv("PROMETHEUS_URL")
 	os.Unsetenv("QUOTA_CHECK_INTERVAL")
+	os.Unsetenv("RELAY_PENDING_WAIT_WINDOW")
 
 	cfg := Load()
 
@@ -22,6 +23,9 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.QuotaCheckInterval != 5*time.Minute {
 		t.Errorf("QuotaCheckInterval = %v, want 5m", cfg.QuotaCheckInterval)
+	}
+	if cfg.RelayPendingWaitWindow != 7*time.Second {
+		t.Errorf("RelayPendingWaitWindow = %v, want 7s", cfg.RelayPendingWaitWindow)
 	}
 }
 
