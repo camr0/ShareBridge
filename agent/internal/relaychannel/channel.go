@@ -6,7 +6,6 @@ import (
 	"crypto/ecdh"
 	"encoding/json"
 	"fmt"
-	"sync"
 
 	"github.com/coder/websocket"
 	"sharebridge/agent/internal/noise"
@@ -25,7 +24,6 @@ type SecureRelayChannel struct {
 	send  *noise.CipherState
 	recv  *noise.CipherState
 
-	mu        sync.Mutex
 	onMessage func([]byte)
 	onOpen    func()
 	onClose   func()
@@ -145,11 +143,8 @@ func (c *SecureRelayChannel) readLoop(ctx context.Context) {
 			c.conn.Close(websocket.StatusPolicyViolation, "relay decrypt failed")
 			return
 		}
-		c.mu.Lock()
-		handler := c.onMessage
-		c.mu.Unlock()
-		if handler != nil {
-			handler(plain)
+		if c.onMessage != nil {
+			c.onMessage(plain)
 		}
 	}
 }
