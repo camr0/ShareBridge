@@ -6,8 +6,7 @@ WebSocket-based signaling server for WebRTC peer connection establishment.
 
 ShareBridge uses a secure relay architecture that replaces traditional TURN servers:
 
-- **Cloudflare STUN**: Uses Cloudflare's free public STUN server (`stun:stun.cloudflare.com:3478`) for NAT traversal
-- **Secure Relay**: WebRTC traffic is relayed through an encrypted tunnel when direct connection fails
+- **Secure Relay**: Data is relayed through an encrypted tunnel when direct connection fails
 - **No TURN server required**: Eliminates the complexity of deploying and managing Coturn
 
 Users behind symmetric NAT (typically corporate/ISP firewalls) will automatically use relay mode. Connection status in the browser shows "Connected (Relay)" when relay is used.
@@ -50,5 +49,5 @@ The secure relay mode uses the signaling server as a relay when direct WebRTC co
 1. Browser and agent attempt direct WebRTC connection via STUN
 2. If direct connection fails (symmetric NAT), both sides open a relay tunnel
 3. Traffic flows: Browser <-> Signaling Server <-> Agent
-4. All relay traffic is encrypted end-to-end with WebRTC DataChannel encryption
+4. All relay traffic is encrypted end-to-end with Noise XX handshake
 5. The agent's IP address remains hidden from recipients
