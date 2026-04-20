@@ -914,9 +914,9 @@ func TestDaemonGetsRelayStaticKey(t *testing.T) {
 	}
 
 	// Derive public key using the helper function
-	pubHex, err := relayStaticPubHex(privKey)
+	pubHex, err := RelayStaticPubHex(privKey)
 	if err != nil {
-		t.Fatalf("relayStaticPubHex() error: %v", err)
+		t.Fatalf("RelayStaticPubHex() error: %v", err)
 	}
 
 	// Verify public key is hex-encoded and starts with expected prefix (uncompressed P-256)

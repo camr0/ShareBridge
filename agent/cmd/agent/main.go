@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -269,15 +268,6 @@ func extractCodeFromHTML(html string) string {
 	return strings.TrimSpace(html[contentStart : contentStart+h3End])
 }
 
-// relayStaticPubHexMain derives the hex-encoded P-256 public key from the raw private key bytes.
-func relayStaticPubHexMain(rawPrivateKey []byte) (string, error) {
-	priv, err := ecdh.P256().NewPrivateKey(rawPrivateKey)
-	if err != nil {
-		return "", fmt.Errorf("import relay static key: %w", err)
-	}
-	return hex.EncodeToString(priv.PublicKey().Bytes()), nil
-}
-
 // runShareSingle runs the share in single-session mode without daemon.
 func runShareSingle(shareURL string) error {
 	cfg := config.Load()
@@ -370,7 +360,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	if err != nil {
 		return "", fmt.Errorf("get relay static key: %w", err)
 	}
-	relayStaticPub, err := relayStaticPubHexMain(relayStaticPriv)
+	relayStaticPub, err := daemon.RelayStaticPubHex(relayStaticPriv)
 	if err != nil {
 		return "", fmt.Errorf("derive relay static public key: %w", err)
 	}

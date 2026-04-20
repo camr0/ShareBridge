@@ -260,7 +260,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 	if err != nil {
 		return "", fmt.Errorf("get relay static key: %w", err)
 	}
-	relayStaticPub, err := relayStaticPubHex(relayStaticPriv)
+	relayStaticPub, err := RelayStaticPubHex(relayStaticPriv)
 	if err != nil {
 		return "", fmt.Errorf("derive relay static public key: %w", err)
 	}
@@ -692,7 +692,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	}
 	var relayStaticPub string
 	if relayStaticPriv != nil {
-		relayStaticPub, err = relayStaticPubHex(relayStaticPriv)
+		relayStaticPub, err = RelayStaticPubHex(relayStaticPriv)
 		if err != nil {
 			log.Printf("warning: could not derive relay static public key: %v", err)
 			relayStaticPub = ""
@@ -866,8 +866,8 @@ func hasTURNServer(servers []webrtc.ICEServer) bool {
 	return false
 }
 
-// relayStaticPubHex derives the hex-encoded P-256 public key from the raw private key bytes.
-func relayStaticPubHex(rawPrivateKey []byte) (string, error) {
+// RelayStaticPubHex derives the hex-encoded P-256 public key from the raw private key bytes.
+func RelayStaticPubHex(rawPrivateKey []byte) (string, error) {
 	priv, err := ecdh.P256().NewPrivateKey(rawPrivateKey)
 	if err != nil {
 		return "", fmt.Errorf("import relay static key: %w", err)
