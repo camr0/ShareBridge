@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -268,6 +269,15 @@ func extractCodeFromHTML(html string) string {
 	return strings.TrimSpace(html[contentStart : contentStart+h3End])
 }
 
+// relayStaticPubHexMain derives the hex-encoded P-256 public key from the raw private key bytes.
+func relayStaticPubHexMain(rawPrivateKey []byte) (string, error) {
+	priv, err := ecdh.P256().NewPrivateKey(rawPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("import relay static key: %w", err)
+	}
+	return hex.EncodeToString(priv.PublicKey().Bytes()), nil
+}
+
 // runShareSingle runs the share in single-session mode without daemon.
 func runShareSingle(shareURL string) error {
 	cfg := config.Load()
@@ -355,8 +365,18 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	}
 	log.Printf("connected to signaling server at %s", cfg.SignalingURL)
 
+	// Get relay static private key and derive public key
+	relayStaticPriv, err := st.GetRelayStaticPrivateKey()
+	if err != nil {
+		return "", fmt.Errorf("get relay static key: %w", err)
+	}
+	relayStaticPub, err := relayStaticPubHexMain(relayStaticPriv)
+	if err != nil {
+		return "", fmt.Errorf("derive relay static public key: %w", err)
+	}
+
 	// Use new RegisterShare instead of CreateSession
-	code, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode, relayOnly)
+	code, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode, relayOnly, relayStaticPub)
 	if err != nil {
 		return "", fmt.Errorf("register share: %w", err)
 	}

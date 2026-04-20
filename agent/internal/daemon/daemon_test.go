@@ -28,11 +28,12 @@ func (m *mockConfigManager) Get() *config.Config {
 
 // mockStore implements StoreInterface for testing.
 type mockStore struct {
-	mu        sync.Mutex
-	agentID   string
-	sessions  map[string]store.SessionEntry
-	downloads map[string]int
-	saveError error
+	mu              sync.Mutex
+	agentID         string
+	relayStaticPriv []byte
+	sessions        map[string]store.SessionEntry
+	downloads       map[string]int
+	saveError       error
 }
 
 func newMockStore() *mockStore {
@@ -45,6 +46,19 @@ func newMockStore() *mockStore {
 
 func (m *mockStore) GetAgentID() string {
 	return m.agentID
+}
+
+func (m *mockStore) GetRelayStaticPrivateKey() ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.relayStaticPriv == nil {
+		// Generate a deterministic test key
+		m.relayStaticPriv = make([]byte, 32)
+		for i := range m.relayStaticPriv {
+			m.relayStaticPriv[i] = byte(i)
+		}
+	}
+	return m.relayStaticPriv, nil
 }
 
 func (m *mockStore) GetSession(code string) *store.SessionEntry {
@@ -113,7 +127,7 @@ type mockSignalingClient struct {
 	connected     bool
 	onMessage     func(signaling.Message)
 	iceServers    []webrtc.ICEServer
-	registerShare func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
+	registerShare func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error)
 	sendMessages  []map[string]any
 	codeCounter   int // Counter for generating unique codes
 }
@@ -134,11 +148,11 @@ func (m *mockSignalingClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
+func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.registerShare != nil {
-		return m.registerShare(ctx, shareURL, preferredCode, relayOnly)
+		return m.registerShare(ctx, shareURL, preferredCode, relayOnly, relayStaticPub)
 	}
 	// Default: generate a unique code
 	if preferredCode != "" {
@@ -687,7 +701,7 @@ func TestLoadSessionsFromStore(t *testing.T) {
 	})
 
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
+	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
 		return preferredCode, true, nil
 	}
 
@@ -766,7 +780,7 @@ func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
 	})
 
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
+	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
 		return preferredCode, true, nil
 	}
 
@@ -879,5 +893,64 @@ func TestHasTURN(t *testing.T) {
 	d.hasTURN = true
 	if !d.HasTURN() {
 		t.Errorf("HasTURN should be true after setting")
+	}
+}
+
+// TestDaemonGetsRelayStaticKey tests that the daemon correctly retrieves
+// the relay static private key and derives the public key.
+func TestDaemonGetsRelayStaticKey(t *testing.T) {
+	cfg := &config.Config{
+		SignalingURL: "ws://localhost:8080",
+		APIKey:       "test-api-key",
+		AllowedHost:  "opencloud.example.com",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+
+	// Get relay static private key from mock store
+	privKey, err := st.GetRelayStaticPrivateKey()
+	if err != nil {
+		t.Fatalf("GetRelayStaticPrivateKey() error: %v", err)
+	}
+
+	// Derive public key using the helper function
+	pubHex, err := relayStaticPubHex(privKey)
+	if err != nil {
+		t.Fatalf("relayStaticPubHex() error: %v", err)
+	}
+
+	// Verify public key is hex-encoded and starts with expected prefix (uncompressed P-256)
+	if len(pubHex) != 130 { // 65 bytes * 2 hex chars = 130
+		t.Errorf("relay static public key hex length = %d, expected 130", len(pubHex))
+	}
+	if pubHex[:2] != "04" {
+		t.Errorf("relay static public key should start with 04 (uncompressed point), got %s", pubHex[:2])
+	}
+
+	// Verify the mock signaling client receives the relay_static_pub
+	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	var receivedRelayPub string
+	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
+		receivedRelayPub = relayStaticPub
+		return "test-code", false, nil
+	}
+
+	d, err := NewWithSignaling(cfgMgr, st, sigClient)
+	if err != nil {
+		t.Fatalf("NewWithSignaling() error: %v", err)
+	}
+
+	ctx := context.Background()
+	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
+	if err != nil {
+		t.Fatalf("CreateSession() error: %v", err)
+	}
+
+	if code != "test-code" {
+		t.Errorf("CreateSession() code = %s, expected test-code", code)
+	}
+
+	if receivedRelayPub != pubHex {
+		t.Errorf("RegisterShare received relay_static_pub = %s, expected %s", receivedRelayPub, pubHex)
 	}
 }

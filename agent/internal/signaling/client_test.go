@@ -1,0 +1,72 @@
+package signaling
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+func TestRegisterShare_IncludesRelayStaticPub(t *testing.T) {
+	var payload map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		defer conn.CloseNow()
+
+		ctx := r.Context()
+		_, helloBytes, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("Read hello: %v", err)
+		}
+		var hello map[string]any
+		if err := json.Unmarshal(helloBytes, &hello); err != nil {
+			t.Fatalf("Unmarshal hello: %v", err)
+		}
+
+		_, registerBytes, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("Read register_share: %v", err)
+		}
+		if err := json.Unmarshal(registerBytes, &payload); err != nil {
+			t.Fatalf("Unmarshal register_share: %v", err)
+		}
+
+		resp, _ := json.Marshal(map[string]any{
+			"type": "share_registered",
+			"code": "SHARE1234",
+		})
+		_ = conn.Write(ctx, websocket.MessageText, resp)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	client := New(wsURL, "key", "agent-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- client.Listen(ctx) }()
+
+	_, _, err := client.RegisterShare(ctx, "https://example.com/s/abc", "", false, "04abcd")
+	if err != nil {
+		t.Fatalf("RegisterShare: %v", err)
+	}
+
+	if got := payload["relay_static_pub"]; got != "04abcd" {
+		t.Fatalf("relay_static_pub = %v, want 04abcd", got)
+	}
+}

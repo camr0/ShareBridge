@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -564,5 +565,40 @@ func TestSaveSession_PersistsFileID(t *testing.T) {
 	}
 	if loaded.FileID != "storage-users-1$abc!def" {
 		t.Errorf("FileID = %q, want storage-users-1$abc!def", loaded.FileID)
+	}
+}
+
+func TestGetRelayStaticPrivateKey_GeneratesAndPersistsStableKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
+
+	st, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	first, err := st.GetRelayStaticPrivateKey()
+	if err != nil {
+		t.Fatalf("GetRelayStaticPrivateKey() first call failed: %v", err)
+	}
+	second, err := st.GetRelayStaticPrivateKey()
+	if err != nil {
+		t.Fatalf("GetRelayStaticPrivateKey() second call failed: %v", err)
+	}
+
+	if !bytes.Equal(first, second) {
+		t.Fatal("relay static private key changed within one store instance")
+	}
+
+	reloaded, err := New()
+	if err != nil {
+		t.Fatalf("New() reload failed: %v", err)
+	}
+	third, err := reloaded.GetRelayStaticPrivateKey()
+	if err != nil {
+		t.Fatalf("GetRelayStaticPrivateKey() after reload failed: %v", err)
+	}
+	if !bytes.Equal(first, third) {
+		t.Fatal("relay static private key changed after reload")
 	}
 }

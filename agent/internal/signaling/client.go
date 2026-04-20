@@ -89,7 +89,8 @@ func (c *Client) Connect(ctx context.Context) error {
 // RegisterShare sends register_share message and waits for the response.
 // It must not call conn.Read directly — all reads go through Listen.
 // The response is delivered via pendingReg, which Listen feeds.
-func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
+// relayStaticPub is the hex-encoded P-256 public key for relay identity.
+func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
 	responseCh := make(chan Message, 1)
 	c.pendingRegMu.Lock()
 	c.pendingReg = responseCh
@@ -107,6 +108,9 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 	}
 	if preferredCode != "" {
 		msg["code"] = preferredCode
+	}
+	if relayStaticPub != "" {
+		msg["relay_static_pub"] = relayStaticPub
 	}
 	if err := c.Send(ctx, msg); err != nil {
 		return "", false, fmt.Errorf("send register_share: %w", err)

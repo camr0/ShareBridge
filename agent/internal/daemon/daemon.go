@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -45,6 +46,7 @@ type ConfigManagerInterface interface {
 // StoreInterface defines the interface for session storage.
 type StoreInterface interface {
 	GetAgentID() string
+	GetRelayStaticPrivateKey() ([]byte, error)
 	GetSession(code string) *store.SessionEntry
 	GetByShareURL(shareURL string) *store.SessionEntry
 	ListSessions(filterExpired bool) []store.SessionEntry
@@ -56,7 +58,7 @@ type StoreInterface interface {
 // SignalingClientInterface defines the interface for signaling client.
 type SignalingClientInterface interface {
 	Connect(ctx context.Context) error
-	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
+	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error)
 	DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error
 	Send(ctx context.Context, msg any) error
 	GetICEServers() []webrtc.ICEServer
@@ -253,8 +255,18 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 		fileID = ""
 	}
 
+	// Get relay static private key and derive public key
+	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
+	if err != nil {
+		return "", fmt.Errorf("get relay static key: %w", err)
+	}
+	relayStaticPub, err := relayStaticPubHex(relayStaticPriv)
+	if err != nil {
+		return "", fmt.Errorf("derive relay static public key: %w", err)
+	}
+
 	// Register with signaling server (no preferred code for new sessions)
-	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly)
+	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly, relayStaticPub)
 	if err != nil {
 		return "", fmt.Errorf("register share: %w", err)
 	}
@@ -672,6 +684,21 @@ func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
 func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	sessions := d.store.ListSessions(true) // Filter expired
 
+	// Get relay static key once for all sessions
+	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
+	if err != nil {
+		log.Printf("warning: could not get relay static key: %v", err)
+		relayStaticPriv = nil
+	}
+	var relayStaticPub string
+	if relayStaticPriv != nil {
+		relayStaticPub, err = relayStaticPubHex(relayStaticPriv)
+		if err != nil {
+			log.Printf("warning: could not derive relay static public key: %v", err)
+			relayStaticPub = ""
+		}
+	}
+
 	cfg := d.GetConfig()
 	for _, entry := range sessions {
 		if entry.ShareType == "" {
@@ -687,7 +714,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		}
 
 		// Re-register with signaling server
-		code, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly)
+		code, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly, relayStaticPub)
 		if err != nil {
 			log.Printf("warning: could not re-register session %s: %v", entry.Code, err)
 			continue
@@ -837,4 +864,13 @@ func hasTURNServer(servers []webrtc.ICEServer) bool {
 		}
 	}
 	return false
+}
+
+// relayStaticPubHex derives the hex-encoded P-256 public key from the raw private key bytes.
+func relayStaticPubHex(rawPrivateKey []byte) (string, error) {
+	priv, err := ecdh.P256().NewPrivateKey(rawPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("import relay static key: %w", err)
+	}
+	return hex.EncodeToString(priv.PublicKey().Bytes()), nil
 }
