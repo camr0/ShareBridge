@@ -675,7 +675,7 @@ This is intentionally low-risk:
 
 ## Implementation Decomposition
 
-This spec is intended to be implemented as five separate plans so the work can land in testable slices without mixing unrelated concerns.
+This spec is intended to be implemented as four separate plans so the work can land in testable slices without mixing unrelated concerns.
 
 - **Plan A: Signaling + Relay Backend**
   - relay session records, browser/agent relay JWTs, relay websocket endpoint, `sid` pairing, pending wait window, `jti` replay protection, and server-authoritative relay byte accounting
@@ -683,17 +683,14 @@ This spec is intended to be implemented as five separate plans so the work can l
   - browser relay socket client, Noise handshake over framed relay bytes, direct-first orchestration, relay fallback, and connection status integration
 - **Plan C: Agent Relay Client / Agent `SecureRelayChannel`**
   - agent relay socket registration, relay-side Noise responder flow, framed encrypted channel behavior, and fail-closed relay-session handling
-- **Plan D: Transfer-Layer Integration / Cutover**
-  - adapt the transfer layer to the shared channel abstraction, preserve the current direct protocol shape, and prove the same transfer protocol works over direct and relay
-- **Plan E: Infrastructure Cleanup**
-  - remove Coturn and TURN-specific Prometheus quota plumbing from the new path, keep Cloudflare STUN as the direct default, and clean up config/docs/deploy assumptions left over from TURN fallback
+- **Plan D: Coverage + Cleanup + Verification**
+  - add high-value integration coverage for direct success, relay-only success, direct-timeout-to-relay fallback, and relay-disallowed/quota-blocked cases; then remove Coturn and TURN-era quota/plumbing leftovers from the new path, keep Cloudflare STUN as the direct default, and rerun the same coverage after cleanup
 
 Dependency order:
 
 - Plan A lands first
 - Plans B and C can proceed after A
-- Plan D depends on A/B/C
-- Plan E can follow once the new direct/relay behavior is working end to end
+- Plan D depends on A/B/C and serves as the final hardening/cleanup phase once the new direct/relay behavior is working end to end
 
 ## Testing Strategy
 
