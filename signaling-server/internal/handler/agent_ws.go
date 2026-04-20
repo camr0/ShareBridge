@@ -161,13 +161,8 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				})
 
 			case "auth_ok":
-				// Browser authentication succeeded - prepare relay session if relay is configured.
+				// Browser authentication succeeded - send relay_policy so browser can proceed.
 				if agentID == "" {
-					continue
-				}
-				if reg == nil || cfg.RelayJWTSecret == "" {
-					// Relay not configured - silently handle auth_ok without relay messages.
-					// Direct WebRTC flow continues normally.
 					continue
 				}
 
@@ -181,32 +176,42 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					continue
 				}
 
-				accountRecord, err := app.FindRecordById("users", accountID)
-				if err != nil {
-					log.Printf("agent_ws: auth_ok account lookup failed for account %s: %v", accountID, err)
-					continue
-				}
-				quotaExceeded, _ := checkRelayQuota(accountRecord)
+				relayOnly := session.GetBool("relay_only")
 				expectedStaticPub := session.GetString("relay_static_pub")
-				relayAllowed := !quotaExceeded && expectedStaticPub != ""
 
-				sid := relay.NewSID()
-				now := time.Now().UTC()
+				// Determine relay availability: requires relay to be configured, non-relay-only session,
+				// and either explicit static pub from session or configured relay JWT secret.
+				var relayAllowed bool
+				if reg != nil && cfg.RelayJWTSecret != "" && !relayOnly && expectedStaticPub != "" {
+					accountRecord, err := app.FindRecordById("users", accountID)
+					if err != nil {
+						log.Printf("agent_ws: auth_ok account lookup failed for account %s: %v", accountID, err)
+						continue
+					}
+					quotaExceeded, _ := checkRelayQuota(accountRecord)
+					relayAllowed = !quotaExceeded
+				}
 
-				browserClaims := relay.BrowserPolicyClaims{
-					SID:               sid,
-					SessionCode:       msg.Code,
-					RelayAllowed:      relayAllowed,
-					RelayOnly:         session.GetBool("relay_only"),
-					ExpectedStaticPub: expectedStaticPub,
-					RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
-				}
-				browserJWT, err := relay.SignBrowserPolicyJWT(cfg.RelayJWTSecret, browserClaims, now)
-				if err != nil {
-					log.Printf("agent_ws: failed to sign browser policy JWT: %v", err)
-					continue
-				}
+				var browserJWT string
 				if relayAllowed {
+					sid := relay.NewSID()
+					now := time.Now().UTC()
+
+					browserClaims := relay.BrowserPolicyClaims{
+						SID:               sid,
+						SessionCode:       msg.Code,
+						RelayAllowed:      true,
+						RelayOnly:         false,
+						ExpectedStaticPub: expectedStaticPub,
+						RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
+					}
+					var err error
+					browserJWT, err = relay.SignBrowserPolicyJWT(cfg.RelayJWTSecret, browserClaims, now)
+					if err != nil {
+						log.Printf("agent_ws: failed to sign browser policy JWT: %v", err)
+						continue
+					}
+
 					agentJWT, err := relay.SignAgentRelayJWT(cfg.RelayJWTSecret, relay.AgentRelayClaims{SID: sid, AgentID: agentID}, now)
 					if err != nil {
 						log.Printf("agent_ws: failed to sign agent relay JWT: %v", err)
@@ -218,9 +223,9 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 						AccountID:         accountID,
 						SessionCode:       msg.Code,
 						AgentID:           agentID,
-						RelayAllowed:      browserClaims.RelayAllowed,
-						RelayOnly:         browserClaims.RelayOnly,
-						ExpectedStaticPub: browserClaims.ExpectedStaticPub,
+						RelayAllowed:      true,
+						RelayOnly:         false,
+						ExpectedStaticPub: expectedStaticPub,
 						JTI:               browserClaims.RegisteredClaims.ID,
 						ExpiresAt:         now.Add(relay.TokenLifetime),
 					}, now)
@@ -237,17 +242,17 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 						"expires_at": now.Add(relay.TokenLifetime).Format(time.RFC3339),
 						"relay_jwt":  agentJWT,
 					})
+
+					log.Printf("agent_ws: relay session prepared: sid=%s code=%s agent_id=%s", sid, msg.Code, agentID)
 				}
 
-				// Send relay_policy to browser via hub
+				// Send relay_policy to browser via hub (always, so browser can proceed)
 				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
 					"type":          "relay_policy",
 					"token":         browserJWT,
-					"relay_allowed": browserClaims.RelayAllowed,
-					"relay_only":    browserClaims.RelayOnly,
+					"relay_allowed": relayAllowed,
+					"relay_only":    relayOnly,
 				})
-
-				log.Printf("agent_ws: relay session prepared: sid=%s code=%s agent_id=%s", sid, msg.Code, agentID)
 
 			case "auth_failed":
 				// Track failures per connID. After 3, close the browser WebSocket.

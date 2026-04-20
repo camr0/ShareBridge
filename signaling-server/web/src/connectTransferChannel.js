@@ -9,6 +9,9 @@ export async function connectTransferChannel({
   onStatusChange = () => {},
 }) {
   if (relayPolicy.relayOnly) {
+    if (!relayPolicy.relayAllowed) {
+      throw new Error('Relay is required for this share but relay service is not available')
+    }
     onStatusChange('connecting-relay')
     const relayChannel = await relayConnect()
     onStatusChange('connected-relay')
@@ -44,6 +47,14 @@ export function buildDirectIceServers(iceServers) {
 }
 
 export function decodeRelayPolicyToken(token) {
+  // Handle empty token (relay not configured) - relay not allowed
+  if (!token) {
+    return {
+      expectedStaticPubHex: '',
+      relayAllowed: false,
+      relayOnly: false,
+    }
+  }
   const [, payload] = token.split('.')
   const json = JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload)))
   return {

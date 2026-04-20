@@ -37,6 +37,15 @@ function debugLog(...args) {
   console.log('[secure-relay]', ...args)
 }
 
+export function assertJoinNotActive(socket, log = debugLog) {
+  if (!socket) return
+  if (socket.readyState === 3) return
+
+  const err = new Error(`join() re-entered while browser signaling socket is still active (readyState=${socket.readyState})`)
+  log('FATAL', err.message)
+  throw err
+}
+
 // Export for testing
 export function publishGlobalActions(globals, { join, submitPassword, navigateTo }) {
   globals.join = join
@@ -243,8 +252,11 @@ function hideSection(id) {
 }
 
 function join() {
+  assertJoinNotActive(ws)
+
   const code = document.getElementById('code').value.trim()
   if (!code) return
+  debugLog('join invoked', { code })
   status('Connecting...')
 
   // Reset quota state for new connection
@@ -794,6 +806,16 @@ function initFromURL() {
 // Make functions available globally for inline handlers (browser only)
 if (typeof window !== 'undefined') {
   publishGlobalActions(window, { join, submitPassword, navigateTo })
+
+  window.addEventListener('beforeunload', () => {
+    debugLog('window beforeunload', { readyState: ws?.readyState })
+  })
+  window.addEventListener('pagehide', () => {
+    debugLog('window pagehide', { readyState: ws?.readyState })
+  })
+  document.addEventListener('visibilitychange', () => {
+    debugLog('document visibilitychange', { visibilityState: document.visibilityState, readyState: ws?.readyState })
+  })
 
   document.addEventListener('DOMContentLoaded', () => {
     initFromURL()

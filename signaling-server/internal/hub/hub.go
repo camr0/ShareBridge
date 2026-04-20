@@ -129,6 +129,10 @@ func (h *Hub) ForwardToBrowser(ctx context.Context, sessionID string, msg any) e
 	return send(ctx, h, sessionPair.browserConn, msg)
 }
 
+func (h *Hub) SendDirect(ctx context.Context, conn *websocket.Conn, msg any) error {
+	return send(ctx, h, conn, msg)
+}
+
 func SendDirect(ctx context.Context, conn *websocket.Conn, msg any) error {
 	return send(ctx, nil, conn, msg)
 }

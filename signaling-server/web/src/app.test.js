@@ -1,7 +1,13 @@
 // signaling-server/web/src/app.test.js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { installSessionMessageHandler, publishGlobalActions, applyConnectionBadge, initializeIceConfigTransport } from './app.js'
+import {
+  installSessionMessageHandler,
+  publishGlobalActions,
+  applyConnectionBadge,
+  initializeIceConfigTransport,
+  assertJoinNotActive,
+} from './app.js'
 
 test('publishGlobalActions preserves inline button handlers after the move to an ES module', () => {
   const globals = {}
@@ -119,4 +125,17 @@ test('relay_only ice_config skips direct peer creation and leaves initial knock 
   assert.equal(peer, null)
   assert.equal(createCalls, 0)
   assert.deepEqual(sent, [])
+})
+
+test('assertJoinNotActive throws loudly when join re-enters on an active socket', () => {
+  const logs = []
+  assert.throws(
+    () => assertJoinNotActive({ readyState: 1 }, (...args) => logs.push(args)),
+    /join\(\) re-entered/
+  )
+  assert.match(logs[0][1], /join\(\) re-entered/)
+})
+
+test('assertJoinNotActive allows a closed socket', () => {
+  assert.doesNotThrow(() => assertJoinNotActive({ readyState: 3 }, () => {}))
 })
