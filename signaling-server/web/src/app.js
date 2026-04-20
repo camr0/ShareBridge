@@ -11,6 +11,12 @@ let remoteDescSet = false
 let relayQuotaExceeded = false
 let quotaPeriodEnd = null
 
+const DEBUG = location.search.includes('debug=1') || localStorage.getItem('sharebridge_debug')
+
+function debugLog(...args) {
+  if (DEBUG) console.log('[secure-relay]', ...args)
+}
+
 // Direct connection promise handling
 let directChannelResolve = null
 let directChannelReject = null
@@ -32,10 +38,6 @@ let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
 let pendingNonce = null // nonce received from agent, consumed on join
-
-function debugLog(...args) {
-  console.log('[secure-relay]', ...args)
-}
 
 export function assertJoinNotActive(socket, log = debugLog) {
   if (!socket) return
