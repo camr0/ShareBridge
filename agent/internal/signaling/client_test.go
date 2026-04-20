@@ -132,6 +132,25 @@ func TestRegisterShare_OmitsEmptyRelayStaticPub(t *testing.T) {
 	}
 }
 
+func TestRelayWebSocketURL(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{in: "wss://sharebridge.app", want: "wss://sharebridge.app/ws/relay"},
+		{in: "ws://localhost:8787", want: "ws://localhost:8787/ws/relay"},
+		{in: "https://sharebridge.app", want: "wss://sharebridge.app/ws/relay"},
+		{in: "http://localhost:8787", want: "ws://localhost:8787/ws/relay"},
+		{in: "wss://sharebridge.app/some/path?query=1", want: "wss://sharebridge.app/ws/relay"},
+	}
+
+	for _, tc := range cases {
+		if got := RelayWebSocketURL(tc.in); got != tc.want {
+			t.Fatalf("RelayWebSocketURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestListen_ParsesRelayPrepare(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
