@@ -3,6 +3,9 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"strings"
@@ -952,5 +955,178 @@ func TestDaemonGetsRelayStaticKey(t *testing.T) {
 
 	if receivedRelayPub != pubHex {
 		t.Errorf("RegisterShare received relay_static_pub = %s, expected %s", receivedRelayPub, pubHex)
+	}
+}
+
+// mockRelayChannel implements relayTransferChannel for testing.
+type mockRelayChannel struct {
+	startFn       func(context.Context) error
+	sendBinaryFn  func([]byte) error
+	sendTextFn    func(string) error
+	bufferedFn    func() uint64
+	closeFn       func() error
+	onMessage     func([]byte)
+	onOpen        func()
+	onClose       func()
+}
+
+func (m *mockRelayChannel) Start(ctx context.Context) error {
+	if m.startFn != nil {
+		return m.startFn(ctx)
+	}
+	return nil
+}
+
+func (m *mockRelayChannel) SendBinary(data []byte) error {
+	if m.sendBinaryFn != nil {
+		return m.sendBinaryFn(data)
+	}
+	return nil
+}
+
+func (m *mockRelayChannel) SendText(text string) error {
+	if m.sendTextFn != nil {
+		return m.sendTextFn(text)
+	}
+	return nil
+}
+
+func (m *mockRelayChannel) BufferedAmount() uint64 {
+	if m.bufferedFn != nil {
+		return m.bufferedFn()
+	}
+	return 0
+}
+
+func (m *mockRelayChannel) Close() error {
+	if m.closeFn != nil {
+		return m.closeFn()
+	}
+	return nil
+}
+
+func (m *mockRelayChannel) SetOnMessage(handler func([]byte)) {
+	m.onMessage = handler
+}
+
+func (m *mockRelayChannel) SetOnOpen(handler func()) {
+	m.onOpen = handler
+}
+
+func (m *mockRelayChannel) SetOnClose(handler func()) {
+	m.onClose = handler
+}
+
+// hasSentMessage checks if a message was sent with the given type and fields.
+func hasSentMessage(messages []map[string]any, msgType string, expectedFields map[string]any) bool {
+	for _, msg := range messages {
+		if msg["type"] == msgType {
+			// Check all expected fields match
+			match := true
+			for key, expected := range expectedFields {
+				if msg[key] != expected {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestHandleJoin_SendsAuthOKAfterHMACVerification tests that auth_ok is sent
+// after successful HMAC verification, before creating the peer.
+func TestHandleJoin_SendsAuthOKAfterHMACVerification(t *testing.T) {
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	d, err := NewWithSignaling(cfgMgr, st, sig)
+	if err != nil {
+		t.Fatalf("NewWithSignaling: %v", err)
+	}
+
+	d.sessions["SHARE123"] = &Session{
+		Code:      "SHARE123",
+		Password:  "secret",
+		CreatedAt: time.Now(),
+		peers:     make(map[string]*peer.Peer),
+	}
+
+	d.nonces["conn-1"] = nonceEntry{
+		nonce:     "abc123",
+		expiresAt: time.Now().Add(time.Minute),
+	}
+
+	mac := hmac.New(sha256.New, []byte("secret"))
+	mac.Write([]byte("abc123"))
+	joinedHMAC := hex.EncodeToString(mac.Sum(nil))
+
+	d.handleJoin("conn-1", "SHARE123", joinedHMAC)
+
+	// Check that auth_ok was sent with correct fields
+	if !hasSentMessage(sig.sendMessages, "auth_ok", map[string]any{
+		"conn_id": "conn-1",
+		"code":    "SHARE123",
+	}) {
+		t.Fatalf("expected auth_ok to be sent, got %#v", sig.sendMessages)
+	}
+}
+
+// TestHandleRelayPrepare_StartsRelayTransferChannel tests that relay_prepare
+// starts a relay channel and adds it to the session.
+func TestHandleRelayPrepare_StartsRelayTransferChannel(t *testing.T) {
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	d, err := NewWithSignaling(cfgMgr, st, sig)
+	if err != nil {
+		t.Fatalf("NewWithSignaling: %v", err)
+	}
+
+	session := &Session{
+		Code:          "SHARE123",
+		CreatedAt:     time.Now(),
+		peers:         make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions["SHARE123"] = session
+
+	started := make(chan struct{}, 1)
+	d.newRelayChannel = func(cfg relayChannelConfig) (relayTransferChannel, error) {
+		return &mockRelayChannel{
+			startFn: func(context.Context) error {
+				started <- struct{}{}
+				return nil
+			},
+		}, nil
+	}
+
+	d.handleSignalingMessage(signaling.Message{
+		Type:     "relay_prepare",
+		SID:      "sid-123",
+		Code:     "SHARE123",
+		RelayJWT: "relay.jwt.token",
+	})
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay channel never started")
+	}
+
+	// Verify channel was added to session
+	session.mu.Lock()
+	channel := session.relayChannels["sid-123"]
+	session.mu.Unlock()
+
+	if channel == nil {
+		t.Fatal("relay channel not added to session")
 	}
 }

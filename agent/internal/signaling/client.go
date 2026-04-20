@@ -225,3 +225,22 @@ func (c *Client) SetOnMessage(handler func(Message)) {
 	defer c.mu.Unlock()
 	c.OnMessage = handler
 }
+
+// RelayWebSocketURL derives the relay WebSocket URL from the signaling URL.
+// It converts http/https to ws/wss and appends "/ws/relay" path.
+func RelayWebSocketURL(signalingURL string) string {
+	u, err := url.Parse(signalingURL)
+	if err != nil {
+		return signalingURL + "/ws/relay"
+	}
+	switch u.Scheme {
+	case "https":
+		u.Scheme = "wss"
+	case "http":
+		u.Scheme = "ws"
+	}
+	u.Path = "/ws/relay"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}

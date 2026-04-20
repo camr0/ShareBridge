@@ -19,6 +19,7 @@ import (
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/peer"
+	"sharebridge/agent/internal/relaychannel"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 	"sharebridge/agent/internal/transfer"
@@ -28,6 +29,26 @@ import (
 type nonceEntry struct {
 	nonce     string
 	expiresAt time.Time
+}
+
+// relayTransferChannel is the interface for relay transfer channels.
+// It matches transfer.DataChannel plus lifecycle methods.
+type relayTransferChannel interface {
+	Start(ctx context.Context) error
+	SendBinary(data []byte) error
+	SendText(text string) error
+	BufferedAmount() uint64
+	Close() error
+	SetOnMessage(handler func([]byte))
+	SetOnOpen(handler func())
+	SetOnClose(handler func())
+}
+
+// relayChannelConfig holds configuration for creating a relay channel.
+type relayChannelConfig struct {
+	RelayURL      string
+	RelayJWT      string
+	StaticPrivate []byte
 }
 
 // WebServer is the interface for the admin UI web server.
@@ -79,9 +100,10 @@ type Session struct {
 	RelayOnly    bool
 	CreatedAt    time.Time
 
-	webdavClient *cloudwebdav.Client
-	peers        map[string]*peer.Peer // peerID -> Peer
-	mu           sync.Mutex
+	webdavClient   *cloudwebdav.Client
+	peers          map[string]*peer.Peer // peerID -> Peer
+	relayChannels  map[string]relayTransferChannel // sid -> relay channel
+	mu             sync.Mutex
 }
 
 // Daemon manages multiple concurrent sessions, a single signaling connection,
@@ -102,6 +124,9 @@ type Daemon struct {
 	// Nonce store for HMAC pre-challenge (connID -> nonce)
 	nonces   map[string]nonceEntry
 	noncesMu sync.Mutex
+
+	// Factory for creating relay channels (injected for testing)
+	newRelayChannel func(cfg relayChannelConfig) (relayTransferChannel, error)
 
 	// Callbacks for external handling (e.g., web server refresh)
 	OnSessionAdded   func(session *Session)
@@ -405,6 +430,9 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	case "ice_candidate":
 		d.handleICECandidate(msg.PeerID, msg.Candidate)
 
+	case "relay_prepare":
+		go d.handleRelayPrepare(msg)
+
 	case "error":
 		log.Printf("signaling error: %s", msg.Err)
 	}
@@ -498,6 +526,14 @@ func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
 	}
 
 	log.Printf("HMAC verified for session %s conn %s — creating peer", sessionCode, connID)
+
+	// Send auth_ok to signaling server after successful HMAC verification
+	d.signaling.Send(context.Background(), map[string]any{
+		"type":    "auth_ok",
+		"conn_id": connID,
+		"code":    sessionCode,
+	})
+
 	go d.createPeer(connID, sessionCode)
 }
 
@@ -676,6 +712,107 @@ func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
 
 	if err := p.AddICECandidate(init); err != nil {
 		log.Printf("add ICE candidate for peer %s: %v", peerID, err)
+	}
+}
+
+// handleRelayPrepare handles a relay_prepare message from the signaling server.
+// It creates a SecureRelayChannel, wires it to a transfer manager, and starts it.
+func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
+	d.mu.RLock()
+	session := d.sessions[msg.Code]
+	d.mu.RUnlock()
+	if session == nil {
+		log.Printf("relay_prepare for unknown session %s", msg.Code)
+		return
+	}
+
+	// Get relay static private key
+	rawPriv, err := d.store.GetRelayStaticPrivateKey()
+	if err != nil {
+		log.Printf("get relay static key: %v", err)
+		return
+	}
+
+	// Convert raw bytes to ecdh.PrivateKey
+	staticPriv, err := ecdh.P256().NewPrivateKey(rawPriv)
+	if err != nil {
+		log.Printf("import relay static key: %v", err)
+		return
+	}
+
+	// Create relay channel
+	relayURL := signaling.RelayWebSocketURL(d.config.SignalingURL)
+
+	// Use factory function if set (for testing), otherwise create real channel
+	var channel relayTransferChannel
+	if d.newRelayChannel != nil {
+		channel, err = d.newRelayChannel(relayChannelConfig{
+			RelayURL:      relayURL,
+			RelayJWT:      msg.RelayJWT,
+			StaticPrivate: rawPriv,
+		})
+		if err != nil {
+			log.Printf("new relay channel: %v", err)
+			return
+		}
+	} else {
+		// Production: create SecureRelayChannel directly
+		rc, err := relaychannel.NewSecureRelayChannel(relaychannel.SecureRelayConfig{
+			RelayURL:      relayURL,
+			RelayJWT:      msg.RelayJWT,
+			StaticPrivate: staticPriv,
+		})
+		if err != nil {
+			log.Printf("new relay channel: %v", err)
+			return
+		}
+		channel = rc
+	}
+
+	// Create transfer manager for this relay channel
+	tm := transfer.NewManager(channel, session.webdavClient, session.MaxDownloads)
+	tm.SetDownloadCount(session.Downloads)
+
+	// Wire transfer callbacks
+	tm.OnSessionExpired = func() {
+		_ = d.signaling.Send(context.Background(), map[string]any{
+			"type":       "session_expired",
+			"session_id": msg.Code,
+		})
+	}
+	tm.OnDownloadComplete = func(bytesTransferred int64) {
+		session.mu.Lock()
+		session.Downloads++
+		session.mu.Unlock()
+		if _, err := d.store.IncrementDownloads(msg.Code); err != nil {
+			log.Printf("persist download count: %v", err)
+		}
+		_ = d.signaling.DownloadComplete(context.Background(), msg.Code, bytesTransferred)
+	}
+
+	// Wire channel callbacks
+	channel.SetOnMessage(tm.HandleMessage)
+	channel.SetOnOpen(tm.HandleOpen)
+	channel.SetOnClose(func() {
+		session.mu.Lock()
+		delete(session.relayChannels, msg.SID)
+		session.mu.Unlock()
+	})
+
+	// Add channel to session
+	session.mu.Lock()
+	if session.relayChannels == nil {
+		session.relayChannels = make(map[string]relayTransferChannel)
+	}
+	session.relayChannels[msg.SID] = channel
+	session.mu.Unlock()
+
+	// Start relay channel (asynchronously handles handshake)
+	if err := channel.Start(context.Background()); err != nil {
+		log.Printf("start relay channel sid=%s: %v", msg.SID, err)
+		session.mu.Lock()
+		delete(session.relayChannels, msg.SID)
+		session.mu.Unlock()
 	}
 }
 
