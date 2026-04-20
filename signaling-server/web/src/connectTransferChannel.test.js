@@ -95,3 +95,25 @@ test('decodeRelayPolicyToken extracts the expected static key from the JWT paylo
     relayOnly: false,
   })
 })
+
+test('relay_only ignores direct timeout entirely and reports relay mode immediately', async () => {
+  const statuses = []
+  const connected = await connectTransferChannel({
+    relayPolicy: { relayAllowed: true, relayOnly: true },
+    directConnect: async () => { throw new Error('direct should be skipped') },
+    relayConnect: async () => ({ readyState: 'open', close() {} }),
+    onStatusChange: (status) => statuses.push(status),
+  })
+
+  assert.equal(connected.mode, 'relay')
+  assert.deepEqual(statuses, ['connecting-relay', 'connected-relay'])
+})
+
+test('relay_allowed false surfaces a quota-style failure instead of silently trying relay', async () => {
+  await assert.rejects(() => connectTransferChannel({
+    relayPolicy: { relayAllowed: false, relayOnly: false },
+    directConnect: async () => { throw new Error('direct connect timeout after 5000ms') },
+    relayConnect: async () => ({ readyState: 'open', close() {} }),
+    onStatusChange: () => {},
+  }), /direct connect timeout/i)
+})

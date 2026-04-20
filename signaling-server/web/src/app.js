@@ -88,20 +88,26 @@ export function installSessionMessageHandler({
             return relayChannel
           }
 
-          const result = await connectTransfer({
-            relayPolicy,
-            directConnect,
-            relayConnect,
-            onStatusChange: (s) => {
-              // Map internal states to UI messages
-              if (s === 'connecting-direct') status('Connecting directly...')
-              else if (s === 'connecting-relay') status('Connecting via relay...')
-              else if (s === 'falling-back-to-relay') status('Direct failed, using relay...')
-              else if (s === 'connected-direct') status('Connected directly')
-              else if (s === 'connected-relay') status('Connected via relay')
-              else if (s === 'failed') status('Connection failed')
-            },
-          })
+          let result
+          try {
+            result = await connectTransfer({
+              relayPolicy,
+              directConnect,
+              relayConnect,
+              onStatusChange: (s) => {
+                // Map internal states to UI messages
+                if (s === 'connecting-direct') status('Connecting directly...')
+                else if (s === 'connecting-relay') status('Connecting via relay...')
+                else if (s === 'falling-back-to-relay') status('Direct failed, using relay...')
+                else if (s === 'connected-direct') status('Connected directly')
+                else if (s === 'connected-relay') status('Connected via relay')
+                else if (s === 'failed') status('Connection failed')
+              },
+            })
+          } catch (err) {
+            status(err.message)
+            throw err
+          }
 
           transferChannel = result.channel
           currentTransferMode = result.mode
@@ -304,19 +310,25 @@ function join() {
           return relayChannel
         }
 
-        const result = await connectTransferChannel({
-          relayPolicy,
-          directConnect,
-          relayConnect,
-          onStatusChange: (s) => {
-            if (s === 'connecting-direct') status('Connecting directly...')
-            else if (s === 'connecting-relay') status('Connecting via relay...')
-            else if (s === 'falling-back-to-relay') status('Direct failed, using relay...')
-            else if (s === 'connected-direct') status('Connected directly')
-            else if (s === 'connected-relay') status('Connected via relay')
-            else if (s === 'failed') status('Connection failed')
-          },
-        })
+        let result
+        try {
+          result = await connectTransferChannel({
+            relayPolicy,
+            directConnect,
+            relayConnect,
+            onStatusChange: (s) => {
+              if (s === 'connecting-direct') status('Connecting directly...')
+              else if (s === 'connecting-relay') status('Connecting via relay...')
+              else if (s === 'falling-back-to-relay') status('Direct failed, using relay...')
+              else if (s === 'connected-direct') status('Connected directly')
+              else if (s === 'connected-relay') status('Connected via relay')
+              else if (s === 'failed') status('Connection failed')
+            },
+          })
+        } catch (err) {
+          status(err.message)
+          throw err
+        }
 
         transferChannel = result.channel
         currentTransferMode = result.mode

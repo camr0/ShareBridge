@@ -70,3 +70,27 @@ test('relay_policy drives connection badge and transfer channel setup without ch
   assert.equal(statuses.at(-1), 'badge:relay')
   assert.equal(sends[0], JSON.stringify({ type: 'list_request', path: '' }))
 })
+
+test('relay_policy with relay_allowed false preserves the quota-exceeded user message on direct failure', async () => {
+  const statuses = []
+  const controller = installSessionMessageHandler({
+    status: (msg) => statuses.push(msg),
+    connectTransferChannel: async ({ onStatusChange }) => {
+      onStatusChange('failed')
+      throw new Error('Direct unavailable, relay blocked (quota exceeded).')
+    },
+    requestFileList: () => {},
+    applyConnectionBadge: () => {},
+    decodeRelayPolicyToken: () => ({ relayOnly: false, relayAllowed: false, expectedStaticPubHex: '00' }),
+    hideSection: () => {},
+  })
+
+  await assert.rejects(() => controller.handleMessage({
+    type: 'relay_policy',
+    token: 'jwt',
+    relay_allowed: false,
+    relay_only: false,
+  }))
+
+  assert.match(statuses.at(-1), /quota exceeded/i)
+})
