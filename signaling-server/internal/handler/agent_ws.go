@@ -179,10 +179,11 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				relayOnly := session.GetBool("relay_only")
 				expectedStaticPub := session.GetString("relay_static_pub")
 
-				// Determine relay availability: requires relay to be configured, non-relay-only session,
-				// and either explicit static pub from session or configured relay JWT secret.
+				// Determine relay availability: requires relay to be configured,
+				// a valid static pub key from the session, and (for relay-only sessions,
+				// relay is mandatory; for direct sessions, relay is optional fallback).
 				var relayAllowed bool
-				if reg != nil && cfg.RelayJWTSecret != "" && !relayOnly && expectedStaticPub != "" {
+				if reg != nil && cfg.RelayJWTSecret != "" && expectedStaticPub != "" {
 					accountRecord, err := app.FindRecordById("users", accountID)
 					if err != nil {
 						log.Printf("agent_ws: auth_ok account lookup failed for account %s: %v", accountID, err)
@@ -201,7 +202,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 						SID:               sid,
 						SessionCode:       msg.Code,
 						RelayAllowed:      true,
-						RelayOnly:         false,
+						RelayOnly:         relayOnly,
 						ExpectedStaticPub: expectedStaticPub,
 						RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
 					}
@@ -224,7 +225,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 						SessionCode:       msg.Code,
 						AgentID:           agentID,
 						RelayAllowed:      true,
-						RelayOnly:         false,
+						RelayOnly:         relayOnly,
 						ExpectedStaticPub: expectedStaticPub,
 						JTI:               browserClaims.RegisteredClaims.ID,
 						ExpiresAt:         now.Add(relay.TokenLifetime),
