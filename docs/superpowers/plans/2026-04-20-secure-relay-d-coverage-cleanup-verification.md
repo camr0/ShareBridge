@@ -82,6 +82,8 @@
 
 ```js
 // signaling-server/web/src/app.test.js
+import { installSessionMessageHandler, initializeIceConfigTransport, __test } from './app.js'
+
 test('relay_policy opens the relay channel and requests the root file list', async () => {
   const statuses = []
   const requested = []
@@ -118,21 +120,21 @@ test('relay_policy opens the relay channel and requests the root file list', asy
 
 test('direct failure after quota warning keeps the quota-blocked message', async () => {
   const statuses = []
-  relayQuotaExceeded = true
-  quotaPeriodEnd = '2026-05-01T00:00:00Z'
+  __test.setQuotaState({ exceeded: true, periodEnd: '2026-05-01T00:00:00Z' })
 
-  const onDirectFailure = initializeIceConfigTransport({
+  const peer = initializeIceConfigTransport({
     msg: { type: 'ice_config', relay_only: false, ice_servers: [{ urls: ['stun:stun.cloudflare.com:3478'] }] },
     ws: { send() {} },
     createPeerConnection: () => ({ onicecandidate: null, ondatachannel: null, onconnectionstatechange: null, connectionState: 'new' }),
     onDirectChannel() {},
     onDirectFailure: () => {
-      const periodEnd = new Date(quotaPeriodEnd).toLocaleDateString()
+      const periodEnd = new Date('2026-05-01T00:00:00Z').toLocaleDateString()
       statuses.push(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
     },
   })
 
-  onDirectFailure?.onconnectionstatechange?.()
+  peer.connectionState = 'failed'
+  peer.onconnectionstatechange()
   assert.match(statuses.at(-1), /quota exceeded/i)
 })
 ```
@@ -242,22 +244,52 @@ Expected:
 - [ ] **Step 4: Add the minimal test-support implementation**
 
 ```js
-// signaling-server/web/src/app.test.js
-// Reuse installSessionMessageHandler(...) instead of adding new production entrypoints.
-// If a test needs quota state, expose a tiny test helper:
-export function setQuotaStateForTest({ exceeded, periodEnd }) {
-  relayQuotaExceeded = exceeded
-  quotaPeriodEnd = periodEnd
+// signaling-server/web/src/app.js
+export const __test = {
+  setQuotaState({ exceeded, periodEnd }) {
+    relayQuotaExceeded = exceeded
+    quotaPeriodEnd = periodEnd
+  },
 }
+```
+
+```js
+// signaling-server/web/src/app.test.js
+import { installSessionMessageHandler, initializeIceConfigTransport, __test } from './app.js'
+
+// Reuse installSessionMessageHandler(...) instead of adding new production entrypoints.
+// Use __test.setQuotaState(...) rather than mutating module-private state directly.
 ```
 
 ```go
 // signaling-server/internal/handler/browser_ws_test.go
-// Reuse setupBrowserTestApp/createTestAccountWithQuota/createTestAPIKeyForUser helpers.
-// Do not add new runtime behavior here; only pin existing relay-only + nonce flow.
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
 
+	"github.com/coder/websocket"
+	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tests"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
+	"sharebridge/server/internal/config"
+	"sharebridge/server/internal/hub"
+	"sharebridge/server/internal/middleware"
+	"sharebridge/server/internal/relay"
+	"sharebridge/server/migrations"
+}
+```
+
+```go
 // agent/internal/daemon/daemon_test.go
 // Reuse existing mockSignalingClient.sendMessages inspection to assert no direct offer is emitted.
+// No production code change is required here beyond the new test body from Step 2.
 ```
 
 - [ ] **Step 5: Run the targeted tests again**
