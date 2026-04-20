@@ -2,6 +2,8 @@ package handler
 
 import (
 	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pocketbase/pocketbase/core"
@@ -12,6 +14,22 @@ import (
 func ServeFile(path string) func(*core.RequestEvent) error {
 	return func(requestEvent *core.RequestEvent) error {
 		http.ServeFile(requestEvent.Response, requestEvent.Request, path)
+		return nil
+	}
+}
+
+// ServeDir returns a handler that serves files under root using a "{path...}"
+// route wildcard. Requests attempting to escape the root are rejected.
+func ServeDir(root string) func(*core.RequestEvent) error {
+	return func(requestEvent *core.RequestEvent) error {
+		relPath := filepath.Clean(requestEvent.Request.PathValue("path"))
+		if relPath == "." || relPath == "" {
+			return requestEvent.NotFoundError("file not found", nil)
+		}
+		if strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || relPath == ".." {
+			return requestEvent.NotFoundError("file not found", nil)
+		}
+		http.ServeFile(requestEvent.Response, requestEvent.Request, filepath.Join(root, relPath))
 		return nil
 	}
 }

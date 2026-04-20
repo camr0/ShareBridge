@@ -82,6 +82,8 @@ func main() {
 
 		// Static assets for file client
 		router.GET("/app.js", handler.ServeFile("./web/app.js"))
+		router.GET("/src/{path...}", handler.ServeDir("./web/src"))
+		router.GET("/noise-p256/{path...}", handler.ServeDir("./web/noise-p256"))
 
 		// User-facing pages (placeholders - full implementation in Task 10)
 		router.GET("/register", handler.ServeFile("./web/register.html"))
