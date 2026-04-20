@@ -363,7 +363,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	}
 	log.Printf("connected to signaling server at %s", cfg.SignalingURL)
 
-	relayStaticPub, err := registrationRelayStaticPub(false, st)
+	relayStaticPub, err := registrationRelayStaticPub(true, st)
 	if err != nil {
 		return "", fmt.Errorf("derive relay static public key: %w", err)
 	}
