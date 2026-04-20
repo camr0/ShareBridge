@@ -7,11 +7,13 @@ test('publishGlobalActions preserves inline button handlers after the move to an
   const globals = {}
   const join = () => {}
   const submitPassword = () => {}
+  const navigateTo = () => {}
 
-  publishGlobalActions(globals, { join, submitPassword })
+  publishGlobalActions(globals, { join, submitPassword, navigateTo })
 
   assert.equal(globals.join, join)
   assert.equal(globals.submitPassword, submitPassword)
+  assert.equal(globals.navigateTo, navigateTo)
 })
 
 test('applyConnectionBadge preserves the colored direct/relay badge', () => {
@@ -41,7 +43,7 @@ test('applyConnectionBadge preserves the colored direct/relay badge', () => {
   assert.deepEqual(badge.classList.added, ['connection-relay'])
 })
 
-test('relay_policy drives connection badge and transfer channel setup without changing file protocol handlers', async () => {
+test('relay_policy immediately initializes an already-open transfer channel without waiting for a new onopen event', async () => {
   const statuses = []
   const sends = []
   const fakeChannel = {
@@ -65,7 +67,6 @@ test('relay_policy drives connection badge and transfer channel setup without ch
   })
 
   await controller.handleMessage({ type: 'relay_policy', token: 'jwt', relay_allowed: true, relay_only: true })
-  fakeChannel.onopen()
 
   assert.equal(statuses.at(-1), 'badge:relay')
   assert.equal(sends[0], JSON.stringify({ type: 'list_request', path: '' }))

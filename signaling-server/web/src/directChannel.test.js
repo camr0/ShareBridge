@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { DirectChannel } from './directChannel.js'
+import { DirectChannel, waitForDirectChannelOpen } from './directChannel.js'
 
 function createMockRTCDataChannel() {
   return {
@@ -46,4 +46,16 @@ test('DirectChannel normalizes RTCDataChannel into the shared channel contract',
   assert.equal(channel.bufferedAmount, 17)
   assert.equal(rtc.sent.length, 2)
   assert.equal(rtc.closeCalled, true)
+})
+
+test('waitForDirectChannelOpen resolves when the RTC data channel opens later', async () => {
+  const rtc = createMockRTCDataChannel()
+  const channel = new DirectChannel(rtc)
+
+  const pending = waitForDirectChannelOpen(channel)
+  rtc.readyState = 'open'
+  rtc.onopen()
+
+  const opened = await pending
+  assert.equal(opened, channel)
 })

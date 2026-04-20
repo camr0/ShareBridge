@@ -62,6 +62,7 @@ test('SecureRelayChannel performs Noise handshake, pins static key, and exchange
   socket.readyState = 1
   const started = channel.start()
   await socket.waitForSentCount(2)
+  assert.equal(socket.binaryType, 'arraybuffer')
 
   // Browser sent hello JSON, then msg1 as a handshake frame.
   const hello = new TextDecoder().decode(socket.sent[0])

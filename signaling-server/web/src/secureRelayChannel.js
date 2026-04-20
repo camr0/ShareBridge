@@ -22,6 +22,7 @@ export class SecureRelayChannel {
   async start() {
     this._noise = await NoiseXX.createInitiator()
     this._socket = this._websocketFactory(this._relayURL)
+    this._socket.binaryType = 'arraybuffer'
 
     await new Promise((resolve, reject) => {
       const handleOpen = async () => {

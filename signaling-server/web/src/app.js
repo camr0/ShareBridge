@@ -1,4 +1,4 @@
-import { DirectChannel } from './directChannel.js'
+import { DirectChannel, waitForDirectChannelOpen } from './directChannel.js'
 import { SecureRelayChannel } from './secureRelayChannel.js'
 import { connectTransferChannel, buildDirectIceServers, decodeRelayPolicyToken } from './connectTransferChannel.js'
 
@@ -34,9 +34,10 @@ let sessionPassword = '' // set from URL hash on load, or from password input
 let pendingNonce = null // nonce received from agent, consumed on join
 
 // Export for testing
-export function publishGlobalActions(globals, { join, submitPassword }) {
+export function publishGlobalActions(globals, { join, submitPassword, navigateTo }) {
   globals.join = join
   globals.submitPassword = submitPassword
+  globals.navigateTo = navigateTo
 }
 
 // Export for testing
@@ -70,7 +71,7 @@ export function installSessionMessageHandler({
 
           const directConnect = async () => {
             const channel = await directChannelPromise
-            return channel
+            return waitForDirectChannelOpen(channel)
           }
 
           const relayConnect = async () => {
@@ -111,24 +112,16 @@ export function installSessionMessageHandler({
 
           transferChannel = result.channel
           currentTransferMode = result.mode
-
-          // Set up transfer channel handlers
-          transferChannel.onopen = () => {
-            status('Transfer channel open!')
-            hideSection('join-section')
-            hideSection('password-section')
-            applyBadge({ mode: result.mode })
-            requestFileList(transferChannel, '')
-          }
-
-          transferChannel.onmessage = (event) => {
-            handleTransferMessage(event)
-          }
-
-          transferChannel.onclose = () => {
-            status('Connection closed')
-            resetUI()
-          }
+          attachTransferChannel({
+            channel: transferChannel,
+            mode: result.mode,
+            status,
+            hideSection,
+            requestFileList,
+            applyConnectionBadge: ({ mode }) => applyBadge({ mode }),
+            handleTransferMessage,
+            onClose: resetUI,
+          })
           break
       }
     },
@@ -141,6 +134,41 @@ function hexToBytes(hex) {
     bytes[i] = parseInt(hex.substr(i * 2, 2), 16)
   }
   return bytes
+}
+
+function attachTransferChannel({
+  channel,
+  mode,
+  status,
+  hideSection,
+  requestFileList,
+  applyConnectionBadge,
+  handleTransferMessage,
+  onClose,
+}) {
+  let opened = false
+  const handleOpen = () => {
+    if (opened) return
+    opened = true
+    status('Transfer channel open!')
+    hideSection('join-section')
+    hideSection('password-section')
+    applyConnectionBadge({ mode })
+    requestFileList(channel, '')
+  }
+
+  channel.onopen = handleOpen
+  channel.onmessage = (event) => {
+    handleTransferMessage(event)
+  }
+  channel.onclose = () => {
+    status('Connection closed')
+    onClose()
+  }
+
+  if (channel.readyState === 'open') {
+    handleOpen()
+  }
 }
 
 function getConnectionStatusEl() {
@@ -292,7 +320,7 @@ function join() {
 
         const directConnect = async () => {
           const channel = await directChannelPromise
-          return channel
+          return waitForDirectChannelOpen(channel)
         }
 
         const relayConnect = async () => {
@@ -332,28 +360,21 @@ function join() {
 
         transferChannel = result.channel
         currentTransferMode = result.mode
-
-        // Set up transfer channel handlers
-        transferChannel.onopen = () => {
-          status('Transfer channel open!')
-          hideSection('join-section')
-          hideSection('password-section')
-          applyConnectionBadge({
-            statusContainer: getConnectionStatusEl(),
-            badge: getConnectionTypeEl(),
-            mode: result.mode,
-          })
-          requestFileList(transferChannel, '')
-        }
-
-        transferChannel.onmessage = (event) => {
-          handleTransferMessage(event)
-        }
-
-        transferChannel.onclose = () => {
-          status('Connection closed')
-          resetUI()
-        }
+        attachTransferChannel({
+          channel: transferChannel,
+          mode: result.mode,
+          status,
+          hideSection,
+          requestFileList,
+          applyConnectionBadge: ({ mode }) =>
+            applyConnectionBadge({
+              statusContainer: getConnectionStatusEl(),
+              badge: getConnectionTypeEl(),
+              mode,
+            }),
+          handleTransferMessage,
+          onClose: resetUI,
+        })
         break
       }
 
@@ -712,7 +733,7 @@ function initFromURL() {
 
 // Make functions available globally for inline handlers (browser only)
 if (typeof window !== 'undefined') {
-  publishGlobalActions(window, { join, submitPassword })
+  publishGlobalActions(window, { join, submitPassword, navigateTo })
 
   document.addEventListener('DOMContentLoaded', () => {
     initFromURL()
