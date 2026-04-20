@@ -10,7 +10,6 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -27,19 +26,19 @@ import (
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type          string          `json:"type"`
-	AgentID       string          `json:"agent_id,omitempty"`
-	Code          string          `json:"code,omitempty"`
-	ShareURL      string          `json:"share_url,omitempty"` // received for protocol compat, not stored
-	ExpiresAt     *time.Time      `json:"expires_at,omitempty"`
-	SessionID     string          `json:"session_id,omitempty"`
-	SDP           string          `json:"sdp,omitempty"`
-	Candidate     json.RawMessage `json:"candidate,omitempty"`
-	ConnID        string          `json:"conn_id,omitempty"`
-	Value         string          `json:"value,omitempty"`
-	HasPassword   bool            `json:"has_password,omitempty"`
-	RelayOnly     bool            `json:"relay_only,omitempty"`
-	RelayStaticPub string         `json:"relay_static_pub,omitempty"`
+	Type           string          `json:"type"`
+	AgentID        string          `json:"agent_id,omitempty"`
+	Code           string          `json:"code,omitempty"`
+	ShareURL       string          `json:"share_url,omitempty"` // received for protocol compat, not stored
+	ExpiresAt      *time.Time      `json:"expires_at,omitempty"`
+	SessionID      string          `json:"session_id,omitempty"`
+	SDP            string          `json:"sdp,omitempty"`
+	Candidate      json.RawMessage `json:"candidate,omitempty"`
+	ConnID         string          `json:"conn_id,omitempty"`
+	Value          string          `json:"value,omitempty"`
+	HasPassword    bool            `json:"has_password,omitempty"`
+	RelayOnly      bool            `json:"relay_only,omitempty"`
+	RelayStaticPub string          `json:"relay_static_pub,omitempty"`
 }
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
@@ -68,28 +67,10 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 		}
 		defer conn.CloseNow()
 
-			// coder/websocket recommends avoiding request.Context() for upgraded
-			// WebSocket lifetime.
-			ctx := context.Background()
+		// coder/websocket recommends avoiding request.Context() for upgraded
+		// WebSocket lifetime.
+		ctx := context.Background()
 		var agentID string
-
-		// Cached quota state - refreshed at most once per minute to avoid
-		// a DB lookup on every ICE candidate while staying current after quota resets.
-		var quotaExceeded bool
-		var quotaCheckedAt time.Time
-
-		refreshQuota := func() {
-			if time.Since(quotaCheckedAt) < time.Minute {
-				return
-			}
-			accountRecord, err := app.FindRecordById("users", accountID)
-			if err != nil {
-				log.Printf("agent_ws: quota refresh for account %s: %v", accountID, err)
-				return
-			}
-			quotaExceeded, _ = checkRelayQuota(accountRecord)
-			quotaCheckedAt = time.Now()
-		}
 
 		// Main message loop
 		for {
@@ -135,27 +116,21 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				if agentID == "" {
 					continue
 				}
-				if cfg.HasTurn() {
-					refreshQuota()
-				}
-				if quotaExceeded && isRelayCandidate(msg.Candidate) {
-					log.Printf("agent_ws: dropping relay candidate for over-quota account %s", accountID)
-					continue
-				}
+				// TURN removed - relay candidates now handled by secure relay
 				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
 					"type":      "ice_candidate",
 					"candidate": msg.Candidate,
 				})
 
-				case "nonce":
-					// Route nonce from agent to the specific browser identified by connID.
-					if agentID == "" {
-						continue
-					}
-					log.Printf("agent_ws: forwarding nonce to browser conn_id=%s has_password=%v", msg.ConnID, msg.HasPassword)
-					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-						"type":         "nonce",
-						"conn_id":      msg.ConnID,
+			case "nonce":
+				// Route nonce from agent to the specific browser identified by connID.
+				if agentID == "" {
+					continue
+				}
+				log.Printf("agent_ws: forwarding nonce to browser conn_id=%s has_password=%v", msg.ConnID, msg.HasPassword)
+				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+					"type":         "nonce",
+					"conn_id":      msg.ConnID,
 					"value":        msg.Value,
 					"has_password": msg.HasPassword,
 				})
@@ -293,38 +268,15 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
 	log.Printf("agent hello received: api_key_id=%s agent_id=%s", apiKeyID, agentID)
 
-	// Build ICE config for agent - always include TURN credentials.
-	// Quota enforcement happens in the ice_candidate forwarding path instead,
-	// where relay candidates are stripped when the account is over quota.
-	var turnCreds *turn.Credentials
-	if cfg.HasTurn() {
-		turnExpiry := time.Now().Add(24 * time.Hour)
-		creds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
-		turnCreds = &creds
-	}
-
+	// Build ICE config for agent - STUN-only (no TURN)
 	iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-		STUNURL:     cfg.STUNURL,
-		TurnURL:     cfg.TurnURL(),
-		Credentials: turnCreds,
+		STUNURL: cfg.STUNURL,
 	})
 
 	hub.SendDirect(ctx, conn, map[string]any{
 		"type":        "welcome",
 		"ice_servers": iceServers,
 	})
-}
-
-// isRelayCandidate reports whether a raw ICE candidate JSON is a TURN relay candidate.
-// The candidate field is a webrtc.ICECandidateInit object with a "candidate" string.
-func isRelayCandidate(raw json.RawMessage) bool {
-	var init struct {
-		Candidate string `json:"candidate"`
-	}
-	if err := json.Unmarshal(raw, &init); err != nil {
-		return false
-	}
-	return strings.Contains(init.Candidate, " typ relay")
 }
 
 // handleRegisterShare processes share registration (new or reconnect)

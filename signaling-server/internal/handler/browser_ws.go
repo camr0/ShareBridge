@@ -127,27 +127,18 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			log.Printf("browser_ws: relay_only session %s with quota exceeded, rejecting", sessionCode)
 			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{
 				"type":    "error",
-				"message": "file host's relay quota exceeded - this share requires TURN relay which is unavailable",
+				"message": "file host's relay quota exceeded - this share requires secure relay which is unavailable",
 			})
 			browserConn.Close(websocket.StatusNormalClosure, "relay quota exceeded")
 			return
 		}
 
-		// Send ICE config - only include TURN if quota not exceeded.
-		// Use account-scoped TURN username to bound Prometheus label cardinality.
-		var turnCreds *turn.Credentials
-		if cfg.HasTurn() && !quotaExceeded {
-			turnExpiry := time.Now().Add(24 * time.Hour)
-			generatedCreds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
-			turnCreds = &generatedCreds
-		}
+		// Send ICE config - STUN-only (no TURN)
 		iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-			STUNURL:     cfg.STUNURL,
-			TurnURL:     cfg.TurnURL(),
-			Credentials: turnCreds,
+			STUNURL: cfg.STUNURL,
 		})
 
-		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s TURN=%s", sessionCode, cfg.STUNURL, cfg.TurnURL())
+		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s", sessionCode, cfg.STUNURL)
 
 		if quotaExceeded {
 			msg := map[string]any{

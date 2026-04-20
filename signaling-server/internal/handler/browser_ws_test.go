@@ -228,7 +228,7 @@ func TestBrowserWS_QuotaExceeded_SendsSTUNOnly(t *testing.T) {
 	assert.Contains(t, string(data), `"relay_quota_exceeded"`)
 }
 
-func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
+func TestBrowserWS_QuotaNotExceeded_SendsSTUNOnlyICE(t *testing.T) {
 	app, cleanup := setupBrowserTestApp(t)
 	defer cleanup()
 
@@ -245,9 +245,6 @@ func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
 	h := hub.New()
 	cfg := config.Load()
 	reg := relay.NewRegistry(2 * time.Second)
-	// Enable TURN for this test
-	cfg.TurnSecret = "test-turn-secret-for-testing-only"
-	cfg.TurnHost = "turn.example.com"
 
 	// First connect an agent to the hub
 	fullKey := apiKey.Id + ".normalsecret"
@@ -291,13 +288,14 @@ func TestBrowserWS_QuotaNotExceeded_SendsFullICE(t *testing.T) {
 	_, data, err = conn.Read(ctx)
 	require.NoError(t, err)
 
-	// Should receive ice_config with TURN servers
+	// Should receive ice_config with STUN-only servers (TURN removed)
 	assert.Contains(t, string(data), `"type":"ice_config"`)
 	assert.Contains(t, string(data), `"ice_servers"`)
 	// Should NOT have relay_quota_exceeded
 	assert.NotContains(t, string(data), `"relay_quota_exceeded"`)
-	// Should have TURN credentials (indicated by username field in ice_servers)
-	assert.Contains(t, string(data), `"username"`)
+	// Should NOT have TURN credentials (STUN-only after TURN removal)
+	assert.NotContains(t, string(data), `"username"`)
+	assert.NotContains(t, string(data), `"credential"`)
 }
 
 func TestBrowserWS_DirectFlowStillSendsICEConfigFirst(t *testing.T) {
@@ -409,6 +407,63 @@ func TestBrowserWS_RelayOnlyAnnotatesIceConfig(t *testing.T) {
 	assert.Contains(t, string(nonceMsg), `"value":"relaynonce"`)
 }
 
+func TestBrowserWS_IceConfigIsStunOnlyWithoutTurnFields(t *testing.T) {
+	app, cleanup := setupBrowserTestApp(t)
+	defer cleanup()
+
+	user, err := createTestAccountWithQuota(app, "stunonly@example.com", 50.0, 0.0)
+	require.NoError(t, err)
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "stunonlysecret")
+	require.NoError(t, err)
+
+	_, err = createTestSessionWithAPIKey(app, apiKey.Id, "agent-stunonly", "STUNONLY1")
+	require.NoError(t, err)
+
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+
+	fullKey := apiKey.Id + ".stunonlysecret"
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	// Connect agent
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer agentConn.CloseNow()
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-stunonly"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"STUNONLY1"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	// Connect browser
+	browserConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=STUNONLY1", nil)
+	require.NoError(t, err)
+	defer browserConn.CloseNow()
+
+	// First message should be ice_config with STUN-only (no TURN credentials)
+	_, firstMsg, err := browserConn.Read(ctx)
+	require.NoError(t, err)
+
+	// Verify ice_config is sent
+	assert.Contains(t, string(firstMsg), `"type":"ice_config"`)
+	assert.Contains(t, string(firstMsg), `"ice_servers"`)
+
+	// Verify no TURN credentials are present (no username/credential fields in ice_servers)
+	assert.NotContains(t, string(firstMsg), `"username"`)
+	assert.NotContains(t, string(firstMsg), `"credential"`)
+}
+
 func TestBrowserWS_KnockSurvivesRequestContextCancellation(t *testing.T) {
 	app, cleanup := setupBrowserTestApp(t)
 	defer cleanup()
@@ -491,8 +546,6 @@ func TestBrowserWS_RelayOnlyStillEmitsIceConfigAndInitiatesNonceChallenge(t *tes
 
 	h := hub.New()
 	cfg := config.Load()
-	cfg.TurnSecret = "test-turn-secret-for-challenge"
-	cfg.TurnHost = "turn.example.com"
 	reg := relay.NewRegistry(2 * time.Second)
 
 	fullKey := apiKey.Id + ".relayonlychallenge"
