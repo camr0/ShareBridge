@@ -820,6 +820,7 @@ git commit -m "feat(web): add browser transport selection and fallback logic"
 
 **Files:**
 - Create: `signaling-server/web/src/app.js`
+- Create: `signaling-server/web/src/app.test.js`
 - Modify: `signaling-server/web/index.html`
 - Delete: `signaling-server/web/app.js`
 
@@ -829,7 +830,43 @@ git commit -m "feat(web): add browser transport selection and fallback logic"
 // signaling-server/web/src/app.test.js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { installSessionMessageHandler } from './app.js'
+import { installSessionMessageHandler, publishGlobalActions, applyConnectionBadge } from './app.js'
+
+test('publishGlobalActions preserves inline button handlers after the move to an ES module', () => {
+  const globals = {}
+  const join = () => {}
+  const submitPassword = () => {}
+
+  publishGlobalActions(globals, { join, submitPassword })
+
+  assert.equal(globals.join, join)
+  assert.equal(globals.submitPassword, submitPassword)
+})
+
+test('applyConnectionBadge preserves the colored direct/relay badge', () => {
+  const statusContainer = {
+    classList: {
+      removed: [],
+      remove(...names) { this.removed.push(...names) },
+    },
+  }
+  const badge = {
+    textContent: '',
+    classList: {
+      removed: [],
+      added: [],
+      remove(...names) { this.removed.push(...names) },
+      add(...names) { this.added.push(...names) },
+    },
+  }
+
+  applyConnectionBadge({ statusContainer, badge, mode: 'relay' })
+
+  assert.equal(badge.textContent, '● Connected (Relay)')
+  assert.deepEqual(statusContainer.classList.removed, ['hidden'])
+  assert.deepEqual(badge.classList.removed, ['connection-direct', 'connection-relay'])
+  assert.deepEqual(badge.classList.added, ['connection-relay'])
+})
 
 test('relay_policy drives connection badge and transfer channel setup without changing file protocol handlers', async () => {
   const statuses = []
@@ -849,12 +886,13 @@ test('relay_policy drives connection badge and transfer channel setup without ch
     status: (msg) => statuses.push(msg),
     connectTransferChannel: async () => ({ channel: fakeChannel, mode: 'relay' }),
     requestFileList: (channel, path) => channel.send(JSON.stringify({ type: 'list_request', path })),
+    applyConnectionBadge: ({ mode }) => statuses.push(`badge:${mode}`),
   })
 
   await controller.handleMessage({ type: 'relay_policy', token: 'jwt', relay_allowed: true, relay_only: true })
   fakeChannel.onopen()
 
-  assert.equal(statuses.at(-1), 'Connected (Relay)')
+  assert.equal(statuses.at(-1), 'badge:relay')
   assert.equal(sends[0], JSON.stringify({ type: 'list_request', path: '' }))
 })
 ```
@@ -871,7 +909,7 @@ Expected:
 
 - FAIL because `src/app.js` does not exist
 
-- [ ] **Step 3: Move the browser entrypoint into `src/app.js` and delegate transport setup**
+- [ ] **Step 3: Copy the current `web/app.js` into `web/src/app.js`, preserve the existing UI logic, and refactor only the connection-specific functions**
 
 ```js
 // signaling-server/web/src/app.js
@@ -879,21 +917,43 @@ import { DirectChannel, waitForDirectChannelOpen } from './directChannel.js'
 import { SecureRelayChannel } from './secureRelayChannel.js'
 import { connectTransferChannel, buildDirectIceServers, decodeRelayPolicyToken } from './connectTransferChannel.js'
 
+// Start from the current signaling-server/web/app.js file and move its full contents
+// into this module. Keep the existing UI and transfer helpers intact:
+// - renderFileList
+// - renderBreadcrumb
+// - requestFile
+// - startDownload
+// - appendChunk
+// - completeDownload
+// - markFileDone
+// - handleError
+// - resetUI
+// - formatBytes / formatSpeed / escapeHtml / initFromURL
+// Only the connection layer should be rewritten to use DirectChannel /
+// SecureRelayChannel / connectTransferChannel.
+
 let pc, ws, transferChannel, currentDirectChannel
 let pendingCandidates = []
 let remoteDescSet = false
 let relayPolicy = null
+let pendingNonce = null
+let relayQuotaExceeded = false
+let quotaPeriodEnd = null
+let sessionPassword = ''
 
 export function installSessionMessageHandler({
   status,
   connectTransferChannel: connectFn = connectTransferChannel,
   requestFileList = (channel, path) => channel.send(JSON.stringify({ type: 'list_request', path })),
+  applyConnectionBadge: applyBadge = applyConnectionBadge,
 } = {}) {
   return {
     async handleMessage(msg) {
       switch (msg.type) {
         case 'ice_config':
           pc = new RTCPeerConnection({ iceServers: buildDirectIceServers(msg.ice_servers ?? []) })
+          relayQuotaExceeded = Boolean(msg.relay_quota_exceeded)
+          quotaPeriodEnd = msg.quota_period_end ?? null
           pc.onicecandidate = (event) => {
             if (event.candidate) {
               ws.send(JSON.stringify({ type: 'ice_candidate', candidate: event.candidate.toJSON() }))
@@ -904,7 +964,45 @@ export function installSessionMessageHandler({
             currentDirectChannel.onmessage = handleTransferMessage
             currentDirectChannel.onclose = resetUI
           }
+          pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+              if (relayQuotaExceeded) {
+                const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
+                status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
+              } else {
+                status('Connection lost')
+              }
+              resetUI()
+            }
+          }
           ws.send(JSON.stringify({ type: 'knock' }))
+          break
+
+        case 'nonce':
+          pendingNonce = msg.value
+          if (msg.has_password && !sessionPassword) {
+            showSection('password-section')
+            document.getElementById('password-input').focus()
+          } else {
+            sendJoin()
+          }
+          break
+
+        case 'auth_failed':
+          {
+            const errorDiv = document.getElementById('password-error')
+            const attemptsRemaining = msg.attempts_remaining || 0
+            if (attemptsRemaining <= 0) {
+              errorDiv.textContent = 'Too many incorrect attempts. Connection closed.'
+              document.getElementById('password-input').disabled = true
+              document.querySelector('#password-section button').disabled = true
+            } else {
+              errorDiv.textContent = `Incorrect password. ${attemptsRemaining} attempt${attemptsRemaining === 1 ? '' : 's'} remaining.`
+              document.getElementById('password-input').value = ''
+              document.getElementById('password-input').focus()
+              ws.send(JSON.stringify({ type: 'knock' }))
+            }
+          }
           break
 
         case 'relay_policy':
@@ -948,9 +1046,23 @@ export function installSessionMessageHandler({
             onStatusChange: (next) => {
               if (next === 'connecting-direct') status('Connecting directly...')
               if (next === 'falling-back-to-relay') status('Direct unavailable, falling back to relay...')
-              if (next === 'connected-direct') status('Connected (Direct)')
+              if (next === 'connected-direct') {
+                status('Connected (Direct)')
+                applyBadge({
+                  statusContainer: document.getElementById('connection-status'),
+                  badge: document.getElementById('connection-type'),
+                  mode: 'direct',
+                })
+              }
               if (next === 'connecting-relay') status('Connecting via relay...')
-              if (next === 'connected-relay') status('Connected (Relay)')
+              if (next === 'connected-relay') {
+                status('Connected (Relay)')
+                applyBadge({
+                  statusContainer: document.getElementById('connection-status'),
+                  badge: document.getElementById('connection-type'),
+                  mode: 'relay',
+                })
+              }
             },
           })
 
@@ -987,6 +1099,71 @@ export function installSessionMessageHandler({
       }
     },
   }
+}
+
+export function publishGlobalActions(target, actions) {
+  Object.assign(target, actions)
+}
+
+export function applyConnectionBadge({ statusContainer, badge, mode }) {
+  statusContainer.classList.remove('hidden')
+  badge.classList.remove('connection-direct', 'connection-relay')
+  if (mode === 'direct') {
+    badge.textContent = '● Connected (Direct)'
+    badge.classList.add('connection-direct')
+    return
+  }
+  badge.textContent = '● Connected (Relay)'
+  badge.classList.add('connection-relay')
+}
+
+function join() {
+  const code = document.getElementById('code').value.trim()
+  if (!code) return
+  status('Connecting...')
+
+  relayQuotaExceeded = false
+  quotaPeriodEnd = null
+  currentDirectChannel = null
+  transferChannel = null
+  relayPolicy = null
+
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  ws = new WebSocket(`${protocol}//${location.host}/ws/client?session=${code}`)
+
+  const controller = installSessionMessageHandler({ status })
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data)
+    if (msg.type === 'error') {
+      status('Error: ' + msg.message)
+      return
+    }
+    await controller.handleMessage(msg)
+  }
+  ws.onerror = () => {
+    if (relayQuotaExceeded) {
+      const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
+      status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
+    } else {
+      status('WebSocket error')
+    }
+  }
+  ws.onclose = () => {
+    if (pc) pc.close()
+    resetUI()
+  }
+}
+
+async function sendJoin() {
+  if (!pendingNonce) return
+  const hmac = sessionPassword ? await computeHMAC(sessionPassword, pendingNonce) : ''
+  ws.send(JSON.stringify({ type: 'join', hmac }))
+  pendingNonce = null
+}
+
+function submitPassword() {
+  sessionPassword = document.getElementById('password-input').value
+  sendJoin()
 }
 
 function hexToBytes(hex) {
@@ -1032,6 +1209,14 @@ function handleTransferMessage(event) {
       break
   }
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+  initFromURL()
+  publishGlobalActions(window, { join, submitPassword, navigateTo })
+  if (document.getElementById('code').value) {
+    join()
+  }
+})
 ```
 
 ```html
