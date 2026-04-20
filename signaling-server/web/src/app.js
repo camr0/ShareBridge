@@ -11,7 +11,10 @@ let remoteDescSet = false
 let relayQuotaExceeded = false
 let quotaPeriodEnd = null
 
-const DEBUG = location.search.includes('debug=1') || localStorage.getItem('sharebridge_debug')
+const DEBUG = typeof location !== 'undefined' && (
+  location.search.includes('debug=1') ||
+  (typeof localStorage !== 'undefined' && localStorage.getItem('sharebridge_debug'))
+)
 
 function debugLog(...args) {
   if (DEBUG) console.log('[secure-relay]', ...args)
@@ -832,4 +835,12 @@ if (typeof window !== 'undefined') {
       join()
     }
   })
+}
+
+// Export test helpers for unit tests
+export const __test = {
+  setQuotaState({ exceeded, periodEnd }) {
+    relayQuotaExceeded = exceeded
+    quotaPeriodEnd = periodEnd
+  },
 }

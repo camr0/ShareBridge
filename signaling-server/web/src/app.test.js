@@ -7,6 +7,7 @@ import {
   applyConnectionBadge,
   initializeIceConfigTransport,
   assertJoinNotActive,
+  __test,
 } from './app.js'
 
 test('publishGlobalActions preserves inline button handlers after the move to an ES module', () => {
@@ -138,4 +139,69 @@ test('assertJoinNotActive throws loudly when join re-enters on an active socket'
 
 test('assertJoinNotActive allows a closed socket', () => {
   assert.doesNotThrow(() => assertJoinNotActive({ readyState: 3 }, () => {}))
+})
+
+test('relay_policy opens the relay channel and requests the root file list', async () => {
+  const statuses = []
+  const sends = []
+  const fakeChannel = {
+    readyState: 'open',
+    bufferedAmount: 0,
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    send(text) { sends.push(text) },
+    sendBinary() {},
+    close() {},
+  }
+
+  const controller = installSessionMessageHandler({
+    status: (msg) => statuses.push(msg),
+    connectTransferChannel: async () => ({ channel: fakeChannel, mode: 'relay' }),
+    requestFileList: (channel, path) => channel.send(JSON.stringify({ type: 'list_request', path })),
+    applyConnectionBadge: ({ mode }) => statuses.push(`badge:${mode}`),
+    decodeRelayPolicyToken: () => ({ relayOnly: true, relayAllowed: true, expectedStaticPubHex: '00' }),
+    hideSection: () => {},
+  })
+
+  await controller.handleMessage({ type: 'relay_policy', token: 'jwt', relay_allowed: true, relay_only: true })
+
+  assert.equal(statuses.at(-1), 'badge:relay')
+  assert.equal(sends[0], JSON.stringify({ type: 'list_request', path: '' }))
+})
+
+test('direct failure after quota warning keeps the quota-blocked message', async () => {
+  // Set up quota exceeded state
+  __test.setQuotaState({ exceeded: true, periodEnd: '2025-12-31T23:59:59Z' })
+
+  const statuses = []
+  const controller = installSessionMessageHandler({
+    status: (msg) => statuses.push(msg),
+    connectTransferChannel: async ({ onStatusChange }) => {
+      onStatusChange('failed')
+      throw new Error('Direct unavailable, relay blocked (quota exceeded).')
+    },
+    requestFileList: () => {},
+    applyConnectionBadge: () => {},
+    decodeRelayPolicyToken: () => ({ relayOnly: false, relayAllowed: false, expectedStaticPubHex: '00' }),
+    hideSection: () => {},
+  })
+
+  try {
+    await controller.handleMessage({
+      type: 'relay_policy',
+      token: 'jwt',
+      relay_allowed: false,
+      relay_only: false,
+    })
+  } catch (err) {
+    // Expected to throw
+  }
+
+  // Verify the quota exceeded message is shown
+  const lastStatus = statuses.at(-1)
+  assert.match(lastStatus, /quota exceeded/i, 'Expected quota exceeded message, got: ' + lastStatus)
+
+  // Reset quota state
+  __test.setQuotaState({ exceeded: false, periodEnd: null })
 })

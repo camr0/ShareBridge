@@ -473,3 +473,74 @@ func TestBrowserWS_KnockSurvivesRequestContextCancellation(t *testing.T) {
 	assert.Contains(t, string(knockMsg), `"type":"knock"`)
 	assert.Contains(t, string(knockMsg), `"code":"CTXCANCEL1"`)
 }
+
+func TestBrowserWS_RelayOnlyStillEmitsIceConfigAndInitiatesNonceChallenge(t *testing.T) {
+	app, cleanup := setupBrowserTestApp(t)
+	defer cleanup()
+
+	user, err := createTestAccountWithQuota(app, "relayonlychallenge@example.com", 50.0, 0.0)
+	require.NoError(t, err)
+	apiKey, err := createTestAPIKeyForUser(app, user.Id, "relayonlychallenge")
+	require.NoError(t, err)
+
+	session, err := createTestSessionWithAPIKey(app, apiKey.Id, "agent-relayonly-challenge", "RELAYONLYCHAL")
+	require.NoError(t, err)
+	session.Set("relay_only", true)
+	session.Set("password", "testpass123")
+	require.NoError(t, app.Save(session))
+
+	h := hub.New()
+	cfg := config.Load()
+	cfg.TurnSecret = "test-turn-secret-for-challenge"
+	cfg.TurnHost = "turn.example.com"
+	reg := relay.NewRegistry(2 * time.Second)
+
+	fullKey := apiKey.Id + ".relayonlychallenge"
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+
+	// Connect agent
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/agent?api_key="+fullKey, nil)
+	require.NoError(t, err)
+	defer agentConn.CloseNow()
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-relayonly-challenge"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"RELAYONLYCHAL"}`)))
+	_, _, err = agentConn.Read(ctx)
+	require.NoError(t, err)
+
+	// Connect browser
+	browserConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/client?session=RELAYONLYCHAL", nil)
+	require.NoError(t, err)
+	defer browserConn.CloseNow()
+
+	// First message should be ice_config with relay_only flag
+	_, firstMsg, err := browserConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(firstMsg), `"type":"ice_config"`)
+	assert.Contains(t, string(firstMsg), `"relay_only":true`)
+
+	// Should receive knock at agent
+	_, knockMsg, err := agentConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(knockMsg), `"type":"knock"`)
+
+	// Extract conn_id and send nonce
+	connID := extractJSONField(t, knockMsg, "conn_id")
+	require.NoError(t, agentConn.Write(ctx, websocket.MessageText, []byte(`{"type":"nonce","conn_id":"`+connID+`","value":"testnonce123","has_password":true}`)))
+
+	// Browser should receive nonce
+	_, nonceMsg, err := browserConn.Read(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, string(nonceMsg), `"type":"nonce"`)
+	assert.Contains(t, string(nonceMsg), `"has_password":true`)
+}

@@ -1176,3 +1176,71 @@ func TestHandleRelayPrepare_StartsRelayTransferChannel(t *testing.T) {
 		t.Fatal("relay channel not added to session")
 	}
 }
+
+// TestHandleRelayPrepare_RelayOnlySessionDoesNotCreateDirectPeer tests that
+// relay_prepare in a relay-only session does not create a direct peer connection.
+func TestHandleRelayPrepare_RelayOnlySessionDoesNotCreateDirectPeer(t *testing.T) {
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	d, err := NewWithSignaling(cfgMgr, st, sig)
+	if err != nil {
+		t.Fatalf("NewWithSignaling: %v", err)
+	}
+
+	// Create a relay-only session
+	session := &Session{
+		Code:          "RELAYONLY123",
+		CreatedAt:     time.Now(),
+		RelayOnly:     true,
+		peers:         make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions["RELAYONLY123"] = session
+
+	// Track if relay channel was created using a channel (handleRelayPrepare runs in goroutine)
+	relayChannelCreated := make(chan struct{}, 1)
+	d.newRelayChannel = func(cfg relayChannelConfig) (relayTransferChannel, error) {
+		relayChannelCreated <- struct{}{}
+		return &mockRelayChannel{
+			startFn: func(context.Context) error {
+				return nil
+			},
+		}, nil
+	}
+
+	// Send relay_prepare for relay-only session
+	d.handleSignalingMessage(signaling.Message{
+		Type:     "relay_prepare",
+		SID:      "sid-relayonly",
+		Code:     "RELAYONLY123",
+		RelayJWT: "relay.jwt.token",
+	})
+
+	// Wait for relay channel to be created (goroutine may take time)
+	select {
+	case <-relayChannelCreated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay channel should be created for relay-only session")
+	}
+
+	// Verify no direct peer was created (peers map should be empty)
+	session.mu.Lock()
+	peerCount := len(session.peers)
+	session.mu.Unlock()
+
+	if peerCount != 0 {
+		t.Fatalf("relay-only session should not create direct peers, got %d peers", peerCount)
+	}
+
+	// Verify relay channel was added to session
+	session.mu.Lock()
+	channel := session.relayChannels["sid-relayonly"]
+	session.mu.Unlock()
+
+	if channel == nil {
+		t.Fatal("relay channel should be added to session")
+	}
+}
