@@ -35,6 +35,22 @@ export class SecureRelayChannel {
     this._socket = this._websocketFactory(this._relayURL)
     this._socket.binaryType = 'arraybuffer'
     debugLog('WebSocket created, url:', this._relayURL, 'readyState:', this._socket.readyState)
+    this._socket.addEventListener('error', (event) => {
+      debugLog('relay transport socket error', {
+        readyState: this.readyState,
+        socketReadyState: this._socket?.readyState,
+        eventType: event.type,
+      })
+    })
+    this._socket.addEventListener('close', (event) => {
+      debugLog('relay transport socket close', {
+        code: event?.code,
+        reason: event?.reason,
+        wasClean: event?.wasClean,
+        readyState: this.readyState,
+        socketReadyState: this._socket?.readyState,
+      })
+    })
 
     await new Promise((resolve, reject) => {
       const handleOpen = async () => {
@@ -109,7 +125,7 @@ export class SecureRelayChannel {
         } catch (err) {
           this._handshakeError = err
           console.error('[secure-relay] Handshake frame error:', err)
-          this.close()
+          this.close('handshake frame error')
           this._handshakeReject?.(err)
         }
         continue
@@ -118,8 +134,10 @@ export class SecureRelayChannel {
       try {
         const plaintext = await this._recvCipher.decrypt(new Uint8Array(0), frame.payload)
         if (frame.kind === FRAME_TEXT) {
+          debugLog('relay text frame decrypted', { byteLength: plaintext.length })
           this.onmessage?.({ data: new TextDecoder().decode(plaintext) })
         } else if (frame.kind === FRAME_BINARY) {
+          debugLog('relay binary frame decrypted', { byteLength: plaintext.length })
           // Create a proper ArrayBuffer copy to avoid browser-specific issues with underlying buffer
           const arrayBuffer = new ArrayBuffer(plaintext.length)
           new Uint8Array(arrayBuffer).set(plaintext)
@@ -129,7 +147,7 @@ export class SecureRelayChannel {
         }
       } catch (err) {
         console.error('[secure-relay] decrypt/forward error:', err.message, err.stack)
-        this.close()
+        this.close('decrypt/forward error')
       }
     }
   }
@@ -152,16 +170,23 @@ export class SecureRelayChannel {
 
   async send(text) {
     const plaintext = new TextEncoder().encode(text)
+    debugLog('sending relay text frame', { byteLength: plaintext.length })
     const ciphertext = await this._sendCipher.encrypt(new Uint8Array(0), plaintext)
     this._socket.send(writeFrame(FRAME_TEXT, ciphertext))
   }
 
   async sendBinary(bytes) {
+    debugLog('sending relay binary frame', { byteLength: bytes.length })
     const ciphertext = await this._sendCipher.encrypt(new Uint8Array(0), bytes)
     this._socket.send(writeFrame(FRAME_BINARY, ciphertext))
   }
 
-  close() {
+  close(reason = 'local close') {
+    debugLog('SecureRelayChannel.close()', {
+      reason,
+      readyState: this.readyState,
+      socketReadyState: this._socket?.readyState,
+    })
     this.readyState = 'closing'
     this._socket?.close()
   }

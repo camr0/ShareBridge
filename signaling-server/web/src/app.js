@@ -34,6 +34,7 @@ let receivedBytes = 0
 let fileChunks = []
 let isDownloading = false
 let transferStartTime = 0
+let receivedChunkCount = 0
 
 // Navigation state
 let currentPath = []
@@ -218,6 +219,7 @@ function attachTransferChannel({
   const handleOpen = () => {
     if (opened) return
     opened = true
+    debugLog('transfer channel opened', { mode, readyState: channel.readyState })
     updateStatus('Transfer channel open!')
     hideSection('join-section')
     hideSection('password-section')
@@ -227,9 +229,21 @@ function attachTransferChannel({
 
   channel.onopen = handleOpen
   channel.onmessage = (event) => {
-    handleTransferMessage(event)
+    try {
+      handleTransferMessage(event)
+    } catch (err) {
+      console.error('[secure-relay] transfer message handler error:', err)
+      throw err
+    }
   }
   channel.onclose = () => {
+    debugLog('transfer channel closed', {
+      mode,
+      channelReadyState: channel.readyState,
+      currentFile: currentFile?.name || null,
+      receivedBytes,
+      receivedChunkCount,
+    })
     updateStatus('Connection closed')
     onClose()
   }
@@ -286,182 +300,193 @@ function join() {
   }
 
   ws.onmessage = async (event) => {
-    debugLog('browser signaling WebSocket message received', event.data)
-
-    let msg
     try {
-      msg = JSON.parse(event.data)
-    } catch (err) {
-      debugLog('failed to parse signaling message JSON', err)
-      throw err
-    }
+      debugLog('browser signaling WebSocket message received', event.data)
 
-    switch (msg.type) {
-      case 'ice_config':
-        debugLog('handling ice_config', msg)
-        // Store quota state for use if connection fails
-        if (msg.relay_quota_exceeded) {
-          relayQuotaExceeded = true
-          quotaPeriodEnd = msg.quota_period_end
-        }
-
-        pc = initializeIceConfigTransport({
-          msg,
-          ws,
-          onDirectChannel: (directChannel) => {
-            directChannelResolve(directChannel)
-          },
-          onDirectFailure: () => {
-            if (relayQuotaExceeded) {
-              const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
-              updateStatus(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
-            } else {
-              updateStatus('Connection lost')
-            }
-            if (directChannelReject) {
-              directChannelReject(new Error('PeerConnection failed'))
-            }
-            resetUI()
-          },
-        })
-        break
-
-      case 'nonce':
-        debugLog('received nonce for browser challenge', { hasPassword: msg.has_password, connID: msg.conn_id })
-        pendingNonce = msg.value
-        if (msg.has_password && !sessionPassword) {
-          debugLog('nonce requires password input before join')
-          showSection('password-section')
-          document.getElementById('password-input').focus()
-        } else {
-          debugLog('nonce can be consumed immediately; sending join')
-          sendJoin()
-        }
-        break
-
-      case 'auth_failed': {
-        debugLog('received auth_failed', msg)
-        const errorDiv = document.getElementById('password-error')
-        const attemptsRemaining = msg.attempts_remaining || 0
-        if (attemptsRemaining <= 0) {
-          errorDiv.textContent = 'Too many incorrect attempts. Connection closed.'
-          document.getElementById('password-input').disabled = true
-          document.querySelector('#password-section button').disabled = true
-        } else {
-          errorDiv.textContent = `Incorrect password. ${attemptsRemaining} attempt${attemptsRemaining === 1 ? '' : 's'} remaining.`
-          document.getElementById('password-input').value = ''
-          document.getElementById('password-input').focus()
-          // Knock again to get a fresh nonce
-          ws.send(JSON.stringify({ type: 'knock' }))
-        }
-        break
+      let msg
+      try {
+        msg = JSON.parse(event.data)
+      } catch (err) {
+        debugLog('failed to parse signaling message JSON', err)
+        throw err
       }
 
-      case 'offer':
-        debugLog('received WebRTC offer')
-        if (!pc) return
-        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp })
-        remoteDescSet = true
+      switch (msg.type) {
+        case 'ice_config':
+          debugLog('handling ice_config', msg)
+          // Store quota state for use if connection fails
+          if (msg.relay_quota_exceeded) {
+            relayQuotaExceeded = true
+            quotaPeriodEnd = msg.quota_period_end
+          }
 
-        for (const c of pendingCandidates) {
-          await pc.addIceCandidate(c)
-        }
-        pendingCandidates = []
-
-        const answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }))
-        updateStatus('Negotiating...')
-        break
-
-      case 'ice_candidate':
-        debugLog('received ICE candidate from signaling server')
-        if (!pc) return
-        if (!remoteDescSet) {
-          pendingCandidates.push(msg.candidate)
-        } else {
-          await pc.addIceCandidate(msg.candidate)
-        }
-        break
-
-      case 'relay_policy': {
-        debugLog('received relay_policy', msg)
-        updateStatus('Connecting to agent...')
-        const relayPolicy = decodeRelayPolicyToken(msg.token)
-        // Use relay_only from message (server's authoritative value), not from decoded token
-        // Token may be empty when relay is not configured
-        relayPolicy.relayOnly = msg.relay_only
-        relayPolicy.relayAllowed = msg.relay_allowed
-
-        const directConnect = async () => {
-          const channel = await directChannelPromise
-          return waitForDirectChannelOpen(channel)
-        }
-
-        const relayConnect = async () => {
-          debugLog('relayConnect called, creating SecureRelayChannel')
-          const relayToken = msg.token
-          const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-          const relayURL = `${protocol}//${location.host}/ws/relay`
-          const expectedStaticPub = hexToBytes(relayPolicy.expectedStaticPubHex)
-
-          debugLog('relayConnect: creating channel', { relayURL, expectedStaticPubLength: expectedStaticPub?.length })
-          const relayChannel = new SecureRelayChannel({
-            relayURL,
-            relayToken,
-            expectedStaticPub,
-          })
-          debugLog('relayConnect: calling channel.start()')
-          await relayChannel.start()
-          debugLog('relayConnect: channel.start() completed successfully')
-          return relayChannel
-        }
-
-        let result
-        try {
-          result = await connectTransferChannel({
-            relayPolicy,
-            directConnect,
-            relayConnect,
-            onStatusChange: (s) => {
-              if (s === 'connecting-direct') updateStatus('Connecting directly...')
-              else if (s === 'connecting-relay') updateStatus('Connecting via relay...')
-              else if (s === 'falling-back-to-relay') updateStatus('Direct failed, using relay...')
-              else if (s === 'connected-direct') updateStatus('Connected directly')
-              else if (s === 'connected-relay') updateStatus('Connected via relay')
-              else if (s === 'failed') updateStatus('Connection failed')
+          pc = initializeIceConfigTransport({
+            msg,
+            ws,
+            onDirectChannel: (directChannel) => {
+              directChannelResolve(directChannel)
+            },
+            onDirectFailure: () => {
+              if (relayQuotaExceeded) {
+                const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
+                updateStatus(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
+              } else {
+                updateStatus('Connection lost')
+              }
+              if (directChannelReject) {
+                directChannelReject(new Error('PeerConnection failed'))
+              }
+              resetUI()
             },
           })
-        } catch (err) {
-          debugLog('connectTransferChannel failed', err)
-          updateStatus(err.message)
-          throw err
+          break
+
+        case 'nonce':
+          debugLog('received nonce for browser challenge', { hasPassword: msg.has_password, connID: msg.conn_id })
+          pendingNonce = msg.value
+          if (msg.has_password && !sessionPassword) {
+            debugLog('nonce requires password input before join')
+            showSection('password-section')
+            document.getElementById('password-input').focus()
+          } else {
+            debugLog('nonce can be consumed immediately; sending join')
+            sendJoin()
+          }
+          break
+
+        case 'auth_failed': {
+          debugLog('received auth_failed', msg)
+          const errorDiv = document.getElementById('password-error')
+          const attemptsRemaining = msg.attempts_remaining || 0
+          if (attemptsRemaining <= 0) {
+            errorDiv.textContent = 'Too many incorrect attempts. Connection closed.'
+            document.getElementById('password-input').disabled = true
+            document.querySelector('#password-section button').disabled = true
+          } else {
+            errorDiv.textContent = `Incorrect password. ${attemptsRemaining} attempt${attemptsRemaining === 1 ? '' : 's'} remaining.`
+            document.getElementById('password-input').value = ''
+            document.getElementById('password-input').focus()
+            // Knock again to get a fresh nonce
+            ws.send(JSON.stringify({ type: 'knock' }))
+          }
+          break
         }
 
-        transferChannel = result.channel
-        currentTransferMode = result.mode
-        attachTransferChannel({
-          channel: transferChannel,
-          mode: result.mode,
-          updateStatus,
-          hideSection,
-          requestFileList,
-          applyConnectionBadge: ({ mode }) =>
-            applyConnectionBadge({
-              statusContainer: getConnectionStatusEl(),
-              badge: getConnectionTypeEl(),
-              mode,
-            }),
-          handleTransferMessage,
-          onClose: resetUI,
-        })
-        break
-      }
+        case 'offer':
+          debugLog('received WebRTC offer')
+          if (!pc) return
+          await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp })
+          remoteDescSet = true
 
-      case 'error':
-        debugLog('received signaling error message', msg)
-        updateStatus('Error: ' + msg.message)
-        break
+          for (const c of pendingCandidates) {
+            await pc.addIceCandidate(c)
+          }
+          pendingCandidates = []
+
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }))
+          updateStatus('Negotiating...')
+          break
+
+        case 'ice_candidate':
+          debugLog('received ICE candidate from signaling server')
+          if (!pc) return
+          if (!remoteDescSet) {
+            pendingCandidates.push(msg.candidate)
+          } else {
+            await pc.addIceCandidate(msg.candidate)
+          }
+          break
+
+        case 'relay_policy': {
+          debugLog('received relay_policy', msg)
+          updateStatus('Connecting to agent...')
+          debugLog('relay_policy: decoding token')
+          const relayPolicy = decodeRelayPolicyToken(msg.token)
+          debugLog('relay_policy: decoded token', relayPolicy)
+          // Use relay_only from message (server's authoritative value), not from decoded token
+          // Token may be empty when relay is not configured
+          relayPolicy.relayOnly = msg.relay_only
+          relayPolicy.relayAllowed = msg.relay_allowed
+          debugLog('relay_policy: effective policy', relayPolicy)
+
+          const directConnect = async () => {
+            debugLog('relay_policy: directConnect invoked')
+            const channel = await directChannelPromise
+            return waitForDirectChannelOpen(channel)
+          }
+
+          const relayConnect = async () => {
+            debugLog('relayConnect called, creating SecureRelayChannel')
+            const relayToken = msg.token
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+            const relayURL = `${protocol}//${location.host}/ws/relay`
+            const expectedStaticPub = hexToBytes(relayPolicy.expectedStaticPubHex)
+
+            debugLog('relayConnect: creating channel', { relayURL, expectedStaticPubLength: expectedStaticPub?.length })
+            const relayChannel = new SecureRelayChannel({
+              relayURL,
+              relayToken,
+              expectedStaticPub,
+            })
+            debugLog('relayConnect: calling channel.start()')
+            await relayChannel.start()
+            debugLog('relayConnect: channel.start() completed successfully')
+            return relayChannel
+          }
+
+          let result
+          try {
+            debugLog('relay_policy: calling connectTransferChannel')
+            result = await connectTransferChannel({
+              relayPolicy,
+              directConnect,
+              relayConnect,
+              onStatusChange: (s) => {
+                debugLog('connectTransferChannel status', { status: s })
+                if (s === 'connecting-direct') updateStatus('Connecting directly...')
+                else if (s === 'connecting-relay') updateStatus('Connecting via relay...')
+                else if (s === 'falling-back-to-relay') updateStatus('Direct failed, using relay...')
+                else if (s === 'connected-direct') updateStatus('Connected directly')
+                else if (s === 'connected-relay') updateStatus('Connected via relay')
+                else if (s === 'failed') updateStatus('Connection failed')
+              },
+            })
+            debugLog('relay_policy: connectTransferChannel resolved', { mode: result?.mode, readyState: result?.channel?.readyState })
+          } catch (err) {
+            debugLog('connectTransferChannel failed', err)
+            updateStatus(err.message)
+            throw err
+          }
+
+          transferChannel = result.channel
+          currentTransferMode = result.mode
+          attachTransferChannel({
+            channel: transferChannel,
+            mode: result.mode,
+            updateStatus,
+            hideSection,
+            requestFileList,
+            applyConnectionBadge: ({ mode }) =>
+              applyConnectionBadge({
+                statusContainer: getConnectionStatusEl(),
+                badge: getConnectionTypeEl(),
+                mode,
+              }),
+            handleTransferMessage,
+            onClose: resetUI,
+          })
+          break
+        }
+
+        case 'error':
+          debugLog('received signaling error message', msg)
+          updateStatus('Error: ' + msg.message)
+          break
+      }
+    } catch (err) {
+      console.error('[secure-relay] signaling message handler error:', err)
     }
   }
 
@@ -506,14 +531,23 @@ async function sendJoin() {
 
 function handleTransferMessage(event) {
   if (event.data instanceof ArrayBuffer) {
+    debugLog('transfer binary message received', {
+      byteLength: event.data.byteLength,
+      currentFile: currentFile?.name || null,
+    })
     const bytes = new Uint8Array(event.data)
     appendChunk(bytes)
     return
   }
 
+  debugLog('transfer text message received', {
+    length: typeof event.data === 'string' ? event.data.length : undefined,
+    preview: typeof event.data === 'string' ? event.data.slice(0, 160) : String(event.data),
+  })
   const msg = JSON.parse(event.data)
   switch (msg.type) {
     case 'file_list':
+      debugLog('file_list received', { count: msg.files?.length || 0, currentPath })
       renderFileList(msg.files)
       break
     case 'file_header':
@@ -524,6 +558,9 @@ function handleTransferMessage(event) {
       break
     case 'error':
       handleError(msg)
+      break
+    default:
+      debugLog('unhandled transfer message type', { type: msg.type })
       break
   }
 }
@@ -593,6 +630,12 @@ function requestFile(name) {
     return
   }
   const fullPath = [...currentPath, name].join('/')
+  debugLog('requesting file', {
+    name,
+    fullPath,
+    mode: currentTransferMode,
+    channelReadyState: transferChannel?.readyState,
+  })
   transferChannel.send(JSON.stringify({ type: 'file_request', path: fullPath }))
 }
 
@@ -602,6 +645,14 @@ function startDownload(header) {
   fileChunks = []
   isDownloading = true
   transferStartTime = Date.now()
+  receivedChunkCount = 0
+  debugLog('download started', {
+    name: header.name,
+    size: header.size,
+    mimeType: header.mimeType,
+    sha1: header.sha1 || null,
+    mode: currentTransferMode,
+  })
   updateStatus('')
 
   const fileItem = getFileItem(header.name)
@@ -617,6 +668,17 @@ function appendChunk(bytes) {
   if (!currentFile) return
   fileChunks.push(bytes)
   receivedBytes += bytes.length
+  receivedChunkCount += 1
+
+  if (receivedChunkCount <= 3 || receivedChunkCount % 25 === 0 || receivedBytes === currentFile.size) {
+    debugLog('download chunk received', {
+      file: currentFile.name,
+      chunkCount: receivedChunkCount,
+      chunkBytes: bytes.length,
+      receivedBytes,
+      expectedBytes: currentFile.size,
+    })
+  }
 
   const pct = currentFile.size > 0 ? Math.round((receivedBytes / currentFile.size) * 100) : 0
   const elapsed = (Date.now() - transferStartTime) / 1000
@@ -635,6 +697,11 @@ function appendChunk(bytes) {
 
 async function completeDownload() {
   if (!currentFile) return
+  debugLog('download complete frame received', {
+    file: currentFile.name,
+    receivedBytes,
+    chunkCount: receivedChunkCount,
+  })
   // Assemble all chunks
   const totalLength = fileChunks.reduce((sum, c) => sum + c.length, 0)
   const combined = new Uint8Array(totalLength)
@@ -668,6 +735,7 @@ async function completeDownload() {
   currentFile = null
   fileChunks = []
   receivedBytes = 0
+  receivedChunkCount = 0
   transferStartTime = 0
 
   const fileItem = getFileItem(downloadedFile.name)
@@ -748,6 +816,11 @@ function openFolder(name) {
 }
 
 function requestFileList(channel, subpath) {
+  debugLog('requesting file list', {
+    subpath,
+    mode: currentTransferMode,
+    channelReadyState: channel?.readyState,
+  })
   channel.send(JSON.stringify({ type: 'list_request', path: subpath }))
 }
 
@@ -758,11 +831,23 @@ function submitPassword() {
 
 function handleError(msg) {
   const message = msg.message || ''
+  debugLog('transfer error message received', {
+    message,
+    currentFile: currentFile?.name || null,
+    receivedBytes,
+    receivedChunkCount,
+  })
   updateStatus('Error: ' + message)
   isDownloading = false
 }
 
 function resetUI() {
+  debugLog('resetUI', {
+    currentFile: currentFile?.name || null,
+    receivedBytes,
+    receivedChunkCount,
+    currentTransferMode,
+  })
   showSection('join-section')
   hideSection('password-section')
   hideSection('file-list')
@@ -778,6 +863,7 @@ function resetUI() {
   fileChunks = []
   isDownloading = false
   receivedBytes = 0
+  receivedChunkCount = 0
   transferStartTime = 0
   pendingNonce = null
   currentPath = []

@@ -58,3 +58,44 @@ test('CipherState: zero key is rejected as uninitialized', async () => {
   const cs = new CipherState(new Uint8Array(32))
   await assert.rejects(() => cs.encrypt(new Uint8Array(0), new Uint8Array([0x01])))
 })
+
+test('CipherState: concurrent decrypts are serialized to preserve nonce order', async () => {
+  const key = new Uint8Array(32).fill(0x55)
+  const sender = new CipherState(key)
+  const receiver = new CipherState(key)
+  const ad = new Uint8Array(0)
+  const plaintext1 = new TextEncoder().encode('first')
+  const plaintext2 = new TextEncoder().encode('second')
+  const ct1 = await sender.encrypt(ad, plaintext1)
+  const ct2 = await sender.encrypt(ad, plaintext2)
+
+  const originalDecrypt = crypto.subtle.decrypt
+  let decryptCalls = 0
+  let releaseFirstDecrypt
+  const firstDecryptBlocked = new Promise((resolve) => {
+    releaseFirstDecrypt = resolve
+  })
+
+  crypto.subtle.decrypt = async function (...args) {
+    decryptCalls += 1
+    if (decryptCalls === 1) {
+      await firstDecryptBlocked
+    }
+    return originalDecrypt.apply(this, args)
+  }
+
+  try {
+    const p1 = receiver.decrypt(ad, ct1)
+    const p2 = receiver.decrypt(ad, ct2)
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(decryptCalls, 1, 'expected second decrypt to wait for the first nonce to finish')
+
+    releaseFirstDecrypt()
+    const [pt1, pt2] = await Promise.all([p1, p2])
+    assert.deepEqual(pt1, plaintext1)
+    assert.deepEqual(pt2, plaintext2)
+  } finally {
+    crypto.subtle.decrypt = originalDecrypt
+  }
+})
