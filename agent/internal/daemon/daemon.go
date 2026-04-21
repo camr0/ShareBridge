@@ -733,6 +733,8 @@ func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
 // handleRelayPrepare handles a relay_prepare message from the signaling server.
 // It creates a SecureRelayChannel, wires it to a transfer manager, and starts it.
 func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
+	log.Printf("relay_prepare received for session %s sid=%s", msg.Code, msg.SID)
+
 	d.mu.RLock()
 	session := d.sessions[msg.Code]
 	d.mu.RUnlock()
@@ -747,6 +749,7 @@ func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
 		log.Printf("get relay static key: %v", err)
 		return
 	}
+	log.Printf("relay_prepare: got static key for session %s", msg.Code)
 
 	// Convert raw bytes to ecdh.PrivateKey
 	staticPriv, err := ecdh.P256().NewPrivateKey(rawPriv)
@@ -757,6 +760,7 @@ func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
 
 	// Create relay channel
 	relayURL := signaling.RelayWebSocketURL(d.config.SignalingURL)
+	log.Printf("relay_prepare: connecting to relay at %s for session %s", relayURL, msg.Code)
 
 	// Use factory function if set (for testing), otherwise create real channel
 	var channel relayTransferChannel
@@ -823,12 +827,15 @@ func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
 	session.mu.Unlock()
 
 	// Start relay channel (asynchronously handles handshake)
+	log.Printf("relay_prepare: starting relay channel for session %s sid=%s", msg.Code, msg.SID)
 	if err := channel.Start(context.Background()); err != nil {
 		log.Printf("start relay channel sid=%s: %v", msg.SID, err)
 		session.mu.Lock()
 		delete(session.relayChannels, msg.SID)
 		session.mu.Unlock()
+		return
 	}
+	log.Printf("relay_prepare: relay channel started successfully for session %s sid=%s", msg.Code, msg.SID)
 }
 
 // loadSessionsFromStore loads persisted sessions from the store and

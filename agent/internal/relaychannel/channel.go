@@ -6,6 +6,7 @@ import (
 	"crypto/ecdh"
 	"encoding/json"
 	"fmt"
+	"log"
 
 	"github.com/coder/websocket"
 	"sharebridge/agent/internal/noise"
@@ -46,12 +47,14 @@ func (c *SecureRelayChannel) Start(ctx context.Context) error {
 		return fmt.Errorf("dial relay websocket: %w", err)
 	}
 	c.conn = conn
+	log.Printf("relaychannel: connected to relay at %s", c.cfg.RelayURL)
 
 	hello, _ := json.Marshal(map[string]string{"token": c.cfg.RelayJWT})
 	if err := c.conn.Write(ctx, websocket.MessageText, hello); err != nil {
 		c.conn.CloseNow()
 		return fmt.Errorf("write relay hello: %w", err)
 	}
+	log.Printf("relaychannel: sent hello with JWT")
 
 	nx, err := noise.NewResponder(c.cfg.StaticPrivate)
 	if err != nil {
@@ -59,11 +62,13 @@ func (c *SecureRelayChannel) Start(ctx context.Context) error {
 		return fmt.Errorf("new responder: %w", err)
 	}
 	c.noise = nx
+	log.Printf("relaychannel: created noise responder")
 
 	if err := c.runHandshake(ctx); err != nil {
 		c.conn.CloseNow()
 		return err
 	}
+	log.Printf("relaychannel: handshake complete")
 
 	go c.readLoop(context.Background())
 
