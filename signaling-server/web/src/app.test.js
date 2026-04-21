@@ -65,7 +65,7 @@ test('relay_policy immediately initializes an already-open transfer channel with
   }
 
   const controller = installSessionMessageHandler({
-    status: (msg) => statuses.push(msg),
+    updateStatus: (msg) => statuses.push(msg),
     connectTransferChannel: async () => ({ channel: fakeChannel, mode: 'relay' }),
     requestFileList: (channel, path) => channel.send(JSON.stringify({ type: 'list_request', path })),
     applyConnectionBadge: ({ mode }) => statuses.push(`badge:${mode}`),
@@ -82,7 +82,7 @@ test('relay_policy immediately initializes an already-open transfer channel with
 test('relay_policy with relay_allowed false preserves the quota-exceeded user message on direct failure', async () => {
   const statuses = []
   const controller = installSessionMessageHandler({
-    status: (msg) => statuses.push(msg),
+    updateStatus: (msg) => statuses.push(msg),
     connectTransferChannel: async ({ onStatusChange }) => {
       onStatusChange('failed')
       throw new Error('Direct unavailable, relay blocked (quota exceeded).')
@@ -156,7 +156,7 @@ test('relay_policy opens the relay channel and requests the root file list', asy
   }
 
   const controller = installSessionMessageHandler({
-    status: (msg) => statuses.push(msg),
+    updateStatus: (msg) => statuses.push(msg),
     connectTransferChannel: async () => ({ channel: fakeChannel, mode: 'relay' }),
     requestFileList: (channel, path) => channel.send(JSON.stringify({ type: 'list_request', path })),
     applyConnectionBadge: ({ mode }) => statuses.push(`badge:${mode}`),
@@ -176,7 +176,7 @@ test('direct failure after quota warning keeps the quota-blocked message', async
 
   const statuses = []
   const controller = installSessionMessageHandler({
-    status: (msg) => statuses.push(msg),
+    updateStatus: (msg) => statuses.push(msg),
     connectTransferChannel: async ({ onStatusChange }) => {
       onStatusChange('failed')
       throw new Error('Direct unavailable, relay blocked (quota exceeded).')

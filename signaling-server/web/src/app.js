@@ -120,7 +120,7 @@ export function initializeIceConfigTransport({
 
 // Export for testing - creates a message handler with injected dependencies
 export function installSessionMessageHandler({
-  status,
+  updateStatus,
   connectTransferChannel: connectTransfer,
   requestFileList,
   applyConnectionBadge: applyBadge,
@@ -131,7 +131,7 @@ export function installSessionMessageHandler({
     async handleMessage(msg) {
       switch (msg.type) {
         case 'relay_policy':
-          status('Connecting to agent...')
+          updateStatus('Connecting to agent...')
           const relayPolicy = decodeToken(msg.token)
           // Use relay_only from message (server's authoritative value), not from decoded token
           relayPolicy.relayOnly = msg.relay_only
@@ -165,16 +165,16 @@ export function installSessionMessageHandler({
               relayConnect,
               onStatusChange: (s) => {
                 // Map internal states to UI messages
-                if (s === 'connecting-direct') status('Connecting directly...')
-                else if (s === 'connecting-relay') status('Connecting via relay...')
-                else if (s === 'falling-back-to-relay') status('Direct failed, using relay...')
-                else if (s === 'connected-direct') status('Connected directly')
-                else if (s === 'connected-relay') status('Connected via relay')
-                else if (s === 'failed') status('Connection failed')
+                if (s === 'connecting-direct') updateStatus('Connecting directly...')
+                else if (s === 'connecting-relay') updateStatus('Connecting via relay...')
+                else if (s === 'falling-back-to-relay') updateStatus('Direct failed, using relay...')
+                else if (s === 'connected-direct') updateStatus('Connected directly')
+                else if (s === 'connected-relay') updateStatus('Connected via relay')
+                else if (s === 'failed') updateStatus('Connection failed')
               },
             })
           } catch (err) {
-            status(err.message)
+            updateStatus(err.message)
             throw err
           }
 
@@ -183,7 +183,7 @@ export function installSessionMessageHandler({
           attachTransferChannel({
             channel: transferChannel,
             mode: result.mode,
-            status,
+            updateStatus,
             hideSection,
             requestFileList,
             applyConnectionBadge: ({ mode }) => applyBadge({ mode }),
@@ -207,7 +207,7 @@ function hexToBytes(hex) {
 function attachTransferChannel({
   channel,
   mode,
-  status,
+  updateStatus,
   hideSection,
   requestFileList,
   applyConnectionBadge,
@@ -218,7 +218,7 @@ function attachTransferChannel({
   const handleOpen = () => {
     if (opened) return
     opened = true
-    status('Transfer channel open!')
+    updateStatus('Transfer channel open!')
     hideSection('join-section')
     hideSection('password-section')
     applyConnectionBadge({ mode })
@@ -230,7 +230,7 @@ function attachTransferChannel({
     handleTransferMessage(event)
   }
   channel.onclose = () => {
-    status('Connection closed')
+    updateStatus('Connection closed')
     onClose()
   }
 
@@ -247,7 +247,7 @@ function getConnectionTypeEl() {
   return document.getElementById('connection-type')
 }
 
-function status(msg) {
+function updateStatus(msg) {
   document.getElementById('status').textContent = msg
 }
 
@@ -265,7 +265,7 @@ function join() {
   const code = document.getElementById('code').value.trim()
   if (!code) return
   debugLog('join invoked', { code })
-  status('Connecting...')
+  updateStatus('Connecting...')
 
   // Reset quota state for new connection
   relayQuotaExceeded = false
@@ -314,9 +314,9 @@ function join() {
           onDirectFailure: () => {
             if (relayQuotaExceeded) {
               const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
-              status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
+              updateStatus(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
             } else {
-              status('Connection lost')
+              updateStatus('Connection lost')
             }
             if (directChannelReject) {
               directChannelReject(new Error('PeerConnection failed'))
@@ -371,7 +371,7 @@ function join() {
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }))
-        status('Negotiating...')
+        updateStatus('Negotiating...')
         break
 
       case 'ice_candidate':
@@ -386,7 +386,7 @@ function join() {
 
       case 'relay_policy': {
         debugLog('received relay_policy', msg)
-        status('Connecting to agent...')
+        updateStatus('Connecting to agent...')
         const relayPolicy = decodeRelayPolicyToken(msg.token)
         // Use relay_only from message (server's authoritative value), not from decoded token
         // Token may be empty when relay is not configured
@@ -424,17 +424,17 @@ function join() {
             directConnect,
             relayConnect,
             onStatusChange: (s) => {
-              if (s === 'connecting-direct') status('Connecting directly...')
-              else if (s === 'connecting-relay') status('Connecting via relay...')
-              else if (s === 'falling-back-to-relay') status('Direct failed, using relay...')
-              else if (s === 'connected-direct') status('Connected directly')
-              else if (s === 'connected-relay') status('Connected via relay')
-              else if (s === 'failed') status('Connection failed')
+              if (s === 'connecting-direct') updateStatus('Connecting directly...')
+              else if (s === 'connecting-relay') updateStatus('Connecting via relay...')
+              else if (s === 'falling-back-to-relay') updateStatus('Direct failed, using relay...')
+              else if (s === 'connected-direct') updateStatus('Connected directly')
+              else if (s === 'connected-relay') updateStatus('Connected via relay')
+              else if (s === 'failed') updateStatus('Connection failed')
             },
           })
         } catch (err) {
           debugLog('connectTransferChannel failed', err)
-          status(err.message)
+          updateStatus(err.message)
           throw err
         }
 
@@ -443,7 +443,7 @@ function join() {
         attachTransferChannel({
           channel: transferChannel,
           mode: result.mode,
-          status,
+          updateStatus,
           hideSection,
           requestFileList,
           applyConnectionBadge: ({ mode }) =>
@@ -460,7 +460,7 @@ function join() {
 
       case 'error':
         debugLog('received signaling error message', msg)
-        status('Error: ' + msg.message)
+        updateStatus('Error: ' + msg.message)
         break
     }
   }
@@ -469,9 +469,9 @@ function join() {
     debugLog('browser signaling WebSocket error', event)
     if (relayQuotaExceeded) {
       const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
-      status(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
+      updateStatus(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
     } else {
-      status('WebSocket error')
+      updateStatus('WebSocket error')
     }
   }
   ws.onclose = (event) => {
@@ -589,7 +589,7 @@ function getFileItem(name) {
 
 function requestFile(name) {
   if (isDownloading) {
-    status('Download in progress, please wait')
+    updateStatus('Download in progress, please wait')
     return
   }
   const fullPath = [...currentPath, name].join('/')
@@ -602,7 +602,7 @@ function startDownload(header) {
   fileChunks = []
   isDownloading = true
   transferStartTime = Date.now()
-  status('')
+  updateStatus('')
 
   const fileItem = getFileItem(header.name)
   if (fileItem) {
@@ -664,7 +664,7 @@ async function completeDownload() {
 
   // Reset transfer state
   isDownloading = false
-  status('')
+  updateStatus('')
   currentFile = null
   fileChunks = []
   receivedBytes = 0
@@ -740,7 +740,7 @@ function navigateTo(index) {
 
 function openFolder(name) {
   if (isDownloading) {
-    status('Download in progress, please wait')
+    updateStatus('Download in progress, please wait')
     return
   }
   currentPath.push(name)
@@ -758,7 +758,7 @@ function submitPassword() {
 
 function handleError(msg) {
   const message = msg.message || ''
-  status('Error: ' + message)
+  updateStatus('Error: ' + message)
   isDownloading = false
 }
 
