@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -51,24 +52,34 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			return
 		}
 
-		browserConn, err := websocket.Accept(responseWriter, request, nil)
+		log.Printf("browser_ws: incoming request session=%s remote=%s upgrade=%q wskey=%q",
+			sessionCode, request.RemoteAddr,
+			request.Header.Get("Upgrade"),
+			request.Header.Get("Sec-WebSocket-Key"),
+		)
+		browserConn, err := websocket.Accept(responseWriter, request, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
 		if err != nil {
 			log.Printf("browser_ws accept: %v", err)
 			return
 		}
 		defer browserConn.CloseNow()
 
-		requestCtx := request.Context()
+		// coder/websocket recommends not using request.Context() for upgraded
+		// connection lifetime, because it can be canceled surprisingly after
+		// the HTTP upgrade machinery completes.
+		requestCtx := context.Background()
 
 		_, agentConnected := sessionHub.GetAgentConn(sessionCode)
 		if !agentConnected {
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
+			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
 			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
 
 		if err := sessionHub.PairSession(sessionCode, browserConn); err != nil {
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
+			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
 			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
@@ -85,7 +96,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 		apiKeyRecord, err := app.FindRecordById("api_keys", apiKeyID)
 		if err != nil {
 			log.Printf("browser_ws: error looking up api_key %s: %v", apiKeyID, err)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
+			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
 			browserConn.Close(websocket.StatusInternalError, "internal error")
 			return
 		}
@@ -93,7 +104,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 		accountID := apiKeyRecord.GetString("account_id")
 		if accountID == "" {
 			log.Printf("browser_ws: api_key %s has empty account_id", apiKeyID)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
+			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
 			browserConn.Close(websocket.StatusInternalError, "internal error")
 			return
 		}
@@ -102,7 +113,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 		accountRecord, err := app.FindRecordById("users", accountID)
 		if err != nil {
 			log.Printf("browser_ws: error looking up account %s: %v", accountID, err)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
+			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "internal error"})
 			browserConn.Close(websocket.StatusInternalError, "internal error")
 			return
 		}
@@ -114,52 +125,59 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 		relayOnly := sessionRecord.GetBool("relay_only")
 		if relayOnly && quotaExceeded {
 			log.Printf("browser_ws: relay_only session %s with quota exceeded, rejecting", sessionCode)
-			hub.SendDirect(requestCtx, browserConn, map[string]string{
+			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{
 				"type":    "error",
-				"message": "file host's relay quota exceeded - this share requires TURN relay which is unavailable",
+				"message": "file host's relay quota exceeded - this share requires secure relay which is unavailable",
 			})
 			browserConn.Close(websocket.StatusNormalClosure, "relay quota exceeded")
 			return
 		}
 
-		// Send ICE config - only include TURN if quota not exceeded
-		// Use account-scoped TURN username to bound Prometheus label cardinality.
-		var turnCreds *turn.Credentials
-		if cfg.HasTurn() && !quotaExceeded {
-			turnExpiry := time.Now().Add(24 * time.Hour)
-			generatedCreds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
-			turnCreds = &generatedCreds
-		}
+		// Send ICE config - STUN-only (no TURN)
 		iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-			STUNURL:     cfg.STUNURL,
-			TurnURL:     cfg.TurnURL(),
-			Credentials: turnCreds,
+			STUNURL: cfg.STUNURL,
 		})
 
-		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s TURN=%s", sessionCode, cfg.STUNURL, cfg.TurnURL())
+		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s", sessionCode, cfg.STUNURL)
 
 		if quotaExceeded {
 			msg := map[string]any{
 				"type":                 "ice_config",
 				"ice_servers":          iceServers,
+				"relay_only":           relayOnly,
 				"relay_quota_exceeded": true,
 				"quota_period_end":     periodEnd.Format(time.RFC3339),
 			}
 			log.Printf("browser_ws: sending ice_config (quota exceeded): %+v", msg)
-			hub.SendDirect(requestCtx, browserConn, msg)
+			sessionHub.SendDirect(requestCtx, browserConn, msg)
 		} else {
 			msg := map[string]any{
 				"type":        "ice_config",
 				"ice_servers": iceServers,
+				"relay_only":  relayOnly,
 			}
 			log.Printf("browser_ws: sending ice_config: %+v", msg)
-			hub.SendDirect(requestCtx, browserConn, msg)
+			sessionHub.SendDirect(requestCtx, browserConn, msg)
+		}
+
+		// Relay-only sessions skip direct browser setup, so the server must kick
+		// off the initial HMAC challenge instead of waiting for a browser-side
+		// "knock" message.
+		if relayOnly {
+			log.Printf("browser_ws: relay_only session %s - server initiating nonce challenge for conn %s", sessionCode, connID)
+			if err := sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
+				"type":    "knock",
+				"conn_id": connID,
+				"code":    sessionCode,
+			}); err != nil {
+				log.Printf("browser_ws: initial relay-only knock send failed for session %s conn %s: %v", sessionCode, connID, err)
+			}
 		}
 
 		for {
 			_, data, err := browserConn.Read(requestCtx)
 			if err != nil {
-				log.Printf("browser disconnected from session %s (conn %s)", sessionCode, connID)
+				log.Printf("browser disconnected from session %s (conn %s): %v", sessionCode, connID, err)
 				return
 			}
 

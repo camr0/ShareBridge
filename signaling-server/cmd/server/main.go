@@ -14,15 +14,15 @@ import (
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/handler"
 	"sharebridge/server/internal/hub"
-	"sharebridge/server/internal/metrics"
 	"sharebridge/server/internal/middleware"
-	"sharebridge/server/internal/quota"
+	"sharebridge/server/internal/relay"
 	_ "sharebridge/server/migrations"
 )
 
 func main() {
 	cfg := config.Load()
 	h := hub.New()
+	reg := relay.NewRegistry(cfg.RelayPendingWaitWindow)
 
 	app := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir: cfg.DataDir,
@@ -51,7 +51,7 @@ func main() {
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
 			authMiddleware := middleware.APIKeyAuth(app)
-			handlerFunc := handler.AgentWS(app, h, cfg)
+			handlerFunc := handler.AgentWS(app, h, reg, cfg)
 			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
 			return nil
 		})
@@ -61,25 +61,32 @@ func main() {
 			return nil
 		})
 
+		router.GET("/ws/relay", func(e *core.RequestEvent) error {
+			handler.RelayWS(app, reg, cfg)(e.Response, e.Request)
+			return nil
+		})
+
 		// Public session info endpoint
 		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
 
 		// Direct link route - serves file client; JS reads code from window.location
-		router.GET("/s/{code}", handler.ServeFile("./web/index.html"))
+		router.GET("/s/{code}", handler.ServeFileNoCache("./web/index.html"))
 
 		// Homepage (marketing)
-		router.GET("/", handler.ServeFile("./web/home.html"))
+		router.GET("/", handler.ServeFileNoCache("./web/home.html"))
 
 		// File transfer client (manual join)
-		router.GET("/join", handler.ServeFile("./web/index.html"))
+		router.GET("/join", handler.ServeFileNoCache("./web/index.html"))
 
 		// Static assets for file client
-		router.GET("/app.js", handler.ServeFile("./web/app.js"))
+		router.GET("/app.js", handler.ServeFileNoCache("./web/app.js"))
+		router.GET("/src/{path...}", handler.ServeDirNoCache("./web/src"))
+		router.GET("/noise-p256/{path...}", handler.ServeDirNoCache("./web/noise-p256"))
 
 		// User-facing pages (placeholders - full implementation in Task 10)
-		router.GET("/register", handler.ServeFile("./web/register.html"))
-		router.GET("/login", handler.ServeFile("./web/login.html"))
-		router.GET("/account", handler.ServeFile("./web/account.html"))
+		router.GET("/register", handler.ServeFileNoCache("./web/register.html"))
+		router.GET("/login", handler.ServeFileNoCache("./web/login.html"))
+		router.GET("/account", handler.ServeFileNoCache("./web/account.html"))
 
 		// User-scoped API key management (requires JWT auth)
 		// Uses Bind middleware for auth (apis.RequireAuth returns *hook.Handler)
@@ -120,6 +127,13 @@ func main() {
 			}
 		})
 
+		// Relay registry entries are short-lived and in-memory only. Clean up
+		// expired pending sessions so direct-mode success does not leak them until
+		// process restart.
+		app.Cron().MustAdd("relay_registry_cleanup", "* * * * *", func() {
+			reg.CleanupExpired(time.Now().UTC())
+		})
+
 		// Initialize quota fields when a new user registers.
 		app.OnRecordCreate("users").BindFunc(func(e *core.RecordEvent) error {
 			now := time.Now().UTC()
@@ -133,14 +147,6 @@ func main() {
 
 		log.Printf("signaling server listening on :%s", cfg.Port)
 		log.Printf("pocketbase data dir: %s", cfg.DataDir)
-
-		// Initialize and start the quota poller only when TURN is configured
-		if cfg.HasTurn() {
-			metricsClient := metrics.NewPrometheusClient(cfg.PrometheusURL)
-			quotaPoller := quota.NewPoller(app, metricsClient, cfg)
-			quotaPoller.Start()
-			log.Printf("quota poller started with interval: %v", cfg.QuotaCheckInterval)
-		}
 
 		return se.Next()
 	})
@@ -177,4 +183,3 @@ func deleteExpiredSessions(app core.App) error {
 		}
 	}
 }
-

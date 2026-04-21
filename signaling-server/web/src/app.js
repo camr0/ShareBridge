@@ -1,0 +1,936 @@
+import { DirectChannel, waitForDirectChannelOpen } from './directChannel.js'
+import { SecureRelayChannel } from './secureRelayChannel.js'
+import { connectTransferChannel, buildDirectIceServers, decodeRelayPolicyToken } from './connectTransferChannel.js'
+
+// Module state
+let pc, ws, dc
+let transferChannel = null // Unified channel: DirectChannel or SecureRelayChannel
+let currentTransferMode = null // 'direct' or 'relay'
+let pendingCandidates = []
+let remoteDescSet = false
+let relayQuotaExceeded = false
+let quotaPeriodEnd = null
+
+const DEBUG = typeof location !== 'undefined' && (
+  location.search.includes('debug=1') ||
+  (typeof localStorage !== 'undefined' && localStorage.getItem('sharebridge_debug'))
+)
+
+function debugLog(...args) {
+  if (DEBUG) console.log('[secure-relay]', ...args)
+}
+
+// Direct connection promise handling
+let directChannelResolve = null
+let directChannelReject = null
+let directChannelPromise = new Promise((resolve, reject) => {
+  directChannelResolve = resolve
+  directChannelReject = reject
+})
+
+// Download state
+let currentFile = null
+let receivedBytes = 0
+let fileChunks = []
+let isDownloading = false
+let transferStartTime = 0
+let receivedChunkCount = 0
+
+// Navigation state
+let currentPath = []
+let sessionPassword = '' // set from URL hash on load, or from password input
+
+// HMAC pre-challenge state
+let pendingNonce = null // nonce received from agent, consumed on join
+
+export function assertJoinNotActive(socket, log = debugLog) {
+  if (!socket) return
+  if (socket.readyState === 3) return
+
+  const err = new Error(`join() re-entered while browser signaling socket is still active (readyState=${socket.readyState})`)
+  log('FATAL', err.message)
+  throw err
+}
+
+// Export for testing
+export function publishGlobalActions(globals, { join, submitPassword, navigateTo }) {
+  globals.join = join
+  globals.submitPassword = submitPassword
+  globals.navigateTo = navigateTo
+}
+
+// Export for testing
+export function applyConnectionBadge({ statusContainer, badge, mode }) {
+  statusContainer.classList.remove('hidden')
+  badge.classList.remove('connection-direct', 'connection-relay')
+  if (mode === 'direct') {
+    badge.textContent = '● Connected (Direct)'
+    badge.classList.add('connection-direct')
+  } else {
+    badge.textContent = '● Connected (Relay)'
+    badge.classList.add('connection-relay')
+  }
+}
+
+export function initializeIceConfigTransport({
+  msg,
+  ws,
+  createPeerConnection = (config) => new RTCPeerConnection(config),
+  onDirectChannel,
+  onDirectFailure,
+}) {
+  if (msg.relay_only) {
+    debugLog('ice_config indicates relay_only; skipping RTCPeerConnection setup')
+    return null
+  }
+
+  const peer = createPeerConnection({ iceServers: buildDirectIceServers(msg.ice_servers) })
+  debugLog('created RTCPeerConnection for direct path')
+
+  peer.onicecandidate = (e) => {
+    if (e.candidate) {
+      debugLog('sending ICE candidate to signaling server')
+      ws.send(
+        JSON.stringify({
+          type: 'ice_candidate',
+          candidate: e.candidate.toJSON(),
+        })
+      )
+    }
+  }
+
+  peer.ondatachannel = (e) => {
+    dc = e.channel
+    dc.binaryType = 'arraybuffer'
+    debugLog('received RTCDataChannel from direct peer')
+    const directChannel = new DirectChannel(dc)
+    onDirectChannel(directChannel)
+  }
+
+  peer.onconnectionstatechange = () => {
+    debugLog('RTCPeerConnection state change', peer.connectionState)
+    if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
+      onDirectFailure()
+    }
+  }
+
+  debugLog('sending initial knock from browser for non-relay_only session')
+  ws.send(JSON.stringify({ type: 'knock' }))
+  return peer
+}
+
+// Export for testing - creates a message handler with injected dependencies
+export function installSessionMessageHandler({
+  updateStatus,
+  connectTransferChannel: connectTransfer,
+  requestFileList,
+  applyConnectionBadge: applyBadge,
+  decodeRelayPolicyToken: decodeToken,
+  hideSection,
+}) {
+  return {
+    async handleMessage(msg) {
+      switch (msg.type) {
+        case 'relay_policy':
+          updateStatus('Connecting to agent...')
+          const relayPolicy = decodeToken(msg.token)
+          // Use relay_only from message (server's authoritative value), not from decoded token
+          relayPolicy.relayOnly = msg.relay_only
+          relayPolicy.relayAllowed = msg.relay_allowed
+
+          const directConnect = async () => {
+            const channel = await directChannelPromise
+            return waitForDirectChannelOpen(channel)
+          }
+
+          const relayConnect = async () => {
+            const relayToken = msg.token
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+            const relayURL = `${protocol}//${location.host}/ws/relay`
+            const expectedStaticPub = hexToBytes(relayPolicy.expectedStaticPubHex)
+
+            const relayChannel = new SecureRelayChannel({
+              relayURL,
+              relayToken,
+              expectedStaticPub,
+            })
+            await relayChannel.start()
+            return relayChannel
+          }
+
+          let result
+          try {
+            result = await connectTransfer({
+              relayPolicy,
+              directConnect,
+              relayConnect,
+              onStatusChange: (s) => {
+                // Map internal states to UI messages
+                if (s === 'connecting-direct') updateStatus('Connecting directly...')
+                else if (s === 'connecting-relay') updateStatus('Connecting via relay...')
+                else if (s === 'falling-back-to-relay') updateStatus('Direct failed, using relay...')
+                else if (s === 'connected-direct') updateStatus('Connected directly')
+                else if (s === 'connected-relay') updateStatus('Connected via relay')
+                else if (s === 'failed') updateStatus('Connection failed')
+              },
+            })
+          } catch (err) {
+            updateStatus(err.message)
+            throw err
+          }
+
+          transferChannel = result.channel
+          currentTransferMode = result.mode
+          attachTransferChannel({
+            channel: transferChannel,
+            mode: result.mode,
+            updateStatus,
+            hideSection,
+            requestFileList,
+            applyConnectionBadge: ({ mode }) => applyBadge({ mode }),
+            handleTransferMessage,
+            onClose: resetUI,
+          })
+          break
+      }
+    },
+  }
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16)
+  }
+  return bytes
+}
+
+function attachTransferChannel({
+  channel,
+  mode,
+  updateStatus,
+  hideSection,
+  requestFileList,
+  applyConnectionBadge,
+  handleTransferMessage,
+  onClose,
+}) {
+  let opened = false
+  const handleOpen = () => {
+    if (opened) return
+    opened = true
+    debugLog('transfer channel opened', { mode, readyState: channel.readyState })
+    updateStatus('Transfer channel open!')
+    hideSection('join-section')
+    hideSection('password-section')
+    applyConnectionBadge({ mode })
+    requestFileList(channel, '')
+  }
+
+  channel.onopen = handleOpen
+  channel.onmessage = (event) => {
+    try {
+      handleTransferMessage(event)
+    } catch (err) {
+      console.error('[secure-relay] transfer message handler error:', err)
+      throw err
+    }
+  }
+  channel.onclose = () => {
+    debugLog('transfer channel closed', {
+      mode,
+      channelReadyState: channel.readyState,
+      currentFile: currentFile?.name || null,
+      receivedBytes,
+      receivedChunkCount,
+    })
+    updateStatus('Connection closed')
+    onClose()
+  }
+
+  if (channel.readyState === 'open') {
+    handleOpen()
+  }
+}
+
+function getConnectionStatusEl() {
+  return document.getElementById('connection-status')
+}
+
+function getConnectionTypeEl() {
+  return document.getElementById('connection-type')
+}
+
+function updateStatus(msg) {
+  document.getElementById('status').textContent = msg
+}
+
+function showSection(id) {
+  document.getElementById(id).classList.remove('hidden')
+}
+
+function hideSection(id) {
+  document.getElementById(id).classList.add('hidden')
+}
+
+function join() {
+  assertJoinNotActive(ws)
+
+  const code = document.getElementById('code').value.trim()
+  if (!code) return
+  debugLog('join invoked', { code })
+  updateStatus('Connecting...')
+
+  // Reset quota state for new connection
+  relayQuotaExceeded = false
+  quotaPeriodEnd = null
+
+  // Reset direct channel promise for new connection
+  directChannelPromise = new Promise((resolve, reject) => {
+    directChannelResolve = resolve
+    directChannelReject = reject
+  })
+
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  ws = new WebSocket(`${protocol}//${location.host}/ws/client?session=${code}`)
+  debugLog('opening browser signaling WebSocket', ws.url)
+
+  ws.onopen = () => {
+    debugLog('browser signaling WebSocket open')
+  }
+
+  ws.onmessage = async (event) => {
+    try {
+      debugLog('browser signaling WebSocket message received', event.data)
+
+      let msg
+      try {
+        msg = JSON.parse(event.data)
+      } catch (err) {
+        debugLog('failed to parse signaling message JSON', err)
+        throw err
+      }
+
+      switch (msg.type) {
+        case 'ice_config':
+          debugLog('handling ice_config', msg)
+          // Store quota state for use if connection fails
+          if (msg.relay_quota_exceeded) {
+            relayQuotaExceeded = true
+            quotaPeriodEnd = msg.quota_period_end
+          }
+
+          pc = initializeIceConfigTransport({
+            msg,
+            ws,
+            onDirectChannel: (directChannel) => {
+              directChannelResolve(directChannel)
+            },
+            onDirectFailure: () => {
+              if (relayQuotaExceeded) {
+                const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
+                updateStatus(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
+              } else {
+                updateStatus('Connection lost')
+              }
+              if (directChannelReject) {
+                directChannelReject(new Error('PeerConnection failed'))
+              }
+              resetUI()
+            },
+          })
+          break
+
+        case 'nonce':
+          debugLog('received nonce for browser challenge', { hasPassword: msg.has_password, connID: msg.conn_id })
+          pendingNonce = msg.value
+          if (msg.has_password && !sessionPassword) {
+            debugLog('nonce requires password input before join')
+            showSection('password-section')
+            document.getElementById('password-input').focus()
+          } else {
+            debugLog('nonce can be consumed immediately; sending join')
+            sendJoin()
+          }
+          break
+
+        case 'auth_failed': {
+          debugLog('received auth_failed', msg)
+          const errorDiv = document.getElementById('password-error')
+          const attemptsRemaining = msg.attempts_remaining || 0
+          if (attemptsRemaining <= 0) {
+            errorDiv.textContent = 'Too many incorrect attempts. Connection closed.'
+            document.getElementById('password-input').disabled = true
+            document.querySelector('#password-section button').disabled = true
+          } else {
+            errorDiv.textContent = `Incorrect password. ${attemptsRemaining} attempt${attemptsRemaining === 1 ? '' : 's'} remaining.`
+            document.getElementById('password-input').value = ''
+            document.getElementById('password-input').focus()
+            // Knock again to get a fresh nonce
+            ws.send(JSON.stringify({ type: 'knock' }))
+          }
+          break
+        }
+
+        case 'offer':
+          debugLog('received WebRTC offer')
+          if (!pc) return
+          await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp })
+          remoteDescSet = true
+
+          for (const c of pendingCandidates) {
+            await pc.addIceCandidate(c)
+          }
+          pendingCandidates = []
+
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }))
+          updateStatus('Negotiating...')
+          break
+
+        case 'ice_candidate':
+          debugLog('received ICE candidate from signaling server')
+          if (!pc) return
+          if (!remoteDescSet) {
+            pendingCandidates.push(msg.candidate)
+          } else {
+            await pc.addIceCandidate(msg.candidate)
+          }
+          break
+
+        case 'relay_policy': {
+          debugLog('received relay_policy', msg)
+          updateStatus('Connecting to agent...')
+          debugLog('relay_policy: decoding token')
+          const relayPolicy = decodeRelayPolicyToken(msg.token)
+          debugLog('relay_policy: decoded token', relayPolicy)
+          // Use relay_only from message (server's authoritative value), not from decoded token
+          // Token may be empty when relay is not configured
+          relayPolicy.relayOnly = msg.relay_only
+          relayPolicy.relayAllowed = msg.relay_allowed
+          debugLog('relay_policy: effective policy', relayPolicy)
+
+          const directConnect = async () => {
+            debugLog('relay_policy: directConnect invoked')
+            const channel = await directChannelPromise
+            return waitForDirectChannelOpen(channel)
+          }
+
+          const relayConnect = async () => {
+            debugLog('relayConnect called, creating SecureRelayChannel')
+            const relayToken = msg.token
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+            const relayURL = `${protocol}//${location.host}/ws/relay`
+            const expectedStaticPub = hexToBytes(relayPolicy.expectedStaticPubHex)
+
+            debugLog('relayConnect: creating channel', { relayURL, expectedStaticPubLength: expectedStaticPub?.length })
+            const relayChannel = new SecureRelayChannel({
+              relayURL,
+              relayToken,
+              expectedStaticPub,
+            })
+            debugLog('relayConnect: calling channel.start()')
+            await relayChannel.start()
+            debugLog('relayConnect: channel.start() completed successfully')
+            return relayChannel
+          }
+
+          let result
+          try {
+            debugLog('relay_policy: calling connectTransferChannel')
+            result = await connectTransferChannel({
+              relayPolicy,
+              directConnect,
+              relayConnect,
+              onStatusChange: (s) => {
+                debugLog('connectTransferChannel status', { status: s })
+                if (s === 'connecting-direct') updateStatus('Connecting directly...')
+                else if (s === 'connecting-relay') updateStatus('Connecting via relay...')
+                else if (s === 'falling-back-to-relay') updateStatus('Direct failed, using relay...')
+                else if (s === 'connected-direct') updateStatus('Connected directly')
+                else if (s === 'connected-relay') updateStatus('Connected via relay')
+                else if (s === 'failed') updateStatus('Connection failed')
+              },
+            })
+            debugLog('relay_policy: connectTransferChannel resolved', { mode: result?.mode, readyState: result?.channel?.readyState })
+          } catch (err) {
+            debugLog('connectTransferChannel failed', err)
+            updateStatus(err.message)
+            throw err
+          }
+
+          transferChannel = result.channel
+          currentTransferMode = result.mode
+          attachTransferChannel({
+            channel: transferChannel,
+            mode: result.mode,
+            updateStatus,
+            hideSection,
+            requestFileList,
+            applyConnectionBadge: ({ mode }) =>
+              applyConnectionBadge({
+                statusContainer: getConnectionStatusEl(),
+                badge: getConnectionTypeEl(),
+                mode,
+              }),
+            handleTransferMessage,
+            onClose: resetUI,
+          })
+          break
+        }
+
+        case 'error':
+          debugLog('received signaling error message', msg)
+          updateStatus('Error: ' + msg.message)
+          break
+      }
+    } catch (err) {
+      console.error('[secure-relay] signaling message handler error:', err)
+    }
+  }
+
+  ws.onerror = (event) => {
+    debugLog('browser signaling WebSocket error', event)
+    if (relayQuotaExceeded) {
+      const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
+      updateStatus(`Connection failed: Direct unavailable, relay blocked (quota exceeded). Resets ${periodEnd}.`)
+    } else {
+      updateStatus('WebSocket error')
+    }
+  }
+  ws.onclose = (event) => {
+    debugLog('browser signaling WebSocket close', { code: event.code, reason: event.reason, wasClean: event.wasClean })
+    if (pc) pc.close()
+    resetUI()
+  }
+}
+
+async function computeHMAC(password, nonce) {
+  const encoder = new TextEncoder()
+  const key = await crypto.subtle.importKey('raw', encoder.encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, [
+    'sign',
+  ])
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(nonce))
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function sendJoin() {
+  if (!pendingNonce) {
+    debugLog('sendJoin called without a pending nonce; skipping')
+    return
+  }
+  debugLog('computing HMAC for join', { hasPassword: Boolean(sessionPassword), nonceLength: pendingNonce.length })
+  const hmac = sessionPassword ? await computeHMAC(sessionPassword, pendingNonce) : ''
+  debugLog('sending join message to signaling server', { hmacLength: hmac.length })
+  ws.send(JSON.stringify({ type: 'join', hmac }))
+  pendingNonce = null
+}
+
+function handleTransferMessage(event) {
+  if (event.data instanceof ArrayBuffer) {
+    debugLog('transfer binary message received', {
+      byteLength: event.data.byteLength,
+      currentFile: currentFile?.name || null,
+    })
+    const bytes = new Uint8Array(event.data)
+    appendChunk(bytes)
+    return
+  }
+
+  debugLog('transfer text message received', {
+    length: typeof event.data === 'string' ? event.data.length : undefined,
+    preview: typeof event.data === 'string' ? event.data.slice(0, 160) : String(event.data),
+  })
+  const msg = JSON.parse(event.data)
+  switch (msg.type) {
+    case 'file_list':
+      debugLog('file_list received', { count: msg.files?.length || 0, currentPath })
+      renderFileList(msg.files)
+      break
+    case 'file_header':
+      startDownload(msg)
+      break
+    case 'chunk_end':
+      completeDownload()
+      break
+    case 'error':
+      handleError(msg)
+      break
+    default:
+      debugLog('unhandled transfer message type', { type: msg.type })
+      break
+  }
+}
+
+function renderFileList(files) {
+  hideSection('password-section')
+  showSection('file-list')
+  renderBreadcrumb()
+
+  const container = document.getElementById('file-list')
+  container.innerHTML = ''
+
+  if (files.length === 0) {
+    const emptyMsg = currentPath.length === 0 ? 'No files in share' : 'No files in this folder'
+    container.innerHTML = `<p style="color:#6c7086;margin-top:8px">${emptyMsg}</p>`
+    return
+  }
+
+  // Sort: folders first, then files, each group alphabetically
+  const sorted = [...files].sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+
+  sorted.forEach((file) => {
+    const div = document.createElement('div')
+    div.className = 'file-item'
+    div.dataset.name = file.name
+
+    if (file.isDir) {
+      div.innerHTML = `
+        <div class="file-main">
+          <div class="file-name">📁 ${escapeHtml(file.name)}</div>
+        </div>
+      `
+      div.onclick = () => openFolder(file.name)
+    } else {
+      div.innerHTML = `
+        <div class="file-main">
+          <div class="file-name">${escapeHtml(file.name)}</div>
+          <div class="file-status"></div>
+        </div>
+        <div class="file-meta">
+          <span class="file-size">${formatBytes(file.size)}</span>
+          <span class="file-hash"></span>
+        </div>
+        <div class="file-progress hidden">
+          <div class="file-progress-track">
+            <div class="file-progress-fill"></div>
+          </div>
+          <div class="file-progress-text"></div>
+        </div>
+      `
+      div.onclick = () => requestFile(file.name)
+    }
+    container.appendChild(div)
+  })
+}
+
+function getFileItem(name) {
+  return document.querySelector(`.file-item[data-name="${CSS.escape(name)}"]`)
+}
+
+function requestFile(name) {
+  if (isDownloading) {
+    updateStatus('Download in progress, please wait')
+    return
+  }
+  const fullPath = [...currentPath, name].join('/')
+  debugLog('requesting file', {
+    name,
+    fullPath,
+    mode: currentTransferMode,
+    channelReadyState: transferChannel?.readyState,
+  })
+  transferChannel.send(JSON.stringify({ type: 'file_request', path: fullPath }))
+}
+
+function startDownload(header) {
+  currentFile = header
+  receivedBytes = 0
+  fileChunks = []
+  isDownloading = true
+  transferStartTime = Date.now()
+  receivedChunkCount = 0
+  debugLog('download started', {
+    name: header.name,
+    size: header.size,
+    mimeType: header.mimeType,
+    sha1: header.sha1 || null,
+    mode: currentTransferMode,
+  })
+  updateStatus('')
+
+  const fileItem = getFileItem(header.name)
+  if (fileItem) {
+    fileItem.classList.add('downloading')
+    fileItem.onclick = null
+    fileItem.querySelector('.file-progress').classList.remove('hidden')
+    fileItem.querySelector('.file-progress-text').textContent = '0%'
+  }
+}
+
+function appendChunk(bytes) {
+  if (!currentFile) return
+  fileChunks.push(bytes)
+  receivedBytes += bytes.length
+  receivedChunkCount += 1
+
+  if (receivedChunkCount <= 3 || receivedChunkCount % 25 === 0 || receivedBytes === currentFile.size) {
+    debugLog('download chunk received', {
+      file: currentFile.name,
+      chunkCount: receivedChunkCount,
+      chunkBytes: bytes.length,
+      receivedBytes,
+      expectedBytes: currentFile.size,
+    })
+  }
+
+  const pct = currentFile.size > 0 ? Math.round((receivedBytes / currentFile.size) * 100) : 0
+  const elapsed = (Date.now() - transferStartTime) / 1000
+  const speedBps = elapsed > 0 ? receivedBytes / elapsed : 0
+
+  const fileItem = getFileItem(currentFile.name)
+  if (fileItem) {
+    fileItem.querySelector('.file-progress-fill').style.width = pct + '%'
+    fileItem.querySelector('.file-progress-text').textContent =
+      `${pct}% — ${formatBytes(receivedBytes)} of ${formatBytes(currentFile.size)}`
+    const statusEl = fileItem.querySelector('.file-status')
+    statusEl.textContent = '↓ ' + formatSpeed(speedBps)
+    statusEl.className = 'file-status speed'
+  }
+}
+
+async function completeDownload() {
+  if (!currentFile) return
+  debugLog('download complete frame received', {
+    file: currentFile.name,
+    receivedBytes,
+    chunkCount: receivedChunkCount,
+  })
+  // Assemble all chunks
+  const totalLength = fileChunks.reduce((sum, c) => sum + c.length, 0)
+  const combined = new Uint8Array(totalLength)
+  let offset = 0
+  for (const chunk of fileChunks) {
+    combined.set(chunk, offset)
+    offset += chunk.length
+  }
+
+  // Trigger browser file save immediately — don't wait for SHA-1
+  const blob = new Blob([combined], { type: currentFile.mimeType || 'application/octet-stream' })
+  const objectUrl = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = objectUrl
+  a.download = currentFile.name
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(objectUrl)
+
+  const elapsed = (Date.now() - transferStartTime) / 1000
+  const avgSpeed = elapsed > 0 ? formatSpeed(totalLength / elapsed) : '—'
+
+  // Capture state before reset
+  const downloadedFile = currentFile
+  const downloadedBuffer = combined
+
+  // Reset transfer state
+  isDownloading = false
+  updateStatus('')
+  currentFile = null
+  fileChunks = []
+  receivedBytes = 0
+  receivedChunkCount = 0
+  transferStartTime = 0
+
+  const fileItem = getFileItem(downloadedFile.name)
+  if (fileItem) {
+    fileItem.querySelector('.file-progress').classList.add('hidden')
+  }
+
+  // SHA-1 verification (async — updates UI after save dialog appears)
+  if (downloadedFile.sha1 && typeof crypto !== 'undefined' && crypto.subtle) {
+    try {
+      const hashBuffer = await crypto.subtle.digest('SHA-1', downloadedBuffer.buffer)
+      const hashArray = Array.from(new Uint8Array(hashBuffer))
+      const computed = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
+      const ok = computed === downloadedFile.sha1.toLowerCase()
+
+      if (fileItem) {
+        fileItem.classList.remove('downloading')
+        fileItem.classList.add(ok ? 'verified' : 'corrupted')
+        fileItem.querySelector('.file-status').textContent = ok ? '✓ intact' : '✗ corrupted'
+        fileItem.querySelector('.file-status').className = 'file-status ' + (ok ? 'ok' : 'fail')
+        fileItem.querySelector('.file-size').textContent = formatBytes(downloadedFile.size) + ' · avg ' + avgSpeed
+        fileItem.querySelector('.file-hash').textContent = ok
+          ? 'SHA-1: ' + downloadedFile.sha1.toLowerCase()
+          : 'expected ' + downloadedFile.sha1.slice(0, 8) + '… got ' + computed.slice(0, 8) + '…'
+      }
+    } catch (e) {
+      markFileDone(fileItem, downloadedFile, avgSpeed)
+    }
+  } else {
+    markFileDone(fileItem, downloadedFile, avgSpeed)
+  }
+}
+
+function markFileDone(fileItem, file, avgSpeed) {
+  if (!fileItem) return
+  fileItem.classList.remove('downloading')
+  fileItem.classList.add('done')
+  fileItem.querySelector('.file-status').textContent = '✓ done'
+  fileItem.querySelector('.file-status').className = 'file-status ok'
+  fileItem.querySelector('.file-size').textContent = formatBytes(file.size) + ' · avg ' + avgSpeed
+  if (file.sha1) {
+    fileItem.querySelector('.file-hash').textContent = 'SHA-1: ' + file.sha1.toLowerCase()
+  }
+}
+
+function renderBreadcrumb() {
+  const breadcrumb = document.getElementById('breadcrumb')
+  if (currentPath.length === 0) {
+    breadcrumb.classList.add('hidden')
+    return
+  }
+  breadcrumb.classList.remove('hidden')
+  const parts = [{ label: 'Share root', index: -1 }, ...currentPath.map((seg, i) => ({ label: seg, index: i }))]
+  breadcrumb.innerHTML = parts
+    .map((part, i) => {
+      const isLast = i === parts.length - 1
+      if (isLast) {
+        return `<span class="breadcrumb-current">${escapeHtml(part.label)}</span>`
+      }
+      return `<span class="breadcrumb-link" onclick="navigateTo(${part.index})">${escapeHtml(part.label)}</span>`
+    })
+    .join('<span class="breadcrumb-sep"> › </span>')
+}
+
+function navigateTo(index) {
+  // index -1 = share root, 0 = first segment, 1 = second, etc.
+  currentPath = index === -1 ? [] : currentPath.slice(0, index + 1)
+  requestFileList(transferChannel, currentPath.join('/'))
+}
+
+function openFolder(name) {
+  if (isDownloading) {
+    updateStatus('Download in progress, please wait')
+    return
+  }
+  currentPath.push(name)
+  requestFileList(transferChannel, currentPath.join('/'))
+}
+
+function requestFileList(channel, subpath) {
+  debugLog('requesting file list', {
+    subpath,
+    mode: currentTransferMode,
+    channelReadyState: channel?.readyState,
+  })
+  channel.send(JSON.stringify({ type: 'list_request', path: subpath }))
+}
+
+function submitPassword() {
+  sessionPassword = document.getElementById('password-input').value
+  sendJoin()
+}
+
+function handleError(msg) {
+  const message = msg.message || ''
+  debugLog('transfer error message received', {
+    message,
+    currentFile: currentFile?.name || null,
+    receivedBytes,
+    receivedChunkCount,
+  })
+  updateStatus('Error: ' + message)
+  isDownloading = false
+}
+
+function resetUI() {
+  debugLog('resetUI', {
+    currentFile: currentFile?.name || null,
+    receivedBytes,
+    receivedChunkCount,
+    currentTransferMode,
+  })
+  showSection('join-section')
+  hideSection('password-section')
+  hideSection('file-list')
+  getConnectionStatusEl().classList.add('hidden')
+  getConnectionTypeEl().className = 'connection-badge'
+  document.getElementById('breadcrumb').classList.add('hidden')
+  document.getElementById('file-list').innerHTML = ''
+  document.getElementById('password-error').textContent = ''
+  document.getElementById('password-input').value = ''
+  document.getElementById('password-input').disabled = false
+  document.querySelector('#password-section button').disabled = false
+  currentFile = null
+  fileChunks = []
+  isDownloading = false
+  receivedBytes = 0
+  receivedChunkCount = 0
+  transferStartTime = 0
+  pendingNonce = null
+  currentPath = []
+  sessionPassword = ''
+  transferChannel = null
+  currentTransferMode = null
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div')
+  div.textContent = text
+  return div.innerHTML
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+}
+
+function formatSpeed(bps) {
+  if (bps >= 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + ' MB/s'
+  if (bps >= 1024) return (bps / 1024).toFixed(0) + ' KB/s'
+  return Math.round(bps) + ' B/s'
+}
+
+function initFromURL() {
+  const parts = window.location.pathname.split('/')
+  // /s/ABC123 → ['', 's', 'ABC123']
+  if (parts[1] === 's' && parts[2]) {
+    document.getElementById('code').value = parts[2]
+  }
+
+  if (window.location.hash) {
+    sessionPassword = decodeURIComponent(window.location.hash.slice(1))
+    history.replaceState(null, '', window.location.pathname)
+  }
+}
+
+// Make functions available globally for inline handlers (browser only)
+if (typeof window !== 'undefined') {
+  publishGlobalActions(window, { join, submitPassword, navigateTo })
+
+  window.addEventListener('beforeunload', () => {
+    debugLog('window beforeunload', { readyState: ws?.readyState })
+  })
+  window.addEventListener('pagehide', () => {
+    debugLog('window pagehide', { readyState: ws?.readyState })
+  })
+  document.addEventListener('visibilitychange', () => {
+    debugLog('document visibilitychange', { visibilityState: document.visibilityState, readyState: ws?.readyState })
+  })
+
+  document.addEventListener('DOMContentLoaded', () => {
+    initFromURL()
+    if (document.getElementById('code').value) {
+      join()
+    }
+  })
+}
+
+// Export test helpers for unit tests
+export const __test = {
+  setQuotaState({ exceeded, periodEnd }) {
+    relayQuotaExceeded = exceeded
+    quotaPeriodEnd = periodEnd
+  },
+}

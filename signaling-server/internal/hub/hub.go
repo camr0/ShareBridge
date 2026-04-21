@@ -22,6 +22,7 @@ type Hub struct {
 	pairs        map[string]*pair           // sessionID → pair
 	connBrowsers map[string]*websocket.Conn // connID → browser conn
 	connFails    map[string]int             // connID → auth failure count
+	connWrites   map[*websocket.Conn]*sync.Mutex
 }
 
 func New() *Hub {
@@ -31,6 +32,7 @@ func New() *Hub {
 		pairs:        make(map[string]*pair),
 		connBrowsers: make(map[string]*websocket.Conn),
 		connFails:    make(map[string]int),
+		connWrites:   make(map[*websocket.Conn]*sync.Mutex),
 	}
 }
 
@@ -38,11 +40,15 @@ func (h *Hub) RegisterAgent(apiKey string, conn *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.agents[apiKey] = conn
+	h.ensureWriteMuLocked(conn)
 }
 
 func (h *Hub) UnregisterAgent(apiKey string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if conn, ok := h.agents[apiKey]; ok {
+		delete(h.connWrites, conn)
+	}
 	delete(h.agents, apiKey)
 }
 
@@ -100,7 +106,7 @@ func (h *Hub) SendToAgent(ctx context.Context, apiKey string, msg any) error {
 	if !ok {
 		return fmt.Errorf("agent not connected: %s", apiKey)
 	}
-	return send(ctx, conn, msg)
+	return send(ctx, h, conn, msg)
 }
 
 func (h *Hub) ForwardToAgent(ctx context.Context, sessionID string, msg any) error {
@@ -110,7 +116,7 @@ func (h *Hub) ForwardToAgent(ctx context.Context, sessionID string, msg any) err
 	if !ok {
 		return nil
 	}
-	return send(ctx, sessionPair.agentConn, msg)
+	return send(ctx, h, sessionPair.agentConn, msg)
 }
 
 func (h *Hub) ForwardToBrowser(ctx context.Context, sessionID string, msg any) error {
@@ -120,19 +126,47 @@ func (h *Hub) ForwardToBrowser(ctx context.Context, sessionID string, msg any) e
 	if !ok {
 		return nil
 	}
-	return send(ctx, sessionPair.browserConn, msg)
+	return send(ctx, h, sessionPair.browserConn, msg)
+}
+
+func (h *Hub) SendDirect(ctx context.Context, conn *websocket.Conn, msg any) error {
+	return send(ctx, h, conn, msg)
 }
 
 func SendDirect(ctx context.Context, conn *websocket.Conn, msg any) error {
-	return send(ctx, conn, msg)
+	return send(ctx, nil, conn, msg)
 }
 
-func send(ctx context.Context, conn *websocket.Conn, msg any) error {
+func send(ctx context.Context, h *Hub, conn *websocket.Conn, msg any) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
+	if h != nil {
+		mu := h.writeMu(conn)
+		mu.Lock()
+		defer mu.Unlock()
+	}
 	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+func (h *Hub) ensureWriteMuLocked(conn *websocket.Conn) {
+	if conn == nil {
+		return
+	}
+	if _, ok := h.connWrites[conn]; !ok {
+		h.connWrites[conn] = &sync.Mutex{}
+	}
+}
+
+func (h *Hub) writeMu(conn *websocket.Conn) *sync.Mutex {
+	if conn == nil {
+		return &sync.Mutex{}
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ensureWriteMuLocked(conn)
+	return h.connWrites[conn]
 }
 
 // CloseAgent closes the WebSocket connection for the agent identified by apiKeyID,
@@ -168,9 +202,15 @@ func (h *Hub) CloseAgent(apiKeyID string) {
 	h.mu.Unlock()
 
 	if ok && conn != nil {
+		h.mu.Lock()
+		delete(h.connWrites, conn)
+		h.mu.Unlock()
 		conn.Close(websocket.StatusPolicyViolation, "API key revoked")
 	}
 	for _, browserConn := range browserConns {
+		h.mu.Lock()
+		delete(h.connWrites, browserConn)
+		h.mu.Unlock()
 		browserConn.Close(websocket.StatusNormalClosure, "agent disconnected")
 	}
 }
@@ -181,6 +221,7 @@ func (h *Hub) RegisterBrowserConn(connID string, conn *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.connBrowsers[connID] = conn
+	h.ensureWriteMuLocked(conn)
 }
 
 // UnregisterBrowserConn removes the browser conn and its failure count.
@@ -188,6 +229,9 @@ func (h *Hub) RegisterBrowserConn(connID string, conn *websocket.Conn) {
 func (h *Hub) UnregisterBrowserConn(connID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if conn, ok := h.connBrowsers[connID]; ok {
+		delete(h.connWrites, conn)
+	}
 	delete(h.connBrowsers, connID)
 	delete(h.connFails, connID)
 }
@@ -201,7 +245,7 @@ func (h *Hub) ForwardToBrowserByConnID(ctx context.Context, connID string, msg a
 	if !ok {
 		return nil
 	}
-	return send(ctx, conn, msg)
+	return send(ctx, h, conn, msg)
 }
 
 // IncrementAuthFailure increments the failure count for connID and returns
@@ -222,6 +266,6 @@ func (h *Hub) CloseBrowserConnWithError(ctx context.Context, connID, message str
 	if !ok {
 		return
 	}
-	send(ctx, conn, map[string]string{"type": "error", "message": message})
+	send(ctx, h, conn, map[string]string{"type": "error", "message": message})
 	conn.Close(websocket.StatusNormalClosure, message)
 }

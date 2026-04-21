@@ -10,33 +10,35 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"sharebridge/server/internal/config"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/middleware"
+	"sharebridge/server/internal/relay"
 	"sharebridge/server/internal/turn"
 )
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type        string          `json:"type"`
-	AgentID     string          `json:"agent_id,omitempty"`
-	Code        string          `json:"code,omitempty"`
-	ShareURL    string          `json:"share_url,omitempty"` // received for protocol compat, not stored
-	ExpiresAt   *time.Time      `json:"expires_at,omitempty"`
-	SessionID   string          `json:"session_id,omitempty"`
-	SDP         string          `json:"sdp,omitempty"`
-	Candidate   json.RawMessage `json:"candidate,omitempty"`
-	ConnID      string          `json:"conn_id,omitempty"`
-	Value       string          `json:"value,omitempty"`
-	HasPassword bool            `json:"has_password,omitempty"`
-	RelayOnly   bool            `json:"relay_only,omitempty"`
+	Type           string          `json:"type"`
+	AgentID        string          `json:"agent_id,omitempty"`
+	Code           string          `json:"code,omitempty"`
+	ShareURL       string          `json:"share_url,omitempty"` // received for protocol compat, not stored
+	ExpiresAt      *time.Time      `json:"expires_at,omitempty"`
+	SessionID      string          `json:"session_id,omitempty"`
+	SDP            string          `json:"sdp,omitempty"`
+	Candidate      json.RawMessage `json:"candidate,omitempty"`
+	ConnID         string          `json:"conn_id,omitempty"`
+	Value          string          `json:"value,omitempty"`
+	HasPassword    bool            `json:"has_password,omitempty"`
+	RelayOnly      bool            `json:"relay_only,omitempty"`
+	RelayStaticPub string          `json:"relay_static_pub,omitempty"`
 }
 
 // codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
@@ -46,7 +48,8 @@ var errCodeAlreadyInUse = errors.New("code already in use")
 
 // AgentWS handles WebSocket connections from agents.
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
-func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
+// The registry parameter is optional - if nil, relay functionality is disabled.
+func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
 		apiKeyID := middleware.GetAPIKeyID(r.Context())
@@ -64,26 +67,10 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 		}
 		defer conn.CloseNow()
 
-		ctx := r.Context()
+		// coder/websocket recommends avoiding request.Context() for upgraded
+		// WebSocket lifetime.
+		ctx := context.Background()
 		var agentID string
-
-		// Cached quota state - refreshed at most once per minute to avoid
-		// a DB lookup on every ICE candidate while staying current after quota resets.
-		var quotaExceeded bool
-		var quotaCheckedAt time.Time
-
-		refreshQuota := func() {
-			if time.Since(quotaCheckedAt) < time.Minute {
-				return
-			}
-			accountRecord, err := app.FindRecordById("users", accountID)
-			if err != nil {
-				log.Printf("agent_ws: quota refresh for account %s: %v", accountID, err)
-				return
-			}
-			quotaExceeded, _ = checkRelayQuota(accountRecord)
-			quotaCheckedAt = time.Now()
-		}
 
 		// Main message loop
 		for {
@@ -129,13 +116,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 				if agentID == "" {
 					continue
 				}
-				if cfg.HasTurn() {
-					refreshQuota()
-				}
-				if quotaExceeded && isRelayCandidate(msg.Candidate) {
-					log.Printf("agent_ws: dropping relay candidate for over-quota account %s", accountID)
-					continue
-				}
+				// TURN removed - relay candidates now handled by secure relay
 				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
 					"type":      "ice_candidate",
 					"candidate": msg.Candidate,
@@ -146,11 +127,107 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config) http.HandlerFunc {
 				if agentID == "" {
 					continue
 				}
+				log.Printf("agent_ws: forwarding nonce to browser conn_id=%s has_password=%v", msg.ConnID, msg.HasPassword)
 				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
 					"type":         "nonce",
 					"conn_id":      msg.ConnID,
 					"value":        msg.Value,
 					"has_password": msg.HasPassword,
+				})
+
+			case "auth_ok":
+				// Browser authentication succeeded - send relay_policy so browser can proceed.
+				if agentID == "" {
+					continue
+				}
+
+				session, err := getSessionByCode(app, msg.Code)
+				if err != nil {
+					log.Printf("agent_ws: auth_ok session lookup failed for code %s: %v", msg.Code, err)
+					continue
+				}
+				if session == nil {
+					log.Printf("agent_ws: auth_ok session not found for code %s", msg.Code)
+					continue
+				}
+
+				relayOnly := session.GetBool("relay_only")
+				expectedStaticPub := session.GetString("relay_static_pub")
+
+				// Determine relay availability: requires relay to be configured,
+				// a valid static pub key from the session, and (for relay-only sessions,
+				// relay is mandatory; for direct sessions, relay is optional fallback).
+				var relayAllowed bool
+				if reg != nil && cfg.RelayJWTSecret != "" && expectedStaticPub != "" {
+					accountRecord, err := app.FindRecordById("users", accountID)
+					if err != nil {
+						log.Printf("agent_ws: auth_ok account lookup failed for account %s: %v", accountID, err)
+						continue
+					}
+					quotaExceeded, _ := checkRelayQuota(accountRecord)
+					relayAllowed = !quotaExceeded
+				}
+
+				var browserJWT string
+				if relayAllowed {
+					sid := relay.NewSID()
+					now := time.Now().UTC()
+
+					browserClaims := relay.BrowserPolicyClaims{
+						SID:               sid,
+						SessionCode:       msg.Code,
+						RelayAllowed:      true,
+						RelayOnly:         relayOnly,
+						ExpectedStaticPub: expectedStaticPub,
+						RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
+					}
+					var err error
+					browserJWT, err = relay.SignBrowserPolicyJWT(cfg.RelayJWTSecret, browserClaims, now)
+					if err != nil {
+						log.Printf("agent_ws: failed to sign browser policy JWT: %v", err)
+						continue
+					}
+
+					agentJWT, err := relay.SignAgentRelayJWT(cfg.RelayJWTSecret, relay.AgentRelayClaims{SID: sid, AgentID: agentID}, now)
+					if err != nil {
+						log.Printf("agent_ws: failed to sign agent relay JWT: %v", err)
+						continue
+					}
+
+					err = reg.CreatePendingSession(relay.PendingSession{
+						SID:               sid,
+						AccountID:         accountID,
+						SessionCode:       msg.Code,
+						AgentID:           agentID,
+						RelayAllowed:      true,
+						RelayOnly:         relayOnly,
+						ExpectedStaticPub: expectedStaticPub,
+						JTI:               browserClaims.RegisteredClaims.ID,
+						ExpiresAt:         now.Add(relay.TokenLifetime),
+					}, now)
+					if err != nil {
+						log.Printf("agent_ws: failed to create pending relay session: %v", err)
+						continue
+					}
+
+					// Send relay_prepare to agent only when relay fallback is actually allowed.
+					hub.SendDirect(ctx, conn, map[string]any{
+						"type":       "relay_prepare",
+						"sid":        sid,
+						"code":       msg.Code,
+						"expires_at": now.Add(relay.TokenLifetime).Format(time.RFC3339),
+						"relay_jwt":  agentJWT,
+					})
+
+					log.Printf("agent_ws: relay session prepared: sid=%s code=%s agent_id=%s", sid, msg.Code, agentID)
+				}
+
+				// Send relay_policy to browser via hub (always, so browser can proceed)
+				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+					"type":          "relay_policy",
+					"token":         browserJWT,
+					"relay_allowed": relayAllowed,
+					"relay_only":    relayOnly,
 				})
 
 			case "auth_failed":
@@ -191,38 +268,15 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
 	log.Printf("agent hello received: api_key_id=%s agent_id=%s", apiKeyID, agentID)
 
-	// Build ICE config for agent - always include TURN credentials.
-	// Quota enforcement happens in the ice_candidate forwarding path instead,
-	// where relay candidates are stripped when the account is over quota.
-	var turnCreds *turn.Credentials
-	if cfg.HasTurn() {
-		turnExpiry := time.Now().Add(24 * time.Hour)
-		creds := turn.GenerateCredentials(cfg.TurnSecret, accountID, turnExpiry)
-		turnCreds = &creds
-	}
-
+	// Build ICE config for agent - STUN-only (no TURN)
 	iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-		STUNURL:     cfg.STUNURL,
-		TurnURL:     cfg.TurnURL(),
-		Credentials: turnCreds,
+		STUNURL: cfg.STUNURL,
 	})
 
 	hub.SendDirect(ctx, conn, map[string]any{
 		"type":        "welcome",
 		"ice_servers": iceServers,
 	})
-}
-
-// isRelayCandidate reports whether a raw ICE candidate JSON is a TURN relay candidate.
-// The candidate field is a webrtc.ICECandidateInit object with a "candidate" string.
-func isRelayCandidate(raw json.RawMessage) bool {
-	var init struct {
-		Candidate string `json:"candidate"`
-	}
-	if err := json.Unmarshal(raw, &init); err != nil {
-		return false
-	}
-	return strings.Contains(init.Candidate, " typ relay")
 }
 
 // handleRegisterShare processes share registration (new or reconnect)
@@ -256,7 +310,7 @@ func handleRegisterShare(
 		// Try to create with collision retry (5 attempts)
 		created := false
 		for i := 0; i < 5; i++ {
-			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, msg.RelayOnly)
+			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub)
 			if err == nil {
 				created = true
 				break
@@ -291,7 +345,7 @@ func handleRegisterShare(
 			return
 		}
 
-		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt, msg.RelayOnly)
+		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub)
 		if err != nil {
 			if errors.Is(err, errCodeAlreadyInUse) {
 				hub.SendDirect(ctx, conn, map[string]string{
@@ -354,7 +408,7 @@ func handleRegisterShare(
 
 // createSession creates a new session record in PocketBase.
 // share_url and max_downloads are intentionally not stored — the server is untrusted.
-func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time, relayOnly bool) error {
+func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time, relayOnly bool, relayStaticPub string) error {
 	col, err := app.FindCollectionByNameOrId("sessions")
 	if err != nil {
 		return err
@@ -365,6 +419,7 @@ func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", agentID)
 	record.Set("relay_only", relayOnly)
+	record.Set("relay_static_pub", relayStaticPub)
 
 	if expiresAt != nil {
 		dt, _ := types.ParseDateTime(*expiresAt)
@@ -394,7 +449,7 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 }
 
 // claimSessionCode atomically creates or reassigns a custom code.
-func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly bool) (*core.Record, bool, error) {
+func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly bool, relayStaticPub string) (*core.Record, bool, error) {
 	var claimed *core.Record
 	reconnected := false
 
@@ -418,7 +473,7 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 			if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, relayOnly); err != nil {
+			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, relayOnly, relayStaticPub); err != nil {
 				return err
 			}
 			record, getErr := getSessionByCode(txApp, code)
@@ -442,6 +497,7 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 		}
 		record.Set("api_key_id", apiKeyID)
 		record.Set("agent_id", agentID)
+		record.Set("relay_static_pub", relayStaticPub)
 		if expiresAt != nil {
 			dt, _ := types.ParseDateTime(*expiresAt)
 			record.Set("expires_at", dt)

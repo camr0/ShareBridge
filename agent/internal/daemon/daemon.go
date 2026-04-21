@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -18,6 +19,7 @@ import (
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/peer"
+	"sharebridge/agent/internal/relaychannel"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 	"sharebridge/agent/internal/transfer"
@@ -27,6 +29,26 @@ import (
 type nonceEntry struct {
 	nonce     string
 	expiresAt time.Time
+}
+
+// relayTransferChannel is the interface for relay transfer channels.
+// It matches transfer.DataChannel plus lifecycle methods.
+type relayTransferChannel interface {
+	Start(ctx context.Context) error
+	SendBinary(data []byte) error
+	SendText(text string) error
+	BufferedAmount() uint64
+	Close() error
+	SetOnMessage(handler func([]byte))
+	SetOnOpen(handler func())
+	SetOnClose(handler func())
+}
+
+// relayChannelConfig holds configuration for creating a relay channel.
+type relayChannelConfig struct {
+	RelayURL      string
+	RelayJWT      string
+	StaticPrivate []byte
 }
 
 // WebServer is the interface for the admin UI web server.
@@ -45,6 +67,7 @@ type ConfigManagerInterface interface {
 // StoreInterface defines the interface for session storage.
 type StoreInterface interface {
 	GetAgentID() string
+	GetRelayStaticPrivateKey() ([]byte, error)
 	GetSession(code string) *store.SessionEntry
 	GetByShareURL(shareURL string) *store.SessionEntry
 	ListSessions(filterExpired bool) []store.SessionEntry
@@ -56,7 +79,7 @@ type StoreInterface interface {
 // SignalingClientInterface defines the interface for signaling client.
 type SignalingClientInterface interface {
 	Connect(ctx context.Context) error
-	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error)
+	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error)
 	DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error
 	Send(ctx context.Context, msg any) error
 	GetICEServers() []webrtc.ICEServer
@@ -77,9 +100,10 @@ type Session struct {
 	RelayOnly    bool
 	CreatedAt    time.Time
 
-	webdavClient *cloudwebdav.Client
-	peers        map[string]*peer.Peer // peerID -> Peer
-	mu           sync.Mutex
+	webdavClient   *cloudwebdav.Client
+	peers          map[string]*peer.Peer // peerID -> Peer
+	relayChannels  map[string]relayTransferChannel // sid -> relay channel
+	mu             sync.Mutex
 }
 
 // Daemon manages multiple concurrent sessions, a single signaling connection,
@@ -100,6 +124,9 @@ type Daemon struct {
 	// Nonce store for HMAC pre-challenge (connID -> nonce)
 	nonces   map[string]nonceEntry
 	noncesMu sync.Mutex
+
+	// Factory for creating relay channels (injected for testing)
+	newRelayChannel func(cfg relayChannelConfig) (relayTransferChannel, error)
 
 	// Callbacks for external handling (e.g., web server refresh)
 	OnSessionAdded   func(session *Session)
@@ -198,7 +225,7 @@ func (d *Daemon) Stop() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Close all peer connections
+	// Close all peer connections and relay channels
 	for _, session := range d.sessions {
 		session.mu.Lock()
 		for peerID, peerConn := range session.peers {
@@ -206,7 +233,11 @@ func (d *Daemon) Stop() error {
 				log.Printf("close peer %s: %v", peerID, err)
 			}
 		}
-		session.peers = make(map[string]*peer.Peer)
+		for sid, rc := range session.relayChannels {
+			if err := rc.Close(); err != nil {
+				log.Printf("close relay channel %s: %v", sid, err)
+			}
+		}
 		session.mu.Unlock()
 	}
 
@@ -253,8 +284,18 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 		fileID = ""
 	}
 
+	// Get relay static private key and derive public key
+	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
+	if err != nil {
+		return "", fmt.Errorf("get relay static key: %w", err)
+	}
+	relayStaticPub, err := RelayStaticPubHex(relayStaticPriv)
+	if err != nil {
+		return "", fmt.Errorf("derive relay static public key: %w", err)
+	}
+
 	// Register with signaling server (no preferred code for new sessions)
-	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly)
+	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly, relayStaticPub)
 	if err != nil {
 		return "", fmt.Errorf("register share: %w", err)
 	}
@@ -329,6 +370,12 @@ func (d *Daemon) RevokeSession(code string) error {
 			log.Printf("close peer %s: %v", peerID, err)
 		}
 	}
+	// Close all relay channels
+	for sid, rc := range session.relayChannels {
+		if err := rc.Close(); err != nil {
+			log.Printf("close relay channel %s: %v", sid, err)
+		}
+	}
 	session.mu.Unlock()
 
 	// Remove from store
@@ -392,6 +439,9 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 
 	case "ice_candidate":
 		d.handleICECandidate(msg.PeerID, msg.Candidate)
+
+	case "relay_prepare":
+		go d.handleRelayPrepare(msg)
 
 	case "error":
 		log.Printf("signaling error: %s", msg.Err)
@@ -486,6 +536,19 @@ func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
 	}
 
 	log.Printf("HMAC verified for session %s conn %s — creating peer", sessionCode, connID)
+
+	// Send auth_ok to signaling server after successful HMAC verification
+	d.signaling.Send(context.Background(), map[string]any{
+		"type":    "auth_ok",
+		"conn_id": connID,
+		"code":    sessionCode,
+	})
+
+	if session.RelayOnly {
+		log.Printf("relay-only session %s conn %s — skipping direct WebRTC peer", sessionCode, connID)
+		return
+	}
+
 	go d.createPeer(connID, sessionCode)
 }
 
@@ -667,10 +730,133 @@ func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
 	}
 }
 
+// handleRelayPrepare handles a relay_prepare message from the signaling server.
+// It creates a SecureRelayChannel, wires it to a transfer manager, and starts it.
+func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
+	log.Printf("relay_prepare received for session %s sid=%s", msg.Code, msg.SID)
+
+	d.mu.RLock()
+	session := d.sessions[msg.Code]
+	d.mu.RUnlock()
+	if session == nil {
+		log.Printf("relay_prepare for unknown session %s", msg.Code)
+		return
+	}
+
+	// Get relay static private key
+	rawPriv, err := d.store.GetRelayStaticPrivateKey()
+	if err != nil {
+		log.Printf("get relay static key: %v", err)
+		return
+	}
+	log.Printf("relay_prepare: got static key for session %s", msg.Code)
+
+	// Convert raw bytes to ecdh.PrivateKey
+	staticPriv, err := ecdh.P256().NewPrivateKey(rawPriv)
+	if err != nil {
+		log.Printf("import relay static key: %v", err)
+		return
+	}
+
+	// Create relay channel
+	relayURL := signaling.RelayWebSocketURL(d.config.SignalingURL)
+	log.Printf("relay_prepare: connecting to relay at %s for session %s", relayURL, msg.Code)
+
+	// Use factory function if set (for testing), otherwise create real channel
+	var channel relayTransferChannel
+	if d.newRelayChannel != nil {
+		channel, err = d.newRelayChannel(relayChannelConfig{
+			RelayURL:      relayURL,
+			RelayJWT:      msg.RelayJWT,
+			StaticPrivate: rawPriv,
+		})
+		if err != nil {
+			log.Printf("new relay channel: %v", err)
+			return
+		}
+	} else {
+		// Production: create SecureRelayChannel directly
+		rc, err := relaychannel.NewSecureRelayChannel(relaychannel.SecureRelayConfig{
+			RelayURL:      relayURL,
+			RelayJWT:      msg.RelayJWT,
+			StaticPrivate: staticPriv,
+		})
+		if err != nil {
+			log.Printf("new relay channel: %v", err)
+			return
+		}
+		channel = rc
+	}
+
+	// Create transfer manager for this relay channel
+	tm := transfer.NewManager(channel, session.webdavClient, session.MaxDownloads)
+	tm.SetDownloadCount(session.Downloads)
+
+	// Wire transfer callbacks
+	tm.OnSessionExpired = func() {
+		_ = d.signaling.Send(context.Background(), map[string]any{
+			"type":       "session_expired",
+			"session_id": msg.Code,
+		})
+	}
+	tm.OnDownloadComplete = func(bytesTransferred int64) {
+		session.mu.Lock()
+		session.Downloads++
+		session.mu.Unlock()
+		if _, err := d.store.IncrementDownloads(msg.Code); err != nil {
+			log.Printf("persist download count: %v", err)
+		}
+		_ = d.signaling.DownloadComplete(context.Background(), msg.Code, bytesTransferred)
+	}
+
+	// Wire channel callbacks
+	channel.SetOnMessage(tm.HandleMessage)
+	channel.SetOnOpen(tm.HandleOpen)
+	channel.SetOnClose(func() {
+		session.mu.Lock()
+		delete(session.relayChannels, msg.SID)
+		session.mu.Unlock()
+	})
+
+	// Add channel to session
+	session.mu.Lock()
+	if session.relayChannels == nil {
+		session.relayChannels = make(map[string]relayTransferChannel)
+	}
+	session.relayChannels[msg.SID] = channel
+	session.mu.Unlock()
+
+	// Start relay channel (asynchronously handles handshake)
+	log.Printf("relay_prepare: starting relay channel for session %s sid=%s", msg.Code, msg.SID)
+	if err := channel.Start(context.Background()); err != nil {
+		log.Printf("start relay channel sid=%s: %v", msg.SID, err)
+		session.mu.Lock()
+		delete(session.relayChannels, msg.SID)
+		session.mu.Unlock()
+		return
+	}
+	log.Printf("relay_prepare: relay channel started successfully for session %s sid=%s", msg.Code, msg.SID)
+}
+
 // loadSessionsFromStore loads persisted sessions from the store and
 // re-registers them with the signaling server.
 func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	sessions := d.store.ListSessions(true) // Filter expired
+
+	// Get relay static key once for all sessions
+	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
+	if err != nil {
+		log.Printf("warning: could not get relay static key: %v", err)
+		relayStaticPriv = nil
+	}
+	var relayStaticPub string
+	if relayStaticPriv != nil {
+		relayStaticPub, err = RelayStaticPubHex(relayStaticPriv)
+		if err != nil {
+			log.Printf("warning: could not derive relay static public key: %v", err)
+			relayStaticPub = ""
+		}
+	}
 
 	cfg := d.GetConfig()
 	for _, entry := range sessions {
@@ -687,7 +873,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		}
 
 		// Re-register with signaling server
-		code, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly)
+		code, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly, relayStaticPub)
 		if err != nil {
 			log.Printf("warning: could not re-register session %s: %v", entry.Code, err)
 			continue
@@ -753,6 +939,12 @@ func (d *Daemon) pruneExpiredSessions() {
 			for peerID, peerConn := range session.peers {
 				if err := peerConn.Close(); err != nil {
 					log.Printf("close peer %s: %v", peerID, err)
+				}
+			}
+			// Close all relay channels
+			for sid, rc := range session.relayChannels {
+				if err := rc.Close(); err != nil {
+					log.Printf("close relay channel %s: %v", sid, err)
 				}
 			}
 			session.mu.Unlock()
@@ -837,4 +1029,13 @@ func hasTURNServer(servers []webrtc.ICEServer) bool {
 		}
 	}
 	return false
+}
+
+// RelayStaticPubHex derives the hex-encoded P-256 public key from the raw private key bytes.
+func RelayStaticPubHex(rawPrivateKey []byte) (string, error) {
+	priv, err := ecdh.P256().NewPrivateKey(rawPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("import relay static key: %w", err)
+	}
+	return hex.EncodeToString(priv.PublicKey().Bytes()), nil
 }
