@@ -1,6 +1,9 @@
 package store
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,8 +32,9 @@ type SessionEntry struct {
 }
 
 type storeData struct {
-	AgentID  string         `json:"agent_id"` // UUID for reconnection
-	Sessions []SessionEntry `json:"sessions"`
+	AgentID               string         `json:"agent_id"` // UUID for reconnection
+	RelayStaticPrivateHex string         `json:"relay_static_private_hex,omitempty"` // P-256 private key for relay identity
+	Sessions              []SessionEntry `json:"sessions"`
 }
 
 type Store struct {
@@ -88,6 +92,31 @@ func (s *Store) GetAgentID() string {
 	}
 
 	return s.data.AgentID
+}
+
+// GetRelayStaticPrivateKey returns the agent's long-lived P-256 relay static private key,
+// generating one if it doesn't exist. The key is persisted in hex format.
+func (s *Store) GetRelayStaticPrivateKey() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.data.RelayStaticPrivateHex == "" {
+		priv, err := ecdh.P256().GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("generate relay static key: %w", err)
+		}
+		s.data.RelayStaticPrivateHex = hex.EncodeToString(priv.Bytes())
+		if err := s.save(); err != nil {
+			return nil, fmt.Errorf("persist relay static key: %w", err)
+		}
+		return append([]byte(nil), priv.Bytes()...), nil
+	}
+
+	raw, err := hex.DecodeString(s.data.RelayStaticPrivateHex)
+	if err != nil {
+		return nil, fmt.Errorf("decode relay static key: %w", err)
+	}
+	return raw, nil
 }
 
 // GetSession returns the session for a given code, or nil if not found.

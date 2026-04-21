@@ -65,10 +65,6 @@ ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 
-# Coturn TURN server
-ufw allow 3478/tcp
-ufw allow 3478/udp
-
 # Enable UFW (will prompt for confirmation - auto-confirm with --force)
 ufw --force enable
 
@@ -92,18 +88,22 @@ cd /opt/sharebridge/signaling-server
 
 # Generate secrets (save these!)
 echo -e "${YELLOW}Generating secrets...${NC}"
-COTURN_SECRET=$(openssl rand -base64 32)
+RELAY_JWT_SECRET=$(openssl rand -base64 32)
 SIGNING_KEY=$(openssl rand -base64 32)
 
 # Create .env file
 cat > .env <<EOF
 # ShareBridge Signaling Server Configuration
-COTURN_SECRET=${COTURN_SECRET}
 SIGNING_KEY=${SIGNING_KEY}
+RELAY_JWT_SECRET=${RELAY_JWT_SECRET}
 DB_PATH=/data/sharebridge.db
 MAX_SESSIONS=1000
 SESSION_TTL=24h
 LOG_LEVEL=info
+# Cloudflare STUN server (free, no auth required)
+STUN_URL=stun:stun.cloudflare.com:3478
+# Relay pending wait window (how long relay waits for peer before giving up)
+RELAY_PENDING_WAIT_WINDOW=30s
 EOF
 
 # Create docker-compose.yml
@@ -122,13 +122,12 @@ services:
       - MAX_SESSIONS=${MAX_SESSIONS:-1000}
       - SESSION_TTL=${SESSION_TTL:-24h}
       - DB_PATH=/data/sharebridge.db
-      - COTURN_HOST=coturn
-      - COTURN_SECRET=${COTURN_SECRET}
+      - RELAY_JWT_SECRET=${RELAY_JWT_SECRET}
+      - RELAY_PENDING_WAIT_WINDOW=${RELAY_PENDING_WAIT_WINDOW:-30s}
+      - STUN_URL=${STUN_URL:-stun:stun.cloudflare.com:3478}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
       - ./data:/data
-    depends_on:
-      - coturn
     networks:
       - sharebridge
     healthcheck:
@@ -136,25 +135,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-  coturn:
-    image: coturn/coturn:latest
-    container_name: coturn
-    restart: unless-stopped
-    network_mode: host
-    command: >
-      --use-auth-secret
-      --static-auth-secret=${COTURN_SECRET}
-      --realm=sharebridge
-      --listening-port=3478
-      --no-cli
-      --no-tls
-      --no-dtls
-      --stun-only=no
-      --fingerprint
-      --verbose
-    environment:
-      - COTURN_SECRET=${COTURN_SECRET}
 
 networks:
   sharebridge:
@@ -167,8 +147,13 @@ mkdir -p data
 # Create Caddyfile (user will need to edit domain)
 cat > /etc/caddy/Caddyfile <<'EOF'
 # ShareBridge Signaling Server
-# EDIT THIS: Replace with your domain
+# EDIT THIS: Replace with your actual domain
 share.example.com {
+    reverse_proxy localhost:8080
+}
+
+# Relay subdomain - configure as DNS-only in Cloudflare to bypass TOS
+relay.share.example.com {
     reverse_proxy localhost:8080
 }
 
@@ -222,12 +207,24 @@ cat > /opt/sharebridge/SETUP.md <<EOF
 ## 1. Configure your domain
 Edit /etc/caddy/Caddyfile:
    Replace 'share.example.com' with your actual domain
+   Replace 'relay.share.example.com' with relay.youractualdomain.com
 
 Reload Caddy:
    systemctl reload caddy
 
 ## 2. Configure DNS
 Point your domain's A record to this server's IP address.
+
+**Relay Security Considerations:**
+The relay subdomain uses a separate TLS certificate (not Cloudflare origin certificates) and exposes the VPS IP address. This is intentional and acceptable because:
+1. **Authentication required**: Relay connections require valid JWT tokens from the signaling server
+2. **Encrypted payload**: Relay traffic is encrypted end-to-end (Noise XX handshake); the relay server cannot read content
+3. **No origin exposure**: The main sharebridge.app site remains behind Cloudflare's orange cloud with origin certificates
+4. **Rate limiting**: JWT validation provides authentication gating; consider additional UFW rate limits if needed
+
+To add Cloudflare DDoS protection back to the relay (optional, costs $5/mo for Spectrum):
+   - Enable Cloudflare Spectrum for the relay subdomain (proxies TCP/WebSocket traffic)
+   - Update Caddy to use Cloudflare origin certificates for relay subdomain
 
 ## 3. Build and start the signaling server
 \`\`\`bash
@@ -256,8 +253,8 @@ curl https://your-domain.com/healthz
 \`\`\`
 
 ## 5. Get your secrets (save these somewhere secure!)
-Coturn Secret: ${COTURN_SECRET}
-Signing Key: ${SIGNING_KEY}
+Signing Key:   ${SIGNING_KEY}
+Relay JWT Secret: ${RELAY_JWT_SECRET}
 
 ## 6. Security checklist
 - [ ] SSH key-only auth (no passwords)
@@ -292,8 +289,8 @@ echo ""
 echo -e "${YELLOW}IMPORTANT: Read /opt/sharebridge/SETUP.md for next steps${NC}"
 echo ""
 echo "Your secrets (SAVE THESE):"
-echo "  Coturn Secret: ${COTURN_SECRET}"
-echo "  Signing Key:   ${SIGNING_KEY}"
+echo "  Signing Key:      ${SIGNING_KEY}"
+echo "  Relay JWT Secret: ${RELAY_JWT_SECRET}"
 echo ""
 echo "Next steps:"
 echo "  1. Configure your domain in /etc/caddy/Caddyfile"

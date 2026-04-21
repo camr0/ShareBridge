@@ -32,6 +32,9 @@ type Message struct {
 	HMAC        string          `json:"hmac,omitempty"`
 	Reconnected bool            `json:"reconnected,omitempty"`
 	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
+	SID         string          `json:"sid,omitempty"`
+	RelayJWT    string          `json:"relay_jwt,omitempty"`
+	ExpiresAt   string          `json:"expires_at,omitempty"`
 }
 
 // Client manages a WebSocket connection to the signaling server.
@@ -89,7 +92,8 @@ func (c *Client) Connect(ctx context.Context) error {
 // RegisterShare sends register_share message and waits for the response.
 // It must not call conn.Read directly — all reads go through Listen.
 // The response is delivered via pendingReg, which Listen feeds.
-func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool) (string, bool, error) {
+// relayStaticPub is the hex-encoded P-256 public key for relay identity.
+func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
 	responseCh := make(chan Message, 1)
 	c.pendingRegMu.Lock()
 	c.pendingReg = responseCh
@@ -107,6 +111,9 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 	}
 	if preferredCode != "" {
 		msg["code"] = preferredCode
+	}
+	if relayStaticPub != "" {
+		msg["relay_static_pub"] = relayStaticPub
 	}
 	if err := c.Send(ctx, msg); err != nil {
 		return "", false, fmt.Errorf("send register_share: %w", err)
@@ -217,4 +224,23 @@ func (c *Client) SetOnMessage(handler func(Message)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.OnMessage = handler
+}
+
+// RelayWebSocketURL derives the relay WebSocket URL from the signaling URL.
+// It converts http/https to ws/wss and appends "/ws/relay" path.
+func RelayWebSocketURL(signalingURL string) string {
+	u, err := url.Parse(signalingURL)
+	if err != nil {
+		return signalingURL + "/ws/relay"
+	}
+	switch u.Scheme {
+	case "https":
+		u.Scheme = "wss"
+	case "http":
+		u.Scheme = "ws"
+	}
+	u.Path = "/ws/relay"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }

@@ -20,3 +20,4 @@ bin/
 dist/
 signaling-server/server
 agent/opencloudshare
+agent/agent

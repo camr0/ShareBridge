@@ -4,20 +4,29 @@ import { hkdf2 } from './transcript.js'
 export class CipherState {
   #key
   #n = 0n
+  #pending = Promise.resolve()
 
   constructor(key) {
     this.#key = key
   }
 
   async encrypt(ad, plaintext) {
-    return this.encryptWithAd(ad, plaintext)
+    return this.#serialize(() => this.#encryptNow(ad, plaintext))
   }
 
   async decrypt(ad, ciphertext) {
-    return this.decryptWithAd(ad, ciphertext)
+    return this.#serialize(() => this.#decryptNow(ad, ciphertext))
   }
 
   async encryptWithAd(ad, plaintext) {
+    return this.#serialize(() => this.#encryptNow(ad, plaintext))
+  }
+
+  async decryptWithAd(ad, ciphertext) {
+    return this.#serialize(() => this.#decryptNow(ad, ciphertext))
+  }
+
+  async #encryptNow(ad, plaintext) {
     this.#assertInitializedKey()
     if (this.#n === (2n ** 64n) - 1n) {
       throw new Error('noise: nonce exhausted')
@@ -30,7 +39,7 @@ export class CipherState {
     return new Uint8Array(ct)
   }
 
-  async decryptWithAd(ad, ciphertext) {
+  async #decryptNow(ad, ciphertext) {
     this.#assertInitializedKey()
     if (this.#n === (2n ** 64n) - 1n) {
       throw new Error('noise: nonce exhausted')
@@ -50,6 +59,12 @@ export class CipherState {
   // Expose key for interop test vector generation only
   get keyBytes() { return this.#key }
   _setNonceForTest(value) { this.#n = value }
+
+  #serialize(operation) {
+    const result = this.#pending.then(operation, operation)
+    this.#pending = result.catch(() => {})
+    return result
+  }
 
   #assertInitializedKey() {
     if (isZeroKey(this.#key)) {
