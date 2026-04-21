@@ -36,12 +36,14 @@ export class SecureRelayChannel {
           reject(err)
         }
       }
+      const handleClose = () => {
+        this.readyState = 'closed'
+        reject(new Error('websocket closed during handshake'))
+        if (this.onclose) this.onclose()
+      }
       this._socket.addEventListener('open', handleOpen, { once: true })
       this._socket.addEventListener('error', reject, { once: true })
-      this._socket.addEventListener('close', () => {
-        this.readyState = 'closed'
-        if (this.onclose) this.onclose()
-      }, { once: true })
+      this._socket.addEventListener('close', handleClose, { once: true })
       if (this._socket.readyState === 1) {
         handleOpen()
       }
@@ -50,7 +52,22 @@ export class SecureRelayChannel {
     await new Promise((resolve, reject) => {
       this._handshakeResolve = resolve
       this._handshakeReject = reject
+      // If socket closes during handshake, reject the handshake promise
+      const handleClose = () => {
+        // Only reject if handshake hasn't completed and we haven't already rejected
+        if (this.readyState !== 'open' && !this._handshakeError) {
+          this.readyState = 'closed'
+          reject(new Error('websocket closed during handshake'))
+          if (this.onclose) this.onclose()
+        }
+      }
+      this._socket.addEventListener('close', handleClose, { once: true })
+      // Remove this handler once handshake succeeds
+      this._handshakeCleanup = () => {
+        this._socket.removeEventListener('close', handleClose)
+      }
     })
+    this._handshakeCleanup?.()
   }
 
   _handleMessage = async (event) => {
@@ -60,6 +77,7 @@ export class SecureRelayChannel {
         try {
           await this._handleHandshakeFrame(frame.payload)
         } catch (err) {
+          this._handshakeError = err
           this.close()
           this._handshakeReject?.(err)
         }
@@ -71,11 +89,15 @@ export class SecureRelayChannel {
         if (frame.kind === FRAME_TEXT) {
           this.onmessage?.({ data: new TextDecoder().decode(plaintext) })
         } else if (frame.kind === FRAME_BINARY) {
-          this.onmessage?.({ data: plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength) })
+          // Create a proper ArrayBuffer copy to avoid browser-specific issues with underlying buffer
+          const arrayBuffer = new ArrayBuffer(plaintext.length)
+          new Uint8Array(arrayBuffer).set(plaintext)
+          this.onmessage?.({ data: arrayBuffer })
         } else {
           throw new Error(`unknown frame kind: 0x${frame.kind.toString(16)}`)
         }
       } catch (err) {
+        console.error('[secure-relay] decrypt/forward error:', err.message, err.stack)
         this.close()
       }
     }
