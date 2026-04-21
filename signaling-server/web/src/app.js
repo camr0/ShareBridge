@@ -399,17 +399,21 @@ function join() {
         }
 
         const relayConnect = async () => {
+          debugLog('relayConnect called, creating SecureRelayChannel')
           const relayToken = msg.token
           const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
           const relayURL = `${protocol}//${location.host}/ws/relay`
           const expectedStaticPub = hexToBytes(relayPolicy.expectedStaticPubHex)
 
+          debugLog('relayConnect: creating channel', { relayURL, expectedStaticPubLength: expectedStaticPub?.length })
           const relayChannel = new SecureRelayChannel({
             relayURL,
             relayToken,
             expectedStaticPub,
           })
+          debugLog('relayConnect: calling channel.start()')
           await relayChannel.start()
+          debugLog('relayConnect: channel.start() completed successfully')
           return relayChannel
         }
 

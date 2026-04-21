@@ -1,6 +1,15 @@
 import { NoiseXX } from '../noise-p256/index.js'
 import { FRAME_HANDSHAKE, FRAME_TEXT, FRAME_BINARY, FrameDecoder, writeFrame } from './frame.js'
 
+const DEBUG = typeof location !== 'undefined' && (
+  location.search.includes('debug=1') ||
+  (typeof localStorage !== 'undefined' && localStorage.getItem('sharebridge_debug'))
+)
+
+function debugLog(...args) {
+  if (DEBUG) console.log('[secure-relay]', ...args)
+}
+
 export class SecureRelayChannel {
   constructor({ relayURL, relayToken, expectedStaticPub, websocketFactory = (url) => new WebSocket(url) }) {
     this._relayURL = relayURL
@@ -20,31 +29,44 @@ export class SecureRelayChannel {
   }
 
   async start() {
+    debugLog('SecureRelayChannel.start() called')
     this._noise = await NoiseXX.createInitiator()
+    debugLog('NoiseXX initiator created')
     this._socket = this._websocketFactory(this._relayURL)
     this._socket.binaryType = 'arraybuffer'
+    debugLog('WebSocket created, url:', this._relayURL, 'readyState:', this._socket.readyState)
 
     await new Promise((resolve, reject) => {
       const handleOpen = async () => {
+        debugLog('WebSocket open event fired')
         try {
           this._socket.send(new TextEncoder().encode(JSON.stringify({ token: this._relayToken })))
+          debugLog('Hello token sent')
           this._socket.addEventListener('message', this._handleMessage)
           const msg1 = await this._noise.writeMessage1()
+          debugLog('Noise msg1 created, sending...')
           this._socket.send(writeFrame(FRAME_HANDSHAKE, msg1))
+          debugLog('msg1 sent, waiting for msg2...')
           resolve()
         } catch (err) {
+          console.error('[secure-relay] Error in handleOpen:', err)
           reject(err)
         }
       }
       const handleClose = () => {
+        debugLog('WebSocket closed in first phase, readyState:', this.readyState)
         this.readyState = 'closed'
         reject(new Error('websocket closed during handshake'))
         if (this.onclose) this.onclose()
       }
       this._socket.addEventListener('open', handleOpen, { once: true })
-      this._socket.addEventListener('error', reject, { once: true })
+      this._socket.addEventListener('error', (e) => {
+        console.error('[secure-relay] WebSocket error in first phase:', e)
+        reject(e)
+      }, { once: true })
       this._socket.addEventListener('close', handleClose, { once: true })
       if (this._socket.readyState === 1) {
+        debugLog('WebSocket already open, calling handleOpen immediately')
         handleOpen()
       }
     })
@@ -52,10 +74,12 @@ export class SecureRelayChannel {
     await new Promise((resolve, reject) => {
       this._handshakeResolve = resolve
       this._handshakeReject = reject
+      debugLog('Waiting for handshake completion (msg2)...')
       // If socket closes during handshake, reject the handshake promise
       const handleClose = () => {
         // Only reject if handshake hasn't completed and we haven't already rejected
         if (this.readyState !== 'open' && !this._handshakeError) {
+          debugLog('WebSocket closed during handshake phase 2')
           this.readyState = 'closed'
           reject(new Error('websocket closed during handshake'))
           if (this.onclose) this.onclose()
@@ -67,17 +91,24 @@ export class SecureRelayChannel {
         this._socket.removeEventListener('close', handleClose)
       }
     })
+    debugLog('Handshake promise resolved, calling cleanup')
     this._handshakeCleanup?.()
+    debugLog('SecureRelayChannel.start() completed')
   }
 
   _handleMessage = async (event) => {
+    debugLog('WebSocket message received, data length:', event.data?.byteLength || event.data?.length || 'unknown')
     const chunk = new Uint8Array(event.data)
+    debugLog('Processing chunk, length:', chunk.length)
     for (const frame of this._decoder.push(chunk)) {
+      debugLog('Frame decoded, kind:', frame.kind, 'payload length:', frame.payload?.length)
       if (frame.kind === FRAME_HANDSHAKE) {
+        debugLog('Handling handshake frame')
         try {
           await this._handleHandshakeFrame(frame.payload)
         } catch (err) {
           this._handshakeError = err
+          console.error('[secure-relay] Handshake frame error:', err)
           this.close()
           this._handshakeReject?.(err)
         }
@@ -104,14 +135,17 @@ export class SecureRelayChannel {
   }
 
   async _handleHandshakeFrame(msg2) {
+    debugLog('Processing msg2 from responder')
     await this._noise.readMessage2(msg2)
     if (!equalBytes(this._noise.remoteStaticPub, this._expectedStaticPub)) {
       throw new Error('unexpected agent static key')
     }
+    debugLog('msg2 validated, sending msg3')
     const msg3 = await this._noise.writeMessage3()
     this._socket.send(writeFrame(FRAME_HANDSHAKE, msg3))
     ;[this._sendCipher, this._recvCipher] = await this._noise.split()
     this.readyState = 'open'
+    debugLog('Handshake complete, readyState is open')
     this._handshakeResolve?.()
     this.onopen?.()
   }
