@@ -28,6 +28,7 @@ For Slice 16a, the bottleneck is the browser save pipeline, not the transport pr
 - Prevent "complete" UI states until byte-count validation and SHA-1 validation pass when SHA-1 is available
 - Keep compatibility on non-streaming browsers via the existing Blob-style path
 - Make the fallback path explicit to the user when it is memory-backed and therefore more failure-prone for large files
+- Add an experimental large-file streaming path for Mobile Safari when in-memory Blob downloads are more likely to fail than help
 - Keep direct mode and relay mode identical above the transport boundary
 
 ## Non-Goals
@@ -69,6 +70,18 @@ On browsers that support StreamSaver-style streaming downloads:
   - if validation succeeds, write the held-back tail and close the writer
   - if validation fails, abort the writer and mark the download as failed
 
+### Experimental Mobile Safari Path
+
+On Mobile Safari, Slice 16a should use a size-based policy instead of pretending that one path fits all downloads:
+
+- downloads smaller than 100 MiB stay on the Blob-style in-memory path
+- downloads at or above 100 MiB may use an experimental StreamSaver-based path built from the Safari-capable fork
+- the page should show a strong warning before the large-download streaming path starts
+- once the user has tapped download, the experimental path should start automatically without an extra confirmation step
+- if that experimental streaming path fails, the transfer should fail outright rather than silently falling back to Blob for a large iOS download that is likely to run out of memory anyway
+
+This is intentionally a product-policy exception, not a claim that Mobile Safari is fully solved.
+
 ### Fallback Path
 
 On browsers that cannot use the streaming path:
@@ -88,23 +101,31 @@ Implementation should prefer runtime feature detection and initialization succes
 
 - can the StreamSaver service worker register successfully
 - are the required stream primitives available
-- can the streaming writer actually be created for this download
+- can the appropriate streaming writer actually be initialized for this browser bucket
 
-The browser/version groupings below are informational expectations for testing coverage, not the primary gating mechanism:
+The browser/version groupings below are the intended Slice 16a policy:
 
 - **Streaming-capable desktop browsers**
   - Chrome, Edge, Brave
   - Firefox desktop
   - Safari macOS 16.6+ after the StreamSaver Safari fallback patch
+- **Experimental large-file Mobile Safari**
+  - Safari iOS/iPadOS on Mobile Safari
+  - files below 100 MiB stay on Blob fallback
+  - files at or above 100 MiB use the experimental streaming path with a strong warning
 - **Non-streaming fallback browsers**
   - Safari macOS below 16.6
-  - Safari iOS
   - any browser where the StreamSaver path cannot be initialized successfully
 - **Uncertain/mobile browsers**
   - browsers that appear compatible but are known to have memory or lifecycle limits
   - these may still use the fallback path, but the UI should make the risk visible
 
-The one explicit browser-specific exception is the vendored StreamSaver Safari patch. In the current StreamSaver build, Safari is hard-forced onto Blob fallback through a Safari-specific check. For Slice 16a, the vendored copy should remove that forced fallback so Safari macOS 16.6+ can attempt the normal streaming path and then succeed or fail through the same runtime capability checks as other browsers.
+Slice 16a should still keep browser-specific exceptions narrow and explicit:
+
+- the vendored general StreamSaver build should remove the hardcoded Safari Blob-fallback check so Safari macOS 16.6+ can attempt normal streaming
+- the vendored Mobile Safari experiment should use the Safari-capable forked StreamSaver build rather than the generic build
+- the Mobile Safari threshold rule is the one intentional place where UA bucketing is acceptable, because the behavior is a product-policy decision tied to known iOS memory constraints, not just a support-detection shortcut
+- the Safari fork should be consumed as vendored static assets in the ShareBridge repo, refreshed from a pinned fork commit by a small sync script rather than a git submodule
 
 ## Integrity Model
 
@@ -173,7 +194,7 @@ The held-back tail does not need to be large. It only needs to be large enough t
 
 If `file_header.size` is less than or equal to the held-back tail size, the whole file may remain in memory until `chunk_end`. That is acceptable and should stay on the streaming code path rather than switching storage strategies mid-transfer. In that case, no bytes are written to disk until validation passes, which is actually the safest outcome for small files.
 
-## Fallback UX
+## Warning UX
 
 If the browser is forced onto the Blob path, the page should say so before download starts.
 
@@ -182,11 +203,19 @@ The warning should communicate:
 - this browser is using an in-memory download path
 - large downloads may fail
 - desktop Chrome, Firefox, Edge, and Safari 16.6+ use the safer streaming path
+- large iPhone/iPad downloads may use an experimental streaming path instead of the memory-backed one
 
 When file size is known, the message can be more specific, for example:
 
 - normal fallback warning for small files
 - stronger warning for large files such as 500 MiB or larger
+
+For Mobile Safari files at or above 100 MiB, the page should show a different strong warning that communicates:
+
+- this download is using an experimental streaming path on iPhone/iPad
+- the path is meant to avoid iOS memory limits on large files
+- it usually works, but may still stall or fail and require retrying later or using another device/browser
+- the transfer will start automatically because the user already chose to download the file
 
 The goal is honesty, not gating. Slice 16a keeps the fallback path available rather than refusing the download.
 
@@ -203,6 +232,7 @@ Suggested user-visible states:
 - `failed`
 - `corrupted`
 - `memory-backed download` warning on fallback browsers
+- `experimental iPhone/iPad download` warning on large Mobile Safari transfers
 
 The UI should not mark a transfer as complete until validation is done. That is the main semantic change from the current implementation. `intact` means byte-count validation passed and checksum validation passed when a checksum was provided. If no checksum was available, the transfer may still complete as `done` under the weaker byte-count-only validation model already used by current non-OpenCloud sources.
 
@@ -223,6 +253,12 @@ Abort the writer and show a failed state when any of the following occur:
 - the writer reports an error while writing or closing
 
 If streaming initialization fails before any bytes are written, the browser may fall back to the Blob path if that behavior is explicit and predictable. If bytes have already begun streaming, the browser should fail the transfer instead of silently switching storage strategies mid-file.
+
+For the Mobile Safari experimental path, the rule is stricter:
+
+- if the large-file experimental path cannot initialize before the transfer starts, fail the transfer instead of silently downgrading to large in-memory Blob mode
+- if the experimental path fails mid-transfer, fail the transfer outright
+- do not offer an automatic Blob retry for those large iPhone/iPad downloads
 
 Aborting the streaming writer does not guarantee cleanup of bytes already written to disk. Slice 16a should explicitly accept that a failed streaming download may leave behind a visibly partial file. The implementation should not chase a fake cleanup mechanism that StreamSaver does not provide. The UX should instead make the failure clear so the user understands the leftover file is incomplete and can be deleted manually if desired.
 
@@ -251,6 +287,10 @@ Expected implementation areas:
   - fallback warning helpers
 - vendored StreamSaver assets under the web app
   - include the Safari patch in the vendored copy by removing the hardcoded Safari Blob-fallback check from the upstream build
+  - vendor the Safari-capable fork as a separate Mobile Safari-specific build so the experimental iPhone/iPad path is isolated from the default desktop/general build
+  - refresh both vendored builds from pinned upstream/fork commits via a small repo-local sync script so deployment stays self-contained and the browser assets remain normal tracked files
+  - the sync script should also reapply the generic upstream Safari patch when refreshing `streamsaver.js`, so rerunning the script cannot silently restore the hardcoded Blob fallback
+  - record the source repo URL and pinned commit SHA in a short header comment or adjacent metadata note when refreshing the vendored files
 - service worker asset registration for the streaming path
 
 The Go agent transfer manager should remain unchanged for Slice 16a unless implementation uncovers a concrete gap.
@@ -280,14 +320,17 @@ Manually verify:
 - Chrome desktop streaming path
 - Firefox desktop streaming path
 - Safari macOS 16.6+ streaming path with the patched StreamSaver build
-- at least one non-streaming fallback case, ideally Safari iOS or an older Safari/macOS environment
+- Safari iOS/iPadOS below 100 MiB on the Blob fallback path
+- Safari iOS/iPadOS at or above 100 MiB on the experimental streaming path
 
 Manual verification should confirm:
 
 - large files no longer require full-buffer memory on streaming-capable browsers
 - fallback browsers show an explicit warning before download
+- large iPhone/iPad downloads show the experimental warning before streaming begins
 - corrupted or truncated transfers do not land as successful completed files
 - failed streaming downloads are clearly presented as failed even if a partial file is left behind on disk
+- failed large iPhone/iPad downloads do not silently retry through the Blob path
 - direct and relay modes behave the same from the recipient UI's point of view
 
 ### Performance Check
@@ -306,4 +349,5 @@ This does not need to be a formal benchmark suite in Slice 16a; it is a sanity c
 - Use incremental hashing for the streaming path
 - Keep Blob fallback for incompatible browsers
 - Warn explicitly when the browser is using the memory-backed fallback path
+- Add a Mobile Safari threshold policy: Blob below 100 MiB, experimental streaming at or above 100 MiB, fail outright if that experimental path fails
 - Defer parallel downloads, resumable downloads, and broader download-manager redesign to later slices
