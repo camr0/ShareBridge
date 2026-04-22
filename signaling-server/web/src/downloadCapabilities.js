@@ -1,4 +1,5 @@
 export const MOBILE_SAFARI_EXPERIMENT_BYTES = 100 * 1024 * 1024
+const LARGE_FILE_WARNING_BYTES = 500 * 1024 * 1024
 
 function isMobileSafari(userAgent = '') {
   return /Safari/i.test(userAgent) && /Mobile/i.test(userAgent) && !/CriOS|FxiOS|EdgiOS|OPiOS|Chrome|Chromium|Android/i.test(userAgent)
@@ -9,12 +10,12 @@ function formatReason(reason) {
 }
 
 export function buildFallbackWarning({ fileSize, reason }) {
-  const isLargeFile = typeof fileSize === 'number' && fileSize >= MOBILE_SAFARI_EXPERIMENT_BYTES
+  const isLargeFile = typeof fileSize === 'number' && fileSize >= LARGE_FILE_WARNING_BYTES
 
   return {
     level: isLargeFile ? 'strong' : 'normal',
     message: isLargeFile
-      ? `This browser is using a fallback path, and large downloads may fail. Reason: ${reason}.`
+      ? `This browser is using the in-memory download path, and large downloads may fail. Reason: ${reason}.`
       : `This browser is using the in-memory download path. Reason: ${reason}.`,
   }
 }
@@ -28,9 +29,9 @@ export function buildExperimentalWarning() {
 
 export async function detectDownloadSupport({
   fileSize = 0,
-  userAgent = '',
-  hasWritableStream = false,
-  hasServiceWorker = false,
+  userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : '',
+  hasWritableStream = typeof WritableStream !== 'undefined',
+  hasServiceWorker = typeof navigator !== 'undefined' && !!navigator.serviceWorker,
   registerServiceWorker,
   registerExperimentalServiceWorker,
 } = {}) {

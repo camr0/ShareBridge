@@ -7,6 +7,46 @@ import {
   buildExperimentalWarning,
 } from './downloadCapabilities.js'
 
+test('detectDownloadSupport derives runtime defaults when args are omitted', async (t) => {
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const originalWritableStream = Object.getOwnPropertyDescriptor(globalThis, 'WritableStream')
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: {
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+      serviceWorker: {},
+    },
+  })
+  Object.defineProperty(globalThis, 'WritableStream', {
+    configurable: true,
+    writable: true,
+    value: class WritableStreamMock {},
+  })
+
+  t.after(() => {
+    if (originalNavigator) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigator)
+    } else {
+      delete globalThis.navigator
+    }
+
+    if (originalWritableStream) {
+      Object.defineProperty(globalThis, 'WritableStream', originalWritableStream)
+    } else {
+      delete globalThis.WritableStream
+    }
+  })
+
+  const result = await detectDownloadSupport({
+    registerServiceWorker: async () => ({ scope: '/src/vendor/' }),
+  })
+
+  assert.equal(result.mode, 'streaming')
+  assert.equal(result.warning, null)
+})
+
 test('detectDownloadSupport chooses streaming when runtime primitives are present', async () => {
   const result = await detectDownloadSupport({
     hasWritableStream: true,
@@ -80,6 +120,7 @@ test('buildFallbackWarning strengthens copy for large files', () => {
   const mobile = buildExperimentalWarning()
 
   assert.match(small.message, /in-memory download path/i)
+  assert.match(large.message, /in-memory download path/i)
   assert.match(large.message, /large downloads may fail/i)
   assert.match(mobile.message, /experimental streaming path/i)
 })
