@@ -50,7 +50,7 @@ export async function detectDownloadSupport({
     if (fileSize < MOBILE_SAFARI_EXPERIMENT_BYTES) {
       return {
         mode: 'blob',
-        reason: `Mobile Safari downloads below 100 MiB stay on the blob fallback.`,
+        reason: 'Mobile Safari downloads below 100 MiB stay on the blob fallback.',
         warning: buildFallbackWarning({
           fileSize,
           reason: 'Mobile Safari downloads below 100 MiB stay on the blob fallback',
