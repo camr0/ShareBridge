@@ -73,6 +73,21 @@ test('detectDownloadSupport chooses experimental streaming for large Mobile Safa
   assert.match(result.warning.message, /experimental streaming path/i)
 })
 
+test('detectDownloadSupport chooses experimental streaming at the exact Mobile Safari threshold', async () => {
+  const result = await detectDownloadSupport({
+    fileSize: MOBILE_SAFARI_EXPERIMENT_BYTES,
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    hasWritableStream: true,
+    hasServiceWorker: true,
+    registerServiceWorker: async () => ({ scope: '/src/vendor/' }),
+    registerExperimentalServiceWorker: async () => ({ scope: '/src/vendor/' }),
+  })
+
+  assert.equal(result.mode, 'experimental-streaming')
+  assert.equal(result.warning.level, 'strong')
+  assert.match(result.warning.message, /experimental streaming path/i)
+})
+
 test('detectDownloadSupport keeps small Mobile Safari downloads on blob fallback', async () => {
   const result = await detectDownloadSupport({
     fileSize: 10 * 1024 * 1024,
@@ -111,7 +126,8 @@ test('detectDownloadSupport fails large Mobile Safari downloads when experimenta
 
   assert.equal(result.mode, 'fail')
   assert.match(result.reason, /register failed/i)
-  assert.match(result.warning.message, /experimental streaming path/i)
+  assert.match(result.warning.message, /attempted the experimental streaming path/i)
+  assert.match(result.warning.message, /initialization failed/i)
 })
 
 test('buildFallbackWarning strengthens copy for large files', () => {

@@ -20,10 +20,16 @@ export function buildFallbackWarning({ fileSize, reason }) {
   }
 }
 
+function buildExperimentalWarningMessage({ failed = false, reason } = {}) {
+  return failed
+    ? `This browser attempted the experimental streaming path for large downloads, but initialization failed. Reason: ${reason}.`
+    : 'This browser is using the experimental streaming path for large downloads.'
+}
+
 export function buildExperimentalWarning() {
   return {
     level: 'strong',
-    message: 'This browser is using the experimental streaming path for large downloads.',
+    message: buildExperimentalWarningMessage(),
   }
 }
 
@@ -38,6 +44,8 @@ export async function detectDownloadSupport({
   const mobileSafari = isMobileSafari(userAgent)
   const hasRuntimeStreaming = hasWritableStream && hasServiceWorker
 
+  // Policy-driven heuristic: Mobile Safari gets a separate large-file path because
+  // its default download behavior is unreliable at this threshold.
   if (mobileSafari) {
     if (fileSize < MOBILE_SAFARI_EXPERIMENT_BYTES) {
       return {
@@ -61,10 +69,17 @@ export async function detectDownloadSupport({
         warning: buildExperimentalWarning(),
       }
     } catch (error) {
+      const reason = formatReason(error)
       return {
         mode: 'fail',
-        reason: formatReason(error),
-        warning: buildExperimentalWarning(),
+        reason,
+        warning: {
+          level: 'strong',
+          message: buildExperimentalWarningMessage({
+            failed: true,
+            reason,
+          }),
+        },
       }
     }
   }
