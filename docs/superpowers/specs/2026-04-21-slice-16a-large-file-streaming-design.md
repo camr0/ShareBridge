@@ -84,7 +84,13 @@ This keeps compatibility without pretending that all browsers have the same reli
 
 The browser should classify the download path before the first chunk is written.
 
-The spec assumes three broad categories:
+Implementation should prefer runtime feature detection and initialization success over browser-sniffing. The practical checks are:
+
+- can the StreamSaver service worker register successfully
+- are the required stream primitives available
+- can the streaming writer actually be created for this download
+
+The browser/version groupings below are informational expectations for testing coverage, not the primary gating mechanism:
 
 - **Streaming-capable desktop browsers**
   - Chrome, Edge, Brave
@@ -98,7 +104,7 @@ The spec assumes three broad categories:
   - browsers that appear compatible but are known to have memory or lifecycle limits
   - these may still use the fallback path, but the UI should make the risk visible
 
-Capability detection should prefer actual runtime support over brittle browser-sniffing where possible. The one explicit browser-specific exception is the vendored StreamSaver Safari patch described in the existing memory note.
+The one explicit browser-specific exception is the vendored StreamSaver Safari patch. In the current StreamSaver build, Safari is hard-forced onto Blob fallback through a Safari-specific check. For Slice 16a, the vendored copy should remove that forced fallback so Safari macOS 16.6+ can attempt the normal streaming path and then succeed or fail through the same runtime capability checks as other browsers.
 
 ## Integrity Model
 
@@ -129,14 +135,16 @@ When `file_header.sha1` is present:
 When `file_header.sha1` is absent:
 
 - byte-count validation is still required
-- the UI should not claim cryptographic integrity verification
-- completion may be shown as successful but unverified
+- completion may still be shown as `done`
+- the UI should avoid implying that checksum verification ran when no checksum was available
 
 This matches current reality, where SHA-1 is available on OpenCloud and only sometimes available on other sources.
 
 ### Why Incremental Hashing
 
 `SubtleCrypto.digest()` does not support streaming input, so it cannot be used for the new streaming path without reintroducing full-file buffering. The streaming path therefore needs an incremental hashing implementation such as `hash-wasm` or an equivalent library with `init/update/digest` semantics.
+
+Slice 16a only needs SHA-1 because that is the checksum the current protocol already carries. The browser-side hasher wrapper may be written so a future slice can swap algorithms without rewriting the pipeline, but this slice only guarantees SHA-1 behavior end to end.
 
 ## Streaming Save Pipeline
 
@@ -161,7 +169,9 @@ The streaming pipeline should work like this:
      - abort the writer
      - mark failure
 
-The held-back tail does not need to be large. It only needs to be large enough that a failed validation never leaves the user with a convincingly complete file on disk. The existing memory note suggests roughly 1 MiB, which is a reasonable starting point for implementation planning.
+The held-back tail does not need to be large. It only needs to be large enough that a failed validation never leaves the user with a convincingly complete file on disk, while still being negligible RAM cost compared with the full file. Roughly 1 MiB is a reasonable starting point for implementation planning.
+
+If `file_header.size` is less than or equal to the held-back tail size, the whole file may remain in memory until `chunk_end`. That is acceptable and should stay on the streaming code path rather than switching storage strategies mid-transfer. In that case, no bytes are written to disk until validation passes, which is actually the safest outcome for small files.
 
 ## Fallback UX
 
@@ -188,13 +198,13 @@ Suggested user-visible states:
 
 - `downloading`
 - `verifying`
+- `intact`
 - `done`
-- `done (unverified)` when no SHA-1 is available
 - `failed`
 - `corrupted`
 - `memory-backed download` warning on fallback browsers
 
-The UI should not mark a transfer as complete until validation is done. That is the main semantic change from the current implementation.
+The UI should not mark a transfer as complete until validation is done. That is the main semantic change from the current implementation. `intact` means byte-count validation passed and checksum validation passed when a checksum was provided. If no checksum was available, the transfer may still complete as `done` under the weaker byte-count-only validation model already used by current non-OpenCloud sources.
 
 ## Failure Handling
 
@@ -206,12 +216,15 @@ Abort the writer and show a failed state when any of the following occur:
 
 - the streaming writer cannot be initialized
 - service worker registration fails and no streaming writer can be created
-- `chunk_end` never arrives
+- no chunk activity arrives for 60 seconds after the most recent received chunk and before `chunk_end`
+- the peer connection or data channel closes before `chunk_end`
 - byte count does not match `file_header.size`
 - SHA-1 does not match `file_header.sha1`
 - the writer reports an error while writing or closing
 
 If streaming initialization fails before any bytes are written, the browser may fall back to the Blob path if that behavior is explicit and predictable. If bytes have already begun streaming, the browser should fail the transfer instead of silently switching storage strategies mid-file.
+
+Aborting the streaming writer does not guarantee cleanup of bytes already written to disk. Slice 16a should explicitly accept that a failed streaming download may leave behind a visibly partial file. The implementation should not chase a fake cleanup mechanism that StreamSaver does not provide. The UX should instead make the failure clear so the user understands the leftover file is incomplete and can be deleted manually if desired.
 
 ### Fallback Path Failures
 
@@ -237,7 +250,7 @@ Expected implementation areas:
   - incremental hash wrapper
   - fallback warning helpers
 - vendored StreamSaver assets under the web app
-  - include the Safari patch in the vendored copy
+  - include the Safari patch in the vendored copy by removing the hardcoded Safari Blob-fallback check from the upstream build
 - service worker asset registration for the streaming path
 
 The Go agent transfer manager should remain unchanged for Slice 16a unless implementation uncovers a concrete gap.
@@ -251,8 +264,10 @@ Add browser-side tests for:
 - capability detection
 - streaming-path chunk handling
 - held-back-tail behavior
+- small-file behavior when the whole file fits inside the held-back tail
 - byte-count validation
 - checksum validation
+- transfer timeout and connection-close failure handling
 - fallback warning conditions
 - "no SHA-1 available" completion behavior
 
@@ -272,6 +287,7 @@ Manual verification should confirm:
 - large files no longer require full-buffer memory on streaming-capable browsers
 - fallback browsers show an explicit warning before download
 - corrupted or truncated transfers do not land as successful completed files
+- failed streaming downloads are clearly presented as failed even if a partial file is left behind on disk
 - direct and relay modes behave the same from the recipient UI's point of view
 
 ### Performance Check
