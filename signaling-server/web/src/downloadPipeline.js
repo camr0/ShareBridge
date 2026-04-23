@@ -88,6 +88,9 @@ export async function createDownloadPipeline({
       onTerminalState(terminal)
       return terminal
     },
+    async fail(code, message) {
+      return fail(code, message)
+    },
     async failForDisconnect() {
       return fail('disconnected', 'Connection closed before completion')
     },

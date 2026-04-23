@@ -245,3 +245,26 @@ test('connection closure fails the pipeline before completion', async () => {
   assert.equal(result.avgBytesPerSecond, 2)
   assert.equal(terminal.code, 'disconnected')
 })
+
+test('explicit failure reports the provided code and message', async () => {
+  let abortReason = null
+  const pipeline = await createDownloadPipeline({
+    header: { name: 'movie.mp4', size: 8, mimeType: 'video/mp4', sha1: '' },
+    sinkFactory: async () => ({
+      append() {},
+      finalize() {},
+      abort(reason) {
+        abortReason = reason
+      },
+    }),
+    now: () => 1000,
+    scheduleTimeout: () => 1,
+    clearScheduledTimeout: () => {},
+  })
+
+  const result = await pipeline.fail('transfer-error', 'Agent reported an error')
+
+  assert.equal(abortReason, 'transfer-error')
+  assert.equal(result.code, 'transfer-error')
+  assert.equal(result.statusText, '✗ Agent reported an error')
+})

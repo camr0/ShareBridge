@@ -242,6 +242,48 @@ function fakeFileItem() {
   }
 }
 
+function withMinimalDocument(fn) {
+  const originalDocument = globalThis.document
+  const elements = new Map([
+    ['status', {
+      textContent: '',
+    }],
+    ['join-section', {
+      classList: {
+        removed: [],
+        added: [],
+        remove(name) { this.removed.push(name) },
+        add(name) { this.added.push(name) },
+      },
+    }],
+    ['connection-status', {
+      classList: {
+        added: [],
+        add(name) { this.added.push(name) },
+      },
+    }],
+    ['connection-type', {
+      className: '',
+    }],
+  ])
+
+  globalThis.document = {
+    getElementById(id) {
+      const el = elements.get(id)
+      if (!el) {
+        throw new Error('unexpected element id: ' + id)
+      }
+      return el
+    },
+  }
+
+  return Promise.resolve()
+    .then(() => fn(elements))
+    .finally(() => {
+      globalThis.document = originalDocument
+    })
+}
+
 test('applyFinalDownloadState maps checksum-backed success to intact', () => {
   const fileItem = fakeFileItem()
 
@@ -265,16 +307,39 @@ test('applyFinalDownloadState maps checksum-backed success to intact', () => {
 })
 
 test('handleTransferClosure fails an active download before chunk_end', async () => {
-  let failed = false
-  __test.setActiveDownload({
-    async failForDisconnect() {
-      failed = true
-      return { ok: false, code: 'disconnected', statusText: '✗ Connection closed before completion' }
-    },
+  await withMinimalDocument(async () => {
+    let failed = false
+    __test.setTransferSession({ channel: { readyState: 'closed' }, mode: 'relay' })
+    __test.setActiveDownload({
+      async failForDisconnect() {
+        failed = true
+        return { ok: false, code: 'disconnected', statusText: '✗ Connection closed before completion' }
+      },
+    })
+
+    await __test.handleTransferClosure()
+
+    assert.equal(failed, true)
+    assert.equal(__test.getTransferSession().transferChannel, null)
+    __test.setActiveDownload(null)
   })
+})
 
-  await __test.handleTransferClosure()
+test('handleError fails the active download and clears the dead session', async () => {
+  await withMinimalDocument(async () => {
+    let failedArgs = null
+    __test.setTransferSession({ channel: { readyState: 'closed' }, mode: 'relay' })
+    __test.setActiveDownload({
+      async fail(code, message) {
+        failedArgs = { code, message }
+        return { ok: false, code, statusText: `✗ ${message}` }
+      },
+    })
 
-  assert.equal(failed, true)
-  __test.setActiveDownload(null)
+    await __test.handleError({ message: 'agent exploded' })
+
+    assert.deepEqual(failedArgs, { code: 'transfer-error', message: 'agent exploded' })
+    assert.equal(__test.getTransferSession().transferChannel, null)
+    __test.setActiveDownload(null)
+  })
 })

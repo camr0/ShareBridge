@@ -565,7 +565,7 @@ async function handleTransferMessage(event) {
       await completeDownload()
       break
     case 'error':
-      handleError(msg)
+      await handleError(msg)
       break
     default:
       debugLog('unhandled transfer message type', { type: msg.type })
@@ -635,6 +635,10 @@ function getFileItem(name) {
 function requestFile(name) {
   if (activeDownload) {
     updateStatus('Download in progress, please wait')
+    return
+  }
+  if (!transferChannel) {
+    updateStatus('Connection closed')
     return
   }
   const fullPath = [...currentPath, name].join('/')
@@ -838,7 +842,9 @@ function updateDownloadUI(file, state) {
 }
 
 function finalizeDownloadUI(file, result) {
-  updateStatus('')
+  if (result.code !== 'disconnected' && result.code !== 'transfer-error') {
+    updateStatus('')
+  }
   applyFinalDownloadState(getFileItem(file.name), file, result)
 }
 
@@ -888,6 +894,10 @@ function renderBreadcrumb() {
 function navigateTo(index) {
   // index -1 = share root, 0 = first segment, 1 = second, etc.
   currentPath = index === -1 ? [] : currentPath.slice(0, index + 1)
+  if (!transferChannel) {
+    updateStatus('Connection closed')
+    return
+  }
   requestFileList(transferChannel, currentPath.join('/'))
 }
 
@@ -896,11 +906,19 @@ function openFolder(name) {
     updateStatus('Download in progress, please wait')
     return
   }
+  if (!transferChannel) {
+    updateStatus('Connection closed')
+    return
+  }
   currentPath.push(name)
   requestFileList(transferChannel, currentPath.join('/'))
 }
 
 function requestFileList(channel, subpath) {
+  if (!channel) {
+    updateStatus('Connection closed')
+    return
+  }
   debugLog('requesting file list', {
     subpath,
     mode: currentTransferMode,
@@ -914,7 +932,7 @@ function submitPassword() {
   sendJoin()
 }
 
-function handleError(msg) {
+async function handleError(msg) {
   const message = msg.message || ''
   debugLog('transfer error message received', {
     message,
@@ -922,6 +940,14 @@ function handleError(msg) {
     receivedBytes,
     receivedChunkCount,
   })
+
+  if (activeDownload?.fail) {
+    updateStatus('Transfer failed')
+    await activeDownload.fail('transfer-error', message || 'Transfer failed')
+    clearClosedTransferSession()
+    return
+  }
+
   updateStatus('Error: ' + message)
 }
 
@@ -929,10 +955,19 @@ async function handleTransferClosure() {
   const download = activeDownload
   if (download?.failForDisconnect) {
     await download.failForDisconnect()
+    clearClosedTransferSession()
     return
   }
 
   resetUI()
+}
+
+function clearClosedTransferSession() {
+  transferChannel = null
+  currentTransferMode = null
+  getConnectionStatusEl().classList.add('hidden')
+  getConnectionTypeEl().className = 'connection-badge'
+  showSection('join-section')
 }
 
 function resetUI() {
@@ -1030,6 +1065,17 @@ export const __test = {
   setActiveDownload(download) {
     activeDownload = download
   },
+  setTransferSession({ channel, mode }) {
+    transferChannel = channel
+    currentTransferMode = mode
+  },
+  getTransferSession() {
+    return {
+      transferChannel,
+      currentTransferMode,
+    }
+  },
   handleTransferClosure,
+  handleError,
   applyFinalDownloadState,
 }
