@@ -17,6 +17,9 @@ export async function createDownloadPipeline({
   let timeoutId = null
 
   const bumpTimeout = () => {
+    if (finished) {
+      return
+    }
     if (timeoutId) {
       clearScheduledTimeout(timeoutId)
     }
@@ -41,15 +44,17 @@ export async function createDownloadPipeline({
 
       receivedBytes += bytes.length
       receivedChunkCount += 1
-      await sink.append(bytes)
       bumpTimeout()
+      try {
+        await sink.append(bytes)
+      } catch (err) {
+        return fail('append-failed', buildOperationFailureMessage(err))
+      }
+      if (finished) {
+        return { ok: false, code: 'already-finished' }
+      }
 
-      onStateChange({
-        phase: 'downloading',
-        receivedBytes,
-        expectedBytes: header.size,
-        receivedChunkCount,
-      })
+      onStateChange(buildProgressState('downloading', { header, receivedBytes, receivedChunkCount }))
     },
     async complete() {
       if (finished) {
@@ -61,18 +66,18 @@ export async function createDownloadPipeline({
         clearScheduledTimeout(timeoutId)
       }
 
-      onStateChange({
-        phase: 'verifying',
-        receivedBytes,
-        expectedBytes: header.size,
-        receivedChunkCount,
-      })
+      onStateChange(buildProgressState('verifying', { header, receivedBytes, receivedChunkCount }))
 
-      const result = await sink.finalize({
-        expectedSha1: header.sha1 || null,
-        expectedSize: header.size,
-        receivedBytes,
-      })
+      let result
+      try {
+        result = await sink.finalize({
+          expectedSha1: header.sha1 || null,
+          expectedSize: header.size,
+          receivedBytes,
+        })
+      } catch (err) {
+        return abortAndEmitFailure('finalize-failed', buildOperationFailureMessage(err))
+      }
       const terminal = mapFinalizeResult({
         result,
         receivedBytes,
@@ -94,17 +99,28 @@ export async function createDownloadPipeline({
     }
 
     finished = true
+    return abortAndEmitFailure(code, message)
+  }
+
+  async function abortAndEmitFailure(code, message) {
     if (timeoutId) {
       clearScheduledTimeout(timeoutId)
+      timeoutId = null
     }
 
-    await sink.abort(code)
+    try {
+      await sink.abort(code)
+    } catch {}
     const terminal = {
       ok: false,
       code,
       statusClass: 'failed',
       statusText: `✗ ${message}`,
-      avgBytesPerSecond: 0,
+      avgBytesPerSecond: computeAverageBytesPerSecond({
+        receivedBytes,
+        startedAt,
+        finishedAt: now(),
+      }),
       computedSha1: null,
     }
     onTerminalState(terminal)
@@ -112,9 +128,26 @@ export async function createDownloadPipeline({
   }
 }
 
+function buildProgressState(phase, { header, receivedBytes, receivedChunkCount }) {
+  return {
+    phase,
+    receivedBytes,
+    expectedBytes: header.size,
+    receivedChunkCount,
+  }
+}
+
+function buildOperationFailureMessage(err) {
+  const detail = err instanceof Error ? err.message : String(err)
+  return detail ? `Download failed: ${detail}` : 'Download failed'
+}
+
 function mapFinalizeResult({ result, receivedBytes, startedAt, finishedAt }) {
-  const elapsedSeconds = Math.max(1, (finishedAt - startedAt) / 1000)
-  const avgBytesPerSecond = receivedBytes / elapsedSeconds
+  const avgBytesPerSecond = computeAverageBytesPerSecond({
+    receivedBytes,
+    startedAt,
+    finishedAt,
+  })
 
   if (!result.ok) {
     return {
@@ -135,4 +168,9 @@ function mapFinalizeResult({ result, receivedBytes, startedAt, finishedAt }) {
     avgBytesPerSecond,
     computedSha1: result.computedSha1 || null,
   }
+}
+
+function computeAverageBytesPerSecond({ receivedBytes, startedAt, finishedAt }) {
+  const elapsedSeconds = Math.max(1, (finishedAt - startedAt) / 1000)
+  return receivedBytes / elapsedSeconds
 }
