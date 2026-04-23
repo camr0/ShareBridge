@@ -205,3 +205,76 @@ test('direct failure after quota warning keeps the quota-blocked message', async
   // Reset quota state
   __test.setQuotaState({ exceeded: false, periodEnd: null })
 })
+
+function fakeFileItem() {
+  const parts = {
+    status: { textContent: '', className: '' },
+    size: { textContent: '' },
+    hash: { textContent: '' },
+    progress: {
+      classList: {
+        added: [],
+        add(name) {
+          this.added.push(name)
+        },
+      },
+    },
+  }
+
+  return {
+    classList: {
+      added: [],
+      removed: [],
+      add(name) {
+        this.added.push(name)
+      },
+      remove(...names) {
+        this.removed.push(...names)
+      },
+    },
+    querySelector(selector) {
+      if (selector === '.file-status') return parts.status
+      if (selector === '.file-size') return parts.size
+      if (selector === '.file-hash') return parts.hash
+      if (selector === '.file-progress') return parts.progress
+      throw new Error('unexpected selector: ' + selector)
+    },
+  }
+}
+
+test('applyFinalDownloadState maps checksum-backed success to intact', () => {
+  const fileItem = fakeFileItem()
+
+  __test.applyFinalDownloadState(fileItem, {
+    name: 'report.pdf',
+    size: 1024,
+    sha1: 'abc123',
+  }, {
+    ok: true,
+    code: 'intact',
+    statusClass: 'verified',
+    statusText: '✓ intact',
+    avgBytesPerSecond: 2048,
+    computedSha1: 'abc123',
+  })
+
+  assert.equal(fileItem.querySelector('.file-status').textContent, '✓ intact')
+  assert.equal(fileItem.querySelector('.file-status').className, 'file-status ok')
+  assert.equal(fileItem.classList.added.at(-1), 'verified')
+  assert.equal(fileItem.querySelector('.file-hash').textContent, 'SHA-1: abc123')
+})
+
+test('handleTransferClosure fails an active download before chunk_end', async () => {
+  let failed = false
+  __test.setActiveDownload({
+    async failForDisconnect() {
+      failed = true
+      return { ok: false, code: 'disconnected', statusText: '✗ Connection closed before completion' }
+    },
+  })
+
+  await __test.handleTransferClosure()
+
+  assert.equal(failed, true)
+  __test.setActiveDownload(null)
+})
