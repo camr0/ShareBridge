@@ -23,7 +23,7 @@ export function buildFallbackWarning({ fileSize, reason }) {
 function buildExperimentalWarningMessage({ failed = false, reason } = {}) {
   return failed
     ? `This browser attempted the experimental streaming path for large downloads, but initialization failed. Reason: ${reason}.`
-    : 'This browser is using the experimental streaming path for large downloads.'
+    : 'This browser is using the experimental streaming path for large downloads. This might fail.'
 }
 
 export function buildExperimentalWarning() {
