@@ -7,6 +7,9 @@ import {
   applyConnectionBadge,
   initializeIceConfigTransport,
   assertJoinNotActive,
+  isTransferChannelActive,
+  detachBrowserSignalingSocket,
+  handleBrowserSignalingClose,
   __test,
 } from './app.js'
 
@@ -139,6 +142,56 @@ test('assertJoinNotActive throws loudly when join re-enters on an active socket'
 
 test('assertJoinNotActive allows a closed socket', () => {
   assert.doesNotThrow(() => assertJoinNotActive({ readyState: 3 }, () => {}))
+})
+
+test('isTransferChannelActive only treats open/connecting channels as active', () => {
+  assert.equal(isTransferChannelActive(null), false)
+  assert.equal(isTransferChannelActive({ readyState: 'closed' }), false)
+  assert.equal(isTransferChannelActive({ readyState: 'closing' }), false)
+  assert.equal(isTransferChannelActive({ readyState: 'connecting' }), true)
+  assert.equal(isTransferChannelActive({ readyState: 'open' }), true)
+})
+
+test('detachBrowserSignalingSocket closes an open signaling socket and installs ignore handlers', () => {
+  const logs = []
+  const socket = {
+    readyState: 1,
+    onmessage: () => {},
+    onerror: null,
+    onclose: null,
+    closeCalls: [],
+    close(code, reason) {
+      this.closeCalls.push({ code, reason })
+    },
+  }
+
+  const detached = detachBrowserSignalingSocket(socket, (...args) => logs.push(args))
+
+  assert.equal(detached, null)
+  assert.equal(socket.onmessage, null)
+  assert.equal(typeof socket.onerror, 'function')
+  assert.equal(typeof socket.onclose, 'function')
+  assert.deepEqual(socket.closeCalls, [{ code: 1000, reason: 'transfer channel active' }])
+  assert.match(logs[0][0], /detaching browser signaling WebSocket/)
+})
+
+test('handleBrowserSignalingClose ignores signaling closure once transfer channel is active', () => {
+  let peerClosed = false
+  let resetCalled = false
+  const logs = []
+
+  const handled = handleBrowserSignalingClose({
+    event: { code: 1006, reason: 'proxy idle timeout', wasClean: false },
+    transferChannel: { readyState: 'open' },
+    pc: { close() { peerClosed = true } },
+    resetUI: () => { resetCalled = true },
+    log: (...args) => logs.push(args),
+  })
+
+  assert.equal(handled, false)
+  assert.equal(peerClosed, false)
+  assert.equal(resetCalled, false)
+  assert.match(logs[0][0], /ignoring browser signaling WebSocket close/)
 })
 
 test('relay_policy opens the relay channel and requests the root file list', async () => {
