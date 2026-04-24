@@ -60,6 +60,59 @@ export function assertJoinNotActive(socket, log = debugLog) {
   throw err
 }
 
+export function isTransferChannelActive(channel) {
+  return Boolean(channel && (channel.readyState === 'open' || channel.readyState === 'connecting'))
+}
+
+export function detachBrowserSignalingSocket(socket, log = debugLog) {
+  if (!socket) {
+    return null
+  }
+
+  log('detaching browser signaling WebSocket', { readyState: socket.readyState })
+  socket.onmessage = null
+  socket.onerror = (event) => {
+    log('ignoring browser signaling WebSocket error after transfer channel open', event)
+  }
+  socket.onclose = (event) => {
+    log('ignoring browser signaling WebSocket close after transfer channel open', {
+      code: event?.code,
+      reason: event?.reason,
+      wasClean: event?.wasClean,
+    })
+  }
+
+  if (socket.readyState === 0 || socket.readyState === 1) {
+    socket.close(1000, 'transfer channel active')
+  }
+
+  return null
+}
+
+export function handleBrowserSignalingClose({
+  event,
+  transferChannel,
+  pc,
+  resetUI,
+  log = debugLog,
+}) {
+  if (isTransferChannelActive(transferChannel)) {
+    log('ignoring browser signaling WebSocket close after transfer channel became active', {
+      code: event?.code,
+      reason: event?.reason,
+      wasClean: event?.wasClean,
+      transferMode: currentTransferMode,
+      channelReadyState: transferChannel?.readyState,
+    })
+    return false
+  }
+
+  log('browser signaling WebSocket close', { code: event.code, reason: event.reason, wasClean: event.wasClean })
+  if (pc) pc.close()
+  resetUI()
+  return true
+}
+
 // Export for testing
 export function publishGlobalActions(globals, { join, submitPassword, navigateTo }) {
   globals.join = join
@@ -234,6 +287,7 @@ function attachTransferChannel({
     hideSection('password-section')
     applyConnectionBadge({ mode })
     requestFileList(channel, '')
+    ws = detachBrowserSignalingSocket(ws)
   }
 
   channel.onopen = handleOpen
@@ -499,6 +553,10 @@ function join() {
   }
 
   ws.onerror = (event) => {
+    if (isTransferChannelActive(transferChannel)) {
+      debugLog('ignoring browser signaling WebSocket error after transfer channel became active', event)
+      return
+    }
     debugLog('browser signaling WebSocket error', event)
     if (relayQuotaExceeded) {
       const periodEnd = quotaPeriodEnd ? new Date(quotaPeriodEnd).toLocaleDateString() : 'soon'
@@ -508,9 +566,13 @@ function join() {
     }
   }
   ws.onclose = (event) => {
-    debugLog('browser signaling WebSocket close', { code: event.code, reason: event.reason, wasClean: event.wasClean })
-    if (pc) pc.close()
-    void handleTransferClosure()
+    handleBrowserSignalingClose({
+      event,
+      transferChannel,
+      pc,
+      resetUI,
+      log: debugLog,
+    })
   }
 }
 
@@ -999,6 +1061,11 @@ function resetUI() {
   sessionPassword = ''
   transferChannel = null
   currentTransferMode = null
+  ws = null
+  pc = null
+  dc = null
+  pendingCandidates = []
+  remoteDescSet = false
 }
 
 function escapeHtml(text) {

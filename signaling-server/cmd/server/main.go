@@ -160,26 +160,21 @@ func main() {
 }
 
 func deleteExpiredSessions(app core.App) error {
-	for {
-		records, err := app.FindRecordsByFilter(
-			"sessions",
-			"expires_at <= {:now}",
-			"",
-			500,
-			0,
-			map[string]any{"now": time.Now().UTC().Format(time.RFC3339)},
-		)
-		if err != nil {
-			return err
-		}
-		if len(records) == 0 {
-			return nil
-		}
+	records, err := app.FindAllRecords("sessions")
+	if err != nil {
+		return err
+	}
 
-		for _, record := range records {
-			if err := app.Delete(record); err != nil {
-				return fmt.Errorf("delete expired session %s: %w", record.Id, err)
-			}
+	now := time.Now().UTC()
+	for _, record := range records {
+		expiresAt := record.GetDateTime("expires_at")
+		if expiresAt.IsZero() || expiresAt.Time().After(now) {
+			continue
+		}
+		if err := app.Delete(record); err != nil {
+			return fmt.Errorf("delete expired session %s: %w", record.Id, err)
 		}
 	}
+
+	return nil
 }
