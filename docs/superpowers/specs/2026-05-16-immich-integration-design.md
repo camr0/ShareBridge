@@ -42,7 +42,9 @@ type Client struct {
 | `GetFile` | `GET /api/assets/{id}/original?key={key}` | share key |
 | `PollShares` | `GET /shared-links` | API key (sharedLink.read) |
 
-**Password handling**: Unlike OC/NC (where the agent owns and verifies the password via HMAC), the Immich agent is a blind relay. It does not know the password. When a recipient submits a password, the agent forwards it to the Immich API as an `X-Immich-Shared-Link-Password` header. Immich's own auth gates the share and returns accept/reject. The agent sees only the yes/no result. Whether a share requires a password is discovered from the share info response on first access.
+**Password handling**: Unlike OC/NC (where the agent owns the password and verifies it via HMAC pre-challenge), the Immich agent is a blind relay. It does not know the password — Immich stores it as a hash. When a recipient submits a password, the agent forwards it to the Immich API as an `X-Immich-Shared-Link-Password` header. Immich's own auth gates the share and returns accept/reject. The agent sees only the yes/no result.
+
+This is a slight regression from the OC/NC HMAC model: the raw password transits through the signaling server on join. In practice the HMAC model itself assumes a trusted signaling server serving untampered JS (a malicious server can swap the JS to capture the password before it is ever HMAC'd), so the real security boundary is that the signaling server has no LAN or Immich access. The password alone is useless without network access to Immich.
 
 ## Protocol Changes
 
