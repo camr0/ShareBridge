@@ -26,6 +26,14 @@ type browserMsg struct {
 func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.HandlerFunc {
 	return func(responseWriter http.ResponseWriter, request *http.Request) {
 		sessionCode := request.URL.Query().Get("session")
+		log.Printf("browser_ws: request received session=%q remote=%s ua=%q upgrade=%q connection=%q wskey=%q",
+			sessionCode,
+			request.RemoteAddr,
+			request.UserAgent(),
+			request.Header.Get("Upgrade"),
+			request.Header.Get("Connection"),
+			request.Header.Get("Sec-WebSocket-Key"),
+		)
 
 		records, err := app.FindRecordsByFilter(
 			"sessions",
@@ -41,6 +49,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			return
 		}
 		if len(records) == 0 {
+			log.Printf("browser_ws: session lookup returned no records for code=%q", sessionCode)
 			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
@@ -48,14 +57,19 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 
 		expiresAt := sessionRecord.GetDateTime("expires_at")
 		if !expiresAt.IsZero() && time.Now().After(expiresAt.Time()) {
+			log.Printf("browser_ws: session expired code=%q expires_at=%s now=%s",
+				sessionCode,
+				expiresAt.Time().UTC().Format(time.RFC3339),
+				time.Now().UTC().Format(time.RFC3339),
+			)
 			http.Error(responseWriter, `{"error":"session not found or expired"}`, http.StatusNotFound)
 			return
 		}
 
-		log.Printf("browser_ws: incoming request session=%s remote=%s upgrade=%q wskey=%q",
-			sessionCode, request.RemoteAddr,
-			request.Header.Get("Upgrade"),
-			request.Header.Get("Sec-WebSocket-Key"),
+		log.Printf("browser_ws: session lookup succeeded code=%q api_key_id=%q relay_only=%v",
+			sessionCode,
+			sessionRecord.GetString("api_key_id"),
+			sessionRecord.GetBool("relay_only"),
 		)
 		browserConn, err := websocket.Accept(responseWriter, request, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
@@ -83,7 +97,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
-		defer sessionHub.UnpairSession(sessionCode)
+		defer sessionHub.UnpairSession(sessionCode, browserConn)
 
 		connID := generateConnID()
 		sessionHub.RegisterBrowserConn(connID, browserConn)

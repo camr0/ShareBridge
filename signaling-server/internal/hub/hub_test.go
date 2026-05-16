@@ -158,7 +158,7 @@ func TestPairSession(t *testing.T) {
 	require.NoError(t, err)
 
 	// Unpair
-	h.UnpairSession(code)
+	h.UnpairSession(code, browserServerConn)
 
 	// Cleanup
 	_ = agentConn.Close(websocket.StatusNormalClosure, "test complete")
@@ -248,7 +248,7 @@ func TestUnpairSession(t *testing.T) {
 	require.NoError(t, err)
 
 	// Unpair
-	h.UnpairSession(code)
+	h.UnpairSession(code, browserServerConn)
 
 	// ForwardToAgent should return nil (no error, but no-op)
 	ctx := context.Background()
@@ -263,6 +263,31 @@ func TestUnpairSession(t *testing.T) {
 	_ = agentConn.Close(websocket.StatusNormalClosure, "test complete")
 	_ = browserClient.Close(websocket.StatusNormalClosure, "test complete")
 	_ = browserServerConn.Close(websocket.StatusNormalClosure, "test complete")
+}
+
+func TestUnpairSession_ReplacementPairSurvivesOldCleanup(t *testing.T) {
+	h := New()
+	apiKey := "test-api-key-replacement"
+	code := "REPLACE123"
+
+	agentConn := new(websocket.Conn)
+	originalBrowserConn := new(websocket.Conn)
+	replacementBrowserConn := new(websocket.Conn)
+
+	h.RegisterAgent(apiKey, agentConn)
+	h.RegisterCode(code, apiKey)
+
+	require.NoError(t, h.PairSession(code, originalBrowserConn))
+	require.NoError(t, h.PairSession(code, replacementBrowserConn))
+
+	h.UnpairSession(code, originalBrowserConn)
+
+	h.mu.RLock()
+	sessionPair := h.pairs[code]
+	h.mu.RUnlock()
+
+	require.NotNil(t, sessionPair)
+	assert.Equal(t, replacementBrowserConn, sessionPair.browserConn)
 }
 
 func TestSendToAgent(t *testing.T) {

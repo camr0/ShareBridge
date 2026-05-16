@@ -93,9 +93,18 @@ func (h *Hub) PairSession(sessionID string, browserConn *websocket.Conn) error {
 	return nil
 }
 
-func (h *Hub) UnpairSession(sessionID string) {
+// UnpairSession removes the active browser pair for sessionID, but only if the
+// caller is cleaning up the browser connection that is still current.
+func (h *Hub) UnpairSession(sessionID string, browserConn *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	sessionPair, ok := h.pairs[sessionID]
+	if !ok {
+		return
+	}
+	if browserConn != nil && sessionPair.browserConn != browserConn {
+		return
+	}
 	delete(h.pairs, sessionID)
 }
 

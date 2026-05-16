@@ -67,6 +67,7 @@
     .file-item.downloading { border-left-color: #89b4fa; cursor: default; }
     .file-item.verified   { border-left-color: #a6e3a1; cursor: default; }
     .file-item.corrupted  { border-left-color: #f38ba8; cursor: default; }
+    .file-item.failed     { border-left-color: #f38ba8; cursor: default; }
     .file-item.done       { border-left-color: #6c7086; cursor: default; }
 
     .file-main {
@@ -137,6 +138,26 @@
       background: #f59e0b;
       color: white;
     }
+
+    .download-warning {
+      margin: 12px 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      background: rgba(245, 158, 11, 0.14);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      color: #f9d18b;
+    }
+
+    .download-warning.hidden {
+      display: none;
+    }
+
+    .download-warning-strong {
+      background: rgba(243, 139, 168, 0.14);
+      border-color: rgba(243, 139, 168, 0.35);
+      color: #f5b3c7;
+    }
   </style>
 </head>
 <body>
@@ -147,6 +168,7 @@
     <button onclick="join()">Join</button>
   </div>
   <div id="status"></div>
+  <div id="download-warning" class="download-warning hidden" role="status" aria-live="polite"></div>
   <div id="password-section" class="hidden">
     <p>This share is password protected.</p>
     <input id="password-input" type="password" placeholder="Enter password" />

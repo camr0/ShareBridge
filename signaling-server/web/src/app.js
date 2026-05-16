@@ -1,6 +1,15 @@
 import { DirectChannel, waitForDirectChannelOpen } from './directChannel.js'
 import { SecureRelayChannel } from './secureRelayChannel.js'
 import { connectTransferChannel, buildDirectIceServers, decodeRelayPolicyToken } from './connectTransferChannel.js'
+import { detectDownloadSupport } from './downloadCapabilities.js'
+import {
+  createBlobSink,
+  createBrowserStreamWriter,
+  createIncrementalSha1,
+  createSafariBrowserStreamWriter,
+  createStreamingSink,
+} from './downloadSinks.js'
+import { createDownloadPipeline } from './downloadPipeline.js'
 
 // Module state
 let pc, ws, dc
@@ -10,6 +19,7 @@ let pendingCandidates = []
 let remoteDescSet = false
 let relayQuotaExceeded = false
 let quotaPeriodEnd = null
+let activeDownload = null
 
 const DEBUG = typeof location !== 'undefined' && (
   location.search.includes('debug=1') ||
@@ -31,8 +41,6 @@ let directChannelPromise = new Promise((resolve, reject) => {
 // Download state
 let currentFile = null
 let receivedBytes = 0
-let fileChunks = []
-let isDownloading = false
 let transferStartTime = 0
 let receivedChunkCount = 0
 
@@ -242,7 +250,7 @@ export function installSessionMessageHandler({
             requestFileList,
             applyConnectionBadge: ({ mode }) => applyBadge({ mode }),
             handleTransferMessage,
-            onClose: resetUI,
+            onClose: handleTransferClosure,
           })
           break
       }
@@ -269,6 +277,7 @@ function attachTransferChannel({
   onClose,
 }) {
   let opened = false
+  let messageChain = Promise.resolve()
   const handleOpen = () => {
     if (opened) return
     opened = true
@@ -283,12 +292,9 @@ function attachTransferChannel({
 
   channel.onopen = handleOpen
   channel.onmessage = (event) => {
-    try {
-      handleTransferMessage(event)
-    } catch (err) {
+    messageChain = messageChain.then(() => handleTransferMessage(event)).catch((err) => {
       console.error('[secure-relay] transfer message handler error:', err)
-      throw err
-    }
+    })
   }
   channel.onclose = () => {
     debugLog('transfer channel closed', {
@@ -299,7 +305,9 @@ function attachTransferChannel({
       receivedChunkCount,
     })
     updateStatus('Connection closed')
-    onClose()
+    void Promise.resolve(onClose()).catch((err) => {
+      console.error('[secure-relay] transfer close handler error:', err)
+    })
   }
 
   if (channel.readyState === 'open') {
@@ -390,7 +398,7 @@ function join() {
               if (directChannelReject) {
                 directChannelReject(new Error('PeerConnection failed'))
               }
-              resetUI()
+              void handleTransferClosure()
             },
           })
           break
@@ -529,7 +537,7 @@ function join() {
                 mode,
               }),
             handleTransferMessage,
-            onClose: resetUI,
+            onClose: handleTransferClosure,
           })
           break
         }
@@ -591,14 +599,14 @@ async function sendJoin() {
   pendingNonce = null
 }
 
-function handleTransferMessage(event) {
+async function handleTransferMessage(event) {
   if (event.data instanceof ArrayBuffer) {
     debugLog('transfer binary message received', {
       byteLength: event.data.byteLength,
       currentFile: currentFile?.name || null,
     })
     const bytes = new Uint8Array(event.data)
-    appendChunk(bytes)
+    await appendChunk(bytes)
     return
   }
 
@@ -613,13 +621,13 @@ function handleTransferMessage(event) {
       renderFileList(msg.files)
       break
     case 'file_header':
-      startDownload(msg)
+      await startDownload(msg)
       break
     case 'chunk_end':
-      completeDownload()
+      await completeDownload()
       break
     case 'error':
-      handleError(msg)
+      await handleError(msg)
       break
     default:
       debugLog('unhandled transfer message type', { type: msg.type })
@@ -687,8 +695,12 @@ function getFileItem(name) {
 }
 
 function requestFile(name) {
-  if (isDownloading) {
+  if (activeDownload) {
     updateStatus('Download in progress, please wait')
+    return
+  }
+  if (!transferChannel) {
+    updateStatus('Connection closed')
     return
   }
   const fullPath = [...currentPath, name].join('/')
@@ -701,11 +713,18 @@ function requestFile(name) {
   transferChannel.send(JSON.stringify({ type: 'file_request', path: fullPath }))
 }
 
-function startDownload(header) {
+async function getDownloadSupport(header) {
+  return detectDownloadSupport({
+    fileSize: header.size,
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+    registerServiceWorker: () => navigator.serviceWorker.register('/src/vendor/streamsaver-sw.js'),
+    registerExperimentalServiceWorker: () => navigator.serviceWorker.register('/src/vendor/streamsaver-safari-sw.js'),
+  })
+}
+
+async function startDownload(header) {
   currentFile = header
   receivedBytes = 0
-  fileChunks = []
-  isDownloading = true
   transferStartTime = Date.now()
   receivedChunkCount = 0
   debugLog('download started', {
@@ -723,124 +742,196 @@ function startDownload(header) {
     fileItem.onclick = null
     fileItem.querySelector('.file-progress').classList.remove('hidden')
     fileItem.querySelector('.file-progress-text').textContent = '0%'
+    fileItem.querySelector('.file-progress-fill').style.width = '0%'
+    fileItem.querySelector('.file-hash').textContent = ''
+  }
+
+  const support = await getDownloadSupport(header)
+  renderDownloadWarning(support.warning)
+
+  if (support.mode === 'fail') {
+    finalizeDownloadUI(header, {
+      ok: false,
+      code: 'unsupported',
+      statusClass: 'failed',
+      statusText: '✗ experimental download unavailable',
+      avgBytesPerSecond: 0,
+      computedSha1: null,
+    })
+    currentFile = null
+    transferStartTime = 0
+    return
+  }
+
+  try {
+    activeDownload = await createDownloadPipeline({
+      header,
+      sinkFactory: async () => buildDownloadSink(header, support),
+      onStateChange: (state) => updateDownloadUI(header, state),
+      onTerminalState: (result) => {
+        finalizeDownloadUI(header, result)
+        activeDownload = null
+        currentFile = null
+        receivedBytes = 0
+        receivedChunkCount = 0
+        transferStartTime = 0
+      },
+    })
+  } catch (err) {
+    debugLog('download initialization failed', {
+      file: header.name,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    finalizeDownloadUI(header, {
+      ok: false,
+      code: 'init-failed',
+      statusClass: 'failed',
+      statusText: '✗ failed',
+      avgBytesPerSecond: 0,
+      computedSha1: null,
+    })
+    activeDownload = null
+    currentFile = null
+    receivedBytes = 0
+    receivedChunkCount = 0
+    transferStartTime = 0
   }
 }
 
-function appendChunk(bytes) {
-  if (!currentFile) return
-  fileChunks.push(bytes)
-  receivedBytes += bytes.length
-  receivedChunkCount += 1
-
-  if (receivedChunkCount <= 3 || receivedChunkCount % 25 === 0 || receivedBytes === currentFile.size) {
-    debugLog('download chunk received', {
-      file: currentFile.name,
-      chunkCount: receivedChunkCount,
-      chunkBytes: bytes.length,
-      receivedBytes,
-      expectedBytes: currentFile.size,
-    })
-  }
-
-  const pct = currentFile.size > 0 ? Math.round((receivedBytes / currentFile.size) * 100) : 0
-  const elapsed = (Date.now() - transferStartTime) / 1000
-  const speedBps = elapsed > 0 ? receivedBytes / elapsed : 0
-
-  const fileItem = getFileItem(currentFile.name)
-  if (fileItem) {
-    fileItem.querySelector('.file-progress-fill').style.width = pct + '%'
-    fileItem.querySelector('.file-progress-text').textContent =
-      `${pct}% — ${formatBytes(receivedBytes)} of ${formatBytes(currentFile.size)}`
-    const statusEl = fileItem.querySelector('.file-status')
-    statusEl.textContent = '↓ ' + formatSpeed(speedBps)
-    statusEl.className = 'file-status speed'
-  }
+async function appendChunk(bytes) {
+  if (!activeDownload || !currentFile) return
+  await activeDownload.append(bytes)
 }
 
 async function completeDownload() {
-  if (!currentFile) return
+  if (!activeDownload || !currentFile) return
   debugLog('download complete frame received', {
     file: currentFile.name,
     receivedBytes,
     chunkCount: receivedChunkCount,
   })
-  // Assemble all chunks
-  const totalLength = fileChunks.reduce((sum, c) => sum + c.length, 0)
-  const combined = new Uint8Array(totalLength)
-  let offset = 0
-  for (const chunk of fileChunks) {
-    combined.set(chunk, offset)
-    offset += chunk.length
-  }
-
-  // Trigger browser file save immediately — don't wait for SHA-1
-  const blob = new Blob([combined], { type: currentFile.mimeType || 'application/octet-stream' })
-  const objectUrl = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = objectUrl
-  a.download = currentFile.name
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(objectUrl)
-
-  const elapsed = (Date.now() - transferStartTime) / 1000
-  const avgSpeed = elapsed > 0 ? formatSpeed(totalLength / elapsed) : '—'
-
-  // Capture state before reset
-  const downloadedFile = currentFile
-  const downloadedBuffer = combined
-
-  // Reset transfer state
-  isDownloading = false
-  updateStatus('')
-  currentFile = null
-  fileChunks = []
-  receivedBytes = 0
-  receivedChunkCount = 0
-  transferStartTime = 0
-
-  const fileItem = getFileItem(downloadedFile.name)
-  if (fileItem) {
-    fileItem.querySelector('.file-progress').classList.add('hidden')
-  }
-
-  // SHA-1 verification (async — updates UI after save dialog appears)
-  if (downloadedFile.sha1 && typeof crypto !== 'undefined' && crypto.subtle) {
-    try {
-      const hashBuffer = await crypto.subtle.digest('SHA-1', downloadedBuffer.buffer)
-      const hashArray = Array.from(new Uint8Array(hashBuffer))
-      const computed = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
-      const ok = computed === downloadedFile.sha1.toLowerCase()
-
-      if (fileItem) {
-        fileItem.classList.remove('downloading')
-        fileItem.classList.add(ok ? 'verified' : 'corrupted')
-        fileItem.querySelector('.file-status').textContent = ok ? '✓ intact' : '✗ corrupted'
-        fileItem.querySelector('.file-status').className = 'file-status ' + (ok ? 'ok' : 'fail')
-        fileItem.querySelector('.file-size').textContent = formatBytes(downloadedFile.size) + ' · avg ' + avgSpeed
-        fileItem.querySelector('.file-hash').textContent = ok
-          ? 'SHA-1: ' + downloadedFile.sha1.toLowerCase()
-          : 'expected ' + downloadedFile.sha1.slice(0, 8) + '… got ' + computed.slice(0, 8) + '…'
-      }
-    } catch (e) {
-      markFileDone(fileItem, downloadedFile, avgSpeed)
-    }
-  } else {
-    markFileDone(fileItem, downloadedFile, avgSpeed)
-  }
+  await activeDownload.complete()
 }
 
-function markFileDone(fileItem, file, avgSpeed) {
-  if (!fileItem) return
-  fileItem.classList.remove('downloading')
-  fileItem.classList.add('done')
-  fileItem.querySelector('.file-status').textContent = '✓ done'
-  fileItem.querySelector('.file-status').className = 'file-status ok'
-  fileItem.querySelector('.file-size').textContent = formatBytes(file.size) + ' · avg ' + avgSpeed
-  if (file.sha1) {
-    fileItem.querySelector('.file-hash').textContent = 'SHA-1: ' + file.sha1.toLowerCase()
+async function buildDownloadSink(header, support) {
+  if (support.mode === 'experimental-streaming') {
+    return createStreamingSink({
+      fileName: header.name,
+      mimeType: header.mimeType,
+      tailBytes: 1024 * 1024,
+      createWriter: createSafariBrowserStreamWriter,
+      createHasher: createIncrementalSha1,
+    })
   }
+
+  if (support.mode === 'streaming') {
+    return createStreamingSink({
+      fileName: header.name,
+      mimeType: header.mimeType,
+      tailBytes: 1024 * 1024,
+      createWriter: createBrowserStreamWriter,
+      createHasher: createIncrementalSha1,
+    })
+  }
+
+  return createBlobSink({
+    fileName: header.name,
+    mimeType: header.mimeType,
+    subtleDigest: (algorithm, bytes) => crypto.subtle.digest(algorithm, bytes),
+    triggerBrowserSave: saveBlobToDisk,
+  })
+}
+
+function renderDownloadWarning(warning) {
+  const el = document.getElementById('download-warning')
+  if (!el) return
+
+  if (!warning) {
+    el.textContent = ''
+    el.className = 'download-warning hidden'
+    return
+  }
+
+  el.textContent = warning.message
+  el.className = `download-warning${warning.level === 'strong' ? ' download-warning-strong' : ''}`
+}
+
+function saveBlobToDisk(blob, fileName = currentFile?.name || 'download') {
+  const objectUrl = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = objectUrl
+  anchor.download = fileName
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  URL.revokeObjectURL(objectUrl)
+}
+
+function updateDownloadUI(file, state) {
+  const fileItem = getFileItem(file.name)
+  if (!fileItem) return
+
+  receivedBytes = state.receivedBytes
+  receivedChunkCount = state.receivedChunkCount
+
+  if (receivedChunkCount <= 3 || receivedChunkCount % 25 === 0 || receivedBytes === file.size) {
+    debugLog('download progress update', {
+      file: file.name,
+      phase: state.phase,
+      receivedBytes,
+      expectedBytes: file.size,
+      receivedChunkCount,
+    })
+  }
+
+  if (state.phase === 'verifying') {
+    const statusEl = fileItem.querySelector('.file-status')
+    statusEl.textContent = '… verifying'
+    statusEl.className = 'file-status speed'
+    return
+  }
+
+  const pct = file.size > 0 ? Math.round((state.receivedBytes / file.size) * 100) : 0
+  const elapsed = (Date.now() - transferStartTime) / 1000
+  const speedBps = elapsed > 0 ? state.receivedBytes / elapsed : 0
+
+  fileItem.querySelector('.file-progress-fill').style.width = pct + '%'
+  fileItem.querySelector('.file-progress-text').textContent =
+    `${pct}% — ${formatBytes(state.receivedBytes)} of ${formatBytes(file.size)}`
+  const statusEl = fileItem.querySelector('.file-status')
+  statusEl.textContent = '↓ ' + formatSpeed(speedBps)
+  statusEl.className = 'file-status speed'
+}
+
+function finalizeDownloadUI(file, result) {
+  if (result.code !== 'disconnected' && result.code !== 'transfer-error') {
+    updateStatus('')
+  }
+  applyFinalDownloadState(getFileItem(file.name), file, result)
+}
+
+function applyFinalDownloadState(fileItem, file, result) {
+  if (!fileItem) return
+
+  fileItem.classList.remove('downloading', 'verified', 'corrupted', 'done', 'failed')
+  fileItem.classList.add(result.statusClass)
+  fileItem.querySelector('.file-progress').classList.add('hidden')
+  fileItem.querySelector('.file-status').textContent = result.statusText
+  fileItem.querySelector('.file-status').className = 'file-status ' + (result.ok ? 'ok' : 'fail')
+  fileItem.querySelector('.file-size').textContent = `${formatBytes(file.size)} · avg ${formatSpeed(result.avgBytesPerSecond || 0)}`
+
+  if (file.sha1 && result.ok) {
+    fileItem.querySelector('.file-hash').textContent = 'SHA-1: ' + file.sha1.toLowerCase()
+    return
+  }
+
+  if (file.sha1 && result.computedSha1) {
+    fileItem.querySelector('.file-hash').textContent =
+      `expected ${file.sha1.slice(0, 8).toLowerCase()}… got ${result.computedSha1.slice(0, 8).toLowerCase()}…`
+    return
+  }
+
+  fileItem.querySelector('.file-hash').textContent = ''
 }
 
 function renderBreadcrumb() {
@@ -865,12 +956,20 @@ function renderBreadcrumb() {
 function navigateTo(index) {
   // index -1 = share root, 0 = first segment, 1 = second, etc.
   currentPath = index === -1 ? [] : currentPath.slice(0, index + 1)
+  if (!transferChannel) {
+    updateStatus('Connection closed')
+    return
+  }
   requestFileList(transferChannel, currentPath.join('/'))
 }
 
 function openFolder(name) {
-  if (isDownloading) {
+  if (activeDownload) {
     updateStatus('Download in progress, please wait')
+    return
+  }
+  if (!transferChannel) {
+    updateStatus('Connection closed')
     return
   }
   currentPath.push(name)
@@ -878,6 +977,10 @@ function openFolder(name) {
 }
 
 function requestFileList(channel, subpath) {
+  if (!channel) {
+    updateStatus('Connection closed')
+    return
+  }
   debugLog('requesting file list', {
     subpath,
     mode: currentTransferMode,
@@ -891,7 +994,7 @@ function submitPassword() {
   sendJoin()
 }
 
-function handleError(msg) {
+async function handleError(msg) {
   const message = msg.message || ''
   debugLog('transfer error message received', {
     message,
@@ -899,8 +1002,34 @@ function handleError(msg) {
     receivedBytes,
     receivedChunkCount,
   })
+
+  if (activeDownload?.fail) {
+    updateStatus('Transfer failed')
+    await activeDownload.fail('transfer-error', message || 'Transfer failed')
+    clearClosedTransferSession()
+    return
+  }
+
   updateStatus('Error: ' + message)
-  isDownloading = false
+}
+
+async function handleTransferClosure() {
+  const download = activeDownload
+  if (download?.failForDisconnect) {
+    await download.failForDisconnect()
+    clearClosedTransferSession()
+    return
+  }
+
+  resetUI()
+}
+
+function clearClosedTransferSession() {
+  transferChannel = null
+  currentTransferMode = null
+  getConnectionStatusEl().classList.add('hidden')
+  getConnectionTypeEl().className = 'connection-badge'
+  showSection('join-section')
 }
 
 function resetUI() {
@@ -921,9 +1050,9 @@ function resetUI() {
   document.getElementById('password-input').value = ''
   document.getElementById('password-input').disabled = false
   document.querySelector('#password-section button').disabled = false
+  renderDownloadWarning(null)
+  activeDownload = null
   currentFile = null
-  fileChunks = []
-  isDownloading = false
   receivedBytes = 0
   receivedChunkCount = 0
   transferStartTime = 0
@@ -1000,4 +1129,20 @@ export const __test = {
     relayQuotaExceeded = exceeded
     quotaPeriodEnd = periodEnd
   },
+  setActiveDownload(download) {
+    activeDownload = download
+  },
+  setTransferSession({ channel, mode }) {
+    transferChannel = channel
+    currentTransferMode = mode
+  },
+  getTransferSession() {
+    return {
+      transferChannel,
+      currentTransferMode,
+    }
+  },
+  handleTransferClosure,
+  handleError,
+  applyFinalDownloadState,
 }
