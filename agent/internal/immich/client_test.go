@@ -77,6 +77,67 @@ func TestValidatePasswordSendsPasswordQueryParam(t *testing.T) {
 	require.True(t, ok)
 }
 
+func TestValidatePasswordStoresPasswordForSubsequentListGallery(t *testing.T) {
+	var galleryPassword string
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		switch requestCount {
+		case 1:
+			require.Equal(t, "secret", r.URL.Query().Get("password"))
+			_, _ = w.Write([]byte(`{"key":"sharekey","assets":[]}`))
+		case 2:
+			galleryPassword = r.URL.Query().Get("password")
+			_, _ = w.Write([]byte(`{"key":"sharekey","assets":[]}`))
+		default:
+			t.Fatalf("unexpected request %d", requestCount)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	ok, err := client.ValidatePassword(t.Context(), "secret")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	_, err = client.ListGallery(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "secret", galleryPassword)
+}
+
+func TestValidatePasswordStoresPasswordForSubsequentGetFile(t *testing.T) {
+	var filePassword string
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		switch requestCount {
+		case 1:
+			require.Equal(t, "/api/shared-links/my-share", r.URL.Path)
+			require.Equal(t, "secret", r.URL.Query().Get("password"))
+			_, _ = w.Write([]byte(`{"key":"sharekey","assets":[]}`))
+		case 2:
+			require.Equal(t, "/api/assets/asset-1/original", r.URL.Path)
+			filePassword = r.URL.Query().Get("password")
+			_, _ = w.Write([]byte("asset"))
+		default:
+			t.Fatalf("unexpected request %d", requestCount)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	ok, err := client.ValidatePassword(t.Context(), "secret")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	var got bytes.Buffer
+	_, err = client.GetFile(t.Context(), "asset-1", &got)
+	require.NoError(t, err)
+	require.Equal(t, "secret", filePassword)
+}
+
 func TestValidatePasswordReturnsFalseForInvalidStatus(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/api/shared-links/my-share", r.URL.Path)
@@ -89,6 +150,34 @@ func TestValidatePasswordReturnsFalseForInvalidStatus(t *testing.T) {
 	ok, err := client.ValidatePassword(t.Context(), "wrong")
 	require.NoError(t, err)
 	require.False(t, ok)
+}
+
+func TestValidatePasswordFailureDoesNotSetPassword(t *testing.T) {
+	var galleryPassword string
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		switch requestCount {
+		case 1:
+			w.WriteHeader(http.StatusNotFound)
+		case 2:
+			galleryPassword = r.URL.Query().Get("password")
+			_, _ = w.Write([]byte(`{"key":"sharekey","assets":[]}`))
+		default:
+			t.Fatalf("unexpected request %d", requestCount)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	ok, err := client.ValidatePassword(t.Context(), "wrong")
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	_, err = client.ListGallery(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, galleryPassword)
 }
 
 func TestListFilesConvertsImmichAssetsToGalleryItems(t *testing.T) {

@@ -1,13 +1,16 @@
 package transfer
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"sharebridge/agent/internal/cloudwebdav"
 )
 
@@ -70,6 +73,54 @@ func (m *mockDC) reset() {
 	m.closed = false
 }
 
+func (m *mockDC) hasTextType(messageType string) bool {
+	return m.countTextType(messageType) > 0
+}
+
+func (m *mockDC) getTextByType(messageType string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, msg := range m.textMessages {
+		var parsed struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(msg), &parsed) == nil && parsed.Type == messageType {
+			return msg
+		}
+	}
+	return ""
+}
+
+func (m *mockDC) countTextType(messageType string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	count := 0
+	for _, msg := range m.textMessages {
+		var parsed struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(msg), &parsed) == nil && parsed.Type == messageType {
+			count++
+		}
+	}
+	return count
+}
+
+func (m *mockDC) hasErrorContaining(substr string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, msg := range m.textMessages {
+		var parsed struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(msg), &parsed) == nil && parsed.Type == "error" && strings.Contains(parsed.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 // mockOpenCloudClient implements openCloudClient for testing
 type mockOpenCloudClient struct {
 	mu              sync.Mutex
@@ -78,6 +129,7 @@ type mockOpenCloudClient struct {
 	listFilesErr    error
 	getFilePath     string
 	getFileErr      error
+	file            []byte
 }
 
 func (m *mockOpenCloudClient) ListFiles(subpath string) ([]cloudwebdav.FileInfo, error) {
@@ -91,10 +143,88 @@ func (m *mockOpenCloudClient) GetFile(filePath string, w io.Writer) (int64, erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getFilePath = filePath
+	if len(m.file) > 0 {
+		n, err := w.Write(m.file)
+		return int64(n), err
+	}
 	return 0, m.getFileErr
 }
 
 func (m *mockOpenCloudClient) GetSHA1(subpath string) string { return "" }
+
+type mockGalleryClient struct {
+	gallery      Gallery
+	thumbnail    []byte
+	file         []byte
+	assetQuality string
+}
+
+func (m *mockGalleryClient) ListGallery(ctx context.Context) (Gallery, error) {
+	return m.gallery, nil
+}
+
+func (m *mockGalleryClient) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
+	n, err := w.Write(m.thumbnail)
+	return int64(n), err
+}
+
+func (m *mockGalleryClient) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
+	m.assetQuality = quality
+	n, err := w.Write(m.file)
+	return int64(n), err
+}
+
+type blockingGalleryClient struct {
+	gallery     Gallery
+	file        []byte
+	listStarted chan struct{}
+	releaseList chan struct{}
+	listCalls   atomic.Int32
+	assetCalls  atomic.Int32
+}
+
+func (m *blockingGalleryClient) ListGallery(ctx context.Context) (Gallery, error) {
+	if m.listCalls.Add(1) == 1 {
+		close(m.listStarted)
+	}
+	<-m.releaseList
+	return m.gallery, nil
+}
+
+func (m *blockingGalleryClient) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
+	return 0, nil
+}
+
+func (m *blockingGalleryClient) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
+	m.assetCalls.Add(1)
+	n, err := w.Write(m.file)
+	return int64(n), err
+}
+
+type blockingStorageClient struct {
+	files       []cloudwebdav.FileInfo
+	file        []byte
+	listStarted chan struct{}
+	releaseList chan struct{}
+	listCalls   atomic.Int32
+	getCalls    atomic.Int32
+}
+
+func (m *blockingStorageClient) ListFiles(subpath string) ([]cloudwebdav.FileInfo, error) {
+	if m.listCalls.Add(1) == 1 {
+		close(m.listStarted)
+	}
+	<-m.releaseList
+	return m.files, nil
+}
+
+func (m *blockingStorageClient) GetFile(filePath string, w io.Writer) (int64, error) {
+	m.getCalls.Add(1)
+	n, err := w.Write(m.file)
+	return int64(n), err
+}
+
+func (m *blockingStorageClient) GetSHA1(subpath string) string { return "" }
 
 // TestHandleOpen_SendsHello verifies hello is sent without password_required
 func TestHandleOpen_SendsHello(t *testing.T) {
@@ -117,6 +247,151 @@ func TestHandleOpen_SendsHello(t *testing.T) {
 	if _, ok := result["password_required"]; ok {
 		t.Error("hello must not include password_required field")
 	}
+}
+
+func TestHandleOpen_ImmichGallerySendsThumbnailListAndData(t *testing.T) {
+	dc := &mockDC{}
+	client := &mockGalleryClient{
+		gallery: Gallery{
+			AlbumName: "Summer",
+			Items:     []GalleryItem{{ID: "asset-1", Name: "photo.jpg", MimeType: "image/jpeg", Size: 12}},
+		},
+		thumbnail: []byte{0xff, 0xd8, 0xff},
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+	mgr.HandleOpen()
+	time.Sleep(50 * time.Millisecond)
+
+	require.True(t, dc.hasTextType("thumbnail_list"))
+	require.Len(t, dc.binaryData, 1)
+	require.Equal(t, byte(0x11), dc.binaryData[0][0], "thumbnail frames use typed binary envelope")
+}
+
+func TestHandleAssetRequestStreamsByAssetID(t *testing.T) {
+	dc := &mockDC{}
+	client := &mockGalleryClient{
+		gallery: Gallery{Items: []GalleryItem{{ID: "asset-1", Name: "photo.jpg", MimeType: "image/jpeg", Size: 3}}},
+		file:    []byte("abc"),
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+
+	req, _ := json.Marshal(map[string]string{"type": "asset_request", "id": "asset-1", "quality": "original"})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	require.True(t, dc.hasTextType("file_header"))
+	require.True(t, fileHeaderBinaryEnvelope(t, dc))
+	require.NotEmpty(t, dc.binaryData)
+	require.True(t, dc.hasTextType("chunk_end"))
+}
+
+func TestHandleAssetRequestThumbnailQualityStreamsThumbnail(t *testing.T) {
+	dc := &mockDC{}
+	client := &mockGalleryClient{
+		gallery:   Gallery{Items: []GalleryItem{{ID: "asset-1", Name: "photo.jpg", MimeType: "image/jpeg", Size: 3}}},
+		thumbnail: []byte("tn"),
+		file:      []byte("original"),
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+
+	req, _ := json.Marshal(map[string]string{"type": "asset_request", "id": "asset-1", "quality": "thumbnail"})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	require.Len(t, dc.binaryData, 1)
+	require.Equal(t, []byte{0x10, 't', 'n'}, dc.binaryData[0])
+}
+
+func TestHandleFileRequestHeaderIncludesBinaryEnvelope(t *testing.T) {
+	dc := &mockDC{}
+	client := &mockOpenCloudClient{
+		listFilesResult: []cloudwebdav.FileInfo{
+			{Name: "photo.jpg", RequestPath: "photo.jpg", ContentType: "image/jpeg", Size: 3},
+		},
+		file: []byte("abc"),
+	}
+	mgr := NewManager(dc, client, 0)
+
+	req, _ := json.Marshal(map[string]string{"type": "file_request", "path": "photo.jpg"})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	require.True(t, fileHeaderBinaryEnvelope(t, dc))
+}
+
+func TestHandleAssetRequestRejectsUnsupportedQuality(t *testing.T) {
+	dc := &mockDC{}
+	client := &mockGalleryClient{
+		gallery: Gallery{Items: []GalleryItem{{ID: "asset-1", Name: "photo.jpg", MimeType: "image/jpeg", Size: 3}}},
+		file:    []byte("abc"),
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+
+	req, _ := json.Marshal(map[string]string{"type": "asset_request", "id": "asset-1", "quality": "preview"})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	require.True(t, dc.hasErrorContaining("unsupported asset quality"))
+	require.False(t, dc.hasTextType("file_header"))
+	require.Empty(t, dc.binaryData)
+}
+
+func TestConcurrentAssetRequestsOnlyOneStarts(t *testing.T) {
+	dc := &mockDC{}
+	client := &blockingGalleryClient{
+		gallery:     Gallery{Items: []GalleryItem{{ID: "asset-1", Name: "photo.jpg", MimeType: "image/jpeg", Size: 3}}},
+		file:        []byte("abc"),
+		listStarted: make(chan struct{}),
+		releaseList: make(chan struct{}),
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+	req, _ := json.Marshal(map[string]string{"type": "asset_request", "id": "asset-1"})
+
+	go mgr.HandleMessage(req)
+	<-client.listStarted
+	secondDone := make(chan struct{})
+	go func() {
+		mgr.HandleMessage(req)
+		close(secondDone)
+	}()
+	time.Sleep(10 * time.Millisecond)
+	close(client.releaseList)
+	<-secondDone
+	time.Sleep(50 * time.Millisecond)
+
+	require.Equal(t, int32(1), client.assetCalls.Load())
+	require.Equal(t, 1, dc.countTextType("file_header"))
+	require.True(t, dc.hasErrorContaining("transfer in progress"))
+}
+
+func TestConcurrentFileRequestsOnlyOneStarts(t *testing.T) {
+	dc := &mockDC{}
+	client := &blockingStorageClient{
+		files: []cloudwebdav.FileInfo{
+			{Name: "photo.jpg", RequestPath: "photo.jpg", ContentType: "image/jpeg", Size: 3},
+		},
+		file:        []byte("abc"),
+		listStarted: make(chan struct{}),
+		releaseList: make(chan struct{}),
+	}
+	mgr := NewManager(dc, client, 0)
+	req, _ := json.Marshal(map[string]string{"type": "file_request", "path": "photo.jpg"})
+
+	go mgr.HandleMessage(req)
+	<-client.listStarted
+	secondDone := make(chan struct{})
+	go func() {
+		mgr.HandleMessage(req)
+		close(secondDone)
+	}()
+	time.Sleep(10 * time.Millisecond)
+	close(client.releaseList)
+	<-secondDone
+	time.Sleep(50 * time.Millisecond)
+
+	require.Equal(t, int32(1), client.getCalls.Load())
+	require.Equal(t, 1, dc.countTextType("file_header"))
+	require.True(t, dc.hasErrorContaining("transfer in progress"))
 }
 
 // TestFileHeader_IncludesSHA1 verifies sha1 field is present when FileInfo has a checksum
@@ -360,4 +635,15 @@ func TestMaxDownloads_Rejected(t *testing.T) {
 	if !sessionExpiredCalled {
 		t.Error("OnSessionExpired callback should have been called")
 	}
+}
+
+func fileHeaderBinaryEnvelope(t *testing.T, dc *mockDC) bool {
+	t.Helper()
+
+	var header struct {
+		BinaryEnvelope bool `json:"binary_envelope"`
+	}
+	require.NotEmpty(t, dc.getTextByType("file_header"))
+	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("file_header")), &header))
+	return header.BinaryEnvelope
 }

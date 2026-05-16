@@ -228,6 +228,36 @@ test('relay_policy opens the relay channel and requests the root file list', asy
   assert.equal(sends[0], JSON.stringify({ type: 'list_request', path: '' }))
 })
 
+test('relay_policy in gallery mode does not request the file list on channel open', async () => {
+  const statuses = []
+  const sends = []
+  const fakeChannel = {
+    readyState: 'open',
+    bufferedAmount: 0,
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    send(text) { sends.push(text) },
+    sendBinary() {},
+    close() {},
+  }
+
+  const controller = installSessionMessageHandler({
+    updateStatus: (msg) => statuses.push(msg),
+    connectTransferChannel: async () => ({ channel: fakeChannel, mode: 'relay' }),
+    requestFileList: (channel, path) => channel.send(JSON.stringify({ type: 'list_request', path })),
+    applyConnectionBadge: ({ mode }) => statuses.push(`badge:${mode}`),
+    decodeRelayPolicyToken: () => ({ relayOnly: true, relayAllowed: true, expectedStaticPubHex: '00' }),
+    hideSection: () => {},
+    isGalleryMode: () => true,
+  })
+
+  await controller.handleMessage({ type: 'relay_policy', token: 'jwt', relay_allowed: true, relay_only: true })
+
+  assert.equal(statuses.at(-1), 'badge:relay')
+  assert.deepEqual(sends, [])
+})
+
 test('direct failure after quota warning keeps the quota-blocked message', async () => {
   // Set up quota exceeded state
   __test.setQuotaState({ exceeded: true, periodEnd: '2025-12-31T23:59:59Z' })
@@ -381,6 +411,70 @@ test('handleTransferClosure fails an active download before chunk_end', async ()
     assert.equal(__test.getTransferSession().transferChannel, null)
     __test.setActiveDownload(null)
   })
+})
+
+test('handleTransferMessage appends typed file chunk payload only', async () => {
+  const appended = []
+  __test.setCurrentFile({ name: 'photo.jpg', size: 3, binary_envelope: true })
+  __test.setActiveDownload({
+    async append(bytes) {
+      appended.push([...bytes])
+    },
+  })
+
+  await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1, 2, 3]).buffer })
+
+  assert.deepEqual(appended, [[1, 2, 3]])
+  __test.setActiveDownload(null)
+  __test.setCurrentFile(null)
+})
+
+test('handleTransferMessage appends legacy raw chunk starting with 0x10', async () => {
+  const appended = []
+  __test.setCurrentFile({ name: 'legacy-10.bin', size: 3 })
+  __test.setActiveDownload({
+    async append(bytes) {
+      appended.push([...bytes])
+    },
+  })
+
+  await __test.handleTransferMessage({ data: new Uint8Array([0x10, 8, 7]).buffer })
+
+  assert.deepEqual(appended, [[0x10, 8, 7]])
+  __test.setActiveDownload(null)
+  __test.setCurrentFile(null)
+})
+
+test('handleTransferMessage appends legacy raw chunk starting with 0x11', async () => {
+  const appended = []
+  __test.setCurrentFile({ name: 'legacy-11.bin', size: 3 })
+  __test.setActiveDownload({
+    async append(bytes) {
+      appended.push([...bytes])
+    },
+  })
+
+  await __test.handleTransferMessage({ data: new Uint8Array([0x11, 8, 7]).buffer })
+
+  assert.deepEqual(appended, [[0x11, 8, 7]])
+  __test.setActiveDownload(null)
+  __test.setCurrentFile(null)
+})
+
+test('handleTransferMessage still appends legacy raw file chunks', async () => {
+  const appended = []
+  __test.setCurrentFile({ name: 'legacy.bin', size: 3 })
+  __test.setActiveDownload({
+    async append(bytes) {
+      appended.push([...bytes])
+    },
+  })
+
+  await __test.handleTransferMessage({ data: new Uint8Array([9, 8, 7]).buffer })
+
+  assert.deepEqual(appended, [[9, 8, 7]])
+  __test.setActiveDownload(null)
+  __test.setCurrentFile(null)
 })
 
 test('handleError fails the active download and clears the dead session', async () => {

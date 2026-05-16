@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -58,6 +59,54 @@ type immichAuthenticator interface {
 
 type immichGalleryBackend interface {
 	immichAuthenticator
+}
+
+type immichTransferAdapter struct {
+	client *immich.Client
+}
+
+func (a immichTransferAdapter) ValidatePassword(ctx context.Context, password string) (bool, error) {
+	return a.client.ValidatePassword(ctx, password)
+}
+
+func (a immichTransferAdapter) ListGallery(ctx context.Context) (transfer.Gallery, error) {
+	g, err := a.client.ListGallery(ctx)
+	if err != nil {
+		return transfer.Gallery{}, err
+	}
+	items := make([]transfer.GalleryItem, len(g.Items))
+	for i, item := range g.Items {
+		items[i] = transfer.GalleryItem{
+			ID:       item.ID,
+			Name:     item.Name,
+			MimeType: item.MimeType,
+			Width:    item.Width,
+			Height:   item.Height,
+			Size:     item.Size,
+			Duration: item.Duration,
+			SHA1:     item.SHA1,
+		}
+	}
+	return transfer.Gallery{
+		AlbumName:        g.AlbumName,
+		AlbumDescription: g.AlbumDescription,
+		Items:            items,
+	}, nil
+}
+
+func (a immichTransferAdapter) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
+	return a.client.GetThumbnail(ctx, id, w)
+}
+
+func (a immichTransferAdapter) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
+	switch quality {
+	case "", "original":
+		return a.client.GetFile(ctx, id, w)
+	case "thumbnail":
+		return a.client.GetThumbnail(ctx, id, w)
+	default:
+		return 0, fmt.Errorf("unsupported asset quality: %s", quality)
+	}
 }
 
 type immichPoller interface {
@@ -662,7 +711,17 @@ func (d *Daemon) createPeer(connID, sessionCode string) {
 	}
 
 	// Create transfer manager
-	tm := transfer.NewManager(p, session.webdavClient, session.MaxDownloads)
+	var tm *transfer.Manager
+	if session.ShareType == "immich" {
+		galleryBackend, ok := session.immichClient.(transfer.GalleryBackend)
+		if !ok {
+			log.Printf("Immich session %s has no gallery transfer backend", sessionCode)
+			return
+		}
+		tm = transfer.NewGalleryManager(p, galleryBackend, session.MaxDownloads)
+	} else {
+		tm = transfer.NewManager(p, session.webdavClient, session.MaxDownloads)
+	}
 	tm.SetDownloadCount(session.Downloads)
 
 	// Wire transfer callbacks
@@ -847,7 +906,17 @@ func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
 	}
 
 	// Create transfer manager for this relay channel
-	tm := transfer.NewManager(channel, session.webdavClient, session.MaxDownloads)
+	var tm *transfer.Manager
+	if session.ShareType == "immich" {
+		galleryBackend, ok := session.immichClient.(transfer.GalleryBackend)
+		if !ok {
+			log.Printf("Immich session %s has no gallery transfer backend", msg.Code)
+			return
+		}
+		tm = transfer.NewGalleryManager(channel, galleryBackend, session.MaxDownloads)
+	} else {
+		tm = transfer.NewManager(channel, session.webdavClient, session.MaxDownloads)
+	}
 	tm.SetDownloadCount(session.Downloads)
 
 	// Wire transfer callbacks
@@ -1181,12 +1250,16 @@ func (d *Daemon) unregisterShare(ctx context.Context, code string) error {
 }
 
 func (d *Daemon) newImmichClient(code string) (immichGalleryBackend, error) {
-	return immich.New(immich.Config{
+	client, err := immich.New(immich.Config{
 		BaseURL:     d.config.ImmichURL,
 		AllowedHost: d.config.ImmichAllowedHost,
 		APIKey:      d.config.ImmichAPIKey,
 		ShareKey:    code,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return immichTransferAdapter{client: client}, nil
 }
 
 func (d *Daemon) relayStaticPubHex() (string, error) {

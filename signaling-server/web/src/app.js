@@ -10,6 +10,7 @@ import {
   createStreamingSink,
 } from './downloadSinks.js'
 import { createDownloadPipeline } from './downloadPipeline.js'
+import { decodeBinaryEnvelope, FRAME_FILE_CHUNK, FRAME_THUMBNAIL } from './binaryEnvelope.js'
 
 // Module state
 let pc, ws, dc
@@ -198,6 +199,7 @@ export function installSessionMessageHandler({
   applyConnectionBadge: applyBadge,
   decodeRelayPolicyToken: decodeToken,
   hideSection,
+  isGalleryMode = () => galleryMode,
 }) {
   return {
     async handleMessage(msg) {
@@ -261,6 +263,7 @@ export function installSessionMessageHandler({
             applyConnectionBadge: ({ mode }) => applyBadge({ mode }),
             handleTransferMessage,
             onClose: handleTransferClosure,
+            isGalleryMode,
           })
           break
       }
@@ -285,6 +288,7 @@ function attachTransferChannel({
   applyConnectionBadge,
   handleTransferMessage,
   onClose,
+  isGalleryMode = () => galleryMode,
 }) {
   let opened = false
   let messageChain = Promise.resolve()
@@ -296,7 +300,9 @@ function attachTransferChannel({
     hideSection('join-section')
     hideSection('password-section')
     applyConnectionBadge({ mode })
-    requestFileList(channel, '')
+    if (!isGalleryMode()) {
+      requestFileList(channel, '')
+    }
     ws = detachBrowserSignalingSocket(ws)
   }
 
@@ -615,8 +621,19 @@ async function handleTransferMessage(event) {
       byteLength: event.data.byteLength,
       currentFile: currentFile?.name || null,
     })
-    const bytes = new Uint8Array(event.data)
-    await appendChunk(bytes)
+    if (!currentFile?.binary_envelope) {
+      await appendChunk(new Uint8Array(event.data))
+      return
+    }
+    const frame = decodeBinaryEnvelope(event.data)
+    if (frame.type === FRAME_FILE_CHUNK) {
+      await appendChunk(frame.payload)
+      return
+    }
+    if (frame.type === FRAME_THUMBNAIL) {
+      debugLog('thumbnail frame received before gallery UI is enabled', { index: frame.index })
+      return
+    }
     return
   }
 
@@ -1144,6 +1161,9 @@ export const __test = {
   setActiveDownload(download) {
     activeDownload = download
   },
+  setCurrentFile(file) {
+    currentFile = file
+  },
   setTransferSession({ channel, mode }) {
     transferChannel = channel
     currentTransferMode = mode
@@ -1154,6 +1174,7 @@ export const __test = {
       currentTransferMode,
     }
   },
+  handleTransferMessage,
   handleTransferClosure,
   handleError,
   applyFinalDownloadState,

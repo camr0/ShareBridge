@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,7 @@ type Client struct {
 	allowed    string
 	apiKey     string
 	shareKey   string
+	passwordMu sync.RWMutex
 	password   string
 	httpClient *http.Client
 }
@@ -169,11 +171,12 @@ func (c *Client) ValidatePassword(ctx context.Context, password string) (bool, e
 	if err := json.NewDecoder(resp.Body).Decode(&link); err != nil {
 		return false, fmt.Errorf("decode shared link: %w", err)
 	}
+	c.setPassword(password)
 	return true, nil
 }
 
 func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.sharedLinkURL(c.password), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.sharedLinkURL(c.currentPassword()), nil)
 	if err != nil {
 		return Gallery{}, err
 	}
@@ -268,8 +271,23 @@ func (c *Client) assetURL(id, suffix string) string {
 	})
 	q := u.Query()
 	q.Set("key", c.shareKey)
+	if password := c.currentPassword(); password != "" {
+		q.Set("password", password)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func (c *Client) currentPassword() string {
+	c.passwordMu.RLock()
+	defer c.passwordMu.RUnlock()
+	return c.password
+}
+
+func (c *Client) setPassword(password string) {
+	c.passwordMu.Lock()
+	defer c.passwordMu.Unlock()
+	c.password = password
 }
 
 func decodeBase64SHA1(input string) string {
