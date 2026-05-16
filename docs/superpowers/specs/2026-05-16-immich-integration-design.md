@@ -157,7 +157,7 @@ The recipient browser app gains a gallery mode alongside the existing file tree 
 - 3-column responsive thumbnail grid (2-col on mobile)
 - Video thumbnails with duration badge overlay
 - Album title + item count in header bar
-- "Download All" button: queues sequential `asset_request` messages for all items. Downloads one at a time using the existing single-transfer protocol (parallel downloads deferred to Slice 17b). Progress shown as "Downloading N of M". User can cancel the queue.
+- "Download All" button: deferred to Slice 17b (requires parallel transfers for good UX).
 - **lightGallery.js** for lightbox: zoom, swipe, keyboard nav, video playback, per-item download
 - ShareBridge header bar preserved (logo, connection badge, session code)
 - PicoCSS styling
