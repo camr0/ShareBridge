@@ -58,7 +58,7 @@ The agent never knows the password — it sees only Immich's yes/no response. Th
 
 ### Session Registration: isPasswordProtected
 
-When the agent calls `registershare` for an Immich key, it fetches the share info from Immich and stores `isPasswordProtected` in the sessions table alongside the code. The signaling server reads this field when a browser connects: if true, it sends `password_required` and enters the auth relay flow. If false, it sends `ice_config` immediately and begins WebRTC negotiation — no knock/nonce/join needed (the share has no password to prove).
+When the agent calls `registershare` for an Immich key, it fetches the share info from Immich and stores `isPasswordProtected` in the sessions table alongside the code. The signaling server reads this field when a browser connects: if true, it sends `password_required` and enters the auth relay flow. If false, it sends `ice_config` immediately. The browser sends a standard `join` message; the agent skips HMAC verification (the share has no password to prove). The `join` triggers peer creation and offer generation.
 
 ### Hub Auth Relay
 
@@ -157,7 +157,7 @@ The recipient browser app gains a gallery mode alongside the existing file tree 
 - 3-column responsive thumbnail grid (2-col on mobile)
 - Video thumbnails with duration badge overlay
 - Album title + item count in header bar
-- "Download All" button
+- "Download All" button: queues sequential `asset_request` messages for all items. Downloads one at a time using the existing single-transfer protocol (parallel downloads deferred to Slice 17b). Progress shown as "Downloading N of M". User can cancel the queue.
 - **lightGallery.js** for lightbox: zoom, swipe, keyboard nav, video playback, per-item download
 - ShareBridge header bar preserved (logo, connection badge, session code)
 - PicoCSS styling
