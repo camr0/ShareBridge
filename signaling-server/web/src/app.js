@@ -46,10 +46,20 @@ let receivedChunkCount = 0
 
 // Navigation state
 let currentPath = []
+let sessionCode = ''
+let galleryMode = false
 let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
 let pendingNonce = null // nonce received from agent, consumed on join
+
+export function detectPathMode(pathname = window.location.pathname) {
+  const [, prefix, ...rest] = pathname.split('/')
+  const code = decodeURIComponent(rest.join('/'))
+  if (prefix === 'i' && code) return { mode: 'gallery', code }
+  if (prefix === 's' && code) return { mode: 'files', code }
+  return { mode: 'files', code: '' }
+}
 
 export function assertJoinNotActive(socket, log = debugLog) {
   if (!socket) return
@@ -1089,10 +1099,11 @@ function formatSpeed(bps) {
 }
 
 function initFromURL() {
-  const parts = window.location.pathname.split('/')
-  // /s/ABC123 → ['', 's', 'ABC123']
-  if (parts[1] === 's' && parts[2]) {
-    document.getElementById('code').value = parts[2]
+  const pathMode = detectPathMode()
+  sessionCode = pathMode.code
+  galleryMode = pathMode.mode === 'gallery'
+  if (sessionCode) {
+    document.getElementById('code').value = sessionCode
   }
 
   if (window.location.hash) {
@@ -1125,6 +1136,7 @@ if (typeof window !== 'undefined') {
 
 // Export test helpers for unit tests
 export const __test = {
+  detectPathMode,
   setQuotaState({ exceeded, periodEnd }) {
     relayQuotaExceeded = exceeded
     quotaPeriodEnd = periodEnd

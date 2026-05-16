@@ -1,13 +1,17 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"github.com/stretchr/testify/require"
+	"sharebridge/server/internal/handler"
 	"sharebridge/server/migrations"
 )
 
@@ -86,6 +90,40 @@ func testSessionExists(t *testing.T, app core.App, code string) bool {
 	)
 	require.NoError(t, err)
 	return len(records) == 1
+}
+
+func setupRouterForTest(t *testing.T) http.Handler {
+	t.Helper()
+	t.Chdir("../..")
+
+	app, cleanup := setupServerTestApp(t)
+	t.Cleanup(cleanup)
+
+	pbRouter, err := apis.NewRouter(app)
+	require.NoError(t, err)
+
+	// Direct link route - serves file client; JS reads code from window.location
+	pbRouter.GET("/s/{code}", handler.ServeFileNoCache("./web/index.html"))
+	pbRouter.GET("/i/{key}", handler.ServeFileNoCache("./web/index.html"))
+
+	// Homepage (marketing)
+	pbRouter.GET("/", handler.ServeFileNoCache("./web/home.html"))
+
+	// File transfer client (manual join)
+	pbRouter.GET("/join", handler.ServeFileNoCache("./web/index.html"))
+
+	mux, err := pbRouter.BuildMux()
+	require.NoError(t, err)
+	return mux
+}
+
+func TestServerRoutesImmichLinksToBrowserApp(t *testing.T) {
+	router := setupRouterForTest(t)
+	req := httptest.NewRequest(http.MethodGet, "/i/ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), "ShareBridge")
 }
 
 func TestDeleteExpiredSessions_PreservesSessionsWithoutExpiry(t *testing.T) {

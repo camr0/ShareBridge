@@ -26,6 +26,11 @@ test('publishGlobalActions preserves inline button handlers after the move to an
   assert.equal(globals.navigateTo, navigateTo)
 })
 
+test('detectPathMode returns gallery mode for /i links and file mode for /s links', () => {
+  assert.deepEqual(__test.detectPathMode('/i/ffSw63qn'), { mode: 'gallery', code: 'ffSw63qn' })
+  assert.deepEqual(__test.detectPathMode('/s/a3f9k2xp'), { mode: 'files', code: 'a3f9k2xp' })
+})
+
 test('applyConnectionBadge preserves the colored direct/relay badge', () => {
   const statusContainer = {
     classList: {
