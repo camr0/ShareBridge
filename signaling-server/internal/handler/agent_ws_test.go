@@ -359,6 +359,46 @@ func TestAgentWS_RegisterShare_AcceptsImmichExternalCodeMetadata(t *testing.T) {
 	require.True(t, session.GetBool("relay_only"))
 }
 
+func TestAgentWS_RegisterShare_ReclaimPreservesRelayOnlyWhenOmitted(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, testApp)
+	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-reclaim-relay")
+	defer agentConn.CloseNow()
+
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMRELAY","relay_only":true,"relay_static_pub":"04abcd"}`)))
+	_, _, err := agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMRELAY","relay_static_pub":"04abcd"}`)))
+	_, _, err = agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	session := findSessionByCode(t, testApp, "RECLAIMRELAY")
+	require.True(t, session.GetBool("relay_only"))
+}
+
+func TestAgentWS_RegisterShare_ReclaimAllowsExplicitRelayOnlyFalse(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, testApp)
+	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-reclaim-relay-false")
+	defer agentConn.CloseNow()
+
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMFALSE","relay_only":true,"relay_static_pub":"04abcd"}`)))
+	_, _, err := agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMFALSE","relay_only":false,"relay_static_pub":"04abcd"}`)))
+	_, _, err = agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	session := findSessionByCode(t, testApp, "RECLAIMFALSE")
+	require.False(t, session.GetBool("relay_only"))
+}
+
 func TestAgentWS_RegisterShare_RejectsExternalCodeOver128Chars(t *testing.T) {
 	testApp, serverURL, cleanup := setupAgentWSTest(t)
 	defer cleanup()

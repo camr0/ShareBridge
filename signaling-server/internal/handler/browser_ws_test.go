@@ -49,6 +49,36 @@ func setupBrowserTestApp(t *testing.T) (core.App, func()) {
 	return testApp, cleanup
 }
 
+func setupBrowserWSTest(t *testing.T) (core.App, string, func()) {
+	t.Helper()
+
+	testApp, appCleanup := setupAgentTestApp(t)
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+
+	authMiddleware := middleware.APIKeyAuth(testApp)
+	agentHandler := AgentWS(testApp, h, reg, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(testApp, h, cfg)))
+
+	server := httptest.NewServer(mux)
+	cleanup := func() {
+		server.Close()
+		appCleanup()
+	}
+	return testApp, server.URL, cleanup
+}
+
+func dialBrowser(t *testing.T, serverURL, sessionCode string) *websocket.Conn {
+	t.Helper()
+
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(serverURL, "http")+"/ws/client?session="+sessionCode, nil)
+	require.NoError(t, err)
+	return conn
+}
+
 func createTestAccountWithQuota(app core.App, email string, quotaGB float64, usageGB float64) (*core.Record, error) {
 	usersCol, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
@@ -596,4 +626,187 @@ func TestBrowserWS_RelayOnlyStillEmitsIceConfigAndInitiatesNonceChallenge(t *tes
 	require.NoError(t, err)
 	assert.Contains(t, string(nonceMsg), `"type":"nonce"`)
 	assert.Contains(t, string(nonceMsg), `"has_password":true`)
+}
+
+func TestBrowserWS_ProtectedImmichSendsPasswordRequiredBeforeIceConfig(t *testing.T) {
+	testApp, serverURL, cleanup := setupBrowserWSTest(t)
+	defer cleanup()
+	apiKey := createTestAgentAPIKey(t, testApp)
+	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-immich-auth")
+	defer agentConn.CloseNow()
+
+	registerPayload := `{"type":"register_share","code":"IMMICHAUTH1","share_type":"immich","is_password_protected":true,"relay_only":true,"relay_static_pub":"04abcd"}`
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(registerPayload)))
+	_, _, err := agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	browserConn := dialBrowser(t, serverURL, "IMMICHAUTH1")
+	defer browserConn.CloseNow()
+
+	_, raw, err := browserConn.Read(context.Background())
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"password_required"}`, string(raw))
+
+	readCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _, err = agentConn.Read(readCtx)
+	require.Error(t, err, "protected Immich must not knock before password_submit")
+}
+
+func TestBrowserWS_ProtectedImmichRejectsKnockBeforePasswordSubmit(t *testing.T) {
+	testApp, serverURL, cleanup := setupBrowserWSTest(t)
+	defer cleanup()
+	apiKey := createTestAgentAPIKey(t, testApp)
+	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-immich-knock")
+	defer agentConn.CloseNow()
+
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"IMMICHAUTHKNOCK","share_type":"immich","is_password_protected":true,"relay_only":true,"relay_static_pub":"04abcd"}`)))
+	_, _, err := agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	browserConn := dialBrowser(t, serverURL, "IMMICHAUTHKNOCK")
+	defer browserConn.CloseNow()
+
+	_, raw, err := browserConn.Read(context.Background())
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"password_required"}`, string(raw))
+
+	require.NoError(t, browserConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"knock"}`)))
+
+	readCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _, err = agentConn.Read(readCtx)
+	require.Error(t, err, "protected Immich must not forward browser knock before password_submit")
+
+	_, rawFail, err := browserConn.Read(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, string(rawFail), `"type":"auth_fail"`)
+	require.Contains(t, string(rawFail), "password auth required")
+}
+
+func TestBrowserWS_ProtectedImmichRejectsSignalingBeforePasswordSubmit(t *testing.T) {
+	tests := []struct {
+		name    string
+		code    string
+		agentID string
+		message string
+	}{
+		{
+			name:    "join",
+			code:    "IMMICHAUTHJOIN",
+			agentID: "agent-immich-join",
+			message: `{"type":"join","hmac":"abc123"}`,
+		},
+		{
+			name:    "answer",
+			code:    "IMMICHAUTHANSWER",
+			agentID: "agent-immich-answer",
+			message: `{"type":"answer","sdp":"v=0"}`,
+		},
+		{
+			name:    "ice_candidate",
+			code:    "IMMICHAUTHICE",
+			agentID: "agent-immich-ice",
+			message: `{"type":"ice_candidate","candidate":{"candidate":"candidate:1 1 udp 1 127.0.0.1 1 typ host"}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			testApp, serverURL, cleanup := setupBrowserWSTest(t)
+			defer cleanup()
+			apiKey := createTestAgentAPIKey(t, testApp)
+			agentConn := dialAgentAndHello(t, serverURL, apiKey, tc.agentID)
+			defer agentConn.CloseNow()
+
+			registerPayload := `{"type":"register_share","code":"` + tc.code + `","share_type":"immich","is_password_protected":true,"relay_only":true,"relay_static_pub":"04abcd"}`
+			require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(registerPayload)))
+			_, _, err := agentConn.Read(context.Background())
+			require.NoError(t, err)
+
+			browserConn := dialBrowser(t, serverURL, tc.code)
+			defer browserConn.CloseNow()
+
+			_, raw, err := browserConn.Read(context.Background())
+			require.NoError(t, err)
+			require.JSONEq(t, `{"type":"password_required"}`, string(raw))
+
+			require.NoError(t, browserConn.Write(context.Background(), websocket.MessageText, []byte(tc.message)))
+
+			readCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			_, _, err = agentConn.Read(readCtx)
+			require.Error(t, err, "protected Immich must not forward %s before password_submit", tc.name)
+
+			_, rawFail, err := browserConn.Read(context.Background())
+			require.NoError(t, err)
+			require.Contains(t, string(rawFail), `"type":"auth_fail"`)
+			require.Contains(t, string(rawFail), "password auth required")
+		})
+	}
+}
+
+func TestBrowserWS_ImmichPasswordSubmitReturnsRelayPolicyAfterAuthOK(t *testing.T) {
+	testApp, serverURL, cleanup := setupBrowserWSTest(t)
+	defer cleanup()
+	apiKey := createTestAgentAPIKey(t, testApp)
+	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-immich-auth-ok")
+	defer agentConn.CloseNow()
+
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"IMMICHAUTH2","share_type":"immich","is_password_protected":true,"relay_only":true,"relay_static_pub":"04abcd"}`)))
+	_, _, err := agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	browserConn := dialBrowser(t, serverURL, "IMMICHAUTH2")
+	defer browserConn.CloseNow()
+	_, _, err = browserConn.Read(context.Background())
+	require.NoError(t, err)
+
+	require.NoError(t, browserConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"password_submit","code":"IMMICHAUTH2","password":"secret"}`)))
+	_, rawSubmit, err := agentConn.Read(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, string(rawSubmit), `"type":"password_submit"`)
+	require.Contains(t, string(rawSubmit), `"code":"IMMICHAUTH2"`)
+	require.Contains(t, string(rawSubmit), `"password":"secret"`)
+
+	connID := extractJSONField(t, rawSubmit, "conn_id")
+	require.NotEmpty(t, connID)
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"auth_ok","code":"IMMICHAUTH2","conn_id":"`+connID+`"}`)))
+
+	_, rawPolicy, err := browserConn.Read(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, string(rawPolicy), `"type":"relay_policy"`)
+	require.Contains(t, string(rawPolicy), `"relay_only":true`)
+}
+
+func TestBrowserWS_ImmichAuthFailClosesAfterFiveAttempts(t *testing.T) {
+	testApp, serverURL, cleanup := setupBrowserWSTest(t)
+	defer cleanup()
+	apiKey := createTestAgentAPIKey(t, testApp)
+	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-immich-fail")
+	defer agentConn.CloseNow()
+
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"IMMICHFAIL1","share_type":"immich","is_password_protected":true,"relay_only":true,"relay_static_pub":"04abcd"}`)))
+	_, _, err := agentConn.Read(context.Background())
+	require.NoError(t, err)
+
+	browserConn := dialBrowser(t, serverURL, "IMMICHFAIL1")
+	defer browserConn.CloseNow()
+	_, _, err = browserConn.Read(context.Background())
+	require.NoError(t, err)
+
+	for i := 0; i < 5; i++ {
+		require.NoError(t, browserConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"password_submit","code":"IMMICHFAIL1","password":"bad"}`)))
+		_, rawSubmit, err := agentConn.Read(context.Background())
+		require.NoError(t, err)
+		connID := extractJSONField(t, rawSubmit, "conn_id")
+		require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"auth_fail","conn_id":"`+connID+`","code":"IMMICHFAIL1"}`)))
+		_, rawBrowser, err := browserConn.Read(context.Background())
+		require.NoError(t, err)
+		if i < 4 {
+			require.Contains(t, string(rawBrowser), `"type":"auth_fail"`)
+		} else {
+			require.Contains(t, string(rawBrowser), "too many incorrect password attempts")
+		}
+	}
 }

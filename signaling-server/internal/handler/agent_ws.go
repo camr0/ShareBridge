@@ -36,8 +36,9 @@ type agentMsg struct {
 	Candidate           json.RawMessage `json:"candidate,omitempty"`
 	ConnID              string          `json:"conn_id,omitempty"`
 	Value               string          `json:"value,omitempty"`
+	Password            string          `json:"password,omitempty"`
 	HasPassword         bool            `json:"has_password,omitempty"`
-	RelayOnly           bool            `json:"relay_only,omitempty"`
+	RelayOnly           *bool           `json:"relay_only,omitempty"`
 	RelayStaticPub      string          `json:"relay_static_pub,omitempty"`
 	ShareType           string          `json:"share_type,omitempty"`
 	IsPasswordProtected bool            `json:"is_password_protected,omitempty"`
@@ -238,6 +239,21 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					"relay_only":    relayOnly,
 				})
 
+			case "auth_fail":
+				if agentID == "" {
+					continue
+				}
+				failures := h.IncrementImmichAuthFailure(msg.ConnID)
+				log.Printf("Immich auth failed: conn %s failure %d/5", msg.ConnID, failures)
+				if failures >= 5 {
+					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
+				} else {
+					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+						"type":               "auth_fail",
+						"attempts_remaining": 5 - failures,
+					})
+				}
+
 			case "auth_failed":
 				// Track failures per connID. After 3, close the browser WebSocket.
 				// Browser receives auth_failed with attempts_remaining so it can re-prompt.
@@ -318,7 +334,11 @@ func handleRegisterShare(
 		// Try to create with collision retry (5 attempts)
 		created := false
 		for i := 0; i < 5; i++ {
-			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub, "", false)
+			relayOnly := false
+			if msg.RelayOnly != nil {
+				relayOnly = *msg.RelayOnly
+			}
+			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, relayOnly, msg.RelayStaticPub, "", false)
 			if err == nil {
 				created = true
 				break
@@ -492,7 +512,7 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 }
 
 // claimSessionCode atomically creates or reassigns a custom code.
-func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly bool, relayStaticPub, shareType string, isPasswordProtected bool) (*core.Record, bool, error) {
+func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly *bool, relayStaticPub, shareType string, isPasswordProtected bool) (*core.Record, bool, error) {
 	var claimed *core.Record
 	reconnected := false
 
@@ -516,7 +536,11 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 			if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, relayOnly, relayStaticPub, shareType, isPasswordProtected); err != nil {
+			createRelayOnly := false
+			if relayOnly != nil {
+				createRelayOnly = *relayOnly
+			}
+			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, createRelayOnly, relayStaticPub, shareType, isPasswordProtected); err != nil {
 				return err
 			}
 			record, getErr := getSessionByCode(txApp, code)
@@ -540,7 +564,9 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 		}
 		record.Set("api_key_id", apiKeyID)
 		record.Set("agent_id", agentID)
-		record.Set("relay_only", relayOnly)
+		if relayOnly != nil {
+			record.Set("relay_only", *relayOnly)
+		}
 		record.Set("relay_static_pub", relayStaticPub)
 		record.Set("share_type", shareType)
 		record.Set("is_password_protected", isPasswordProtected)

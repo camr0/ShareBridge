@@ -18,6 +18,8 @@ import (
 
 type browserMsg struct {
 	Type      string          `json:"type"`
+	Code      string          `json:"code,omitempty"`
+	Password  string          `json:"password,omitempty"`
 	SDP       string          `json:"sdp,omitempty"`
 	Candidate json.RawMessage `json:"candidate,omitempty"`
 	HMAC      string          `json:"hmac,omitempty"`
@@ -54,6 +56,9 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			return
 		}
 		sessionRecord := records[0]
+		shareType := sessionRecord.GetString("share_type")
+		isImmich := shareType == "immich"
+		isPasswordProtected := sessionRecord.GetBool("is_password_protected")
 
 		expiresAt := sessionRecord.GetDateTime("expires_at")
 		if !expiresAt.IsZero() && time.Now().After(expiresAt.Time()) {
@@ -147,45 +152,10 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			return
 		}
 
-		// Send ICE config - STUN-only (no TURN)
-		iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-			STUNURL: cfg.STUNURL,
-		})
-
-		log.Printf("browser_ws: sending ICE config for session %s: STUN=%s", sessionCode, cfg.STUNURL)
-
-		if quotaExceeded {
-			msg := map[string]any{
-				"type":                 "ice_config",
-				"ice_servers":          iceServers,
-				"relay_only":           relayOnly,
-				"relay_quota_exceeded": true,
-				"quota_period_end":     periodEnd.Format(time.RFC3339),
-			}
-			log.Printf("browser_ws: sending ice_config (quota exceeded): %+v", msg)
-			sessionHub.SendDirect(requestCtx, browserConn, msg)
+		if isImmich && isPasswordProtected {
+			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "password_required"})
 		} else {
-			msg := map[string]any{
-				"type":        "ice_config",
-				"ice_servers": iceServers,
-				"relay_only":  relayOnly,
-			}
-			log.Printf("browser_ws: sending ice_config: %+v", msg)
-			sessionHub.SendDirect(requestCtx, browserConn, msg)
-		}
-
-		// Relay-only sessions skip direct browser setup, so the server must kick
-		// off the initial HMAC challenge instead of waiting for a browser-side
-		// "knock" message.
-		if relayOnly {
-			log.Printf("browser_ws: relay_only session %s - server initiating nonce challenge for conn %s", sessionCode, connID)
-			if err := sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
-				"type":    "knock",
-				"conn_id": connID,
-				"code":    sessionCode,
-			}); err != nil {
-				log.Printf("browser_ws: initial relay-only knock send failed for session %s conn %s: %v", sessionCode, connID, err)
-			}
+			sendBrowserIceConfigAndMaybeKnock(requestCtx, sessionHub, browserConn, apiKeyID, sessionCode, connID, relayOnly, quotaExceeded, periodEnd, cfg)
 		}
 
 		for {
@@ -200,12 +170,33 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 				continue
 			}
 
+			if isImmich && isPasswordProtected && msg.Type != "password_submit" {
+				sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "auth_fail", "message": "password auth required"})
+				continue
+			}
+
 			switch msg.Type {
 			case "knock":
 				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
 					"type":    "knock",
 					"conn_id": connID,
 					"code":    sessionCode,
+				})
+
+			case "password_submit":
+				if !isImmich || !isPasswordProtected {
+					sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "auth_fail", "message": "password auth not required"})
+					continue
+				}
+				if msg.Code != sessionCode {
+					sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "auth_fail", "message": "session code mismatch"})
+					continue
+				}
+				sessionHub.SendToAgent(requestCtx, apiKeyID, map[string]any{
+					"type":     "password_submit",
+					"conn_id":  connID,
+					"code":     sessionCode,
+					"password": msg.Password,
 				})
 
 			case "join":
@@ -232,6 +223,21 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 					"candidate":  msg.Candidate,
 				})
 			}
+		}
+	}
+}
+
+func sendBrowserIceConfigAndMaybeKnock(ctx context.Context, sessionHub *hub.Hub, browserConn *websocket.Conn, apiKeyID, sessionCode, connID string, relayOnly, quotaExceeded bool, periodEnd time.Time, cfg *config.Config) {
+	iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{STUNURL: cfg.STUNURL})
+	msg := map[string]any{"type": "ice_config", "ice_servers": iceServers, "relay_only": relayOnly}
+	if quotaExceeded {
+		msg["relay_quota_exceeded"] = true
+		msg["quota_period_end"] = periodEnd.Format(time.RFC3339)
+	}
+	sessionHub.SendDirect(ctx, browserConn, msg)
+	if relayOnly {
+		if err := sessionHub.SendToAgent(ctx, apiKeyID, map[string]any{"type": "knock", "conn_id": connID, "code": sessionCode}); err != nil {
+			log.Printf("browser_ws: initial relay-only knock send failed for session %s conn %s: %v", sessionCode, connID, err)
 		}
 	}
 }

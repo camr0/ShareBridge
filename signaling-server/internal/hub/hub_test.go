@@ -328,6 +328,17 @@ func TestHubUnregisterCodeClosesPairedBrowser(t *testing.T) {
 	require.Contains(t, string(raw), "share has been removed")
 }
 
+func TestAuthFailureCountersAreSeparate(t *testing.T) {
+	h := New()
+	connID := "conn-mixed-auth"
+
+	require.Equal(t, 1, h.IncrementImmichAuthFailure(connID))
+	require.Equal(t, 2, h.IncrementImmichAuthFailure(connID))
+	require.Equal(t, 1, h.IncrementAuthFailure(connID))
+	require.Equal(t, 3, h.IncrementImmichAuthFailure(connID))
+	require.Equal(t, 2, h.IncrementAuthFailure(connID))
+}
+
 func TestSendToAgent(t *testing.T) {
 	server, connChan := setupTestServer(t)
 	defer server.Close()

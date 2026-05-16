@@ -16,23 +16,25 @@ type pair struct {
 }
 
 type Hub struct {
-	mu           sync.RWMutex
-	agents       map[string]*websocket.Conn // apiKey → conn (one conn per API key)
-	codes        map[string]string          // code → apiKey (for browser lookup)
-	pairs        map[string]*pair           // sessionID → pair
-	connBrowsers map[string]*websocket.Conn // connID → browser conn
-	connFails    map[string]int             // connID → auth failure count
-	connWrites   map[*websocket.Conn]*sync.Mutex
+	mu              sync.RWMutex
+	agents          map[string]*websocket.Conn // apiKey → conn (one conn per API key)
+	codes           map[string]string          // code → apiKey (for browser lookup)
+	pairs           map[string]*pair           // sessionID → pair
+	connBrowsers    map[string]*websocket.Conn // connID → browser conn
+	connFails       map[string]int             // connID → auth failure count
+	connImmichFails map[string]int             // connID → Immich password auth failure count
+	connWrites      map[*websocket.Conn]*sync.Mutex
 }
 
 func New() *Hub {
 	return &Hub{
-		agents:       make(map[string]*websocket.Conn),
-		codes:        make(map[string]string),
-		pairs:        make(map[string]*pair),
-		connBrowsers: make(map[string]*websocket.Conn),
-		connFails:    make(map[string]int),
-		connWrites:   make(map[*websocket.Conn]*sync.Mutex),
+		agents:          make(map[string]*websocket.Conn),
+		codes:           make(map[string]string),
+		pairs:           make(map[string]*pair),
+		connBrowsers:    make(map[string]*websocket.Conn),
+		connFails:       make(map[string]int),
+		connImmichFails: make(map[string]int),
+		connWrites:      make(map[*websocket.Conn]*sync.Mutex),
 	}
 }
 
@@ -261,6 +263,7 @@ func (h *Hub) UnregisterBrowserConn(connID string) {
 	}
 	delete(h.connBrowsers, connID)
 	delete(h.connFails, connID)
+	delete(h.connImmichFails, connID)
 }
 
 // ForwardToBrowserByConnID sends msg to the browser identified by connID.
@@ -276,7 +279,7 @@ func (h *Hub) ForwardToBrowserByConnID(ctx context.Context, connID string, msg a
 }
 
 // IncrementAuthFailure increments the failure count for connID and returns
-// the new total. Used by agent_ws.go to enforce the 3-strike limit.
+// the new total. Callers decide which strike limit applies to their auth flow.
 func (h *Hub) IncrementAuthFailure(connID string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -284,8 +287,17 @@ func (h *Hub) IncrementAuthFailure(connID string) int {
 	return h.connFails[connID]
 }
 
+// IncrementImmichAuthFailure increments the Immich password failure count for
+// connID and returns the new total.
+func (h *Hub) IncrementImmichAuthFailure(connID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.connImmichFails[connID]++
+	return h.connImmichFails[connID]
+}
+
 // CloseBrowserConnWithError sends an error message to the browser identified by
-// connID and then closes its WebSocket. Used after 3 HMAC auth failures.
+// connID and then closes its WebSocket.
 func (h *Hub) CloseBrowserConnWithError(ctx context.Context, connID, message string) {
 	h.mu.RLock()
 	conn, ok := h.connBrowsers[connID]
