@@ -42,6 +42,25 @@ cp .env.example .env
 docker-compose up -d
 ```
 
+## Immich Backend
+
+Immich support is configured on the agent, not on the signaling server. The
+signaling server stores Immich keys as normal sessions and serves gallery links at
+`/i/<immich-share-key>`.
+
+Set these environment variables on the agent:
+
+```bash
+IMMICH_URL=http://immich.lan:2283
+IMMICH_ALLOWED_HOST=immich.lan:2283
+IMMICH_API_KEY=sb_immich_read_key_example
+IMMICH_POLL_INTERVAL=30
+```
+
+Immich shares are always relay-only. Protected Immich shares validate passwords
+through the agent against Immich before any transfer channel is opened; recipient
+passwords are not persisted.
+
 ### Architecture
 
 The secure relay mode uses the signaling server as a relay when direct WebRTC connection fails:

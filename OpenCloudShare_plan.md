@@ -805,14 +805,15 @@ Near-identical to OpenCloud — same ownCloud lineage, same public share link fo
 changes, mostly config/branding. Could ship in Phase 2.
 
 ### Immich
-Immich has shared album links with its own REST API:
-- `GET /api/shared-link/{key}` — fetch album metadata and asset list
-- `GET /api/assets/{id}/original` — download individual photo/video
-- Password-protected albums supported via `X-Api-Key` or `password` query param
-
-Immich is photo/video focused, so the browser UI would need a media preview mode
-rather than a generic file list. Planned for a dedicated phase post-OpenCloud
-integration.
+Implemented in Slice 14 as a relay-only gallery backend:
+- Agent polls `GET /api/shared-links` with an Immich API key and auto-registers
+  shared-link keys as `/i/{key}` sessions.
+- Recipients get a photo/video gallery mode instead of the file tree.
+- Protected albums use Immich password validation through the agent before any
+  transfer channel is opened.
+- Thumbnails and full assets are fetched with the share key via
+  `/api/shared-links/my-share`, `/api/assets/{id}/thumbnail`, and
+  `/api/assets/{id}/original`.
 
 ### Generic WebDAV
 Any server exposing a standard WebDAV endpoint (Seafile, nginx with mod_dav, etc.)

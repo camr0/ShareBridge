@@ -1,7 +1,7 @@
 # Immich Integration — Design Spec
 
 **Slice 14** (moved up from Slice 17, 2026-05-16)
-**Status:** Designing
+**Status:** Implemented in Slice 14
 **Inspiration:** Immich Public Proxy ([alangrainger/immich-public-proxy](https://github.com/alangrainger/immich-public-proxy))
 
 ## Overview
@@ -17,7 +17,7 @@ Immich (LAN) ←→ Agent (LAN) ←→ Signaling Server (public) ←→ Recipien
             sharedLink.read       sessions table
 ```
 
-- **Discovery**: Agent polls `GET /shared-links` every 30s with a `sharedLink.read`-scoped API key. Auto-registers each discovered key as a session via the existing `register_share` mechanism. The auto-discovery polling is new (Immich-specific); the session registration path is shared with OC/NC.
+- **Discovery**: Agent polls `GET /api/shared-links` every 30s with a `sharedLink.read`-scoped API key. Auto-registers each discovered key as a session via the existing `register_share` mechanism. The auto-discovery polling is new (Immich-specific); the session registration path is shared with OC/NC.
 - **Asset serving**: All file/thumbnail access uses the Immich share key as auth (no API key). Same pattern as immich-public-proxy.
 - **Signaling server**: Stores Immich shares in the standard sessions table. `/i/KEY` is a session lookup (same as `/s/CODE`). No separate routing infrastructure.
 - **Transport policy**: Immich sessions are registered as `relay_only: true`. Direct mode would expose the agent/home IP to recipients, which contradicts the product promise for an Immich public-share replacement.
@@ -41,7 +41,7 @@ type Client struct {
 | `ListFiles` | `GET /api/shared-links/my-share?key={key}` | share key |
 | `GetThumbnail` | `GET /api/assets/{id}/thumbnail?key={key}` | share key |
 | `GetFile` | `GET /api/assets/{id}/original?key={key}` or download endpoint | share key |
-| `PollShares` | `GET /shared-links` | API key (sharedLink.read) |
+| `PollShares` | `GET /api/shared-links` | API key (sharedLink.read) |
 
 Exact paths and password parameter placement must be verified against the target Immich version before implementation. Current public API docs show `getMySharedLink` accepting `key` and `password` query parameters, and `getAssetThumbnail` / `downloadAsset` accepting `key`; do not assume an `X-Immich-Shared-Link-Password` header unless verified against a real instance.
 
@@ -203,16 +203,16 @@ A newly-created Immich share may not appear for up to 30 seconds (until the next
 
 **Share deletion during active transfer:** If the 30s poll detects a key removal (share deleted/expired in Immich) while a recipient has an active download, the agent terminates the transfer with an `{"type": "error", "message": "share has been removed"}` message and closes the peer connection.
 
-### Immich API Paths (verify during implementation)
+### Immich API Paths
 
-The spec uses these paths based on the documented Immich API. Exact paths must be verified against the running Immich instance during implementation — the API docs pagination prevented full verification.
+Implemented paths are based on the documented Immich API and are covered by the agent's mocked Immich client tests. A live target-instance smoke test should still be run before production rollout because Immich has changed API paths across releases.
 
-| Purpose | Expected path | Auth |
+| Purpose | Implemented path | Auth |
 |---------|--------------|------|
-| List all shares | `GET /shared-links` | API key |
-| Get share by key | `GET /shared-links/my-share?key={key}` | share key |
-| Thumbnail | `GET /assets/{id}/thumbnail?key={key}` | share key |
-| Original | `GET /assets/{id}/original?key={key}` | share key |
+| List all shares | `GET /api/shared-links` with `x-api-key` | API key |
+| Get share by key | `GET /api/shared-links/my-share?key={key}&password={password}` | share key, optional password |
+| Thumbnail | `GET /api/assets/{id}/thumbnail?key={key}` | share key, validated password query when needed |
+| Original | `GET /api/assets/{id}/original?key={key}` | share key, validated password query when needed |
 
 ## URL Structure
 
@@ -238,7 +238,7 @@ If you need the link before the 30s window, the agent admin UI can trigger an im
 
 ```bash
 IMMICH_URL=http://immich.lan:2283
-IMMICH_ALLOWED_HOST=immich.lan       # SSRF protection
+IMMICH_ALLOWED_HOST=immich.lan:2283  # SSRF protection, must match URL host[:port]
 IMMICH_API_KEY=sb_immich_xxx         # scoped to sharedLink.read only
 ```
 
