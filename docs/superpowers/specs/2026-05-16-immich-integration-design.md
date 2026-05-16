@@ -13,13 +13,13 @@ Add Immich as a third storage backend (alongside OpenCloud and Nextcloud). Recip
 ```
 Immich (LAN) ←→ Agent (LAN) ←→ Signaling Server (public) ←→ Recipient Browser
                   ↑                 ↑
-            API key:              /i/KEY routing
-            sharedLink.read       (key→agent map, 30s poll)
+            API key:              /i/KEY in
+            sharedLink.read       sessions table
 ```
 
-- **Discovery**: Agent polls `GET /shared-links` every 30s with a `sharedLink.read`-scoped API key. Reports active share keys to the signaling server (capability map).
+- **Discovery**: Agent polls `GET /shared-links` every 30s with a `sharedLink.read`-scoped API key. Auto-registers each key as a session via `registershare` — same mechanism as OC/NC shares.
 - **Asset serving**: All file/thumbnail access uses the Immich share key as auth (no API key). Same pattern as immich-public-proxy.
-- **Signaling server**: Maintains ephemeral key→agent map. Routes `/i/KEY` to the matching agent. Miss triggers an on-demand targeted poll.
+- **Signaling server**: Stores Immich shares in the standard sessions table. `/i/KEY` is a session lookup (same as `/s/CODE`). No separate routing infrastructure.
 
 ## Agent: Immich API Client
 
@@ -42,7 +42,7 @@ type Client struct {
 | `GetFile` | `GET /api/assets/{id}/original?key={key}` | share key |
 | `PollShares` | `GET /shared-links` | API key (sharedLink.read) |
 
-**Password handling**: Agent validates by calling the Immich API with the password. Immich's own auth gates the share. Agent never stores the password before first recipient access — it discovers password requirement via the share info response.
+**Password handling**: Agent never knows the password. When a recipient submits a password, the agent forwards it to the Immich API as an `X-Immich-Shared-Link-Password` header. Immich accepts or rejects. Agent is a blind relay for password validation — same trust model as the signaling server for OC/NC HMAC (never sees plaintext password, only the yes/no result). Whether a share requires a password is discovered from the share info response on first access.
 
 ## Protocol Changes
 
@@ -97,37 +97,27 @@ The recipient browser app gains a gallery mode alongside the existing file tree 
 
 **Video note**: Full download before playback (no progressive streaming through DataChannel). Future optimization: MediaSource Extensions with fragmented MP4 repackaging.
 
-## Capability Map + Routing
+## Session Registration + Routing
 
-### Agent → Server: Capability Messages
+Immich shares use the same session infrastructure as OC/NC. No separate routing layer.
 
-```
-Agent: {"type": "capabilities", "keys": ["ffSw63qn...", "aBc12xYz..."]}
-Agent: {"type": "capabilities", "keys": []}   // no active shares
-```
+### Agent: Auto-Registration
 
-Sent on startup and every 30s thereafter. Full snapshot, not delta (simpler, and key lists are small).
+- Every 30s: poll `GET /shared-links` → get active share keys
+- For each **new** key not yet registered: send `registershare` to signaling server with the Immich key as the code
+- For each **removed** key (share expired/deleted in Immich): send `unregistershare`
+- On agent startup: poll immediately, register all current keys
+- On agent reconnect: same flow as OC/NC — re-register all persisted sessions (including Immich)
 
-### Server → Agent: Targeted Poll
+The signaling server stores Immich shares in the same sessions table. The code column holds the Immich key. All existing session infrastructure works unchanged: persistence, bandwidth tracking, download counting, expiry, reclaim on reconnect.
 
-```
-Server: {"type": "poll_shares"}
-```
+### Signaling Server
 
-Sent when a `/i/KEY` request arrives and KEY is not in the capability map. The server picks ONE Immich-capable agent and sends this message. The agent immediately polls `GET /shared-links` and reports updated capabilities.
+- `GET /i/KEY` → lookup in sessions table (same as `/s/CODE`)
+- Key miss → 404
+- No separate capability map — the sessions table IS the source of truth
 
-### Server State
-
-- In-memory `map[key]agentConn` (ephemeral, dropped on agent disconnect)
-- `GET /i/KEY` → O(1) lookup → route to agent
-- Key miss → targeted poll one agent → update map → retry
-- Agent disconnect → remove all entries for that agent
-- Pending `/i/KEY` requests time out after 10s (agent didn't respond to poll)
-
-### Scaling
-
-At single-user scale: one agent, one Immich, routing is trivial.
-At multi-user scale: O(1) routing, no broadcast, no cross-agent information leak. A miss costs at most one extra Immich API call.
+A newly-created Immich share may not appear for up to 30 seconds (until the next poll). Acceptable.
 
 ### Immich API Paths (verify during implementation)
 
@@ -151,14 +141,14 @@ Both use the same sessions table. Immich keys are just longer strings. Code gene
 
 ## Share Creation Flow
 
-**Phase 1 (this slice):** Agent Admin UI
-1. In Immich: create shared album, copy link
-2. In agent dashboard: paste URL, select type "Immich", configure password/expiry
-3. Agent extracts key, creates ImmichClient, registers with signaling server
+Zero-touch. No extension, no admin UI, no userscript required.
 
-**Phase 2 (future):** Immich userscript
-- Browser script adds "Share via ShareBridge" button in Immich share dialog
-- Calls agent v1 API directly, returns code inline
+1. In Immich: create a shared album (sets password, expiry, etc. in Immich)
+2. Agent's next 30s poll discovers the new share key
+3. Agent calls `registershare` with the Immich key → signaling server stores it in sessions table
+4. Share link (`sharebridge.app/i/KEY`) is immediately live for recipients
+
+If you need the link before the 30s window, the agent admin UI can trigger an immediate poll (manual refresh button). Not required for normal use.
 
 ## Config
 
@@ -196,7 +186,7 @@ No new API endpoints needed.
 - `agent/internal/transfer/manager.go` — thumbnail pass before serving file list
 - `signaling-server/web/src/app.js` — detect `/i/` path, route to gallery mode
 - `signaling-server/web/src/messages.js` — handle thumbnail_list, thumbnail_data, asset_request
-- Signaling server: capability map, `/i/` route handler, agent WebSocket handler for capabilities
+- Signaling server: `/i/` route handler, `registershare`/`unregistershare` for external codes
 
 **Dependency added:**
 - `lightGallery.js` (npm, ~50KB gzipped)
@@ -209,7 +199,7 @@ No new API endpoints needed.
 - **Password validated by Immich** — agent proxies password to Immich API, never stores it pre-discovery
 - **No IP leak** — all recipient traffic goes through signaling server WebSocket
 - **Key enumeration protection** — rate limiting on `/i/KEY` endpoint, keys are high-entropy random strings
-- **No broadcast** — capability map ensures O(1) routing, no cross-agent information leak
+- **No broadcast** — sessions table ensures O(1) routing, no cross-agent information leak
 
 ## Credit
 
