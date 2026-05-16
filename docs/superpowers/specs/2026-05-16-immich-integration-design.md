@@ -17,7 +17,7 @@ Immich (LAN) ←→ Agent (LAN) ←→ Signaling Server (public) ←→ Recipien
             sharedLink.read       sessions table
 ```
 
-- **Discovery**: Agent polls `GET /shared-links` every 30s with a `sharedLink.read`-scoped API key. Auto-registers each key as a session via `registershare` — same mechanism as OC/NC shares.
+- **Discovery**: Agent polls `GET /shared-links` every 30s with a `sharedLink.read`-scoped API key. Auto-registers each discovered key as a session via the existing `registershare` mechanism. The auto-discovery polling is new (Immich-specific); the session registration path is shared with OC/NC.
 - **Asset serving**: All file/thumbnail access uses the Immich share key as auth (no API key). Same pattern as immich-public-proxy.
 - **Signaling server**: Stores Immich shares in the standard sessions table. `/i/KEY` is a session lookup (same as `/s/CODE`). No separate routing infrastructure.
 
@@ -42,7 +42,7 @@ type Client struct {
 | `GetFile` | `GET /api/assets/{id}/original?key={key}` | share key |
 | `PollShares` | `GET /shared-links` | API key (sharedLink.read) |
 
-**Password handling**: Agent never knows the password. When a recipient submits a password, the agent forwards it to the Immich API as an `X-Immich-Shared-Link-Password` header. Immich accepts or rejects. Agent is a blind relay for password validation — same trust model as the signaling server for OC/NC HMAC (never sees plaintext password, only the yes/no result). Whether a share requires a password is discovered from the share info response on first access.
+**Password handling**: Unlike OC/NC (where the agent owns and verifies the password via HMAC), the Immich agent is a blind relay. It does not know the password. When a recipient submits a password, the agent forwards it to the Immich API as an `X-Immich-Shared-Link-Password` header. Immich's own auth gates the share and returns accept/reject. The agent sees only the yes/no result. Whether a share requires a password is discovered from the share info response on first access.
 
 ## Protocol Changes
 
@@ -196,7 +196,7 @@ No new API endpoints needed.
 - **Signaling server never accesses Immich** — agent is the only thing that calls Immich API
 - **Share key gates asset access** — no API key used for serving content
 - **API key is read-only, single-scope** (`sharedLink.read`) — cannot modify, upload, or delete
-- **Password validated by Immich** — agent proxies password to Immich API, never stores it pre-discovery
+- **Password validated by Immich** — agent is a blind relay, never knows the password (unlike OC/NC where agent owns it)
 - **No IP leak** — all recipient traffic goes through signaling server WebSocket
 - **Key enumeration protection** — rate limiting on `/i/KEY` endpoint, keys are high-entropy random strings
 - **No broadcast** — sessions table ensures O(1) routing, no cross-agent information leak
