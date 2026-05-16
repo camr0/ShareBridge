@@ -51,6 +51,7 @@ let currentPath = []
 let sessionCode = ''
 let galleryMode = false
 let galleryController = null
+let galleryAssetRequestPending = false
 let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
@@ -792,6 +793,7 @@ async function getDownloadSupport(header) {
 }
 
 async function startDownload(header) {
+  galleryAssetRequestPending = false
   currentFile = header
   receivedBytes = 0
   transferStartTime = Date.now()
@@ -829,6 +831,7 @@ async function startDownload(header) {
     })
     currentFile = null
     transferStartTime = 0
+    galleryAssetRequestPending = false
     return
   }
 
@@ -841,6 +844,7 @@ async function startDownload(header) {
         finalizeDownloadUI(header, result)
         activeDownload = null
         currentFile = null
+        galleryAssetRequestPending = false
         receivedBytes = 0
         receivedChunkCount = 0
         transferStartTime = 0
@@ -861,6 +865,7 @@ async function startDownload(header) {
     })
     activeDownload = null
     currentFile = null
+    galleryAssetRequestPending = false
     receivedBytes = 0
     receivedChunkCount = 0
     transferStartTime = 0
@@ -1077,12 +1082,17 @@ async function handleError(msg) {
   })
 
   if (activeDownload?.fail) {
+    if (message === 'transfer in progress') {
+      updateStatus('Download in progress, please wait')
+      return
+    }
     updateStatus('Transfer failed')
     await activeDownload.fail('transfer-error', message || 'Transfer failed')
     clearClosedTransferSession()
     return
   }
 
+  galleryAssetRequestPending = false
   updateStatus('Error: ' + message)
 }
 
@@ -1098,6 +1108,7 @@ async function handleTransferClosure() {
 }
 
 function clearClosedTransferSession() {
+  galleryAssetRequestPending = false
   transferChannel = null
   currentTransferMode = null
   getConnectionStatusEl().classList.add('hidden')
@@ -1127,6 +1138,7 @@ function resetUI() {
   renderDownloadWarning(null)
   activeDownload = null
   currentFile = null
+  galleryAssetRequestPending = false
   receivedBytes = 0
   receivedChunkCount = 0
   transferStartTime = 0
@@ -1170,10 +1182,23 @@ function ensureGalleryController() {
   if (root) {
     galleryController = createGalleryController({
       root,
-      sendAssetRequest: (id) => transferChannel?.send(JSON.stringify({ type: 'asset_request', id, quality: 'original' })),
+      sendAssetRequest: requestGalleryAsset,
     })
   }
   return galleryController
+}
+
+function requestGalleryAsset(id) {
+  if (activeDownload || galleryAssetRequestPending) {
+    updateStatus('Download in progress, please wait')
+    return
+  }
+  if (!transferChannel) {
+    updateStatus('Connection closed')
+    return
+  }
+  galleryAssetRequestPending = true
+  transferChannel.send(JSON.stringify({ type: 'asset_request', id, quality: 'original' }))
 }
 
 function initFromURL() {
@@ -1250,5 +1275,6 @@ export const __test = {
   submitPassword,
   handleTransferClosure,
   handleError,
+  requestGalleryAsset,
   applyFinalDownloadState,
 }

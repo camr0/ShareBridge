@@ -429,7 +429,7 @@ func TestCreateSession(t *testing.T) {
 func TestCreateSessionManualImmichRegistersRelayOnlyShare(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
-	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
@@ -1365,7 +1365,7 @@ func TestHandlePasswordSubmit_NonImmichSendsAuthFail(t *testing.T) {
 func TestSyncImmichSharesRegistersNewAndUnregistersRemoved(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
-	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
@@ -1383,7 +1383,7 @@ func TestSyncImmichSharesRegistersNewAndUnregistersRemoved(t *testing.T) {
 func TestSyncImmichSharesRemovedShareNotifiesRelayChannelBeforeClose(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
-	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{}, nil
@@ -1421,7 +1421,7 @@ func TestSyncImmichSharesRemovedShareNotifiesRelayChannelBeforeClose(t *testing.
 func TestSyncImmichSharesUnregisterFailureLeavesRemovedSessionInMemory(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
-	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{}, nil
@@ -1442,7 +1442,7 @@ func TestSyncImmichSharesUnregisterFailureLeavesRemovedSessionInMemory(t *testin
 func TestSyncImmichSharesStoreDeleteFailureLeavesRemovedSessionInMemory(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
-	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{}, nil
@@ -1463,7 +1463,7 @@ func TestSyncImmichSharesStoreDeleteFailureLeavesRemovedSessionInMemory(t *testi
 func TestSyncImmichSharesRollsBackSignalingRegistrationOnStoreSaveFailure(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
-	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{{Key: "IMMICHROLLBACK1"}}}, nil
@@ -1481,7 +1481,7 @@ func TestSyncImmichSharesRollsBackSignalingRegistrationOnStoreSaveFailure(t *tes
 func TestSyncImmichSharesWiresClientForNewSession(t *testing.T) {
 	d, _ := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
-	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
@@ -1506,7 +1506,7 @@ func TestLoadSessionsFromStoreWiresPersistedImmichSession(t *testing.T) {
 		SignalingURL:      "ws://localhost:8080",
 		APIKey:            "test-key",
 		ImmichURL:         "http://immich.lan:2283",
-		ImmichAllowedHost: "immich.lan",
+		ImmichAllowedHost: "immich.lan:2283",
 		ImmichAPIKey:      "api",
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}

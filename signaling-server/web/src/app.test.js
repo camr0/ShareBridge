@@ -663,3 +663,40 @@ test('handleError fails the active download and clears the dead session', async 
     __test.setActiveDownload(null)
   })
 })
+
+test('requestGalleryAsset ignores repeated requests while one is pending', async () => {
+  await withMinimalDocument(async (elements) => {
+    const sends = []
+    __test.setTransferSession({ channel: { send: (text) => sends.push(text) }, mode: 'relay' })
+
+    __test.requestGalleryAsset('asset-1')
+    __test.requestGalleryAsset('asset-2')
+
+    assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1'])
+    assert.equal(elements.get('status').textContent, 'Download in progress, please wait')
+
+    await __test.handleError({ message: 'not found' })
+    __test.requestGalleryAsset('asset-3')
+
+    assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3'])
+    await __test.handleError({ message: 'cleanup' })
+    __test.setTransferSession({ channel: null, mode: null })
+  })
+})
+
+test('transfer in progress errors do not fail the current gallery download', async () => {
+  await withMinimalDocument(async (elements) => {
+    let failCalled = false
+    __test.setActiveDownload({
+      async fail() {
+        failCalled = true
+      },
+    })
+
+    await __test.handleError({ message: 'transfer in progress' })
+
+    assert.equal(failCalled, false)
+    assert.equal(elements.get('status').textContent, 'Download in progress, please wait')
+    __test.setActiveDownload(null)
+  })
+})

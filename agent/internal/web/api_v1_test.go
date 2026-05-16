@@ -230,7 +230,7 @@ func TestV1CreateShareAcceptsImmichTypeWhenConfigured(t *testing.T) {
 		DefaultExpiry:       24,
 		DefaultMaxDownloads: 10,
 		ImmichURL:           "http://immich.lan:2283",
-		ImmichAllowedHost:   "immich.lan",
+		ImmichAllowedHost:   "immich.lan:2283",
 		ImmichAPIKey:        "api",
 	}
 	ws, _ := newV1TestServer(cfg)
@@ -281,7 +281,7 @@ func TestV1CreateShareReturnsBadRequestForManualImmichURLValidationError(t *test
 		DefaultExpiry:       24,
 		DefaultMaxDownloads: 10,
 		ImmichURL:           "http://immich.lan:2283",
-		ImmichAllowedHost:   "immich.lan",
+		ImmichAllowedHost:   "immich.lan:2283",
 		ImmichAPIKey:        "api",
 	}
 	ws, mock := newV1TestServer(cfg)

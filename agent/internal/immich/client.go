@@ -124,14 +124,11 @@ func hostAllowed(got, allowed string) bool {
 	if allowed == "" {
 		return false
 	}
-	if got == allowed {
-		return true
-	}
-	host, _, err := net.SplitHostPort(got)
-	if err != nil {
-		return false
-	}
-	return host == allowed
+	return canonicalHost(got) == canonicalHost(allowed)
+}
+
+func canonicalHost(host string) string {
+	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
 func (c *Client) PollShares(ctx context.Context) ([]SharedLink, error) {

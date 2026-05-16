@@ -21,6 +21,13 @@ func TestNewRejectsHostOutsideAllowList(t *testing.T) {
 	require.ErrorContains(t, err, `host "evil.example:2283" not allowed`)
 }
 
+func TestHostAllowedRequiresExactHostAndPort(t *testing.T) {
+	require.True(t, hostAllowed("immich.lan:2283", "immich.lan:2283"))
+	require.True(t, hostAllowed("immich.lan", "immich.lan"))
+	require.False(t, hostAllowed("immich.lan:9999", "immich.lan"))
+	require.False(t, hostAllowed("immich.lan:9999", "immich.lan:2283"))
+}
+
 func TestPollSharesUsesAPIKeyAndNormalizesProtection(t *testing.T) {
 	var gotKey string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

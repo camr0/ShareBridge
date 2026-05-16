@@ -118,7 +118,7 @@ func TestCreateShareForm_AcceptsImmichShareTypeWhenConfigured(t *testing.T) {
 		SignalingURL:      "wss://share.example.com",
 		DefaultExpiry:     24,
 		ImmichURL:         "http://immich.lan:2283",
-		ImmichAllowedHost: "immich.lan",
+		ImmichAllowedHost: "immich.lan:2283",
 		ImmichAPIKey:      "api",
 	}
 	ws, mock := newV1TestServer(cfg)
@@ -175,7 +175,7 @@ func TestCreateShareForm_ReturnsBadRequestForManualImmichURLValidationError(t *t
 		SignalingURL:      "wss://share.example.com",
 		DefaultExpiry:     24,
 		ImmichURL:         "http://immich.lan:2283",
-		ImmichAllowedHost: "immich.lan",
+		ImmichAllowedHost: "immich.lan:2283",
 		ImmichAPIKey:      "api",
 	}
 	ws, mock := newV1TestServer(cfg)
