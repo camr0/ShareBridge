@@ -54,6 +54,35 @@ type Client struct {
 
 The agent never knows the password — it sees only Immich's yes/no response. The raw password transits the signaling server, but this is acceptable: the signaling server has no Immich or LAN access, and a malicious signaling server can already swap the browser JS to capture passwords (the HMAC model assumes a trusted server serving untampered JS). This provides the same resource-exhaustion protection as HMAC (no peer created before auth) via a different mechanism (Immich API validation instead of local HMAC verify).
 
+**Trust model note:** This is a deliberate exception to the server trust model for Immich shares. The OC/NC HMAC pre-challenge prevents the signaling server from seeing the raw password; the Immich flow does not. Future readers should treat this as a known design decision, not an oversight. The Immich architecture (password hash stored on Immich, not shared with the agent) makes HMAC impossible without out-of-band password exchange.
+
+### Session Registration: isPasswordProtected
+
+When the agent calls `registershare` for an Immich key, it fetches the share info from Immich and stores `isPasswordProtected` in the sessions table alongside the code. The signaling server reads this field when a browser connects and sends `password_required` before any peer creation if the flag is true. For unprotected shares, the flag is false and the flow skips directly to peer negotiation.
+
+### Hub Auth Relay
+
+The signaling server's hub already routes WebRTC signaling messages (offer/answer/ICE) between browser and agent WebSocket connections using the session code as the routing key. The password auth flow reuses these same routing primitives:
+
+```
+Browser WS                  Hub                     Agent WS
+   |                         |                         |
+   |-- password_submit ----->|                         |
+   |  {code, password}      |                         |
+   |                         |-- password_submit ----->|
+   |                         |  {code, password}      |
+   |                         |                         |-- Immich API call
+   |                         |                         |   (with password)
+   |                         |                     <---|
+   |                         |                         |
+   |                         |<-- auth_ok / auth_fail -|
+   |<-- auth_ok / auth_fail -|                         |
+   |                         |                         |
+   |--- (on auth_ok) WebRTC negotiation begins ---->---|
+```
+
+The hub's `ForwardToAgent` and `ForwardToBrowser` methods handle the routing. No new hub infrastructure is needed — this is the same pattern as WebRTC offer/answer relaying. The only new behavior is that the hub sends `password_required` unilaterally (not a relay, a server-originating message) when the session's `isPasswordProtected` field is true.
+
 ## Signaling Protocol Changes
 
 ### Password Auth (Immich-specific, replaces HMAC pre-challenge)
@@ -88,12 +117,23 @@ Four new DataChannel message types:
       "width": 4000,
       "height": 3000,
       "size": 5242880,
-      "thumbSize": 18432
+      "thumbSize": 18432,
+      "duration": null
+    },
+    {
+      "id": "vid456",
+      "name": "sunset.mp4",
+      "mimeType": "video/mp4",
+      "width": 3840,
+      "height": 2160,
+      "size": 524288000,
+      "thumbSize": 24576,
+      "duration": 94.5
     }
   ]
 }
 ```
-`albumName` and `albumDescription` come from the Immich share info response. `albumDescription` may be empty.
+`albumName` and `albumDescription` come from the Immich share info response. `albumDescription` may be empty. `duration` is a float in seconds for video assets, `null` for images — sourced from the Immich asset metadata (`exifInfo.duration`).
 
 ### `thumbnail_data` (agent → browser, binary)
 2-byte asset index (into thumbnail_list array) + JPEG bytes. One per asset.
