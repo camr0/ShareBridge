@@ -29,6 +29,35 @@ func ServeFileNoCache(path string) func(*core.RequestEvent) error {
 	}
 }
 
+// ServeSessionFileNoCache serves a static shell only when the route code maps
+// to an existing session. If shareType is non-empty, the session must match it.
+func ServeSessionFileNoCache(app core.App, path, routeParam, shareType string) func(*core.RequestEvent) error {
+	return func(requestEvent *core.RequestEvent) error {
+		code := requestEvent.Request.PathValue(routeParam)
+		if code == "" {
+			return requestEvent.NotFoundError("session not found", nil)
+		}
+
+		filter := "code = {:code}"
+		params := map[string]any{"code": code}
+		if shareType != "" {
+			filter += " && share_type = {:share_type}"
+			params["share_type"] = shareType
+		}
+		records, err := app.FindRecordsByFilter("sessions", filter, "", 1, 0, params)
+		if err != nil {
+			return requestEvent.InternalServerError("failed to lookup session", err)
+		}
+		if len(records) == 0 {
+			return requestEvent.NotFoundError("session not found", nil)
+		}
+
+		requestEvent.Response.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(requestEvent.Response, requestEvent.Request, path)
+		return nil
+	}
+}
+
 // ServeDir returns a handler that serves files under root using a "{path...}"
 // route wildcard. Requests attempting to escape the root are rejected.
 func ServeDir(root string) func(*core.RequestEvent) error {

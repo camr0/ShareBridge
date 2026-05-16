@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -234,6 +235,124 @@ func TestSecureRelayChannel_SendBinary(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for reply")
+	}
+}
+
+func TestSecureRelayChannel_ConcurrentSendsAreSerialized(t *testing.T) {
+	serverStatic, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(serverStatic): %v", err)
+	}
+
+	const sends = 32
+	received := make(chan []string, 1)
+	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		defer conn.CloseNow()
+
+		ctx := r.Context()
+		if _, _, err := conn.Read(ctx); err != nil {
+			t.Fatalf("Read hello: %v", err)
+		}
+
+		initiator, err := noise.NewInitiator()
+		if err != nil {
+			t.Fatalf("NewInitiator: %v", err)
+		}
+		msg1, err := initiator.WriteMessage1()
+		if err != nil {
+			t.Fatalf("WriteMessage1: %v", err)
+		}
+		if err := conn.Write(ctx, websocket.MessageBinary, mustFrame(FrameHandshake, msg1)); err != nil {
+			t.Fatalf("Write msg1: %v", err)
+		}
+		_, msg2Frame, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("Read msg2: %v", err)
+		}
+		msg2, err := mustDecodeFramePayload(msg2Frame, FrameHandshake)
+		if err != nil {
+			t.Fatalf("Decode msg2: %v", err)
+		}
+		if err := initiator.ReadMessage2(msg2); err != nil {
+			t.Fatalf("ReadMessage2: %v", err)
+		}
+		msg3, err := initiator.WriteMessage3()
+		if err != nil {
+			t.Fatalf("WriteMessage3: %v", err)
+		}
+		if err := conn.Write(ctx, websocket.MessageBinary, mustFrame(FrameHandshake, msg3)); err != nil {
+			t.Fatalf("Write msg3: %v", err)
+		}
+
+		_, iRecv := initiator.Split()
+		var out []string
+		for i := 0; i < sends; i++ {
+			_, frameBytes, err := conn.Read(ctx)
+			if err != nil {
+				t.Fatalf("Read encrypted frame %d: %v", i, err)
+			}
+			payload, err := mustDecodeFramePayload(frameBytes, FrameText)
+			if err != nil {
+				t.Fatalf("Decode encrypted frame %d: %v", i, err)
+			}
+			plain, err := iRecv.Decrypt(nil, payload)
+			if err != nil {
+				t.Fatalf("Decrypt encrypted frame %d: %v", i, err)
+			}
+			out = append(out, string(plain))
+		}
+		received <- out
+	}))
+	defer relayServer.Close()
+
+	channel, err := NewSecureRelayChannel(SecureRelayConfig{
+		RelayURL:      "ws" + strings.TrimPrefix(relayServer.URL, "http"),
+		RelayJWT:      "relay.jwt.token",
+		StaticPrivate: serverStatic,
+	})
+	if err != nil {
+		t.Fatalf("NewSecureRelayChannel: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := channel.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer channel.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < sends; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := channel.SendText(fmt.Sprintf("msg-%02d", i)); err != nil {
+				t.Errorf("SendText(%d): %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	select {
+	case got := <-received:
+		if len(got) != sends {
+			t.Fatalf("received %d frames, want %d", len(got), sends)
+		}
+		seen := make(map[string]bool, sends)
+		for _, msg := range got {
+			seen[msg] = true
+		}
+		for i := 0; i < sends; i++ {
+			want := fmt.Sprintf("msg-%02d", i)
+			if !seen[want] {
+				t.Fatalf("missing %q in %#v", want, got)
+			}
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for concurrent sends")
 	}
 }
 

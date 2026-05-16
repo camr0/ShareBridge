@@ -71,7 +71,7 @@ func main() {
 
 		// Direct link route - serves file client; JS reads code from window.location
 		router.GET("/s/{code}", handler.ServeFileNoCache("./web/index.html"))
-		router.GET("/i/{key}", handler.ServeFileNoCache("./web/index.html"))
+		router.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
 
 		// Homepage (marketing)
 		router.GET("/", handler.ServeFileNoCache("./web/home.html"))

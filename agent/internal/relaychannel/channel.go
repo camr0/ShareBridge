@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/coder/websocket"
 	"sharebridge/agent/internal/noise"
@@ -19,11 +20,12 @@ type SecureRelayConfig struct {
 }
 
 type SecureRelayChannel struct {
-	cfg   SecureRelayConfig
-	conn  *websocket.Conn
-	noise *noise.NoiseXX
-	send  *noise.CipherState
-	recv  *noise.CipherState
+	cfg    SecureRelayConfig
+	conn   *websocket.Conn
+	noise  *noise.NoiseXX
+	send   *noise.CipherState
+	recv   *noise.CipherState
+	sendMu sync.Mutex
 
 	onMessage func([]byte)
 	onOpen    func()
@@ -172,6 +174,9 @@ func (c *SecureRelayChannel) Close() error {
 }
 
 func (c *SecureRelayChannel) sendFrame(kind byte, plaintext []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
 	ciphertext, err := c.send.Encrypt(nil, plaintext)
 	if err != nil {
 		return err

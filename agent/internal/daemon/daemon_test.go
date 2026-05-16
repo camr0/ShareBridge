@@ -1380,6 +1380,44 @@ func TestSyncImmichSharesRegistersNewAndUnregistersRemoved(t *testing.T) {
 	require.True(t, sig.unregisteredCode("IMMICHOLD1"))
 }
 
+func TestSyncImmichSharesRemovedShareNotifiesRelayChannelBeforeClose(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{}, nil
+	}
+
+	var events []string
+	session := &Session{
+		Code:          "IMMICHOLD1",
+		ShareType:     "immich",
+		RelayOnly:     true,
+		peers:         map[string]*peer.Peer{},
+		relayChannels: map[string]relayTransferChannel{},
+	}
+	session.relayChannels["sid-1"] = &mockRelayChannel{
+		sendTextFn: func(text string) error {
+			events = append(events, "send:"+text)
+			return nil
+		},
+		closeFn: func() error {
+			events = append(events, "close")
+			return nil
+		},
+	}
+	d.sessions["IMMICHOLD1"] = session
+
+	require.NoError(t, d.syncImmichShares(context.Background()))
+
+	require.True(t, sig.unregisteredCode("IMMICHOLD1"))
+	require.Len(t, events, 2)
+	require.Equal(t, "close", events[1])
+	require.Contains(t, events[0], `"type":"error"`)
+	require.Contains(t, events[0], `"message":"share has been removed"`)
+}
+
 func TestSyncImmichSharesUnregisterFailureLeavesRemovedSessionInMemory(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"

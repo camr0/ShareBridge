@@ -1232,7 +1232,7 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 	d.mu.RUnlock()
 
 	for _, session := range removed {
-		d.closeSessionResources(session)
+		d.closeSessionResourcesWithError(session, "share has been removed")
 		if err := d.unregisterShare(ctx, session.Code); err != nil {
 			return err
 		}
@@ -1346,11 +1346,27 @@ func (d *Daemon) relayStaticPubHex() (string, error) {
 }
 
 func (d *Daemon) closeSessionResources(session *Session) {
+	d.closeSessionResourcesWithError(session, "")
+}
+
+func (d *Daemon) closeSessionResourcesWithError(session *Session, message string) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	for peerID, peerConn := range session.peers {
 		if err := peerConn.Close(); err != nil {
 			log.Printf("close peer %s: %v", peerID, err)
+		}
+	}
+	if message != "" {
+		msg, err := json.Marshal(map[string]string{"type": "error", "message": message})
+		if err != nil {
+			log.Printf("marshal session close error: %v", err)
+		} else {
+			for sid, rc := range session.relayChannels {
+				if err := rc.SendText(string(msg)); err != nil {
+					log.Printf("notify relay channel %s before close: %v", sid, err)
+				}
+			}
 		}
 	}
 	for sid, rc := range session.relayChannels {

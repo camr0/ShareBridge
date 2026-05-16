@@ -92,7 +92,7 @@ func testSessionExists(t *testing.T, app core.App, code string) bool {
 	return len(records) == 1
 }
 
-func setupRouterForTest(t *testing.T) http.Handler {
+func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
 	t.Helper()
 	t.Chdir("../..")
 
@@ -104,7 +104,7 @@ func setupRouterForTest(t *testing.T) http.Handler {
 
 	// Direct link route - serves file client; JS reads code from window.location
 	pbRouter.GET("/s/{code}", handler.ServeFileNoCache("./web/index.html"))
-	pbRouter.GET("/i/{key}", handler.ServeFileNoCache("./web/index.html"))
+	pbRouter.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
 
 	// Homepage (marketing)
 	pbRouter.GET("/", handler.ServeFileNoCache("./web/home.html"))
@@ -114,16 +114,30 @@ func setupRouterForTest(t *testing.T) http.Handler {
 
 	mux, err := pbRouter.BuildMux()
 	require.NoError(t, err)
-	return mux
+	return app, mux
 }
 
 func TestServerRoutesImmichLinksToBrowserApp(t *testing.T) {
-	router := setupRouterForTest(t)
+	app, router := setupRouterForTest(t)
+	user := createServerTestUser(t, app, "immich-route@example.com")
+	apiKey := createServerTestAPIKey(t, app, user.Id)
+	session := createServerTestSession(t, app, apiKey.Id, "ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", nil)
+	session.Set("share_type", "immich")
+	require.NoError(t, app.Save(session))
+
 	req := httptest.NewRequest(http.MethodGet, "/i/ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Contains(t, rec.Body.String(), "ShareBridge")
+}
+
+func TestServerRoutesImmichLinks404ForUnknownSession(t *testing.T) {
+	_, router := setupRouterForTest(t)
+	req := httptest.NewRequest(http.MethodGet, "/i/ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestDeleteExpiredSessions_PreservesSessionsWithoutExpiry(t *testing.T) {
