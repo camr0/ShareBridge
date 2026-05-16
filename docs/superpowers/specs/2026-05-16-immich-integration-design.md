@@ -101,7 +101,7 @@ Browser sends password over signaling WebSocket. Server validates that `code` ma
 
 **Brute-force protection:** The hub limits password attempts to 5 per browser WS connection. On the 5th `auth_fail`, the hub closes the browser WebSocket. A new WS connection resets the counter (but WS connect itself is rate-limited at the knock endpoint). This replaces the DataChannel-based "3 strikes per session" lockout used for OC/NC.
 
-**Unprotected share flow:** When `isPasswordProtected` is false, the hub skips the `password_required` message and sends `ice_config` immediately on browser WS connect. No `knock`/`nonce`/`join` pre-challenge is needed — the Immich share has no password to prove. Peer negotiation begins directly.
+**Unprotected share flow:** When `isPasswordProtected` is false, the hub sends `ice_config` immediately on browser WS connect and the browser sends a standard `join` message. The agent sees `ShareType == "immich"` with `isPasswordProtected == false` and skips HMAC verification — there's no password to prove. The `join` triggers peer creation and offer generation as usual. Reusing `join` (rather than a new message) keeps the agent-side peer creation trigger path unified.
 
 ## DataChannel Protocol Changes
 
@@ -182,7 +182,7 @@ Immich shares use the same session infrastructure as OC/NC. No separate routing 
 - On agent startup: poll immediately, register all current keys
 - On agent reconnect: same flow as OC/NC — re-register all persisted sessions (including Immich)
 
-**External code protocol note:** The existing `register_share` message gains an optional `code` field. When present and non-empty, the signaling server skips code generation and uses the provided value. The server still validates uniqueness — if the Immich key collides with an existing code (vanishingly unlikely), it returns an error and the agent skips that share. Immich keys are long random strings with sufficient entropy to share the same namespace as 8-char server-generated codes.
+**External code protocol note:** The existing `register_share` message gains two new fields: `code` (optional, string) and `is_password_protected` (optional, boolean). When `code` is present and non-empty, the server skips code generation and uses the provided value. The server stores `is_password_protected` in the sessions table alongside the code. The server still validates code uniqueness — if the Immich key collides with an existing code (vanishingly unlikely), it returns an error and the agent skips that share. Immich keys are long random strings with sufficient entropy to share the same namespace as 8-char server-generated codes.
 
 The signaling server stores Immich shares in the same sessions table. The code column holds the Immich key. All existing session infrastructure works unchanged: persistence, bandwidth tracking, download counting, expiry, reclaim on reconnect.
 
@@ -246,7 +246,7 @@ No new API endpoints needed.
 
 ## Persistence
 
-`SessionEntry.ShareType` already stored as `"opencloud"` or `"nextcloud"`. Adding `"immich"` requires no schema migration. On agent restart, `ShareType` is used to reconstruct the correct backend client.
+`SessionEntry.ShareType` already stored as `"opencloud"` or `"nextcloud"`. Adding `"immich"` requires one new boolean column in the sessions table: `is_password_protected` (default false, no migration needed for existing OC/NC rows). On agent restart, `ShareType` is used to reconstruct the correct backend client. Agent-side session persistence (`sessions.json`) also gains the `is_password_protected` field.
 
 ## Files Changed
 
@@ -265,7 +265,8 @@ No new API endpoints needed.
 - `agent/internal/signaling/client.go` — accept optional code in `RegisterShare`
 - `signaling-server/web/src/app.js` — detect `/i/` path, route to gallery mode
 - `signaling-server/web/src/messages.js` — handle thumbnail_list, thumbnail_data, asset_request
-- Signaling server: `/i/` route handler, accept external codes in `register_share`
+- Signaling server schema: add `is_password_protected` column to sessions table
+- Signaling server: `/i/` route handler, accept `code` and `is_password_protected` in `register_share`
 
 **Dependency added:**
 - `lightGallery.js` (npm, ~50KB gzipped)
