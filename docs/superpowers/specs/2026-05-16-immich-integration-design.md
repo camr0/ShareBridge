@@ -58,7 +58,7 @@ The agent never knows the password — it sees only Immich's yes/no response. Th
 
 ### Session Registration: isPasswordProtected
 
-When the agent calls `registershare` for an Immich key, it fetches the share info from Immich and stores `isPasswordProtected` in the sessions table alongside the code. The signaling server reads this field when a browser connects and sends `password_required` before any peer creation if the flag is true. For unprotected shares, the flag is false and the flow skips directly to peer negotiation.
+When the agent calls `registershare` for an Immich key, it fetches the share info from Immich and stores `isPasswordProtected` in the sessions table alongside the code. The signaling server reads this field when a browser connects: if true, it sends `password_required` and enters the auth relay flow. If false, it sends `ice_config` immediately and begins WebRTC negotiation — no knock/nonce/join needed (the share has no password to prove).
 
 ### Hub Auth Relay
 
@@ -81,7 +81,7 @@ Browser WS                  Hub                     Agent WS
    |--- (on auth_ok) WebRTC negotiation begins ---->---|
 ```
 
-The hub's `ForwardToAgent` and `ForwardToBrowser` methods handle the routing. No new hub infrastructure is needed — this is the same pattern as WebRTC offer/answer relaying. The only new behavior is that the hub sends `password_required` unilaterally (not a relay, a server-originating message) when the session's `isPasswordProtected` field is true.
+The hub's `ForwardToAgent` and `ForwardToBrowser` methods handle the routing. No new hub infrastructure is needed — this is the same pattern as WebRTC offer/answer relaying. The hub adds three new behaviors: (1) send `ice_config` or `password_required` unilaterally on browser connect based on `isPasswordProtected`, (2) validate `password_submit.code` matches the WS session code, and (3) count password attempts, close browser WS after 5 consecutive `auth_fail` responses.
 
 ## Signaling Protocol Changes
 
@@ -97,7 +97,11 @@ Sent when the session is password-protected and the browser must submit a passwo
 ```json
 {"type": "password_submit", "code": "ffSw63qn...", "password": "hunter2"}
 ```
-Browser sends password over signaling WebSocket. Server relays to agent. Agent tests against Immich API. On success: `auth_ok` + peer creation. On failure: `auth_fail`, no peer created.
+Browser sends password over signaling WebSocket. Server validates that `code` matches the session code on this WS connection (reject with `auth_fail` if mismatched). Then relays to agent. Agent tests against Immich API. On success: `auth_ok` + peer creation. On failure: `auth_fail`, no peer created.
+
+**Brute-force protection:** The hub limits password attempts to 5 per browser WS connection. On the 5th `auth_fail`, the hub closes the browser WebSocket. A new WS connection resets the counter (but WS connect itself is rate-limited at the knock endpoint). This replaces the DataChannel-based "3 strikes per session" lockout used for OC/NC.
+
+**Unprotected share flow:** When `isPasswordProtected` is false, the hub skips the `password_required` message and sends `ice_config` immediately on browser WS connect. No `knock`/`nonce`/`join` pre-challenge is needed — the Immich share has no password to prove. Peer negotiation begins directly.
 
 ## DataChannel Protocol Changes
 
