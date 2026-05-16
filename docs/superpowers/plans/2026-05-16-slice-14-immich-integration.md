@@ -447,7 +447,7 @@ func TestBrowserWS_ProtectedImmichSendsPasswordRequiredBeforeIceConfig(t *testin
 	require.Error(t, err, "protected Immich must not knock before password_submit")
 }
 
-func TestBrowserWS_ImmichPasswordSubmitRelaysAndStartsNonceAfterAuthOK(t *testing.T) {
+func TestBrowserWS_ImmichPasswordSubmitReturnsRelayPolicyAfterAuthOK(t *testing.T) {
 	testApp, serverURL, cleanup := setupBrowserWSTest(t)
 	defer cleanup()
 	apiKey := createTestAPIKey(t, testApp)
@@ -483,7 +483,7 @@ func TestBrowserWS_ImmichPasswordSubmitRelaysAndStartsNonceAfterAuthOK(t *testin
 
 Run: `cd signaling-server && go test ./internal/handler -run 'TestBrowserWS_.*Immich' -count=1`
 
-Expected: FAIL because browser messages lack `password_submit`, protected sessions always receive `ice_config`, and `auth_ok` currently assumes HMAC flow only.
+Expected: FAIL because browser messages lack `password_submit`, protected sessions always receive `ice_config`, and the existing `auth_ok` relay-policy path is not yet explicitly covered for protected Immich auth.
 
 - [ ] **Step 2: Extend browser messages and protected session gate**
 
@@ -570,6 +570,8 @@ case "auth_fail":
 ```
 
 Keep existing `auth_failed` at 3 attempts for OC/NC HMAC.
+
+Preserve the existing `case "auth_ok"` behavior in `agent_ws.go` and make sure it works for Immich sessions: look up the session by `msg.Code`, create `relay_prepare` for the agent when relay is allowed, then send `relay_policy` to `msg.ConnID` with `relay_only: true`. Do not send a new `knock` after protected Immich `auth_ok`; the Immich password validation is the auth proof, and the browser proceeds by opening the secure relay transfer channel from `relay_policy`.
 
 Run: `cd signaling-server && go test ./internal/handler -run 'TestBrowserWS_.*Immich' -count=1`
 
@@ -1037,6 +1039,9 @@ func TestListFilesConvertsImmichAssetsToGalleryItems(t *testing.T) {
 				ID: "asset-1", OriginalFileName: "photo.jpg", OriginalMimeType: "image/jpeg",
 				FileSizeInByte: 1234, Type: "IMAGE", Checksum: base64.StdEncoding.EncodeToString(sha),
 				ExifInfo: &ExifInfo{ExifImageWidth: 4000, ExifImageHeight: 3000},
+			}, {
+				ID: "asset-2", OriginalFileName: "clip.mp4", OriginalMimeType: "video/mp4",
+				FileSizeInByte: 4567, Type: "VIDEO", Duration: "00:01:34.500",
 			}},
 		})
 	}))
@@ -1050,6 +1055,8 @@ func TestListFilesConvertsImmichAssetsToGalleryItems(t *testing.T) {
 	require.Equal(t, "Beach", gallery.AlbumDescription)
 	require.Equal(t, "asset-1", gallery.Items[0].ID)
 	require.Equal(t, "abababababababababababababababababababab", gallery.Items[0].SHA1)
+	require.NotNil(t, gallery.Items[1].Duration)
+	require.Equal(t, 94.5, *gallery.Items[1].Duration)
 }
 ```
 
@@ -1181,6 +1188,34 @@ func decodeBase64SHA1(input string) string {
 		return ""
 	}
 	return hex.EncodeToString(raw)
+}
+```
+
+For video durations, parse Immich's duration string into seconds:
+
+```go
+func parseDurationSeconds(input string) *float64 {
+	if input == "" {
+		return nil
+	}
+	parts := strings.Split(input, ":")
+	if len(parts) != 3 {
+		return nil
+	}
+	hours, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil
+	}
+	minutes, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil
+	}
+	seconds, err := strconv.ParseFloat(parts[2], 64)
+	if err != nil {
+		return nil
+	}
+	total := float64(hours*3600+minutes*60) + seconds
+	return &total
 }
 ```
 
@@ -1530,7 +1565,6 @@ type GalleryItem struct {
 	Width     int      `json:"width"`
 	Height    int      `json:"height"`
 	Size      int64    `json:"size"`
-	ThumbSize int64    `json:"thumbSize"`
 	Duration  *float64 `json:"duration"`
 	SHA1      string   `json:"sha1,omitempty"`
 }
@@ -1560,7 +1594,7 @@ func encodeThumbnailFrame(index uint16, jpg []byte) []byte {
 }
 ```
 
-For new file chunks, wrap as `0x10 + bytes`. Browser Task 8 will decode both old raw chunks and new envelope while rollout is in progress; once both sides are deployed, raw chunks can be removed.
+For new file chunks, wrap as `0x10 + bytes`. Browser Task 8 will decode both old raw chunks and new envelope so a new browser can still receive raw chunks from an older agent. Deploy the agent and web assets atomically when enabling this protocol change: an old browser receiving `0x10`-prefixed chunks would treat the prefix as file data and corrupt downloads.
 
 - [ ] **Step 3: Implement gallery transfer flow**
 

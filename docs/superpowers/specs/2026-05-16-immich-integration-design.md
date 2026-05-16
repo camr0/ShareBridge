@@ -124,7 +124,6 @@ Three new DataChannel message types:
       "width": 4000,
       "height": 3000,
       "size": 5242880,
-      "thumbSize": 18432,
       "duration": null
     },
     {
@@ -134,13 +133,12 @@ Three new DataChannel message types:
       "width": 3840,
       "height": 2160,
       "size": 524288000,
-      "thumbSize": 24576,
       "duration": 94.5
     }
   ]
 }
 ```
-`albumName` and `albumDescription` come from the Immich share info response. `albumDescription` may be empty. `duration` is a float in seconds for video assets, `null` for images — sourced from the Immich asset metadata (`exifInfo.duration`).
+`albumName` and `albumDescription` come from the Immich share info response. `albumDescription` may be empty. `duration` is a float in seconds for video assets, `null` for images — parsed from Immich's asset duration string when present. `thumbSize` is intentionally omitted because Immich does not expose it without fetching or probing each thumbnail.
 
 ### `thumbnail_data` (agent → browser, binary)
 2-byte asset index (into thumbnail_list array) + JPEG bytes. One per asset.
@@ -152,7 +150,7 @@ This binary payload must be framed so it cannot be confused with file-transfer c
 {"type": "asset_request", "id": "abc123", "quality": "original"}
 ```
 
-Full asset transfer reuses existing `file_header` / `chunk` / `chunk_end` protocol unchanged.
+Full asset transfer reuses the existing `file_header` / `chunk_end` JSON messages. Binary file chunks should share the typed binary envelope with thumbnails so thumbnail bytes and file bytes cannot collide.
 
 ## Browser: Gallery Mode
 
