@@ -18,6 +18,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
+	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/peer"
 	"sharebridge/agent/internal/relaychannel"
 	"sharebridge/agent/internal/signaling"
@@ -49,6 +50,26 @@ type relayChannelConfig struct {
 	RelayURL      string
 	RelayJWT      string
 	StaticPrivate []byte
+}
+
+type immichAuthenticator interface {
+	ValidatePassword(ctx context.Context, password string) (bool, error)
+}
+
+type immichGalleryBackend interface {
+	immichAuthenticator
+}
+
+type immichPoller interface {
+	PollShares(ctx context.Context) ([]immich.SharedLink, error)
+}
+
+type shareOptionRegistrar interface {
+	RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, bool, error)
+}
+
+type shareUnregistrar interface {
+	UnregisterShare(ctx context.Context, code string) error
 }
 
 // WebServer is the interface for the admin UI web server.
@@ -100,10 +121,12 @@ type Session struct {
 	RelayOnly    bool
 	CreatedAt    time.Time
 
-	webdavClient   *cloudwebdav.Client
-	peers          map[string]*peer.Peer // peerID -> Peer
-	relayChannels  map[string]relayTransferChannel // sid -> relay channel
-	mu             sync.Mutex
+	IsPasswordProtected bool
+	immichClient        immichGalleryBackend
+	webdavClient        *cloudwebdav.Client
+	peers               map[string]*peer.Peer           // peerID -> Peer
+	relayChannels       map[string]relayTransferChannel // sid -> relay channel
+	mu                  sync.Mutex
 }
 
 // Daemon manages multiple concurrent sessions, a single signaling connection,
@@ -127,6 +150,8 @@ type Daemon struct {
 
 	// Factory for creating relay channels (injected for testing)
 	newRelayChannel func(cfg relayChannelConfig) (relayTransferChannel, error)
+
+	newImmichPoller func() (immichPoller, error)
 
 	// Callbacks for external handling (e.g., web server refresh)
 	OnSessionAdded   func(session *Session)
@@ -202,6 +227,10 @@ func (d *Daemon) Start(ctx context.Context) <-chan error {
 
 	// Load persisted sessions and re-register them
 	d.loadSessionsFromStore(ctx)
+
+	if d.config.ImmichURL != "" && d.config.ImmichAPIKey != "" {
+		go d.runImmichPoller(ctx)
+	}
 
 	// Start expiry pruner
 	go d.runExpiryPruner(ctx)
@@ -434,6 +463,9 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	case "join":
 		go d.handleJoin(msg.ConnID, msg.Code, msg.HMAC)
 
+	case "password_submit":
+		go d.handlePasswordSubmit(msg.ConnID, msg.Code, msg.Password)
+
 	case "answer":
 		d.handleAnswer(msg.PeerID, msg.SDP)
 
@@ -518,8 +550,18 @@ func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
 		return
 	}
 
+	if session.ShareType == "immich" && session.IsPasswordProtected {
+		log.Printf("protected Immich join requires password submit: session %s conn %s", sessionCode, connID)
+		d.signaling.Send(context.Background(), map[string]any{
+			"type":    "auth_failed",
+			"conn_id": connID,
+			"code":    sessionCode,
+		})
+		return
+	}
+
 	// Verify HMAC for password-protected shares. Password-less shares skip verification.
-	if session.Password != "" {
+	if session.Password != "" && session.ShareType != "immich" {
 		mac := hmac.New(sha256.New, []byte(session.Password))
 		mac.Write([]byte(entry.nonce))
 		expectedMAC := mac.Sum(nil)
@@ -550,6 +592,22 @@ func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
 	}
 
 	go d.createPeer(connID, sessionCode)
+}
+
+func (d *Daemon) handlePasswordSubmit(connID, sessionCode, password string) {
+	d.mu.RLock()
+	session := d.sessions[sessionCode]
+	d.mu.RUnlock()
+	if session == nil || session.ShareType != "immich" || session.immichClient == nil {
+		_ = d.signaling.Send(context.Background(), map[string]any{"type": "auth_fail", "conn_id": connID, "code": sessionCode})
+		return
+	}
+	ok, err := session.immichClient.ValidatePassword(context.Background(), password)
+	if err != nil || !ok {
+		_ = d.signaling.Send(context.Background(), map[string]any{"type": "auth_fail", "conn_id": connID, "code": sessionCode})
+		return
+	}
+	_ = d.signaling.Send(context.Background(), map[string]any{"type": "auth_ok", "conn_id": connID, "code": sessionCode})
 }
 
 // createPeer creates a WebRTC peer connection for a browser joining a session.
@@ -865,6 +923,56 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			continue
 		}
 
+		if entry.ShareType == "immich" {
+			client, err := d.newImmichClient(entry.Code)
+			if err != nil {
+				log.Printf("warning: could not create Immich client for %s: %v", entry.Code, err)
+				continue
+			}
+			reg, ok := d.signaling.(shareOptionRegistrar)
+			if !ok {
+				log.Printf("warning: signaling client does not support Immich registration options for %s", entry.Code)
+				continue
+			}
+			code, reconnected, err := reg.RegisterShareWithOptions(ctx, signaling.RegisterShareOptions{
+				ShareURL:            entry.ShareURL,
+				PreferredCode:       entry.Code,
+				ShareType:           "immich",
+				IsPasswordProtected: entry.IsPasswordProtected,
+				RelayOnly:           true,
+				RelayStaticPub:      relayStaticPub,
+			})
+			if err != nil {
+				log.Printf("warning: could not re-register Immich session %s: %v", entry.Code, err)
+				continue
+			}
+
+			session := &Session{
+				Code:                code,
+				ShareURL:            entry.ShareURL,
+				ShareType:           "immich",
+				IsPasswordProtected: entry.IsPasswordProtected,
+				ExpiresAt:           entry.ExpiresAt,
+				MaxDownloads:        entry.MaxDownloads,
+				Downloads:           entry.Downloads,
+				RelayOnly:           true,
+				CreatedAt:           entry.CreatedAt,
+				immichClient:        client,
+				peers:               make(map[string]*peer.Peer),
+				relayChannels:       make(map[string]relayTransferChannel),
+			}
+			d.mu.Lock()
+			d.sessions[code] = session
+			d.mu.Unlock()
+
+			if reconnected {
+				log.Printf("Immich session reconnected - code: %s", code)
+			} else {
+				log.Printf("Immich session loaded - code: %s", code)
+			}
+			continue
+		}
+
 		// Create WebDAV client
 		webdavClient, err := cloudwebdav.New(entry.ShareType, entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
 		if err != nil {
@@ -907,6 +1015,205 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	}
 
 	log.Printf("loaded %d sessions from store", len(d.sessions))
+}
+
+func (d *Daemon) runImmichPoller(ctx context.Context) {
+	if err := d.syncImmichShares(ctx); err != nil {
+		log.Printf("immich sync: %v", err)
+	}
+	interval := time.Duration(d.config.ImmichPollInterval) * time.Second
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := d.syncImmichShares(ctx); err != nil {
+				log.Printf("immich sync: %v", err)
+			}
+		}
+	}
+}
+
+func (d *Daemon) syncImmichShares(ctx context.Context) error {
+	poller, err := d.getImmichPoller()
+	if err != nil {
+		return err
+	}
+	links, err := poller.PollShares(ctx)
+	if err != nil {
+		return err
+	}
+
+	relayStaticPub, err := d.relayStaticPubHex()
+	if err != nil {
+		return err
+	}
+
+	seen := make(map[string]immich.SharedLink, len(links))
+	for _, link := range links {
+		if link.Key == "" {
+			continue
+		}
+		seen[link.Key] = link
+
+		d.mu.RLock()
+		_, exists := d.sessions[link.Key]
+		d.mu.RUnlock()
+		if exists {
+			continue
+		}
+
+		session, err := d.registerImmichShare(ctx, link, relayStaticPub)
+		if err != nil {
+			return err
+		}
+		d.mu.Lock()
+		d.sessions[session.Code] = session
+		d.mu.Unlock()
+		if d.OnSessionAdded != nil {
+			d.OnSessionAdded(session)
+		}
+	}
+
+	var removed []*Session
+	d.mu.RLock()
+	for code, session := range d.sessions {
+		if session.ShareType == "immich" {
+			if _, ok := seen[code]; !ok {
+				removed = append(removed, session)
+			}
+		}
+	}
+	d.mu.RUnlock()
+
+	for _, session := range removed {
+		d.closeSessionResources(session)
+		if err := d.unregisterShare(ctx, session.Code); err != nil {
+			return err
+		}
+		if err := d.store.DeleteSession(session.Code); err != nil {
+			return err
+		}
+		d.mu.Lock()
+		delete(d.sessions, session.Code)
+		d.mu.Unlock()
+		if d.OnSessionRemoved != nil {
+			d.OnSessionRemoved(session.Code)
+		}
+	}
+
+	return nil
+}
+
+func (d *Daemon) getImmichPoller() (immichPoller, error) {
+	if d.newImmichPoller != nil {
+		return d.newImmichPoller()
+	}
+	return immich.New(immich.Config{
+		BaseURL:     d.config.ImmichURL,
+		AllowedHost: d.config.ImmichAllowedHost,
+		APIKey:      d.config.ImmichAPIKey,
+	})
+}
+
+func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink, relayStaticPub string) (*Session, error) {
+	reg, ok := d.signaling.(shareOptionRegistrar)
+	if !ok {
+		return nil, fmt.Errorf("signaling client does not support option registration")
+	}
+
+	shareURL := "immich://" + link.Key
+	passwordProtected := link.IsPasswordProtected()
+	opts := signaling.RegisterShareOptions{
+		ShareURL:            shareURL,
+		PreferredCode:       link.Key,
+		ShareType:           "immich",
+		IsPasswordProtected: passwordProtected,
+		RelayOnly:           true,
+		RelayStaticPub:      relayStaticPub,
+	}
+	code, _, err := reg.RegisterShareWithOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	client, err := d.newImmichClient(code)
+	if err != nil {
+		_ = d.unregisterShare(ctx, code)
+		return nil, err
+	}
+
+	now := time.Now()
+	session := &Session{
+		Code:                code,
+		ShareURL:            shareURL,
+		ShareType:           "immich",
+		IsPasswordProtected: passwordProtected,
+		RelayOnly:           true,
+		CreatedAt:           now,
+		immichClient:        client,
+		peers:               make(map[string]*peer.Peer),
+		relayChannels:       make(map[string]relayTransferChannel),
+	}
+	if err := d.store.SaveSession(store.SessionEntry{
+		Code:                code,
+		ShareURL:            shareURL,
+		ShareType:           "immich",
+		IsPasswordProtected: passwordProtected,
+		RelayOnly:           true,
+		CreatedAt:           now,
+	}); err != nil {
+		_ = d.unregisterShare(ctx, code)
+		return nil, err
+	}
+	return session, nil
+}
+
+func (d *Daemon) unregisterShare(ctx context.Context, code string) error {
+	if unreg, ok := d.signaling.(shareUnregistrar); ok {
+		return unreg.UnregisterShare(ctx, code)
+	}
+	return d.signaling.Send(ctx, map[string]string{"type": "unregister_share", "code": code})
+}
+
+func (d *Daemon) newImmichClient(code string) (immichGalleryBackend, error) {
+	return immich.New(immich.Config{
+		BaseURL:     d.config.ImmichURL,
+		AllowedHost: d.config.ImmichAllowedHost,
+		APIKey:      d.config.ImmichAPIKey,
+		ShareKey:    code,
+	})
+}
+
+func (d *Daemon) relayStaticPubHex() (string, error) {
+	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
+	if err != nil {
+		return "", fmt.Errorf("get relay static key: %w", err)
+	}
+	relayStaticPub, err := RelayStaticPubHex(relayStaticPriv)
+	if err != nil {
+		return "", fmt.Errorf("derive relay static public key: %w", err)
+	}
+	return relayStaticPub, nil
+}
+
+func (d *Daemon) closeSessionResources(session *Session) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for peerID, peerConn := range session.peers {
+		if err := peerConn.Close(); err != nil {
+			log.Printf("close peer %s: %v", peerID, err)
+		}
+	}
+	for sid, rc := range session.relayChannels {
+		if err := rc.Close(); err != nil {
+			log.Printf("close relay channel %s: %v", sid, err)
+		}
+	}
 }
 
 // runExpiryPruner periodically checks for and removes expired sessions.

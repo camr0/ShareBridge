@@ -6,6 +6,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -14,7 +16,9 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/stretchr/testify/require"
 	"sharebridge/agent/internal/config"
+	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/peer"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
@@ -37,6 +41,7 @@ type mockStore struct {
 	sessions        map[string]store.SessionEntry
 	downloads       map[string]int
 	saveError       error
+	deleteError     error
 }
 
 func newMockStore() *mockStore {
@@ -110,6 +115,9 @@ func (m *mockStore) SaveSession(session store.SessionEntry) error {
 func (m *mockStore) DeleteSession(code string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.deleteError != nil {
+		return m.deleteError
+	}
 	delete(m.sessions, code)
 	return nil
 }
@@ -133,6 +141,9 @@ type mockSignalingClient struct {
 	registerShare func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error)
 	sendMessages  []map[string]any
 	codeCounter   int // Counter for generating unique codes
+	registered    []signaling.RegisterShareOptions
+	unregistered  []string
+	unregisterErr error
 }
 
 func newMockSignalingClient(serverURL, apiKey, agentID string) *mockSignalingClient {
@@ -163,6 +174,20 @@ func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, prefe
 	}
 	m.codeCounter++
 	return fmt.Sprintf("test-code-%d", m.codeCounter), false, nil
+}
+
+func (m *mockSignalingClient) RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, bool, error) {
+	m.mu.Lock()
+	m.registered = append(m.registered, opts)
+	m.mu.Unlock()
+	return m.RegisterShare(ctx, opts.ShareURL, opts.PreferredCode, opts.RelayOnly, opts.RelayStaticPub)
+}
+
+func (m *mockSignalingClient) UnregisterShare(ctx context.Context, code string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unregistered = append(m.unregistered, code)
+	return m.unregisterErr
 }
 
 func (m *mockSignalingClient) DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error {
@@ -211,6 +236,75 @@ func (m *mockSignalingClient) sendMessage(msg signaling.Message) {
 	if handler != nil {
 		handler(msg)
 	}
+}
+
+func (m *mockSignalingClient) sentContains(fragment string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, msg := range m.sendMessages {
+		raw, err := json.Marshal(msg)
+		if err == nil && strings.Contains(string(raw), fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mockSignalingClient) registeredCode(code string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, opts := range m.registered {
+		if opts.PreferredCode == code {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mockSignalingClient) unregisteredCode(code string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, got := range m.unregistered {
+		if got == code {
+			return true
+		}
+	}
+	return false
+}
+
+func newTestDaemon(t *testing.T) (*Daemon, *mockSignalingClient) {
+	t.Helper()
+	cfg := &config.Config{
+		SignalingURL: "ws://localhost:8080",
+		APIKey:       "test-key",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	d, err := NewWithSignaling(cfgMgr, st, sig)
+	require.NoError(t, err)
+	return d, sig
+}
+
+type fakeImmichAuth struct {
+	gotPassword string
+	ok          bool
+	err         error
+}
+
+func (f *fakeImmichAuth) ValidatePassword(ctx context.Context, password string) (bool, error) {
+	f.gotPassword = password
+	return f.ok, f.err
+}
+
+type fakeImmichPoller struct {
+	shares []immich.SharedLink
+	err    error
+}
+
+func (f *fakeImmichPoller) PollShares(ctx context.Context) ([]immich.SharedLink, error) {
+	return f.shares, f.err
 }
 
 // mockWebServer implements WebServer interface for testing.
@@ -960,14 +1054,14 @@ func TestDaemonGetsRelayStaticKey(t *testing.T) {
 
 // mockRelayChannel implements relayTransferChannel for testing.
 type mockRelayChannel struct {
-	startFn       func(context.Context) error
-	sendBinaryFn  func([]byte) error
-	sendTextFn    func(string) error
-	bufferedFn    func() uint64
-	closeFn       func() error
-	onMessage     func([]byte)
-	onOpen        func()
-	onClose       func()
+	startFn      func(context.Context) error
+	sendBinaryFn func([]byte) error
+	sendTextFn   func(string) error
+	bufferedFn   func() uint64
+	closeFn      func() error
+	onMessage    func([]byte)
+	onOpen       func()
+	onClose      func()
 }
 
 func (m *mockRelayChannel) Start(ctx context.Context) error {
@@ -1121,6 +1215,210 @@ func TestHandleJoin_RelayOnlySkipsDirectPeerCreation(t *testing.T) {
 	}) {
 		t.Fatalf("relay_only session should not create direct offer, got %#v", sig.sendMessages)
 	}
+}
+
+func TestHandleJoin_ImmichUnprotectedRequiresNonceButSkipsHMAC(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.sessions["IMMICHOPEN1"] = &Session{
+		Code: "IMMICHOPEN1", ShareType: "immich", RelayOnly: true,
+		peers: map[string]*peer.Peer{}, relayChannels: map[string]relayTransferChannel{},
+	}
+	d.nonces["conn1"] = nonceEntry{nonce: "abc123", expiresAt: time.Now().Add(time.Minute)}
+
+	d.handleJoin("conn1", "IMMICHOPEN1", "")
+
+	require.True(t, sig.sentContains(`"type":"auth_ok"`))
+	require.True(t, sig.sentContains(`"code":"IMMICHOPEN1"`))
+}
+
+func TestHandleJoin_ImmichProtectedRejectsNonceJoin(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.sessions["IMMICHPROTECTED1"] = &Session{
+		Code: "IMMICHPROTECTED1", ShareType: "immich", IsPasswordProtected: true, RelayOnly: true,
+		peers: map[string]*peer.Peer{}, relayChannels: map[string]relayTransferChannel{},
+	}
+	d.nonces["conn1"] = nonceEntry{nonce: "abc123", expiresAt: time.Now().Add(time.Minute)}
+
+	d.handleJoin("conn1", "IMMICHPROTECTED1", "")
+
+	require.True(t, sig.sentContains(`"type":"auth_failed"`))
+	require.False(t, sig.sentContains(`"type":"auth_ok"`))
+}
+
+func TestHandlePasswordSubmit_ImmichValidatesWithClientBeforeAuthOK(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	fake := &fakeImmichAuth{ok: true}
+	d.sessions["IMMICHPASS1"] = &Session{
+		Code: "IMMICHPASS1", ShareType: "immich", RelayOnly: true,
+		immichClient: fake,
+		peers:        map[string]*peer.Peer{}, relayChannels: map[string]relayTransferChannel{},
+	}
+
+	d.handlePasswordSubmit("conn1", "IMMICHPASS1", "secret")
+
+	require.Equal(t, "secret", fake.gotPassword)
+	require.True(t, sig.sentContains(`"type":"auth_ok"`))
+}
+
+func TestHandlePasswordSubmit_ImmichInvalidPasswordSendsAuthFail(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.sessions["IMMICHPASS1"] = &Session{
+		Code: "IMMICHPASS1", ShareType: "immich", RelayOnly: true,
+		immichClient: &fakeImmichAuth{ok: false},
+		peers:        map[string]*peer.Peer{}, relayChannels: map[string]relayTransferChannel{},
+	}
+
+	d.handlePasswordSubmit("conn1", "IMMICHPASS1", "wrong")
+
+	require.True(t, sig.sentContains(`"type":"auth_fail"`))
+	require.False(t, sig.sentContains(`"type":"auth_ok"`))
+}
+
+func TestHandlePasswordSubmit_NonImmichSendsAuthFail(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.sessions["WEBDAVPASS1"] = &Session{
+		Code: "WEBDAVPASS1", ShareType: "opencloud", RelayOnly: true,
+		peers: map[string]*peer.Peer{}, relayChannels: map[string]relayTransferChannel{},
+	}
+
+	d.handlePasswordSubmit("conn1", "WEBDAVPASS1", "secret")
+
+	require.True(t, sig.sentContains(`"type":"auth_fail"`))
+	require.False(t, sig.sentContains(`"type":"auth_ok"`))
+}
+
+func TestSyncImmichSharesRegistersNewAndUnregistersRemoved(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{
+			{Key: "IMMICHNEW1", Password: "********"},
+		}}, nil
+	}
+	d.sessions["IMMICHOLD1"] = &Session{Code: "IMMICHOLD1", ShareType: "immich", RelayOnly: true}
+
+	require.NoError(t, d.syncImmichShares(context.Background()))
+
+	require.True(t, sig.registeredCode("IMMICHNEW1"))
+	require.True(t, sig.unregisteredCode("IMMICHOLD1"))
+}
+
+func TestSyncImmichSharesUnregisterFailureLeavesRemovedSessionInMemory(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{}, nil
+	}
+	sig.unregisterErr = errors.New("unregister failed")
+	d.sessions["IMMICHOLD1"] = &Session{
+		Code: "IMMICHOLD1", ShareType: "immich", RelayOnly: true,
+		peers: map[string]*peer.Peer{}, relayChannels: map[string]relayTransferChannel{},
+	}
+
+	err := d.syncImmichShares(context.Background())
+
+	require.ErrorContains(t, err, "unregister failed")
+	require.NotNil(t, d.GetSession("IMMICHOLD1"))
+	require.True(t, sig.unregisteredCode("IMMICHOLD1"))
+}
+
+func TestSyncImmichSharesStoreDeleteFailureLeavesRemovedSessionInMemory(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{}, nil
+	}
+	d.store.(*mockStore).deleteError = errors.New("delete failed")
+	d.sessions["IMMICHOLD1"] = &Session{
+		Code: "IMMICHOLD1", ShareType: "immich", RelayOnly: true,
+		peers: map[string]*peer.Peer{}, relayChannels: map[string]relayTransferChannel{},
+	}
+
+	err := d.syncImmichShares(context.Background())
+
+	require.ErrorContains(t, err, "delete failed")
+	require.NotNil(t, d.GetSession("IMMICHOLD1"))
+	require.True(t, sig.unregisteredCode("IMMICHOLD1"))
+}
+
+func TestSyncImmichSharesRollsBackSignalingRegistrationOnStoreSaveFailure(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{{Key: "IMMICHROLLBACK1"}}}, nil
+	}
+	d.store.(*mockStore).saveError = errors.New("save failed")
+
+	err := d.syncImmichShares(context.Background())
+
+	require.ErrorContains(t, err, "save failed")
+	require.True(t, sig.registeredCode("IMMICHROLLBACK1"))
+	require.True(t, sig.unregisteredCode("IMMICHROLLBACK1"))
+	require.Nil(t, d.GetSession("IMMICHROLLBACK1"))
+}
+
+func TestSyncImmichSharesWiresClientForNewSession(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{
+			{Key: "IMMICHCLIENT1", Password: "********"},
+		}}, nil
+	}
+
+	require.NoError(t, d.syncImmichShares(context.Background()))
+
+	session := d.GetSession("IMMICHCLIENT1")
+	require.NotNil(t, session)
+	require.NotNil(t, session.immichClient)
+	require.True(t, session.IsPasswordProtected)
+
+	stored := d.store.GetSession("IMMICHCLIENT1")
+	require.NotNil(t, stored)
+	require.True(t, stored.IsPasswordProtected)
+}
+
+func TestLoadSessionsFromStoreWiresPersistedImmichSession(t *testing.T) {
+	cfg := &config.Config{
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		ImmichURL:         "http://immich.lan:2283",
+		ImmichAllowedHost: "immich.lan",
+		ImmichAPIKey:      "api",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	require.NoError(t, st.SaveSession(store.SessionEntry{
+		Code:                "IMMICHPERSIST1",
+		ShareURL:            "immich://IMMICHPERSIST1",
+		ShareType:           "immich",
+		IsPasswordProtected: true,
+		RelayOnly:           true,
+		CreatedAt:           time.Now().Add(-time.Hour),
+	}))
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	d, err := NewWithSignaling(cfgMgr, st, sig)
+	require.NoError(t, err)
+
+	d.loadSessionsFromStore(context.Background())
+
+	session := d.GetSession("IMMICHPERSIST1")
+	require.NotNil(t, session)
+	require.Equal(t, "immich", session.ShareType)
+	require.True(t, session.RelayOnly)
+	require.True(t, session.IsPasswordProtected)
+	require.NotNil(t, session.immichClient)
+	require.True(t, sig.registeredCode("IMMICHPERSIST1"))
 }
 
 // TestHandleRelayPrepare_StartsRelayTransferChannel tests that relay_prepare

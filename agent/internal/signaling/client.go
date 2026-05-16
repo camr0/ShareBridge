@@ -30,6 +30,7 @@ type Message struct {
 	Code        string          `json:"code,omitempty"`
 	ConnID      string          `json:"conn_id,omitempty"`
 	HMAC        string          `json:"hmac,omitempty"`
+	Password    string          `json:"password,omitempty"`
 	Reconnected bool            `json:"reconnected,omitempty"`
 	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
 	SID         string          `json:"sid,omitempty"`
