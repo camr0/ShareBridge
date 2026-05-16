@@ -426,6 +426,81 @@ func TestCreateSession(t *testing.T) {
 	}
 }
 
+func TestCreateSessionManualImmichRegistersRelayOnlyShare(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{
+			{Key: "IMMICHMANUAL1", Password: "********"},
+		}}, nil
+	}
+
+	code, err := d.CreateSession(context.Background(), "immich://IMMICHMANUAL1", "immich", "", 24*time.Hour, 10, false)
+
+	require.NoError(t, err)
+	require.Equal(t, "IMMICHMANUAL1", code)
+
+	session := d.GetSession("IMMICHMANUAL1")
+	require.NotNil(t, session)
+	require.Equal(t, "immich://IMMICHMANUAL1", session.ShareURL)
+	require.Equal(t, "immich", session.ShareType)
+	require.True(t, session.RelayOnly)
+	require.True(t, session.IsPasswordProtected)
+	require.NotNil(t, session.immichClient)
+
+	stored := d.store.GetSession("IMMICHMANUAL1")
+	require.NotNil(t, stored)
+	require.Equal(t, "immich://IMMICHMANUAL1", stored.ShareURL)
+	require.Equal(t, "immich", stored.ShareType)
+	require.True(t, stored.RelayOnly)
+	require.True(t, stored.IsPasswordProtected)
+
+	require.Len(t, sig.registered, 1)
+	require.Equal(t, signaling.RegisterShareOptions{
+		ShareURL:            "immich://IMMICHMANUAL1",
+		PreferredCode:       "IMMICHMANUAL1",
+		ShareType:           "immich",
+		IsPasswordProtected: true,
+		RelayOnly:           true,
+		RelayStaticPub:      sig.registered[0].RelayStaticPub,
+	}, sig.registered[0])
+}
+
+func TestCreateSessionManualImmichRejectsNonImmichURL(t *testing.T) {
+	d, _ := newTestDaemon(t)
+
+	_, err := d.CreateSession(context.Background(), "https://immich.lan/share/KEY", "immich", "", 24*time.Hour, 10, false)
+
+	require.ErrorContains(t, err, "share_url must be immich://KEY for manual Immich shares")
+}
+
+func TestCreateSessionManualImmichReturnsExistingSessionWithoutReregistering(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	existing := &Session{
+		Code:          "IMMICHMANUAL1",
+		ShareURL:      "immich://IMMICHMANUAL1",
+		ShareType:     "immich",
+		RelayOnly:     true,
+		CreatedAt:     time.Now().Add(-time.Hour),
+		peers:         make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions["IMMICHMANUAL1"] = existing
+	d.newImmichPoller = func() (immichPoller, error) {
+		t.Fatal("manual Immich creation should not poll when session already exists")
+		return nil, nil
+	}
+
+	code, err := d.CreateSession(context.Background(), "immich://IMMICHMANUAL1", "immich", "", 24*time.Hour, 10, false)
+
+	require.NoError(t, err)
+	require.Equal(t, "IMMICHMANUAL1", code)
+	require.Same(t, existing, d.GetSession("IMMICHMANUAL1"))
+	require.Empty(t, sig.registered)
+}
+
 // TestCreateSessionWithInvalidHost tests session creation with invalid host.
 func TestCreateSessionWithInvalidHost(t *testing.T) {
 	cfg := &config.Config{

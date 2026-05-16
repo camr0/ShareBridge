@@ -106,8 +106,8 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"share_type is required", "BAD_REQUEST"})
 		return
 	}
-	if req.ShareType != "opencloud" && req.ShareType != "nextcloud" {
-		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{"share_type must be 'opencloud' or 'nextcloud'", "BAD_REQUEST"})
+	if err := validateShareType(req.ShareType, ws.daemon.GetConfig()); err != nil {
+		writeJSON(w, http.StatusBadRequest, v1ErrorResponse{err.Error(), "BAD_REQUEST"})
 		return
 	}
 
@@ -126,6 +126,10 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 		req.RelayOnly,
 	)
 	if err != nil {
+		if isValidationError(err) {
+			writeJSON(w, http.StatusBadRequest, v1ErrorResponse{err.Error(), "BAD_REQUEST"})
+			return
+		}
 		log.Printf("ERROR v1CreateShare: shareURL=%q shareType=%q err=%v", req.ShareURL, req.ShareType, err)
 		writeJSON(w, http.StatusInternalServerError, v1ErrorResponse{err.Error(), "INTERNAL_ERROR"})
 		return

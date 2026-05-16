@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -80,13 +81,12 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 	password := r.FormValue("password")
 	shareType := r.FormValue("share_type")
 
-	// Validate share_type
 	if shareType == "" {
 		http.Error(w, "share_type is required", http.StatusBadRequest)
 		return
 	}
-	if shareType != "opencloud" && shareType != "nextcloud" {
-		http.Error(w, "share_type must be 'opencloud' or 'nextcloud'", http.StatusBadRequest)
+	if err := validateShareType(shareType, ws.daemon.GetConfig()); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -120,6 +120,10 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 		relayOnly,
 	)
 	if err != nil {
+		if isValidationError(err) {
+			http.Error(w, fmt.Sprintf("create session: %v", err), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, fmt.Sprintf("create session: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -161,6 +165,27 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, fmt.Sprintf("render share card: %v", err), http.StatusInternalServerError)
 		return
 	}
+}
+
+func validateShareType(shareType string, cfg *config.Config) error {
+	switch shareType {
+	case "opencloud", "nextcloud":
+		return nil
+	case "immich":
+		if cfg == nil || cfg.ImmichURL == "" || cfg.ImmichAllowedHost == "" || cfg.ImmichAPIKey == "" {
+			return fmt.Errorf("immich is not configured")
+		}
+		return nil
+	default:
+		return fmt.Errorf("share_type must be 'opencloud', 'nextcloud', or 'immich'")
+	}
+}
+
+func isValidationError(err error) bool {
+	var validation interface {
+		IsValidationError() bool
+	}
+	return errors.As(err, &validation) && validation.IsValidationError()
 }
 
 // revokeShareHandler handles DELETE requests to revoke a share session.

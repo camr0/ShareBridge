@@ -121,6 +121,18 @@ type shareUnregistrar interface {
 	UnregisterShare(ctx context.Context, code string) error
 }
 
+type validationError struct {
+	message string
+}
+
+func (e validationError) Error() string {
+	return e.message
+}
+
+func (e validationError) IsValidationError() bool {
+	return true
+}
+
 // WebServer is the interface for the admin UI web server.
 // This interface avoids a circular import between daemon and web packages.
 type WebServer interface {
@@ -339,6 +351,10 @@ func (d *Daemon) Stop() error {
 func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
 	cfg := d.GetConfig()
 
+	if shareType == "immich" {
+		return d.createManualImmichSession(ctx, shareURL)
+	}
+
 	allowedHosts := []string{cfg.AllowedHost, cfg.NCAllowedHost}
 
 	// Validate share URL against allowed hosts
@@ -427,6 +443,61 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 	}
 
 	return code, nil
+}
+
+func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string) (string, error) {
+	const prefix = "immich://"
+	if !strings.HasPrefix(shareURL, prefix) || strings.TrimPrefix(shareURL, prefix) == "" {
+		return "", validationError{message: "share_url must be immich://KEY for manual Immich shares"}
+	}
+	key := strings.TrimPrefix(shareURL, prefix)
+
+	d.mu.RLock()
+	existing := d.sessions[key]
+	d.mu.RUnlock()
+	if existing != nil && existing.ShareType == "immich" {
+		return existing.Code, nil
+	}
+
+	poller, err := d.getImmichPoller()
+	if err != nil {
+		return "", err
+	}
+	links, err := poller.PollShares(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	var link immich.SharedLink
+	found := false
+	for _, candidate := range links {
+		if candidate.Key == key {
+			link = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("immich share %q not found", key)
+	}
+
+	relayStaticPub, err := d.relayStaticPubHex()
+	if err != nil {
+		return "", err
+	}
+	session, err := d.registerImmichShare(ctx, link, relayStaticPub)
+	if err != nil {
+		return "", err
+	}
+
+	d.mu.Lock()
+	d.sessions[session.Code] = session
+	d.mu.Unlock()
+
+	if d.OnSessionAdded != nil {
+		d.OnSessionAdded(session)
+	}
+	return session.Code, nil
 }
 
 // RevokeSession removes a session by code, deregistering it from the

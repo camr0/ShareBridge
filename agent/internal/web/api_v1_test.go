@@ -17,10 +17,11 @@ import (
 
 // mockDaemonV1 implements daemonProvider for v1 handler tests.
 type mockDaemonV1 struct {
-	mu       sync.Mutex
-	cfg      *config.Config
-	sessions map[string]*daemon.Session
-	hasTURN  bool
+	mu               sync.Mutex
+	cfg              *config.Config
+	sessions         map[string]*daemon.Session
+	hasTURN          bool
+	createSessionErr error
 }
 
 func newMockDaemonV1(cfg *config.Config) *mockDaemonV1 {
@@ -60,6 +61,9 @@ func (m *mockDaemonV1) GetConfig() *config.Config { return m.cfg }
 func (m *mockDaemonV1) CreateSession(_ context.Context, shareURL, shareType, _ string, expiry time.Duration, maxDownloads int, relayOnly bool) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.createSessionErr != nil {
+		return "", m.createSessionErr
+	}
 	code := fmt.Sprintf("code-%d", len(m.sessions)+1)
 	m.sessions[code] = &daemon.Session{
 		Code:         code,
@@ -85,16 +89,28 @@ func (m *mockDaemonV1) RevokeSession(code string) error {
 	return nil
 }
 
-func (m *mockDaemonV1) HasTURN() bool                           { return m.hasTURN }
-func (m *mockDaemonV1) IsConnected() bool                       { return true }
-func (m *mockDaemonV1) GetUptime() time.Duration                { return time.Hour }
-func (m *mockDaemonV1) GetConfigPath() string                   { return "" }
-func (m *mockDaemonV1) SaveConfig(cfg *config.Config) error     { m.cfg = cfg; return nil }
+func (m *mockDaemonV1) HasTURN() bool                       { return m.hasTURN }
+func (m *mockDaemonV1) IsConnected() bool                   { return true }
+func (m *mockDaemonV1) GetUptime() time.Duration            { return time.Hour }
+func (m *mockDaemonV1) GetConfigPath() string               { return "" }
+func (m *mockDaemonV1) SaveConfig(cfg *config.Config) error { m.cfg = cfg; return nil }
 
 func newV1TestServer(cfg *config.Config) (*WebServer, *mockDaemonV1) {
 	mock := newMockDaemonV1(cfg)
 	ws := &WebServer{daemon: mock}
 	return ws, mock
+}
+
+type testClientValidationError struct {
+	message string
+}
+
+func (e testClientValidationError) Error() string {
+	return e.message
+}
+
+func (e testClientValidationError) IsValidationError() bool {
+	return true
 }
 
 func TestV1ListShares_ReturnsAllSessions(t *testing.T) {
@@ -204,6 +220,92 @@ func TestV1CreateShare_AcceptsNextcloudShareType(t *testing.T) {
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestV1CreateShareAcceptsImmichTypeWhenConfigured(t *testing.T) {
+	cfg := &config.Config{
+		AgentAPIKey:         "key",
+		SignalingURL:        "wss://share.example.com",
+		DefaultExpiry:       24,
+		DefaultMaxDownloads: 10,
+		ImmichURL:           "http://immich.lan:2283",
+		ImmichAllowedHost:   "immich.lan",
+		ImmichAPIKey:        "api",
+	}
+	ws, _ := newV1TestServer(cfg)
+
+	body := `{"share_url":"immich://KEY","share_type":"immich"}`
+	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	ws.v1CreateShareHandler(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestV1CreateShareRejectsImmichTypeWhenMissingConfig(t *testing.T) {
+	cfg := &config.Config{
+		AgentAPIKey:         "key",
+		SignalingURL:        "wss://share.example.com",
+		DefaultExpiry:       24,
+		DefaultMaxDownloads: 10,
+	}
+	ws, _ := newV1TestServer(cfg)
+
+	body := `{"share_url":"immich://KEY","share_type":"immich"}`
+	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	ws.v1CreateShareHandler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+
+	var resp v1ErrorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error != "immich is not configured" {
+		t.Errorf("error = %q, want immich is not configured", resp.Error)
+	}
+}
+
+func TestV1CreateShareReturnsBadRequestForManualImmichURLValidationError(t *testing.T) {
+	cfg := &config.Config{
+		AgentAPIKey:         "key",
+		SignalingURL:        "wss://share.example.com",
+		DefaultExpiry:       24,
+		DefaultMaxDownloads: 10,
+		ImmichURL:           "http://immich.lan:2283",
+		ImmichAllowedHost:   "immich.lan",
+		ImmichAPIKey:        "api",
+	}
+	ws, mock := newV1TestServer(cfg)
+	mock.createSessionErr = testClientValidationError{message: "share_url must be immich://KEY for manual Immich shares"}
+
+	body := `{"share_url":"https://example.com/share","share_type":"immich"}`
+	req := httptest.NewRequest("POST", "/api/v1/shares", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	ws.v1CreateShareHandler(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp v1ErrorResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error != "share_url must be immich://KEY for manual Immich shares" {
+		t.Errorf("error = %q, want manual Immich URL validation message", resp.Error)
+	}
+	if resp.Code != "BAD_REQUEST" {
+		t.Errorf("error code = %q, want BAD_REQUEST", resp.Code)
 	}
 }
 
