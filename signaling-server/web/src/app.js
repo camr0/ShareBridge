@@ -11,6 +11,7 @@ import {
 } from './downloadSinks.js'
 import { createDownloadPipeline } from './downloadPipeline.js'
 import { decodeBinaryEnvelope, FRAME_FILE_CHUNK, FRAME_THUMBNAIL } from './binaryEnvelope.js'
+import { createGalleryController } from './gallery.js'
 
 // Module state
 let pc, ws, dc
@@ -49,6 +50,7 @@ let receivedChunkCount = 0
 let currentPath = []
 let sessionCode = ''
 let galleryMode = false
+let galleryController = null
 let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
@@ -199,11 +201,21 @@ export function installSessionMessageHandler({
   applyConnectionBadge: applyBadge,
   decodeRelayPolicyToken: decodeToken,
   hideSection,
+  showSection = () => {},
   isGalleryMode = () => galleryMode,
 }) {
   return {
     async handleMessage(msg) {
       switch (msg.type) {
+        case 'password_required':
+          hideSection('join-section')
+          showSection('password-section')
+          updateStatus('This Immich share is password protected.')
+          break
+        case 'auth_fail':
+          showSection('password-section')
+          updateStatus(`Incorrect password. ${msg.attempts_remaining ?? 0} attempts remaining.`)
+          break
         case 'relay_policy':
           updateStatus('Connecting to agent...')
           const relayPolicy = decodeToken(msg.token)
@@ -259,6 +271,7 @@ export function installSessionMessageHandler({
             mode: result.mode,
             updateStatus,
             hideSection,
+            showSection,
             requestFileList,
             applyConnectionBadge: ({ mode }) => applyBadge({ mode }),
             handleTransferMessage,
@@ -284,6 +297,7 @@ function attachTransferChannel({
   mode,
   updateStatus,
   hideSection,
+  showSection = () => {},
   requestFileList,
   applyConnectionBadge,
   handleTransferMessage,
@@ -300,7 +314,11 @@ function attachTransferChannel({
     hideSection('join-section')
     hideSection('password-section')
     applyConnectionBadge({ mode })
-    if (!isGalleryMode()) {
+    if (isGalleryMode()) {
+      ensureGalleryController()
+      showSection('gallery-section')
+      updateStatus('Loading gallery...')
+    } else {
       requestFileList(channel, '')
     }
     ws = detachBrowserSignalingSocket(ws)
@@ -450,6 +468,17 @@ function join() {
           break
         }
 
+        case 'password_required':
+          hideSection('join-section')
+          showSection('password-section')
+          updateStatus('This Immich share is password protected.')
+          break
+
+        case 'auth_fail':
+          showSection('password-section')
+          updateStatus(`Incorrect password. ${msg.attempts_remaining ?? 0} attempts remaining.`)
+          break
+
         case 'offer':
           debugLog('received WebRTC offer')
           if (!pc) return
@@ -545,6 +574,7 @@ function join() {
             mode: result.mode,
             updateStatus,
             hideSection,
+            showSection,
             requestFileList,
             applyConnectionBadge: ({ mode }) =>
               applyConnectionBadge({
@@ -554,6 +584,7 @@ function join() {
               }),
             handleTransferMessage,
             onClose: handleTransferClosure,
+            isGalleryMode: () => galleryMode,
           })
           break
         }
@@ -621,6 +652,13 @@ async function handleTransferMessage(event) {
       byteLength: event.data.byteLength,
       currentFile: currentFile?.name || null,
     })
+    if (galleryController) {
+      const frame = decodeBinaryEnvelope(event.data)
+      if (frame.type === FRAME_THUMBNAIL) {
+        galleryController.handleThumbnailData(frame.index, frame.payload)
+        return
+      }
+    }
     if (!currentFile?.binary_envelope) {
       await appendChunk(new Uint8Array(event.data))
       return
@@ -646,6 +684,10 @@ async function handleTransferMessage(event) {
     case 'file_list':
       debugLog('file_list received', { count: msg.files?.length || 0, currentPath })
       renderFileList(msg.files)
+      break
+    case 'thumbnail_list':
+      ensureGalleryController()
+      galleryController?.handleThumbnailList(msg)
       break
     case 'file_header':
       await startDownload(msg)
@@ -1018,6 +1060,10 @@ function requestFileList(channel, subpath) {
 
 function submitPassword() {
   sessionPassword = document.getElementById('password-input').value
+  if (galleryMode) {
+    ws.send(JSON.stringify({ type: 'password_submit', code: sessionCode, password: sessionPassword }))
+    return
+  }
   sendJoin()
 }
 
@@ -1069,6 +1115,7 @@ function resetUI() {
   showSection('join-section')
   hideSection('password-section')
   hideSection('file-list')
+  hideSection('gallery-section')
   getConnectionStatusEl().classList.add('hidden')
   getConnectionTypeEl().className = 'connection-badge'
   document.getElementById('breadcrumb').classList.add('hidden')
@@ -1086,6 +1133,8 @@ function resetUI() {
   pendingNonce = null
   currentPath = []
   sessionPassword = ''
+  galleryController?.destroy()
+  galleryController = null
   transferChannel = null
   currentTransferMode = null
   ws = null
@@ -1115,10 +1164,25 @@ function formatSpeed(bps) {
   return Math.round(bps) + ' B/s'
 }
 
+function ensureGalleryController() {
+  if (galleryController || !galleryMode) return galleryController
+  const root = document.getElementById('gallery-root')
+  if (root) {
+    galleryController = createGalleryController({
+      root,
+      sendAssetRequest: (id) => transferChannel?.send(JSON.stringify({ type: 'asset_request', id, quality: 'original' })),
+    })
+  }
+  return galleryController
+}
+
 function initFromURL() {
   const pathMode = detectPathMode()
   sessionCode = pathMode.code
   galleryMode = pathMode.mode === 'gallery'
+  if (galleryMode) {
+    ensureGalleryController()
+  }
   if (sessionCode) {
     document.getElementById('code').value = sessionCode
   }
@@ -1168,6 +1232,14 @@ export const __test = {
     transferChannel = channel
     currentTransferMode = mode
   },
+  setGallerySession({ galleryMode: nextGalleryMode, sessionCode: nextSessionCode, socket }) {
+    galleryMode = nextGalleryMode
+    sessionCode = nextSessionCode
+    ws = socket
+  },
+  setGalleryController(controller) {
+    galleryController = controller
+  },
   getTransferSession() {
     return {
       transferChannel,
@@ -1175,6 +1247,7 @@ export const __test = {
     }
   },
   handleTransferMessage,
+  submitPassword,
   handleTransferClosure,
   handleError,
   applyFinalDownloadState,

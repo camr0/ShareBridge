@@ -158,6 +158,67 @@
       border-color: rgba(243, 139, 168, 0.35);
       color: #f5b3c7;
     }
+
+    .gallery-header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 1rem;
+      margin: 1rem 0;
+    }
+    .gallery-header h2 {
+      margin: 0;
+      font-size: 1.25rem;
+    }
+    .gallery-header p {
+      margin: 0.25rem 0 0;
+      color: #a6adc8;
+      overflow-wrap: anywhere;
+    }
+    .gallery-header span {
+      color: #6c7086;
+      font-size: 0.85rem;
+      white-space: nowrap;
+    }
+    .gallery-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.75rem;
+    }
+    .gallery-item {
+      position: relative;
+      aspect-ratio: 1;
+      width: 100%;
+      margin-top: 0;
+      border: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #313244;
+      border-radius: 8px;
+    }
+    .gallery-item:focus-visible {
+      outline: 2px solid #89b4fa;
+      outline-offset: 2px;
+    }
+    .gallery-item img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .gallery-duration {
+      position: absolute;
+      right: 0.4rem;
+      bottom: 0.4rem;
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.72);
+      color: white;
+      font-size: 0.75rem;
+    }
+    @media (max-width: 640px) {
+      .gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -178,6 +239,9 @@
   <div id="connection-status" class="hidden">
     <span id="connection-type" class="connection-badge">● Connected</span>
   </div>
+  <section id="gallery-section" class="hidden">
+    <div id="gallery-root"></div>
+  </section>
   <div id="breadcrumb" class="hidden"></div>
   <div id="file-list" class="hidden"></div>
   <script type="module" src="/src/app.js"></script>

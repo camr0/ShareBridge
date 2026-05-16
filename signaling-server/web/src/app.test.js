@@ -254,8 +254,176 @@ test('relay_policy in gallery mode does not request the file list on channel ope
 
   await controller.handleMessage({ type: 'relay_policy', token: 'jwt', relay_allowed: true, relay_only: true })
 
-  assert.equal(statuses.at(-1), 'badge:relay')
+  assert.ok(statuses.includes('badge:relay'))
   assert.deepEqual(sends, [])
+  assert.equal(statuses.at(-1), 'Loading gallery...')
+})
+
+test('password_required shows the Immich password form', async () => {
+  const statuses = []
+  const shown = []
+  const hidden = []
+
+  const controller = installSessionMessageHandler({
+    updateStatus: (msg) => statuses.push(msg),
+    connectTransferChannel: async () => { throw new Error('unexpected connect') },
+    requestFileList: () => {},
+    applyConnectionBadge: () => {},
+    decodeRelayPolicyToken: () => ({}),
+    hideSection: (id) => hidden.push(id),
+    showSection: (id) => shown.push(id),
+  })
+
+  await controller.handleMessage({ type: 'password_required' })
+
+  assert.deepEqual(hidden, ['join-section'])
+  assert.deepEqual(shown, ['password-section'])
+  assert.equal(statuses.at(-1), 'This Immich share is password protected.')
+})
+
+test('auth_fail keeps the password form visible with remaining attempts', async () => {
+  const statuses = []
+  const shown = []
+
+  const controller = installSessionMessageHandler({
+    updateStatus: (msg) => statuses.push(msg),
+    connectTransferChannel: async () => { throw new Error('unexpected connect') },
+    requestFileList: () => {},
+    applyConnectionBadge: () => {},
+    decodeRelayPolicyToken: () => ({}),
+    hideSection: () => {},
+    showSection: (id) => shown.push(id),
+  })
+
+  await controller.handleMessage({ type: 'auth_fail', attempts_remaining: 2 })
+
+  assert.deepEqual(shown, ['password-section'])
+  assert.equal(statuses.at(-1), 'Incorrect password. 2 attempts remaining.')
+})
+
+test('submitPassword in gallery mode sends password_submit instead of join', () => {
+  const sent = []
+  const originalDocument = globalThis.document
+  globalThis.document = {
+    getElementById(id) {
+      assert.equal(id, 'password-input')
+      return { value: 'secret' }
+    },
+  }
+
+  try {
+    __test.setGallerySession({
+      galleryMode: true,
+      sessionCode: 'immich-code',
+      socket: { send: (payload) => sent.push(JSON.parse(payload)) },
+    })
+
+    __test.submitPassword()
+
+    assert.deepEqual(sent, [{ type: 'password_submit', code: 'immich-code', password: 'secret' }])
+  } finally {
+    globalThis.document = originalDocument
+    __test.setGallerySession({ galleryMode: false, sessionCode: '', socket: null })
+  }
+})
+
+test('handleTransferMessage routes thumbnail_list to the gallery controller', async () => {
+  const lists = []
+  __test.setGalleryController({
+    handleThumbnailList(msg) {
+      lists.push(msg)
+    },
+  })
+
+  await __test.handleTransferMessage({
+    data: JSON.stringify({ type: 'thumbnail_list', albumName: 'Summer', items: [] }),
+  })
+
+  assert.deepEqual(lists, [{ type: 'thumbnail_list', albumName: 'Summer', items: [] }])
+  __test.setGalleryController(null)
+})
+
+test('gallery mode recreates its controller after reset before handling thumbnail_list', async () => {
+  const originalDocument = globalThis.document
+  const elements = new Map()
+  const makeElement = () => ({
+    innerHTML: '',
+    textContent: '',
+    value: '',
+    disabled: false,
+    className: '',
+    classList: {
+      add() {},
+      remove() {},
+    },
+    addEventListener() {},
+    querySelector() { return null },
+  })
+
+  for (const id of [
+    'join-section',
+    'password-section',
+    'file-list',
+    'gallery-section',
+    'connection-status',
+    'connection-type',
+    'breadcrumb',
+    'password-error',
+    'password-input',
+    'download-warning',
+    'gallery-root',
+  ]) {
+    elements.set(id, makeElement())
+  }
+
+  globalThis.document = {
+    getElementById(id) {
+      const el = elements.get(id)
+      if (!el) throw new Error('unexpected element id: ' + id)
+      return el
+    },
+    querySelector(selector) {
+      assert.equal(selector, '#password-section button')
+      return makeElement()
+    },
+  }
+
+  try {
+    let destroyed = false
+    __test.setGallerySession({ galleryMode: true, sessionCode: 'immich-code', socket: null })
+    __test.setGalleryController({ destroy() { destroyed = true } })
+
+    await __test.handleTransferClosure()
+    await __test.handleTransferMessage({
+      data: JSON.stringify({
+        type: 'thumbnail_list',
+        albumName: 'Summer',
+        items: [{ id: 'asset-1', name: 'photo.jpg', mimeType: 'image/jpeg' }],
+      }),
+    })
+
+    assert.equal(destroyed, true)
+    assert.match(elements.get('gallery-root').innerHTML, /Summer/)
+    assert.match(elements.get('gallery-root').innerHTML, /photo.jpg/)
+  } finally {
+    globalThis.document = originalDocument
+    __test.setGallerySession({ galleryMode: false, sessionCode: '', socket: null })
+    __test.setGalleryController(null)
+  }
+})
+
+test('handleTransferMessage routes thumbnail envelopes before file chunks', async () => {
+  const thumbs = []
+  __test.setGalleryController({
+    handleThumbnailData(index, payload) {
+      thumbs.push({ index, payload: [...payload] })
+    },
+  })
+
+  await __test.handleTransferMessage({ data: new Uint8Array([0x11, 0, 4, 9, 8]).buffer })
+
+  assert.deepEqual(thumbs, [{ index: 4, payload: [9, 8] }])
+  __test.setGalleryController(null)
 })
 
 test('direct failure after quota warning keeps the quota-blocked message', async () => {
