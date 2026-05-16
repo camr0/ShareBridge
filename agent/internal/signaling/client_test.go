@@ -3,14 +3,233 @@ package signaling
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 )
+
+func newRegisterShareTestServer(t *testing.T, handle func(t *testing.T, raw []byte) []byte) *httptest.Server {
+	t.Helper()
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		defer conn.CloseNow()
+
+		ctx := r.Context()
+		_, _, err = conn.Read(ctx) // hello
+		if err != nil {
+			t.Fatalf("Read hello: %v", err)
+		}
+
+		_, raw, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("Read message: %v", err)
+		}
+
+		resp := handle(t, raw)
+		if len(resp) > 0 {
+			if err := conn.Write(ctx, websocket.MessageText, resp); err != nil {
+				t.Fatalf("Write response: %v", err)
+			}
+		}
+	}))
+}
+
+func TestRegisterShare_IncludesImmichMetadata(t *testing.T) {
+	server := newRegisterShareTestServer(t, func(t *testing.T, raw []byte) []byte {
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("Unmarshal register_share: %v", err)
+		}
+		if got["type"] != "register_share" {
+			t.Fatalf("type = %v, want register_share", got["type"])
+		}
+		if got["share_type"] != "immich" {
+			t.Fatalf("share_type = %v, want immich", got["share_type"])
+		}
+		if got["code"] != "ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ" {
+			t.Fatalf("code = %v, want ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", got["code"])
+		}
+		if got["share_url"] != "immich://ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ" {
+			t.Fatalf("share_url = %v, want immich://ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", got["share_url"])
+		}
+		if got["is_password_protected"] != true {
+			t.Fatalf("is_password_protected = %v, want true", got["is_password_protected"])
+		}
+		if got["relay_only"] != true {
+			t.Fatalf("relay_only = %v, want true", got["relay_only"])
+		}
+		if got["relay_static_pub"] != "04abcd" {
+			t.Fatalf("relay_static_pub = %v, want 04abcd", got["relay_static_pub"])
+		}
+		return []byte(`{"type":"share_registered","code":"ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ"}`)
+	})
+	defer server.Close()
+
+	client := New(strings.Replace(server.URL, "http://", "ws://", 1), "api", "agent")
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	go client.Listen(context.Background())
+
+	opts := RegisterShareOptions{
+		ShareURL:            "immich://ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ",
+		PreferredCode:       "ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ",
+		ShareType:           "immich",
+		IsPasswordProtected: true,
+		RelayOnly:           true,
+		RelayStaticPub:      "04abcd",
+	}
+	code, _, err := client.RegisterShareWithOptions(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("RegisterShareWithOptions: %v", err)
+	}
+	if code != opts.PreferredCode {
+		t.Fatalf("code = %q, want %q", code, opts.PreferredCode)
+	}
+}
+
+func TestRegisterShare_OmitsFalseImmichPasswordProtected(t *testing.T) {
+	server := newRegisterShareTestServer(t, func(t *testing.T, raw []byte) []byte {
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("Unmarshal register_share: %v", err)
+		}
+		if _, ok := got["is_password_protected"]; ok {
+			t.Fatalf("is_password_protected should be omitted when false: %s", string(raw))
+		}
+		return []byte(`{"type":"share_registered","code":"IMMICHNOPASS"}`)
+	})
+	defer server.Close()
+
+	client := New(strings.Replace(server.URL, "http://", "ws://", 1), "api", "agent")
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	go client.Listen(context.Background())
+
+	_, _, err := client.RegisterShareWithOptions(context.Background(), RegisterShareOptions{
+		ShareURL:      "immich://IMMICHNOPASS",
+		PreferredCode: "IMMICHNOPASS",
+		ShareType:     "immich",
+	})
+	if err != nil {
+		t.Fatalf("RegisterShareWithOptions: %v", err)
+	}
+}
+
+func TestRegisterShareWithOptions_RejectsConcurrentRegistration(t *testing.T) {
+	firstReceived := make(chan struct{})
+	releaseServer := make(chan struct{})
+	defer close(releaseServer)
+	var registerMessages atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		defer conn.CloseNow()
+
+		ctx := r.Context()
+		_, _, err = conn.Read(ctx) // hello
+		if err != nil {
+			t.Fatalf("Read hello: %v", err)
+		}
+
+		_, _, err = conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("Read first register_share: %v", err)
+		}
+		registerMessages.Add(1)
+		close(firstReceived)
+
+		readCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+		defer cancel()
+		if _, _, err := conn.Read(readCtx); err == nil {
+			registerMessages.Add(1)
+		}
+
+		<-releaseServer
+	}))
+	defer server.Close()
+
+	client := New(strings.Replace(server.URL, "http://", "ws://", 1), "api", "agent")
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	go client.Listen(context.Background())
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, err := client.RegisterShareWithOptions(firstCtx, RegisterShareOptions{
+			ShareURL:      "immich://FIRST",
+			PreferredCode: "FIRST",
+			ShareType:     "immich",
+		})
+		firstDone <- err
+	}()
+
+	<-firstReceived
+
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancelSecond()
+	_, _, secondErr := client.RegisterShareWithOptions(secondCtx, RegisterShareOptions{
+		ShareURL:      "immich://SECOND",
+		PreferredCode: "SECOND",
+		ShareType:     "immich",
+	})
+	time.Sleep(250 * time.Millisecond)
+
+	cancelFirst()
+	firstErr := <-firstDone
+
+	if secondErr == nil || secondErr.Error() != "registration already in progress" {
+		t.Fatalf("second RegisterShareWithOptions error = %v, want registration already in progress", secondErr)
+	}
+	if got := registerMessages.Load(); got != 1 {
+		t.Fatalf("register message count = %d, want 1", got)
+	}
+	if !errors.Is(firstErr, context.Canceled) {
+		t.Fatalf("first RegisterShareWithOptions error = %v, want context canceled", firstErr)
+	}
+}
+
+func TestUnregisterShare_SendsMessage(t *testing.T) {
+	server := newRegisterShareTestServer(t, func(t *testing.T, raw []byte) []byte {
+		want := `{"type":"unregister_share","code":"IMMICHDEL1"}`
+		var gotJSON, wantJSON map[string]any
+		if err := json.Unmarshal(raw, &gotJSON); err != nil {
+			t.Fatalf("Unmarshal unregister_share: %v", err)
+		}
+		if err := json.Unmarshal([]byte(want), &wantJSON); err != nil {
+			t.Fatalf("Unmarshal want: %v", err)
+		}
+		if gotJSON["type"] != wantJSON["type"] || gotJSON["code"] != wantJSON["code"] {
+			t.Fatalf("unregister_share = %s, want %s", string(raw), want)
+		}
+		return []byte(`{"type":"share_unregistered","code":"IMMICHDEL1"}`)
+	})
+	defer server.Close()
+
+	client := New(strings.Replace(server.URL, "http://", "ws://", 1), "api", "agent")
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if err := client.UnregisterShare(context.Background(), "IMMICHDEL1"); err != nil {
+		t.Fatalf("UnregisterShare: %v", err)
+	}
+}
 
 func TestRegisterShare_IncludesRelayStaticPub(t *testing.T) {
 	var payload map[string]any

@@ -8,6 +8,23 @@ import (
 	"testing"
 )
 
+func newTempConfigManager(t *testing.T) *Manager {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatalf("MkdirAll home: %v", err)
+	}
+	t.Setenv("HOME", homeDir)
+
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	return mgr
+}
+
 func TestNewManager_CreatesConfigDir(t *testing.T) {
 	// Create a temp home directory
 	tmpDir := t.TempDir()
@@ -42,6 +59,48 @@ func TestNewManager_CreatesConfigDir(t *testing.T) {
 	configDir := filepath.Join(homeDir, ".sharebridge")
 	if _, err := os.Stat(configDir); os.IsNotExist(err) {
 		t.Error("config directory should be created by AgentAPIKey auto-generation during NewManager()")
+	}
+}
+
+func TestConfigLoadsImmichEnv(t *testing.T) {
+	t.Setenv("IMMICH_URL", "http://immich.lan:2283")
+	t.Setenv("IMMICH_ALLOWED_HOST", "immich.lan")
+	t.Setenv("IMMICH_API_KEY", "immich-api-key")
+	t.Setenv("IMMICH_POLL_INTERVAL", "45")
+	mgr := newTempConfigManager(t)
+
+	cfg := mgr.Get()
+	if cfg.ImmichURL != "http://immich.lan:2283" {
+		t.Fatalf("ImmichURL = %q, want http://immich.lan:2283", cfg.ImmichURL)
+	}
+	if cfg.ImmichAllowedHost != "immich.lan" {
+		t.Fatalf("ImmichAllowedHost = %q, want immich.lan", cfg.ImmichAllowedHost)
+	}
+	if cfg.ImmichAPIKey != "immich-api-key" {
+		t.Fatalf("ImmichAPIKey = %q, want immich-api-key", cfg.ImmichAPIKey)
+	}
+	if cfg.ImmichPollInterval != 45 {
+		t.Fatalf("ImmichPollInterval = %d, want 45", cfg.ImmichPollInterval)
+	}
+}
+
+func TestNewManager_EnvImmichAPIKeyNotPersisted(t *testing.T) {
+	t.Setenv("IMMICH_API_KEY", "immich-env-secret")
+	mgr := newTempConfigManager(t)
+
+	if mgr.Get().ImmichAPIKey != "immich-env-secret" {
+		t.Fatalf("ImmichAPIKey = %q, want immich-env-secret", mgr.Get().ImmichAPIKey)
+	}
+
+	data, err := os.ReadFile(mgr.FilePath())
+	if err != nil {
+		t.Fatalf("read config file: %v", err)
+	}
+	if strings.Contains(string(data), "immich-env-secret") {
+		t.Fatalf("config file contains env-provided Immich API key")
+	}
+	if strings.Contains(string(data), "immich_api_key") {
+		t.Fatalf("config file contains immich_api_key field, should be omitted when from env")
 	}
 }
 
@@ -176,9 +235,9 @@ func TestLoad_PartialFileWithEnvFill(t *testing.T) {
 
 	// Write partial config file (missing SignalingURL and APIKey)
 	fileConfig := map[string]interface{}{
-		"ui_port":            7777,
-		"default_expiry":     12,
-		"allowed_host":       "file.example.com",
+		"ui_port":        7777,
+		"default_expiry": 12,
+		"allowed_host":   "file.example.com",
 	}
 	data, err := json.MarshalIndent(fileConfig, "", "  ")
 	if err != nil {

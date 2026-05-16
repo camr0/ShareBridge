@@ -10,6 +10,19 @@ import (
 	"github.com/google/uuid"
 )
 
+func newTempStore(t *testing.T) *Store {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
+
+	st, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	return st
+}
+
 // TestNew_CreatesMissingDir verifies that New() creates the data directory
 // if it does not exist.
 func TestNew_CreatesMissingDir(t *testing.T) {
@@ -145,6 +158,29 @@ func TestSaveSession_GetSession_RoundTripShareType(t *testing.T) {
 	}
 	if gotSession.ShareType != session.ShareType {
 		t.Errorf("ShareType: got %q, expected %q", gotSession.ShareType, session.ShareType)
+	}
+}
+
+func TestSaveSession_RoundTripIsPasswordProtected(t *testing.T) {
+	st := newTempStore(t)
+	session := SessionEntry{
+		Code:                "IMMICHKEY1",
+		ShareURL:            "immich://IMMICHKEY1",
+		ShareType:           "immich",
+		IsPasswordProtected: true,
+		RelayOnly:           true,
+		CreatedAt:           time.Now(),
+	}
+	if err := st.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	got := st.GetSession("IMMICHKEY1")
+	if got == nil {
+		t.Fatalf("GetSession returned nil")
+	}
+	if !got.IsPasswordProtected {
+		t.Fatalf("IsPasswordProtected = false, want true")
 	}
 }
 

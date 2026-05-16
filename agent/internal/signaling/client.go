@@ -37,6 +37,15 @@ type Message struct {
 	ExpiresAt   string          `json:"expires_at,omitempty"`
 }
 
+type RegisterShareOptions struct {
+	ShareURL            string
+	PreferredCode       string
+	ShareType           string
+	IsPasswordProtected bool
+	RelayOnly           bool
+	RelayStaticPub      string
+}
+
 // Client manages a WebSocket connection to the signaling server.
 type Client struct {
 	serverURL  string
@@ -94,8 +103,21 @@ func (c *Client) Connect(ctx context.Context) error {
 // The response is delivered via pendingReg, which Listen feeds.
 // relayStaticPub is the hex-encoded P-256 public key for relay identity.
 func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
+	return c.RegisterShareWithOptions(ctx, RegisterShareOptions{
+		ShareURL:       shareURL,
+		PreferredCode:  preferredCode,
+		RelayOnly:      relayOnly,
+		RelayStaticPub: relayStaticPub,
+	})
+}
+
+func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShareOptions) (string, bool, error) {
 	responseCh := make(chan Message, 1)
 	c.pendingRegMu.Lock()
+	if c.pendingReg != nil {
+		c.pendingRegMu.Unlock()
+		return "", false, fmt.Errorf("registration already in progress")
+	}
 	c.pendingReg = responseCh
 	c.pendingRegMu.Unlock()
 	defer func() {
@@ -106,14 +128,20 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 
 	msg := map[string]any{
 		"type":       "register_share",
-		"share_url":  shareURL,
-		"relay_only": relayOnly,
+		"share_url":  opts.ShareURL,
+		"relay_only": opts.RelayOnly,
 	}
-	if preferredCode != "" {
-		msg["code"] = preferredCode
+	if opts.PreferredCode != "" {
+		msg["code"] = opts.PreferredCode
 	}
-	if relayStaticPub != "" {
-		msg["relay_static_pub"] = relayStaticPub
+	if opts.ShareType != "" {
+		msg["share_type"] = opts.ShareType
+	}
+	if opts.IsPasswordProtected {
+		msg["is_password_protected"] = true
+	}
+	if opts.RelayStaticPub != "" {
+		msg["relay_static_pub"] = opts.RelayStaticPub
 	}
 	if err := c.Send(ctx, msg); err != nil {
 		return "", false, fmt.Errorf("send register_share: %w", err)
@@ -128,6 +156,10 @@ func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode stri
 	case <-ctx.Done():
 		return "", false, ctx.Err()
 	}
+}
+
+func (c *Client) UnregisterShare(ctx context.Context, code string) error {
+	return c.Send(ctx, map[string]string{"type": "unregister_share", "code": code})
 }
 
 // DownloadComplete notifies server of completed download.

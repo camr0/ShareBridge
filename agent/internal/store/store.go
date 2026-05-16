@@ -19,20 +19,21 @@ import (
 
 // SessionEntry represents a single share session with full metadata.
 type SessionEntry struct {
-	Code         string    `json:"code"`
-	ShareURL     string    `json:"share_url"`
-	ShareType    string    `json:"share_type"`
-	FileID       string    `json:"file_id,omitempty"`
-	Password     string    `json:"password,omitempty"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	MaxDownloads int       `json:"max_downloads,omitempty"` // 0 = unlimited
-	Downloads    int       `json:"downloads"`
-	RelayOnly    bool      `json:"relay_only"`
-	CreatedAt    time.Time `json:"created_at"`
+	Code                string    `json:"code"`
+	ShareURL            string    `json:"share_url"`
+	ShareType           string    `json:"share_type"`
+	IsPasswordProtected bool      `json:"is_password_protected,omitempty"`
+	FileID              string    `json:"file_id,omitempty"`
+	Password            string    `json:"password,omitempty"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	MaxDownloads        int       `json:"max_downloads,omitempty"` // 0 = unlimited
+	Downloads           int       `json:"downloads"`
+	RelayOnly           bool      `json:"relay_only"`
+	CreatedAt           time.Time `json:"created_at"`
 }
 
 type storeData struct {
-	AgentID               string         `json:"agent_id"` // UUID for reconnection
+	AgentID               string         `json:"agent_id"`                           // UUID for reconnection
 	RelayStaticPrivateHex string         `json:"relay_static_private_hex,omitempty"` // P-256 private key for relay identity
 	Sessions              []SessionEntry `json:"sessions"`
 }

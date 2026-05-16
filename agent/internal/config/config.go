@@ -19,8 +19,12 @@ type Config struct {
 	AllowedHost         string `json:"allowed_host,omitempty"`    // OpenCloud hostname for CORS
 	NCAllowedHost       string `json:"nc_allowed_host,omitempty"` // Nextcloud hostname for CORS
 	AgentAPIKey         string `json:"agent_api_key,omitempty"`   // auth key for /api/v1/ JSON endpoints
-	DefaultExpiry       int    `json:"default_expiry"`            // hours, default: 24
-	DefaultMaxDownloads int    `json:"default_max_downloads"`     // 0 = unlimited, default: 10
+	ImmichURL           string `json:"immich_url,omitempty"`
+	ImmichAllowedHost   string `json:"immich_allowed_host,omitempty"`
+	ImmichAPIKey        string `json:"immich_api_key,omitempty"`
+	ImmichPollInterval  int    `json:"immich_poll_interval,omitempty"`
+	DefaultExpiry       int    `json:"default_expiry"`        // hours, default: 24
+	DefaultMaxDownloads int    `json:"default_max_downloads"` // 0 = unlimited, default: 10
 	DefaultRelayOnly    bool   `json:"default_relay_only"`
 	UIPort              int    `json:"ui_port"`           // default: 7878
 	UIAddr              string `json:"ui_addr,omitempty"` // default: 0.0.0.0
@@ -34,9 +38,10 @@ type Config struct {
 
 // Manager handles configuration persistence.
 type Manager struct {
-	filePath           string
-	config             *Config
-	agentAPIKeyFromEnv bool // if true, don't persist AgentAPIKey to disk
+	filePath            string
+	config              *Config
+	agentAPIKeyFromEnv  bool // if true, don't persist AgentAPIKey to disk
+	immichAPIKeyFromEnv bool // if true, don't persist ImmichAPIKey to disk
 }
 
 // NewManager creates a new config manager, loading from the config file.
@@ -134,6 +139,19 @@ func (m *Manager) load() (*Config, error) {
 		cfg.AgentAPIKey = v
 		m.agentAPIKeyFromEnv = true
 	}
+	if v := os.Getenv("IMMICH_URL"); v != "" {
+		cfg.ImmichURL = v
+	}
+	if v := os.Getenv("IMMICH_ALLOWED_HOST"); v != "" {
+		cfg.ImmichAllowedHost = v
+	}
+	if v := os.Getenv("IMMICH_API_KEY"); v != "" {
+		cfg.ImmichAPIKey = v
+		m.immichAPIKeyFromEnv = true
+	}
+	if v := os.Getenv("IMMICH_POLL_INTERVAL"); v != "" {
+		cfg.ImmichPollInterval = getEnvInt("IMMICH_POLL_INTERVAL", cfg.ImmichPollInterval)
+	}
 	if v := os.Getenv("UI_PORT"); v != "" {
 		cfg.UIPort = getEnvInt("UI_PORT", cfg.UIPort)
 	}
@@ -149,6 +167,9 @@ func (m *Manager) load() (*Config, error) {
 	}
 	if cfg.UIPort == 0 {
 		cfg.UIPort = 7878
+	}
+	if cfg.ImmichPollInterval == 0 {
+		cfg.ImmichPollInterval = 30
 	}
 	if cfg.UIAddr == "" {
 		cfg.UIAddr = "0.0.0.0"
@@ -171,6 +192,9 @@ func (m *Manager) save() error {
 	// Don't persist AgentAPIKey if it came from env var (allows temporary overrides)
 	if m.agentAPIKeyFromEnv {
 		cfg.AgentAPIKey = ""
+	}
+	if m.immichAPIKeyFromEnv {
+		cfg.ImmichAPIKey = ""
 	}
 
 	// Marshal with indentation for readability
