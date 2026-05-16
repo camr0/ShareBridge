@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
@@ -29,6 +30,17 @@ func dialTestClient(t *testing.T, server *httptest.Server) *websocket.Conn {
 	conn, _, err := websocket.Dial(ctx, server.URL, nil)
 	require.NoError(t, err)
 	return conn
+}
+
+func newTestWebSocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn) {
+	t.Helper()
+
+	server, connChan := setupTestServer(t)
+	t.Cleanup(server.Close)
+
+	clientConn := dialTestClient(t, server)
+	serverConn := <-connChan
+	return clientConn, serverConn
 }
 
 func TestNewHub(t *testing.T) {
@@ -288,6 +300,32 @@ func TestUnpairSession_ReplacementPairSurvivesOldCleanup(t *testing.T) {
 
 	require.NotNil(t, sessionPair)
 	assert.Equal(t, replacementBrowserConn, sessionPair.browserConn)
+}
+
+func TestHubUnregisterCodeClosesPairedBrowser(t *testing.T) {
+	h := New()
+	ctx := context.Background()
+	agentConn, agentServer := newTestWebSocketPair(t)
+	browserConn, browserServer := newTestWebSocketPair(t)
+	defer agentConn.CloseNow()
+	defer agentServer.CloseNow()
+	defer browserConn.CloseNow()
+	defer browserServer.CloseNow()
+
+	h.RegisterAgent("api-key-1", agentConn)
+	h.RegisterCode("IMMICHKEY1", "api-key-1")
+	require.NoError(t, h.PairSession("IMMICHKEY1", browserConn))
+
+	start := time.Now()
+	h.UnregisterCode(ctx, "IMMICHKEY1", "api-key-1", "share has been removed")
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+
+	_, ok := h.GetAgentConn("IMMICHKEY1")
+	require.False(t, ok)
+
+	_, raw, err := browserServer.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "share has been removed")
 }
 
 func TestSendToAgent(t *testing.T) {

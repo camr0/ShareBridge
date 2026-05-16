@@ -26,23 +26,25 @@ import (
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type           string          `json:"type"`
-	AgentID        string          `json:"agent_id,omitempty"`
-	Code           string          `json:"code,omitempty"`
-	ShareURL       string          `json:"share_url,omitempty"` // received for protocol compat, not stored
-	ExpiresAt      *time.Time      `json:"expires_at,omitempty"`
-	SessionID      string          `json:"session_id,omitempty"`
-	SDP            string          `json:"sdp,omitempty"`
-	Candidate      json.RawMessage `json:"candidate,omitempty"`
-	ConnID         string          `json:"conn_id,omitempty"`
-	Value          string          `json:"value,omitempty"`
-	HasPassword    bool            `json:"has_password,omitempty"`
-	RelayOnly      bool            `json:"relay_only,omitempty"`
-	RelayStaticPub string          `json:"relay_static_pub,omitempty"`
+	Type                string          `json:"type"`
+	AgentID             string          `json:"agent_id,omitempty"`
+	Code                string          `json:"code,omitempty"`
+	ShareURL            string          `json:"share_url,omitempty"` // received for protocol compat, not stored
+	ExpiresAt           *time.Time      `json:"expires_at,omitempty"`
+	SessionID           string          `json:"session_id,omitempty"`
+	SDP                 string          `json:"sdp,omitempty"`
+	Candidate           json.RawMessage `json:"candidate,omitempty"`
+	ConnID              string          `json:"conn_id,omitempty"`
+	Value               string          `json:"value,omitempty"`
+	HasPassword         bool            `json:"has_password,omitempty"`
+	RelayOnly           bool            `json:"relay_only,omitempty"`
+	RelayStaticPub      string          `json:"relay_static_pub,omitempty"`
+	ShareType           string          `json:"share_type,omitempty"`
+	IsPasswordProtected bool            `json:"is_password_protected,omitempty"`
 }
 
-// codeRegex matches valid share codes: 8-30 chars, alphanumeric + hyphen + underscore
-var codeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,30}$`)
+var generatedCodeRegex = regexp.MustCompile(`^[a-z0-9]{8}$`)
+var externalCodeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,128}$`)
 
 var errCodeAlreadyInUse = errors.New("code already in use")
 
@@ -102,6 +104,12 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					continue
 				}
 				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg)
+
+			case "unregister_share":
+				if agentID == "" {
+					continue
+				}
+				handleUnregisterShare(ctx, conn, h, app, apiKeyID, msg.Code)
 
 			case "offer":
 				if agentID == "" {
@@ -310,7 +318,7 @@ func handleRegisterShare(
 		// Try to create with collision retry (5 attempts)
 		created := false
 		for i := 0; i < 5; i++ {
-			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub)
+			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub, "", false)
 			if err == nil {
 				created = true
 				break
@@ -337,15 +345,15 @@ func handleRegisterShare(
 		}
 	} else {
 		// Validate custom code format
-		if !codeRegex.MatchString(code) {
+		if !externalCodeRegex.MatchString(code) {
 			hub.SendDirect(ctx, conn, map[string]string{
 				"type":    "error",
-				"message": "invalid code format (8-30 chars, alphanumeric + hyphen + underscore)",
+				"message": "invalid external code format (8-128 chars, alphanumeric + hyphen + underscore)",
 			})
 			return
 		}
 
-		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub)
+		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub, msg.ShareType, msg.IsPasswordProtected)
 		if err != nil {
 			if errors.Is(err, errCodeAlreadyInUse) {
 				hub.SendDirect(ctx, conn, map[string]string{
@@ -406,9 +414,42 @@ func handleRegisterShare(
 	log.Printf("share registered: code=%s api_key_id=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, reconnected)
 }
 
+func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app core.App, apiKeyID, code string) {
+	if code == "" {
+		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "code required"})
+		return
+	}
+	if !externalCodeRegex.MatchString(code) {
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "invalid external code format (8-128 chars, alphanumeric + hyphen + underscore)",
+		})
+		return
+	}
+	session, err := getSessionByCode(app, code)
+	if err != nil {
+		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "database error"})
+		return
+	}
+	if session == nil {
+		hub.SendDirect(ctx, conn, map[string]string{"type": "share_unregistered", "code": code})
+		return
+	}
+	if session.GetString("api_key_id") != apiKeyID {
+		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "session not owned by this api key"})
+		return
+	}
+	if err := app.Delete(session); err != nil {
+		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "database error"})
+		return
+	}
+	h.UnregisterCode(ctx, code, apiKeyID, "share has been removed")
+	hub.SendDirect(ctx, conn, map[string]string{"type": "share_unregistered", "code": code})
+}
+
 // createSession creates a new session record in PocketBase.
 // share_url and max_downloads are intentionally not stored — the server is untrusted.
-func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time, relayOnly bool, relayStaticPub string) error {
+func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time.Time, relayOnly bool, relayStaticPub, shareType string, isPasswordProtected bool) error {
 	col, err := app.FindCollectionByNameOrId("sessions")
 	if err != nil {
 		return err
@@ -420,6 +461,8 @@ func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time
 	record.Set("agent_id", agentID)
 	record.Set("relay_only", relayOnly)
 	record.Set("relay_static_pub", relayStaticPub)
+	record.Set("share_type", shareType)
+	record.Set("is_password_protected", isPasswordProtected)
 
 	if expiresAt != nil {
 		dt, _ := types.ParseDateTime(*expiresAt)
@@ -449,7 +492,7 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 }
 
 // claimSessionCode atomically creates or reassigns a custom code.
-func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly bool, relayStaticPub string) (*core.Record, bool, error) {
+func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly bool, relayStaticPub, shareType string, isPasswordProtected bool) (*core.Record, bool, error) {
 	var claimed *core.Record
 	reconnected := false
 
@@ -473,7 +516,7 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 			if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, relayOnly, relayStaticPub); err != nil {
+			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, relayOnly, relayStaticPub, shareType, isPasswordProtected); err != nil {
 				return err
 			}
 			record, getErr := getSessionByCode(txApp, code)
@@ -497,7 +540,10 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 		}
 		record.Set("api_key_id", apiKeyID)
 		record.Set("agent_id", agentID)
+		record.Set("relay_only", relayOnly)
 		record.Set("relay_static_pub", relayStaticPub)
+		record.Set("share_type", shareType)
+		record.Set("is_password_protected", isPasswordProtected)
 		if expiresAt != nil {
 			dt, _ := types.ParseDateTime(*expiresAt)
 			record.Set("expires_at", dt)

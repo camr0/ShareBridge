@@ -65,6 +65,24 @@ func (h *Hub) RegisterCode(code, apiKey string) {
 	h.codes[code] = apiKey
 }
 
+func (h *Hub) UnregisterCode(ctx context.Context, code, apiKey, reason string) {
+	h.mu.Lock()
+	owner, ok := h.codes[code]
+	if !ok || owner != apiKey {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.codes, code)
+	sessionPair := h.pairs[code]
+	delete(h.pairs, code)
+	h.mu.Unlock()
+
+	if sessionPair != nil && sessionPair.browserConn != nil {
+		send(ctx, h, sessionPair.browserConn, map[string]string{"type": "error", "message": reason})
+		sessionPair.browserConn.CloseNow()
+	}
+}
+
 func (h *Hub) GetAgentConn(code string) (*websocket.Conn, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

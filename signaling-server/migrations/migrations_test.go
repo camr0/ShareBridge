@@ -134,3 +134,23 @@ func TestMigration5_AddSessionRelayStaticPub(t *testing.T) {
 	err = migrations.AddSessionRelayStaticPub(testApp)
 	require.NoError(t, err)
 }
+
+func TestMigration6_AddImmichSessionFields(t *testing.T) {
+	testApp, err := tests.NewTestApp(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { testApp.Cleanup() })
+
+	require.NoError(t, testApp.Bootstrap())
+	require.NoError(t, testApp.RunSystemMigrations())
+	require.NoError(t, migrations.CreateCollections(testApp))
+	require.NoError(t, migrations.AddRelayOnly(testApp))
+	require.NoError(t, migrations.AddSessionRelayStaticPub(testApp))
+	require.NoError(t, migrations.AddImmichSessionFields(testApp))
+
+	sessionsCol, err := testApp.FindCollectionByNameOrId("sessions")
+	require.NoError(t, err)
+	require.NotNil(t, sessionsCol.Fields.GetByName("share_type"))
+	require.NotNil(t, sessionsCol.Fields.GetByName("is_password_protected"))
+
+	require.NoError(t, migrations.AddImmichSessionFields(testApp))
+}

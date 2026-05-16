@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,9 +42,32 @@ func setupAgentTestApp(t *testing.T) (core.App, func()) {
 	require.NoError(t, err)
 	err = migrations.AddSessionRelayStaticPub(testApp)
 	require.NoError(t, err)
+	err = migrations.AddImmichSessionFields(testApp)
+	require.NoError(t, err)
 
 	cleanup := func() { testApp.Cleanup() }
 	return testApp, cleanup
+}
+
+func setupAgentWSTest(t *testing.T) (core.App, string, func()) {
+	t.Helper()
+
+	app, appCleanup := setupAgentTestApp(t)
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+
+	server := httptest.NewServer(mux)
+	cleanup := func() {
+		server.Close()
+		appCleanup()
+	}
+	return app, server.URL, cleanup
 }
 
 func createTestUser(app core.App, email string) (*core.Record, error) {
@@ -93,6 +117,29 @@ func createTestAPIKey(app core.App, userID string, secret string) (*core.Record,
 	return record, nil
 }
 
+func createTestAgentAPIKey(t *testing.T, app core.App) string {
+	t.Helper()
+
+	user, err := createTestUser(app, "agent-"+strings.ToLower(t.Name())+"@example.com")
+	require.NoError(t, err)
+	secret := "agentsecret"
+	apiKey, err := createTestAPIKey(app, user.Id, secret)
+	require.NoError(t, err)
+	return apiKey.Id + "." + secret
+}
+
+func dialAgentAndHello(t *testing.T, serverURL, apiKey, agentID string) *websocket.Conn {
+	t.Helper()
+
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverURL, "http")+"/ws/agent?api_key="+apiKey, nil)
+	require.NoError(t, err)
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(fmt.Sprintf(`{"type":"hello","agent_id":%q}`, agentID))))
+	_, _, err = conn.Read(ctx)
+	require.NoError(t, err)
+	return conn
+}
+
 func createTestSession(app core.App, apiKeyID, agentID, code string) (*core.Record, error) {
 	sessionsCol, err := app.FindCollectionByNameOrId("sessions")
 	if err != nil {
@@ -108,6 +155,14 @@ func createTestSession(app core.App, apiKeyID, agentID, code string) (*core.Reco
 		return nil, err
 	}
 	return record, nil
+}
+
+func findSessionByCode(t *testing.T, app core.App, code string) *core.Record {
+	t.Helper()
+
+	session, err := getSessionByCode(app, code)
+	require.NoError(t, err)
+	return session
 }
 
 func TestAgentWS_HelloFlow(t *testing.T) {
@@ -272,6 +327,134 @@ func TestAgentWS_RegisterShare_PersistsRelayStaticPub(t *testing.T) {
 	session, err := getSessionByCode(app, "RELAYKEY1")
 	require.NoError(t, err)
 	require.Equal(t, "04abcd", session.GetString("relay_static_pub"))
+}
+
+func TestAgentWS_RegisterShare_AcceptsImmichExternalCodeMetadata(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, testApp)
+	wsURL := strings.Replace(serverURL, "http://", "ws://", 1) + "/ws/agent?api_key=" + apiKey
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	defer conn.CloseNow()
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-immich"}`)))
+	_, _, err = conn.Read(ctx)
+	require.NoError(t, err)
+
+	code := "ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ-1234567890"
+	payload := fmt.Sprintf(`{"type":"register_share","code":%q,"share_type":"immich","is_password_protected":true,"relay_only":true,"relay_static_pub":"04abcd"}`, code)
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(payload)))
+
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"share_registered"`)
+	require.Contains(t, string(raw), code)
+
+	session := findSessionByCode(t, testApp, code)
+	require.Equal(t, "immich", session.GetString("share_type"))
+	require.True(t, session.GetBool("is_password_protected"))
+	require.True(t, session.GetBool("relay_only"))
+}
+
+func TestAgentWS_RegisterShare_RejectsExternalCodeOver128Chars(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, testApp)
+	wsURL := strings.Replace(serverURL, "http://", "ws://", 1) + "/ws/agent?api_key=" + apiKey
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(t, err)
+	defer conn.CloseNow()
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-immich"}`)))
+	_, _, err = conn.Read(ctx)
+	require.NoError(t, err)
+
+	code := strings.Repeat("a", 129)
+	payload := fmt.Sprintf(`{"type":"register_share","code":%q,"share_type":"immich"}`, code)
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(payload)))
+
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"error"`)
+	require.Contains(t, string(raw), "invalid external code format")
+}
+
+func TestAgentWS_UnregisterShareDeletesOwnedSession(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, testApp)
+	conn := dialAgentAndHello(t, serverURL, apiKey, "agent-unregister")
+	defer conn.CloseNow()
+
+	ctx := context.Background()
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"IMMICHDEL1","share_type":"immich"}`)))
+	_, _, err := conn.Read(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"unregister_share","code":"IMMICHDEL1"}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"share_unregistered"`)
+
+	session := findSessionByCode(t, testApp, "IMMICHDEL1")
+	require.Nil(t, session)
+}
+
+func TestAgentWS_UnregisterShareRejectsInvalidCodeFormat(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, testApp)
+	conn := dialAgentAndHello(t, serverURL, apiKey, "agent-unregister-invalid")
+	defer conn.CloseNow()
+
+	ctx := context.Background()
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"unregister_share","code":"bad space!"}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"error"`)
+	require.Contains(t, string(raw), "invalid external code format")
+}
+
+func TestAgentWS_UnregisterShareRejectsDifferentAPIKeyOwner(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	owner, err := createTestUser(testApp, "unregister-owner@example.com")
+	require.NoError(t, err)
+	ownerAPIKey, err := createTestAPIKey(testApp, owner.Id, "ownersecret")
+	require.NoError(t, err)
+	ownerKey := ownerAPIKey.Id + ".ownersecret"
+	ownerConn := dialAgentAndHello(t, serverURL, ownerKey, "agent-owner")
+	defer ownerConn.CloseNow()
+
+	ctx := context.Background()
+	require.NoError(t, ownerConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"IMMICHOWN1","share_type":"immich"}`)))
+	_, _, err = ownerConn.Read(ctx)
+	require.NoError(t, err)
+
+	other, err := createTestUser(testApp, "unregister-other@example.com")
+	require.NoError(t, err)
+	otherAPIKey, err := createTestAPIKey(testApp, other.Id, "othersecret")
+	require.NoError(t, err)
+	otherKey := otherAPIKey.Id + ".othersecret"
+	otherConn := dialAgentAndHello(t, serverURL, otherKey, "agent-other")
+	defer otherConn.CloseNow()
+
+	require.NoError(t, otherConn.Write(ctx, websocket.MessageText, []byte(`{"type":"unregister_share","code":"IMMICHOWN1"}`)))
+	_, raw, err := otherConn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"error"`)
+	require.Contains(t, string(raw), "session not owned by this api key")
+
+	session := findSessionByCode(t, testApp, "IMMICHOWN1")
+	require.NotNil(t, session)
 }
 
 func TestAgentWS_AuthOK_SendsRelayPrepareToAgentAndRelayPolicyToBrowser(t *testing.T) {
