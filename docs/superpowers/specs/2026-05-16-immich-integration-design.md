@@ -23,7 +23,7 @@ Immich (LAN) ←→ Agent (LAN) ←→ Signaling Server (public) ←→ Recipien
 
 ## Agent: Immich API Client
 
-New package `agent/internal/immich/` implementing the `openCloudClient` interface:
+New package `agent/internal/immich/` implementing the `StorageBackend` interface (renamed from `openCloudClient` to reflect multi-backend support):
 
 ```go
 type Client struct {
@@ -42,18 +42,44 @@ type Client struct {
 | `GetFile` | `GET /api/assets/{id}/original?key={key}` | share key |
 | `PollShares` | `GET /shared-links` | API key (sharedLink.read) |
 
-**Password handling**: Unlike OC/NC (where the agent owns the password and verifies it via HMAC pre-challenge), the Immich agent is a blind relay. It does not know the password — Immich stores it as a hash. When a recipient submits a password, the agent forwards it to the Immich API as an `X-Immich-Shared-Link-Password` header. Immich's own auth gates the share and returns accept/reject. The agent sees only the yes/no result.
+**Password handling**: Immich uses a different auth model than OC/NC — there is no HMAC pre-challenge. The agent cannot verify passwords locally because Immich stores them as a hash. Instead:
 
-This is a slight regression from the OC/NC HMAC model: the raw password transits through the signaling server on join. In practice the HMAC model itself assumes a trusted signaling server serving untampered JS (a malicious server can swap the JS to capture the password before it is ever HMAC'd), so the real security boundary is that the signaling server has no LAN or Immich access. The password alone is useless without network access to Immich.
+1. Share info (fetched during session registration) includes `isPasswordProtected: true`
+2. Recipient visits `/i/KEY` → signaling server responds with `{"type": "password_required"}`
+3. Browser prompts for password, sends `{"type": "password_submit", "password": "..."}` over the signaling WebSocket
+4. Signaling server relays to agent (password transits the signaling server)
+5. Agent calls `GET /api/shared-links/my-share?key={key}` with `X-Immich-Shared-Link-Password` header
+6. Immich accepts/rejects → agent tells signaling server `auth_ok` or `auth_fail`
+7. On success: agent creates WebRTC peer. On failure: no peer created
 
-## Protocol Changes
+The agent never knows the password — it sees only Immich's yes/no response. The raw password transits the signaling server, but this is acceptable: the signaling server has no Immich or LAN access, and a malicious signaling server can already swap the browser JS to capture passwords (the HMAC model assumes a trusted server serving untampered JS). This provides the same resource-exhaustion protection as HMAC (no peer created before auth) via a different mechanism (Immich API validation instead of local HMAC verify).
 
-Three new DataChannel message types:
+## Signaling Protocol Changes
+
+### Password Auth (Immich-specific, replaces HMAC pre-challenge)
+
+**`password_required`** (server → browser, JSON)
+```json
+{"type": "password_required"}
+```
+Sent when the session is password-protected and the browser must submit a password before the agent creates a peer.
+
+**`password_submit`** (browser → server → agent, JSON)
+```json
+{"type": "password_submit", "code": "ffSw63qn...", "password": "hunter2"}
+```
+Browser sends password over signaling WebSocket. Server relays to agent. Agent tests against Immich API. On success: `auth_ok` + peer creation. On failure: `auth_fail`, no peer created.
+
+## DataChannel Protocol Changes
+
+Four new DataChannel message types:
 
 ### `thumbnail_list` (agent → browser, JSON)
 ```json
 {
   "type": "thumbnail_list",
+  "albumName": "Summer Vacation 2025",
+  "albumDescription": "Beach trip photos",
   "items": [
     {
       "id": "abc123",
@@ -67,6 +93,7 @@ Three new DataChannel message types:
   ]
 }
 ```
+`albumName` and `albumDescription` come from the Immich share info response. `albumDescription` may be empty.
 
 ### `thumbnail_data` (agent → browser, binary)
 2-byte asset index (into thumbnail_list array) + JPEG bytes. One per asset.
@@ -106,10 +133,12 @@ Immich shares use the same session infrastructure as OC/NC. No separate routing 
 ### Agent: Auto-Registration
 
 - Every 30s: poll `GET /shared-links` → get active share keys
-- For each **new** key not yet registered: send `registershare` to signaling server with the Immich key as the code
+- For each **new** key not yet registered: send `registershare` with `"code": "ffSw63qn..."` — the server uses the provided code instead of generating one
 - For each **removed** key (share expired/deleted in Immich): send `unregistershare`
 - On agent startup: poll immediately, register all current keys
 - On agent reconnect: same flow as OC/NC — re-register all persisted sessions (including Immich)
+
+**External code protocol note:** The existing `register_share` message gains an optional `code` field. When present and non-empty, the signaling server skips code generation and uses the provided value. The server still validates uniqueness — if the Immich key collides with an existing code (vanishingly unlikely), it returns an error and the agent skips that share. Immich keys are long random strings with sufficient entropy to share the same namespace as 8-char server-generated codes.
 
 The signaling server stores Immich shares in the same sessions table. The code column holds the Immich key. All existing session infrastructure works unchanged: persistence, bandwidth tracking, download counting, expiry, reclaim on reconnect.
 
@@ -120,6 +149,8 @@ The signaling server stores Immich shares in the same sessions table. The code c
 - No separate capability map — the sessions table IS the source of truth
 
 A newly-created Immich share may not appear for up to 30 seconds (until the next poll). Acceptable.
+
+**Share deletion during active transfer:** If the 30s poll detects a key removal (share deleted/expired in Immich) while a recipient has an active download, the agent terminates the transfer with an `{"type": "error", "message": "share has been removed"}` message and closes the peer connection.
 
 ### Immich API Paths (verify during implementation)
 
@@ -181,14 +212,16 @@ No new API endpoints needed.
 - `signaling-server/web/src/gallery.js` — gallery grid + lightGallery.js init
 
 **Modified:**
+- `agent/internal/transfer/manager.go` — rename `openCloudClient` to `StorageBackend`, add thumbnail pass
+- `agent/internal/cloudwebdav/client.go` — rename interface name in doc comment
 - `agent/internal/daemon/daemon.go` — accept "immich" share_type, construct ImmichClient
 - `agent/internal/web/api_v1.go` — validate "immich"
 - `agent/internal/web/api.go` — validate "immich"
 - `agent/internal/config/config.go` — add ImmichURL, ImmichAllowedHost, ImmichAPIKey
-- `agent/internal/transfer/manager.go` — thumbnail pass before serving file list
+- `agent/internal/signaling/client.go` — accept optional code in `RegisterShare`
 - `signaling-server/web/src/app.js` — detect `/i/` path, route to gallery mode
 - `signaling-server/web/src/messages.js` — handle thumbnail_list, thumbnail_data, asset_request
-- Signaling server: `/i/` route handler, `registershare`/`unregistershare` for external codes
+- Signaling server: `/i/` route handler, accept external codes in `register_share`
 
 **Dependency added:**
 - `lightGallery.js` (npm, ~50KB gzipped)
