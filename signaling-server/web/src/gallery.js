@@ -1,10 +1,11 @@
 export function createGalleryController({
   root,
+  lightGallery = globalThis.lightGallery,
   createObjectURL = URL.createObjectURL,
   revokeObjectURL = URL.revokeObjectURL,
   sendAssetRequest,
 }) {
-  const state = { items: [], thumbs: new Map(), urls: new Map() }
+  const state = { items: [], thumbs: new Map(), urls: new Map(), lightbox: null }
 
   const handleClick = (event) => {
     const item = event.target?.closest?.('[data-gallery-id]')
@@ -14,10 +15,12 @@ export function createGalleryController({
   root.addEventListener?.('click', handleClick)
 
   function handleThumbnailList(msg) {
+    destroyLightbox()
     revokeAllUrls()
     state.items = msg.items || []
     state.thumbs.clear()
     root.innerHTML = renderGalleryShell(msg.albumName || 'Shared album', msg.albumDescription || '', state.items)
+    initLightbox()
   }
 
   function handleThumbnailData(index, payload) {
@@ -30,6 +33,12 @@ export function createGalleryController({
     state.urls.set(item.id, url)
     const img = root.querySelector?.(`[data-thumb-id="${cssEscape(item.id)}"]`)
     if (img) img.src = url
+    const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(item.id)}"]`)
+    if (galleryItem?.dataset) {
+      galleryItem.dataset.src = url
+      galleryItem.dataset.downloadUrl = url
+      state.lightbox?.refresh?.()
+    }
   }
 
   function openItem(id) {
@@ -38,7 +47,20 @@ export function createGalleryController({
 
   function destroy() {
     root.removeEventListener?.('click', handleClick)
+    destroyLightbox()
     revokeAllUrls()
+  }
+
+  function initLightbox() {
+    if (!lightGallery || !root.querySelector) return
+    const grid = root.querySelector('.gallery-grid')
+    if (!grid) return
+    state.lightbox = lightGallery(grid, { selector: '.gallery-item', download: true })
+  }
+
+  function destroyLightbox() {
+    state.lightbox?.destroy?.()
+    state.lightbox = null
   }
 
   function revokeAllUrls() {
@@ -65,12 +87,14 @@ export function renderGalleryShell(albumName, albumDescription, items) {
   `
 }
 
+const LIGHTBOX_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='
+
 function renderItem(item) {
   const name = item.name || 'Untitled asset'
   const isVideo = item.mimeType?.startsWith('video/')
   const duration = isVideo ? formatDuration(item.duration) : ''
   return `
-    <button class="gallery-item" type="button" data-gallery-id="${escapeHTML(item.id)}" aria-label="Open ${escapeHTML(name)}">
+    <button class="gallery-item" type="button" data-gallery-id="${escapeHTML(item.id)}" data-src="${LIGHTBOX_PLACEHOLDER_SRC}" data-download-url="${LIGHTBOX_PLACEHOLDER_SRC}" aria-label="Open ${escapeHTML(name)}">
       <img data-thumb-id="${escapeHTML(item.id)}" alt="${escapeHTML(name)}">
       ${duration ? `<span class="gallery-duration">${escapeHTML(duration)}</span>` : ''}
     </button>

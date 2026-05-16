@@ -4,5 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test src/*.test.js"
+  },
+  "devDependencies": {
+    "lightgallery": "2.9.0"
   }
 }

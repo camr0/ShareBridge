@@ -45,6 +45,98 @@ test('gallery sends asset_request when an item is opened', () => {
   assert.deepEqual(sent, ['asset-1'])
 })
 
+test('gallery renders lightGallery source attributes on items', () => {
+  const root = fakeRoot()
+  const controller = createGalleryController({
+    root,
+    createObjectURL: () => 'blob:thumb',
+    revokeObjectURL: () => {},
+    sendAssetRequest: () => {},
+  })
+
+  controller.handleThumbnailList({
+    albumName: 'Summer',
+    items: [{ id: 'asset-1', name: 'photo.jpg', mimeType: 'image/jpeg' }],
+  })
+
+  assert.match(root.innerHTML, /data-src="data:image\/gif;base64,/)
+  assert.match(root.innerHTML, /data-download-url="data:image\/gif;base64,/)
+})
+
+test('gallery updates lightGallery source attributes when thumbnail data arrives', () => {
+  const root = fakeRoot()
+  const itemNode = { dataset: {} }
+  const imgNode = { src: '' }
+  let refreshed = false
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return {}
+    if (selector === '[data-gallery-id="asset-1"]') return itemNode
+    if (selector === '[data-thumb-id="asset-1"]') return imgNode
+    return null
+  }
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ refresh: () => { refreshed = true }, destroy() {} }),
+    createObjectURL: () => 'blob:thumb',
+    revokeObjectURL: () => {},
+    sendAssetRequest: () => {},
+  })
+
+  controller.handleThumbnailList({
+    albumName: 'Summer',
+    items: [{ id: 'asset-1', name: 'photo.jpg', mimeType: 'image/jpeg' }],
+  })
+  controller.handleThumbnailData(0, new Uint8Array([1]))
+
+  assert.equal(imgNode.src, 'blob:thumb')
+  assert.equal(itemNode.dataset.src, 'blob:thumb')
+  assert.equal(itemNode.dataset.downloadUrl, 'blob:thumb')
+  assert.equal(refreshed, true)
+})
+
+test('gallery initializes lightGallery when available', () => {
+  let initialized = false
+  const root = fakeRoot()
+  root.querySelector = () => ({})
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => {
+      initialized = true
+      return { destroy() {} }
+    },
+    createObjectURL: () => 'blob:thumb',
+    revokeObjectURL: () => {},
+    sendAssetRequest: () => {},
+  })
+
+  controller.handleThumbnailList({ albumName: 'Summer', items: [] })
+
+  assert.equal(initialized, true)
+})
+
+test('gallery destroys lightGallery before rerendering and destroying', () => {
+  const destroyed = []
+  let nextLightbox = 1
+  const root = fakeRoot()
+  root.querySelector = () => ({})
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => {
+      const id = nextLightbox++
+      return { destroy: () => destroyed.push(id) }
+    },
+    createObjectURL: () => 'blob:thumb',
+    revokeObjectURL: () => {},
+    sendAssetRequest: () => {},
+  })
+
+  controller.handleThumbnailList({ albumName: 'Summer', items: [] })
+  controller.handleThumbnailList({ albumName: 'Winter', items: [] })
+  controller.destroy()
+
+  assert.deepEqual(destroyed, [1, 2])
+})
+
 test('gallery revokes a previous thumbnail URL when replacing it', () => {
   const revoked = []
   const controller = createGalleryController({
