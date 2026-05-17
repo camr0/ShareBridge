@@ -50,7 +50,7 @@ func (ws *WebServer) listSharesHandler(w http.ResponseWriter, r *http.Request) {
 		data := sessionData{
 			Code:               session.Code,
 			ShareURL:           session.ShareURL,
-			PublicURL:          derivePublicURL(signalingURL, session.Code),
+			PublicURL:          derivePublicURL(signalingURL, session.Code, session.ShareType),
 			Downloads:          session.Downloads,
 			MaxDownloads:       session.MaxDownloads,
 			RelayOnly:          session.RelayOnly,
@@ -153,7 +153,7 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 	data := sessionData{
 		Code:               session.Code,
 		ShareURL:           session.ShareURL,
-		PublicURL:          derivePublicURL(signalingURL, session.Code),
+		PublicURL:          derivePublicURL(signalingURL, session.Code, session.ShareType),
 		Downloads:          session.Downloads,
 		MaxDownloads:       session.MaxDownloads,
 		RelayOnly:          session.RelayOnly,

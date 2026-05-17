@@ -10,14 +10,14 @@ import (
 
 // pageData holds data passed to page templates.
 type pageData struct {
-	Title       string
-	ActivePage  string
-	Version     string
-	Uptime      string
-	GoVersion   string
-	ConfigPath  string
-	Config      configData
-	EnvManaged  envManagedData
+	Title      string
+	ActivePage string
+	Version    string
+	Uptime     string
+	GoVersion  string
+	ConfigPath string
+	Config     configData
+	EnvManaged envManagedData
 }
 
 // configData holds configuration data for templates.
@@ -34,20 +34,20 @@ type configData struct {
 }
 
 type envManagedData struct {
-	SignalingURL   string
-	APIKey         string
-	AllowedHost    string
-	NCAllowedHost  string
+	SignalingURL  string
+	APIKey        string
+	AllowedHost   string
+	NCAllowedHost string
 }
 
 // sessionData holds session data for templates.
 type sessionData struct {
-	Code              string
-	ShareURL          string
-	PublicURL         string // Derived from signaling URL: https://host/s/:code
-	Downloads         int
-	MaxDownloads      int
-	RelayOnly         bool
+	Code               string
+	ShareURL           string
+	PublicURL          string // Derived from signaling URL: https://host/s/:code
+	Downloads          int
+	MaxDownloads       int
+	RelayOnly          bool
 	ExpiresAtFormatted string
 }
 
@@ -180,7 +180,7 @@ func formatUptime(start time.Time) string {
 
 // derivePublicURL converts a signaling WebSocket URL to a public share URL.
 // e.g., "wss://signal.example.com/ws" -> "https://signal.example.com/s/:code"
-func derivePublicURL(signalingURL, code string) string {
+func derivePublicURL(signalingURL, code, shareType string) string {
 	// Handle common WebSocket URL patterns
 	url := signalingURL
 
@@ -198,6 +198,8 @@ func derivePublicURL(signalingURL, code string) string {
 		url = url[:len(url)-1]
 	}
 
-	// Build the public share URL
+	if shareType == "immich" {
+		return url + "/i/" + code
+	}
 	return url + "/s/" + code
 }

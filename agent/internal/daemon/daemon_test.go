@@ -433,7 +433,7 @@ func TestCreateSessionManualImmichRegistersRelayOnlyShare(t *testing.T) {
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
-			{Key: "IMMICHMANUAL1", Password: "********"},
+			{Key: "IMMICHMANUAL1", Type: "ALBUM", Password: "********"},
 		}}, nil
 	}
 
@@ -1369,7 +1369,7 @@ func TestSyncImmichSharesRegistersNewAndUnregistersRemoved(t *testing.T) {
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
-			{Key: "IMMICHNEW1", Password: "********"},
+			{Key: "IMMICHNEW1", Type: "ALBUM", Password: "********"},
 		}}, nil
 	}
 	d.sessions["IMMICHOLD1"] = &Session{Code: "IMMICHOLD1", ShareType: "immich", RelayOnly: true}
@@ -1378,6 +1378,26 @@ func TestSyncImmichSharesRegistersNewAndUnregistersRemoved(t *testing.T) {
 
 	require.True(t, sig.registeredCode("IMMICHNEW1"))
 	require.True(t, sig.unregisteredCode("IMMICHOLD1"))
+}
+
+func TestSyncImmichSharesIgnoresIndividualSharedLinks(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{
+			{Key: "IMMICHINDIVIDUAL1", Type: "INDIVIDUAL"},
+			{Key: "IMMICHALBUM1", Type: "ALBUM"},
+		}}, nil
+	}
+
+	require.NoError(t, d.syncImmichShares(context.Background()))
+
+	require.False(t, sig.registeredCode("IMMICHINDIVIDUAL1"))
+	require.Nil(t, d.GetSession("IMMICHINDIVIDUAL1"))
+	require.True(t, sig.registeredCode("IMMICHALBUM1"))
+	require.NotNil(t, d.GetSession("IMMICHALBUM1"))
 }
 
 func TestSyncImmichSharesRemovedShareNotifiesRelayChannelBeforeClose(t *testing.T) {
@@ -1466,7 +1486,7 @@ func TestSyncImmichSharesRollsBackSignalingRegistrationOnStoreSaveFailure(t *tes
 	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
-		return &fakeImmichPoller{shares: []immich.SharedLink{{Key: "IMMICHROLLBACK1"}}}, nil
+		return &fakeImmichPoller{shares: []immich.SharedLink{{Key: "IMMICHROLLBACK1", Type: "ALBUM"}}}, nil
 	}
 	d.store.(*mockStore).saveError = errors.New("save failed")
 
@@ -1485,7 +1505,7 @@ func TestSyncImmichSharesWiresClientForNewSession(t *testing.T) {
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
-			{Key: "IMMICHCLIENT1", Password: "********"},
+			{Key: "IMMICHCLIENT1", Type: "ALBUM", Password: "********"},
 		}}, nil
 	}
 

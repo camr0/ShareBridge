@@ -1199,6 +1199,9 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 		if link.Key == "" {
 			continue
 		}
+		if !strings.EqualFold(link.Type, "ALBUM") {
+			continue
+		}
 		seen[link.Key] = link
 
 		d.mu.RLock()

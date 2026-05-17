@@ -72,7 +72,7 @@ func (ws *WebServer) v1ListSharesHandler(w http.ResponseWriter, r *http.Request)
 		}
 		shares = append(shares, v1ShareResponse{
 			Code:         session.Code,
-			PublicURL:    derivePublicURL(cfg.SignalingURL, session.Code),
+			PublicURL:    derivePublicURL(cfg.SignalingURL, session.Code, session.ShareType),
 			ShareURL:     session.ShareURL,
 			FileID:       session.FileID,
 			Downloads:    session.Downloads,
@@ -143,7 +143,7 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 
 	writeJSON(w, http.StatusCreated, v1CreateShareResponse{
 		Code:      session.Code,
-		PublicURL: derivePublicURL(ws.daemon.GetConfig().SignalingURL, session.Code),
+		PublicURL: derivePublicURL(ws.daemon.GetConfig().SignalingURL, session.Code, session.ShareType),
 		ExpiresAt: session.ExpiresAt,
 	})
 }
