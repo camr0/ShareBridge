@@ -352,6 +352,7 @@ func (m *Manager) handleFileRequest(filePath string) {
 }
 
 func (m *Manager) handleAssetRequest(id string, quality string) {
+	log.Printf("transfer: asset_request id=%s quality=%s", id, quality)
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
 		m.sendError("share has reached its download limit")
 		if m.OnSessionExpired != nil {
