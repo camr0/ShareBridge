@@ -875,8 +875,12 @@ async function startDownload(header) {
         receivedBytes = 0
         receivedChunkCount = 0
         transferStartTime = 0
+        prePipelineChunks.length = 0
       },
     })
+    while (prePipelineChunks.length) {
+      await activeDownload.append(prePipelineChunks.shift())
+    }
   } catch (err) {
     debugLog('download initialization failed', {
       file: header.name,
@@ -899,8 +903,17 @@ async function startDownload(header) {
   }
 }
 
+const prePipelineChunks = []
+
 async function appendChunk(bytes) {
-  if (!activeDownload || !currentFile) return
+  if (!currentFile) return
+  if (!activeDownload) {
+    prePipelineChunks.push(bytes)
+    return
+  }
+  while (prePipelineChunks.length) {
+    await activeDownload.append(prePipelineChunks.shift())
+  }
   await activeDownload.append(bytes)
 }
 
