@@ -69,6 +69,11 @@ func main() {
 		// Public session info endpoint
 		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
 
+		// Redirect /share/{code} to the canonical path based on share type.
+		// Immich creates share links with /share/ prefix — this catches those
+		// and redirects to /i/{key} for Immich or /s/{code} for regular shares.
+		router.GET("/share/{code}", serveShareRedirect(app))
+
 		// Direct link route - serves file client; JS reads code from window.location
 		router.GET("/s/{code}", handler.ServeFileNoCache("./web/index.html"))
 		router.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
@@ -178,4 +183,27 @@ func deleteExpiredSessions(app core.App) error {
 	}
 
 	return nil
+}
+
+// serveShareRedirect looks up a share code and redirects to the canonical
+// path: /i/{key} for Immich album shares, /s/{code} for everything else.
+func serveShareRedirect(app core.App) func(*core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		code := e.Request.PathValue("code")
+		if code == "" {
+			return e.NotFoundError("session not found", nil)
+		}
+		records, err := app.FindRecordsByFilter(
+			"sessions", "code = {:code}", "", 1, 0,
+			map[string]any{"code": code},
+		)
+		if err != nil || len(records) == 0 {
+			return e.NotFoundError("session not found", nil)
+		}
+		shareType := records[0].GetString("share_type")
+		if shareType == "immich" {
+			return e.Redirect(http.StatusFound, "/i/"+code)
+		}
+		return e.Redirect(http.StatusFound, "/s/"+code)
+	}
 }
