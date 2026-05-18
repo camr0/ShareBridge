@@ -103,7 +103,7 @@ func (a immichTransferAdapter) GetAssetInfo(ctx context.Context, id string) (str
 	if err != nil {
 		return "", 0, "", err
 	}
-	return asset.OriginalFileName, asset.FileSizeInByte, asset.OriginalMimeType, nil
+	return asset.OriginalFileName, asset.FileSize(), asset.OriginalMimeType, nil
 }
 
 func (a immichTransferAdapter) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {

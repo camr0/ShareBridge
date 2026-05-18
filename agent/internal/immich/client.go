@@ -51,7 +51,6 @@ type Asset struct {
 	ID               string    `json:"id"`
 	OriginalFileName string    `json:"originalFileName"`
 	OriginalMimeType string    `json:"originalMimeType"`
-	FileSizeInByte   int64     `json:"fileSizeInByte"`
 	Type             string    `json:"type"`
 	Duration         string    `json:"duration"`
 	Checksum         string    `json:"checksum"`
@@ -59,8 +58,16 @@ type Asset struct {
 }
 
 type ExifInfo struct {
-	ExifImageWidth  int `json:"exifImageWidth"`
-	ExifImageHeight int `json:"exifImageHeight"`
+	ExifImageWidth  int   `json:"exifImageWidth"`
+	ExifImageHeight int   `json:"exifImageHeight"`
+	FileSizeInByte  int64 `json:"fileSizeInByte"`
+}
+
+func (a Asset) FileSize() int64 {
+	if a.ExifInfo != nil {
+		return a.ExifInfo.FileSizeInByte
+	}
+	return 0
 }
 
 func (s SharedLink) IsPasswordProtected() bool {
@@ -253,7 +260,7 @@ func galleryItemFromAsset(asset Asset) GalleryItem {
 		ID:       asset.ID,
 		Name:     asset.OriginalFileName,
 		MimeType: asset.OriginalMimeType,
-		Size:     asset.FileSizeInByte,
+		Size:     asset.FileSize(),
 		Duration: parseDurationSeconds(asset.Duration),
 		SHA1:     decodeBase64SHA1(asset.Checksum),
 	}

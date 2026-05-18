@@ -171,11 +171,12 @@ func TestListGalleryConvertsImmichAssetsToGalleryItems(t *testing.T) {
 			Album: &Album{Name: "Summer", Description: "Beach"},
 			Assets: []Asset{{
 				ID: "asset-1", OriginalFileName: "photo.jpg", OriginalMimeType: "image/jpeg",
-				FileSizeInByte: 1234, Type: "IMAGE", Checksum: base64.StdEncoding.EncodeToString(sha),
-				ExifInfo: &ExifInfo{ExifImageWidth: 4000, ExifImageHeight: 3000},
+				Type: "IMAGE", Checksum: base64.StdEncoding.EncodeToString(sha),
+				ExifInfo: &ExifInfo{ExifImageWidth: 4000, ExifImageHeight: 3000, FileSizeInByte: 1234},
 			}, {
 				ID: "asset-2", OriginalFileName: "clip.mp4", OriginalMimeType: "video/mp4",
-				FileSizeInByte: 4567, Type: "VIDEO", Duration: "00:01:34.500",
+				Type: "VIDEO", Duration: "00:01:34.500",
+				ExifInfo: &ExifInfo{FileSizeInByte: 4567},
 			}},
 		})
 	}))
@@ -205,7 +206,7 @@ func TestListGalleryFallsBackToAlbumAPIWhenInlineAssetsEmpty(t *testing.T) {
 		case 2:
 			require.Equal(t, "/api/albums/album-1", r.URL.Path)
 			require.Equal(t, "sharekey", r.URL.Query().Get("key"))
-			_, _ = w.Write([]byte(`{"id":"album-1","assets":[{"id":"asset-1","originalFileName":"photo.jpg","originalMimeType":"image/jpeg","type":"IMAGE","fileSizeInByte":1234}]}`))
+			_, _ = w.Write([]byte(`{"id":"album-1","assets":[{"id":"asset-1","originalFileName":"photo.jpg","originalMimeType":"image/jpeg","type":"IMAGE","exifInfo":{"fileSizeInByte":1234}}]}`))
 		default:
 			t.Fatalf("unexpected request %d", requestCount)
 		}
