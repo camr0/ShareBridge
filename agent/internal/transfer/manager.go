@@ -419,12 +419,19 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 		BinaryEnvelope: true,
 	}
 	headerData, _ := json.Marshal(header)
+	log.Printf("transfer: sending file_header name=%s size=%d", asset.Name, asset.Size)
 	if err := m.dc.SendText(string(headerData)); err != nil {
+		log.Printf("transfer: file_header send failed: %v", err)
 		m.releaseTransfer()
 		return
 	}
+	log.Printf("transfer: file_header sent, starting stream goroutine id=%s", id)
 
-	go m.streamAsset(id, quality)
+	go func() {
+		log.Printf("transfer: streamAsset goroutine started id=%s quality=%s", id, quality)
+		m.streamAsset(id, quality)
+		log.Printf("transfer: streamAsset goroutine finished id=%s", id)
+	}()
 }
 
 func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
@@ -518,12 +525,14 @@ func (m *Manager) streamFile(filePath string) {
 
 func (m *Manager) streamAsset(id string, quality string) {
 	defer func() { m.transfer.Store(false) }()
+	log.Printf("transfer: streamAsset start id=%s quality=%s", id, quality)
 
 	pr, pw := io.Pipe()
 	defer pr.Close()
 
 	go func() {
 		var err error
+		log.Printf("transfer: streamAsset calling GetAsset id=%s quality=%s", id, quality)
 		if quality == "thumbnail" {
 			_, err = m.gallery.GetThumbnail(context.Background(), id, pw)
 		} else {
