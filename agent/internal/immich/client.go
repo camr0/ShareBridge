@@ -276,6 +276,23 @@ func (c *Client) GetPreview(ctx context.Context, id string, w io.Writer) (int64,
 	return c.getAsset(ctx, u.String(), w)
 }
 
+func (c *Client) GetAssetInfo(ctx context.Context, id string) (Asset, error) {
+	u := c.baseURL.ResolveReference(&url.URL{
+		Path:    "/api/assets/" + id,
+		RawPath: "/api/assets/" + url.PathEscape(id),
+	})
+	c.addSharedLinkParams(u)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return Asset{}, err
+	}
+	var asset Asset
+	if err := c.doJSON(req, &asset); err != nil {
+		return Asset{}, err
+	}
+	return asset, nil
+}
+
 func (c *Client) GetFile(ctx context.Context, id string, w io.Writer) (int64, error) {
 	return c.getAsset(ctx, c.assetURL(id, "/original"), w)
 }

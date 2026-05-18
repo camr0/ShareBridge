@@ -46,6 +46,7 @@ type GalleryBackend interface {
 	ListGallery(ctx context.Context) (Gallery, error)
 	GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error)
 	GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error)
+	GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) // name, size, mimeType
 }
 
 type Gallery struct {
@@ -382,24 +383,11 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 		return
 	}
 
-	gallery, err := m.gallery.ListGallery(context.Background())
+	assetName, assetSize, assetMimeType, err := m.gallery.GetAssetInfo(context.Background(), id)
 	if err != nil {
 		m.releaseTransfer()
-		m.sendError("share unavailable: " + err.Error())
-		return
-	}
-
-	var asset *GalleryItem
-	for _, item := range gallery.Items {
-		if item.ID == id {
-			found := item
-			asset = &found
-			break
-		}
-	}
-	if asset == nil {
-		m.releaseTransfer()
-		m.sendError("asset not found: " + id)
+		m.sendError("asset info unavailable: " + err.Error())
+		log.Printf("transfer: GetAssetInfo failed id=%s: %v", id, err)
 		return
 	}
 
@@ -412,14 +400,14 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 		BinaryEnvelope bool   `json:"binary_envelope"`
 	}{
 		Type:           "file_header",
-		Name:           asset.Name,
-		Size:           asset.Size,
-		MimeType:       asset.MimeType,
-		SHA1:           asset.SHA1,
+		Name:           assetName,
+		Size:           assetSize,
+		MimeType:       assetMimeType,
+		SHA1:           "",
 		BinaryEnvelope: true,
 	}
 	headerData, _ := json.Marshal(header)
-	log.Printf("transfer: sending file_header name=%s size=%d", asset.Name, asset.Size)
+	log.Printf("transfer: sending file_header name=%s size=%d", assetName, assetSize)
 	if err := m.dc.SendText(string(headerData)); err != nil {
 		log.Printf("transfer: file_header send failed: %v", err)
 		m.releaseTransfer()

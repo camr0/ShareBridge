@@ -3,6 +3,7 @@ package transfer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -168,6 +169,15 @@ func (m *mockGalleryClient) GetThumbnail(ctx context.Context, id string, w io.Wr
 	return int64(n), err
 }
 
+func (m *mockGalleryClient) GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) {
+	for _, item := range m.gallery.Items {
+		if item.ID == id {
+			return item.Name, item.Size, item.MimeType, nil
+		}
+	}
+	return "", 0, "", fmt.Errorf("asset %s not found", id)
+}
+
 func (m *mockGalleryClient) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
 	m.assetQuality = quality
 	n, err := w.Write(m.file)
@@ -191,6 +201,19 @@ func (m *blockingGalleryClient) ListGallery(ctx context.Context) (Gallery, error
 	return m.gallery, nil
 }
 
+func (m *blockingGalleryClient) GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) {
+	if m.listCalls.Add(1) == 1 {
+		close(m.listStarted)
+	}
+	<-m.releaseList
+	for _, item := range m.gallery.Items {
+		if item.ID == id {
+			return item.Name, item.Size, item.MimeType, nil
+		}
+	}
+	return "", 0, "", fmt.Errorf("asset %s not found", id)
+}
+
 func (m *blockingGalleryClient) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
 	return 0, nil
 }
@@ -208,6 +231,10 @@ type concurrentThumbnailGalleryClient struct {
 	startedOnce   sync.Once
 	current       atomic.Int32
 	maxConcurrent atomic.Int32
+}
+
+func (m *concurrentThumbnailGalleryClient) GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) {
+	return "asset.jpg", 12345, "image/jpeg", nil
 }
 
 func (m *concurrentThumbnailGalleryClient) ListGallery(ctx context.Context) (Gallery, error) {

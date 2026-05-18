@@ -98,6 +98,14 @@ func (a immichTransferAdapter) GetThumbnail(ctx context.Context, id string, w io
 	return a.client.GetThumbnail(ctx, id, w)
 }
 
+func (a immichTransferAdapter) GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) {
+	asset, err := a.client.GetAssetInfo(ctx, id)
+	if err != nil {
+		return "", 0, "", err
+	}
+	return asset.OriginalFileName, asset.FileSizeInByte, asset.OriginalMimeType, nil
+}
+
 func (a immichTransferAdapter) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
 	switch quality {
 	case "", "original":
