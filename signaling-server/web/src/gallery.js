@@ -13,7 +13,7 @@ export function createGalleryController({
     items: [],
     thumbs: new Map(),
     urls: new Map(),
-    previewRequests: new Map(),
+    previewRequests: new Set(),
     lightbox: null,
     loadedThumbs: 0,
     refreshTimer: null,
@@ -89,21 +89,17 @@ export function createGalleryController({
   }
 
   function handlePreviewData(id, payload, mimeType = 'image/jpeg') {
-    const quality = state.previewRequests.get(id) || 'preview'
     state.previewRequests.delete(id)
-    const cacheKey = quality === 'original' ? `original:${id}` : `preview:${id}`
     const blob = new Blob([payload], { type: mimeType })
     const url = createObjectURL(blob)
-    const previousUrl = state.urls.get(cacheKey)
+    const previousUrl = state.urls.get(`preview:${id}`)
     if (previousUrl) revokeObjectURL(previousUrl)
-    state.urls.set(cacheKey, url)
+    state.urls.set(`preview:${id}`, url)
 
     const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)
     if (galleryItem?.dataset) {
       galleryItem.dataset.src = url
-      if (quality === 'original') {
-        galleryItem.dataset.downloadUrl = url
-      }
+      galleryItem.dataset.downloadUrl = 'false'
       scheduleLightboxRefresh()
     }
 
@@ -179,26 +175,20 @@ export function createGalleryController({
     if (!item) return
     state.activePreviewID = item.id
     ensureLightboxDownloadButton()
-    const existingOriginalUrl = state.urls.get(`original:${item.id}`)
     const existingPreviewUrl = state.urls.get(`preview:${item.id}`)
-    if (existingOriginalUrl) {
-      updateActiveLightboxImage(existingOriginalUrl)
-    } else if (existingPreviewUrl) {
+    if (existingPreviewUrl) {
       updateActiveLightboxImage(existingPreviewUrl)
-      requestPreviewForItem(item, 'active', 'original')
     } else {
-      requestPreviewForItem(item, 'active', 'original')
+      requestPreviewForItem(item, 'active')
     }
-    requestPreviewForItem(state.items[index - 1], 'preload', 'preview')
-    requestPreviewForItem(state.items[index + 1], 'preload', 'preview')
+    requestPreviewForItem(state.items[index - 1], 'preload')
+    requestPreviewForItem(state.items[index + 1], 'preload')
   }
 
-  function requestPreviewForItem(item, priority, quality) {
-    if (!item || state.previewRequests.has(item.id)) return
-    const cacheKey = quality === 'original' ? `original:${item.id}` : `preview:${item.id}`
-    if (state.urls.has(cacheKey)) return
-    state.previewRequests.set(item.id, quality)
-    onPreviewRequest?.(item.id, { priority, quality })
+  function requestPreviewForItem(item, priority) {
+    if (!item || state.urls.has(`preview:${item.id}`) || state.previewRequests.has(item.id)) return
+    state.previewRequests.add(item.id)
+    onPreviewRequest?.(item.id, { priority })
   }
 
   function updateActiveLightboxImage(url) {

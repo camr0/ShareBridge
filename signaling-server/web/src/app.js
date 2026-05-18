@@ -54,8 +54,7 @@ let galleryController = null
 let galleryAssetRequestPending = false
 let galleryPreviewRequestPending = false
 let queuedGalleryPreviewID = ''
-let queuedGalleryPreviewQuality = 'preview'
-let queuedGalleryPreloadItems = []
+let queuedGalleryPreloadIDs = []
 let currentPreview = null
 let sessionPassword = '' // set from URL hash on load, or from password input
 
@@ -1123,7 +1122,7 @@ async function handleError(msg) {
   galleryAssetRequestPending = false
   galleryPreviewRequestPending = false
   queuedGalleryPreviewID = ''
-  queuedGalleryPreloadItems = []
+  queuedGalleryPreloadIDs = []
   currentPreview = null
   updateStatus('Error: ' + message)
 }
@@ -1143,7 +1142,7 @@ function clearClosedTransferSession() {
   galleryAssetRequestPending = false
   galleryPreviewRequestPending = false
   queuedGalleryPreviewID = ''
-  queuedGalleryPreloadItems = []
+  queuedGalleryPreloadIDs = []
   currentPreview = null
   transferChannel = null
   currentTransferMode = null
@@ -1177,7 +1176,7 @@ function resetUI() {
   galleryAssetRequestPending = false
   galleryPreviewRequestPending = false
   queuedGalleryPreviewID = ''
-  queuedGalleryPreloadItems = []
+  queuedGalleryPreloadIDs = []
   currentPreview = null
   receivedBytes = 0
   receivedChunkCount = 0
@@ -1229,14 +1228,13 @@ function ensureGalleryController() {
   return galleryController
 }
 
-function requestGalleryPreview(id, { priority = 'active', quality = 'preview' } = {}) {
+function requestGalleryPreview(id, { priority = 'active' } = {}) {
   if (galleryPreviewRequestPending) {
     if (priority === 'active') {
       queuedGalleryPreviewID = id
-      queuedGalleryPreviewQuality = quality
       return
     }
-    queueGalleryPreload(id, quality)
+    queueGalleryPreload(id)
     return
   }
   if (activeDownload) return
@@ -1245,14 +1243,14 @@ function requestGalleryPreview(id, { priority = 'active', quality = 'preview' } 
     return
   }
   galleryPreviewRequestPending = true
-  transferChannel.send(JSON.stringify({ type: 'asset_preview_request', id, quality }))
+  transferChannel.send(JSON.stringify({ type: 'asset_preview_request', id, quality: 'preview' }))
 }
 
-function queueGalleryPreload(id, quality = 'preview') {
-  if (!id || id === currentPreview?.id || id === queuedGalleryPreviewID || queuedGalleryPreloadItems.some((item) => item.id === id)) return
-  queuedGalleryPreloadItems.push({ id, quality })
-  if (queuedGalleryPreloadItems.length > 2) {
-    queuedGalleryPreloadItems = queuedGalleryPreloadItems.slice(-2)
+function queueGalleryPreload(id) {
+  if (!id || id === currentPreview?.id || id === queuedGalleryPreviewID || queuedGalleryPreloadIDs.includes(id)) return
+  queuedGalleryPreloadIDs.push(id)
+  if (queuedGalleryPreloadIDs.length > 2) {
+    queuedGalleryPreloadIDs = queuedGalleryPreloadIDs.slice(-2)
   }
 }
 
@@ -1290,10 +1288,9 @@ function completeGalleryPreview(msg) {
     offset += chunk.byteLength
   }
   galleryController?.handlePreviewData?.(msg.id || preview.id, merged, preview.mimeType)
-  const nextQueued = queuedGalleryPreviewID ? { id: queuedGalleryPreviewID, quality: queuedGalleryPreviewQuality } : (queuedGalleryPreloadItems.shift() || null)
+  const nextID = queuedGalleryPreviewID || queuedGalleryPreloadIDs.shift()
   queuedGalleryPreviewID = ''
-  queuedGalleryPreviewQuality = 'preview'
-  if (nextQueued) requestGalleryPreview(nextQueued.id, { priority: nextQueued.quality === 'original' ? 'active' : 'preload', quality: nextQueued.quality })
+  if (nextID) requestGalleryPreview(nextID)
 }
 
 function initFromURL() {
