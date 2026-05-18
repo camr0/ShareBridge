@@ -666,35 +666,40 @@ async function handleTransferMessage(event) {
       byteLength: event.data.byteLength,
       currentFile: currentFile?.name || null,
     })
-    if (galleryController) {
-      const frame = decodeBinaryEnvelope(event.data)
-      if (frame.type === FRAME_THUMBNAIL) {
-        galleryController.handleThumbnailData(frame.index, frame.payload)
-        return
-      }
-    }
-    if (currentPreview) {
-      const frame = decodeBinaryEnvelope(event.data)
-      if (frame.type === FRAME_FILE_CHUNK) {
-        currentPreview.chunks.push(frame.payload)
-        currentPreview.bytes += frame.payload.byteLength
-        return
-      }
-    }
-    if (!currentFile?.binary_envelope) {
+    // Legacy path: non-binary-envelope file transfers send raw bytes.
+    // Must check before decodeBinaryEnvelope since raw bytes that happen
+    // to start with 0x10 or 0x11 would be incorrectly framed.
+    if (!currentFile?.binary_envelope && !currentPreview && !galleryController) {
       await appendChunk(new Uint8Array(event.data))
       return
     }
+
     const frame = decodeBinaryEnvelope(event.data)
-    if (frame.type === FRAME_FILE_CHUNK) {
+
+    if (galleryController && frame.type === FRAME_THUMBNAIL) {
+      galleryController.handleThumbnailData(frame.index, frame.payload)
+      return
+    }
+
+    if (frame.type !== FRAME_FILE_CHUNK) {
+      return
+    }
+
+    // Route file chunks: active download takes priority over in-flight preview.
+    // A download can start while a preview is still streaming; without this check
+    // download chunks get stolen by the preview handler.
+    if (currentFile?.binary_envelope) {
       await appendChunk(frame.payload)
       return
     }
-    if (frame.type === FRAME_THUMBNAIL) {
-      debugLog('thumbnail frame received before gallery UI is enabled', { index: frame.index })
+
+    if (currentPreview) {
+      currentPreview.chunks.push(frame.payload)
+      currentPreview.bytes += frame.payload.byteLength
       return
     }
-    return
+
+    await appendChunk(frame.payload)
   }
 
   debugLog('transfer text message received', {
