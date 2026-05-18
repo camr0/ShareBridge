@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -30,8 +29,7 @@ type Client struct {
 	allowed    string
 	apiKey     string
 	shareKey   string
-	tokenMu    sync.RWMutex
-	token      string
+	password   string
 	httpClient *http.Client
 }
 
@@ -86,22 +84,6 @@ type GalleryItem struct {
 	SHA1     string
 }
 
-type timeBucket struct {
-	TimeBucket string `json:"timeBucket"`
-	Count      int    `json:"count"`
-}
-
-type timelineBucket struct {
-	ID       []string              `json:"id"`
-	IsImage  []bool                `json:"isImage"`
-	Ratio    []float64             `json:"ratio"`
-	Duration []timelineDurationSec `json:"duration"`
-}
-
-type timelineDurationSec struct {
-	value *float64
-}
-
 func New(cfg Config) (*Client, error) {
 	baseURL, err := url.Parse(cfg.BaseURL)
 	if err != nil {
@@ -119,6 +101,7 @@ func New(cfg Config) (*Client, error) {
 		allowed:  cfg.AllowedHost,
 		apiKey:   cfg.APIKey,
 		shareKey: cfg.ShareKey,
+		password: cfg.Password,
 		httpClient: &http.Client{
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if !hostAllowed(req.URL.Host, cfg.AllowedHost) {
@@ -148,6 +131,7 @@ func canonicalHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
+// PollShares lists all shared links (authenticated with API key).
 func (c *Client) PollShares(ctx context.Context) ([]SharedLink, error) {
 	log.Printf("immich poll: GET /api/shared-links host=%s", c.baseURL.Host)
 	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/shared-links"})
@@ -167,17 +151,19 @@ func (c *Client) PollShares(ctx context.Context) ([]SharedLink, error) {
 	return shares, nil
 }
 
+// ValidatePassword tries the Immich share endpoint with a password.
+// Immich validates by accepting/rejecting the request — there is no separate login step.
 func (c *Client) ValidatePassword(ctx context.Context, password string) (bool, error) {
-	log.Printf("immich auth: POST /api/shared-links/login share=%s", redactKey(c.shareKey))
-	body, err := json.Marshal(map[string]string{"password": password})
+	log.Printf("immich auth: validating password share=%s", redactKey(c.shareKey))
+	u := c.buildSharedLinkURL()
+	q := u.Query()
+	q.Set("password", password)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return false, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.sharedLinkLoginURL(), strings.NewReader(string(body)))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -185,37 +171,24 @@ func (c *Client) ValidatePassword(ctx context.Context, password string) (bool, e
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		log.Printf("immich auth: rejected password status=%s share=%s", resp.Status, redactKey(c.shareKey))
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("immich auth: rejected password status=%d share=%s", resp.StatusCode, redactKey(c.shareKey))
 		return false, nil
 	}
-
-	var link SharedLink
-	if err := json.NewDecoder(resp.Body).Decode(&link); err != nil {
-		return false, fmt.Errorf("decode shared link: %w", err)
-	}
-	token := ""
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == "immich_shared_link_token" {
-			token = cookie.Value
-			break
-		}
-	}
-	if token == "" {
-		return false, fmt.Errorf("shared link login response did not include auth cookie")
-	}
-	c.setToken(token)
-	log.Printf("immich auth: accepted password and stored shared-link cookie share=%s", redactKey(c.shareKey))
+	// Success — store the password for subsequent asset requests.
+	c.password = password
+	log.Printf("immich auth: password accepted share=%s", redactKey(c.shareKey))
 	return true, nil
 }
 
+// ListGallery returns the album gallery for the shared link.
+// For album-type shares, a second request to /api/albums/{id} populates assets.
 func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
 	log.Printf("immich gallery: GET /api/shared-links/me share=%s", redactKey(c.shareKey))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.sharedLinkURL(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.buildSharedLinkURL().String(), nil)
 	if err != nil {
 		return Gallery{}, err
 	}
-	c.addSharedLinkToken(req)
 
 	var link SharedLink
 	if err := c.doJSON(req, &link); err != nil {
@@ -227,19 +200,16 @@ func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
 		albumID = link.Album.ID
 		albumName = link.Album.Name
 	}
-	log.Printf("immich gallery: share=%s type=%s album_id=%s album_name=%q expanded_assets=%d", redactKey(c.shareKey), link.Type, albumID, albumName, len(link.Assets))
+	log.Printf("immich gallery: share=%s type=%s album_id=%s album_name=%q inline_assets=%d",
+		redactKey(c.shareKey), link.Type, albumID, albumName, len(link.Assets))
 
 	assets := link.Assets
 	if len(assets) == 0 && strings.EqualFold(link.Type, "ALBUM") && link.Album != nil && link.Album.ID != "" {
-		log.Printf("immich gallery: share=%s using timeline fallback album_id=%s", redactKey(c.shareKey), link.Album.ID)
-		items, err := c.listAlbumTimelineItems(ctx, link.Album.ID)
+		albumAssets, err := c.listAlbumAssets(ctx, link.Album.ID)
 		if err != nil {
 			return Gallery{}, err
 		}
-		gallery := Gallery{Items: items}
-		gallery.setAlbum(link.Album)
-		log.Printf("immich gallery: share=%s timeline fallback produced %d items", redactKey(c.shareKey), len(items))
-		return gallery, nil
+		assets = albumAssets
 	}
 
 	gallery := Gallery{Items: make([]GalleryItem, 0, len(assets))}
@@ -249,8 +219,28 @@ func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
 	for _, asset := range assets {
 		gallery.Items = append(gallery.Items, galleryItemFromAsset(asset))
 	}
-	log.Printf("immich gallery: share=%s expanded assets produced %d items", redactKey(c.shareKey), len(gallery.Items))
+	log.Printf("immich gallery: share=%s produced %d items", redactKey(c.shareKey), len(gallery.Items))
 	return gallery, nil
+}
+
+func (c *Client) listAlbumAssets(ctx context.Context, albumID string) ([]Asset, error) {
+	log.Printf("immich gallery: GET /api/albums/%s share=%s", albumID, redactKey(c.shareKey))
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/albums/" + albumID})
+	c.addSharedLinkParams(u)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var album struct {
+		Assets []Asset `json:"assets"`
+	}
+	if err := c.doJSON(req, &album); err != nil {
+		return nil, err
+	}
+	log.Printf("immich gallery: album_id=%s returned %d assets", albumID, len(album.Assets))
+	return album.Assets, nil
 }
 
 func (g *Gallery) setAlbum(album *Album) {
@@ -274,70 +264,22 @@ func galleryItemFromAsset(asset Asset) GalleryItem {
 	return item
 }
 
-func (c *Client) listAlbumTimelineItems(ctx context.Context, albumID string) ([]GalleryItem, error) {
-	log.Printf("immich gallery: GET /api/timeline/buckets share=%s album_id=%s", redactKey(c.shareKey), albumID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.timelineBucketsURL(albumID), nil)
-	if err != nil {
-		return nil, err
-	}
-	c.addSharedLinkToken(req)
-
-	var buckets []timeBucket
-	if err := c.doJSON(req, &buckets); err != nil {
-		return nil, err
-	}
-	log.Printf("immich gallery: album_id=%s buckets=%d", albumID, len(buckets))
-
-	items := make([]GalleryItem, 0)
-	for _, bucket := range buckets {
-		if bucket.TimeBucket == "" || bucket.Count == 0 {
-			continue
-		}
-		log.Printf("immich gallery: GET /api/timeline/bucket share=%s album_id=%s bucket=%s expected_count=%d", redactKey(c.shareKey), albumID, bucket.TimeBucket, bucket.Count)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.timelineBucketURL(albumID, bucket.TimeBucket), nil)
-		if err != nil {
-			return nil, err
-		}
-		c.addSharedLinkToken(req)
-
-		var timeline timelineBucket
-		if err := c.doJSON(req, &timeline); err != nil {
-			return nil, err
-		}
-		log.Printf("immich gallery: album_id=%s bucket=%s ids=%d duration_values=%d", albumID, bucket.TimeBucket, len(timeline.ID), len(timeline.Duration))
-		for i, id := range timeline.ID {
-			item := GalleryItem{
-				ID:       id,
-				Name:     id,
-				MimeType: "image/jpeg",
-			}
-			if i < len(timeline.IsImage) && !timeline.IsImage[i] {
-				item.MimeType = "video/mp4"
-			}
-			if i < len(timeline.Ratio) && timeline.Ratio[i] > 0 {
-				item.Width = 1000
-				item.Height = int(1000 / timeline.Ratio[i])
-			}
-			if i < len(timeline.Duration) && timeline.Duration[i].value != nil {
-				seconds := *timeline.Duration[i].value
-				item.Duration = &seconds
-			}
-			items = append(items, item)
-		}
-	}
-	return items, nil
-}
-
 func (c *Client) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
 	return c.getAsset(ctx, c.assetURL(id, "/thumbnail"), w)
 }
 
 func (c *Client) GetPreview(ctx context.Context, id string, w io.Writer) (int64, error) {
-	return c.getAsset(ctx, c.assetURLWithSize(id, "/thumbnail", "preview"), w)
+	return c.getAsset(ctx, c.assetURL(id, "/thumbnail"), w)
 }
 
 func (c *Client) GetFile(ctx context.Context, id string, w io.Writer) (int64, error) {
 	return c.getAsset(ctx, c.assetURL(id, "/original"), w)
+}
+
+// GetVideoPlayback returns the transcoded video stream URL that the browser can play directly.
+// Immich serves an HLS/video stream at /api/assets/{id}/video/playback.
+func (c *Client) GetVideoPlayback(ctx context.Context, id string, w io.Writer) (int64, error) {
+	return c.getAsset(ctx, c.assetURL(id, "/video/playback"), w)
 }
 
 func (c *Client) getAsset(ctx context.Context, rawURL string, w io.Writer) (int64, error) {
@@ -345,7 +287,6 @@ func (c *Client) getAsset(ctx context.Context, rawURL string, w io.Writer) (int6
 	if err != nil {
 		return 0, err
 	}
-	c.addSharedLinkToken(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -369,7 +310,7 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("GET %s returned %s: %s", req.URL.Path, resp.Status, strings.TrimSpace(string(body)))
+		return fmt.Errorf("GET %s returned %d: %s", req.URL.Path, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
@@ -377,20 +318,19 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 	return nil
 }
 
-func (c *Client) sharedLinkURL() string {
+func (c *Client) buildSharedLinkURL() *url.URL {
 	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/shared-links/me"})
-	q := u.Query()
-	q.Set("key", c.shareKey)
-	u.RawQuery = q.Encode()
-	return u.String()
+	c.addSharedLinkParams(u)
+	return u
 }
 
-func (c *Client) sharedLinkLoginURL() string {
-	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/shared-links/login"})
+func (c *Client) addSharedLinkParams(u *url.URL) {
 	q := u.Query()
 	q.Set("key", c.shareKey)
+	if c.password != "" {
+		q.Set("password", c.password)
+	}
 	u.RawQuery = q.Encode()
-	return u.String()
 }
 
 func (c *Client) assetURL(id, suffix string) string {
@@ -398,55 +338,8 @@ func (c *Client) assetURL(id, suffix string) string {
 		Path:    "/api/assets/" + id + suffix,
 		RawPath: "/api/assets/" + url.PathEscape(id) + suffix,
 	})
-	q := u.Query()
-	q.Set("key", c.shareKey)
-	u.RawQuery = q.Encode()
+	c.addSharedLinkParams(u)
 	return u.String()
-}
-
-func (c *Client) assetURLWithSize(id, suffix, size string) string {
-	u, _ := url.Parse(c.assetURL(id, suffix))
-	q := u.Query()
-	q.Set("size", size)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func (c *Client) timelineBucketsURL(albumID string) string {
-	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/timeline/buckets"})
-	q := u.Query()
-	q.Set("key", c.shareKey)
-	q.Set("albumId", albumID)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func (c *Client) timelineBucketURL(albumID, bucket string) string {
-	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/timeline/bucket"})
-	q := u.Query()
-	q.Set("key", c.shareKey)
-	q.Set("albumId", albumID)
-	q.Set("timeBucket", bucket)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func (c *Client) currentToken() string {
-	c.tokenMu.RLock()
-	defer c.tokenMu.RUnlock()
-	return c.token
-}
-
-func (c *Client) setToken(token string) {
-	c.tokenMu.Lock()
-	defer c.tokenMu.Unlock()
-	c.token = token
-}
-
-func (c *Client) addSharedLinkToken(req *http.Request) {
-	if token := c.currentToken(); token != "" {
-		req.AddCookie(&http.Cookie{Name: "immich_shared_link_token", Value: token})
-	}
 }
 
 func decodeBase64SHA1(input string) string {
@@ -455,25 +348,6 @@ func decodeBase64SHA1(input string) string {
 		return ""
 	}
 	return hex.EncodeToString(raw)
-}
-
-func (d *timelineDurationSec) UnmarshalJSON(data []byte) error {
-	if string(data) == "null" {
-		d.value = nil
-		return nil
-	}
-	var numeric float64
-	if err := json.Unmarshal(data, &numeric); err == nil {
-		seconds := numeric / 1000
-		d.value = &seconds
-		return nil
-	}
-	var text string
-	if err := json.Unmarshal(data, &text); err != nil {
-		return err
-	}
-	d.value = parseDurationSeconds(text)
-	return nil
 }
 
 func parseDurationSeconds(input string) *float64 {

@@ -106,6 +106,8 @@ func (a immichTransferAdapter) GetAsset(ctx context.Context, id string, quality 
 		return a.client.GetPreview(ctx, id, w)
 	case "thumbnail":
 		return a.client.GetThumbnail(ctx, id, w)
+	case "video":
+		return a.client.GetVideoPlayback(ctx, id, w)
 	default:
 		return 0, fmt.Errorf("unsupported asset quality: %s", quality)
 	}
