@@ -269,7 +269,11 @@ func (c *Client) GetThumbnail(ctx context.Context, id string, w io.Writer) (int6
 }
 
 func (c *Client) GetPreview(ctx context.Context, id string, w io.Writer) (int64, error) {
-	return c.getAsset(ctx, c.assetURL(id, "/thumbnail"), w)
+	u, _ := url.Parse(c.assetURL(id, "/thumbnail"))
+	q := u.Query()
+	q.Set("size", "preview")
+	u.RawQuery = q.Encode()
+	return c.getAsset(ctx, u.String(), w)
 }
 
 func (c *Client) GetFile(ctx context.Context, id string, w io.Writer) (int64, error) {
