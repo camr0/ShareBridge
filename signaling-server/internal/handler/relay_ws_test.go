@@ -83,6 +83,66 @@ func TestRelayWS_AgentAndBrowserPairAndForwardOpaqueBytes(t *testing.T) {
 	}
 }
 
+func TestRelayWS_ForwardsOpaqueFrameLargerThanDefaultReadLimit(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+	cfg := config.Load()
+	cfg.RelayJWTSecret = "secret"
+
+	now := time.Unix(1_800_000_000, 0)
+	reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-large",
+		AccountID:    "acct-1",
+		AgentID:      "agent-1",
+		RelayAllowed: true,
+		JTI:          "jti-large",
+		ExpiresAt:    now.Add(relay.TokenLifetime),
+	}, now)
+
+	agentToken, _ := relay.SignAgentRelayJWT("secret", relay.AgentRelayClaims{SID: "sid-large", AgentID: "agent-1"}, now)
+	browserToken, _ := relay.SignBrowserPolicyJWT("secret", relay.BrowserPolicyClaims{
+		SID:              "sid-large",
+		RelayAllowed:     true,
+		RegisteredClaims: jwt.RegisteredClaims{ID: "jti-large"},
+	}, now)
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws/relay", handler.RelayWS(nil, reg, cfg))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	ctx := context.Background()
+	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/relay", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agentConn.CloseNow()
+	agentConn.Write(ctx, websocket.MessageText, []byte(`{"token":"`+agentToken+`"}`))
+
+	browserConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/relay", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browserConn.CloseNow()
+	browserConn.SetReadLimit(128 * 1024)
+	browserConn.Write(ctx, websocket.MessageText, []byte(`{"token":"`+browserToken+`"}`))
+
+	largePayload := strings.Repeat("x", 64*1024)
+	if err := agentConn.Write(ctx, websocket.MessageBinary, []byte(largePayload)); err != nil {
+		t.Fatal(err)
+	}
+
+	typ, data, err := browserConn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != websocket.MessageBinary {
+		t.Errorf("expected binary, got %v", typ)
+	}
+	if string(data) != largePayload {
+		t.Errorf("large relay payload corrupted: got %d bytes, want %d", len(data), len(largePayload))
+	}
+}
+
 func TestRelayWS_RejectsReplayedBrowserJTI(t *testing.T) {
 	reg := relay.NewRegistry(2 * time.Second)
 	cfg := config.Load()

@@ -201,6 +201,40 @@ func (m *blockingGalleryClient) GetAsset(ctx context.Context, id string, quality
 	return int64(n), err
 }
 
+type concurrentThumbnailGalleryClient struct {
+	gallery       Gallery
+	release       chan struct{}
+	started       chan struct{}
+	startedOnce   sync.Once
+	current       atomic.Int32
+	maxConcurrent atomic.Int32
+}
+
+func (m *concurrentThumbnailGalleryClient) ListGallery(ctx context.Context) (Gallery, error) {
+	return m.gallery, nil
+}
+
+func (m *concurrentThumbnailGalleryClient) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
+	current := m.current.Add(1)
+	for {
+		max := m.maxConcurrent.Load()
+		if current <= max || m.maxConcurrent.CompareAndSwap(max, current) {
+			break
+		}
+	}
+	if current == 2 {
+		m.startedOnce.Do(func() { close(m.started) })
+	}
+	<-m.release
+	m.current.Add(-1)
+	n, err := w.Write([]byte(id))
+	return int64(n), err
+}
+
+func (m *concurrentThumbnailGalleryClient) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
+	return 0, nil
+}
+
 type blockingStorageClient struct {
 	files       []cloudwebdav.FileInfo
 	file        []byte
@@ -267,6 +301,34 @@ func TestHandleOpen_ImmichGallerySendsThumbnailListAndData(t *testing.T) {
 	require.Equal(t, byte(0x11), dc.binaryData[0][0], "thumbnail frames use typed binary envelope")
 }
 
+func TestHandleOpen_ImmichGalleryFetchesThumbnailsConcurrently(t *testing.T) {
+	dc := &mockDC{}
+	client := &concurrentThumbnailGalleryClient{
+		gallery: Gallery{Items: []GalleryItem{
+			{ID: "asset-1", Name: "one.jpg"},
+			{ID: "asset-2", Name: "two.jpg"},
+			{ID: "asset-3", Name: "three.jpg"},
+		}},
+		release: make(chan struct{}),
+		started: make(chan struct{}),
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+	mgr.HandleOpen()
+
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("expected at least two thumbnail fetches to overlap")
+	}
+	close(client.release)
+	require.Eventually(t, func() bool {
+		dc.mu.Lock()
+		defer dc.mu.Unlock()
+		return len(dc.binaryData) == 3
+	}, time.Second, 10*time.Millisecond)
+	require.GreaterOrEqual(t, client.maxConcurrent.Load(), int32(2))
+}
+
 func TestHandleAssetRequestStreamsByAssetID(t *testing.T) {
 	dc := &mockDC{}
 	client := &mockGalleryClient{
@@ -300,6 +362,25 @@ func TestHandleAssetRequestThumbnailQualityStreamsThumbnail(t *testing.T) {
 
 	require.Len(t, dc.binaryData, 1)
 	require.Equal(t, []byte{0x10, 't', 'n'}, dc.binaryData[0])
+}
+
+func TestHandleAssetPreviewRequestStreamsPreviewWithoutDownloadHeader(t *testing.T) {
+	dc := &mockDC{}
+	client := &mockGalleryClient{
+		file: []byte("preview"),
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+
+	req, _ := json.Marshal(map[string]string{"type": "asset_preview_request", "id": "asset-1", "quality": "preview"})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	require.False(t, dc.hasTextType("file_header"))
+	require.True(t, dc.hasTextType("asset_preview_header"))
+	require.True(t, dc.hasTextType("asset_preview_end"))
+	require.Equal(t, "preview", client.assetQuality)
+	require.NotEmpty(t, dc.binaryData)
+	require.Equal(t, byte(0x10), dc.binaryData[0][0], "preview chunks reuse typed file chunk envelope")
 }
 
 func TestHandleFileRequestHeaderIncludesBinaryEnvelope(t *testing.T) {

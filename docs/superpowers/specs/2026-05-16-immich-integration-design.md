@@ -38,12 +38,16 @@ type Client struct {
 
 | Method | Immich API | Auth |
 |--------|-----------|------|
-| `ListFiles` | `GET /api/shared-links/my-share?key={key}` | share key |
+| `ListFiles` | `GET /api/shared-links/me?key={key}` | share key, plus Immich shared-link cookie after password login |
+| `ListFiles` album fallback | `GET /api/timeline/buckets?key={key}&albumId={albumId}` + `GET /api/timeline/bucket?key={key}&albumId={albumId}&timeBucket={bucket}` | share key, plus Immich shared-link cookie after password login |
+| `ValidatePassword` | `POST /api/shared-links/login?key={key}` | share key, password JSON body, stores Immich shared-link cookie in memory |
 | `GetThumbnail` | `GET /api/assets/{id}/thumbnail?key={key}` | share key |
 | `GetFile` | `GET /api/assets/{id}/original?key={key}` or download endpoint | share key |
 | `PollShares` | `GET /api/shared-links` | API key (sharedLink.read) |
 
-Exact paths and password parameter placement must be verified against the target Immich version before implementation. Current public API docs show `getMySharedLink` accepting `key` and `password` query parameters, and `getAssetThumbnail` / `downloadAsset` accepting `key`; do not assume an `X-Immich-Shared-Link-Password` header unless verified against a real instance.
+Exact paths and password flow must be verified against the target Immich version before implementation. Current Immich releases use `GET /api/shared-links/me?key={key}` for share metadata and `POST /api/shared-links/login?key={key}` for password validation, returning an `immich_shared_link_token` cookie; older archived docs mention `/my-share` and `password` query parameters, which return `403 Forbidden` on newer Immich because `/my-share` is treated as a protected share-id route.
+
+For album shared links on newer Immich, `/shared-links/me` may return album metadata and `assetCount` without an expanded top-level `assets` array. In that case the agent falls back to the shared-link-authenticated timeline endpoints to enumerate asset IDs for the album.
 
 **Password handling**: Immich uses a different auth model than OC/NC — there is no HMAC pre-challenge. The agent cannot verify passwords locally because Immich stores them as a hash. Instead:
 
@@ -210,9 +214,11 @@ Implemented paths are based on the documented Immich API and are covered by the 
 | Purpose | Implemented path | Auth |
 |---------|--------------|------|
 | List all shares | `GET /api/shared-links` with `x-api-key` | API key |
-| Get share by key | `GET /api/shared-links/my-share?key={key}&password={password}` | share key, optional password |
-| Thumbnail | `GET /api/assets/{id}/thumbnail?key={key}` | share key, validated password query when needed |
-| Original | `GET /api/assets/{id}/original?key={key}` | share key, validated password query when needed |
+| Get share by key | `GET /api/shared-links/me?key={key}` | share key, plus Immich shared-link cookie when password protected |
+| Get album asset IDs | `GET /api/timeline/buckets?key={key}&albumId={albumId}`, then `GET /api/timeline/bucket?key={key}&albumId={albumId}&timeBucket={bucket}` | share key, plus Immich shared-link cookie when password protected |
+| Validate password | `POST /api/shared-links/login?key={key}` | share key, password JSON body, stores returned cookie in memory |
+| Thumbnail | `GET /api/assets/{id}/thumbnail?key={key}` | share key |
+| Original | `GET /api/assets/{id}/original?key={key}` | share key |
 
 ## URL Structure
 

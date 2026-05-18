@@ -181,6 +181,31 @@
       font-size: 0.85rem;
       white-space: nowrap;
     }
+    .gallery-progress {
+      margin: -0.25rem 0 1rem;
+    }
+    .gallery-progress.hidden {
+      display: none;
+    }
+    .gallery-progress-row {
+      display: flex;
+      justify-content: flex-end;
+      color: #a6adc8;
+      font-size: 0.8rem;
+      margin-bottom: 0.35rem;
+    }
+    .gallery-progress-track {
+      height: 6px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #313244;
+    }
+    .gallery-progress-fill {
+      height: 100%;
+      width: 0;
+      background: #89b4fa;
+      transition: width 160ms ease;
+    }
     .gallery-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -196,6 +221,8 @@
       overflow: hidden;
       background: #313244;
       border-radius: 8px;
+      content-visibility: auto;
+      contain-intrinsic-size: 180px 180px;
     }
     .gallery-item:focus-visible {
       outline: 2px solid #89b4fa;
@@ -206,6 +233,27 @@
       height: 100%;
       object-fit: cover;
       display: block;
+    }
+    .gallery-download {
+      position: absolute;
+      right: 0.4rem;
+      top: 0.4rem;
+      display: grid;
+      place-items: center;
+      width: 1.75rem;
+      height: 1.75rem;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.72);
+      color: white;
+      font-size: 1rem;
+      line-height: 1;
+      opacity: 0;
+      transition: opacity 140ms ease;
+    }
+    .gallery-item:hover .gallery-download,
+    .gallery-item:focus-visible .gallery-download,
+    .gallery-download:focus-visible {
+      opacity: 1;
     }
     .gallery-duration {
       position: absolute;

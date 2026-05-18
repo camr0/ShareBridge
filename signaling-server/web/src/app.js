@@ -52,6 +52,10 @@ let sessionCode = ''
 let galleryMode = false
 let galleryController = null
 let galleryAssetRequestPending = false
+let galleryPreviewRequestPending = false
+let queuedGalleryPreviewID = ''
+let queuedGalleryPreloadIDs = []
+let currentPreview = null
 let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
@@ -332,6 +336,15 @@ function attachTransferChannel({
     })
   }
   channel.onclose = () => {
+    if (transferChannel && transferChannel !== channel) {
+      debugLog('ignoring stale transfer channel close', {
+        mode,
+        channelReadyState: channel.readyState,
+        activeReadyState: transferChannel.readyState,
+        activeMode: currentTransferMode,
+      })
+      return
+    }
     debugLog('transfer channel closed', {
       mode,
       channelReadyState: channel.readyState,
@@ -660,6 +673,14 @@ async function handleTransferMessage(event) {
         return
       }
     }
+    if (currentPreview) {
+      const frame = decodeBinaryEnvelope(event.data)
+      if (frame.type === FRAME_FILE_CHUNK) {
+        currentPreview.chunks.push(frame.payload)
+        currentPreview.bytes += frame.payload.byteLength
+        return
+      }
+    }
     if (!currentFile?.binary_envelope) {
       await appendChunk(new Uint8Array(event.data))
       return
@@ -692,6 +713,12 @@ async function handleTransferMessage(event) {
       break
     case 'file_header':
       await startDownload(msg)
+      break
+    case 'asset_preview_header':
+      startGalleryPreview(msg)
+      break
+    case 'asset_preview_end':
+      completeGalleryPreview(msg)
       break
     case 'chunk_end':
       await completeDownload()
@@ -1093,6 +1120,10 @@ async function handleError(msg) {
   }
 
   galleryAssetRequestPending = false
+  galleryPreviewRequestPending = false
+  queuedGalleryPreviewID = ''
+  queuedGalleryPreloadIDs = []
+  currentPreview = null
   updateStatus('Error: ' + message)
 }
 
@@ -1109,6 +1140,10 @@ async function handleTransferClosure() {
 
 function clearClosedTransferSession() {
   galleryAssetRequestPending = false
+  galleryPreviewRequestPending = false
+  queuedGalleryPreviewID = ''
+  queuedGalleryPreloadIDs = []
+  currentPreview = null
   transferChannel = null
   currentTransferMode = null
   getConnectionStatusEl().classList.add('hidden')
@@ -1139,6 +1174,10 @@ function resetUI() {
   activeDownload = null
   currentFile = null
   galleryAssetRequestPending = false
+  galleryPreviewRequestPending = false
+  queuedGalleryPreviewID = ''
+  queuedGalleryPreloadIDs = []
+  currentPreview = null
   receivedBytes = 0
   receivedChunkCount = 0
   transferStartTime = 0
@@ -1182,10 +1221,37 @@ function ensureGalleryController() {
   if (root) {
     galleryController = createGalleryController({
       root,
-      sendAssetRequest: requestGalleryAsset,
+      onPreviewRequest: requestGalleryPreview,
+      onDownloadRequest: requestGalleryAsset,
     })
   }
   return galleryController
+}
+
+function requestGalleryPreview(id, { priority = 'active' } = {}) {
+  if (galleryPreviewRequestPending) {
+    if (priority === 'active') {
+      queuedGalleryPreviewID = id
+      return
+    }
+    queueGalleryPreload(id)
+    return
+  }
+  if (activeDownload) return
+  if (!transferChannel) {
+    updateStatus('Connection closed')
+    return
+  }
+  galleryPreviewRequestPending = true
+  transferChannel.send(JSON.stringify({ type: 'asset_preview_request', id, quality: 'preview' }))
+}
+
+function queueGalleryPreload(id) {
+  if (!id || id === currentPreview?.id || id === queuedGalleryPreviewID || queuedGalleryPreloadIDs.includes(id)) return
+  queuedGalleryPreloadIDs.push(id)
+  if (queuedGalleryPreloadIDs.length > 2) {
+    queuedGalleryPreloadIDs = queuedGalleryPreloadIDs.slice(-2)
+  }
 }
 
 function requestGalleryAsset(id) {
@@ -1199,6 +1265,32 @@ function requestGalleryAsset(id) {
   }
   galleryAssetRequestPending = true
   transferChannel.send(JSON.stringify({ type: 'asset_request', id, quality: 'original' }))
+}
+
+function startGalleryPreview(header) {
+  currentPreview = {
+    id: header.id,
+    mimeType: header.mimeType || 'image/jpeg',
+    chunks: [],
+    bytes: 0,
+  }
+}
+
+function completeGalleryPreview(msg) {
+  if (!currentPreview) return
+  const preview = currentPreview
+  currentPreview = null
+  galleryPreviewRequestPending = false
+  const merged = new Uint8Array(preview.bytes)
+  let offset = 0
+  for (const chunk of preview.chunks) {
+    merged.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  galleryController?.handlePreviewData?.(msg.id || preview.id, merged, preview.mimeType)
+  const nextID = queuedGalleryPreviewID || queuedGalleryPreloadIDs.shift()
+  queuedGalleryPreviewID = ''
+  if (nextID) requestGalleryPreview(nextID)
 }
 
 function initFromURL() {
@@ -1265,6 +1357,9 @@ export const __test = {
   setGalleryController(controller) {
     galleryController = controller
   },
+  getCurrentFile() {
+    return currentFile
+  },
   getTransferSession() {
     return {
       transferChannel,
@@ -1275,6 +1370,7 @@ export const __test = {
   submitPassword,
   handleTransferClosure,
   handleError,
+  requestGalleryPreview,
   requestGalleryAsset,
   applyFinalDownloadState,
 }

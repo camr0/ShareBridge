@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +20,8 @@ const (
 	maxBuffer     = 256 * 1024 // 256KB
 	sleepInterval = 10 * time.Millisecond
 )
+
+const maxConcurrentGalleryThumbnails = 6
 
 const (
 	binaryFrameFileChunk = byte(0x10)
@@ -119,6 +123,8 @@ func (m *Manager) HandleMessage(data []byte) {
 		m.handleFileRequest(msg.Path)
 	case "asset_request":
 		m.handleAssetRequest(msg.ID, msg.Quality)
+	case "asset_preview_request":
+		m.handleAssetPreviewRequest(msg.ID, msg.Quality)
 	default:
 		m.sendError("unknown message type: " + msg.Type)
 	}
@@ -134,18 +140,92 @@ func (m *Manager) sendGallery() {
 		Type string `json:"type"`
 		Gallery
 	}{Type: "thumbnail_list", Gallery: gallery})
-	_ = m.dc.SendText(string(data))
+	log.Printf("transfer gallery: sending thumbnail_list items=%d bytes=%d", len(gallery.Items), len(data))
+	if err := m.dc.SendText(string(data)); err != nil {
+		log.Printf("transfer gallery: send thumbnail_list failed: %v", err)
+		return
+	}
+	log.Printf("transfer gallery: thumbnail_list sent items=%d", len(gallery.Items))
 
-	for i, item := range gallery.Items {
-		if i > 65535 {
-			break
+	sentThumbs, failedThumbs := m.sendGalleryThumbnails(context.Background(), gallery.Items)
+	log.Printf("transfer gallery: thumbnail stream finished sent=%d failed_fetch=%d", sentThumbs, failedThumbs)
+}
+
+type thumbnailJob struct {
+	index int
+	item  GalleryItem
+}
+
+type thumbnailResult struct {
+	index int
+	id    string
+	data  []byte
+	err   error
+}
+
+func (m *Manager) sendGalleryThumbnails(ctx context.Context, items []GalleryItem) (int, int) {
+	total := len(items)
+	if total > 65536 {
+		total = 65536
+	}
+	if total == 0 {
+		return 0, 0
+	}
+
+	workers := maxConcurrentGalleryThumbnails
+	if total < workers {
+		workers = total
+	}
+	jobs := make(chan thumbnailJob)
+	results := make(chan thumbnailResult, workers)
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				var buf bytes.Buffer
+				_, err := m.gallery.GetThumbnail(ctx, job.item.ID, &buf)
+				results <- thumbnailResult{
+					index: job.index,
+					id:    job.item.ID,
+					data:  buf.Bytes(),
+					err:   err,
+				}
+			}
+		}()
+	}
+
+	go func() {
+		for i := 0; i < total; i++ {
+			jobs <- thumbnailJob{index: i, item: items[i]}
 		}
-		var buf bytes.Buffer
-		if _, err := m.gallery.GetThumbnail(context.Background(), item.ID, &buf); err != nil {
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	sentThumbs := 0
+	failedThumbs := 0
+	sendFailed := false
+	for result := range results {
+		if result.err != nil {
+			failedThumbs++
+			log.Printf("transfer gallery: thumbnail fetch failed index=%d id=%s: %v", result.index, result.id, result.err)
 			continue
 		}
-		_ = m.sendWithBackpressure(encodeThumbnailFrame(uint16(i), buf.Bytes()))
+		if sendFailed {
+			continue
+		}
+		if err := m.sendWithBackpressure(encodeThumbnailFrame(uint16(result.index), result.data)); err != nil {
+			log.Printf("transfer gallery: thumbnail send failed index=%d id=%s bytes=%d: %v", result.index, result.id, len(result.data), err)
+			sendFailed = true
+			continue
+		}
+		sentThumbs++
 	}
+	return sentThumbs, failedThumbs
 }
 
 func (m *Manager) handleListRequest(subpath string) {
@@ -346,6 +426,48 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 	go m.streamAsset(id, quality)
 }
 
+func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
+	if id == "" {
+		m.sendError("asset id required")
+		return
+	}
+
+	quality, ok := normalizePreviewQuality(quality)
+	if !ok {
+		m.sendError("unsupported preview quality: " + quality)
+		return
+	}
+
+	if !m.acquireTransfer() {
+		return
+	}
+
+	if m.gallery == nil {
+		m.releaseTransfer()
+		m.sendError("share unavailable: client not initialized")
+		return
+	}
+
+	header := struct {
+		Type           string `json:"type"`
+		ID             string `json:"id"`
+		MimeType       string `json:"mimeType"`
+		BinaryEnvelope bool   `json:"binary_envelope"`
+	}{
+		Type:           "asset_preview_header",
+		ID:             id,
+		MimeType:       "image/jpeg",
+		BinaryEnvelope: true,
+	}
+	headerData, _ := json.Marshal(header)
+	if err := m.dc.SendText(string(headerData)); err != nil {
+		m.releaseTransfer()
+		return
+	}
+
+	go m.streamAssetPreview(id, quality)
+}
+
 func (m *Manager) streamFile(filePath string) {
 	defer func() { m.transfer.Store(false) }()
 
@@ -445,6 +567,41 @@ func (m *Manager) streamAsset(id string, quality string) {
 	}
 }
 
+func (m *Manager) streamAssetPreview(id string, quality string) {
+	defer func() { m.transfer.Store(false) }()
+
+	pr, pw := io.Pipe()
+	defer pr.Close()
+
+	go func() {
+		_, err := m.gallery.GetAsset(context.Background(), id, quality, pw)
+		pw.CloseWithError(err)
+	}()
+
+	buf := make([]byte, chunkSize)
+	for {
+		n, err := pr.Read(buf)
+		if n > 0 {
+			if err := m.sendWithBackpressure(encodeFileChunkFrame(buf[:n])); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				m.sendError("preview failed: " + err.Error())
+			}
+			break
+		}
+	}
+
+	end := struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}{Type: "asset_preview_end", ID: id}
+	endData, _ := json.Marshal(end)
+	m.dc.SendText(string(endData))
+}
+
 func resolveRequestPath(dir string, fileInfo *cloudwebdav.FileInfo) string {
 	if fileInfo.RequestPath == "" {
 		return ""
@@ -477,6 +634,15 @@ func normalizeAssetQuality(quality string) (string, bool) {
 		return "original", true
 	case "thumbnail":
 		return "thumbnail", true
+	default:
+		return quality, false
+	}
+}
+
+func normalizePreviewQuality(quality string) (string, bool) {
+	switch quality {
+	case "", "preview":
+		return "preview", true
 	default:
 		return quality, false
 	}

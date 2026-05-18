@@ -14,7 +14,7 @@
 
 **New files:**
 - `agent/internal/immich/client.go` — Immich shared-link client, polling client, SSRF host validation, asset metadata normalization, password validation.
-- `agent/internal/immich/client_test.go` — `httptest.Server` coverage for URL validation, shared-link polling, password query handling, thumbnail streaming, asset downloads, and base64 SHA-1 decoding.
+- `agent/internal/immich/client_test.go` — `httptest.Server` coverage for URL validation, shared-link polling, password login cookie handling, thumbnail streaming, asset downloads, and base64 SHA-1 decoding.
 - `signaling-server/migrations/6_add_immich_session_fields.go` — adds `share_type` and `is_password_protected` to `sessions`.
 - `signaling-server/web/src/gallery.js` — gallery-mode state machine and DOM rendering for `thumbnail_list`, `thumbnail_data`, and `asset_request`.
 - `signaling-server/web/src/gallery.test.js` — gallery-mode unit tests.
@@ -52,12 +52,13 @@
 
 ## External API Notes
 
-- The Immich docs currently show `getMySharedLink` accepting `key` and `password` query parameters, with shared-link response metadata including album fields, assets, key, password flag, and `allowDownload`.
+- Current Immich releases use `GET /api/shared-links/me?key={key}` for shared-link metadata. Password validation is `POST /api/shared-links/login?key={key}` with a JSON password body; the agent stores the returned `immich_shared_link_token` cookie in memory for subsequent metadata requests.
+- For album shared links, newer Immich may return album metadata without expanded top-level `assets`; the agent falls back to `GET /api/timeline/buckets?key={key}&albumId={albumId}` and `GET /api/timeline/bucket?key={key}&albumId={albumId}&timeBucket={bucket}` to enumerate public album assets.
 - Current docs/archive pages show `downloadAsset` accepts asset `id` as a path parameter and `key` as a query parameter.
-- The plan intentionally includes an early verification step against a local or target Immich instance because Immich API paths have shifted across versions.
+- The original archived docs for `getMySharedLink` used `/api/shared-links/my-share` and `password` query parameters. That path returns `403 Forbidden` on newer Immich because it is treated as a protected share-id route.
 
 References used while writing this plan:
-- `https://v1.107.2.archive.immich.app/docs/api/get-my-shared-link/`
+- `https://github.com/immich-app/immich/blob/main/server/src/controllers/shared-link.controller.ts`
 - `https://v1.105.1.archive.immich.app/docs/api/get-all-shared-links/`
 - `https://pr-15149.preview.immich.app/docs/api/download-asset/`
 
@@ -1011,11 +1012,14 @@ func TestPollSharesUsesAPIKeyAndNormalizesProtection(t *testing.T) {
 	require.True(t, shares[1].IsPasswordProtected())
 }
 
-func TestValidatePasswordSendsPasswordQueryParam(t *testing.T) {
+func TestValidatePasswordPostsLoginAndStoresCookie(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/api/shared-links/my-share", r.URL.Path)
+		require.Equal(t, "/api/shared-links/login", r.URL.Path)
 		require.Equal(t, "sharekey", r.URL.Query().Get("key"))
-		require.Equal(t, "secret", r.URL.Query().Get("password"))
+		var body map[string]string
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, "secret", body["password"])
+		http.SetCookie(w, &http.Cookie{Name: "immich_shared_link_token", Value: "auth-token"})
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"key":"sharekey","assets":[]}`))
 	}))
@@ -1031,7 +1035,7 @@ func TestValidatePasswordSendsPasswordQueryParam(t *testing.T) {
 func TestListFilesConvertsImmichAssetsToGalleryItems(t *testing.T) {
 	sha := bytes.Repeat([]byte{0xab}, 20)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/api/shared-links/my-share", r.URL.Path)
+		require.Equal(t, "/api/shared-links/me", r.URL.Path)
 		_ = json.NewEncoder(w).Encode(SharedLink{
 			Key: "sharekey",
 			Album: &Album{Name: "Summer", Description: "Beach"},
@@ -1157,13 +1161,18 @@ type GalleryItem struct {
 Implement `New`, host validation, `PollShares`, `ValidatePassword`, `ListGallery`, `GetThumbnail`, and `GetFile` with these paths:
 
 ```go
-func (c *Client) sharedLinkURL(password string) string {
-	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/shared-links/my-share"})
+func (c *Client) sharedLinkURL() string {
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/shared-links/me"})
 	q := u.Query()
 	q.Set("key", c.shareKey)
-	if password != "" {
-		q.Set("password", password)
-	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func (c *Client) sharedLinkLoginURL() string {
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/shared-links/login"})
+	q := u.Query()
+	q.Set("key", c.shareKey)
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -2236,7 +2245,9 @@ If implementation verified paths differ from the spec, update `docs/superpowers/
 
 ```markdown
 Implementation verified against the target Immich version used for testing:
-- Shared link info: `GET /api/shared-links/my-share?key={key}&password={password}`
+- Shared link info: `GET /api/shared-links/me?key={key}`
+- Album asset IDs: `GET /api/timeline/buckets?key={key}&albumId={albumId}` and `GET /api/timeline/bucket?key={key}&albumId={albumId}&timeBucket={bucket}` when `/shared-links/me` has no expanded `assets`
+- Password validation: `POST /api/shared-links/login?key={key}` with JSON body `{"password":"..."}`; store returned `immich_shared_link_token` cookie in memory
 - Share polling: `GET /api/shared-links` with `x-api-key`
 - Thumbnail: `GET /api/assets/{id}/thumbnail?key={key}`
 - Asset download: `GET /api/assets/{id}/original?key={key}` or the verified download endpoint

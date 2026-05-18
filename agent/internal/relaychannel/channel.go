@@ -32,6 +32,10 @@ type SecureRelayChannel struct {
 	onClose   func()
 }
 
+// relayWebSocketReadLimit matches the relay transport frame cap with room for
+// framing and Noise overhead.
+const relayWebSocketReadLimit = 10 * 1024 * 1024
+
 func NewSecureRelayChannel(cfg SecureRelayConfig) (*SecureRelayChannel, error) {
 	if cfg.RelayURL == "" || cfg.RelayJWT == "" || cfg.StaticPrivate == nil {
 		return nil, fmt.Errorf("relaychannel: missing required config")
@@ -49,6 +53,7 @@ func (c *SecureRelayChannel) Start(ctx context.Context) error {
 		return fmt.Errorf("dial relay websocket: %w", err)
 	}
 	c.conn = conn
+	c.conn.SetReadLimit(relayWebSocketReadLimit)
 	log.Printf("relaychannel: connected to relay at %s", c.cfg.RelayURL)
 
 	hello, _ := json.Marshal(map[string]string{"token": c.cfg.RelayJWT})
@@ -134,19 +139,23 @@ func (c *SecureRelayChannel) readLoop(ctx context.Context) {
 	for {
 		_, data, err := c.conn.Read(ctx)
 		if err != nil {
+			log.Printf("relaychannel: read loop ended: %v", err)
 			return
 		}
 		frame, _, err := DecodeOneFrame(data)
 		if err != nil {
+			log.Printf("relaychannel: invalid relay frame bytes=%d: %v", len(data), err)
 			c.conn.Close(websocket.StatusPolicyViolation, "invalid relay frame")
 			return
 		}
 		if frame.Kind != FrameText && frame.Kind != FrameBinary {
+			log.Printf("relaychannel: unexpected relay frame kind=0x%02x", frame.Kind)
 			c.conn.Close(websocket.StatusPolicyViolation, "unexpected relay frame kind")
 			return
 		}
 		plain, err := c.recv.Decrypt(nil, frame.Payload)
 		if err != nil {
+			log.Printf("relaychannel: decrypt failed frame_kind=0x%02x ciphertext_bytes=%d: %v", frame.Kind, len(frame.Payload), err)
 			c.conn.Close(websocket.StatusPolicyViolation, "relay decrypt failed")
 			return
 		}
@@ -179,13 +188,19 @@ func (c *SecureRelayChannel) sendFrame(kind byte, plaintext []byte) error {
 
 	ciphertext, err := c.send.Encrypt(nil, plaintext)
 	if err != nil {
+		log.Printf("relaychannel: encrypt failed kind=0x%02x plaintext_bytes=%d: %v", kind, len(plaintext), err)
 		return err
 	}
 	frame, err := WriteFrame(kind, ciphertext)
 	if err != nil {
+		log.Printf("relaychannel: frame encode failed kind=0x%02x ciphertext_bytes=%d: %v", kind, len(ciphertext), err)
 		return err
 	}
-	return c.conn.Write(context.Background(), websocket.MessageBinary, frame)
+	if err := c.conn.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		log.Printf("relaychannel: write failed kind=0x%02x plaintext_bytes=%d ciphertext_bytes=%d frame_bytes=%d: %v", kind, len(plaintext), len(ciphertext), len(frame), err)
+		return err
+	}
+	return nil
 }
 
 func decodeFramePayload(raw []byte, wantKind byte) ([]byte, error) {

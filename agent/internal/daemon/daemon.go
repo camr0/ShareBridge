@@ -102,6 +102,8 @@ func (a immichTransferAdapter) GetAsset(ctx context.Context, id string, quality 
 	switch quality {
 	case "", "original":
 		return a.client.GetFile(ctx, id, w)
+	case "preview":
+		return a.client.GetPreview(ctx, id, w)
 	case "thumbnail":
 		return a.client.GetThumbnail(ctx, id, w)
 	default:

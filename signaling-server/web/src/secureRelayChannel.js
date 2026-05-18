@@ -55,6 +55,7 @@ export class SecureRelayChannel {
     await new Promise((resolve, reject) => {
       const handleOpen = async () => {
         debugLog('WebSocket open event fired')
+        this._socket.removeEventListener('close', handleClose)
         try {
           this._socket.send(new TextEncoder().encode(JSON.stringify({ token: this._relayToken })))
           debugLog('Hello token sent')

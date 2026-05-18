@@ -112,3 +112,36 @@ test('SecureRelayChannel fails closed on responder static-key mismatch', async (
 
   await assert.rejects(() => started, /unexpected agent static key/i)
 })
+
+test('SecureRelayChannel removes first-phase close handler after websocket opens', async () => {
+  const socket = createMockRelaySocket()
+  const responderStatic = await generateKeypair()
+  const responder = await NoiseXX.createResponder(responderStatic.privateKey, responderStatic.publicKeyBytes)
+  let closeCalls = 0
+  const channel = new SecureRelayChannel({
+    relayURL: 'ws://relay.test/ws/relay',
+    relayToken: 'browser-jwt',
+    expectedStaticPub: responderStatic.publicKeyBytes,
+    websocketFactory: () => socket,
+  })
+  channel.onclose = () => {
+    closeCalls += 1
+  }
+
+  socket.readyState = 1
+  const started = channel.start()
+  await socket.waitForSentCount(2)
+
+  const decoder = new FrameDecoder()
+  const [{ payload: msg1 }] = [...decoder.push(socket.sent[1])]
+  await responder.readMessage1(msg1)
+  socket.pushMessage(writeFrame(FRAME_HANDSHAKE, await responder.writeMessage2()))
+  await socket.waitForSentCount(3)
+
+  const [{ payload: msg3 }] = [...decoder.push(socket.sent[2])]
+  await responder.readMessage3(msg3)
+  await started
+
+  socket.close()
+  assert.equal(closeCalls, 0)
+})

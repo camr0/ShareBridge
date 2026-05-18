@@ -111,6 +111,48 @@ test('relay_policy with relay_allowed false preserves the quota-exceeded user me
   assert.match(statuses.at(-1), /quota exceeded/i)
 })
 
+test('stale transfer channel close does not reset a newer relay session', async () => {
+  const statuses = []
+  const sends = []
+  const channels = [
+    {
+      readyState: 'open',
+      bufferedAmount: 0,
+      onopen: null,
+      onmessage: null,
+      onclose: null,
+      send(text) { sends.push(['first', text]) },
+      close() {},
+    },
+    {
+      readyState: 'open',
+      bufferedAmount: 0,
+      onopen: null,
+      onmessage: null,
+      onclose: null,
+      send(text) { sends.push(['second', text]) },
+      close() {},
+    },
+  ]
+  let connectCount = 0
+  const controller = installSessionMessageHandler({
+    updateStatus: (msg) => statuses.push(msg),
+    connectTransferChannel: async () => ({ channel: channels[connectCount++], mode: 'relay' }),
+    requestFileList: (channel, path) => channel.send(JSON.stringify({ type: 'list_request', path })),
+    applyConnectionBadge: ({ mode }) => statuses.push(`badge:${mode}`),
+    decodeRelayPolicyToken: () => ({ relayOnly: true, relayAllowed: true, expectedStaticPubHex: '00' }),
+    hideSection: () => {},
+  })
+
+  await controller.handleMessage({ type: 'relay_policy', token: 'jwt', relay_allowed: true, relay_only: true })
+  await controller.handleMessage({ type: 'relay_policy', token: 'jwt', relay_allowed: true, relay_only: true })
+
+  statuses.length = 0
+  channels[0].readyState = 'closed'
+  channels[0].onclose()
+  assert.deepEqual(statuses, [])
+})
+
 test('relay_only ice_config skips direct peer creation and leaves initial knock to the server', () => {
   const sent = []
   let createCalls = 0
@@ -680,6 +722,112 @@ test('requestGalleryAsset ignores repeated requests while one is pending', async
 
     assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3'])
     await __test.handleError({ message: 'cleanup' })
+    __test.setTransferSession({ channel: null, mode: null })
+  })
+})
+
+test('requestGalleryPreview streams preview data into the gallery controller without starting a download', async () => {
+  await withMinimalDocument(async () => {
+    const sends = []
+    const previews = []
+    __test.setTransferSession({ channel: { send: (text) => sends.push(text) }, mode: 'relay' })
+    __test.setGalleryController({
+      handlePreviewData(id, payload, mimeType) {
+        previews.push({ id, payload: Array.from(payload), mimeType })
+      },
+    })
+
+    __test.requestGalleryPreview('asset-1')
+
+    assert.deepEqual(sends.map((text) => JSON.parse(text)), [
+      { type: 'asset_preview_request', id: 'asset-1', quality: 'preview' },
+    ])
+
+    await __test.handleTransferMessage({
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true }),
+    })
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1, 2]).buffer })
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 3]).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1' }) })
+
+    assert.deepEqual(previews, [{ id: 'asset-1', payload: [1, 2, 3], mimeType: 'image/jpeg' }])
+    assert.equal(__test.getCurrentFile(), null)
+
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channel: null, mode: null })
+  })
+})
+
+test('requestGalleryPreview queues the latest preview while another preview is streaming', async () => {
+  await withMinimalDocument(async () => {
+    const sends = []
+    const previews = []
+    __test.setTransferSession({ channel: { send: (text) => sends.push(text) }, mode: 'relay' })
+    __test.setGalleryController({
+      handlePreviewData(id, payload) {
+        previews.push({ id, payload: Array.from(payload) })
+      },
+    })
+
+    __test.requestGalleryPreview('asset-1')
+    __test.requestGalleryPreview('asset-2')
+    __test.requestGalleryPreview('asset-3')
+
+    assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1'])
+
+    await __test.handleTransferMessage({
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true }),
+    })
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1]).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1' }) })
+
+    assert.deepEqual(previews, [{ id: 'asset-1', payload: [1] }])
+    assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3'])
+
+    await __test.handleTransferMessage({
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-3', mimeType: 'image/jpeg', binary_envelope: true }),
+    })
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 3]).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-3' }) })
+
+    assert.deepEqual(previews, [
+      { id: 'asset-1', payload: [1] },
+      { id: 'asset-3', payload: [3] },
+    ])
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channel: null, mode: null })
+  })
+})
+
+test('requestGalleryPreview prioritizes active previews over queued preloads', async () => {
+  await withMinimalDocument(async () => {
+    const sends = []
+    __test.setTransferSession({ channel: { send: (text) => sends.push(text) }, mode: 'relay' })
+    __test.setGalleryController({ handlePreviewData() {} })
+
+    __test.requestGalleryPreview('asset-1', { priority: 'active' })
+    __test.requestGalleryPreview('asset-0', { priority: 'preload' })
+    __test.requestGalleryPreview('asset-2', { priority: 'preload' })
+    __test.requestGalleryPreview('asset-3', { priority: 'active' })
+
+    assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1'])
+
+    await __test.handleTransferMessage({
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true }),
+    })
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1]).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1' }) })
+
+    assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3'])
+
+    await __test.handleTransferMessage({
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-3', mimeType: 'image/jpeg', binary_envelope: true }),
+    })
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 3]).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-3' }) })
+
+    assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3', 'asset-0'])
+    __test.setGalleryController(null)
     __test.setTransferSession({ channel: null, mode: null })
   })
 })
