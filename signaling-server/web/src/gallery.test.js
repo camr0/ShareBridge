@@ -71,7 +71,7 @@ test('gallery item clicks request the active preview and neighboring preloads', 
     root,
     createObjectURL: () => 'blob:thumb',
     revokeObjectURL: () => {},
-    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority }),
+    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority, quality: opts?.quality }),
   })
 
   controller.handleThumbnailList({
@@ -92,9 +92,9 @@ test('gallery item clicks request the active preview and neighboring preloads', 
   })
 
   assert.deepEqual(previewed, [
-    { id: 'asset-2', priority: 'active' },
-    { id: 'asset-1', priority: 'preload' },
-    { id: 'asset-3', priority: 'preload' },
+    { id: 'asset-2', priority: 'active', quality: 'original' },
+    { id: 'asset-1', priority: 'preload', quality: 'preview' },
+    { id: 'asset-3', priority: 'preload', quality: 'preview' },
   ])
 })
 
@@ -291,7 +291,7 @@ test('gallery requests active and neighboring previews when lightGallery slide c
     lightGallery: () => ({ refresh() {}, destroy() {} }),
     createObjectURL: () => 'blob:thumb',
     revokeObjectURL: () => {},
-    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority }),
+    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority, quality: opts?.quality }),
   })
 
   controller.handleThumbnailList({
@@ -305,9 +305,9 @@ test('gallery requests active and neighboring previews when lightGallery slide c
   slideHandler?.({ detail: { index: 1 } })
 
   assert.deepEqual(previewed, [
-    { id: 'asset-2', priority: 'active' },
-    { id: 'asset-1', priority: 'preload' },
-    { id: 'asset-3', priority: 'preload' },
+    { id: 'asset-2', priority: 'active', quality: 'original' },
+    { id: 'asset-1', priority: 'preload', quality: 'preview' },
+    { id: 'asset-3', priority: 'preload', quality: 'preview' },
   ])
   assert.equal(controller.state.activePreviewID, 'asset-2')
 })
@@ -333,7 +333,7 @@ test('gallery starts preview work before slide transition completes without dupl
     lightGallery: () => ({ refresh() {}, destroy() {} }),
     createObjectURL: () => 'blob:thumb',
     revokeObjectURL: () => {},
-    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority }),
+    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority, quality: opts?.quality }),
   })
 
   controller.handleThumbnailList({
@@ -349,17 +349,17 @@ test('gallery starts preview work before slide transition completes without dupl
 
   beforeSlideHandler({ detail: { index: 1 } })
   assert.deepEqual(previewed, [
-    { id: 'asset-2', priority: 'active' },
-    { id: 'asset-1', priority: 'preload' },
-    { id: 'asset-3', priority: 'preload' },
+    { id: 'asset-2', priority: 'active', quality: 'original' },
+    { id: 'asset-1', priority: 'preload', quality: 'preview' },
+    { id: 'asset-3', priority: 'preload', quality: 'preview' },
   ])
 
   afterSlideHandler({ detail: { index: 1 } })
 
   assert.deepEqual(previewed, [
-    { id: 'asset-2', priority: 'active' },
-    { id: 'asset-1', priority: 'preload' },
-    { id: 'asset-3', priority: 'preload' },
+    { id: 'asset-2', priority: 'active', quality: 'original' },
+    { id: 'asset-1', priority: 'preload', quality: 'preview' },
+    { id: 'asset-3', priority: 'preload', quality: 'preview' },
   ])
   assert.equal(controller.state.activePreviewID, 'asset-2')
 })
@@ -397,7 +397,7 @@ test('gallery uses an already preloaded preview when swiping to that slide', () 
         return null
       },
     },
-    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority }),
+    onPreviewRequest: (id, opts) => previewed.push({ id, priority: opts?.priority, quality: opts?.quality }),
   })
 
   controller.handleThumbnailList({
@@ -415,7 +415,8 @@ test('gallery uses an already preloaded preview when swiping to that slide', () 
 
   assert.equal(activeImage.src, 'blob:preview-1')
   assert.deepEqual(previewed, [
-    { id: 'asset-1', priority: 'preload' },
+    { id: 'asset-2', priority: 'active', quality: 'original' },
+    { id: 'asset-1', priority: 'preload', quality: 'preview' },
   ])
   assert.equal(controller.state.activePreviewID, 'asset-2')
 })

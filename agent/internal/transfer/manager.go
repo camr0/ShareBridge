@@ -641,8 +641,8 @@ func normalizeAssetQuality(quality string) (string, bool) {
 
 func normalizePreviewQuality(quality string) (string, bool) {
 	switch quality {
-	case "", "preview":
-		return "preview", true
+	case "", "preview", "original":
+		return quality, true
 	default:
 		return quality, false
 	}
