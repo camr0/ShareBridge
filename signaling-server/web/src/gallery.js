@@ -92,8 +92,8 @@ export function createGalleryController({
     state.previewRequests.delete(id)
 
     if (mimeType?.startsWith('video/')) {
-      // payload is a MediaSource object URL string, not binary data
-      const url = payload
+      const blob = new Blob([payload], { type: mimeType })
+      const url = createObjectURL(blob)
       const previousUrl = state.urls.get(`preview:${id}`)
       if (previousUrl) revokeObjectURL(previousUrl)
       state.urls.set(`preview:${id}`, url)
