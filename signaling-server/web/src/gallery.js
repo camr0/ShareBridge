@@ -147,12 +147,14 @@ export function createGalleryController({
     if (!grid) return
     state.lightbox = lightGallery(grid, { selector: '.gallery-item', download: false })
     state.lightboxGrid = grid
+    grid.addEventListener?.('lgAfterOpen', handleLightboxSlide)
     grid.addEventListener?.('lgBeforeSlide', handleLightboxSlide)
     grid.addEventListener?.('lgAfterSlide', handleLightboxSlide)
   }
 
   function destroyLightbox() {
     cancelLightboxRefresh()
+    state.lightboxGrid?.removeEventListener?.('lgAfterOpen', handleLightboxSlide)
     state.lightboxGrid?.removeEventListener?.('lgBeforeSlide', handleLightboxSlide)
     state.lightboxGrid?.removeEventListener?.('lgAfterSlide', handleLightboxSlide)
     state.lightboxGrid = null
