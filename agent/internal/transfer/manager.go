@@ -438,6 +438,11 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 		return
 	}
 
+	mimeType := "image/jpeg"
+	if quality == "video" {
+		mimeType = "video/mp4"
+	}
+
 	header := struct {
 		Type           string `json:"type"`
 		ID             string `json:"id"`
@@ -446,7 +451,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 	}{
 		Type:           "asset_preview_header",
 		ID:             id,
-		MimeType:       "image/jpeg",
+		MimeType:       mimeType,
 		BinaryEnvelope: true,
 	}
 	headerData, _ := json.Marshal(header)
@@ -624,6 +629,8 @@ func normalizeAssetQuality(quality string) (string, bool) {
 		return "original", true
 	case "thumbnail":
 		return "thumbnail", true
+	case "video":
+		return "video", true
 	default:
 		return quality, false
 	}
@@ -633,6 +640,8 @@ func normalizePreviewQuality(quality string) (string, bool) {
 	switch quality {
 	case "", "preview":
 		return "preview", true
+	case "video":
+		return "video", true
 	default:
 		return quality, false
 	}
