@@ -90,6 +90,31 @@ export function createGalleryController({
 
   function handlePreviewData(id, payload, mimeType = 'image/jpeg') {
     state.previewRequests.delete(id)
+
+    if (mimeType?.startsWith('video/')) {
+      // payload is a MediaSource object URL string, not binary data
+      const url = payload
+      const previousUrl = state.urls.get(`preview:${id}`)
+      if (previousUrl) revokeObjectURL(previousUrl)
+      state.urls.set(`preview:${id}`, url)
+
+      const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)
+      if (galleryItem?.dataset) {
+        const videoSrc = JSON.stringify([{ src: url, type: mimeType }])
+        galleryItem.dataset.video = videoSrc
+        galleryItem.dataset.src = url
+        galleryItem.dataset.downloadUrl = 'false'
+        scheduleLightboxRefresh()
+      }
+
+      updateLightboxItemVideo(id, url, mimeType)
+
+      if (state.activePreviewID === id) {
+        updateActiveLightboxVideo(url)
+      }
+      return
+    }
+
     const blob = new Blob([payload], { type: mimeType })
     const url = createObjectURL(blob)
     const previousUrl = state.urls.get(`preview:${id}`)
@@ -187,8 +212,9 @@ export function createGalleryController({
 
   function requestPreviewForItem(item, priority) {
     if (!item || state.urls.has(`preview:${item.id}`) || state.previewRequests.has(item.id)) return
+    if (priority === 'preload' && item.mimeType?.startsWith('video/')) return
     state.previewRequests.add(item.id)
-    onPreviewRequest?.(item.id, { priority })
+    onPreviewRequest?.(item.id, { priority, mimeType: item.mimeType })
   }
 
   function updateActiveLightboxImage(url) {
@@ -205,6 +231,39 @@ export function createGalleryController({
     }
     const renderedImages = lightboxRoot?.querySelectorAll?.(`.lg-object[data-index="${index}"]`) || []
     for (const image of renderedImages) image.src = url
+  }
+
+  function updateActiveLightboxVideo(url) {
+    const activeVideo = lightboxRoot?.querySelector?.('.lg-current video.lg-video, .lg-current .lg-video-cont video')
+    if (activeVideo) {
+      activeVideo.src = url
+      return
+    }
+    const imgWrap = lightboxRoot?.querySelector?.('.lg-current .lg-img-wrap')
+    if (!imgWrap) return
+    imgWrap.innerHTML = ''
+    const video = document.createElement('video')
+    video.className = 'lg-object lg-video'
+    video.src = url
+    video.controls = true
+    video.autoplay = true
+    video.muted = true
+    video.playsInline = true
+    video.setAttribute('playsinline', '')
+    video.style.maxWidth = '100%'
+    video.style.maxHeight = '100%'
+    video.style.display = 'block'
+    imgWrap.appendChild(video)
+  }
+
+  function updateLightboxItemVideo(id, url, mimeType) {
+    const index = state.items.findIndex((item) => item.id === id)
+    if (index < 0) return
+    if (state.lightbox?.galleryItems?.[index]) {
+      state.lightbox.galleryItems[index].src = url
+      state.lightbox.galleryItems[index].video = JSON.stringify([{ src: url, type: mimeType }])
+      state.lightbox.galleryItems[index].downloadUrl = 'false'
+    }
   }
 
   function ensureLightboxDownloadButton() {
@@ -264,8 +323,11 @@ function renderItem(item) {
   const name = item.name || 'Untitled asset'
   const isVideo = item.mimeType?.startsWith('video/')
   const duration = isVideo ? formatDuration(item.duration) : ''
+  const videoAttr = isVideo
+    ? ` data-video='[{"src":"${LIGHTBOX_PLACEHOLDER_SRC}","type":"video/mp4"}]'`
+    : ''
   return `
-    <button class="gallery-item" type="button" data-gallery-id="${escapeHTML(item.id)}" data-src="${LIGHTBOX_PLACEHOLDER_SRC}" data-download-url="${LIGHTBOX_PLACEHOLDER_SRC}" aria-label="Open ${escapeHTML(name)}">
+    <button class="gallery-item" type="button" data-gallery-id="${escapeHTML(item.id)}" data-src="${LIGHTBOX_PLACEHOLDER_SRC}" data-download-url="${LIGHTBOX_PLACEHOLDER_SRC}"${videoAttr} aria-label="Open ${escapeHTML(name)}">
       <img data-thumb-id="${escapeHTML(item.id)}" alt="${escapeHTML(name)}" loading="lazy" decoding="async">
       <span class="gallery-download" role="button" tabindex="0" data-gallery-id="${escapeHTML(item.id)}" aria-label="Download ${escapeHTML(name)}">↓</span>
       ${duration ? `<span class="gallery-duration">${escapeHTML(duration)}</span>` : ''}

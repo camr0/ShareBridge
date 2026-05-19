@@ -56,6 +56,8 @@ let galleryPreviewRequestPending = false
 let queuedGalleryPreviewID = ''
 let queuedGalleryPreloadIDs = []
 let currentPreview = null
+let currentVideoPreview = null
+// { id, mediaSource, sourceBuffer, url, pendingChunks, sourceBufferUpdating, ended }
 let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
@@ -693,6 +695,11 @@ async function handleTransferMessage(event) {
       return
     }
 
+    if (currentVideoPreview) {
+      feedSourceBufferToVideoPreview(currentVideoPreview, frame.payload)
+      return
+    }
+
     if (currentPreview) {
       currentPreview.chunks.push(frame.payload)
       currentPreview.bytes += frame.payload.byteLength
@@ -720,7 +727,11 @@ async function handleTransferMessage(event) {
       await startDownload(msg)
       break
     case 'asset_preview_header':
-      startGalleryPreview(msg)
+      if (msg.mimeType?.startsWith('video/')) {
+        startVideoPreview(msg)
+      } else {
+        startGalleryPreview(msg)
+      }
       break
     case 'asset_preview_end':
       completeGalleryPreview(msg)
@@ -1142,6 +1153,7 @@ async function handleError(msg) {
   queuedGalleryPreviewID = ''
   queuedGalleryPreloadIDs = []
   currentPreview = null
+  cleanupCurrentVideoPreview()
   updateStatus('Error: ' + message)
 }
 
@@ -1156,12 +1168,22 @@ async function handleTransferClosure() {
   resetUI()
 }
 
+function cleanupCurrentVideoPreview() {
+  if (!currentVideoPreview) return
+  if (currentVideoPreview.mediaSource.readyState === 'open') {
+    try { currentVideoPreview.mediaSource.endOfStream('network') } catch (_) {}
+  }
+  URL.revokeObjectURL(currentVideoPreview.url)
+  currentVideoPreview = null
+}
+
 function clearClosedTransferSession() {
   galleryAssetRequestPending = false
   galleryPreviewRequestPending = false
   queuedGalleryPreviewID = ''
   queuedGalleryPreloadIDs = []
   currentPreview = null
+  cleanupCurrentVideoPreview()
   transferChannel = null
   currentTransferMode = null
   getConnectionStatusEl().classList.add('hidden')
@@ -1189,6 +1211,7 @@ function resetUI() {
   document.getElementById('password-input').disabled = false
   document.querySelector('#password-section button').disabled = false
   renderDownloadWarning(null)
+  cleanupCurrentVideoPreview()
   activeDownload = null
   currentFile = null
   galleryAssetRequestPending = false
@@ -1246,7 +1269,7 @@ function ensureGalleryController() {
   return galleryController
 }
 
-function requestGalleryPreview(id, { priority = 'active' } = {}) {
+function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) {
   if (galleryPreviewRequestPending) {
     if (priority === 'active') {
       queuedGalleryPreviewID = id
@@ -1261,7 +1284,8 @@ function requestGalleryPreview(id, { priority = 'active' } = {}) {
     return
   }
   galleryPreviewRequestPending = true
-  transferChannel.send(JSON.stringify({ type: 'asset_preview_request', id, quality: 'preview' }))
+  const quality = mimeType?.startsWith('video/') ? 'video' : 'preview'
+  transferChannel.send(JSON.stringify({ type: 'asset_preview_request', id, quality }))
 }
 
 function queueGalleryPreload(id) {
@@ -1294,7 +1318,98 @@ function startGalleryPreview(header) {
   }
 }
 
+function startVideoPreview(header) {
+  const mediaSource = new MediaSource()
+  const url = URL.createObjectURL(mediaSource)
+
+  const vp = {
+    id: header.id,
+    mediaSource,
+    sourceBuffer: null,
+    url,
+    pendingChunks: [],
+    sourceBufferUpdating: false,
+    ended: false,
+  }
+
+  mediaSource.addEventListener('sourceopen', () => {
+    const codecs = [
+      'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+      'video/mp4; codecs="avc1.4D401E, mp4a.40.2"',
+      'video/mp4; codecs="avc1.64001E, mp4a.40.2"',
+      'video/mp4',
+    ]
+    let sb = null
+    for (const mime of codecs) {
+      if (MediaSource.isTypeSupported(mime)) {
+        try { sb = mediaSource.addSourceBuffer(mime); break } catch (_) { /* try next */ }
+      }
+    }
+    if (!sb) {
+      mediaSource.endOfStream('network')
+      return
+    }
+    vp.sourceBuffer = sb
+    sb.addEventListener('updateend', () => {
+      vp.sourceBufferUpdating = false
+      drainPendingVideoChunks(vp)
+    })
+    drainPendingVideoChunks(vp)
+  })
+
+  mediaSource.addEventListener('sourceended', () => {
+    URL.revokeObjectURL(url)
+  })
+
+  currentVideoPreview = vp
+  galleryController?.handlePreviewData?.(header.id, url, 'video/mp4')
+}
+
+function feedSourceBufferToVideoPreview(vp, chunk) {
+  if (vp.ended) return
+  if (!vp.sourceBuffer || vp.sourceBufferUpdating) {
+    vp.pendingChunks.push(chunk)
+    return
+  }
+  try {
+    vp.sourceBufferUpdating = true
+    vp.sourceBuffer.appendBuffer(chunk)
+  } catch (_) {
+    vp.pendingChunks.push(chunk)
+    vp.sourceBufferUpdating = false
+  }
+}
+
+function drainPendingVideoChunks(vp) {
+  if (vp.ended) return
+  while (vp.pendingChunks.length > 0 && !vp.sourceBufferUpdating && vp.sourceBuffer) {
+    try {
+      vp.sourceBufferUpdating = true
+      vp.sourceBuffer.appendBuffer(vp.pendingChunks.shift())
+    } catch (_) {
+      vp.sourceBufferUpdating = false
+      break
+    }
+  }
+  if (vp.ended && vp.pendingChunks.length === 0 && !vp.sourceBufferUpdating) {
+    try { vp.mediaSource.endOfStream() } catch (_) {}
+  }
+}
+
 function completeGalleryPreview(msg) {
+  if (currentVideoPreview && currentVideoPreview.id === msg.id) {
+    const vp = currentVideoPreview
+    vp.ended = true
+    if (!vp.sourceBufferUpdating && vp.pendingChunks.length === 0) {
+      try { vp.mediaSource.endOfStream() } catch (_) {}
+    }
+    galleryPreviewRequestPending = false
+    const nextID = queuedGalleryPreviewID || queuedGalleryPreloadIDs.shift()
+    queuedGalleryPreviewID = ''
+    if (nextID) requestGalleryPreview(nextID)
+    return
+  }
+
   if (!currentPreview) return
   const preview = currentPreview
   currentPreview = null
