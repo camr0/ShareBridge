@@ -202,10 +202,19 @@ export function createGalleryController({
     if (!item) return
     state.activePreviewID = item.id
     ensureLightboxDownloadButton()
+    const isVideo = item.mimeType?.startsWith('video/')
     const existingPreviewUrl = state.urls.get(`preview:${item.id}`)
     if (existingPreviewUrl) {
-      updateActiveLightboxImage(existingPreviewUrl)
+      if (isVideo) {
+        updateActiveLightboxVideo(existingPreviewUrl)
+      } else {
+        updateActiveLightboxImage(existingPreviewUrl)
+      }
     } else {
+      const thumbUrl = state.urls.get(`thumb:${item.id}`)
+      if (isVideo && thumbUrl) {
+        updateActiveLightboxVideo(thumbUrl, true)
+      }
       requestPreviewForItem(item, 'active')
     }
     requestPreviewForItem(state.items[index - 1], 'preload')
@@ -235,10 +244,15 @@ export function createGalleryController({
     for (const image of renderedImages) image.src = url
   }
 
-  function updateActiveLightboxVideo(url) {
-    const activeVideo = lightboxRoot?.querySelector?.('.lg-current video.lg-video, .lg-current .lg-video-cont video')
-    if (activeVideo) {
-      activeVideo.src = url
+  function updateActiveLightboxVideo(url, isPoster) {
+    const existingVideo = lightboxRoot?.querySelector?.('.lg-current video.lg-video, .lg-current .lg-video-cont video')
+    if (existingVideo) {
+      if (isPoster) {
+        existingVideo.poster = url
+      } else {
+        existingVideo.src = url
+        existingVideo.load()
+      }
       return
     }
     const imgWrap = lightboxRoot?.querySelector?.('.lg-current .lg-img-wrap')
@@ -246,15 +260,19 @@ export function createGalleryController({
     imgWrap.innerHTML = ''
     const video = document.createElement('video')
     video.className = 'lg-object lg-video'
-    video.src = url
     video.controls = true
-    video.autoplay = true
     video.muted = true
     video.playsInline = true
     video.setAttribute('playsinline', '')
     video.style.maxWidth = '100%'
     video.style.maxHeight = '100%'
     video.style.display = 'block'
+    if (isPoster) {
+      video.poster = url
+    } else {
+      video.src = url
+      video.autoplay = true
+    }
     imgWrap.appendChild(video)
   }
 

@@ -417,6 +417,7 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 }
 
 func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
+	log.Printf("transfer: asset_preview_request id=%s quality=%s", id, quality)
 	if id == "" {
 		m.sendError("asset id required")
 		return
