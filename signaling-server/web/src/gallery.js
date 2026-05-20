@@ -239,7 +239,11 @@ export function createGalleryController({
           video.src = url
           video.autoplay = true
         } else {
-          const thumbUrl = state.urls.get(`thumb:${state.activePreviewID}`)
+          let thumbUrl = state.urls.get(`thumb:${state.activePreviewID}`)
+          if (!thumbUrl) {
+            const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(state.activePreviewID)}"]`)
+            thumbUrl = galleryItem?.dataset?.src
+          }
           if (thumbUrl) video.poster = thumbUrl
         }
         imgWrap.appendChild(video)
