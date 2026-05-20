@@ -110,7 +110,7 @@ export function createGalleryController({
       updateLightboxItemVideo(id, url, mimeType)
 
       if (state.activePreviewID === id) {
-        updateActiveLightboxVideo(url)
+        showVideoInLightbox(url)
       }
       return
     }
@@ -202,23 +202,53 @@ export function createGalleryController({
     if (!item) return
     state.activePreviewID = item.id
     ensureLightboxDownloadButton()
-    const isVideo = item.mimeType?.startsWith('video/')
     const existingPreviewUrl = state.urls.get(`preview:${item.id}`)
     if (existingPreviewUrl) {
-      if (isVideo) {
-        updateActiveLightboxVideo(existingPreviewUrl)
+      if (item.mimeType?.startsWith('video/')) {
+        showVideoInLightbox(existingPreviewUrl)
       } else {
         updateActiveLightboxImage(existingPreviewUrl)
       }
     } else {
-      const thumbUrl = state.urls.get(`thumb:${item.id}`)
-      if (isVideo && thumbUrl) {
-        updateActiveLightboxVideo(thumbUrl, true)
+      if (item.mimeType?.startsWith('video/')) {
+        showVideoInLightbox(null)
       }
       requestPreviewForItem(item, 'active')
     }
     requestPreviewForItem(state.items[index - 1], 'preload')
     requestPreviewForItem(state.items[index + 1], 'preload')
+  }
+
+  function showVideoInLightbox(url) {
+    // Try up to 10 times with 50ms delays waiting for lightbox DOM
+    let attempts = 0
+    const tryShow = () => {
+      const imgWrap = lightboxRoot?.querySelector?.('.lg-current .lg-img-wrap')
+      if (imgWrap) {
+        imgWrap.innerHTML = ''
+        const video = document.createElement('video')
+        video.className = 'lg-object lg-video'
+        video.controls = true
+        video.muted = true
+        video.playsInline = true
+        video.setAttribute('playsinline', '')
+        video.style.maxWidth = '100%'
+        video.style.maxHeight = '100%'
+        video.style.display = 'block'
+        if (url) {
+          video.src = url
+          video.autoplay = true
+        } else {
+          const thumbUrl = state.urls.get(`thumb:${state.activePreviewID}`)
+          if (thumbUrl) video.poster = thumbUrl
+        }
+        imgWrap.appendChild(video)
+        return
+      }
+      attempts++
+      if (attempts < 10) setTimeout(tryShow, 50)
+    }
+    tryShow()
   }
 
   function requestPreviewForItem(item, priority) {
