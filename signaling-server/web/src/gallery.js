@@ -237,7 +237,6 @@ export function createGalleryController({
         video.setAttribute('playsinline', '')
         video.style.maxWidth = '100%'
         video.style.maxHeight = '80vh'
-        video.style.display = 'block'
 		video.style.margin = '0 auto'
 		video.style.objectFit = 'contain'
         if (url) {
@@ -305,7 +304,6 @@ export function createGalleryController({
     video.setAttribute('playsinline', '')
     video.style.maxWidth = '100%'
     video.style.maxHeight = '80vh'
-    video.style.display = 'block'
 		video.style.margin = '0 auto'
 		video.style.objectFit = 'contain'
     if (isPoster) {
