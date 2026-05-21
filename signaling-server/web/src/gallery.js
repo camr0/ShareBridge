@@ -236,8 +236,10 @@ export function createGalleryController({
         video.playsInline = true
         video.setAttribute('playsinline', '')
         video.style.maxWidth = '100%'
-        video.style.maxHeight = '100%'
+        video.style.maxHeight = '80vh'
         video.style.display = 'block'
+		video.style.margin = '0 auto'
+		video.style.objectFit = 'contain'
         if (url) {
           video.src = url
           video.autoplay = true
@@ -302,8 +304,10 @@ export function createGalleryController({
     video.playsInline = true
     video.setAttribute('playsinline', '')
     video.style.maxWidth = '100%'
-    video.style.maxHeight = '100%'
+    video.style.maxHeight = '80vh'
     video.style.display = 'block'
+		video.style.margin = '0 auto'
+		video.style.objectFit = 'contain'
     if (isPoster) {
       video.poster = url
     } else {
