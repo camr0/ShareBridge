@@ -10,7 +10,7 @@ self.addEventListener('activate', event => {
   event.waitUntil(self.clients.claim())
 })
 
-// Map of mediaId -> { controller, readable, pendingChunks, resolveReady, ready }
+// Map of mediaId -> { controller, pendingChunks, resolvePull, resolveReady, ready }
 const streams = new Map()
 
 self.addEventListener('fetch', event => {
@@ -21,42 +21,52 @@ self.addEventListener('fetch', event => {
   const mediaId = match[1]
   let entry = streams.get(mediaId)
   if (!entry) {
-    let controller
+    let ctrl
     let resolveReady
     const ready = new Promise(r => { resolveReady = r })
 
     const readable = new ReadableStream({
-      start(c) { controller = c },
-      cancel() { streams.delete(mediaId) }
+      start(controller) {
+        ctrl = controller
+      },
+      pull(controller) {
+        // Serve pending chunks if available
+        while (entry.pendingChunks.length > 0) {
+          const chunk = entry.pendingChunks.shift()
+          if (chunk === null) {
+            controller.close()
+            streams.delete(mediaId)
+            return
+          }
+          controller.enqueue(chunk)
+        }
+        // Return a promise that resolves when next chunk arrives.
+        // This tells the browser to wait instead of erroring.
+        return new Promise(resolve => {
+          entry.resolvePull = resolve
+        })
+      },
+      cancel() {
+        streams.delete(mediaId)
+      }
     })
 
     const pendingChunks = []
-    entry = { controller, readable, pendingChunks, resolveReady, ready }
+    entry = { controller: ctrl, readable, pendingChunks, resolvePull: null, resolveReady, ready }
     streams.set(mediaId, entry)
   }
 
-  // Wait for at least one chunk before responding, so Chrome's MP4 demuxer
-  // has data to probe immediately instead of failing on an empty stream.
+  // Wait for initial chunks before responding, so Chrome's MP4 demuxer
+  // has data to probe immediately.
   event.respondWith(
-    entry.ready.then(() => {
-      // Flush any chunks that arrived while waiting
-      while (entry.pendingChunks.length > 0) {
-        const chunk = entry.pendingChunks.shift()
-        if (chunk === null) {
-          try { entry.controller.close() } catch (_) {}
-        } else {
-          entry.controller.enqueue(chunk)
-        }
+    entry.ready.then(() => new Response(entry.readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'none',
+        'Cache-Control': 'no-store',
       }
-      return new Response(entry.readable, {
-        status: 200,
-        headers: {
-          'Content-Type': 'video/mp4',
-          'Accept-Ranges': 'none',
-          'Cache-Control': 'no-store',
-        }
-      })
-    })
+    }))
   )
 })
 
@@ -72,15 +82,21 @@ self.addEventListener('message', event => {
       controller: null,
       readable: null,
       pendingChunks: [],
+      resolvePull: null,
       resolveReady: null,
       ready: Promise.resolve(),
     }
     streams.set(mediaId, entry)
   }
 
+  // Signal end-of-stream
   if (chunk === null) {
     if (entry.controller) {
-      try { entry.controller.close() } catch (_) {}
+      if (entry.resolvePull) {
+        entry.resolvePull()
+        entry.resolvePull = null
+      }
+      entry.controller.close()
     } else {
       entry.pendingChunks.push(null)
     }
@@ -88,15 +104,19 @@ self.addEventListener('message', event => {
     return
   }
 
-  // Signal that at least one chunk is available
+  // Buffer chunk
+  entry.pendingChunks.push(chunk)
+
+  // Resolve the ready promise (first chunk available)
   if (entry.resolveReady) {
     entry.resolveReady()
     entry.resolveReady = null
   }
 
-  if (entry.controller) {
-    entry.controller.enqueue(chunk)
-  } else {
-    entry.pendingChunks.push(chunk)
+  // Wake up the pull() promise if consumer is waiting
+  if (entry.resolvePull) {
+    const resolve = entry.resolvePull
+    entry.resolvePull = null
+    resolve()
   }
 })
