@@ -85,6 +85,9 @@ func main() {
 		router.GET("/join", handler.ServeFileNoCache("./web/index.html"))
 
 		// Static assets for file client
+			router.GET("/sw.js", handler.ServeFileNoCache("./web/sw.js"))
+
+
 		router.GET("/app.js", handler.ServeFileNoCache("./web/app.js"))
 		router.GET("/src/{path...}", handler.ServeDirNoCache("./web/src"))
 		router.GET("/noise-p256/{path...}", handler.ServeDirNoCache("./web/noise-p256"))
