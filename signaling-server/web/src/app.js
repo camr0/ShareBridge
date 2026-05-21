@@ -57,7 +57,7 @@ let queuedGalleryPreviewID = ''
 let queuedGalleryPreloadIDs = []
 let currentPreview = null
 let currentVideoPreview = null
-// { id, mimeType, chunks: [], bytes: 0 }
+// { id, mediaId }
 let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
@@ -696,8 +696,10 @@ async function handleTransferMessage(event) {
     }
 
     if (currentVideoPreview) {
-      currentVideoPreview.chunks.push(frame.payload)
-      currentVideoPreview.bytes += frame.payload.byteLength
+      navigator.serviceWorker?.controller?.postMessage({
+        mediaId: currentVideoPreview.mediaId,
+        chunk: frame.payload,
+      })
       return
     }
 
@@ -1170,6 +1172,12 @@ async function handleTransferClosure() {
 }
 
 function cleanupCurrentVideoPreview() {
+  if (currentVideoPreview) {
+    navigator.serviceWorker?.controller?.postMessage({
+      mediaId: currentVideoPreview.mediaId,
+      chunk: null,
+    })
+  }
   currentVideoPreview = null
 }
 
@@ -1315,12 +1323,11 @@ function startGalleryPreview(header) {
 }
 
 function startVideoPreview(header) {
-  currentVideoPreview = {
-    id: header.id,
-    mimeType: header.mimeType || 'video/mp4',
-    chunks: [],
-    bytes: 0,
-  }
+  const vp = { id: header.id, mediaId: header.id }
+  currentVideoPreview = vp
+  // Tell the gallery to show /media/{id} as the video URL immediately.
+  // The SW will stream chunks as they arrive.
+  galleryController?.handlePreviewData?.(header.id, new Uint8Array(0), 'video/mp4')
 }
 
 function completeGalleryPreview(msg) {
@@ -1328,13 +1335,13 @@ function completeGalleryPreview(msg) {
     const vp = currentVideoPreview
     currentVideoPreview = null
     galleryPreviewRequestPending = false
-    const merged = new Uint8Array(vp.bytes)
-    let offset = 0
-    for (const chunk of vp.chunks) {
-      merged.set(chunk, offset)
-      offset += chunk.byteLength
-    }
-    galleryController?.handlePreviewData?.(msg.id || vp.id, merged, vp.mimeType)
+    // Signal end of stream to the SW
+    navigator.serviceWorker?.controller?.postMessage({
+      mediaId: vp.mediaId,
+      chunk: null,
+    })
+    // Notify gallery that video data is complete (URL is already /media/{id})
+    galleryController?.handlePreviewData?.(msg.id || vp.id, new Uint8Array(0), 'video/mp4')
     const nextID = queuedGalleryPreviewID || queuedGalleryPreloadIDs.shift()
     queuedGalleryPreviewID = ''
     if (nextID) requestGalleryPreview(nextID)

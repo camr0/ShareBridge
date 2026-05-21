@@ -92,15 +92,18 @@ export function createGalleryController({
     state.previewRequests.delete(id)
 
     if (mimeType?.startsWith('video/')) {
-      const blob = new Blob([payload], { type: mimeType })
-      const url = createObjectURL(blob)
-      const previousUrl = state.urls.get(`preview:${id}`)
-      if (previousUrl) revokeObjectURL(previousUrl)
-      state.urls.set(`preview:${id}`, url)
+      const url = `/media/${encodeURIComponent(id)}`
+      if (!state.hasVideoURL) state.hasVideoURL = new Set()
+      if (!state.hasVideoURL.has(id)) {
+        state.hasVideoURL.add(id)
+        const previousUrl = state.urls.get(`preview:${id}`)
+        if (previousUrl) revokeObjectURL(previousUrl)
+        state.urls.set(`preview:${id}`, url)
+      }
 
       const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)
       if (galleryItem?.dataset) {
-        const videoSrc = JSON.stringify([{ src: url, type: mimeType }])
+        const videoSrc = JSON.stringify([{ src: url, type: 'video/mp4' }])
         galleryItem.dataset.video = videoSrc
         galleryItem.dataset.src = url
         galleryItem.dataset.downloadUrl = 'false'
