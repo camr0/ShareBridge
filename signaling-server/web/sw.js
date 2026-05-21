@@ -10,7 +10,12 @@ self.addEventListener('activate', event => {
   event.waitUntil(self.clients.claim())
 })
 
-// Map of mediaId -> { controller, pendingChunks, resolvePull, resolveReady, ready }
+// Wait for several chunks before starting the stream so Chrome's MP4 demuxer
+// has enough data to parse the full moov atom (including the AAC audio decoder
+// config in the esds box). 6 × 64KB = 384KB covers the moov for even large videos.
+const MIN_INITIAL_CHUNKS = 6
+
+// Map of mediaId -> { controller, pendingChunks, resolvePull, resolveReady, ready, chunkCount }
 const streams = new Map()
 
 self.addEventListener('fetch', event => {
@@ -52,7 +57,7 @@ self.addEventListener('fetch', event => {
     })
 
     const pendingChunks = []
-    entry = { controller: ctrl, readable, pendingChunks, resolvePull: null, resolveReady, ready }
+    entry = { controller: ctrl, readable, pendingChunks, resolvePull: null, resolveReady, ready, chunkCount: 0 }
     streams.set(mediaId, entry)
   }
 
@@ -85,12 +90,18 @@ self.addEventListener('message', event => {
       resolvePull: null,
       resolveReady: null,
       ready: Promise.resolve(),
+      chunkCount: 0,
     }
     streams.set(mediaId, entry)
   }
 
   // Signal end-of-stream
   if (chunk === null) {
+    // Resolve ready immediately so the stream can close
+    if (entry.resolveReady) {
+      entry.resolveReady()
+      entry.resolveReady = null
+    }
     if (entry.controller) {
       if (entry.resolvePull) {
         entry.resolvePull()
@@ -106,9 +117,10 @@ self.addEventListener('message', event => {
 
   // Buffer chunk
   entry.pendingChunks.push(chunk)
+  entry.chunkCount++
 
-  // Resolve the ready promise (first chunk available)
-  if (entry.resolveReady) {
+  // Resolve the ready promise once enough initial chunks are buffered
+  if (entry.resolveReady && entry.chunkCount >= MIN_INITIAL_CHUNKS) {
     entry.resolveReady()
     entry.resolveReady = null
   }
