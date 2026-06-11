@@ -223,38 +223,46 @@ export function createGalleryController({
   }
 
   function showVideoInLightbox(url) {
-    // Try up to 10 times with 50ms delays waiting for lightbox DOM
+    const id = state.activePreviewID
     let attempts = 0
     const tryShow = () => {
       const imgWrap = lightboxRoot?.querySelector?.('.lg-current .lg-img-wrap')
-      if (imgWrap) {
-        imgWrap.innerHTML = ''
-        const video = document.createElement('video')
-        video.className = 'lg-object lg-video'
-        video.controls = true
-        video.muted = true
-        video.playsInline = true
-        video.setAttribute('playsinline', '')
-        video.style.maxWidth = '100%'
-        video.style.maxHeight = '80vh'
-		video.style.margin = '0 auto'
-		video.style.objectFit = 'contain'
-        if (url) {
-          video.src = url
-          video.autoplay = true
-        } else {
-          let thumbUrl = state.urls.get(`thumb:${state.activePreviewID}`)
-          if (!thumbUrl) {
-            const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(state.activePreviewID)}"]`)
-            thumbUrl = galleryItem?.dataset?.src
-          }
-          if (thumbUrl) video.poster = thumbUrl
-        }
-        imgWrap.appendChild(video)
+      if (!imgWrap) {
+        attempts++
+        if (attempts < 10) setTimeout(tryShow, 50)
         return
       }
-      attempts++
-      if (attempts < 10) setTimeout(tryShow, 50)
+      const existing = imgWrap.querySelector('video.lg-video')
+      if (existing && state._lastVideoID === id) {
+        if (url && existing.src !== url) existing.src = url
+        else if (!url) {
+          const thumbUrl = state.urls.get(`thumb:${id}`)
+            || root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)?.dataset?.src
+          if (thumbUrl) existing.poster = thumbUrl
+        }
+        return
+      }
+      imgWrap.innerHTML = ''
+      const video = document.createElement('video')
+      video.className = 'lg-object lg-video'
+      video.controls = true
+      video.muted = true
+      video.playsInline = true
+      video.setAttribute('playsinline', '')
+      video.style.maxWidth = '100%'
+      video.style.maxHeight = '80vh'
+      video.style.margin = '0 auto'
+      video.style.objectFit = 'contain'
+      if (url) {
+        video.src = url
+        video.autoplay = true
+      } else {
+        const thumbUrl = state.urls.get(`thumb:${id}`)
+          || root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)?.dataset?.src
+        if (thumbUrl) video.poster = thumbUrl
+      }
+      imgWrap.appendChild(video)
+      state._lastVideoID = id
     }
     tryShow()
   }

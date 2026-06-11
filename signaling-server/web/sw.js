@@ -10,125 +10,131 @@ self.addEventListener('activate', event => {
   event.waitUntil(self.clients.claim())
 })
 
-// Wait for several chunks before starting the stream so Chrome's MP4 demuxer
-// has enough data to parse the full moov atom (including the AAC audio decoder
-// config in the esds box). 6 × 64KB = 384KB covers the moov for even large videos.
+// Buffer initial chunks before responding so Chrome's MP4 demuxer has
+// enough data to parse the moov atom.  Without this, Chrome's
+// ReadableStream read timeout fires before chunks arrive via the relay.
+// Chrome's *fetch* timeout is much longer, so delaying the Response is
+// the correct strategy.
 const MIN_INITIAL_CHUNKS = 6
 
-// Map of mediaId -> { controller, pendingChunks, resolvePull, resolveReady, ready, chunkCount }
-const streams = new Map()
+// Map of mediaId -> { streams: Set<stream>, pendingChunks: [], resolvePull, chunkCount }
+// Each fetch creates a dedicated ReadableStream stored in `streams`.
+// Chunks are broadcast to every active stream.
+const entries = new Map()
+
+function ensureEntry(mediaId) {
+  let entry = entries.get(mediaId)
+  if (!entry) {
+    entry = {
+      streams: new Set(),
+      pendingChunks: [],
+      resolvePull: null,
+      chunkCount: 0,
+    }
+    entries.set(mediaId, entry)
+  }
+  return entry
+}
+
+function createStreamForEntry(entry, mediaId) {
+  let ctrl
+  // Per-stream ready promise: resolves when global chunkCount >= MIN_INITIAL_CHUNKS.
+  // Each stream has its own ready so concurrent fetches don't share a locked stream.
+  let resolveReady
+  let readyTimer = null
+  const ready = new Promise(r => { resolveReady = r })
+
+  if (entry.chunkCount >= MIN_INITIAL_CHUNKS) {
+    resolveReady()
+    resolveReady = null
+  }
+
+  const readable = new ReadableStream({
+    start(controller) { ctrl = controller },
+    pull(controller) {
+      while (entry.pendingChunks.length > 0) {
+        const chunk = entry.pendingChunks.shift()
+        if (chunk === null) { drainNull(entry, mediaId); return }
+        controller.enqueue(chunk)
+      }
+      return new Promise(resolve => { entry.resolvePull = resolve })
+    },
+    cancel() {
+      clearTimeout(readyTimer)
+      entry.streams.delete(readable)
+      if (entry.streams.size === 0) entries.delete(mediaId)
+    },
+  })
+
+  const stream = { controller: ctrl, readable, resolveReady, readyTimer }
+  entry.streams.add(stream)
+  return stream
+}
+
+function drainNull(entry, mediaId) {
+  for (const stream of entry.streams) {
+    try { stream.controller.close() } catch (_) {}
+  }
+  entry.streams.clear()
+  entries.delete(mediaId)
+}
+
+function broadcastChunk(entry, chunk, mediaId) {
+  for (const stream of entry.streams) {
+    try { stream.controller.enqueue(chunk) } catch (_) {}
+  }
+  if (entry.resolvePull) {
+    const r = entry.resolvePull; entry.resolvePull = null; r()
+  }
+}
+
+function resolveAllReady(entry) {
+  for (const stream of entry.streams) {
+    if (stream.resolveReady) {
+      clearTimeout(stream.readyTimer)
+      stream.readyTimer = null
+      stream.resolveReady()
+      stream.resolveReady = null
+    }
+  }
+}
+
+// --- event listeners -------------------------------------------------
 
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url)
   const match = url.pathname.match(/^\/media\/([^/]+)$/)
   if (!match) return
-
   const mediaId = match[1]
-  let entry = streams.get(mediaId)
-  if (!entry) {
-    let ctrl
-    let resolveReady
-    const ready = new Promise(r => { resolveReady = r })
+  const entry = ensureEntry(mediaId)
+  const stream = createStreamForEntry(entry, mediaId)
 
-    const readable = new ReadableStream({
-      start(controller) {
-        ctrl = controller
-      },
-      pull(controller) {
-        // Serve pending chunks if available
-        while (entry.pendingChunks.length > 0) {
-          const chunk = entry.pendingChunks.shift()
-          if (chunk === null) {
-            controller.close()
-            streams.delete(mediaId)
-            return
-          }
-          controller.enqueue(chunk)
-        }
-        // Return a promise that resolves when next chunk arrives.
-        // This tells the browser to wait instead of erroring.
-        return new Promise(resolve => {
-          entry.resolvePull = resolve
-        })
-      },
-      cancel() {
-        streams.delete(mediaId)
-      }
-    })
-
-    const pendingChunks = []
-    entry = { controller: ctrl, readable, pendingChunks, resolvePull: null, resolveReady, ready, chunkCount: 0 }
-    streams.set(mediaId, entry)
-  }
-
-  // Wait for initial chunks before responding, so Chrome's MP4 demuxer
-  // has data to probe immediately.
   event.respondWith(
-    entry.ready.then(() => new Response(entry.readable, {
+    stream.ready.then(() => new Response(stream.readable, {
       status: 200,
-      headers: {
-        'Content-Type': 'video/mp4',
-        'Accept-Ranges': 'none',
-        'Cache-Control': 'no-store',
-      }
+      headers: { 'Content-Type': 'video/mp4', 'Cache-Control': 'no-store' }
     }))
   )
 })
 
 self.addEventListener('message', event => {
   if (event.data === 'ping') return
-
   const { mediaId, chunk } = event.data
   if (!mediaId) return
+  const entry = ensureEntry(mediaId)
 
-  let entry = streams.get(mediaId)
-  if (!entry) {
-    entry = {
-      controller: null,
-      readable: null,
-      pendingChunks: [],
-      resolvePull: null,
-      resolveReady: null,
-      ready: Promise.resolve(),
-      chunkCount: 0,
-    }
-    streams.set(mediaId, entry)
-  }
-
-  // Signal end-of-stream
   if (chunk === null) {
-    // Resolve ready immediately so the stream can close
-    if (entry.resolveReady) {
-      entry.resolveReady()
-      entry.resolveReady = null
-    }
-    if (entry.controller) {
-      if (entry.resolvePull) {
-        entry.resolvePull()
-        entry.resolvePull = null
-      }
-      entry.controller.close()
-    } else {
-      entry.pendingChunks.push(null)
-    }
-    streams.delete(mediaId)
+    resolveAllReady(entry)
+    if (entry.streams.size > 0) drainNull(entry, mediaId)
+    else entry.pendingChunks.push(null)
+    entries.delete(mediaId)
     return
   }
 
-  // Buffer chunk
   entry.pendingChunks.push(chunk)
   entry.chunkCount++
 
-  // Resolve the ready promise once enough initial chunks are buffered
-  if (entry.resolveReady && entry.chunkCount >= MIN_INITIAL_CHUNKS) {
-    entry.resolveReady()
-    entry.resolveReady = null
-  }
+  if (entry.chunkCount >= MIN_INITIAL_CHUNKS) resolveAllReady(entry)
 
-  // Wake up the pull() promise if consumer is waiting
-  if (entry.resolvePull) {
-    const resolve = entry.resolvePull
-    entry.resolvePull = null
-    resolve()
-  }
+  if (entry.streams.size > 0) broadcastChunk(entry, chunk, mediaId)
 })

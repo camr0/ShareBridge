@@ -457,9 +457,11 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 	}
 	headerData, _ := json.Marshal(header)
 	if err := m.dc.SendText(string(headerData)); err != nil {
+		log.Printf("transfer: asset_preview_header send failed id=%s: %v", id, err)
 		m.releaseTransfer()
 		return
 	}
+	log.Printf("transfer: asset_preview_header sent id=%s mime=%s", id, mimeType)
 
 	go m.streamAssetPreview(id, quality)
 }
@@ -574,20 +576,36 @@ func (m *Manager) streamAssetPreview(id string, quality string) {
 		pw.CloseWithError(err)
 	}()
 
+	var totalBytes int64
+	var transferErr error
+	chunksSent := 0
 	buf := make([]byte, chunkSize)
 	for {
 		n, err := pr.Read(buf)
 		if n > 0 {
+			totalBytes += int64(n)
+			chunksSent++
+			if chunksSent == 1 {
+				log.Printf("transfer: preview first chunk id=%s size=%d", id, n)
+			}
 			if err := m.sendWithBackpressure(encodeFileChunkFrame(buf[:n])); err != nil {
+				log.Printf("transfer: preview send failed id=%s bytes=%d chunks=%d: %v", id, totalBytes, chunksSent, err)
 				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
+				transferErr = err
+				log.Printf("transfer: preview read failed id=%s bytes=%d: %v", id, totalBytes, err)
 				m.sendError("preview failed: " + err.Error())
 			}
 			break
 		}
+	}
+
+	log.Printf("transfer: preview finished id=%s bytes=%d err=%v", id, totalBytes, transferErr)
+	if transferErr != nil {
+		return
 	}
 
 	end := struct {
