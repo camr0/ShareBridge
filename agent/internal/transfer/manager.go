@@ -17,7 +17,7 @@ import (
 
 const (
 	chunkSize     = 64 * 1024  // 64KB
-	maxBuffer     = 256 * 1024 // 256KB
+	maxBuffer     = 5 * 1024 * 1024 // 5MB — deep pipeline for smooth streaming
 	sleepInterval = 10 * time.Millisecond
 )
 
@@ -444,15 +444,20 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 		mimeType = "video/mp4"
 	}
 
+	// Get file size for Content-Length. Best-effort — ignore error.
+	_, previewSize, _, _ := m.gallery.GetAssetInfo(context.Background(), id)
+
 	header := struct {
 		Type           string `json:"type"`
 		ID             string `json:"id"`
 		MimeType       string `json:"mimeType"`
+		Size           int64  `json:"size"`
 		BinaryEnvelope bool   `json:"binary_envelope"`
 	}{
 		Type:           "asset_preview_header",
 		ID:             id,
 		MimeType:       mimeType,
+		Size:           previewSize,
 		BinaryEnvelope: true,
 	}
 	headerData, _ := json.Marshal(header)
@@ -461,7 +466,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 		m.releaseTransfer()
 		return
 	}
-	log.Printf("transfer: asset_preview_header sent id=%s mime=%s", id, mimeType)
+	log.Printf("transfer: asset_preview_header sent id=%s mime=%s size=%d", id, mimeType, previewSize)
 
 	go m.streamAssetPreview(id, quality)
 }

@@ -1,6 +1,12 @@
 // Service Worker for streaming video through the DataChannel.
 // Intercepts /media/{id} fetches and returns a Response backed by a
 // ReadableStream whose chunks arrive via postMessage from the page.
+//
+// Responds immediately — no minimum-buffer gate. Chrome falls through
+// to the network if event.respondWith() takes too long, so we must
+// return the Response synchronously. The ReadableStream's pull() handles
+// backpressure naturally: it drains available chunks and waits when
+// none are ready.
 
 self.addEventListener('install', () => {
   self.skipWaiting()
@@ -10,16 +16,11 @@ self.addEventListener('activate', event => {
   event.waitUntil(self.clients.claim())
 })
 
-// Buffer initial chunks before responding so Chrome's MP4 demuxer has
-// enough data to parse the moov atom.  Without this, Chrome's
-// ReadableStream read timeout fires before chunks arrive via the relay.
-// Chrome's *fetch* timeout is much longer, so delaying the Response is
-// the correct strategy.
-const MIN_INITIAL_CHUNKS = 6
-
-// Map of mediaId -> { streams: Set<stream>, pendingChunks: [], resolvePull, chunkCount }
-// Each fetch creates a dedicated ReadableStream stored in `streams`.
-// Chunks are broadcast to every active stream.
+// Map of mediaId -> { streams: Set<stream>, chunks: [], isDone }
+//
+// chunks is an append-only history array. Each stream tracks its own
+// readCursor into this array so multiple concurrent fetches each see
+// every byte from the beginning — no shared destructive shift().
 const entries = new Map()
 
 function ensureEntry(mediaId) {
@@ -27,74 +28,84 @@ function ensureEntry(mediaId) {
   if (!entry) {
     entry = {
       streams: new Set(),
-      pendingChunks: [],
-      resolvePull: null,
-      chunkCount: 0,
+      chunks: [],        // append-only (push, never shift)
+      isDone: false,
     }
     entries.set(mediaId, entry)
   }
   return entry
 }
 
-function createStreamForEntry(entry, mediaId) {
+function createStreamForEntry(entry, mediaId, startOffset) {
   let ctrl
-  // Per-stream ready promise: resolves when global chunkCount >= MIN_INITIAL_CHUNKS.
-  // Each stream has its own ready so concurrent fetches don't share a locked stream.
-  let resolveReady
-  let readyTimer = null
-  const ready = new Promise(r => { resolveReady = r })
+  let readCursor = 0        // per-stream position into entry.chunks
+  let skipBytes = startOffset || 0  // bytes to skip within the first chunk
 
-  if (entry.chunkCount >= MIN_INITIAL_CHUNKS) {
-    resolveReady()
-    resolveReady = null
+  // If starting mid-stream, find the right chunk and byte offset.
+  if (startOffset > 0) {
+    let bytesSeen = 0
+    for (let i = 0; i < entry.chunks.length; i++) {
+      const chunk = entry.chunks[i]
+      if (chunk === null) break
+      if (bytesSeen + chunk.byteLength > startOffset) {
+        readCursor = i
+        skipBytes = startOffset - bytesSeen
+        break
+      }
+      bytesSeen += chunk.byteLength
+      readCursor = i + 1
+    }
   }
 
   const readable = new ReadableStream({
     start(controller) { ctrl = controller },
     pull(controller) {
-      while (entry.pendingChunks.length > 0) {
-        const chunk = entry.pendingChunks.shift()
-        if (chunk === null) { drainNull(entry, mediaId); return }
+      // Drain every chunk available from this stream's cursor position.
+      while (readCursor < entry.chunks.length) {
+        let chunk = entry.chunks[readCursor++]
+        if (chunk === null) {
+          entry.streams.delete(readable)
+          if (entry.streams.size === 0) entries.delete(mediaId)
+          try { controller.close() } catch (_) {}
+          return
+        }
+        // Slice the first chunk if we need to skip leading bytes.
+        if (skipBytes > 0) {
+          if (skipBytes >= chunk.byteLength) { skipBytes -= chunk.byteLength; continue }
+          chunk = chunk.slice(skipBytes)
+          skipBytes = 0
+        }
         controller.enqueue(chunk)
       }
-      return new Promise(resolve => { entry.resolvePull = resolve })
+      if (entry.isDone) {
+        entry.streams.delete(readable)
+        if (entry.streams.size === 0) entries.delete(mediaId)
+        try { controller.close() } catch (_) {}
+        return
+      }
+      return new Promise(resolve => { stream.resolvePull = resolve })
     },
     cancel() {
-      clearTimeout(readyTimer)
       entry.streams.delete(readable)
       if (entry.streams.size === 0) entries.delete(mediaId)
     },
   })
 
-  const stream = { controller: ctrl, readable, resolveReady, readyTimer }
+  const stream = {
+    controller: ctrl,
+    readable,
+    resolvePull: null,   // per-stream pull-wait promise
+  }
   entry.streams.add(stream)
   return stream
 }
 
-function drainNull(entry, mediaId) {
+function wakeAllStreams(entry) {
   for (const stream of entry.streams) {
-    try { stream.controller.close() } catch (_) {}
-  }
-  entry.streams.clear()
-  entries.delete(mediaId)
-}
-
-function broadcastChunk(entry, chunk, mediaId) {
-  for (const stream of entry.streams) {
-    try { stream.controller.enqueue(chunk) } catch (_) {}
-  }
-  if (entry.resolvePull) {
-    const r = entry.resolvePull; entry.resolvePull = null; r()
-  }
-}
-
-function resolveAllReady(entry) {
-  for (const stream of entry.streams) {
-    if (stream.resolveReady) {
-      clearTimeout(stream.readyTimer)
-      stream.readyTimer = null
-      stream.resolveReady()
-      stream.resolveReady = null
+    if (stream.resolvePull) {
+      const r = stream.resolvePull
+      stream.resolvePull = null
+      r()
     }
   }
 }
@@ -107,14 +118,33 @@ self.addEventListener('fetch', event => {
   if (!match) return
   const mediaId = match[1]
   const entry = ensureEntry(mediaId)
-  const stream = createStreamForEntry(entry, mediaId)
 
-  event.respondWith(
-    stream.ready.then(() => new Response(stream.readable, {
-      status: 200,
-      headers: { 'Content-Type': 'video/mp4', 'Cache-Control': 'no-store' }
-    }))
-  )
+  // Parse Range header for seeking.  Only return 206 for actual seeks
+  // (startOffset > 0); initial loads get 200 so Chrome doesn't lock onto
+  // a Content-Length we can't guarantee.
+  let startOffset = 0
+  let status = 200
+  const rangeHeader = event.request.headers.get('range')
+  if (rangeHeader) {
+    const m = rangeHeader.match(/bytes=(\d+)-/)
+    if (m) {
+      startOffset = parseInt(m[1], 10) || 0
+      if (startOffset > 0) status = 206
+    }
+  }
+
+  const stream = createStreamForEntry(entry, mediaId, startOffset)
+
+  const headers = {
+    'Content-Type': 'video/mp4',
+    'Cache-Control': 'no-store',
+  }
+  // NOTE: Don't set Accept-Ranges.  Without a known Content-Length, Chrome
+  // will cancel the initial 200 and issue Range:bytes=X- to probe the file
+  // end, but we can't serve that offset until all data arrives.  Seeking
+  // (range support) will be added once we track the true transcoded size.
+
+  event.respondWith(new Response(stream.readable, { status, headers }))
 })
 
 self.addEventListener('message', event => {
@@ -124,17 +154,18 @@ self.addEventListener('message', event => {
   const entry = ensureEntry(mediaId)
 
   if (chunk === null) {
-    resolveAllReady(entry)
-    if (entry.streams.size > 0) drainNull(entry, mediaId)
-    else entry.pendingChunks.push(null)
-    entries.delete(mediaId)
+    // Signal end of stream. Push null as EOF marker so every stream's
+    // pull() loop can see it at their own cursor position.
+    entry.isDone = true
+    entry.chunks.push(null)
+    wakeAllStreams(entry)
     return
   }
 
-  entry.pendingChunks.push(chunk)
-  entry.chunkCount++
+  // Append to shared history. Never shift — each stream drains
+  // independently from its own readCursor.
+  entry.chunks.push(chunk)
 
-  if (entry.chunkCount >= MIN_INITIAL_CHUNKS) resolveAllReady(entry)
-
-  if (entry.streams.size > 0) broadcastChunk(entry, chunk, mediaId)
+  // Wake all waiting pull() loops so they drain from their cursors.
+  wakeAllStreams(entry)
 })
