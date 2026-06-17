@@ -47,6 +47,7 @@ type GalleryBackend interface {
 	GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error)
 	GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error)
 	GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) // name, size, mimeType
+	HeadVideoPlayback(ctx context.Context, id string) (int64, error)           // Content-Length of transcoded video (0 if unknown)
 }
 
 type Gallery struct {
@@ -444,8 +445,26 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 		mimeType = "video/mp4"
 	}
 
-	// Get file size for Content-Length. Best-effort — ignore error.
+	// Get file size for Content-Length. For video, prefer the transcoded
+	// Content-Length from Immich's /video/playback endpoint via HEAD so
+	// the browser can calculate accurate byte offsets for seeking.
+	// Never forward the original asset size for video — it can differ
+	// significantly from the transcoded stream and Chrome will mis-seek.
 	_, previewSize, _, _ := m.gallery.GetAssetInfo(context.Background(), id)
+	if quality == "video" {
+		transcodedSize, err := m.gallery.HeadVideoPlayback(context.Background(), id)
+		if err == nil && transcodedSize > 0 {
+			log.Printf("transfer: video preview using transcoded size=%d (original=%d)", transcodedSize, previewSize)
+			previewSize = transcodedSize
+		} else {
+			// No accurate size available — don't mislead Chrome with the
+			// original file size.  The SW will serve without Content-Length
+			// and Chrome can still seek via byte-range probes after parsing
+			// the moov atom.
+			log.Printf("transfer: video preview no transcoded size (head_err=%v), omitting Content-Length", err)
+			previewSize = 0
+		}
+	}
 
 	header := struct {
 		Type           string `json:"type"`

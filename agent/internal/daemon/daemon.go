@@ -121,6 +121,10 @@ func (a immichTransferAdapter) GetAsset(ctx context.Context, id string, quality 
 	}
 }
 
+func (a immichTransferAdapter) HeadVideoPlayback(ctx context.Context, id string) (int64, error) {
+	return a.client.HeadVideoPlayback(ctx, id)
+}
+
 type immichPoller interface {
 	PollShares(ctx context.Context) ([]immich.SharedLink, error)
 }

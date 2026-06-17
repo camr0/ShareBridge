@@ -310,6 +310,25 @@ func (c *Client) GetVideoPlayback(ctx context.Context, id string, w io.Writer) (
 	return c.getAsset(ctx, c.assetURL(id, "/video/playback"), w)
 }
 
+// HeadVideoPlayback returns the Content-Length of the transcoded video stream,
+// or 0 if Immich doesn't report one (e.g. chunked transfer encoding).
+// Uses a HEAD request so the response body is not consumed.
+func (c *Client) HeadVideoPlayback(ctx context.Context, id string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.assetURL(id, "/video/playback"), nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HEAD /video/playback returned %s", resp.Status)
+	}
+	return resp.ContentLength, nil
+}
+
 func (c *Client) getAsset(ctx context.Context, rawURL string, w io.Writer) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {

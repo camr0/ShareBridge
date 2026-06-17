@@ -1325,9 +1325,23 @@ function startGalleryPreview(header) {
 function startVideoPreview(header) {
   const vp = { id: header.id, mediaId: header.id }
   currentVideoPreview = vp
-  // Tell the gallery to show /media/{id} as the video URL immediately.
-  // The SW will stream chunks as they arrive.
-  galleryController?.handlePreviewData?.(header.id, new Uint8Array(0), 'video/mp4')
+
+  // Forward the content size to the SW so it can set Content-Length
+  // and Accept-Ranges for seeking.
+  if (header.size > 0) {
+    navigator.serviceWorker?.controller?.postMessage({
+      mediaId: header.id,
+      size: header.size,
+    })
+  }
+
+  // Defer creating the <video> element (which triggers the fetch) to the
+  // next macrotask.  This gives the SW's message handler a chance to store
+  // totalSize before it handles the first fetch event, so the initial 200
+  // response already carries Content-Length + Accept-Ranges.
+  setTimeout(() => {
+    galleryController?.handlePreviewData?.(header.id, new Uint8Array(0), 'video/mp4')
+  }, 0)
 }
 
 function completeGalleryPreview(msg) {
