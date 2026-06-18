@@ -48,6 +48,7 @@ type GalleryBackend interface {
 	GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error)
 	GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) // name, size, mimeType
 	HeadVideoPlayback(ctx context.Context, id string) (int64, error)           // Content-Length of transcoded video (0 if unknown)
+	GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error)
 }
 
 type Gallery struct {
@@ -77,6 +78,9 @@ type Manager struct {
 	transfer     atomic.Bool
 	maxDownloads int
 	downloads    atomic.Int32
+
+	streamCancel      context.CancelFunc
+	currentGeneration atomic.Uint32
 
 	OnSessionExpired   func()
 	OnDownloadComplete func(bytesTransferred int64)
@@ -108,10 +112,12 @@ func (m *Manager) HandleOpen() {
 // HandleMessage processes incoming DataChannel messages.
 func (m *Manager) HandleMessage(data []byte) {
 	var msg struct {
-		Type    string `json:"type"`
-		Path    string `json:"path"`
-		ID      string `json:"id"`
-		Quality string `json:"quality"`
+		Type        string `json:"type"`
+		Path        string `json:"path"`
+		ID          string `json:"id"`
+		Quality     string `json:"quality"`
+		StartOffset int64  `json:"start_offset"`
+		Generation  int    `json:"generation"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		m.sendError("invalid message format")
@@ -126,7 +132,9 @@ func (m *Manager) HandleMessage(data []byte) {
 	case "asset_request":
 		m.handleAssetRequest(msg.ID, msg.Quality)
 	case "asset_preview_request":
-		m.handleAssetPreviewRequest(msg.ID, msg.Quality)
+		m.handleAssetPreviewRequest(msg.ID, msg.Quality, msg.Generation)
+	case "asset_preview_seek":
+		m.handleAssetPreviewSeek(msg.ID, msg.Quality, msg.StartOffset, msg.Generation)
 	default:
 		m.sendError("unknown message type: " + msg.Type)
 	}
@@ -220,7 +228,7 @@ func (m *Manager) sendGalleryThumbnails(ctx context.Context, items []GalleryItem
 		if sendFailed {
 			continue
 		}
-		if err := m.sendWithBackpressure(encodeThumbnailFrame(uint16(result.index), result.data)); err != nil {
+		if err := m.sendWithBackpressure(context.Background(), encodeThumbnailFrame(uint16(result.index), result.data)); err != nil {
 			log.Printf("transfer gallery: thumbnail send failed index=%d id=%s bytes=%d: %v", result.index, result.id, len(result.data), err)
 			sendFailed = true
 			continue
@@ -417,8 +425,8 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 	go func() { m.streamAsset(id, quality) }()
 }
 
-func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
-	log.Printf("transfer: asset_preview_request id=%s quality=%s", id, quality)
+func (m *Manager) handleAssetPreviewRequest(id string, quality string, generation int) {
+	log.Printf("transfer: asset_preview_request id=%s quality=%s generation=%d", id, quality, generation)
 	if id == "" {
 		m.sendError("asset id required")
 		return
@@ -464,8 +472,45 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 			log.Printf("transfer: video preview no transcoded size (head_err=%v), omitting Content-Length", err)
 			previewSize = 0
 		}
+
+		// Create cancelable context for stream lifecycle. The seek handler
+		// calls m.streamCancel() to stop the old stream before starting a new one.
+		ctx, cancel := context.WithCancel(context.Background())
+		m.streamCancel = cancel
+		m.currentGeneration.Store(uint32(generation))
+
+		header := struct {
+			Type           string `json:"type"`
+			ID             string `json:"id"`
+			MimeType       string `json:"mimeType"`
+			Size           int64  `json:"size"`
+			BinaryEnvelope bool   `json:"binary_envelope"`
+			Generation     int    `json:"generation"`
+			ByteOffset     int64  `json:"byte_offset"`
+		}{
+			Type:           "asset_preview_header",
+			ID:             id,
+			MimeType:       mimeType,
+			Size:           previewSize,
+			BinaryEnvelope: true,
+			Generation:     generation,
+			ByteOffset:     0,
+		}
+		headerData, _ := json.Marshal(header)
+		if err := m.dc.SendText(string(headerData)); err != nil {
+			log.Printf("transfer: asset_preview_header send failed id=%s: %v", id, err)
+			m.releaseTransfer()
+			cancel()
+			m.streamCancel = nil
+			return
+		}
+		log.Printf("transfer: asset_preview_header sent id=%s mime=%s size=%d generation=%d", id, mimeType, previewSize, generation)
+
+		go m.streamAssetPreview(ctx, id, quality, uint32(generation))
+		return
 	}
 
+	// Non-video preview path (unchanged).
 	header := struct {
 		Type           string `json:"type"`
 		ID             string `json:"id"`
@@ -487,7 +532,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string) {
 	}
 	log.Printf("transfer: asset_preview_header sent id=%s mime=%s size=%d", id, mimeType, previewSize)
 
-	go m.streamAssetPreview(id, quality)
+	go m.streamAssetPreview(context.Background(), id, quality, 0)
 }
 
 func (m *Manager) streamFile(filePath string) {
@@ -508,7 +553,7 @@ func (m *Manager) streamFile(filePath string) {
 		n, err := pr.Read(buf)
 		if n > 0 {
 			totalBytes += int64(n)
-			if err := m.sendWithBackpressure(encodeFileChunkFrame(buf[:n])); err != nil {
+			if chunkErr := m.sendWithBackpressure(context.Background(), encodeFileChunkFrameLegacy(buf[:n])); chunkErr != nil {
 				return
 			}
 		}
@@ -560,7 +605,7 @@ func (m *Manager) streamAsset(id string, quality string) {
 		n, err := pr.Read(buf)
 		if n > 0 {
 			totalBytes += int64(n)
-			if err := m.sendWithBackpressure(encodeFileChunkFrame(buf[:n])); err != nil {
+			if chunkErr := m.sendWithBackpressure(context.Background(), encodeFileChunkFrameLegacy(buf[:n])); chunkErr != nil {
 				return
 			}
 		}
@@ -589,8 +634,104 @@ func (m *Manager) streamAsset(id string, quality string) {
 	}
 }
 
-func (m *Manager) streamAssetPreview(id string, quality string) {
-	defer func() { m.transfer.Store(false) }()
+func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset int64, generation int) {
+	log.Printf("transfer: asset_preview_seek id=%s start_offset=%d generation=%d", id, startOffset, generation)
+	if id == "" || quality == "" {
+		m.sendError("asset_preview_seek: id and quality required")
+		return
+	}
+	if startOffset < 0 {
+		m.sendError("asset_preview_seek: start_offset must be >= 0")
+		return
+	}
+	if m.gallery == nil {
+		m.sendError("share unavailable: client not initialized")
+		return
+	}
+
+	// Single GET with first-byte validation — do NOT cancel the old stream yet.
+	// We validate the Immich Range request succeeds before tearing anything down.
+	pr, pw := io.Pipe()
+
+	go func() {
+		_, err := m.gallery.GetAssetRange(context.Background(), id, quality, startOffset, pw)
+		pw.CloseWithError(err)
+	}()
+
+	// Read first byte to validate the Immich response arrived.
+	firstByte := make([]byte, 1)
+	_, readErr := io.ReadFull(pr, firstByte)
+	if readErr != nil {
+		pr.Close()
+		log.Printf("transfer: seek validation failed id=%s start_offset=%d: %v", id, startOffset, readErr)
+		m.sendError("preview seek failed: " + readErr.Error())
+		return
+	}
+
+	// Validation succeeded. Store new generation FIRST so the old stream's
+	// send-guard immediately fails, then cancel the old stream.
+	m.currentGeneration.Store(uint32(generation))
+
+	// Cancel old stream if one is running.
+	if m.streamCancel != nil {
+		m.streamCancel()
+		m.streamCancel = nil
+	}
+
+	// Release transfer lock — the old stream's deferred unlock is
+	// generation-guarded and will be a no-op since we stored a new generation.
+	m.transfer.Store(false)
+
+	// Acquire the lock for the new stream goroutine.
+	if !m.acquireTransfer() {
+		log.Printf("transfer: seek failed to acquire transfer lock id=%s", id)
+		pr.Close()
+		return
+	}
+
+	// Create new cancelable context for the new stream.
+	ctx, cancel := context.WithCancel(context.Background())
+	m.streamCancel = cancel
+
+	// Send header with byte_offset so the page knows where this stream starts.
+	header := struct {
+		Type           string `json:"type"`
+		ID             string `json:"id"`
+		MimeType       string `json:"mimeType"`
+		Size           int64  `json:"size"`
+		BinaryEnvelope bool   `json:"binary_envelope"`
+		Generation     int    `json:"generation"`
+		ByteOffset     int64  `json:"byte_offset"`
+	}{
+		Type:           "asset_preview_header",
+		ID:             id,
+		MimeType:       "video/mp4",
+		BinaryEnvelope: true,
+		Generation:     generation,
+		ByteOffset:     startOffset,
+	}
+	headerData, _ := json.Marshal(header)
+	if err := m.dc.SendText(string(headerData)); err != nil {
+		log.Printf("transfer: seek header send failed id=%s: %v", id, err)
+		pr.Close()
+		cancel()
+		m.streamCancel = nil
+		return
+	}
+	log.Printf("transfer: seek header sent id=%s byte_offset=%d generation=%d", id, startOffset, generation)
+
+	// Prepend the already-read byte and stream from the pipe via a fresh goroutine.
+	reader := io.MultiReader(bytes.NewReader(firstByte), pr)
+	go m.streamAssetPreviewFromReader(ctx, id, reader, uint32(generation))
+}
+
+func (m *Manager) streamAssetPreview(ctx context.Context, id string, quality string, generation uint32) {
+	defer func() {
+		// Only release transfer lock if we're still the active generation.
+		if m.currentGeneration.Load() == generation {
+			m.transfer.Store(false)
+		}
+	}()
 
 	pr, pw := io.Pipe()
 	defer pr.Close()
@@ -600,44 +741,78 @@ func (m *Manager) streamAssetPreview(id string, quality string) {
 		pw.CloseWithError(err)
 	}()
 
+	m.streamAssetPreviewFromReader(ctx, id, pr, generation)
+}
+
+// streamAssetPreviewFromReader streams chunks from reader, guarded by generation.
+// The caller must hold the transfer lock (acquired via acquireTransfer()).
+func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, reader io.Reader, generation uint32) {
+	defer func() {
+		if m.currentGeneration.Load() == generation {
+			m.transfer.Store(false)
+		}
+	}()
+
 	var totalBytes int64
 	var transferErr error
 	chunksSent := 0
 	buf := make([]byte, chunkSize)
 	for {
-		n, err := pr.Read(buf)
+		// Check generation before every read. If stale, abort immediately.
+		select {
+		case <-ctx.Done():
+			log.Printf("transfer: preview stream cancelled generation=%d bytes=%d", generation, totalBytes)
+			return
+		default:
+		}
+		if m.currentGeneration.Load() != generation {
+			log.Printf("transfer: preview stale generation=%d (current=%d), aborting", generation, m.currentGeneration.Load())
+			return
+		}
+
+		n, err := reader.Read(buf)
 		if n > 0 {
 			totalBytes += int64(n)
 			chunksSent++
 			if chunksSent == 1 {
-				log.Printf("transfer: preview first chunk id=%s size=%d", id, n)
+				log.Printf("transfer: preview first chunk generation=%d size=%d", generation, n)
 			}
-			if err := m.sendWithBackpressure(encodeFileChunkFrame(buf[:n])); err != nil {
-				log.Printf("transfer: preview send failed id=%s bytes=%d chunks=%d: %v", id, totalBytes, chunksSent, err)
+			var frame []byte
+			if generation > 0 {
+				frame = encodeFileChunkFrame(generation, buf[:n])
+			} else {
+				frame = encodeFileChunkFrameLegacy(buf[:n])
+			}
+			if chunkSendErr := m.sendWithBackpressure(ctx, frame); chunkSendErr != nil {
+				log.Printf("transfer: preview send failed generation=%d bytes=%d chunks=%d: %v", generation, totalBytes, chunksSent, chunkSendErr)
 				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
 				transferErr = err
-				log.Printf("transfer: preview read failed id=%s bytes=%d: %v", id, totalBytes, err)
+				log.Printf("transfer: preview read failed generation=%d bytes=%d: %v", generation, totalBytes, err)
 				m.sendError("preview failed: " + err.Error())
 			}
 			break
 		}
 	}
 
-	log.Printf("transfer: preview finished id=%s bytes=%d err=%v", id, totalBytes, transferErr)
+	log.Printf("transfer: preview finished generation=%d bytes=%d err=%v", generation, totalBytes, transferErr)
 	if transferErr != nil {
 		return
 	}
 
-	end := struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-	}{Type: "asset_preview_end", ID: id}
-	endData, _ := json.Marshal(end)
-	m.dc.SendText(string(endData))
+	// Only send end if we're still the active generation.
+	if m.currentGeneration.Load() == generation {
+		end := struct {
+			Type       string `json:"type"`
+			ID         string `json:"id"`
+			Generation int    `json:"generation"`
+		}{Type: "asset_preview_end", ID: id, Generation: int(generation)}
+		endData, _ := json.Marshal(end)
+		m.dc.SendText(string(endData))
+	}
 }
 
 func resolveRequestPath(dir string, fileInfo *cloudwebdav.FileInfo) string {
@@ -659,7 +834,20 @@ func encodeThumbnailFrame(index uint16, jpg []byte) []byte {
 	return out
 }
 
-func encodeFileChunkFrame(data []byte) []byte {
+func encodeFileChunkFrame(generation uint32, data []byte) []byte {
+	out := make([]byte, 5+len(data)) // 1 (type 0x10) + 4 (generation uint32 BE) + data
+	out[0] = binaryFrameFileChunk
+	out[1] = byte(generation >> 24)
+	out[2] = byte(generation >> 16)
+	out[3] = byte(generation >> 8)
+	out[4] = byte(generation)
+	copy(out[5:], data)
+	return out
+}
+
+// encodeFileChunkFrameLegacy is used by non-preview file transfers that don't
+// participate in the generation protocol.
+func encodeFileChunkFrameLegacy(data []byte) []byte {
 	out := make([]byte, 1+len(data))
 	out[0] = binaryFrameFileChunk
 	copy(out[1:], data)
@@ -702,9 +890,14 @@ func (m *Manager) releaseTransfer() {
 	m.transfer.Store(false)
 }
 
-func (m *Manager) sendWithBackpressure(data []byte) error {
+func (m *Manager) sendWithBackpressure(ctx context.Context, data []byte) error {
 	for m.dc.BufferedAmount() > maxBuffer {
-		time.Sleep(sleepInterval)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			time.Sleep(sleepInterval)
+		}
 	}
 	return m.dc.SendBinary(data)
 }

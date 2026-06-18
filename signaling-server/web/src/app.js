@@ -57,7 +57,9 @@ let queuedGalleryPreviewID = ''
 let queuedGalleryPreloadIDs = []
 let currentPreview = null
 let currentVideoPreview = null
-// { id, mediaId }
+// { id, mediaId, generation, totalSize, baseOffset, totalBytesReceived, seekTimer, seekListener, seeking }
+
+let globalGeneration = 0  // uint32, never reset, unique across all previews
 let sessionPassword = '' // set from URL hash on load, or from password input
 
 // HMAC pre-challenge state
@@ -696,10 +698,27 @@ async function handleTransferMessage(event) {
     }
 
     if (currentVideoPreview) {
+      // For generation > 0 (seek path): frame format is [0x10][gen_u32be][data].
+      // Decode generation and strip it before forwarding to the SW.
+      // For generation === 0 (initial load): frame is [0x10][data] (legacy).
+      const b = frame.payload
+      let chunk, chunkGeneration
+      if (currentVideoPreview.generation > 0) {
+        // Use multiplication for top byte to avoid JS signed-32-bit overflow from << 24.
+        chunkGeneration = (b[0] * 0x1000000) + (b[1] << 16) + (b[2] << 8) + b[3]
+        chunk = b.slice(4)
+      } else {
+        chunkGeneration = 0
+        chunk = b
+      }
       navigator.serviceWorker?.controller?.postMessage({
         mediaId: currentVideoPreview.mediaId,
-        chunk: frame.payload,
+        chunk,
+        generation: chunkGeneration > 0 ? chunkGeneration : undefined,
       })
+      if (chunkGeneration === currentVideoPreview.generation) {
+        currentVideoPreview.totalBytesReceived += chunk.byteLength
+      }
       return
     }
 
@@ -1173,6 +1192,16 @@ async function handleTransferClosure() {
 
 function cleanupCurrentVideoPreview() {
   if (currentVideoPreview) {
+    clearTimeout(currentVideoPreview.seekTimer)
+    currentVideoPreview.seekTimer = null
+    // Remove seeked listener from video element if present.
+    if (currentVideoPreview.seekListener) {
+      const video = document.querySelector('video.lg-video')
+      if (video) {
+        video.removeEventListener('seeked', currentVideoPreview.seekListener)
+      }
+      currentVideoPreview.seekListener = null
+    }
     navigator.serviceWorker?.controller?.postMessage({
       mediaId: currentVideoPreview.mediaId,
       chunk: null,
@@ -1289,7 +1318,30 @@ function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) 
   }
   galleryPreviewRequestPending = true
   const quality = mimeType?.startsWith('video/') ? 'video' : 'preview'
-  transferChannel.send(JSON.stringify({ type: 'asset_preview_request', id, quality }))
+
+  // For video, pre-create currentVideoPreview with a unique generation
+  // BEFORE sending the request, so it's ready when the header arrives.
+  // Initial load uses generation=0 (no binary frame generation encoding)
+  // to avoid a race between SW postMessage and the initial fetch event.
+  // Seeks increment globalGeneration and use generation-encoded frames.
+  if (quality === 'video') {
+    currentVideoPreview = {
+      id,
+      mediaId: id,
+      generation: globalGeneration,  // 0 for initial load; seek handlers increment
+      totalSize: 0,
+      baseOffset: 0,
+      totalBytesReceived: 0,
+      seekTimer: null,
+      seekListener: null,
+      seeking: false,
+    }
+  }
+
+  transferChannel.send(JSON.stringify({
+    type: 'asset_preview_request', id, quality,
+    generation: quality === 'video' ? currentVideoPreview.generation : undefined,
+  }))
 }
 
 function queueGalleryPreload(id) {
@@ -1301,6 +1353,13 @@ function queueGalleryPreload(id) {
 }
 
 function requestGalleryAsset(id) {
+  // Guard downloads during an active video seek — the transfer lock is
+  // briefly released during the generation handoff and we don't want a
+  // download to steal it.
+  if (currentVideoPreview?.seeking) {
+    updateStatus('Please wait, seeking...')
+    return
+  }
   if (activeDownload || galleryAssetRequestPending) {
     updateStatus('Download in progress, please wait')
     return
@@ -1323,29 +1382,110 @@ function startGalleryPreview(header) {
 }
 
 function startVideoPreview(header) {
-  const vp = { id: header.id, mediaId: header.id }
-  currentVideoPreview = vp
+  const vp = currentVideoPreview
+  if (!vp) return
 
-  // Forward the content size to the SW so it can set Content-Length
-  // and Accept-Ranges for seeking.
+  // Check if this header is for the current generation.
+  if (header.generation !== undefined && header.generation !== vp.generation) return
+
+  // Store size/offset from header for seek calculations.
+  if (header.size > 0) {
+    vp.totalSize = header.size
+  }
+  vp.baseOffset = header.byte_offset || 0
+  vp.totalBytesReceived = 0
+  vp.seeking = false  // clear any pending seek flag
+
+  // For seeks (byte_offset > 0), reset the SW entry to clear old chunks
+  // and set the new generation.  For the initial load (byte_offset=0),
+  // we only send the size — the entry already starts at baseOffset=0
+  // and we don't want to race with the fetch event that fires when the
+  // video element is created below.
+  if (header.byte_offset > 0) {
+    navigator.serviceWorker?.controller?.postMessage({
+      mediaId: vp.mediaId,
+      reset: header.byte_offset,
+      generation: vp.generation,
+    })
+  }
+
+  // Forward total size for Content-Length (initial load only — subsequent
+  // seeks keep the same transcoded size).
   if (header.size > 0) {
     navigator.serviceWorker?.controller?.postMessage({
-      mediaId: header.id,
+      mediaId: vp.mediaId,
       size: header.size,
     })
   }
 
-  // Defer creating the <video> element (which triggers the fetch) to the
-  // next macrotask.  This gives the SW's message handler a chance to store
-  // totalSize before it handles the first fetch event, so the initial 200
-  // response already carries Content-Length + Accept-Ranges.
+  // Defer creating the <video> element (which triggers the fetch) by
+  // 100ms.  This gives the SW's message handler time to process the
+  // size / reset postMessages before Chrome issues its initial Range
+  // probe, so the response carries Content-Length + Accept-Ranges and
+  // Chrome recognizes the resource as seekable.
   setTimeout(() => {
     galleryController?.handlePreviewData?.(header.id, new Uint8Array(0), 'video/mp4')
-  }, 0)
+
+    // Attach seeked listener to the video element after it's created.
+    const video = document.querySelector('video.lg-video')
+    if (video && !vp.seekListener) {
+      const onSeeked = createSeekHandler(vp)
+      vp.seekListener = onSeeked
+      video.addEventListener('seeked', onSeeked)
+    }
+  }, 100)
+}
+
+function createSeekHandler(vp) {
+  return () => {
+    const video = document.querySelector('video.lg-video')
+    if (!video || !video.duration || !vp.totalSize) return  // metadata not loaded
+
+    const byteOffset = Math.floor(video.currentTime / video.duration * vp.totalSize)
+
+    // Cached seek optimization: if the requested offset is within the
+    // buffered range for this generation, the SW already has the data
+    // and Chrome's Range request will be served immediately.
+    if (byteOffset >= vp.baseOffset && byteOffset < vp.baseOffset + vp.totalBytesReceived) {
+      return
+    }
+
+    // Immediately tell the SW about the new base offset + generation
+    // so it can intercept Chrome's Range: bytes=0- init-segment request
+    // that fires synchronously when the video seeks.  The agent round-
+    // trip is debounced below.
+    vp.generation = ++globalGeneration
+    navigator.serviceWorker?.controller?.postMessage({
+      mediaId: vp.mediaId,
+      reset: byteOffset,
+      generation: vp.generation,
+    })
+
+    // Debounce: clear any pending seek, schedule a new one.
+    if (vp.seekTimer) clearTimeout(vp.seekTimer)
+    vp.seekTimer = setTimeout(() => {
+      vp.seekTimer = null
+      if (!transferChannel) return
+
+      // Guard downloads during seek.
+      vp.seeking = true
+
+      transferChannel.send(JSON.stringify({
+        type: 'asset_preview_seek',
+        id: vp.id,
+        quality: 'video',
+        start_offset: byteOffset,
+        generation: vp.generation,
+      }))
+    }, 300)
+  }
 }
 
 function completeGalleryPreview(msg) {
   if (currentVideoPreview && currentVideoPreview.id === msg.id) {
+    // Ignore stale end messages from old generations.
+    if (msg.generation !== undefined && msg.generation !== currentVideoPreview.generation) return
+
     const vp = currentVideoPreview
     currentVideoPreview = null
     galleryPreviewRequestPending = false

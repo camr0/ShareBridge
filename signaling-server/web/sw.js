@@ -14,6 +14,11 @@
 // Content-Range. Backward seeks are instant (data already buffered in
 // the append-only chunks array). Forward seeks wait for the streaming
 // position to catch up.
+//
+// Generation protocol: every preview (initial or seek) gets a unique
+// generation number. Chunks carry generation in the postMessage, and
+// the SW drops stale chunks. Streams are stamped with the generation
+// at creation time and close themselves when it changes.
 
 self.addEventListener('install', () => {
   self.skipWaiting()
@@ -23,11 +28,17 @@ self.addEventListener('activate', event => {
   event.waitUntil(self.clients.claim())
 })
 
-// Map of mediaId -> { streams: Set<stream>, chunks: [], isDone, totalSize }
-//
-// chunks is an append-only history array. Each stream tracks its own
-// readCursor into this array so multiple concurrent fetches each see
-// every byte from the beginning — no shared destructive shift().
+// Map of mediaId -> {
+//   streams: Set<stream>,
+//   chunks: [],        // append-only (push, never shift)
+//   isDone: false,
+//   totalSize: 0,      // Content-Length of the full transcoded video
+//   baseOffset: 0,     // byte offset where the current generation starts
+//   generation: 0,     // monotonic generation counter
+//   totalBufferedBytes: 0,  // total bytes buffered for current generation
+//   initSegment: Uint8Array|null,  // cached MP4 init segment (ftyp+...+moov)
+//   initCapture: Uint8Array|null,  // temporary bytes while finding moov
+// }
 const entries = new Map()
 
 function ensureEntry(mediaId) {
@@ -38,64 +49,178 @@ function ensureEntry(mediaId) {
       chunks: [],        // append-only (push, never shift)
       isDone: false,
       totalSize: 0,      // Content-Length of the full transcoded video
+      baseOffset: 0,
+      generation: 0,
+      totalBufferedBytes: 0,
+      initSegment: null,
+      initCapture: null,
     }
     entries.set(mediaId, entry)
   }
   return entry
 }
 
-function createStreamForEntry(entry, mediaId, startOffset) {
-  let ctrl
-  let readCursor = 0        // per-stream position into entry.chunks
-  let skipBytes = startOffset || 0  // bytes to skip before enqueuing
+function concatUint8Arrays(parts) {
+  let total = 0
+  for (const part of parts) total += part.byteLength
+  const merged = new Uint8Array(total)
+  let offset = 0
+  for (const part of parts) {
+    merged.set(part, offset)
+    offset += part.byteLength
+  }
+  return merged
+}
+
+function readBoxSize(bytes, offset) {
+  return (
+    (bytes[offset] * 0x1000000) +
+    (bytes[offset + 1] << 16) +
+    (bytes[offset + 2] << 8) +
+    bytes[offset + 3]
+  )
+}
+
+function captureInitSegment(entry, chunk) {
+  if (entry.initSegment || entry.baseOffset !== 0 || !chunk?.byteLength) return
+
+  entry.initCapture = entry.initCapture
+    ? concatUint8Arrays([entry.initCapture, chunk])
+    : chunk.slice()
+
+  const bytes = entry.initCapture
+  let offset = 0
+  while (offset + 8 <= bytes.byteLength) {
+    const size = readBoxSize(bytes, offset)
+    if (size < 8) return
+    if (offset + size > bytes.byteLength) return
+
+    const type = String.fromCharCode(
+      bytes[offset + 4],
+      bytes[offset + 5],
+      bytes[offset + 6],
+      bytes[offset + 7],
+    )
+    offset += size
+    if (type === 'moov') {
+      entry.initSegment = bytes.slice(0, offset)
+      entry.initCapture = null
+      return
+    }
+  }
+}
+
+function parseRangeHeader(rangeHeader) {
+  if (!rangeHeader) return null
+  const match = rangeHeader.match(/bytes=(\d+)-(\d+)?/)
+  if (!match) return null
+
+  return {
+    start: parseInt(match[1], 10) || 0,
+    end: match[2] !== undefined ? (parseInt(match[2], 10) || 0) : null,
+  }
+}
+
+function computeStreamPosition(entry, startOffset) {
+  let readCursor = 0
+  let skipBytes = 0
+
+  // Compute effective offset within the current generation's data.
+  let effectiveStart = startOffset - (entry.baseOffset || 0)
+  if (effectiveStart < 0) {
+    // Seek is before the start of our buffered data for this generation.
+    // Chrome will try a few offsets; the page will trigger a new agent seek
+    // if needed. Clamp and let what data we have be served.
+    effectiveStart = 0
+  }
 
   // If starting mid-stream, find the right chunk and byte offset.
-  if (startOffset > 0) {
+  if (effectiveStart > 0) {
     let bytesSeen = 0
     for (let i = 0; i < entry.chunks.length; i++) {
       const chunk = entry.chunks[i]
       if (chunk === null) break
-      if (bytesSeen + chunk.byteLength > startOffset) {
+      if (bytesSeen + chunk.byteLength > effectiveStart) {
         readCursor = i
-        skipBytes = startOffset - bytesSeen
+        skipBytes = effectiveStart - bytesSeen
         break
       }
       bytesSeen += chunk.byteLength
       readCursor = i + 1
     }
-    // If we exhausted all available chunks without reaching startOffset,
+    // If we exhausted all available chunks without reaching effectiveStart,
     // deduct what we've already scanned past so pull() only skips the
     // remaining bytes when new chunks arrive.
     if (readCursor >= entry.chunks.length) {
-      skipBytes = startOffset - bytesSeen
+      skipBytes = effectiveStart - bytesSeen
     }
   }
 
+  return { readCursor, skipBytes }
+}
+
+function rebaseStream(stream, entry, generation) {
+  const position = computeStreamPosition(entry, stream.startOffset)
+  stream.readCursor = position.readCursor
+  stream.skipBytes = position.skipBytes
+  stream.generation = generation
+}
+
+function createStreamForEntry(entry, mediaId, startOffset) {
+  let ctrl
+  const stream = {
+    controller: null,
+    readable: null,
+    resolvePull: null,   // per-stream pull-wait promise
+    startOffset,
+    generation: entry.generation,
+    readCursor: 0,
+    skipBytes: 0,
+    initSegment: null,
+    initQueued: false,
+  }
+  rebaseStream(stream, entry, entry.generation)
+
   const readable = new ReadableStream({
-    start(controller) { ctrl = controller },
+    start(controller) {
+      ctrl = controller
+      stream.controller = controller
+    },
     pull(controller) {
+      // If generation changed, this stream is stale — close it.
+      if (entry.generation !== stream.generation) {
+        entry.streams.delete(stream)
+        if (entry.streams.size === 0) entries.delete(mediaId)
+        try { controller.close() } catch (_) {}
+        return
+      }
+      if (stream.initSegment && !stream.initQueued) {
+        stream.initQueued = true
+        controller.enqueue(stream.initSegment)
+        return
+      }
       // Drain every chunk available from this stream's cursor position.
-      while (readCursor < entry.chunks.length) {
-        let chunk = entry.chunks[readCursor++]
+      while (stream.readCursor < entry.chunks.length) {
+        let chunk = entry.chunks[stream.readCursor++]
         if (chunk === null) {
-          entry.streams.delete(readable)
+          entry.streams.delete(stream)
           if (entry.streams.size === 0) entries.delete(mediaId)
           try { controller.close() } catch (_) {}
           return
         }
         // Trim leading bytes when seeking to a mid-chunk position.
-        if (skipBytes > 0) {
-          if (skipBytes >= chunk.byteLength) {
-            skipBytes -= chunk.byteLength
+        if (stream.skipBytes > 0) {
+          if (stream.skipBytes >= chunk.byteLength) {
+            stream.skipBytes -= chunk.byteLength
             continue
           }
-          chunk = chunk.slice(skipBytes)
-          skipBytes = 0
+          chunk = chunk.slice(stream.skipBytes)
+          stream.skipBytes = 0
         }
         controller.enqueue(chunk)
       }
       if (entry.isDone) {
-        entry.streams.delete(readable)
+        entry.streams.delete(stream)
         if (entry.streams.size === 0) entries.delete(mediaId)
         try { controller.close() } catch (_) {}
         return
@@ -103,16 +228,16 @@ function createStreamForEntry(entry, mediaId, startOffset) {
       return new Promise(resolve => { stream.resolvePull = resolve })
     },
     cancel() {
-      entry.streams.delete(readable)
-      if (entry.streams.size === 0) entries.delete(mediaId)
+      entry.streams.delete(stream)
+      // Don't delete the entry when all streams cancel — Chrome
+      // cancels the old fetch before issuing a new Range request.
+      // Deleting would drop all buffered chunks and force the new
+      // stream to start from scratch.  Only clean up on EOF (null
+      // chunk) when isDone and no streams remain.
     },
   })
 
-  const stream = {
-    controller: ctrl,
-    readable,
-    resolvePull: null,   // per-stream pull-wait promise
-  }
+  stream.readable = readable
   entry.streams.add(stream)
   return stream
 }
@@ -135,23 +260,51 @@ self.addEventListener('fetch', event => {
   if (!match) return
   const mediaId = match[1]
   const entry = ensureEntry(mediaId)
+  const rangeHeader = event.request.headers.get('range')
+  const parsedRange = parseRangeHeader(rangeHeader)
+
+  if (
+    parsedRange &&
+    parsedRange.start === 0 &&
+    entry.baseOffset > 0 &&
+    entry.initSegment
+  ) {
+    const initSegmentLength = entry.initSegment.byteLength
+    const endOffset = Math.min(
+      parsedRange.end ?? (initSegmentLength - 1),
+      initSegmentLength - 1,
+    )
+    const contentLength = Math.max(0, endOffset + 1)
+    const totalSize = entry.totalSize || initSegmentLength
+
+    event.respondWith(new Response(entry.initSegment.slice(0, contentLength), {
+      status: 206,
+      headers: {
+        'Content-Type': 'video/mp4',
+        'Cache-Control': 'no-store',
+        'Accept-Ranges': 'bytes',
+        'Content-Length': String(contentLength),
+        'Content-Range': `bytes 0-${endOffset}/${totalSize}`,
+      },
+    }))
+    return
+  }
 
   // Parse Range header for seeking.
   let startOffset = 0
   let status = 200
   let contentRange = null
-  const rangeHeader = event.request.headers.get('range')
-  if (rangeHeader) {
-    const m = rangeHeader.match(/bytes=(\d+)-/)
-    if (m) {
-      startOffset = parseInt(m[1], 10) || 0
-      // Only use 206 for actual seeks (startOffset > 0).  Chrome's video
-      // element sends Range: bytes=0- as a probe but needs a 200 with the
-      // full MP4 (including ftyp/moov atoms) to initialize the demuxer.
-      if (startOffset > 0 && entry.totalSize > 0) {
-        status = 206
-        contentRange = `bytes ${startOffset}-${entry.totalSize - 1}/${entry.totalSize}`
-      }
+  if (parsedRange) {
+    startOffset = parsedRange.start
+      // Return 206 for all Range requests when totalSize is known so
+      // Chrome detects Range support on its initial probe and uses
+      // Range requests for seeking.  bytes=0- with 206 + Content-Range
+      // is semantically identical to 200 + Content-Length.
+    if (entry.totalSize > 0) {
+      status = 206
+      contentRange = startOffset === 0
+        ? `bytes 0-${entry.totalSize - 1}/${entry.totalSize}`
+        : `bytes ${startOffset}-${entry.totalSize - 1}/${entry.totalSize}`
     }
   }
 
@@ -183,10 +336,39 @@ self.addEventListener('fetch', event => {
 self.addEventListener('message', event => {
   if (event.data === 'ping') return
 
-  const { mediaId, chunk, size } = event.data
+  const { mediaId, chunk, size, generation, reset } = event.data
   if (!mediaId) return
 
   const entry = ensureEntry(mediaId)
+
+  // --- Reset message (seek start) ---
+  // {mediaId, reset: byteOffset, generation: N}
+  if (reset !== undefined && reset !== null) {
+    // Guard against stale resets: only apply if the generation is newer.
+    // generation 0 is the initial state; every real generation is >= 1.
+    if (generation <= entry.generation) return
+    // Wake all parked pull() waiters BEFORE clearing streams.
+    // Streams that still belong to this seek target will be rebased below.
+    wakeAllStreams(entry)
+    // Reset entry state for the new generation.
+    entry.chunks = []
+    entry.isDone = false
+    entry.baseOffset = reset
+    entry.generation = generation
+    entry.totalBufferedBytes = 0
+    for (const s of [...entry.streams]) {
+      // Preserve the fetch stream Chrome opened for this seek race:
+      // it requested bytes at or beyond the new base offset, so after
+      // rebasing it can consume the incoming generation safely.
+      if (s.startOffset >= reset) {
+        rebaseStream(s, entry, generation)
+        continue
+      }
+      entry.streams.delete(s)
+      try { s.controller?.close() } catch (_) {}
+    }
+    return
+  }
 
   // Store the total content size for Content-Length / Accept-Ranges.
   // Sent by the page before the <video> element starts fetching.
@@ -215,9 +397,18 @@ self.addEventListener('message', event => {
     return
   }
 
+  // --- Chunk message ---
+  // {mediaId, chunk, generation}
+  // Drop stale chunks from cancelled streams.
+  if (generation !== undefined && generation !== entry.generation) {
+    return
+  }
+
   // Append to shared history. Never shift — each stream drains
   // independently from its own readCursor.
+  captureInitSegment(entry, chunk)
   entry.chunks.push(chunk)
+  entry.totalBufferedBytes += chunk.byteLength
 
   // Wake all waiting pull() loops so they drain from their cursors.
   wakeAllStreams(entry)

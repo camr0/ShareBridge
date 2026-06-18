@@ -272,7 +272,7 @@ func galleryItemFromAsset(asset Asset) GalleryItem {
 }
 
 func (c *Client) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
-	return c.getAsset(ctx, c.assetURL(id, "/thumbnail"), w)
+	return c.getAsset(ctx, c.assetURL(id, "/thumbnail"), 0, w)
 }
 
 func (c *Client) GetPreview(ctx context.Context, id string, w io.Writer) (int64, error) {
@@ -280,7 +280,7 @@ func (c *Client) GetPreview(ctx context.Context, id string, w io.Writer) (int64,
 	q := u.Query()
 	q.Set("size", "preview")
 	u.RawQuery = q.Encode()
-	return c.getAsset(ctx, u.String(), w)
+	return c.getAsset(ctx, u.String(), 0, w)
 }
 
 func (c *Client) GetAssetInfo(ctx context.Context, id string) (Asset, error) {
@@ -301,13 +301,18 @@ func (c *Client) GetAssetInfo(ctx context.Context, id string) (Asset, error) {
 }
 
 func (c *Client) GetFile(ctx context.Context, id string, w io.Writer) (int64, error) {
-	return c.getAsset(ctx, c.assetURL(id, "/original"), w)
+	return c.getAsset(ctx, c.assetURL(id, "/original"), 0, w)
 }
 
-// GetVideoPlayback returns the transcoded video stream URL that the browser can play directly.
-// Immich serves an HLS/video stream at /api/assets/{id}/video/playback.
+// GetVideoPlayback returns the transcoded video stream starting from byte 0.
 func (c *Client) GetVideoPlayback(ctx context.Context, id string, w io.Writer) (int64, error) {
-	return c.getAsset(ctx, c.assetURL(id, "/video/playback"), w)
+	return c.getAsset(ctx, c.assetURL(id, "/video/playback"), 0, w)
+}
+
+// GetVideoPlaybackRange returns the transcoded video stream starting from startOffset.
+// Sends an HTTP Range request; Immich returns 206 + Content-Range for valid offsets.
+func (c *Client) GetVideoPlaybackRange(ctx context.Context, id string, startOffset int64, w io.Writer) (int64, error) {
+	return c.getAsset(ctx, c.assetURL(id, "/video/playback"), startOffset, w)
 }
 
 // HeadVideoPlayback returns the Content-Length of the transcoded video stream,
@@ -329,10 +334,13 @@ func (c *Client) HeadVideoPlayback(ctx context.Context, id string) (int64, error
 	return resp.ContentLength, nil
 }
 
-func (c *Client) getAsset(ctx context.Context, rawURL string, w io.Writer) (int64, error) {
+func (c *Client) getAsset(ctx context.Context, rawURL string, startOffset int64, w io.Writer) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, err
+	}
+	if startOffset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -341,7 +349,10 @@ func (c *Client) getAsset(ctx context.Context, rawURL string, w io.Writer) (int6
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		return 0, fmt.Errorf("range not satisfiable: start_offset=%d", startOffset)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(resp.Body)
 		return 0, fmt.Errorf("GET %s returned %s: %s", req.URL.Path, resp.Status, strings.TrimSpace(string(body)))
 	}
