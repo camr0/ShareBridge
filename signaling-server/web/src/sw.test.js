@@ -59,7 +59,8 @@ test('forward seek fetch created before reset survives and rebases to the new ge
   const response = await sw.dispatchFetch('/media/video', { range: 'bytes=100-' })
   const reader = response.body.getReader()
 
-  sw.dispatchMessage({ mediaId: 'video', reset: 100, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', startOffset: 100, generation: 1 })
   sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([7, 8, 9]), generation: 1 })
 
   assert.deepEqual(await readChunk(reader), { done: false, value: [7, 8, 9] })
@@ -71,11 +72,13 @@ test('later seek generation wins over an earlier parked seek stream', async () =
 
   const firstResponse = await sw.dispatchFetch('/media/video', { range: 'bytes=100-' })
   const firstReader = firstResponse.body.getReader()
-  sw.dispatchMessage({ mediaId: 'video', reset: 100, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', startOffset: 100, generation: 1 })
 
   const secondResponse = await sw.dispatchFetch('/media/video', { range: 'bytes=120-' })
   const secondReader = secondResponse.body.getReader()
-  sw.dispatchMessage({ mediaId: 'video', reset: 120, generation: 2 })
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 2 })
+  sw.dispatchMessage({ mediaId: 'video', startOffset: 120, generation: 2 })
 
   sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([1, 2, 3]), generation: 1 })
   sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([4, 5, 6]), generation: 2 })
@@ -100,7 +103,7 @@ test('backward seek within buffered range is served from buffered chunks without
   assert.deepEqual(await readChunk(seekReader), { done: false, value: [12, 13, 14] })
 })
 
-test('forward seek fetch prepends cached init segment before rebased seek data', async () => {
+test('seek init probe returns the cached init segment for the new generation', async () => {
   const sw = await loadServiceWorker()
   sw.dispatchMessage({ mediaId: 'video', size: 1000 })
 
@@ -110,15 +113,28 @@ test('forward seek fetch prepends cached init segment before rebased seek data',
   ])
   sw.dispatchMessage({ mediaId: 'video', chunk: initSegment })
 
-  const response = await sw.dispatchFetch('/media/video', { range: 'bytes=100-' })
-  assert.equal(response.status, 200)
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 1 })
 
+  const response = await sw.dispatchFetch('/media/video', { range: 'bytes=0-' })
+  assert.equal(response.status, 206)
+
+  const body = new Uint8Array(await response.arrayBuffer())
+  assert.deepEqual([...body], [...initSegment])
+})
+
+test('seek stream slices from Chrome range relative to the agent-reported stream start', async () => {
+  const sw = await loadServiceWorker()
+  sw.dispatchMessage({ mediaId: 'video', size: 1000 })
+
+  const response = await sw.dispatchFetch('/media/video', { range: 'bytes=210-' })
   const reader = response.body.getReader()
-  sw.dispatchMessage({ mediaId: 'video', reset: 100, generation: 1 })
-  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([7, 8, 9]), generation: 1 })
+  const chunk = Uint8Array.from(Array.from({ length: 80 }, (_, i) => i))
 
-  assert.deepEqual(await readChunk(reader), { done: false, value: [...initSegment] })
-  assert.deepEqual(await readChunk(reader), { done: false, value: [7, 8, 9] })
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', startOffset: 200, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', chunk, generation: 1 })
+
+  assert.deepEqual(await readChunk(reader), { done: false, value: [...chunk.slice(10)] })
 })
 
 test('normal sequential playback streams chunks in order until EOF', async () => {

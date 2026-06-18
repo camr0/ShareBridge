@@ -1,0 +1,5 @@
+.git/
+.DS_Store
+agent.log
+.env
+.env.*

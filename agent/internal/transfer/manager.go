@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	chunkSize     = 64 * 1024  // 64KB
-	maxBuffer     = 5 * 1024 * 1024 // 5MB — deep pipeline for smooth streaming
-	sleepInterval = 10 * time.Millisecond
+	chunkSize        = 64 * 1024       // 64KB
+	previewChunkSize = 256 * 1024      // 256KB
+	maxBuffer        = 5 * 1024 * 1024 // 5MB — deep pipeline for smooth streaming
+	sleepInterval    = 10 * time.Millisecond
 )
 
 const maxConcurrentGalleryThumbnails = 6
@@ -47,7 +48,7 @@ type GalleryBackend interface {
 	GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error)
 	GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error)
 	GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) // name, size, mimeType
-	HeadVideoPlayback(ctx context.Context, id string) (int64, error)           // Content-Length of transcoded video (0 if unknown)
+	HeadVideoPlayback(ctx context.Context, id string) (int64, error)            // Content-Length of transcoded video (0 if unknown)
 	GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error)
 }
 
@@ -506,7 +507,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 		}
 		log.Printf("transfer: asset_preview_header sent id=%s mime=%s size=%d generation=%d", id, mimeType, previewSize, generation)
 
-		go m.streamAssetPreview(ctx, id, quality, uint32(generation))
+		go m.streamAssetPreview(ctx, id, quality, uint32(generation), previewChunkSize)
 		return
 	}
 
@@ -532,7 +533,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 	}
 	log.Printf("transfer: asset_preview_header sent id=%s mime=%s size=%d", id, mimeType, previewSize)
 
-	go m.streamAssetPreview(context.Background(), id, quality, 0)
+	go m.streamAssetPreview(context.Background(), id, quality, 0, chunkSize)
 }
 
 func (m *Manager) streamFile(filePath string) {
@@ -722,10 +723,10 @@ func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset 
 
 	// Prepend the already-read byte and stream from the pipe via a fresh goroutine.
 	reader := io.MultiReader(bytes.NewReader(firstByte), pr)
-	go m.streamAssetPreviewFromReader(ctx, id, reader, uint32(generation))
+	go m.streamAssetPreviewFromReader(ctx, id, reader, uint32(generation), previewChunkSize)
 }
 
-func (m *Manager) streamAssetPreview(ctx context.Context, id string, quality string, generation uint32) {
+func (m *Manager) streamAssetPreview(ctx context.Context, id string, quality string, generation uint32, bufSize int) {
 	defer func() {
 		// Only release transfer lock if we're still the active generation.
 		if m.currentGeneration.Load() == generation {
@@ -741,12 +742,12 @@ func (m *Manager) streamAssetPreview(ctx context.Context, id string, quality str
 		pw.CloseWithError(err)
 	}()
 
-	m.streamAssetPreviewFromReader(ctx, id, pr, generation)
+	m.streamAssetPreviewFromReader(ctx, id, pr, generation, bufSize)
 }
 
 // streamAssetPreviewFromReader streams chunks from reader, guarded by generation.
 // The caller must hold the transfer lock (acquired via acquireTransfer()).
-func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, reader io.Reader, generation uint32) {
+func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, reader io.Reader, generation uint32, bufSize int) {
 	defer func() {
 		if m.currentGeneration.Load() == generation {
 			m.transfer.Store(false)
@@ -756,7 +757,10 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 	var totalBytes int64
 	var transferErr error
 	chunksSent := 0
-	buf := make([]byte, chunkSize)
+	if bufSize <= 0 {
+		bufSize = chunkSize
+	}
+	buf := make([]byte, bufSize)
 	for {
 		// Check generation before every read. If stale, abort immediately.
 		select {

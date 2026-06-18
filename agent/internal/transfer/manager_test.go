@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -158,6 +159,8 @@ type mockGalleryClient struct {
 	thumbnail    []byte
 	file         []byte
 	assetQuality string
+	headSize     int64
+	rangeStart   int64
 }
 
 func (m *mockGalleryClient) ListGallery(ctx context.Context) (Gallery, error) {
@@ -181,6 +184,20 @@ func (m *mockGalleryClient) GetAssetInfo(ctx context.Context, id string) (string
 func (m *mockGalleryClient) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
 	m.assetQuality = quality
 	n, err := w.Write(m.file)
+	return int64(n), err
+}
+
+func (m *mockGalleryClient) HeadVideoPlayback(ctx context.Context, id string) (int64, error) {
+	return m.headSize, nil
+}
+
+func (m *mockGalleryClient) GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error) {
+	m.assetQuality = quality
+	m.rangeStart = startOffset
+	if startOffset >= int64(len(m.file)) {
+		return 0, io.EOF
+	}
+	n, err := w.Write(m.file[startOffset:])
 	return int64(n), err
 }
 
@@ -224,6 +241,18 @@ func (m *blockingGalleryClient) GetAsset(ctx context.Context, id string, quality
 	return int64(n), err
 }
 
+func (m *blockingGalleryClient) HeadVideoPlayback(ctx context.Context, id string) (int64, error) {
+	return int64(len(m.file)), nil
+}
+
+func (m *blockingGalleryClient) GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error) {
+	if startOffset >= int64(len(m.file)) {
+		return 0, io.EOF
+	}
+	n, err := w.Write(m.file[startOffset:])
+	return int64(n), err
+}
+
 type concurrentThumbnailGalleryClient struct {
 	gallery       Gallery
 	release       chan struct{}
@@ -259,6 +288,14 @@ func (m *concurrentThumbnailGalleryClient) GetThumbnail(ctx context.Context, id 
 }
 
 func (m *concurrentThumbnailGalleryClient) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
+	return 0, nil
+}
+
+func (m *concurrentThumbnailGalleryClient) HeadVideoPlayback(ctx context.Context, id string) (int64, error) {
+	return 0, nil
+}
+
+func (m *concurrentThumbnailGalleryClient) GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error) {
 	return 0, nil
 }
 
@@ -408,6 +445,28 @@ func TestHandleAssetPreviewRequestStreamsPreviewWithoutDownloadHeader(t *testing
 	require.Equal(t, "preview", client.assetQuality)
 	require.NotEmpty(t, dc.binaryData)
 	require.Equal(t, byte(0x10), dc.binaryData[0][0], "preview chunks reuse typed file chunk envelope")
+}
+
+func TestHandleAssetPreviewRequestStreamsVideoPreviewInLargerFrames(t *testing.T) {
+	dc := &mockDC{}
+	client := &mockGalleryClient{
+		file:     bytes.Repeat([]byte{0xab}, 200*1024),
+		headSize: 200 * 1024,
+	}
+	mgr := NewGalleryManager(dc, client, 0)
+
+	req, _ := json.Marshal(map[string]interface{}{
+		"type":       "asset_preview_request",
+		"id":         "asset-1",
+		"quality":    "video",
+		"generation": 0,
+	})
+	mgr.HandleMessage(req)
+	time.Sleep(50 * time.Millisecond)
+
+	require.True(t, dc.hasTextType("asset_preview_header"))
+	require.True(t, dc.hasTextType("asset_preview_end"))
+	require.Len(t, dc.binaryData, 1)
 }
 
 func TestHandleFileRequestHeaderIncludesBinaryEnvelope(t *testing.T) {

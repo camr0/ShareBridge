@@ -758,6 +758,111 @@ test('requestGalleryPreview streams preview data into the gallery controller wit
   })
 })
 
+test('seek handler resets the SW generation without sending a page-computed byte offset', () => {
+  const sent = []
+  const swMessages = []
+  const originalDocument = globalThis.document
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+
+  globalThis.document = {
+    querySelector(selector) {
+      assert.equal(selector, 'video.lg-video')
+      return { currentTime: 20, duration: 40 }
+    },
+  }
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      serviceWorker: {
+        controller: {
+          postMessage(payload) {
+            swMessages.push(payload)
+          },
+        },
+      },
+    },
+  })
+
+  try {
+    __test.setTransferSession({
+      channel: { send: (payload) => sent.push(JSON.parse(payload)) },
+      mode: 'relay',
+    })
+
+    const vp = {
+      id: 'asset-1',
+      mediaId: 'asset-1',
+      generation: 0,
+      totalSize: 1000,
+      streamStartOffset: 0,
+      totalBytesReceived: 0,
+      seekTimer: null,
+      seeking: false,
+    }
+
+    const onSeeked = __test.createSeekHandler(vp, {
+      setTimeoutFn(fn) {
+        fn()
+        return 1
+      },
+      clearTimeoutFn() {},
+    })
+
+    onSeeked()
+
+    assert.equal(vp.generation, 1)
+    assert.deepEqual(swMessages, [{ mediaId: 'asset-1', reset: true, generation: 1 }])
+    assert.equal(sent.length, 1)
+    assert.deepEqual(sent[0], {
+      type: 'asset_preview_seek',
+      id: 'asset-1',
+      quality: 'video',
+      start_offset: 500,
+      generation: 1,
+    })
+  } finally {
+    globalThis.document = originalDocument
+    if (navigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+    __test.setTransferSession({ channel: null, mode: null })
+  }
+})
+
+test('seek playback recovery calls play when data is flowing but playback stays paused', async () => {
+  let playCalls = 0
+  const video = {
+    paused: true,
+    play() {
+      playCalls += 1
+      return Promise.resolve()
+    },
+  }
+  const vp = {
+    generation: 3,
+    seeking: true,
+    awaitingSeekPlayback: true,
+    totalBytesReceived: 128 * 1024,
+    resumePlaybackTimer: null,
+  }
+
+  __test.scheduleSeekPlaybackRecovery(vp, {
+    delayMs: 0,
+    queryVideo: () => video,
+    isCurrentPreview: () => true,
+    setTimeoutFn(fn) {
+      fn()
+      return 1
+    },
+    clearTimeoutFn() {},
+  })
+
+  await Promise.resolve()
+  assert.equal(playCalls, 1)
+})
+
 test('requestGalleryPreview queues the latest preview while another preview is streaming', async () => {
   await withMinimalDocument(async () => {
     const sends = []

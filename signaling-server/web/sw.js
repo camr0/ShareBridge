@@ -33,7 +33,7 @@ self.addEventListener('activate', event => {
 //   chunks: [],        // append-only (push, never shift)
 //   isDone: false,
 //   totalSize: 0,      // Content-Length of the full transcoded video
-//   baseOffset: 0,     // byte offset where the current generation starts
+//   streamStartOffset: 0|null, // actual byte offset where the current generation starts
 //   generation: 0,     // monotonic generation counter
 //   totalBufferedBytes: 0,  // total bytes buffered for current generation
 //   initSegment: Uint8Array|null,  // cached MP4 init segment (ftyp+...+moov)
@@ -49,7 +49,7 @@ function ensureEntry(mediaId) {
       chunks: [],        // append-only (push, never shift)
       isDone: false,
       totalSize: 0,      // Content-Length of the full transcoded video
-      baseOffset: 0,
+      streamStartOffset: 0,
       generation: 0,
       totalBufferedBytes: 0,
       initSegment: null,
@@ -82,7 +82,7 @@ function readBoxSize(bytes, offset) {
 }
 
 function captureInitSegment(entry, chunk) {
-  if (entry.initSegment || entry.baseOffset !== 0 || !chunk?.byteLength) return
+  if (entry.initSegment || entry.streamStartOffset !== 0 || entry.generation !== 0 || !chunk?.byteLength) return
 
   entry.initCapture = entry.initCapture
     ? concatUint8Arrays([entry.initCapture, chunk])
@@ -126,7 +126,8 @@ function computeStreamPosition(entry, startOffset) {
   let skipBytes = 0
 
   // Compute effective offset within the current generation's data.
-  let effectiveStart = startOffset - (entry.baseOffset || 0)
+  const streamStartOffset = entry.streamStartOffset ?? 0
+  let effectiveStart = startOffset - streamStartOffset
   if (effectiveStart < 0) {
     // Seek is before the start of our buffered data for this generation.
     // Chrome will try a few offsets; the page will trigger a new agent seek
@@ -173,6 +174,7 @@ function createStreamForEntry(entry, mediaId, startOffset) {
     readable: null,
     resolvePull: null,   // per-stream pull-wait promise
     startOffset,
+    createdGeneration: entry.generation,
     generation: entry.generation,
     readCursor: 0,
     skipBytes: 0,
@@ -266,7 +268,7 @@ self.addEventListener('fetch', event => {
   if (
     parsedRange &&
     parsedRange.start === 0 &&
-    entry.baseOffset > 0 &&
+    entry.generation > 0 &&
     entry.initSegment
   ) {
     const initSegmentLength = entry.initSegment.byteLength
@@ -336,36 +338,46 @@ self.addEventListener('fetch', event => {
 self.addEventListener('message', event => {
   if (event.data === 'ping') return
 
-  const { mediaId, chunk, size, generation, reset } = event.data
+  const { mediaId, chunk, size, generation, reset, startOffset } = event.data
   if (!mediaId) return
 
   const entry = ensureEntry(mediaId)
 
   // --- Reset message (seek start) ---
-  // {mediaId, reset: byteOffset, generation: N}
+  // {mediaId, reset: true, generation: N}
   if (reset !== undefined && reset !== null) {
     // Guard against stale resets: only apply if the generation is newer.
     // generation 0 is the initial state; every real generation is >= 1.
     if (generation <= entry.generation) return
-    // Wake all parked pull() waiters BEFORE clearing streams.
-    // Streams that still belong to this seek target will be rebased below.
-    wakeAllStreams(entry)
+    const previousGeneration = entry.generation
     // Reset entry state for the new generation.
     entry.chunks = []
     entry.isDone = false
-    entry.baseOffset = reset
+    entry.streamStartOffset = null
     entry.generation = generation
     entry.totalBufferedBytes = 0
+    entry.initCapture = null
     for (const s of [...entry.streams]) {
-      // Preserve the fetch stream Chrome opened for this seek race:
-      // it requested bytes at or beyond the new base offset, so after
-      // rebasing it can consume the incoming generation safely.
-      if (s.startOffset >= reset) {
-        rebaseStream(s, entry, generation)
+      if (s.createdGeneration !== previousGeneration) {
+        entry.streams.delete(s)
+        try { s.controller?.close() } catch (_) {}
         continue
       }
-      entry.streams.delete(s)
-      try { s.controller?.close() } catch (_) {}
+      rebaseStream(s, entry, generation)
+    }
+    wakeAllStreams(entry)
+    return
+  }
+
+  // Store the actual byte offset where the agent's current seek stream starts.
+  // This is the reference point we use when slicing Chrome's Range requests.
+  if (startOffset !== undefined && startOffset !== null) {
+    if (generation !== undefined && generation !== entry.generation) return
+    entry.streamStartOffset = startOffset
+    for (const s of entry.streams) {
+      if (s.generation === entry.generation) {
+        rebaseStream(s, entry, entry.generation)
+      }
     }
     return
   }
