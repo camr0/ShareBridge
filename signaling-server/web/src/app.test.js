@@ -1,6 +1,7 @@
 // signaling-server/web/src/app.test.js
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import vm from 'node:vm'
 import {
   installSessionMessageHandler,
   publishGlobalActions,
@@ -493,6 +494,25 @@ test('handleTransferMessage routes thumbnail envelopes before file chunks', asyn
 
   assert.deepEqual(thumbs, [{ index: 4, payload: [9, 8] }])
   __test.setGalleryController(null)
+})
+
+test('handleTransferMessage accepts a binary frame from another JavaScript realm', async () => {
+  const thumbnails = []
+  const foreignBuffer = vm.runInNewContext('new Uint8Array([0x11, 0, 4, 9, 8]).buffer')
+  assert.equal(foreignBuffer instanceof ArrayBuffer, false)
+
+  __test.setGalleryController({
+    handleThumbnailData(index, payload) {
+      thumbnails.push({ index, payload: [...payload] })
+    },
+  })
+
+  try {
+    await __test.handleTransferMessage({ data: foreignBuffer })
+    assert.deepEqual(thumbnails, [{ index: 4, payload: [9, 8] }])
+  } finally {
+    __test.setGalleryController(null)
+  }
 })
 
 test('direct failure after quota warning keeps the quota-blocked message', async () => {

@@ -666,7 +666,7 @@ async function sendJoin() {
 }
 
 async function handleTransferMessage(event) {
-  if (event.data instanceof ArrayBuffer) {
+  if (isBinaryTransferData(event.data)) {
     debugLog('transfer binary message received', {
       byteLength: event.data.byteLength,
       currentFile: currentFile?.name || null,
@@ -779,6 +779,12 @@ async function handleTransferMessage(event) {
       debugLog('unhandled transfer message type', { type: msg.type })
       break
   }
+}
+
+function isBinaryTransferData(data) {
+  return data instanceof ArrayBuffer ||
+    ArrayBuffer.isView(data) ||
+    Object.prototype.toString.call(data) === '[object ArrayBuffer]'
 }
 
 function renderFileList(files) {
