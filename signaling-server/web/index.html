@@ -9,8 +9,8 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #1e1e2e;
-      color: #cdd6f4;
+      background: #18181b;
+      color: #f4f4f5;
       max-width: 640px;
       margin: 48px auto;
       padding: 0 1rem;
@@ -21,22 +21,22 @@
       width: 100%;
       padding: 10px 12px;
       font-size: 1rem;
-      background: #313244;
-      color: #cdd6f4;
-      border: 1px solid #45475a;
+      background: #27272a;
+      color: #f4f4f5;
+      border: 1px solid #3f3f46;
       border-radius: 6px;
       outline: none;
     }
-    input:focus { border-color: #89b4fa; }
-    input::placeholder { color: #6c7086; }
+    input:focus { border-color: #60a5fa; }
+    input::placeholder { color: #a1a1aa; }
     input:disabled { opacity: 0.5; }
 
     button {
       margin-top: 8px;
       padding: 10px 20px;
       font-size: 0.95rem;
-      background: #89b4fa;
-      color: #1e1e2e;
+      background: #60a5fa;
+      color: #18181b;
       border: none;
       border-radius: 6px;
       cursor: pointer;
@@ -45,31 +45,31 @@
     button:hover { opacity: 0.9; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-    #status { margin: 16px 0; color: #6c7086; font-size: 0.9rem; min-height: 1.2em; }
+    #status { margin: 16px 0; color: #a1a1aa; font-size: 0.9rem; min-height: 1.2em; }
 
     #password-section { margin-top: 16px; }
-    #password-section p { margin-bottom: 8px; color: #a6adc8; }
+    #password-section p { margin-bottom: 8px; color: #d4d4d8; }
     #password-error { color: #f38ba8; margin-top: 8px; font-size: 0.9rem; min-height: 1.2em; }
 
     #file-list { margin-top: 8px; }
 
     .file-item {
       padding: 12px 14px;
-      background: #313244;
+      background: #27272a;
       border-radius: 8px;
       margin: 6px 0;
       cursor: pointer;
-      border-left: 3px solid #45475a;
+      border-left: 3px solid #3f3f46;
       transition: border-color 0.2s;
     }
     .file-item:hover:not(.downloading):not(.verified):not(.corrupted):not(.done) {
-      background: #363650;
+      background: #323236;
     }
-    .file-item.downloading { border-left-color: #89b4fa; cursor: default; }
+    .file-item.downloading { border-left-color: #60a5fa; cursor: default; }
     .file-item.verified   { border-left-color: #a6e3a1; cursor: default; }
     .file-item.corrupted  { border-left-color: #f38ba8; cursor: default; }
     .file-item.failed     { border-left-color: #f38ba8; cursor: default; }
-    .file-item.done       { border-left-color: #6c7086; cursor: default; }
+    .file-item.done       { border-left-color: #a1a1aa; cursor: default; }
 
     .file-main {
       display: flex;
@@ -83,24 +83,24 @@
     .file-status.fail  { color: #f38ba8; }
 
     .file-meta { margin-top: 4px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-    .file-size { color: #6c7086; font-size: 0.85rem; }
-    .file-hash { color: #45475a; font-size: 0.75rem; font-family: monospace; word-break: break-all; }
+    .file-size { color: #a1a1aa; font-size: 0.85rem; }
+    .file-hash { color: #71717a; font-size: 0.75rem; font-family: monospace; word-break: break-all; }
 
     .file-progress { margin-top: 8px; }
     .file-progress-track {
       height: 3px;
-      background: #45475a;
+      background: #3f3f46;
       border-radius: 2px;
       overflow: hidden;
     }
     .file-progress-fill {
       height: 100%;
-      background: #89b4fa;
+      background: #60a5fa;
       border-radius: 2px;
       width: 0%;
       transition: width 0.15s;
     }
-    .file-progress-text { color: #6c7086; font-size: 0.8rem; margin-top: 4px; }
+    .file-progress-text { color: #a1a1aa; font-size: 0.8rem; margin-top: 4px; }
 
     #breadcrumb {
       margin-bottom: 8px;
@@ -111,12 +111,12 @@
       gap: 4px;
     }
     .breadcrumb-link {
-      color: #89b4fa;
+      color: #60a5fa;
       cursor: pointer;
     }
     .breadcrumb-link:hover { text-decoration: underline; }
-    .breadcrumb-current { color: #cdd6f4; }
-    .breadcrumb-sep { color: #45475a; }
+    .breadcrumb-current { color: #f4f4f5; }
+    .breadcrumb-sep { color: #71717a; }
 
     .hidden { display: none; }
     #breadcrumb.hidden { display: none; }
@@ -136,7 +136,7 @@
     }
 
     .connection-relay {
-      background: #f59e0b;
+      background: #3b82f6;
       color: white;
     }
 
@@ -173,11 +173,11 @@
     }
     .gallery-header p {
       margin: 0.25rem 0 0;
-      color: #a6adc8;
+      color: #d4d4d8;
       overflow-wrap: anywhere;
     }
     .gallery-header span {
-      color: #6c7086;
+      color: #a1a1aa;
       font-size: 0.85rem;
       white-space: nowrap;
     }
@@ -190,7 +190,7 @@
     .gallery-progress-row {
       display: flex;
       justify-content: flex-end;
-      color: #a6adc8;
+      color: #d4d4d8;
       font-size: 0.8rem;
       margin-bottom: 0.35rem;
     }
@@ -198,12 +198,12 @@
       height: 6px;
       overflow: hidden;
       border-radius: 999px;
-      background: #313244;
+      background: #27272a;
     }
     .gallery-progress-fill {
       height: 100%;
       width: 0;
-      background: #89b4fa;
+      background: #60a5fa;
       transition: width 160ms ease;
     }
     .gallery-grid {
@@ -219,13 +219,13 @@
       border: 0;
       padding: 0;
       overflow: hidden;
-      background: #313244;
+      background: #27272a;
       border-radius: 8px;
       content-visibility: auto;
       contain-intrinsic-size: 180px 180px;
     }
     .gallery-item:focus-visible {
-      outline: 2px solid #89b4fa;
+      outline: 2px solid #60a5fa;
       outline-offset: 2px;
     }
     .gallery-item img {
@@ -278,7 +278,7 @@
       padding: 0.55rem 0.75rem;
       border: 1px solid #f9e2af;
       border-radius: 0.5rem;
-      background: rgba(30, 30, 46, 0.92);
+      background: rgba(24, 24, 27, 0.92);
       color: #f9e2af;
       font-size: 0.82rem;
       line-height: 1.35;
