@@ -12,6 +12,7 @@ import {
 import { createDownloadPipeline } from './downloadPipeline.js'
 import { decodeBinaryEnvelope, FRAME_FILE_CHUNK, FRAME_THUMBNAIL } from './binaryEnvelope.js'
 import { createGalleryController } from './gallery.js'
+import { createVideoBufferWarningMonitor } from './videoBufferWarning.js'
 
 // Module state
 let pc, ws, dc
@@ -1201,6 +1202,8 @@ function cleanupCurrentVideoPreview() {
     clearTimeout(currentVideoPreview.seekTimer)
     currentVideoPreview.seekTimer = null
     clearSeekPlaybackRecovery(currentVideoPreview)
+    currentVideoPreview.bufferWarningMonitor?.destroy()
+    currentVideoPreview.hideBufferWarning?.()
     // Remove seeked listener from video element if present.
     if (currentVideoPreview.seekListener) {
       const video = document.querySelector('video.lg-video')
@@ -1215,6 +1218,31 @@ function cleanupCurrentVideoPreview() {
     })
   }
   currentVideoPreview = null
+}
+
+const VIDEO_BUFFER_WARNING_CLASS = 'sharebridge-video-buffer-warning'
+const VIDEO_BUFFER_WARNING_TEXT = 'This video is buffering on the current connection. A lower-bitrate Immich transcode may improve playback.'
+
+function getVideoBufferWarningContainer(video) {
+  return video?.closest?.('.lg-img-wrap') || video?.parentElement || null
+}
+
+function showVideoBufferWarning(video) {
+  const container = getVideoBufferWarningContainer(video)
+  if (!container || container.querySelector?.(`.${VIDEO_BUFFER_WARNING_CLASS}`)) return
+
+  const createElement = globalThis.document?.createElement?.bind(globalThis.document)
+  if (!createElement) return
+  const warning = createElement('div')
+  warning.className = VIDEO_BUFFER_WARNING_CLASS
+  warning.setAttribute('role', 'status')
+  warning.textContent = VIDEO_BUFFER_WARNING_TEXT
+  container.appendChild(warning)
+}
+
+function hideVideoBufferWarning(video) {
+  const warning = getVideoBufferWarningContainer(video)?.querySelector?.(`.${VIDEO_BUFFER_WARNING_CLASS}`)
+  warning?.remove?.()
 }
 
 function clearClosedTransferSession() {
@@ -1432,6 +1460,12 @@ function startVideoPreview(header) {
       const onSeeked = createSeekHandler(vp)
       vp.seekListener = onSeeked
       video.addEventListener('seeked', onSeeked)
+      vp.hideBufferWarning = () => hideVideoBufferWarning(video)
+      vp.bufferWarningMonitor = createVideoBufferWarningMonitor({
+        video,
+        showWarning: () => showVideoBufferWarning(video),
+        hideWarning: vp.hideBufferWarning,
+      })
     }
   }, 100)
 }
@@ -1613,6 +1647,9 @@ export const __test = {
   setGalleryController(controller) {
     galleryController = controller
   },
+  setCurrentVideoPreview(preview) {
+    currentVideoPreview = preview
+  },
   getCurrentFile() {
     return currentFile
   },
@@ -1628,6 +1665,7 @@ export const __test = {
   handleError,
   requestGalleryPreview,
   requestGalleryAsset,
+  cleanupCurrentVideoPreview,
   applyFinalDownloadState,
   createSeekHandler,
   scheduleSeekPlaybackRecovery,

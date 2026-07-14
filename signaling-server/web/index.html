@@ -265,6 +265,25 @@
       color: white;
       font-size: 0.75rem;
     }
+    .lg-current .lg-img-wrap {
+      position: relative;
+    }
+    .sharebridge-video-buffer-warning {
+      position: absolute;
+      left: 50%;
+      bottom: 1rem;
+      transform: translateX(-50%);
+      z-index: 3;
+      max-width: min(34rem, calc(100% - 2rem));
+      padding: 0.55rem 0.75rem;
+      border: 1px solid #f9e2af;
+      border-radius: 0.5rem;
+      background: rgba(30, 30, 46, 0.92);
+      color: #f9e2af;
+      font-size: 0.82rem;
+      line-height: 1.35;
+      text-align: center;
+    }
     @media (max-width: 640px) {
       .gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }

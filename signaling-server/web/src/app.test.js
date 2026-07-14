@@ -831,6 +831,23 @@ test('seek handler resets the SW generation without sending a page-computed byte
   }
 })
 
+test('cleanupCurrentVideoPreview disposes its buffering monitor and hides its banner', () => {
+  let disposed = 0
+  let hidden = 0
+  __test.setCurrentVideoPreview({
+    mediaId: 'video-1',
+    seekTimer: null,
+    resumePlaybackTimer: null,
+    seekListener: null,
+    bufferWarningMonitor: { destroy() { disposed += 1 } },
+    hideBufferWarning: () => { hidden += 1 },
+  })
+
+  __test.cleanupCurrentVideoPreview()
+
+  assert.deepEqual({ disposed, hidden }, { disposed: 1, hidden: 1 })
+})
+
 test('seek playback recovery calls play when data is flowing but playback stays paused', async () => {
   let playCalls = 0
   const video = {
