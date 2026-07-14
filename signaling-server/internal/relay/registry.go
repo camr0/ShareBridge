@@ -44,6 +44,7 @@ type sessionEntry struct {
 	session        PendingSession
 	agentSocket    *websocket.Conn
 	browserSocket  *websocket.Conn
+	active         bool
 	forwardedBytes int64
 	agentReady     chan struct{}
 	browserReady   chan struct{}
@@ -89,6 +90,7 @@ func (r *Registry) BindBrowserSocket(sid, jti string, conn *websocket.Conn, now 
 	}
 	select {
 	case <-entry.agentReady:
+		entry.active = true
 		return entry.agentSocket, StateActive, nil
 	default:
 	}
@@ -145,6 +147,7 @@ func (r *Registry) BindAgentSocket(sid, agentID string, conn *websocket.Conn, no
 	}
 	select {
 	case <-entry.browserReady:
+		entry.active = true
 		return entry.browserSocket, StateActive, nil
 	default:
 	}
@@ -234,7 +237,7 @@ func (r *Registry) CleanupExpired(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for sid, entry := range r.sessions {
-		if now.After(entry.session.ExpiresAt) {
+		if !entry.active && now.After(entry.session.ExpiresAt) {
 			r.cleanupSessionLocked(sid)
 		}
 	}

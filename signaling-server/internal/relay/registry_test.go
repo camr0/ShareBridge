@@ -326,3 +326,31 @@ func TestRegistry_CleanupExpiredRemovesSessionAndSpentJTI(t *testing.T) {
 		t.Fatalf("expected cleaned JTI to be reusable, got %v", err)
 	}
 }
+
+func TestRegistry_CleanupExpiredKeepsActiveRelaySession(t *testing.T) {
+	reg := relay.NewRegistry(2 * time.Second)
+	now := time.Unix(1_800_000_000, 0)
+
+	if err := reg.CreatePendingSession(relay.PendingSession{
+		SID:          "sid-active",
+		JTI:          "jti-active",
+		AgentID:      "agent-1",
+		RelayAllowed: true,
+		ExpiresAt:    now.Add(100 * time.Millisecond),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, state, err := reg.BindAgentSocket("sid-active", "agent-1", nil, now); err != nil || state != relay.StatePendingAgent {
+		t.Fatalf("agent bind = state %q, err %v; want pending agent", state, err)
+	}
+	if _, state, err := reg.BindBrowserSocket("sid-active", "jti-active", nil, now); err != nil || state != relay.StateActive {
+		t.Fatalf("browser bind = state %q, err %v; want active", state, err)
+	}
+
+	reg.CleanupExpired(now.Add(time.Second))
+
+	if _, err := reg.Get("sid-active"); err != nil {
+		t.Fatalf("active relay session was removed at JWT expiry: %v", err)
+	}
+}
