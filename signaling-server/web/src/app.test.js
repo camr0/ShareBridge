@@ -385,7 +385,7 @@ test('handleTransferMessage routes thumbnail_list to the gallery controller', as
   __test.setGalleryController(null)
 })
 
-test('thumbnail_complete finishes the gallery loading status', async () => {
+test('thumbnail_complete clears the gallery loading status', async () => {
   const completed = []
   const originalDocument = globalThis.document
   const status = { textContent: 'Loading gallery...' }
@@ -405,7 +405,7 @@ test('thumbnail_complete finishes the gallery loading status', async () => {
     await __test.handleTransferMessage({ data: JSON.stringify({ type: 'thumbnail_complete', sent: 306, failed: 1 }) })
 
     assert.deepEqual(completed, [{ type: 'thumbnail_complete', sent: 306, failed: 1 }])
-    assert.equal(status.textContent, 'Gallery ready')
+    assert.equal(status.textContent, '')
   } finally {
     globalThis.document = originalDocument
     __test.setGalleryController(null)
