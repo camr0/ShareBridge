@@ -363,6 +363,15 @@ func TestHandleOpen_ImmichGallerySendsThumbnailListAndData(t *testing.T) {
 	require.True(t, dc.hasTextType("thumbnail_list"))
 	require.Len(t, dc.binaryData, 1)
 	require.Equal(t, byte(0x11), dc.binaryData[0][0], "thumbnail frames use typed binary envelope")
+	completed := dc.getTextByType("thumbnail_complete")
+	require.NotEmpty(t, completed)
+	var result struct {
+		Sent   int `json:"sent"`
+		Failed int `json:"failed"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(completed), &result))
+	require.Equal(t, 1, result.Sent)
+	require.Zero(t, result.Failed)
 }
 
 func TestHandleOpen_ImmichGalleryFetchesThumbnailsConcurrently(t *testing.T) {

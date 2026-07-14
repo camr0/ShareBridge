@@ -752,6 +752,9 @@ async function handleTransferMessage(event) {
       ensureGalleryController()
       galleryController?.handleThumbnailList(msg)
       break
+    case 'thumbnail_complete':
+      galleryController?.handleThumbnailComplete(msg)
+      break
     case 'file_header':
       await startDownload(msg)
       break

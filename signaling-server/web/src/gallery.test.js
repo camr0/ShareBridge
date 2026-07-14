@@ -601,6 +601,40 @@ test('gallery tracks thumbnail loading progress', () => {
   assert.deepEqual(progress.classList.added, ['hidden'])
 })
 
+test('gallery completes thumbnail progress when the agent reports unavailable thumbnails', () => {
+  const root = fakeRoot()
+  const progressText = { textContent: '' }
+  const progressFill = { style: { width: '' } }
+  const progress = {
+    classList: {
+      added: [],
+      remove() {},
+      add(name) { this.added.push(name) },
+    },
+  }
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-progress-text') return progressText
+    if (selector === '.gallery-progress-fill') return progressFill
+    if (selector === '.gallery-progress') return progress
+    return null
+  }
+  const controller = createGalleryController({ root, createObjectURL: () => 'blob:thumb', revokeObjectURL: () => {} })
+
+  controller.handleThumbnailList({
+    albumName: 'Summer',
+    items: [
+      { id: 'asset-1', name: 'one.jpg', mimeType: 'image/jpeg' },
+      { id: 'asset-2', name: 'missing.jpg', mimeType: 'image/jpeg' },
+    ],
+  })
+  controller.handleThumbnailData(0, new Uint8Array([1]))
+  controller.handleThumbnailComplete({ failed: 1 })
+
+  assert.equal(progressText.textContent, '1 / 2 thumbnails (1 unavailable)')
+  assert.equal(progressFill.style.width, '100%')
+  assert.deepEqual(progress.classList.added, ['hidden'])
+})
+
 test('gallery initializes lightGallery when available', () => {
   let initialized = false
   let options = null

@@ -160,6 +160,14 @@ func (m *Manager) sendGallery() {
 
 	sentThumbs, failedThumbs := m.sendGalleryThumbnails(context.Background(), gallery.Items)
 	log.Printf("transfer gallery: thumbnail stream finished sent=%d failed_fetch=%d", sentThumbs, failedThumbs)
+	data, _ = json.Marshal(struct {
+		Type   string `json:"type"`
+		Sent   int    `json:"sent"`
+		Failed int    `json:"failed"`
+	}{Type: "thumbnail_complete", Sent: sentThumbs, Failed: failedThumbs})
+	if err := m.dc.SendText(string(data)); err != nil {
+		log.Printf("transfer gallery: send thumbnail_complete failed: %v", err)
+	}
 }
 
 type thumbnailJob struct {

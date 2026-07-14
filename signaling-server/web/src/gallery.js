@@ -16,6 +16,7 @@ export function createGalleryController({
     previewRequests: new Set(),
     lightbox: null,
     loadedThumbs: 0,
+    unavailableThumbs: 0,
     refreshTimer: null,
     activePreviewID: '',
     lightboxGrid: null,
@@ -59,6 +60,7 @@ export function createGalleryController({
     state.thumbs.clear()
     state.previewRequests.clear()
     state.loadedThumbs = 0
+    state.unavailableThumbs = 0
     root.innerHTML = renderGalleryShell(msg.albumName || 'Shared album', msg.albumDescription || '', state.items)
     updateThumbnailProgress()
     initLightbox()
@@ -86,6 +88,11 @@ export function createGalleryController({
       state.loadedThumbs += 1
       updateThumbnailProgress()
     }
+  }
+
+  function handleThumbnailComplete(msg) {
+    state.unavailableThumbs = Math.max(0, Number(msg.failed) || 0)
+    updateThumbnailProgress()
   }
 
   function handlePreviewData(id, payload, mimeType = 'image/jpeg') {
@@ -173,13 +180,18 @@ export function createGalleryController({
 
   function updateThumbnailProgress() {
     const total = state.items.length
-    const pct = total === 0 ? 100 : Math.round((state.loadedThumbs / total) * 100)
+    const completed = Math.min(total, state.loadedThumbs + state.unavailableThumbs)
+    const pct = total === 0 ? 100 : Math.round((completed / total) * 100)
     const text = root.querySelector?.('.gallery-progress-text')
     const fill = root.querySelector?.('.gallery-progress-fill')
     const progress = root.querySelector?.('.gallery-progress')
-    if (text) text.textContent = `${state.loadedThumbs} / ${total} thumbnails`
+    if (text) {
+      text.textContent = state.unavailableThumbs > 0
+        ? `${state.loadedThumbs} / ${total} thumbnails (${state.unavailableThumbs} unavailable)`
+        : `${state.loadedThumbs} / ${total} thumbnails`
+    }
     if (fill?.style) fill.style.width = `${pct}%`
-    if (progress?.classList && total > 0 && state.loadedThumbs >= total) {
+    if (progress?.classList && total > 0 && completed >= total) {
       progress.classList.add('hidden')
     } else if (progress?.classList) {
       progress.classList.remove('hidden')
@@ -357,7 +369,7 @@ export function createGalleryController({
     state.lightboxDownloadButton = button
   }
 
-  return { handleThumbnailList, handleThumbnailData, handlePreviewData, destroy, state }
+  return { handleThumbnailList, handleThumbnailData, handleThumbnailComplete, handlePreviewData, destroy, state }
 }
 
 export function renderGalleryShell(albumName, albumDescription, items) {
