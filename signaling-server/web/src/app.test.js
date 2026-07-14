@@ -385,6 +385,33 @@ test('handleTransferMessage routes thumbnail_list to the gallery controller', as
   __test.setGalleryController(null)
 })
 
+test('thumbnail_complete finishes the gallery loading status', async () => {
+  const completed = []
+  const originalDocument = globalThis.document
+  const status = { textContent: 'Loading gallery...' }
+  globalThis.document = {
+    getElementById(id) {
+      assert.equal(id, 'status')
+      return status
+    },
+  }
+  __test.setGalleryController({
+    handleThumbnailComplete(msg) {
+      completed.push(msg)
+    },
+  })
+
+  try {
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'thumbnail_complete', sent: 306, failed: 1 }) })
+
+    assert.deepEqual(completed, [{ type: 'thumbnail_complete', sent: 306, failed: 1 }])
+    assert.equal(status.textContent, 'Gallery ready')
+  } finally {
+    globalThis.document = originalDocument
+    __test.setGalleryController(null)
+  }
+})
+
 test('gallery mode recreates its controller after reset before handling thumbnail_list', async () => {
   const originalDocument = globalThis.document
   const elements = new Map()
