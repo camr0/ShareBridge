@@ -33,6 +33,14 @@ function debugLog(...args) {
   if (DEBUG) console.log('[secure-relay]', ...args)
 }
 
+// Service Workers have a separate console, so surface narrowly-scoped media
+// pipeline telemetry in the page's existing ?debug=1 console.
+if (DEBUG && typeof navigator !== 'undefined' && navigator.serviceWorker) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data?.type === 'media_debug') debugLog('media worker', JSON.stringify(event.data))
+  })
+}
+
 // Direct connection promise handling
 let directChannelResolve = null
 let directChannelReject = null
@@ -736,6 +744,11 @@ async function handleTransferMessage(event) {
     }
 
     await appendChunk(frame.payload)
+    // A decoded binary frame is never a control message. In particular, an
+    // agent range can outlive the preview state that initiated it; falling
+    // through would attempt JSON.parse("[object ArrayBuffer]") and discard
+    // every remaining frame in that range.
+    return
   }
 
   debugLog('transfer text message received', {
@@ -1214,11 +1227,11 @@ function cleanupCurrentVideoPreview() {
     clearSeekPlaybackRecovery(currentVideoPreview)
     currentVideoPreview.bufferWarningMonitor?.destroy()
     currentVideoPreview.hideBufferWarning?.()
-    // Remove seeked listener from video element if present.
+    // Remove seeking listener from video element if present.
     if (currentVideoPreview.seekListener) {
       const video = document.querySelector('video.lg-video')
       if (video) {
-        video.removeEventListener('seeked', currentVideoPreview.seekListener)
+        video.removeEventListener('seeking', currentVideoPreview.seekListener)
       }
       currentVideoPreview.seekListener = null
     }
@@ -1341,6 +1354,7 @@ function ensureGalleryController() {
     galleryController = createGalleryController({
       root,
       onPreviewRequest: requestGalleryPreview,
+      onPreviewClose: handleGalleryPreviewClose,
       onDownloadRequest: requestGalleryAsset,
     })
   }
@@ -1361,6 +1375,18 @@ function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) 
     updateStatus('Connection closed')
     return
   }
+
+  // Keep an active video session exclusively routed to its Service Worker
+  // stream. Image preloads have anonymous binary frames, so interleaving one
+  // would corrupt the video range. A user opening another item replaces it.
+  if (currentVideoPreview && currentVideoPreview.id !== id) {
+    if (priority !== 'active') {
+      queueGalleryPreload(id)
+      return
+    }
+    cleanupCurrentVideoPreview()
+  }
+
   galleryPreviewRequestPending = true
   const quality = mimeType?.startsWith('video/') ? 'video' : 'preview'
 
@@ -1382,6 +1408,7 @@ function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) 
       seeking: false,
       awaitingSeekPlayback: false,
       resumePlaybackTimer: null,
+      freshSession: true,
     }
   }
 
@@ -1441,11 +1468,14 @@ function startVideoPreview(header) {
   }
   vp.streamStartOffset = header.byte_offset || 0
   vp.totalBytesReceived = 0
+  const freshSession = vp.freshSession ?? vp.generation === 0
 
   navigator.serviceWorker?.controller?.postMessage({
     mediaId: vp.mediaId,
     startOffset: vp.streamStartOffset,
     generation: vp.generation,
+    ...(freshSession ? { freshPreview: true } : {}),
+    ...(DEBUG ? { debug: true } : {}),
   })
 
   // Forward total size for Content-Length / Accept-Ranges.
@@ -1453,8 +1483,15 @@ function startVideoPreview(header) {
     navigator.serviceWorker?.controller?.postMessage({
       mediaId: vp.mediaId,
       size: header.size,
+      ...(DEBUG ? { debug: true } : {}),
     })
   }
+
+  // Later seek headers only rebase the existing Service Worker stream. Calling
+  // the gallery controller again would invoke video.load() on the active
+  // element and reset playback to 0.
+  if (!freshSession) return
+  vp.freshSession = false
 
   // Defer creating the <video> element (which triggers the fetch) by
   // 100ms.  This gives the SW's message handler time to process the
@@ -1464,12 +1501,14 @@ function startVideoPreview(header) {
   setTimeout(() => {
     galleryController?.handlePreviewData?.(header.id, new Uint8Array(0), 'video/mp4')
 
-    // Attach seeked listener to the video element after it's created.
+    // Start a new range as soon as a seek begins. Waiting for `seeked` creates
+    // a deadlock when the target is outside the playable buffer because that
+    // event cannot fire until the missing range arrives.
     const video = document.querySelector('video.lg-video')
     if (video && !vp.seekListener) {
-      const onSeeked = createSeekHandler(vp)
-      vp.seekListener = onSeeked
-      video.addEventListener('seeked', onSeeked)
+      const onSeeking = createSeekHandler(vp)
+      vp.seekListener = onSeeking
+      video.addEventListener('seeking', onSeeking)
       vp.hideBufferWarning = () => hideVideoBufferWarning(video)
       vp.bufferWarningMonitor = createVideoBufferWarningMonitor({
         video,
@@ -1480,10 +1519,26 @@ function startVideoPreview(header) {
   }, 100)
 }
 
+function handleGalleryPreviewClose(id) {
+  if (!currentVideoPreview || currentVideoPreview.id !== id) return
+  globalGeneration = Math.max(globalGeneration, currentVideoPreview.generation || 0) + 1
+  cleanupCurrentVideoPreview()
+  galleryPreviewRequestPending = false
+}
+
 function createSeekHandler(vp, { setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
   return () => {
     const video = document.querySelector('video.lg-video')
     if (!video || !video.duration || !vp.totalSize) return  // metadata not loaded
+
+    // Chrome can satisfy seeks that remain inside its decoded buffer without
+    // replacing the response stream. Resetting that stream would turn a local
+    // seek into a stall, so only ask the agent for genuinely missing media.
+    for (let i = 0; i < (video.buffered?.length || 0); i++) {
+      if (video.currentTime >= video.buffered.start(i) && video.currentTime < video.buffered.end(i)) {
+        return
+      }
+    }
 
     const byteOffset = Math.floor(video.currentTime / video.duration * vp.totalSize)
 
@@ -1500,6 +1555,7 @@ function createSeekHandler(vp, { setTimeoutFn = setTimeout, clearTimeoutFn = cle
       mediaId: vp.mediaId,
       reset: true,
       generation: vp.generation,
+      ...(DEBUG ? { debug: true } : {}),
     })
 
     // Debounce: clear any pending seek, schedule a new one.
@@ -1561,19 +1617,19 @@ function completeGalleryPreview(msg) {
     if (msg.generation !== undefined && msg.generation !== currentVideoPreview.generation) return
 
     const vp = currentVideoPreview
-    clearSeekPlaybackRecovery(vp)
-    currentVideoPreview = null
     galleryPreviewRequestPending = false
-    // Signal end of stream to the SW
+    debugLog('video preview complete', JSON.stringify({
+      id: vp.id,
+      generation: vp.generation,
+      totalBytesReceived: vp.totalBytesReceived,
+      expectedBytes: vp.totalSize,
+    }))
+    // This ends one byte-range, not the video preview session. Retain the
+    // routing state for the next seek range.
     navigator.serviceWorker?.controller?.postMessage({
       mediaId: vp.mediaId,
       chunk: null,
     })
-    // Notify gallery that video data is complete (URL is already /media/{id})
-    galleryController?.handlePreviewData?.(msg.id || vp.id, new Uint8Array(0), 'video/mp4')
-    const nextID = queuedGalleryPreviewID || queuedGalleryPreloadIDs.shift()
-    queuedGalleryPreviewID = ''
-    if (nextID) requestGalleryPreview(nextID)
     return
   }
 
@@ -1675,6 +1731,8 @@ export const __test = {
   handleError,
   requestGalleryPreview,
   requestGalleryAsset,
+  startVideoPreview,
+  handleGalleryPreviewClose,
   cleanupCurrentVideoPreview,
   applyFinalDownloadState,
   createSeekHandler,

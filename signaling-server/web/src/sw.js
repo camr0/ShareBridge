@@ -54,10 +54,38 @@ function ensureEntry(mediaId) {
       totalBufferedBytes: 0,
       initSegment: null,
       initCapture: null,
+      debug: false,
     }
     entries.set(mediaId, entry)
   }
   return entry
+}
+
+function mediaDebugPayload(stage, entry, extra = {}) {
+  return {
+    type: 'media_debug',
+    stage,
+    generation: entry.generation,
+    isDone: entry.isDone,
+    streamStartOffset: entry.streamStartOffset,
+    totalBufferedBytes: entry.totalBufferedBytes,
+    streamCount: entry.streams.size,
+    ...extra,
+  }
+}
+
+function reportMessageDebug(event, stage, entry, extra) {
+  if (!entry.debug || !event.source?.postMessage) return
+  event.source.postMessage(mediaDebugPayload(stage, entry, extra))
+}
+
+function reportFetchDebug(event, stage, entry, extra) {
+  if (!entry.debug || !event.clientId || !event.waitUntil || !self.clients?.get) return
+  event.waitUntil(
+    self.clients.get(event.clientId).then((client) => {
+      client?.postMessage(mediaDebugPayload(stage, entry, extra))
+    }).catch(() => {}),
+  )
 }
 
 function concatUint8Arrays(parts) {
@@ -206,7 +234,9 @@ function createStreamForEntry(entry, mediaId, startOffset) {
         let chunk = entry.chunks[stream.readCursor++]
         if (chunk === null) {
           entry.streams.delete(stream)
-          if (entry.streams.size === 0) entries.delete(mediaId)
+          // Keep the completed byte history. Chrome can finish this response
+          // after decoding only part of the MP4, then issue another Range
+          // request when playback reaches that buffer edge.
           try { controller.close() } catch (_) {}
           return
         }
@@ -223,7 +253,8 @@ function createStreamForEntry(entry, mediaId, startOffset) {
       }
       if (entry.isDone) {
         entry.streams.delete(stream)
-        if (entry.streams.size === 0) entries.delete(mediaId)
+        // A later Range request must still be able to replay completed bytes.
+        // The next generation-0 freshPreview message resets this entry.
         try { controller.close() } catch (_) {}
         return
       }
@@ -264,6 +295,8 @@ self.addEventListener('fetch', event => {
   const entry = ensureEntry(mediaId)
   const rangeHeader = event.request.headers.get('range')
   const parsedRange = parseRangeHeader(rangeHeader)
+
+  reportFetchDebug(event, 'fetch', entry, { range: rangeHeader, requestStart: parsedRange?.start ?? 0 })
 
   if (
     parsedRange &&
@@ -311,6 +344,11 @@ self.addEventListener('fetch', event => {
   }
 
   const stream = createStreamForEntry(entry, mediaId, startOffset)
+  reportFetchDebug(event, 'stream-created', entry, {
+    requestStart: startOffset,
+    streamStart: stream.startOffset,
+    streamGeneration: stream.generation,
+  })
 
   const headers = {
     'Content-Type': 'video/mp4',
@@ -338,10 +376,31 @@ self.addEventListener('fetch', event => {
 self.addEventListener('message', event => {
   if (event.data === 'ping') return
 
-  const { mediaId, chunk, size, generation, reset, startOffset } = event.data
+  const { mediaId, chunk, size, generation, reset, startOffset, freshPreview, debug } = event.data
   if (!mediaId) return
 
   const entry = ensureEntry(mediaId)
+  entry.debug = entry.debug || debug === true
+
+  // A Service Worker can outlive the page that abandoned this media stream.
+  // Start an initial generation from a clean entry so stale chunks/EOF cannot
+  // complete the replacement response before its new transfer arrives.
+  if (freshPreview === true && Number.isInteger(generation) && generation >= 0) {
+    for (const stream of entry.streams) {
+      try { stream.controller?.close() } catch (_) {}
+    }
+    entry.streams.clear()
+    entry.chunks = []
+    entry.isDone = false
+    entry.totalSize = size > 0 ? size : 0
+    entry.streamStartOffset = startOffset ?? 0
+    entry.generation = generation
+    entry.totalBufferedBytes = 0
+    entry.initSegment = null
+    entry.initCapture = null
+    reportMessageDebug(event, 'fresh-preview', entry)
+    return
+  }
 
   // --- Reset message (seek start) ---
   // {mediaId, reset: true, generation: N}
@@ -357,8 +416,18 @@ self.addEventListener('message', event => {
     entry.generation = generation
     entry.totalBufferedBytes = 0
     entry.initCapture = null
+    // Chrome may create the seek fetch before the page's seeked handler sends
+    // this reset. Prefer streams created during the previous generation when
+    // they exist; otherwise preserve the one parked stream and rebase it
+    // again. The latter happens when Chrome reuses the original fetch across
+    // consecutive seeks. Closing that stream on the second reset leaves the
+    // player waiting forever even though the new generation's chunks arrive.
+    const previousStreams = [...entry.streams].filter((s) => s.generation === previousGeneration)
+    const freshPreviousStreams = previousStreams.filter((s) => s.createdGeneration === previousGeneration)
+    const streamsToRebase = freshPreviousStreams.length > 0 ? freshPreviousStreams : previousStreams
+
     for (const s of [...entry.streams]) {
-      if (s.createdGeneration !== previousGeneration) {
+      if (!streamsToRebase.includes(s)) {
         entry.streams.delete(s)
         try { s.controller?.close() } catch (_) {}
         continue
@@ -366,6 +435,7 @@ self.addEventListener('message', event => {
       rebaseStream(s, entry, generation)
     }
     wakeAllStreams(entry)
+    reportMessageDebug(event, 'reset', entry, { previousGeneration })
     return
   }
 
@@ -379,6 +449,7 @@ self.addEventListener('message', event => {
         rebaseStream(s, entry, entry.generation)
       }
     }
+    reportMessageDebug(event, 'stream-offset', entry, { messageGeneration: generation })
     return
   }
 
@@ -406,6 +477,7 @@ self.addEventListener('message', event => {
       if (total > 0) entry.totalSize = total
     }
     wakeAllStreams(entry)
+    reportMessageDebug(event, 'range-ended', entry)
     return
   }
 

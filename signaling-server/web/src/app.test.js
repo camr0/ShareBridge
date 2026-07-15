@@ -515,6 +515,16 @@ test('handleTransferMessage accepts a binary frame from another JavaScript realm
   }
 })
 
+test('handleTransferMessage does not parse an unclaimed binary file frame as JSON', async () => {
+  __test.setGalleryController({})
+
+  try {
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 9, 8]).buffer })
+  } finally {
+    __test.setGalleryController(null)
+  }
+})
+
 test('direct failure after quota warning keeps the quota-blocked message', async () => {
   // Set up quota exceeded state
   __test.setQuotaState({ exceeded: true, periodEnd: '2025-12-31T23:59:59Z' })
@@ -878,6 +888,49 @@ test('seek handler resets the SW generation without sending a page-computed byte
   }
 })
 
+test('seek handler leaves a target inside the browser buffer on the current generation', () => {
+  const originalDocument = globalThis.document
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const swMessages = []
+  const sent = []
+  globalThis.document = {
+    querySelector: () => ({
+      currentTime: 20,
+      duration: 100,
+      buffered: {
+        length: 1,
+        start: () => 0,
+        end: () => 40,
+      },
+    }),
+  }
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (message) => swMessages.push(message) } } },
+  })
+  __test.setTransferSession({
+    channel: { send: (message) => sent.push(JSON.parse(message)) },
+    mode: 'relay',
+  })
+  const vp = {
+    id: 'asset-1', mediaId: 'asset-1', generation: 0, totalSize: 1000,
+    totalBytesReceived: 0, streamStartOffset: 0, seekTimer: null, seeking: false,
+  }
+
+  try {
+    __test.createSeekHandler(vp)()
+
+    assert.equal(vp.generation, 0)
+    assert.deepEqual(swMessages, [])
+    assert.deepEqual(sent, [])
+  } finally {
+    globalThis.document = originalDocument
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    __test.setTransferSession({ channel: null, mode: null })
+  }
+})
+
 test('cleanupCurrentVideoPreview disposes its buffering monitor and hides its banner', () => {
   let disposed = 0
   let hidden = 0
@@ -893,6 +946,39 @@ test('cleanupCurrentVideoPreview disposes its buffering monitor and hides its ba
   __test.cleanupCurrentVideoPreview()
 
   assert.deepEqual({ disposed, hidden }, { disposed: 1, hidden: 1 })
+})
+
+test('closing and reopening the same video starts a fresh higher generation', () => {
+  const sent = []
+  const swMessages = []
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (message) => swMessages.push(message) } } },
+  })
+  __test.setTransferSession({
+    channel: { send: (message) => sent.push(JSON.parse(message)) },
+    mode: 'relay',
+  })
+  __test.setCurrentVideoPreview({
+    id: 'video-1', mediaId: 'video-1', generation: 3,
+    seekTimer: null, resumePlaybackTimer: null, seekListener: null,
+  })
+
+  try {
+    __test.handleGalleryPreviewClose('video-1')
+    __test.requestGalleryPreview('video-1', { priority: 'active', mimeType: 'video/mp4' })
+
+    assert.deepEqual(swMessages, [{ mediaId: 'video-1', chunk: null }])
+    assert.deepEqual(sent, [{
+      type: 'asset_preview_request', id: 'video-1', quality: 'video', generation: 4,
+    }])
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setTransferSession({ channel: null, mode: null })
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+  }
 })
 
 test('seek playback recovery calls play when data is flowing but playback stays paused', async () => {
@@ -925,6 +1011,153 @@ test('seek playback recovery calls play when data is flowing but playback stays 
 
   await Promise.resolve()
   assert.equal(playCalls, 1)
+})
+
+test('a completed video range remains routed to the next seek range without refreshing the player', async () => {
+  const swMessages = []
+  const galleryCalls = []
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (message) => swMessages.push(message) } } },
+  })
+  __test.setGalleryController({ handlePreviewData: (...args) => galleryCalls.push(args) })
+  __test.setCurrentVideoPreview({
+    id: 'video-1', mediaId: 'video-1', generation: 2, totalBytesReceived: 0,
+    seekTimer: null, resumePlaybackTimer: null,
+  })
+
+  try {
+    await __test.handleTransferMessage({
+      data: JSON.stringify({ type: 'asset_preview_end', id: 'video-1', generation: 2 }),
+    })
+    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 0, 0, 0, 2, 9, 8]).buffer })
+
+    assert.deepEqual(swMessages, [
+      { mediaId: 'video-1', chunk: null },
+      { mediaId: 'video-1', chunk: new Uint8Array([9, 8]), generation: 2 },
+    ])
+    assert.deepEqual(galleryCalls, [])
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setGalleryController(null)
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+  }
+})
+
+test('seek headers rebase the stream without reinitializing the video player', async () => {
+  const swMessages = []
+  const galleryCalls = []
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (message) => swMessages.push(message) } } },
+  })
+  __test.setGalleryController({ handlePreviewData: (...args) => galleryCalls.push(args) })
+  __test.setCurrentVideoPreview({
+    id: 'video-1', mediaId: 'video-1', generation: 3, totalBytesReceived: 0,
+    seekTimer: null, resumePlaybackTimer: null, seekListener: null,
+  })
+
+  try {
+    __test.startVideoPreview({ id: 'video-1', generation: 3, size: 1000, byte_offset: 400 })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.deepEqual(swMessages, [
+      { mediaId: 'video-1', startOffset: 400, generation: 3 },
+      { mediaId: 'video-1', size: 1000 },
+    ])
+    assert.deepEqual(galleryCalls, [])
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setGalleryController(null)
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+  }
+})
+
+test('an initial video header resets stale Service Worker state before creating the player', async () => {
+  const swMessages = []
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (message) => swMessages.push(message) } } },
+  })
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: { querySelector: () => null },
+  })
+  __test.setGalleryController({ handlePreviewData() {} })
+  __test.setCurrentVideoPreview({
+    id: 'video-1', mediaId: 'video-1', generation: 0, totalBytesReceived: 0,
+    seekTimer: null, resumePlaybackTimer: null, seekListener: null,
+  })
+
+  try {
+    __test.startVideoPreview({ id: 'video-1', generation: 0, size: 1000, byte_offset: 0 })
+
+    assert.deepEqual(swMessages, [
+      { mediaId: 'video-1', startOffset: 0, generation: 0, freshPreview: true },
+      { mediaId: 'video-1', size: 1000 },
+    ])
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setGalleryController(null)
+    await new Promise((resolve) => setTimeout(resolve, 110))
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+  }
+})
+
+test('an out-of-buffer seek starts a new generation before seeked can fire', async () => {
+  const swMessages = []
+  const listeners = new Map()
+  const removedListeners = []
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const video = {
+    currentTime: 120,
+    duration: 182,
+    paused: false,
+    addEventListener(type, listener) { listeners.set(type, listener) },
+    removeEventListener(type, listener) { removedListeners.push([type, listener]) },
+  }
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (message) => swMessages.push(message) } } },
+  })
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: { querySelector: () => video },
+  })
+  __test.setGalleryController({ handlePreviewData() {} })
+  const vp = {
+    id: 'video-1', mediaId: 'video-1', generation: 0, totalBytesReceived: 0,
+    seekTimer: null, resumePlaybackTimer: null, seekListener: null,
+  }
+  __test.setCurrentVideoPreview(vp)
+
+  try {
+    __test.startVideoPreview({ id: 'video-1', generation: 0, size: 1000, byte_offset: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 110))
+
+    assert.equal(listeners.has('seeking'), true)
+    assert.equal(listeners.has('seeked'), false)
+    listeners.get('seeking')()
+
+    const reset = swMessages.find((message) => message.reset === true)
+    assert.deepEqual(reset, { mediaId: 'video-1', reset: true, generation: vp.generation })
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setGalleryController(null)
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+  }
 })
 
 test('requestGalleryPreview queues the latest preview while another preview is streaming', async () => {

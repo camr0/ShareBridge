@@ -52,6 +52,12 @@ async function readChunk(reader) {
   }
 }
 
+test('served root Service Worker stays in sync with the tested source worker', async () => {
+  const servedWorker = await readFile(new URL('../sw.js', import.meta.url), 'utf8')
+  const sourceWorker = await readFile(new URL('./sw.js', import.meta.url), 'utf8')
+  assert.equal(servedWorker, sourceWorker)
+})
+
 test('forward seek fetch created before reset survives and rebases to the new generation', async () => {
   const sw = await loadServiceWorker()
   sw.dispatchMessage({ mediaId: 'video', size: 1000 })
@@ -64,6 +70,24 @@ test('forward seek fetch created before reset survives and rebases to the new ge
   sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([7, 8, 9]), generation: 1 })
 
   assert.deepEqual(await readChunk(reader), { done: false, value: [7, 8, 9] })
+})
+
+test('one parked playback stream survives repeated seek generation rebases', async () => {
+  const sw = await loadServiceWorker()
+  sw.dispatchMessage({ mediaId: 'video', size: 1000 })
+
+  const response = await sw.dispatchFetch('/media/video', { range: 'bytes=100-' })
+  const reader = response.body.getReader()
+
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', startOffset: 100, generation: 1 })
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([1]), generation: 1 })
+  assert.deepEqual(await readChunk(reader), { done: false, value: [1] })
+
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 2 })
+  sw.dispatchMessage({ mediaId: 'video', startOffset: 200, generation: 2 })
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([2]), generation: 2 })
+  assert.deepEqual(await readChunk(reader), { done: false, value: [2] })
 })
 
 test('later seek generation wins over an earlier parked seek stream', async () => {
@@ -151,4 +175,67 @@ test('normal sequential playback streams chunks in order until EOF', async () =>
   assert.deepEqual(await readChunk(reader), { done: false, value: [1, 2] })
   assert.deepEqual(await readChunk(reader), { done: false, value: [3, 4] })
   assert.deepEqual(await readChunk(reader), { done: true, value: undefined })
+})
+
+test('a completed initial stream retains bytes for Chrome\'s later range request', async () => {
+  const sw = await loadServiceWorker()
+  sw.dispatchMessage({ mediaId: 'video', size: 4 })
+
+  const initialResponse = await sw.dispatchFetch('/media/video')
+  const initialReader = initialResponse.body.getReader()
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([1, 2]) })
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([3, 4]) })
+  sw.dispatchMessage({ mediaId: 'video', chunk: null })
+
+  assert.deepEqual(await readChunk(initialReader), { done: false, value: [1, 2] })
+  assert.deepEqual(await readChunk(initialReader), { done: false, value: [3, 4] })
+  assert.deepEqual(await readChunk(initialReader), { done: true, value: undefined })
+
+  const continuationResponse = await sw.dispatchFetch('/media/video', { range: 'bytes=2-' })
+  const continuationReader = continuationResponse.body.getReader()
+
+  // If EOF deleted the completed entry, this replacement byte is all the new
+  // stream can see. A retained entry replays the requested historical bytes.
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([9]) })
+  const continuation = await Promise.race([
+    readChunk(continuationReader),
+    new Promise(resolve => setTimeout(() => resolve({ timedOut: true }), 50)),
+  ])
+  assert.deepEqual(continuation, { done: false, value: [3, 4] })
+})
+
+test('a fresh preview clears a completed Service Worker entry from a previous page load', async () => {
+  const sw = await loadServiceWorker()
+  sw.dispatchMessage({ mediaId: 'video', size: 1000 })
+
+  const firstResponse = await sw.dispatchFetch('/media/video')
+  const firstReader = firstResponse.body.getReader()
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([1, 2]) })
+  assert.deepEqual(await readChunk(firstReader), { done: false, value: [1, 2] })
+  await firstReader.cancel()
+
+  // The abandoned stream is gone before EOF, so the completed entry remains
+  // in the long-lived worker with stale chunks and no reader to delete it.
+  sw.dispatchMessage({ mediaId: 'video', chunk: null })
+
+  sw.dispatchMessage({ mediaId: 'video', freshPreview: true, generation: 0, startOffset: 0, size: 1000 })
+  const secondResponse = await sw.dispatchFetch('/media/video')
+  const secondReader = secondResponse.body.getReader()
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([9, 8]) })
+
+  assert.deepEqual(await readChunk(secondReader), { done: false, value: [9, 8] })
+})
+
+test('a reopened preview can freshly reset the worker with a nonzero generation', async () => {
+  const sw = await loadServiceWorker()
+  sw.dispatchMessage({ mediaId: 'video', freshPreview: true, generation: 0, startOffset: 0, size: 1000 })
+  sw.dispatchMessage({ mediaId: 'video', chunk: new Uint8Array([1, 2]) })
+  sw.dispatchMessage({ mediaId: 'video', chunk: null })
+
+  sw.dispatchMessage({ mediaId: 'video', freshPreview: true, generation: 4, startOffset: 0, size: 1000 })
+  const response = await sw.dispatchFetch('/media/video?play=2')
+  const reader = response.body.getReader()
+  sw.dispatchMessage({ mediaId: 'video', generation: 4, chunk: new Uint8Array([9, 8]) })
+
+  assert.deepEqual(await readChunk(reader), { done: false, value: [9, 8] })
 })

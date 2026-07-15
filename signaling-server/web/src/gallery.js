@@ -7,6 +7,7 @@ export function createGalleryController({
   clearRefreshTimeout = globalThis.clearTimeout?.bind(globalThis),
   lightboxRoot = globalThis.document,
   onPreviewRequest,
+  onPreviewClose,
   onDownloadRequest,
 }) {
   const state = {
@@ -21,6 +22,7 @@ export function createGalleryController({
     activePreviewID: '',
     lightboxGrid: null,
     lightboxDownloadButton: null,
+    videoPlaybackSequence: 0,
   }
 
   const handleClick = (event) => {
@@ -49,6 +51,17 @@ export function createGalleryController({
     const index = Number(event.detail?.index)
     if (!Number.isInteger(index)) return
     requestPreviewByIndex(index)
+  }
+
+  const handleLightboxClose = () => {
+    const id = state.activePreviewID
+    const item = state.items.find((candidate) => candidate.id === id)
+    if (!item?.mimeType?.startsWith('video/')) return
+    state.urls.delete(`preview:${id}`)
+    state.previewRequests.delete(id)
+    state._lastVideoID = ''
+    state.activePreviewID = ''
+    onPreviewClose?.(id)
   }
 
   root.addEventListener?.('click', handleClick)
@@ -100,13 +113,7 @@ export function createGalleryController({
 
     if (mimeType?.startsWith('video/')) {
       const url = `/media/${encodeURIComponent(id)}`
-      if (!state.hasVideoURL) state.hasVideoURL = new Set()
-      if (!state.hasVideoURL.has(id)) {
-        state.hasVideoURL.add(id)
-        const previousUrl = state.urls.get(`preview:${id}`)
-        if (previousUrl) revokeObjectURL(previousUrl)
-        state.urls.set(`preview:${id}`, url)
-      }
+      state.urls.set(`preview:${id}`, url)
 
       const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)
       if (galleryItem?.dataset) {
@@ -160,6 +167,7 @@ export function createGalleryController({
     grid.addEventListener?.('lgAfterOpen', handleLightboxSlide)
     grid.addEventListener?.('lgBeforeSlide', handleLightboxSlide)
     grid.addEventListener?.('lgAfterSlide', handleLightboxSlide)
+    grid.addEventListener?.('lgAfterClose', handleLightboxClose)
   }
 
   function destroyLightbox() {
@@ -167,6 +175,7 @@ export function createGalleryController({
     state.lightboxGrid?.removeEventListener?.('lgAfterOpen', handleLightboxSlide)
     state.lightboxGrid?.removeEventListener?.('lgBeforeSlide', handleLightboxSlide)
     state.lightboxGrid?.removeEventListener?.('lgAfterSlide', handleLightboxSlide)
+    state.lightboxGrid?.removeEventListener?.('lgAfterClose', handleLightboxClose)
     state.lightboxGrid = null
     state.lightboxDownloadButton = null
     state.lightbox?.destroy?.()
@@ -236,17 +245,41 @@ export function createGalleryController({
 
   function showVideoInLightbox(url) {
     const id = state.activePreviewID
+    const itemIndex = state.items.findIndex((item) => item.id === id)
     let attempts = 0
     const tryShow = () => {
-      const imgWrap = lightboxRoot?.querySelector?.('.lg-current .lg-img-wrap')
+      if (state.activePreviewID !== id) return
+      const currentSlide = lightboxRoot?.querySelector?.('.lg-current')
+      const datasetIndex = Number(currentSlide?.dataset?.index)
+      const idIndex = Number(currentSlide?.id?.match?.(/-(\d+)$/)?.[1])
+      const currentIndex = Number.isInteger(datasetIndex) ? datasetIndex : idIndex
+      if (Number.isInteger(currentIndex) && currentIndex !== itemIndex) return
+
+      let imgWrap = currentSlide?.querySelector?.('.lg-img-wrap')
+        || lightboxRoot?.querySelector?.('.lg-current .lg-img-wrap')
       if (!imgWrap) {
-        attempts++
-        if (attempts < 10) setTimeout(tryShow, 50)
-        return
+        const createElement = lightboxRoot?.createElement?.bind(lightboxRoot)
+          || globalThis.document?.createElement?.bind(globalThis.document)
+        if (currentSlide && createElement) {
+          // LightGallery can replace a revisited video slide with only its
+          // error message. Rebuild the wrapper instead of waiting for markup
+          // that will never return on its own.
+          imgWrap = createElement('div')
+          imgWrap.className = 'lg-img-wrap'
+          currentSlide.innerHTML = ''
+          currentSlide.appendChild?.(imgWrap)
+        } else {
+          attempts++
+          if (attempts < 10) setTimeout(tryShow, 50)
+          return
+        }
       }
       const existing = imgWrap.querySelector('video.lg-video')
       if (existing && state._lastVideoID === id) {
-        if (url && existing.src !== url) existing.src = url
+        if (url && existing._sharebridgeMediaUrl !== url) {
+          existing._sharebridgeMediaUrl = url
+          existing.src = freshVideoPlaybackURL(url)
+        }
         else if (!url) {
           const thumbUrl = state.urls.get(`thumb:${id}`)
             || root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)?.dataset?.src
@@ -255,7 +288,10 @@ export function createGalleryController({
         return
       }
       imgWrap.innerHTML = ''
-      const video = document.createElement('video')
+      const createElement = lightboxRoot?.createElement?.bind(lightboxRoot)
+        || globalThis.document?.createElement?.bind(globalThis.document)
+      if (!createElement) return
+      const video = createElement('video')
       video.className = 'lg-object lg-video'
       video.controls = true
       video.muted = true
@@ -266,7 +302,8 @@ export function createGalleryController({
       video.style.margin = '0 auto'
       video.style.objectFit = 'contain'
       if (url) {
-        video.src = url
+        video._sharebridgeMediaUrl = url
+        video.src = freshVideoPlaybackURL(url)
         video.autoplay = true
       } else {
         const thumbUrl = state.urls.get(`thumb:${id}`)
@@ -277,6 +314,12 @@ export function createGalleryController({
       state._lastVideoID = id
     }
     tryShow()
+  }
+
+  function freshVideoPlaybackURL(url) {
+    const separator = url.includes('?') ? '&' : '?'
+    state.videoPlaybackSequence += 1
+    return `${url}${separator}play=${state.videoPlaybackSequence}`
   }
 
   function requestPreviewForItem(item, priority) {

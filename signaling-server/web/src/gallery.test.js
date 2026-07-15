@@ -272,6 +272,243 @@ test('gallery preview data upgrades the active lightbox image', () => {
   assert.equal(activeImage.src, 'blob:preview')
 })
 
+test('gallery rebuilds a video player when lightGallery replaced the slide with an error', () => {
+  const root = fakeRoot()
+  const galleryItem = { dataset: {} }
+  const currentSlide = {
+    innerHTML: '<span class="lg-error-msg">Oops... Failed to load content...</span>',
+    children: [],
+    appendChild(node) { this.children.push(node) },
+  }
+  const createElement = (tagName) => ({
+    tagName: tagName.toUpperCase(),
+    className: '',
+    children: [],
+    style: {},
+    appendChild(node) { this.children.push(node) },
+    querySelector(selector) {
+      return selector === 'video.lg-video'
+        ? this.children.find((node) => node.tagName === 'VIDEO') || null
+        : null
+    },
+    setAttribute() {},
+  })
+
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return {}
+    if (selector === '[data-gallery-id="video-1"]') return galleryItem
+    return null
+  }
+
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ galleryItems: [{}], refresh() {}, destroy() {} }),
+    revokeObjectURL: () => {},
+    lightboxRoot: {
+      querySelector(selector) {
+        if (selector === '.lg-current .lg-img-wrap') return null
+        if (selector === '.lg-current') return currentSlide
+        return null
+      },
+      createElement,
+    },
+  })
+
+  controller.handleThumbnailList({
+    albumName: 'Summer',
+    items: [{ id: 'video-1', name: 'clip.mp4', mimeType: 'video/mp4' }],
+  })
+  controller.state.activePreviewID = 'video-1'
+  controller.handlePreviewData('video-1', new Uint8Array(0), 'video/mp4')
+
+  const wrapper = currentSlide.children[0]
+  assert.equal(wrapper?.className, 'lg-img-wrap')
+  assert.equal(wrapper?.children[0]?.className, 'lg-object lg-video')
+  assert.match(wrapper?.children[0]?.src, /^\/media\/video-1\?play=\d+$/)
+})
+
+test('gallery does not mount a video into a different current slide during navigation', () => {
+  const root = fakeRoot()
+  const galleryItem = { dataset: {} }
+  const imageNode = { tagName: 'IMG' }
+  const wrapper = {
+    children: [imageNode],
+    style: {},
+    querySelector: () => null,
+    appendChild(node) { this.children.push(node) },
+    set innerHTML(value) {
+      if (value === '') this.children = []
+    },
+  }
+  const currentSlide = {
+    id: 'lg-item-1-1',
+    dataset: { index: '1' },
+    querySelector(selector) {
+      return selector === '.lg-img-wrap' ? wrapper : null
+    },
+  }
+  const createElement = (tagName) => ({
+    tagName: tagName.toUpperCase(),
+    className: '',
+    style: {},
+    setAttribute() {},
+  })
+
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return {}
+    if (selector === '[data-gallery-id="video-1"]') return galleryItem
+    return null
+  }
+
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ galleryItems: [{}, {}], refresh() {}, destroy() {} }),
+    revokeObjectURL: () => {},
+    lightboxRoot: {
+      querySelector(selector) {
+        if (selector === '.lg-current .lg-img-wrap') return wrapper
+        if (selector === '.lg-current') return currentSlide
+        return null
+      },
+      createElement,
+    },
+  })
+
+  controller.handleThumbnailList({
+    albumName: 'Summer',
+    items: [
+      { id: 'video-1', name: 'clip.mp4', mimeType: 'video/mp4' },
+      { id: 'image-1', name: 'photo.jpg', mimeType: 'image/jpeg' },
+    ],
+  })
+  controller.state.activePreviewID = 'video-1'
+  controller.handlePreviewData('video-1', new Uint8Array(0), 'video/mp4')
+
+  assert.deepEqual(wrapper.children, [imageNode])
+})
+
+test('gallery gives each rebuilt video element a fresh playback URL', () => {
+  const root = fakeRoot()
+  const galleryItem = { dataset: {} }
+  let slideHandler = null
+  let wrapper = makeVideoWrapper()
+  const currentSlide = {
+    id: 'lg-item-1-0',
+    querySelector(selector) {
+      return selector === '.lg-img-wrap' ? wrapper : null
+    },
+  }
+  const grid = {
+    addEventListener(event, handler) {
+      if (event === 'lgAfterSlide') slideHandler = handler
+    },
+    removeEventListener() {},
+  }
+  const createElement = (tagName) => ({
+    tagName: tagName.toUpperCase(),
+    className: '',
+    dataset: {},
+    style: {},
+    setAttribute() {},
+  })
+
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return grid
+    if (selector === '[data-gallery-id="video-1"]') return galleryItem
+    return null
+  }
+
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ galleryItems: [{}], refresh() {}, destroy() {} }),
+    revokeObjectURL: () => {},
+    lightboxRoot: {
+      querySelector(selector) {
+        if (selector === '.lg-current .lg-img-wrap') return wrapper
+        if (selector === '.lg-current') return currentSlide
+        return null
+      },
+      createElement,
+    },
+  })
+
+  controller.handleThumbnailList({
+    albumName: 'Summer',
+    items: [{ id: 'video-1', name: 'clip.mp4', mimeType: 'video/mp4' }],
+  })
+  controller.state.activePreviewID = 'video-1'
+  controller.handlePreviewData('video-1', new Uint8Array(0), 'video/mp4')
+  const firstURL = wrapper.children[0].src
+
+  wrapper = makeVideoWrapper()
+  slideHandler?.({ detail: { index: 0 } })
+  const secondURL = wrapper.children[0].src
+
+  assert.match(firstURL, /^\/media\/video-1/)
+  assert.match(secondURL, /^\/media\/video-1/)
+  assert.notEqual(secondURL, firstURL)
+})
+
+test('closing a video invalidates its cached preview so reopening requests a fresh stream', () => {
+  const previewed = []
+  const closed = []
+  let clickHandler = null
+  let closeHandler = null
+  const root = fakeRoot()
+  const grid = {
+    addEventListener(event, handler) {
+      if (event === 'lgAfterClose') closeHandler = handler
+    },
+    removeEventListener() {},
+  }
+  root.addEventListener = (event, handler) => {
+    if (event === 'click') clickHandler = handler
+  }
+  root.querySelector = (selector) => selector === '.gallery-grid' ? grid : null
+
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ refresh() {}, destroy() {} }),
+    revokeObjectURL: () => {},
+    onPreviewRequest: (id) => previewed.push(id),
+    onPreviewClose: (id) => closed.push(id),
+  })
+  controller.handleThumbnailList({
+    albumName: 'Summer',
+    items: [{ id: 'video-1', name: 'clip.mp4', mimeType: 'video/mp4' }],
+  })
+  controller.state.activePreviewID = 'video-1'
+  controller.state.urls.set('preview:video-1', '/media/video-1')
+
+  closeHandler?.()
+  clickHandler?.({
+    target: {
+      closest: (selector) => selector === '[data-gallery-id]'
+        ? { dataset: { galleryId: 'video-1' } }
+        : null,
+    },
+  })
+
+  assert.deepEqual(closed, ['video-1'])
+  assert.deepEqual(previewed, ['video-1'])
+})
+
+function makeVideoWrapper() {
+  return {
+    children: [],
+    style: {},
+    querySelector(selector) {
+      return selector === 'video.lg-video'
+        ? this.children.find((node) => node.tagName === 'VIDEO') || null
+        : null
+    },
+    appendChild(node) { this.children.push(node) },
+    set innerHTML(value) {
+      if (value === '') this.children = []
+    },
+  }
+}
+
 test('gallery requests active and neighboring previews when lightGallery slide changes', () => {
   const previewed = []
   let slideHandler = null
