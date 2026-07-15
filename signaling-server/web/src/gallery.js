@@ -53,6 +53,16 @@ export function createGalleryController({
     requestPreviewByIndex(index)
   }
 
+  const pauseCurrentSlideVideos = () => {
+    const videos = lightboxRoot?.querySelectorAll?.('.lg-current video') || []
+    for (const video of videos) video.pause?.()
+  }
+
+  const handleLightboxBeforeSlide = (event) => {
+    pauseCurrentSlideVideos()
+    handleLightboxSlide(event)
+  }
+
   const handleLightboxClose = () => {
     const id = state.activePreviewID
     const item = state.items.find((candidate) => candidate.id === id)
@@ -165,16 +175,18 @@ export function createGalleryController({
     state.lightbox = lightGallery(grid, { selector: '.gallery-item', download: false })
     state.lightboxGrid = grid
     grid.addEventListener?.('lgAfterOpen', handleLightboxSlide)
-    grid.addEventListener?.('lgBeforeSlide', handleLightboxSlide)
+    grid.addEventListener?.('lgBeforeSlide', handleLightboxBeforeSlide)
     grid.addEventListener?.('lgAfterSlide', handleLightboxSlide)
+    grid.addEventListener?.('lgBeforeClose', pauseCurrentSlideVideos)
     grid.addEventListener?.('lgAfterClose', handleLightboxClose)
   }
 
   function destroyLightbox() {
     cancelLightboxRefresh()
     state.lightboxGrid?.removeEventListener?.('lgAfterOpen', handleLightboxSlide)
-    state.lightboxGrid?.removeEventListener?.('lgBeforeSlide', handleLightboxSlide)
+    state.lightboxGrid?.removeEventListener?.('lgBeforeSlide', handleLightboxBeforeSlide)
     state.lightboxGrid?.removeEventListener?.('lgAfterSlide', handleLightboxSlide)
+    state.lightboxGrid?.removeEventListener?.('lgBeforeClose', pauseCurrentSlideVideos)
     state.lightboxGrid?.removeEventListener?.('lgAfterClose', handleLightboxClose)
     state.lightboxGrid = null
     state.lightboxDownloadButton = null

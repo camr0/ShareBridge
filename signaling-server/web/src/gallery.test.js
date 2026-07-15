@@ -549,6 +549,78 @@ test('gallery requests active and neighboring previews when lightGallery slide c
   assert.equal(controller.state.activePreviewID, 'asset-2')
 })
 
+test('gallery pauses every outgoing video before slide navigation', () => {
+  let beforeSlideHandler = null
+  const pauseCounts = [0, 0]
+  const videos = pauseCounts.map((_, index) => ({
+    currentTime: 12 + index,
+    pause() { pauseCounts[index] += 1 },
+  }))
+  const root = fakeRoot()
+  const grid = {
+    addEventListener(event, handler) {
+      if (event === 'lgBeforeSlide') beforeSlideHandler = handler
+    },
+    removeEventListener() {},
+  }
+  root.querySelector = (selector) => selector === '.gallery-grid' ? grid : null
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ refresh() {}, destroy() {} }),
+    lightboxRoot: {
+      querySelectorAll(selector) {
+        return selector === '.lg-current video' ? videos : []
+      },
+    },
+  })
+
+  controller.handleThumbnailList({
+    items: [
+      { id: 'video-1', mimeType: 'video/mp4' },
+      { id: 'image-1', mimeType: 'image/jpeg' },
+    ],
+  })
+  beforeSlideHandler?.({ detail: { index: 1 } })
+
+  assert.deepEqual(pauseCounts, [1, 1])
+  assert.deepEqual(videos.map((video) => video.currentTime), [12, 13])
+})
+
+test('gallery pauses every outgoing video before close', () => {
+  let beforeCloseHandler = null
+  const pauseCounts = [0, 0]
+  const videos = pauseCounts.map((_, index) => ({
+    currentTime: 30 + index,
+    pause() { pauseCounts[index] += 1 },
+  }))
+  const root = fakeRoot()
+  const grid = {
+    addEventListener(event, handler) {
+      if (event === 'lgBeforeClose') beforeCloseHandler = handler
+    },
+    removeEventListener() {},
+  }
+  root.querySelector = (selector) => selector === '.gallery-grid' ? grid : null
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ refresh() {}, destroy() {} }),
+    lightboxRoot: {
+      querySelectorAll(selector) {
+        return selector === '.lg-current video' ? videos : []
+      },
+    },
+  })
+
+  controller.handleThumbnailList({
+    items: [{ id: 'video-1', mimeType: 'video/mp4' }],
+  })
+  beforeCloseHandler?.()
+
+  assert.equal(typeof beforeCloseHandler, 'function')
+  assert.deepEqual(pauseCounts, [1, 1])
+  assert.deepEqual(videos.map((video) => video.currentTime), [30, 31])
+})
+
 test('gallery starts preview work before slide transition completes without duplicate after-slide requests', () => {
   const previewed = []
   let beforeSlideHandler = null
