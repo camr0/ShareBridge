@@ -88,6 +88,20 @@ function reportFetchDebug(event, stage, entry, extra) {
   )
 }
 
+function reportMediaRangeRequest(event, entry, mediaId, startOffset) {
+  if (!event.clientId || !event.waitUntil || !self.clients?.get) return
+  event.waitUntil(
+    self.clients.get(event.clientId).then((client) => {
+      client?.postMessage({
+        type: 'media_range_request',
+        mediaId,
+        generation: entry.generation,
+        startOffset,
+      })
+    }).catch(() => {}),
+  )
+}
+
 function concatUint8Arrays(parts) {
   let total = 0
   for (const part of parts) total += part.byteLength
@@ -297,6 +311,9 @@ self.addEventListener('fetch', event => {
   const parsedRange = parseRangeHeader(rangeHeader)
 
   reportFetchDebug(event, 'fetch', entry, { range: rangeHeader, requestStart: parsedRange?.start ?? 0 })
+  if (parsedRange?.start > 0 && entry.generation > 0) {
+    reportMediaRangeRequest(event, entry, mediaId, parsedRange.start)
+  }
 
   if (
     parsedRange &&

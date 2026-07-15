@@ -931,6 +931,153 @@ test('seek handler leaves a target inside the browser buffer on the current gene
   }
 })
 
+test('exact Service Worker Range wins over the estimated video seek offset', () => {
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const sent = []
+  const clearedTimers = []
+  let fallbackTimer = null
+  const video = {
+    currentTime: 69.505,
+    duration: 182,
+    buffered: {
+      length: 1,
+      start: () => 0,
+      end: () => 39.505,
+    },
+  }
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    writable: true,
+    value: { querySelector: () => video },
+  })
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage() {} } } },
+  })
+  __test.setTransferSession({
+    channel: { send: (message) => sent.push(JSON.parse(message)) },
+    mode: 'relay',
+  })
+  const vp = {
+    id: 'video-1', mediaId: 'video-1', generation: 3, totalSize: 61289309,
+    totalBytesReceived: 0, streamStartOffset: 0, seekTimer: null, seeking: false,
+  }
+  __test.setCurrentVideoPreview(vp)
+
+  try {
+    __test.createSeekHandler(vp, {
+      setTimeoutFn(fn) {
+        fallbackTimer = fn
+        return 77
+      },
+      clearTimeoutFn(id) {
+        clearedTimers.push(id)
+      },
+    })()
+
+    const generation = vp.generation
+    __test.handleMediaRangeRequest({
+      type: 'media_range_request',
+      mediaId: 'video-1',
+      generation,
+      startOffset: 22970368,
+    })
+    __test.handleMediaRangeRequest({
+      type: 'media_range_request',
+      mediaId: 'video-1',
+      generation,
+      startOffset: 22970368,
+    })
+    __test.handleMediaRangeRequest({
+      type: 'media_range_request',
+      mediaId: 'video-1',
+      generation: generation - 1,
+      startOffset: 1,
+    })
+    __test.handleMediaRangeRequest({
+      type: 'media_range_request',
+      mediaId: 'other-video',
+      generation,
+      startOffset: 2,
+    })
+
+    assert.equal(typeof fallbackTimer, 'function')
+    assert.deepEqual(clearedTimers, [77])
+    assert.deepEqual(sent, [{
+      type: 'asset_preview_seek',
+      id: 'video-1',
+      quality: 'video',
+      start_offset: 22970368,
+      generation,
+    }])
+  } finally {
+    __test.setCurrentVideoPreview(null)
+    __test.setTransferSession({ channel: null, mode: null })
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+  }
+})
+
+test('seek fallback sends the estimated offset when Chrome reuses its fetch', () => {
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const sent = []
+  let fallbackTimer = null
+  const video = {
+    currentTime: 91,
+    duration: 182,
+    buffered: { length: 0 },
+  }
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    writable: true,
+    value: { querySelector: () => video },
+  })
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage() {} } } },
+  })
+  __test.setTransferSession({
+    channel: { send: (message) => sent.push(JSON.parse(message)) },
+    mode: 'relay',
+  })
+  const vp = {
+    id: 'video-1', mediaId: 'video-1', generation: 8, totalSize: 1000,
+    totalBytesReceived: 0, streamStartOffset: 0, seekTimer: null, seeking: false,
+  }
+  __test.setCurrentVideoPreview(vp)
+
+  try {
+    __test.createSeekHandler(vp, {
+      setTimeoutFn(fn) {
+        fallbackTimer = fn
+        return 88
+      },
+      clearTimeoutFn() {},
+    })()
+
+    fallbackTimer()
+
+    assert.deepEqual(sent, [{
+      type: 'asset_preview_seek',
+      id: 'video-1',
+      quality: 'video',
+      start_offset: 500,
+      generation: vp.generation,
+    }])
+  } finally {
+    __test.setCurrentVideoPreview(null)
+    __test.setTransferSession({ channel: null, mode: null })
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+  }
+})
+
 test('cleanupCurrentVideoPreview disposes its buffering monitor and hides its banner', () => {
   let disposed = 0
   let hidden = 0

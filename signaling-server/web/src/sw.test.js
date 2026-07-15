@@ -5,9 +5,18 @@ import { readFile } from 'node:fs/promises'
 
 async function loadServiceWorker() {
   const listeners = new Map()
+  const clientMessages = []
+  const pendingWaitUntil = []
   const self = {
     skipWaiting() {},
-    clients: { claim: async () => {} },
+    clients: {
+      claim: async () => {},
+      get: async () => ({
+        postMessage(message) {
+          clientMessages.push(message)
+        },
+      }),
+    },
     addEventListener(type, handler) {
       listeners.set(type, handler)
     },
@@ -32,8 +41,12 @@ async function loadServiceWorker() {
       let responsePromise
       listeners.get('fetch')({
         request,
+        clientId: 'test-client',
         respondWith(response) {
           responsePromise = Promise.resolve(response)
+        },
+        waitUntil(promise) {
+          pendingWaitUntil.push(Promise.resolve(promise))
         },
       })
       return responsePromise
@@ -41,6 +54,10 @@ async function loadServiceWorker() {
     dispatchMessage(data) {
       listeners.get('message')({ data })
     },
+    async flushWaitUntil() {
+      await Promise.all(pendingWaitUntil.splice(0))
+    },
+    clientMessages,
   }
 }
 
@@ -56,6 +73,22 @@ test('served root Service Worker stays in sync with the tested source worker', a
   const servedWorker = await readFile(new URL('../sw.js', import.meta.url), 'utf8')
   const sourceWorker = await readFile(new URL('./sw.js', import.meta.url), 'utf8')
   assert.equal(servedWorker, sourceWorker)
+})
+
+test("reports Chrome's exact nonzero Range for the active seek generation", async () => {
+  const sw = await loadServiceWorker()
+  sw.dispatchMessage({ mediaId: 'video', size: 61289309 })
+  sw.dispatchMessage({ mediaId: 'video', reset: true, generation: 3 })
+
+  await sw.dispatchFetch('/media/video', { range: 'bytes=22970368-' })
+  await sw.flushWaitUntil()
+
+  assert.deepEqual(JSON.parse(JSON.stringify(sw.clientMessages)), [{
+    type: 'media_range_request',
+    mediaId: 'video',
+    generation: 3,
+    startOffset: 22970368,
+  }])
 })
 
 test('forward seek fetch created before reset survives and rebases to the new generation', async () => {

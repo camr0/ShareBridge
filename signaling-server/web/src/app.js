@@ -33,11 +33,16 @@ function debugLog(...args) {
   if (DEBUG) console.log('[secure-relay]', ...args)
 }
 
-// Service Workers have a separate console, so surface narrowly-scoped media
-// pipeline telemetry in the page's existing ?debug=1 console.
-if (DEBUG && typeof navigator !== 'undefined' && navigator.serviceWorker) {
+// Service Workers have a separate console. Route media control messages in
+// every build, while surfacing telemetry only in the existing debug console.
+if (typeof navigator !== 'undefined' && navigator.serviceWorker) {
   navigator.serviceWorker.addEventListener('message', (event) => {
-    if (event.data?.type === 'media_debug') debugLog('media worker', JSON.stringify(event.data))
+    if (DEBUG && event.data?.type === 'media_debug') {
+      debugLog('media worker', JSON.stringify(event.data))
+    }
+    if (event.data?.type === 'media_range_request') {
+      handleMediaRangeRequest(event.data)
+    }
   })
 }
 
@@ -1406,6 +1411,7 @@ function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) 
       seekTimer: null,
       seekListener: null,
       seeking: false,
+      seekSentGeneration: null,
       awaitingSeekPlayback: false,
       resumePlaybackTimer: null,
       freshSession: true,
@@ -1548,6 +1554,7 @@ function createSeekHandler(vp, { setTimeoutFn = setTimeout, clearTimeoutFn = cle
     // trip is debounced below.
     clearSeekPlaybackRecovery(vp, clearTimeoutFn)
     vp.generation = ++globalGeneration
+    vp.seekSentGeneration = null
     vp.totalBytesReceived = 0
     vp.streamStartOffset = 0
     vp.awaitingSeekPlayback = true
@@ -1560,22 +1567,43 @@ function createSeekHandler(vp, { setTimeoutFn = setTimeout, clearTimeoutFn = cle
 
     // Debounce: clear any pending seek, schedule a new one.
     if (vp.seekTimer) clearTimeoutFn(vp.seekTimer)
+    const generation = vp.generation
+    vp.clearSeekTimer = () => {
+      if (!vp.seekTimer) return
+      clearTimeoutFn(vp.seekTimer)
+      vp.seekTimer = null
+    }
     vp.seekTimer = setTimeoutFn(() => {
       vp.seekTimer = null
-      if (!transferChannel) return
-
-      // Guard downloads during seek.
-      vp.seeking = true
-
-      transferChannel.send(JSON.stringify({
-        type: 'asset_preview_seek',
-        id: vp.id,
-        quality: 'video',
-        start_offset: byteOffset,
-        generation: vp.generation,
-      }))
+      sendVideoSeek(vp, byteOffset, generation)
     }, 300)
   }
+}
+
+function sendVideoSeek(vp, startOffset, generation = vp?.generation) {
+  if (!vp || generation !== vp.generation) return false
+  if (!Number.isInteger(startOffset) || startOffset < 0) return false
+  if (!transferChannel || vp.seekSentGeneration === generation) return false
+
+  vp.seekSentGeneration = generation
+  vp.seeking = true
+  transferChannel.send(JSON.stringify({
+    type: 'asset_preview_seek',
+    id: vp.id,
+    quality: 'video',
+    start_offset: startOffset,
+    generation,
+  }))
+  return true
+}
+
+function handleMediaRangeRequest(message) {
+  const vp = currentVideoPreview
+  if (!vp || message?.mediaId !== vp.mediaId || message?.generation !== vp.generation) return false
+  if (!Number.isInteger(message.startOffset) || message.startOffset <= 0) return false
+
+  vp.clearSeekTimer?.()
+  return sendVideoSeek(vp, message.startOffset, message.generation)
 }
 
 function clearSeekPlaybackRecovery(vp, clearTimeoutFn = clearTimeout) {
@@ -1736,5 +1764,7 @@ export const __test = {
   cleanupCurrentVideoPreview,
   applyFinalDownloadState,
   createSeekHandler,
+  handleMediaRangeRequest,
+  sendVideoSeek,
   scheduleSeekPlaybackRecovery,
 }
