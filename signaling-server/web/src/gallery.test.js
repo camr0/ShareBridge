@@ -837,7 +837,9 @@ test('gallery adds a lightbox download button for the active asset', () => {
   })
   toolbar.children[0].click({ preventDefault() {} })
 
-  assert.equal(toolbar.children[0].className, 'lg-download sharebridge-lightbox-download')
+  assert.equal(toolbar.children[0].className, 'lg-icon lg-download sharebridge-lightbox-download')
+  assert.equal(toolbar.children[0].textContent, '')
+  assert.equal(toolbar.children[0]['aria-label'], 'Download')
   assert.deepEqual(downloaded, ['asset-1'])
 })
 

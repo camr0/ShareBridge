@@ -412,10 +412,10 @@ export function createGalleryController({
     if (!createElement) return
     const button = createElement('button')
     button.type = 'button'
-    button.className = 'lg-download sharebridge-lightbox-download'
+    button.className = 'lg-icon lg-download sharebridge-lightbox-download'
     button.title = 'Download'
     button.setAttribute?.('aria-label', 'Download')
-    button.textContent = '↓'
+    button.textContent = ''
     button.addEventListener?.('click', (event) => {
       event.preventDefault?.()
       if (state.activePreviewID) onDownloadRequest?.(state.activePreviewID)
