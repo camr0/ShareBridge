@@ -19,6 +19,7 @@ const (
 
 var (
 	ErrRequestTooLarge = errors.New("multilane request exceeds queue capacity")
+	ErrEmptyPayload    = errors.New("multilane scheduler payload must be non-empty")
 	ErrSchedulerClosed = errors.New("multilane scheduler closed")
 )
 
@@ -88,6 +89,7 @@ func classCap(class TrafficClass) (int, bool) {
 }
 
 // Send waits for bounded admitted-byte capacity and for the writer to accept the request.
+// Scheduled frames require a non-empty payload; the lane envelope API has its own contract.
 // Payload bytes remain caller-owned while admission is blocked and are copied on enqueue.
 // The caller must not mutate payload concurrently with Send; after Send returns, ownership is unrestricted.
 func (s *Scheduler) Send(ctx context.Context, class TrafficClass, kind Kind, payload []byte) error {
@@ -100,6 +102,9 @@ func (s *Scheduler) Send(ctx context.Context, class TrafficClass, kind Kind, pay
 	}
 	if kind != KindText && kind != KindBinary {
 		return fmt.Errorf("unknown kind: %d", kind)
+	}
+	if len(payload) == 0 {
+		return ErrEmptyPayload
 	}
 	if ctx == nil {
 		ctx = context.Background()

@@ -146,6 +146,27 @@ test('scheduler rejects an oversized request clearly', async () => {
   await scheduler.close();
 });
 
+test('scheduler rejects empty payloads before admission without poisoning fairness', async () => {
+  const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.className); } });
+  for (const className of [TRAFFIC_CLASS_CONTROL, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_THUMBNAIL, TRAFFIC_CLASS_BULK]) {
+    for (const kind of [FRAME_TEXT, FRAME_BINARY]) await assert.rejects(scheduler.send({ className, kind, payload: new Uint8Array() }), /empty|non-empty/i);
+  }
+  assert.equal(writes.length, 0);
+  for (const className of [TRAFFIC_CLASS_CONTROL, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_THUMBNAIL, TRAFFIC_CLASS_BULK]) {
+    assert.equal(scheduler.bytes.get(className), 0); assert.equal(scheduler.queues.get(className).length, 0); assert.equal(scheduler.waiting.get(className).length, 0);
+  }
+  assert.deepEqual(scheduler.outerDeficit, [0, 0]); assert.deepEqual(scheduler.innerDeficit, [0, 0]); assert.equal(scheduler.outerStarted, false); assert.equal(scheduler.innerStarted, false);
+  await Promise.all([TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_BULK].map((className) => scheduler.send({ className, kind: FRAME_BINARY, payload: payload() })));
+  assert.deepEqual(writes, [TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_BULK]); await scheduler.close();
+});
+
+test('one thousand empty media sends cannot precede bulk', async () => {
+  const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.className); } });
+  const rejected = Array.from({ length: 1000 }, () => assert.rejects(scheduler.send({ className: TRAFFIC_CLASS_INTERACTIVE_MEDIA, kind: FRAME_BINARY, payload: new Uint8Array() }), /empty|non-empty/i));
+  await Promise.all(rejected); await scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: new Uint8Array([1]) });
+  assert.deepEqual(writes, [TRAFFIC_CLASS_BULK]); await scheduler.close();
+});
+
 test('scheduler accepts frame kinds and rejects unknown kinds before admission', async () => {
   const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.kind); } });
   await Promise.all([

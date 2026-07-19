@@ -644,6 +644,78 @@ func TestSchedulerCopiesPayloadAndRejectsOversizedRequest(t *testing.T) {
 	}
 }
 
+func TestSchedulerRejectsEmptyPayloadBeforeAdmissionWithoutPoisoningFairness(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var mu sync.Mutex
+	var writes []TrafficClass
+	s := NewScheduler(func(class TrafficClass, _ Kind, payload []byte) error {
+		mu.Lock()
+		writes = append(writes, class)
+		mu.Unlock()
+		if len(payload) > 0 && class == ClassControl {
+			close(entered)
+			<-gate
+		}
+		return nil
+	})
+	for _, class := range []TrafficClass{ClassControl, ClassInteractiveMedia, ClassThumbnail, ClassBulk} {
+		for _, kind := range []Kind{KindText, KindBinary} {
+			if err := s.Send(context.Background(), class, kind, nil); !errors.Is(err, ErrEmptyPayload) {
+				t.Fatalf("Send(%d, %d, empty) = %v", class, kind, err)
+			}
+		}
+	}
+	s.mu.Lock()
+	changed := s.outerStarted || s.innerStarted || s.outerDeficit != [2]int{} || s.innerDeficit != [2]int{}
+	for _, class := range []TrafficClass{ClassControl, ClassInteractiveMedia, ClassThumbnail, ClassBulk} {
+		changed = changed || s.bytes[class] != 0 || len(s.queues[class]) != 0 || len(s.admissionWaiters[class]) != 0
+	}
+	if changed {
+		t.Fatalf("empty sends changed scheduler state: bytes=%v queues=%v waiters=%v", s.bytes, s.queues, s.admissionWaiters)
+	}
+	s.mu.Unlock()
+	control := asyncSend(s, context.Background(), ClassControl, 1)
+	<-entered
+	sends := []<-chan error{asyncSend(s, context.Background(), ClassInteractiveMedia, 2), asyncSend(s, context.Background(), ClassInteractiveMedia, 3), asyncSend(s, context.Background(), ClassInteractiveMedia, 4), asyncSend(s, context.Background(), ClassBulk, 5)}
+	waitFor(t, "fair traffic admission", func() bool {
+		return queueBytes(s, ClassInteractiveMedia) == 3*testFrameSize && queueBytes(s, ClassBulk) == testFrameSize
+	})
+	close(gate)
+	_ = <-control
+	for _, done := range sends {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = s.Close()
+	mu.Lock()
+	got := append([]TrafficClass(nil), writes[1:]...)
+	mu.Unlock()
+	want := []TrafficClass{ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassBulk}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("post-rejection service = %v, want %v", got, want)
+	}
+}
+
+func TestSchedulerEmptyMediaCannotStarveBulk(t *testing.T) {
+	var calls int
+	var got TrafficClass
+	s := NewScheduler(func(class TrafficClass, _ Kind, _ []byte) error { calls++; got = class; return nil })
+	for i := 0; i < 1000; i++ {
+		if err := s.Send(context.Background(), ClassInteractiveMedia, KindBinary, nil); !errors.Is(err, ErrEmptyPayload) {
+			t.Fatalf("empty send %d = %v", i, err)
+		}
+	}
+	if err := s.Send(context.Background(), ClassBulk, KindBinary, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || got != ClassBulk {
+		t.Fatalf("writes = %d, last class %d; want one bulk", calls, got)
+	}
+	_ = s.Close()
+}
+
 func TestSchedulerCancellationRestoresCapacity(t *testing.T) {
 	gate := make(chan struct{})
 	entered := make(chan struct{})

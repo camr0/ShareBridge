@@ -54,10 +54,12 @@ export class LaneScheduler {
     this.innerStarted = false;
   }
 
+  // Scheduled frames require a non-empty payload; lane envelopes are validated separately.
   async send({ className, kind, payload, signal }) {
     if (!caps.has(className)) throw new RangeError(`unknown traffic class: ${className}`);
     if (kind !== FRAME_TEXT && kind !== FRAME_BINARY) throw new RangeError(`unknown frame kind: ${kind}`);
     if (!(payload instanceof Uint8Array)) throw new TypeError('payload must be a Uint8Array');
+    if (payload.byteLength === 0) throw new RangeError('scheduled payload must be non-empty');
     if (payload.length > caps.get(className)) throw new RangeError(`request too large for ${className} queue`);
     if (this.terminal) throw this.terminal;
     if (signal?.aborted) throw abortError();
