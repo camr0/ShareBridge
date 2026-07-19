@@ -161,11 +161,13 @@ describe('CreateShareModal', () => {
       'direct-option',
     ])
     expect(findEl('relay-option')?.textContent).toContain('Relay (recommended)')
-    expect(findEl('relay-option')?.textContent).toContain(
-      'End-to-end encrypted, hides your IP, and provides consistent performance'
+    expect(findEl('relay-option')?.querySelector('span span')?.textContent?.trim()).toBe(
+      'End-to-end encrypted, hides your IP, and provides consistent performance.'
     )
     expect(findEl('direct-option')?.textContent).toContain('Direct')
-    expect(findEl('direct-option')?.textContent).toContain('Peer-to-peer, quota-free')
+    expect(findEl('direct-option')?.querySelector('span span')?.textContent?.trim()).toBe(
+      'Peer-to-peer, quota-free.'
+    )
     expect(document.body.textContent).not.toContain('TURN')
     wrapper.unmount()
   })

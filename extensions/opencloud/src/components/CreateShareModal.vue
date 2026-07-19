@@ -41,7 +41,7 @@
             />
             <span>
               <strong>Relay (recommended)</strong>
-              <span>End-to-end encrypted, hides your IP, and provides consistent performance</span>
+              <span>End-to-end encrypted, hides your IP, and provides consistent performance.</span>
             </span>
           </label>
 
@@ -55,7 +55,7 @@
             />
             <span>
               <strong>Direct</strong>
-              <span>Peer-to-peer, quota-free</span>
+              <span>Peer-to-peer, quota-free.</span>
             </span>
           </label>
         </fieldset>

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { mount, flushPromises } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
 import ShareBridgePanel from './ShareBridgePanel.vue'
 import type { Share } from '../types'
@@ -8,6 +8,23 @@ import type { Resource } from '@opencloud-eu/web-client'
 const mockListShares = vi.fn()
 const mockRevokeShare = vi.fn()
 const mockGetSettings = vi.fn()
+
+type AgentSettings = {
+  default_expiry_hours: number
+  default_max_downloads: number
+  default_relay_only: boolean
+  turn_available: boolean
+}
+
+const deferred = <T>() => {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
 
 vi.mock('../composables/useAgentClient', () => ({
   useAgentClient: () => ({
@@ -149,6 +166,71 @@ describe('ShareBridgePanel', () => {
 
     await wrapper.find('[data-testid="create-share-btn"]').trigger('click')
     expect(wrapper.find('[data-testid="create-modal"]').exists()).toBe(true)
+  })
+
+  it('does not open the modal while agent settings are still loading', async () => {
+    localStorage.setItem('sharebridge_agent_url', 'http://localhost:7878')
+    localStorage.setItem('sharebridge_api_key', 'sb_agent_key')
+    mockListShares.mockResolvedValue([])
+    const settingsRequest = deferred<AgentSettings>()
+    mockGetSettings.mockReturnValueOnce(settingsRequest.promise)
+
+    const wrapper = mount(ShareBridgePanel, { props: defaultProps })
+    await flushPromises()
+
+    const createButton = wrapper.find('[data-testid="create-share-btn"]')
+    expect((createButton.element as HTMLButtonElement).disabled).toBe(true)
+    await createButton.trigger('click')
+    expect(wrapper.findComponent({ name: 'CreateShareModal' }).exists()).toBe(false)
+
+    settingsRequest.resolve({
+      default_expiry_hours: 24,
+      default_max_downloads: 0,
+      default_relay_only: true,
+      turn_available: true,
+    })
+    await flushPromises()
+  })
+
+  it('preserves an explicit Direct default after deferred settings load', async () => {
+    localStorage.setItem('sharebridge_agent_url', 'http://localhost:7878')
+    localStorage.setItem('sharebridge_api_key', 'sb_agent_key')
+    mockListShares.mockResolvedValue([])
+    const settingsRequest = deferred<AgentSettings>()
+    mockGetSettings.mockReturnValueOnce(settingsRequest.promise)
+
+    const wrapper = mount(ShareBridgePanel, { props: defaultProps })
+    await flushPromises()
+    settingsRequest.resolve({
+      default_expiry_hours: 24,
+      default_max_downloads: 0,
+      default_relay_only: false,
+      turn_available: true,
+    })
+    await flushPromises()
+
+    const createButton = wrapper.find('[data-testid="create-share-btn"]')
+    expect((createButton.element as HTMLButtonElement).disabled).toBe(false)
+    await createButton.trigger('click')
+    expect(wrapper.findComponent({ name: 'CreateShareModal' }).props('defaultRelayOnly')).toBe(false)
+  })
+
+  it('enables creation with no relay default after deferred settings fail', async () => {
+    localStorage.setItem('sharebridge_agent_url', 'http://localhost:7878')
+    localStorage.setItem('sharebridge_api_key', 'sb_agent_key')
+    mockListShares.mockResolvedValue([])
+    const settingsRequest = deferred<AgentSettings>()
+    mockGetSettings.mockReturnValueOnce(settingsRequest.promise)
+
+    const wrapper = mount(ShareBridgePanel, { props: defaultProps })
+    await flushPromises()
+    settingsRequest.reject(new Error('Network error'))
+    await flushPromises()
+
+    const createButton = wrapper.find('[data-testid="create-share-btn"]')
+    expect((createButton.element as HTMLButtonElement).disabled).toBe(false)
+    await createButton.trigger('click')
+    expect(wrapper.findComponent({ name: 'CreateShareModal' }).props('defaultRelayOnly')).toBeUndefined()
   })
 
   it('refreshes share list after new share is created', async () => {

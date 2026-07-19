@@ -58,7 +58,8 @@
 
         <button
           data-testid="create-share-btn"
-          @click="showModal = true"
+          :disabled="loadingAgentSettings"
+          @click="openCreateModal"
           class="create-btn"
         >
           Create ShareBridge Share
@@ -100,10 +101,11 @@ const shares = ref<Share[]>([])
 const loading = ref(false)
 const error = ref('')
 const showModal = ref(false)
+const loadingAgentSettings = ref(true)
 const turnAvailable = ref(false)
 const defaultExpiryHours = ref(24)
 const defaultMaxDownloads = ref(0)
-const defaultRelayOnly = ref(false)
+const defaultRelayOnly = ref<boolean | undefined>(undefined)
 
 const configForm = reactive({
   agentUrl: '',
@@ -115,11 +117,11 @@ const saveConfig = async () => {
   settings.setAgentUrl(configForm.agentUrl)
   settings.setApiKey(configForm.apiKey)
   // Load shares and fetch settings after saving config
-  await loadShares()
-  applyAgentSettings()
+  await Promise.all([loadShares(), applyAgentSettings()])
 }
 
 const applyAgentSettings = async () => {
+  loadingAgentSettings.value = true
   try {
     const agentSettings = await getSettings()
     turnAvailable.value = agentSettings.turn_available
@@ -128,6 +130,14 @@ const applyAgentSettings = async () => {
     defaultRelayOnly.value = agentSettings.default_relay_only
   } catch {
     // leave defaults as initial values
+  } finally {
+    loadingAgentSettings.value = false
+  }
+}
+
+const openCreateModal = () => {
+  if (!loadingAgentSettings.value) {
+    showModal.value = true
   }
 }
 
@@ -249,5 +259,9 @@ onMounted(async () => {
 }
 .create-btn:hover {
   opacity: 0.9;
+}
+.create-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 </style>
