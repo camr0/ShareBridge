@@ -35,6 +35,7 @@
             <input
               data-testid="mode-relay"
               type="radio"
+              :name="connectionModeName"
               :checked="form.relayOnly"
               @change="form.relayOnly = true"
             />
@@ -48,6 +49,7 @@
             <input
               data-testid="mode-direct"
               type="radio"
+              :name="connectionModeName"
               :checked="!form.relayOnly"
               @change="form.relayOnly = false"
             />
@@ -78,7 +80,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed } from 'vue'
+import { ref, reactive, computed, getCurrentInstance } from 'vue'
 import { useClientService } from '@opencloud-eu/web-pkg'
 import { useAgentClient } from '../composables/useAgentClient'
 import type { Resource } from '@opencloud-eu/web-client'
@@ -102,6 +104,7 @@ const emit = defineEmits<{
 
 const clientService = useClientService()
 const { createShare } = useAgentClient()
+const connectionModeName = `connection-mode-${getCurrentInstance()!.uid}`
 
 const loading = ref(false)
 const error = ref('')

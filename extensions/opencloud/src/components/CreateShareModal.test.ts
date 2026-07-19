@@ -227,6 +227,18 @@ describe('CreateShareModal', () => {
     expect(relayRadios[1].checked).toBe(true)
   })
 
+  it('uses a shared native radio group name within each modal and a unique name across modals', () => {
+    mountModal()
+    mountModal()
+    const relayRadios = document.querySelectorAll<HTMLInputElement>('[data-testid="mode-relay"]')
+    const directRadios = document.querySelectorAll<HTMLInputElement>('[data-testid="mode-direct"]')
+
+    expect(relayRadios[0].name).not.toBe('')
+    expect(relayRadios[0].name).toBe(directRadios[0].name)
+    expect(relayRadios[1].name).toBe(directRadios[1].name)
+    expect(relayRadios[0].name).not.toBe(relayRadios[1].name)
+  })
+
   it('selects Direct when defaultRelayOnly is explicitly false', () => {
     mountModal({ defaultRelayOnly: false })
     expect((findEl('mode-relay') as HTMLInputElement)?.checked).toBe(false)
