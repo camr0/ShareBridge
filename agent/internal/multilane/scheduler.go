@@ -346,7 +346,11 @@ func (s *Scheduler) popLocked(class TrafficClass) *sendRequest {
 	queue := s.queues[class]
 	request := queue[0]
 	queue[0] = nil
-	s.queues[class] = queue[1:]
+	queue = queue[1:]
+	if len(queue) == 0 {
+		queue = nil
+	}
+	s.queues[class] = queue
 	if len(s.queues[class]) == 0 {
 		s.resetEmptyLaneLocked(class)
 	}
@@ -403,6 +407,9 @@ func (s *Scheduler) admitWaitersLocked(class TrafficClass) {
 		waiter.request = s.enqueueLocked(waiter.class, waiter.kind, waiter.payload)
 		waiter.ready <- nil
 	}
+	if len(waiters) == 0 {
+		waiters = nil
+	}
 	s.admissionWaiters[class] = waiters
 }
 
@@ -412,7 +419,11 @@ func (s *Scheduler) removeAdmissionWaiterLocked(want *admissionWaiter) bool {
 		if waiter == want {
 			copy(waiters[i:], waiters[i+1:])
 			waiters[len(waiters)-1] = nil
-			s.admissionWaiters[want.class] = waiters[:len(waiters)-1]
+			waiters = waiters[:len(waiters)-1]
+			if len(waiters) == 0 {
+				waiters = nil
+			}
+			s.admissionWaiters[want.class] = waiters
 			if len(s.queues[want.class]) == 0 {
 				s.resetEmptyLaneLocked(want.class)
 			}
@@ -438,7 +449,11 @@ func (s *Scheduler) removeQueuedLocked(want *sendRequest) bool {
 		if request == want {
 			copy(queue[i:], queue[i+1:])
 			queue[len(queue)-1] = nil
-			s.queues[want.class] = queue[:len(queue)-1]
+			queue = queue[:len(queue)-1]
+			if len(queue) == 0 {
+				queue = nil
+			}
+			s.queues[want.class] = queue
 			if len(s.queues[want.class]) == 0 {
 				s.resetEmptyLaneLocked(want.class)
 			}

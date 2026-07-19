@@ -852,6 +852,17 @@ func TestSchedulerRemovedPointerSlotsAreCleared(t *testing.T) {
 		if backing[0] != nil {
 			t.Fatal("popped queue head retained in backing array")
 		}
+		if len(s.queues[ClassBulk]) != 1 || s.queues[ClassBulk][0] != backing[1] {
+			t.Fatal("nonempty queue order changed")
+		}
+	})
+	t.Run("final queue head pop releases backing allocation", func(t *testing.T) {
+		s := bare()
+		s.queues[ClassBulk] = []*sendRequest{request(1)}
+		_ = s.popLocked(ClassBulk)
+		if queue := s.queues[ClassBulk]; queue != nil || len(queue) != 0 || cap(queue) != 0 {
+			t.Fatalf("exhausted queue = %#v len=%d cap=%d, want nil", queue, len(queue), cap(queue))
+		}
 	})
 	t.Run("queued middle cancellation", func(t *testing.T) {
 		s := bare()
@@ -877,6 +888,28 @@ func TestSchedulerRemovedPointerSlotsAreCleared(t *testing.T) {
 			t.Fatal("removed admission waiter retained in backing tail")
 		}
 	})
+	t.Run("final queued cancellation releases backing allocation", func(t *testing.T) {
+		s := bare()
+		removed := request(1)
+		s.queues[ClassBulk] = []*sendRequest{removed}
+		if !s.removeQueuedLocked(removed) {
+			t.Fatal("request not removed")
+		}
+		if queue := s.queues[ClassBulk]; queue != nil || len(queue) != 0 || cap(queue) != 0 {
+			t.Fatalf("exhausted queue len=%d cap=%d, want nil", len(queue), cap(queue))
+		}
+	})
+	t.Run("final admission cancellation releases backing allocation", func(t *testing.T) {
+		s := bare()
+		removed := waiter(1)
+		s.admissionWaiters[ClassBulk] = []*admissionWaiter{removed}
+		if !s.removeAdmissionWaiterLocked(removed) {
+			t.Fatal("waiter not removed")
+		}
+		if waiters := s.admissionWaiters[ClassBulk]; waiters != nil || len(waiters) != 0 || cap(waiters) != 0 {
+			t.Fatalf("exhausted waiters len=%d cap=%d, want nil", len(waiters), cap(waiters))
+		}
+	})
 	t.Run("batch admission heads", func(t *testing.T) {
 		s := bare()
 		backing := []*admissionWaiter{waiter(1), waiter(2), waiter(3)}
@@ -886,6 +919,9 @@ func TestSchedulerRemovedPointerSlotsAreCleared(t *testing.T) {
 			if retained != nil {
 				t.Fatalf("admitted waiter %d retained in backing array", i)
 			}
+		}
+		if waiters := s.admissionWaiters[ClassBulk]; waiters != nil || len(waiters) != 0 || cap(waiters) != 0 {
+			t.Fatalf("batch-exhausted waiters len=%d cap=%d, want nil", len(waiters), cap(waiters))
 		}
 	})
 	t.Run("terminal resets", func(t *testing.T) {
