@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sharebridge/agent/internal/cloudwebdav"
+	"sharebridge/agent/internal/multilane"
 )
 
 const (
@@ -28,14 +29,6 @@ const (
 	binaryFrameFileChunk = byte(0x10)
 	binaryFrameThumbnail = byte(0x11)
 )
-
-// DataChannel abstracts the DataChannel for sending.
-type DataChannel interface {
-	SendBinary(data []byte) error
-	SendText(text string) error
-	BufferedAmount() uint64
-	Close() error
-}
 
 type StorageBackend interface {
 	ListFiles(subpath string) ([]cloudwebdav.FileInfo, error)
@@ -73,14 +66,20 @@ type GalleryItem struct {
 // Authentication is handled at the signaling layer (HMAC pre-challenge)
 // before the WebRTC peer is created — no auth needed here.
 type Manager struct {
-	dc           DataChannel
-	client       StorageBackend
-	gallery      GalleryBackend
-	transfer     atomic.Bool
-	maxDownloads int
-	downloads    atomic.Int32
+	channels      multilane.ChannelSet
+	control       multilane.Endpoint
+	media         multilane.Endpoint
+	bulk          multilane.Endpoint
+	client        StorageBackend
+	gallery       GalleryBackend
+	mediaTransfer atomic.Bool
+	bulkTransfer  atomic.Bool
+	maxDownloads  int
+	downloads     atomic.Int32
 
-	streamCancel      context.CancelFunc
+	mediaMu           sync.Mutex
+	mediaCancel       context.CancelFunc
+	mediaOperation    atomic.Uint64
 	currentGeneration atomic.Uint32
 
 	OnSessionExpired   func()
@@ -88,16 +87,32 @@ type Manager struct {
 }
 
 // NewManager creates a transfer manager with an optional download limit.
-func NewManager(dc DataChannel, client StorageBackend, maxDownloads int) *Manager {
-	return &Manager{
-		dc:           dc,
+func NewManager(channels multilane.ChannelSet, client StorageBackend, maxDownloads int) *Manager {
+	m := &Manager{
+		channels:     channels,
 		client:       client,
 		maxDownloads: maxDownloads,
 	}
+	m.installChannels()
+	return m
 }
 
-func NewGalleryManager(dc DataChannel, backend GalleryBackend, maxDownloads int) *Manager {
-	return &Manager{dc: dc, gallery: backend, maxDownloads: maxDownloads}
+func NewGalleryManager(channels multilane.ChannelSet, backend GalleryBackend, maxDownloads int) *Manager {
+	m := &Manager{channels: channels, gallery: backend, maxDownloads: maxDownloads}
+	m.installChannels()
+	return m
+}
+
+func (m *Manager) installChannels() {
+	if m.channels == nil {
+		return
+	}
+	m.control = m.channels.Endpoint(multilane.LaneControl)
+	m.media = m.channels.Endpoint(multilane.LaneMedia)
+	m.bulk = m.channels.Endpoint(multilane.LaneBulk)
+	if m.control != nil {
+		m.control.SetOnMessage(m.HandleMessage)
+	}
 }
 
 // HandleOpen sends the hello message when DataChannel opens.
@@ -107,7 +122,7 @@ func (m *Manager) HandleOpen() {
 		return
 	}
 	data, _ := json.Marshal(map[string]string{"type": "hello"})
-	m.dc.SendText(string(data))
+	_ = m.control.SendText(string(data))
 }
 
 // HandleMessage processes incoming DataChannel messages.
@@ -119,32 +134,33 @@ func (m *Manager) HandleMessage(data []byte) {
 		Quality     string `json:"quality"`
 		StartOffset int64  `json:"start_offset"`
 		Generation  int    `json:"generation"`
+		RequestID   string `json:"request_id"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
-		m.sendError("invalid message format")
+		m.sendError("connection", "", "invalid message format")
 		return
 	}
 
 	switch msg.Type {
 	case "list_request":
-		m.handleListRequest(msg.Path)
+		m.handleListRequest(msg.Path, msg.RequestID)
 	case "file_request":
-		m.handleFileRequest(msg.Path)
+		m.handleFileRequest(msg.Path, msg.RequestID)
 	case "asset_request":
-		m.handleAssetRequest(msg.ID, msg.Quality)
+		m.handleAssetRequest(msg.ID, msg.Quality, msg.RequestID)
 	case "asset_preview_request":
-		m.handleAssetPreviewRequest(msg.ID, msg.Quality, msg.Generation)
+		m.handleAssetPreviewRequest(msg.ID, msg.Quality, msg.Generation, msg.RequestID)
 	case "asset_preview_seek":
-		m.handleAssetPreviewSeek(msg.ID, msg.Quality, msg.StartOffset, msg.Generation)
+		m.handleAssetPreviewSeek(msg.ID, msg.Quality, msg.StartOffset, msg.Generation, msg.RequestID)
 	default:
-		m.sendError("unknown message type: " + msg.Type)
+		m.sendError("connection", msg.RequestID, "unknown message type: "+msg.Type)
 	}
 }
 
 func (m *Manager) sendGallery() {
 	gallery, err := m.gallery.ListGallery(context.Background())
 	if err != nil {
-		m.sendError("share unavailable: " + err.Error())
+		m.sendError("media", "", "share unavailable: "+err.Error())
 		return
 	}
 	data, _ := json.Marshal(struct {
@@ -152,7 +168,7 @@ func (m *Manager) sendGallery() {
 		Gallery
 	}{Type: "thumbnail_list", Gallery: gallery})
 	log.Printf("transfer gallery: sending thumbnail_list items=%d bytes=%d", len(gallery.Items), len(data))
-	if err := m.dc.SendText(string(data)); err != nil {
+	if err := m.control.SendText(string(data)); err != nil {
 		log.Printf("transfer gallery: send thumbnail_list failed: %v", err)
 		return
 	}
@@ -165,7 +181,7 @@ func (m *Manager) sendGallery() {
 		Sent   int    `json:"sent"`
 		Failed int    `json:"failed"`
 	}{Type: "thumbnail_complete", Sent: sentThumbs, Failed: failedThumbs})
-	if err := m.dc.SendText(string(data)); err != nil {
+	if err := m.control.SendText(string(data)); err != nil {
 		log.Printf("transfer gallery: send thumbnail_complete failed: %v", err)
 	}
 }
@@ -237,7 +253,7 @@ func (m *Manager) sendGalleryThumbnails(ctx context.Context, items []GalleryItem
 		if sendFailed {
 			continue
 		}
-		if err := m.sendWithBackpressure(context.Background(), encodeThumbnailFrame(uint16(result.index), result.data)); err != nil {
+		if err := m.sendWithBackpressure(context.Background(), m.media, multilane.ClassThumbnail, encodeThumbnailFrame(uint16(result.index), result.data)); err != nil {
 			log.Printf("transfer gallery: thumbnail send failed index=%d id=%s bytes=%d: %v", result.index, result.id, len(result.data), err)
 			sendFailed = true
 			continue
@@ -247,9 +263,9 @@ func (m *Manager) sendGalleryThumbnails(ctx context.Context, items []GalleryItem
 	return sentThumbs, failedThumbs
 }
 
-func (m *Manager) handleListRequest(subpath string) {
+func (m *Manager) handleListRequest(subpath, requestID string) {
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
-		m.sendError("share has reached its download limit")
+		m.sendError("bulk", requestID, "share has reached its download limit")
 		if m.OnSessionExpired != nil {
 			m.OnSessionExpired()
 		}
@@ -257,13 +273,13 @@ func (m *Manager) handleListRequest(subpath string) {
 	}
 
 	if m.client == nil {
-		m.sendError("share unavailable: client not initialized")
+		m.sendError("connection", requestID, "share unavailable: client not initialized")
 		return
 	}
 
 	files, err := m.client.ListFiles(subpath)
 	if err != nil {
-		m.sendError("share unavailable: " + err.Error())
+		m.sendError("connection", requestID, "share unavailable: "+err.Error())
 		return
 	}
 
@@ -277,15 +293,15 @@ func (m *Manager) handleListRequest(subpath string) {
 
 	data, err := json.Marshal(resp)
 	if err != nil {
-		m.sendError("internal error")
+		m.sendError("connection", requestID, "internal error")
 		return
 	}
-	m.dc.SendText(string(data))
+	_ = m.control.SendText(string(data))
 }
 
-func (m *Manager) handleFileRequest(filePath string) {
+func (m *Manager) handleFileRequest(filePath, requestID string) {
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
-		m.sendError("share has reached its download limit")
+		m.sendError("bulk", requestID, "share has reached its download limit")
 		if m.OnSessionExpired != nil {
 			m.OnSessionExpired()
 		}
@@ -293,16 +309,16 @@ func (m *Manager) handleFileRequest(filePath string) {
 	}
 
 	if strings.Contains(filePath, "..") {
-		m.sendError("invalid path")
+		m.sendError("bulk", requestID, "invalid path")
 		return
 	}
 
 	if filePath == "" {
-		m.sendError("file path required")
+		m.sendError("bulk", requestID, "file path required")
 		return
 	}
 
-	if !m.acquireTransfer() {
+	if !m.acquireBulk(requestID) {
 		return
 	}
 
@@ -313,15 +329,15 @@ func (m *Manager) handleFileRequest(filePath string) {
 	}
 
 	if m.client == nil {
-		m.releaseTransfer()
-		m.sendError("share unavailable: client not initialized")
+		m.releaseBulk()
+		m.sendError("bulk", requestID, "share unavailable: client not initialized")
 		return
 	}
 
 	files, err := m.client.ListFiles(dir)
 	if err != nil {
-		m.releaseTransfer()
-		m.sendError("share unavailable")
+		m.releaseBulk()
+		m.sendError("bulk", requestID, "share unavailable")
 		return
 	}
 
@@ -334,8 +350,8 @@ func (m *Manager) handleFileRequest(filePath string) {
 		}
 	}
 	if fileInfo == nil {
-		m.releaseTransfer()
-		m.sendError("file not found: " + name)
+		m.releaseBulk()
+		m.sendError("bulk", requestID, "file not found: "+name)
 		return
 	}
 
@@ -353,6 +369,8 @@ func (m *Manager) handleFileRequest(filePath string) {
 		MimeType       string `json:"mimeType"`
 		SHA1           string `json:"sha1,omitempty"`
 		BinaryEnvelope bool   `json:"binary_envelope"`
+		Scope          string `json:"scope"`
+		RequestID      string `json:"request_id,omitempty"`
 	}{
 		Type:           "file_header",
 		Name:           fileInfo.Name,
@@ -360,20 +378,22 @@ func (m *Manager) handleFileRequest(filePath string) {
 		MimeType:       fileInfo.ContentType,
 		SHA1:           sha1,
 		BinaryEnvelope: true,
+		Scope:          "bulk",
+		RequestID:      requestID,
 	}
 	headerData, _ := json.Marshal(header)
-	if err := m.dc.SendText(string(headerData)); err != nil {
-		m.releaseTransfer()
+	if err := m.control.SendText(string(headerData)); err != nil {
+		m.releaseBulk()
 		return
 	}
 
-	go m.streamFile(resolveRequestPath(dir, fileInfo))
+	go m.streamFile(resolveRequestPath(dir, fileInfo), requestID)
 }
 
-func (m *Manager) handleAssetRequest(id string, quality string) {
+func (m *Manager) handleAssetRequest(id string, quality string, requestID string) {
 	log.Printf("transfer: asset_request id=%s quality=%s", id, quality)
 	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
-		m.sendError("share has reached its download limit")
+		m.sendError("bulk", requestID, "share has reached its download limit")
 		if m.OnSessionExpired != nil {
 			m.OnSessionExpired()
 		}
@@ -381,30 +401,30 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 	}
 
 	if id == "" {
-		m.sendError("asset id required")
+		m.sendError("bulk", requestID, "asset id required")
 		return
 	}
 
 	quality, ok := normalizeAssetQuality(quality)
 	if !ok {
-		m.sendError("unsupported asset quality: " + quality)
+		m.sendError("bulk", requestID, "unsupported asset quality: "+quality)
 		return
 	}
 
-	if !m.acquireTransfer() {
+	if !m.acquireBulk(requestID) {
 		return
 	}
 
 	if m.gallery == nil {
-		m.releaseTransfer()
-		m.sendError("share unavailable: client not initialized")
+		m.releaseBulk()
+		m.sendError("bulk", requestID, "share unavailable: client not initialized")
 		return
 	}
 
 	assetName, assetSize, assetMimeType, err := m.gallery.GetAssetInfo(context.Background(), id)
 	if err != nil {
-		m.releaseTransfer()
-		m.sendError("asset info unavailable: " + err.Error())
+		m.releaseBulk()
+		m.sendError("bulk", requestID, "asset info unavailable: "+err.Error())
 		log.Printf("transfer: GetAssetInfo failed id=%s: %v", id, err)
 		return
 	}
@@ -416,6 +436,8 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 		MimeType       string `json:"mimeType"`
 		SHA1           string `json:"sha1,omitempty"`
 		BinaryEnvelope bool   `json:"binary_envelope"`
+		Scope          string `json:"scope"`
+		RequestID      string `json:"request_id,omitempty"`
 	}{
 		Type:           "file_header",
 		Name:           assetName,
@@ -423,39 +445,39 @@ func (m *Manager) handleAssetRequest(id string, quality string) {
 		MimeType:       assetMimeType,
 		SHA1:           "",
 		BinaryEnvelope: true,
+		Scope:          "bulk",
+		RequestID:      requestID,
 	}
 	headerData, _ := json.Marshal(header)
-	if err := m.dc.SendText(string(headerData)); err != nil {
+	if err := m.control.SendText(string(headerData)); err != nil {
 		log.Printf("transfer: file_header send failed: %v", err)
-		m.releaseTransfer()
+		m.releaseBulk()
 		return
 	}
 
-	go func() { m.streamAsset(id, quality) }()
+	go func() { m.streamAsset(id, quality, requestID) }()
 }
 
-func (m *Manager) handleAssetPreviewRequest(id string, quality string, generation int) {
+func (m *Manager) handleAssetPreviewRequest(id string, quality string, generation int, requestID string) {
 	log.Printf("transfer: asset_preview_request id=%s quality=%s generation=%d", id, quality, generation)
 	if id == "" {
-		m.sendError("asset id required")
+		m.sendError("media", requestID, "asset id required")
 		return
 	}
 
 	quality, ok := normalizePreviewQuality(quality)
 	if !ok {
-		m.sendError("unsupported preview quality: " + quality)
-		return
-	}
-
-	if !m.acquireTransfer() {
+		m.sendError("media", requestID, "unsupported preview quality: "+quality)
 		return
 	}
 
 	if m.gallery == nil {
-		m.releaseTransfer()
-		m.sendError("share unavailable: client not initialized")
+		m.sendError("media", requestID, "share unavailable: client not initialized")
 		return
 	}
+
+	ctx, mediaOperation := m.beginMedia()
+	m.currentGeneration.Store(uint32(generation))
 
 	mimeType := "image/jpeg"
 	if quality == "video" {
@@ -482,10 +504,6 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 			previewSize = 0
 		}
 
-		// Create cancelable context for stream lifecycle. The seek handler
-		// calls m.streamCancel() to stop the old stream before starting a new one.
-		ctx, cancel := context.WithCancel(context.Background())
-		m.streamCancel = cancel
 		m.currentGeneration.Store(uint32(generation))
 
 		header := struct {
@@ -496,6 +514,8 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 			BinaryEnvelope bool   `json:"binary_envelope"`
 			Generation     int    `json:"generation"`
 			ByteOffset     int64  `json:"byte_offset"`
+			Scope          string `json:"scope"`
+			RequestID      string `json:"request_id,omitempty"`
 		}{
 			Type:           "asset_preview_header",
 			ID:             id,
@@ -504,18 +524,18 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 			BinaryEnvelope: true,
 			Generation:     generation,
 			ByteOffset:     0,
+			Scope:          "media",
+			RequestID:      requestID,
 		}
 		headerData, _ := json.Marshal(header)
-		if err := m.dc.SendText(string(headerData)); err != nil {
+		if err := m.control.SendText(string(headerData)); err != nil {
 			log.Printf("transfer: asset_preview_header send failed id=%s: %v", id, err)
-			m.releaseTransfer()
-			cancel()
-			m.streamCancel = nil
+			m.finishMedia(mediaOperation)
 			return
 		}
 		log.Printf("transfer: asset_preview_header sent id=%s mime=%s size=%d generation=%d", id, mimeType, previewSize, generation)
 
-		go m.streamAssetPreview(ctx, id, quality, uint32(generation), previewChunkSize)
+		go m.streamAssetPreview(ctx, id, quality, uint32(generation), previewChunkSize, mediaOperation, requestID)
 		return
 	}
 
@@ -526,26 +546,30 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 		MimeType       string `json:"mimeType"`
 		Size           int64  `json:"size"`
 		BinaryEnvelope bool   `json:"binary_envelope"`
+		Scope          string `json:"scope"`
+		RequestID      string `json:"request_id,omitempty"`
 	}{
 		Type:           "asset_preview_header",
 		ID:             id,
 		MimeType:       mimeType,
 		Size:           previewSize,
 		BinaryEnvelope: true,
+		Scope:          "media",
+		RequestID:      requestID,
 	}
 	headerData, _ := json.Marshal(header)
-	if err := m.dc.SendText(string(headerData)); err != nil {
+	if err := m.control.SendText(string(headerData)); err != nil {
 		log.Printf("transfer: asset_preview_header send failed id=%s: %v", id, err)
-		m.releaseTransfer()
+		m.finishMedia(mediaOperation)
 		return
 	}
 	log.Printf("transfer: asset_preview_header sent id=%s mime=%s size=%d", id, mimeType, previewSize)
 
-	go m.streamAssetPreview(context.Background(), id, quality, 0, chunkSize)
+	go m.streamAssetPreview(ctx, id, quality, 0, chunkSize, mediaOperation, requestID)
 }
 
-func (m *Manager) streamFile(filePath string) {
-	defer func() { m.transfer.Store(false) }()
+func (m *Manager) streamFile(filePath, requestID string) {
+	defer m.releaseBulk()
 
 	pr, pw := io.Pipe()
 	defer pr.Close()
@@ -562,14 +586,14 @@ func (m *Manager) streamFile(filePath string) {
 		n, err := pr.Read(buf)
 		if n > 0 {
 			totalBytes += int64(n)
-			if chunkErr := m.sendWithBackpressure(context.Background(), encodeFileChunkFrameLegacy(buf[:n])); chunkErr != nil {
+			if chunkErr := m.sendWithBackpressure(context.Background(), m.bulk, multilane.ClassBulk, encodeFileChunkFrameLegacy(buf[:n])); chunkErr != nil {
 				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
 				transferErr = err
-				m.sendError("transfer failed: " + err.Error())
+				m.sendError("bulk", requestID, "transfer failed: "+err.Error())
 			}
 			break
 		}
@@ -580,10 +604,12 @@ func (m *Manager) streamFile(filePath string) {
 	}
 
 	end := struct {
-		Type string `json:"type"`
-	}{Type: "chunk_end"}
+		Type      string `json:"type"`
+		Scope     string `json:"scope"`
+		RequestID string `json:"request_id,omitempty"`
+	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID}
 	endData, _ := json.Marshal(end)
-	m.dc.SendText(string(endData))
+	_ = m.control.SendText(string(endData))
 
 	m.downloads.Add(1)
 	if m.OnDownloadComplete != nil {
@@ -591,8 +617,8 @@ func (m *Manager) streamFile(filePath string) {
 	}
 }
 
-func (m *Manager) streamAsset(id string, quality string) {
-	defer func() { m.transfer.Store(false) }()
+func (m *Manager) streamAsset(id string, quality string, requestID string) {
+	defer m.releaseBulk()
 
 	pr, pw := io.Pipe()
 	defer pr.Close()
@@ -614,14 +640,14 @@ func (m *Manager) streamAsset(id string, quality string) {
 		n, err := pr.Read(buf)
 		if n > 0 {
 			totalBytes += int64(n)
-			if chunkErr := m.sendWithBackpressure(context.Background(), encodeFileChunkFrameLegacy(buf[:n])); chunkErr != nil {
+			if chunkErr := m.sendWithBackpressure(context.Background(), m.bulk, multilane.ClassBulk, encodeFileChunkFrameLegacy(buf[:n])); chunkErr != nil {
 				return
 			}
 		}
 		if err != nil {
 			if err != io.EOF {
 				transferErr = err
-				m.sendError("transfer failed: " + err.Error())
+				m.sendError("bulk", requestID, "transfer failed: "+err.Error())
 			}
 			break
 		}
@@ -632,10 +658,12 @@ func (m *Manager) streamAsset(id string, quality string) {
 	}
 
 	end := struct {
-		Type string `json:"type"`
-	}{Type: "chunk_end"}
+		Type      string `json:"type"`
+		Scope     string `json:"scope"`
+		RequestID string `json:"request_id,omitempty"`
+	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID}
 	endData, _ := json.Marshal(end)
-	m.dc.SendText(string(endData))
+	_ = m.control.SendText(string(endData))
 
 	m.downloads.Add(1)
 	if m.OnDownloadComplete != nil {
@@ -643,18 +671,18 @@ func (m *Manager) streamAsset(id string, quality string) {
 	}
 }
 
-func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset int64, generation int) {
+func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset int64, generation int, requestID string) {
 	log.Printf("transfer: asset_preview_seek id=%s start_offset=%d generation=%d", id, startOffset, generation)
 	if id == "" || quality == "" {
-		m.sendError("asset_preview_seek: id and quality required")
+		m.sendError("media", requestID, "asset_preview_seek: id and quality required")
 		return
 	}
 	if startOffset < 0 {
-		m.sendError("asset_preview_seek: start_offset must be >= 0")
+		m.sendError("media", requestID, "asset_preview_seek: start_offset must be >= 0")
 		return
 	}
 	if m.gallery == nil {
-		m.sendError("share unavailable: client not initialized")
+		m.sendError("media", requestID, "share unavailable: client not initialized")
 		return
 	}
 
@@ -673,34 +701,14 @@ func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset 
 	if readErr != nil {
 		pr.Close()
 		log.Printf("transfer: seek validation failed id=%s start_offset=%d: %v", id, startOffset, readErr)
-		m.sendError("preview seek failed: " + readErr.Error())
+		m.sendError("media", requestID, "preview seek failed: "+readErr.Error())
 		return
 	}
 
-	// Validation succeeded. Store new generation FIRST so the old stream's
-	// send-guard immediately fails, then cancel the old stream.
+	// Validation succeeded. Replace the active media stream without changing
+	// bulk state, then publish the new wire generation.
+	ctx, mediaOperation := m.beginMedia()
 	m.currentGeneration.Store(uint32(generation))
-
-	// Cancel old stream if one is running.
-	if m.streamCancel != nil {
-		m.streamCancel()
-		m.streamCancel = nil
-	}
-
-	// Release transfer lock — the old stream's deferred unlock is
-	// generation-guarded and will be a no-op since we stored a new generation.
-	m.transfer.Store(false)
-
-	// Acquire the lock for the new stream goroutine.
-	if !m.acquireTransfer() {
-		log.Printf("transfer: seek failed to acquire transfer lock id=%s", id)
-		pr.Close()
-		return
-	}
-
-	// Create new cancelable context for the new stream.
-	ctx, cancel := context.WithCancel(context.Background())
-	m.streamCancel = cancel
 
 	// Send header with byte_offset so the page knows where this stream starts.
 	header := struct {
@@ -711,6 +719,8 @@ func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset 
 		BinaryEnvelope bool   `json:"binary_envelope"`
 		Generation     int    `json:"generation"`
 		ByteOffset     int64  `json:"byte_offset"`
+		Scope          string `json:"scope"`
+		RequestID      string `json:"request_id,omitempty"`
 	}{
 		Type:           "asset_preview_header",
 		ID:             id,
@@ -718,49 +728,39 @@ func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset 
 		BinaryEnvelope: true,
 		Generation:     generation,
 		ByteOffset:     startOffset,
+		Scope:          "media",
+		RequestID:      requestID,
 	}
 	headerData, _ := json.Marshal(header)
-	if err := m.dc.SendText(string(headerData)); err != nil {
+	if err := m.control.SendText(string(headerData)); err != nil {
 		log.Printf("transfer: seek header send failed id=%s: %v", id, err)
 		pr.Close()
-		cancel()
-		m.streamCancel = nil
+		m.finishMedia(mediaOperation)
 		return
 	}
 	log.Printf("transfer: seek header sent id=%s byte_offset=%d generation=%d", id, startOffset, generation)
 
 	// Prepend the already-read byte and stream from the pipe via a fresh goroutine.
 	reader := io.MultiReader(bytes.NewReader(firstByte), pr)
-	go m.streamAssetPreviewFromReader(ctx, id, reader, uint32(generation), previewChunkSize)
+	go m.streamAssetPreviewFromReader(ctx, id, reader, uint32(generation), previewChunkSize, mediaOperation, requestID)
 }
 
-func (m *Manager) streamAssetPreview(ctx context.Context, id string, quality string, generation uint32, bufSize int) {
-	defer func() {
-		// Only release transfer lock if we're still the active generation.
-		if m.currentGeneration.Load() == generation {
-			m.transfer.Store(false)
-		}
-	}()
-
+func (m *Manager) streamAssetPreview(ctx context.Context, id string, quality string, generation uint32, bufSize int, mediaOperation uint64, requestID string) {
 	pr, pw := io.Pipe()
 	defer pr.Close()
 
 	go func() {
-		_, err := m.gallery.GetAsset(context.Background(), id, quality, pw)
+		_, err := m.gallery.GetAsset(ctx, id, quality, pw)
 		pw.CloseWithError(err)
 	}()
 
-	m.streamAssetPreviewFromReader(ctx, id, pr, generation, bufSize)
+	m.streamAssetPreviewFromReader(ctx, id, pr, generation, bufSize, mediaOperation, requestID)
 }
 
-// streamAssetPreviewFromReader streams chunks from reader, guarded by generation.
-// The caller must hold the transfer lock (acquired via acquireTransfer()).
-func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, reader io.Reader, generation uint32, bufSize int) {
-	defer func() {
-		if m.currentGeneration.Load() == generation {
-			m.transfer.Store(false)
-		}
-	}()
+// streamAssetPreviewFromReader streams chunks from reader, guarded by both the
+// media operation and the video generation.
+func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, reader io.Reader, generation uint32, bufSize int, mediaOperation uint64, requestID string) {
+	defer m.finishMedia(mediaOperation)
 
 	var totalBytes int64
 	var transferErr error
@@ -784,6 +784,10 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 
 		n, err := reader.Read(buf)
 		if n > 0 {
+			if ctx.Err() != nil || m.mediaOperation.Load() != mediaOperation {
+				log.Printf("transfer: discarding stale preview chunk operation=%d generation=%d size=%d", mediaOperation, generation, n)
+				return
+			}
 			totalBytes += int64(n)
 			chunksSent++
 			if chunksSent == 1 {
@@ -795,7 +799,7 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 			} else {
 				frame = encodeFileChunkFrameLegacy(buf[:n])
 			}
-			if chunkSendErr := m.sendWithBackpressure(ctx, frame); chunkSendErr != nil {
+			if chunkSendErr := m.sendInteractiveMedia(ctx, mediaOperation, frame); chunkSendErr != nil {
 				log.Printf("transfer: preview send failed generation=%d bytes=%d chunks=%d: %v", generation, totalBytes, chunksSent, chunkSendErr)
 				return
 			}
@@ -804,7 +808,9 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 			if err != io.EOF {
 				transferErr = err
 				log.Printf("transfer: preview read failed generation=%d bytes=%d: %v", generation, totalBytes, err)
-				m.sendError("preview failed: " + err.Error())
+				if ctx.Err() == nil {
+					m.sendError("media", requestID, "preview failed: "+err.Error())
+				}
 			}
 			break
 		}
@@ -816,14 +822,16 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 	}
 
 	// Only send end if we're still the active generation.
-	if m.currentGeneration.Load() == generation {
+	if ctx.Err() == nil && m.mediaOperation.Load() == mediaOperation && m.currentGeneration.Load() == generation {
 		end := struct {
 			Type       string `json:"type"`
 			ID         string `json:"id"`
 			Generation int    `json:"generation"`
-		}{Type: "asset_preview_end", ID: id, Generation: int(generation)}
+			Scope      string `json:"scope"`
+			RequestID  string `json:"request_id,omitempty"`
+		}{Type: "asset_preview_end", ID: id, Generation: int(generation), Scope: "media", RequestID: requestID}
 		endData, _ := json.Marshal(end)
-		m.dc.SendText(string(endData))
+		_ = m.control.SendText(string(endData))
 	}
 }
 
@@ -890,40 +898,94 @@ func normalizePreviewQuality(quality string) (string, bool) {
 	}
 }
 
-func (m *Manager) acquireTransfer() bool {
-	if !m.transfer.CompareAndSwap(false, true) {
-		m.sendError("transfer in progress")
+func (m *Manager) acquireBulk(requestID string) bool {
+	if !m.bulkTransfer.CompareAndSwap(false, true) {
+		m.sendError("bulk", requestID, "transfer in progress")
 		return false
 	}
 	return true
 }
 
-func (m *Manager) releaseTransfer() {
-	m.transfer.Store(false)
+func (m *Manager) releaseBulk() {
+	m.bulkTransfer.Store(false)
 }
 
-func (m *Manager) sendWithBackpressure(ctx context.Context, data []byte) error {
-	for m.dc.BufferedAmount() > maxBuffer {
+func (m *Manager) beginMedia() (context.Context, uint64) {
+	m.mediaMu.Lock()
+	if m.mediaCancel != nil {
+		m.mediaCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.mediaCancel = cancel
+	operation := m.mediaOperation.Add(1)
+	m.mediaTransfer.Store(true)
+	m.mediaMu.Unlock()
+	return ctx, operation
+}
+
+func (m *Manager) finishMedia(operation uint64) {
+	m.mediaMu.Lock()
+	if m.mediaOperation.Load() == operation {
+		if m.mediaCancel != nil {
+			m.mediaCancel()
+		}
+		m.mediaCancel = nil
+		m.mediaTransfer.Store(false)
+	}
+	m.mediaMu.Unlock()
+}
+
+func (m *Manager) sendWithBackpressure(ctx context.Context, endpoint multilane.Endpoint, class multilane.TrafficClass, data []byte) error {
+	for endpoint.BufferedAmount() > maxBuffer {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			time.Sleep(sleepInterval)
+		case <-time.After(sleepInterval):
 		}
 	}
-	return m.dc.SendBinary(data)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return endpoint.SendBinaryClass(class, data)
 }
 
-func (m *Manager) sendError(message string) {
+func (m *Manager) sendInteractiveMedia(ctx context.Context, operation uint64, data []byte) error {
+	for m.media.BufferedAmount() > maxBuffer {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleepInterval):
+		}
+	}
+
+	// Serialize the final active-operation check with beginMedia. A replaced
+	// stream either finishes this frame before the replacement header or is
+	// rejected here, so stale bytes cannot follow a replacement lifecycle.
+	m.mediaMu.Lock()
+	defer m.mediaMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.mediaOperation.Load() != operation {
+		return context.Canceled
+	}
+	return m.media.SendBinaryClass(multilane.ClassInteractiveMedia, data)
+}
+
+func (m *Manager) sendError(scope, requestID, message string) {
 	errMsg := struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
+		Type      string `json:"type"`
+		Scope     string `json:"scope"`
+		RequestID string `json:"request_id,omitempty"`
+		Message   string `json:"message"`
 	}{
-		Type:    "error",
-		Message: message,
+		Type:      "error",
+		Scope:     scope,
+		RequestID: requestID,
+		Message:   message,
 	}
 	data, _ := json.Marshal(errMsg)
-	m.dc.SendText(string(data))
+	_ = m.control.SendText(string(data))
 }
 
 // SetDownloadCount initializes the download counter from persisted state.
