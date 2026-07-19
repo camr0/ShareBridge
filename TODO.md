@@ -11,3 +11,14 @@
 ## Signaling server delivery
 
 - Add a private GHCR build and Komodo deployment workflow for the signaling server, following the agent image pattern.
+
+## Website
+
+- Reuse the revised [three-lane transport diagram](docs/diagrams/multilane-transport.html) on the ShareBridge website when documenting direct and relay media/download concurrency.
+
+## Transfer roadmap
+
+- After multi-lane transport, add Immich `Download All` by relaying Immich's ordered `/api/download/info` and `/api/download/archive` ZIP flow. Count a successful multi-part album batch as one ShareBridge download.
+- Add a serial browser download-job queue so user requests made during an active download wait in order instead of being rejected.
+- Design parallel bulk downloads later using transfer IDs and a higher bulk concurrency limit.
+- Revisit WebTransport as a relay adapter behind the three-lane API once its browser and deployment ecosystem is mature enough; retain WebRTC for direct peer-to-peer sessions.
