@@ -28,17 +28,40 @@
           />
         </label>
 
-        <label>
-          <input data-testid="relay-only-input" v-model="form.relayOnly" type="checkbox" />
-          Relay mode only
-        </label>
+        <fieldset class="sb-connection-mode">
+          <legend>Connection Mode</legend>
 
-        <div
-          v-if="form.relayOnly && !turnAvailable"
-          data-testid="turn-warning"
-          class="sb-warning"
-        >
-          Warning: Relay mode requires a TURN server. Shares may not connect without one.
+          <label data-testid="relay-option" class="sb-mode-option">
+            <input
+              data-testid="mode-relay"
+              type="radio"
+              name="connection-mode"
+              :checked="form.relayOnly"
+              @change="form.relayOnly = true"
+            />
+            <span>
+              <strong>Relay (recommended)</strong>
+              <span>End-to-end encrypted, hides your IP, and provides consistent performance</span>
+            </span>
+          </label>
+
+          <label data-testid="direct-option" class="sb-mode-option">
+            <input
+              data-testid="mode-direct"
+              type="radio"
+              name="connection-mode"
+              :checked="!form.relayOnly"
+              @change="form.relayOnly = false"
+            />
+            <span>
+              <strong>Direct</strong>
+              <span>Peer-to-peer, quota-free</span>
+            </span>
+          </label>
+        </fieldset>
+
+        <div v-if="!form.relayOnly" data-testid="direct-advisory" class="sb-warning">
+          Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.
         </div>
 
         <div v-if="error" data-testid="error-msg" class="sb-error">{{ error }}</div>
@@ -65,13 +88,15 @@ import type { CreateShareResult } from '../types'
 
 const PRESET_EXPIRY_OPTIONS = [1, 6, 12, 24, 72, 168, 720] // hours: 1h, 6h, 12h, 24h, 3d, 7d, 30d (matches agent UI)
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   resource: Resource
   turnAvailable?: boolean
   defaultExpiryHours?: number
   defaultMaxDownloads?: number
   defaultRelayOnly?: boolean
-}>()
+}>(), {
+  defaultRelayOnly: undefined,
+})
 const emit = defineEmits<{
   close: []
   created: [result: CreateShareResult]
@@ -86,7 +111,7 @@ const form = reactive({
   expiryHours: props.defaultExpiryHours ?? 24,
   password: '',
   maxDownloads: props.defaultMaxDownloads ?? 0,
-  relayOnly: props.defaultRelayOnly ?? false,
+  relayOnly: props.defaultRelayOnly ?? true,
 })
 
 // Include agent default in expiry options if it's not a preset
@@ -176,7 +201,7 @@ const submit = async () => {
 
 </script>
 
-<style>
+<style scoped>
 .sb-modal-overlay {
   position: fixed;
   inset: 0;
@@ -212,6 +237,32 @@ const submit = async () => {
   border: 1px solid var(--oc-color-border, #555);
   background: var(--oc-color-background-muted, #2a2a2a);
   color: var(--oc-color-text-default, #fff);
+}
+.sb-connection-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.sb-connection-mode legend {
+  margin-bottom: 4px;
+  font-size: 0.9em;
+}
+.sb-modal .sb-mode-option {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+.sb-mode-option input {
+  margin: 3px 0 0;
+}
+.sb-mode-option span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .sb-warning {
   background: rgba(255, 180, 0, 0.15);

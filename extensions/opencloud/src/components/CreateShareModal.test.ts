@@ -48,35 +48,34 @@ describe('CreateShareModal', () => {
 
   // Helper to find teleported elements
   const findEl = (testId: string) => document.querySelector(`[data-testid="${testId}"]`)
-  const findEls = (testId: string) => document.querySelectorAll(`[data-testid="${testId}"]`)
 
   it('renders TTL selector with default from props', () => {
-    const wrapper = mountModal({ defaultExpiryHours: 168 })
+    mountModal({ defaultExpiryHours: 168 })
     const select = findEl('expiry-select') as HTMLSelectElement
     expect(select).toBeTruthy()
     expect(select?.value).toBe('168')
   })
 
   it('falls back to 24h expiry when no default prop provided', () => {
-    const wrapper = mountModal()
+    mountModal()
     const select = findEl('expiry-select') as HTMLSelectElement
     expect(select?.value).toBe('24')
   })
 
   it('renders password field', () => {
-    const wrapper = mountModal()
+    mountModal()
     expect(findEl('password-input')).toBeTruthy()
   })
 
   it('renders max downloads field with default from props', () => {
-    const wrapper = mountModal({ defaultMaxDownloads: 10 })
+    mountModal({ defaultMaxDownloads: 10 })
     const input = findEl('max-downloads-input') as HTMLInputElement
     expect(input).toBeTruthy()
     expect(input?.value).toBe('10')
   })
 
   it('falls back to 0 max downloads when no default prop provided', () => {
-    const wrapper = mountModal()
+    mountModal()
     const input = findEl('max-downloads-input') as HTMLInputElement
     expect(input?.value).toBe('0')
   })
@@ -107,7 +106,7 @@ describe('CreateShareModal', () => {
       expect.objectContaining({ type: 'view' })
     )
     expect(mockCreateShare).toHaveBeenCalledWith(
-      expect.objectContaining({ share_url: shareUrl })
+      expect.objectContaining({ share_url: shareUrl, relay_only: true })
     )
   })
 
@@ -153,32 +152,48 @@ describe('CreateShareModal', () => {
     expect(errorMsg?.textContent).toContain('Failed to create ShareBridge share')
   })
 
-  it('shows TURN warning when relay-only checked and turnAvailable is false', async () => {
-    const wrapper = mountModal({ turnAvailable: false })
-    const checkbox = findEl('relay-only-input') as HTMLInputElement
-    checkbox?.click()
-    await wrapper.vm.$nextTick()
-    expect(findEl('turn-warning')).toBeTruthy()
-  })
-
-  it('hides TURN warning when turnAvailable is true', async () => {
-    const wrapper = mountModal({ turnAvailable: true })
-    const checkbox = findEl('relay-only-input') as HTMLInputElement
-    checkbox?.click()
-    await wrapper.vm.$nextTick()
-    expect(findEl('turn-warning')).toBeFalsy()
-  })
-
-  it('renders relay-only checkbox with default from props', () => {
-    const wrapper = mountModal({ defaultRelayOnly: true })
-    const checkbox = findEl('relay-only-input') as HTMLInputElement
-    expect(checkbox?.checked).toBe(true)
-  })
-
-  it('falls back to relay-only unchecked when no default prop provided', () => {
+  it('renders explicit Relay and Direct choices in recommended order without TURN copy', () => {
     const wrapper = mountModal()
-    const checkbox = findEl('relay-only-input') as HTMLInputElement
-    expect(checkbox?.checked).toBe(false)
+    const options = Array.from(document.querySelectorAll('[data-testid$="-option"]'))
+
+    expect(options.map(option => option.getAttribute('data-testid'))).toEqual([
+      'relay-option',
+      'direct-option',
+    ])
+    expect(findEl('relay-option')?.textContent).toContain('Relay (recommended)')
+    expect(findEl('relay-option')?.textContent).toContain(
+      'End-to-end encrypted, hides your IP, and provides consistent performance'
+    )
+    expect(findEl('direct-option')?.textContent).toContain('Direct')
+    expect(findEl('direct-option')?.textContent).toContain('Peer-to-peer, quota-free')
+    expect(document.body.textContent).not.toContain('TURN')
+    wrapper.unmount()
+  })
+
+  it('selects Relay when defaultRelayOnly is omitted', () => {
+    const wrapper = mountModal()
+    expect((findEl('mode-relay') as HTMLInputElement)?.checked).toBe(true)
+    expect((findEl('mode-direct') as HTMLInputElement)?.checked).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('shows the Direct advisory only when Direct is selected', async () => {
+    const wrapper = mountModal()
+    expect(findEl('direct-advisory')).toBeFalsy()
+
+    const directRadio = findEl('mode-direct') as HTMLInputElement
+    directRadio.click()
+    await wrapper.vm.$nextTick()
+
+    expect(findEl('direct-advisory')?.textContent?.trim()).toBe(
+      'Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.'
+    )
+  })
+
+  it('selects Direct when defaultRelayOnly is explicitly false', () => {
+    mountModal({ defaultRelayOnly: false })
+    expect((findEl('mode-relay') as HTMLInputElement)?.checked).toBe(false)
+    expect((findEl('mode-direct') as HTMLInputElement)?.checked).toBe(true)
   })
 
   it('includes custom expiry option when default is not a preset', async () => {
