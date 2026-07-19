@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +88,7 @@ type Manager struct {
 	operationSequence atomic.Uint64
 	mediaOperation    atomic.Uint64
 	bulkOperation     atomic.Uint64
+	bulkMu            sync.Mutex
 	currentGeneration atomic.Uint32
 
 	OnSessionExpired   func()
@@ -142,6 +144,7 @@ func (m *Manager) HandleMessage(data []byte) {
 		StartOffset int64  `json:"start_offset"`
 		Generation  int    `json:"generation"`
 		RequestID   string `json:"request_id"`
+		OperationID string `json:"operation_id"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		m.sendError("connection", "", "invalid message format")
@@ -158,7 +161,16 @@ func (m *Manager) HandleMessage(data []byte) {
 	case "asset_preview_request":
 		m.handleAssetPreviewRequest(msg.ID, msg.Quality, msg.Generation, msg.RequestID)
 	case "asset_preview_seek":
-		m.handleAssetPreviewSeek(msg.ID, msg.Quality, msg.StartOffset, msg.Generation, msg.RequestID)
+		if msg.OperationID == "" {
+			m.sendError("media", msg.RequestID, "asset_preview_seek: operation_id required")
+			return
+		}
+		parentOperation, err := strconv.ParseUint(msg.OperationID, 10, 64)
+		if err != nil || parentOperation == 0 {
+			m.sendError("media", msg.RequestID, "asset_preview_seek: invalid operation_id")
+			return
+		}
+		m.handleAssetPreviewSeek(msg.ID, msg.Quality, msg.StartOffset, msg.Generation, msg.RequestID, parentOperation)
 	default:
 		m.sendError("connection", msg.RequestID, "unknown message type: "+msg.Type)
 	}
@@ -337,15 +349,15 @@ func (m *Manager) handleFileRequest(filePath, requestID string) {
 	}
 
 	if m.client == nil {
+		m.sendBulkErrorIfActive(operationID, requestID, "share unavailable: client not initialized")
 		m.releaseBulk(operationID)
-		m.sendError("bulk", requestID, "share unavailable: client not initialized")
 		return
 	}
 
 	files, err := m.client.ListFiles(dir)
 	if err != nil {
+		m.sendBulkErrorIfActive(operationID, requestID, "share unavailable")
 		m.releaseBulk(operationID)
-		m.sendError("bulk", requestID, "share unavailable")
 		return
 	}
 
@@ -358,8 +370,8 @@ func (m *Manager) handleFileRequest(filePath, requestID string) {
 		}
 	}
 	if fileInfo == nil {
+		m.sendBulkErrorIfActive(operationID, requestID, "file not found: "+name)
 		m.releaseBulk(operationID)
-		m.sendError("bulk", requestID, "file not found: "+name)
 		return
 	}
 
@@ -379,7 +391,7 @@ func (m *Manager) handleFileRequest(filePath, requestID string) {
 		BinaryEnvelope bool   `json:"binary_envelope"`
 		Scope          string `json:"scope"`
 		RequestID      string `json:"request_id,omitempty"`
-		OperationID    uint64 `json:"operation_id"`
+		OperationID    string `json:"operation_id"`
 	}{
 		Type:           "file_header",
 		Name:           fileInfo.Name,
@@ -389,7 +401,7 @@ func (m *Manager) handleFileRequest(filePath, requestID string) {
 		BinaryEnvelope: true,
 		Scope:          "bulk",
 		RequestID:      requestID,
-		OperationID:    operationID,
+		OperationID:    operationIDString(operationID),
 	}
 	headerData, _ := json.Marshal(header)
 	if err := m.control.SendText(string(headerData)); err != nil {
@@ -427,15 +439,15 @@ func (m *Manager) handleAssetRequest(id string, quality string, requestID string
 	}
 
 	if m.gallery == nil {
+		m.sendBulkErrorIfActive(operationID, requestID, "share unavailable: client not initialized")
 		m.releaseBulk(operationID)
-		m.sendError("bulk", requestID, "share unavailable: client not initialized")
 		return
 	}
 
 	assetName, assetSize, assetMimeType, err := m.gallery.GetAssetInfo(context.Background(), id)
 	if err != nil {
+		m.sendBulkErrorIfActive(operationID, requestID, "asset info unavailable: "+err.Error())
 		m.releaseBulk(operationID)
-		m.sendError("bulk", requestID, "asset info unavailable: "+err.Error())
 		log.Printf("transfer: GetAssetInfo failed id=%s: %v", id, err)
 		return
 	}
@@ -449,7 +461,7 @@ func (m *Manager) handleAssetRequest(id string, quality string, requestID string
 		BinaryEnvelope bool   `json:"binary_envelope"`
 		Scope          string `json:"scope"`
 		RequestID      string `json:"request_id,omitempty"`
-		OperationID    uint64 `json:"operation_id"`
+		OperationID    string `json:"operation_id"`
 	}{
 		Type:           "file_header",
 		Name:           assetName,
@@ -459,7 +471,7 @@ func (m *Manager) handleAssetRequest(id string, quality string, requestID string
 		BinaryEnvelope: true,
 		Scope:          "bulk",
 		RequestID:      requestID,
-		OperationID:    operationID,
+		OperationID:    operationIDString(operationID),
 	}
 	headerData, _ := json.Marshal(header)
 	if err := m.control.SendText(string(headerData)); err != nil {
@@ -530,7 +542,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 			ByteOffset     int64  `json:"byte_offset"`
 			Scope          string `json:"scope"`
 			RequestID      string `json:"request_id,omitempty"`
-			OperationID    uint64 `json:"operation_id"`
+			OperationID    string `json:"operation_id"`
 		}{
 			Type:           "asset_preview_header",
 			ID:             id,
@@ -541,7 +553,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 			ByteOffset:     0,
 			Scope:          "media",
 			RequestID:      requestID,
-			OperationID:    mediaOperation,
+			OperationID:    operationIDString(mediaOperation),
 		}
 		headerData, _ := json.Marshal(header)
 		if err := m.sendMediaControlIfCurrent(mediaOperation, string(headerData)); err != nil {
@@ -564,7 +576,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 		BinaryEnvelope bool   `json:"binary_envelope"`
 		Scope          string `json:"scope"`
 		RequestID      string `json:"request_id,omitempty"`
-		OperationID    uint64 `json:"operation_id"`
+		OperationID    string `json:"operation_id"`
 	}{
 		Type:           "asset_preview_header",
 		ID:             id,
@@ -573,7 +585,7 @@ func (m *Manager) handleAssetPreviewRequest(id string, quality string, generatio
 		BinaryEnvelope: true,
 		Scope:          "media",
 		RequestID:      requestID,
-		OperationID:    mediaOperation,
+		OperationID:    operationIDString(mediaOperation),
 	}
 	headerData, _ := json.Marshal(header)
 	if err := m.sendMediaControlIfCurrent(mediaOperation, string(headerData)); err != nil {
@@ -611,7 +623,7 @@ func (m *Manager) streamFile(filePath, requestID string, operationID uint64) {
 		if err != nil {
 			if err != io.EOF {
 				transferErr = err
-				m.sendError("bulk", requestID, "transfer failed: "+err.Error())
+				m.sendBulkErrorIfActive(operationID, requestID, "transfer failed: "+err.Error())
 			}
 			break
 		}
@@ -625,8 +637,8 @@ func (m *Manager) streamFile(filePath, requestID string, operationID uint64) {
 		Type        string `json:"type"`
 		Scope       string `json:"scope"`
 		RequestID   string `json:"request_id,omitempty"`
-		OperationID uint64 `json:"operation_id"`
-	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationID}
+		OperationID string `json:"operation_id"`
+	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationIDString(operationID)}
 	endData, _ := json.Marshal(end)
 	if err := m.control.SendText(string(endData)); err != nil {
 		return
@@ -668,7 +680,7 @@ func (m *Manager) streamAsset(id string, quality string, requestID string, opera
 		if err != nil {
 			if err != io.EOF {
 				transferErr = err
-				m.sendError("bulk", requestID, "transfer failed: "+err.Error())
+				m.sendBulkErrorIfActive(operationID, requestID, "transfer failed: "+err.Error())
 			}
 			break
 		}
@@ -682,8 +694,8 @@ func (m *Manager) streamAsset(id string, quality string, requestID string, opera
 		Type        string `json:"type"`
 		Scope       string `json:"scope"`
 		RequestID   string `json:"request_id,omitempty"`
-		OperationID uint64 `json:"operation_id"`
-	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationID}
+		OperationID string `json:"operation_id"`
+	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationIDString(operationID)}
 	endData, _ := json.Marshal(end)
 	if err := m.control.SendText(string(endData)); err != nil {
 		return
@@ -695,27 +707,30 @@ func (m *Manager) streamAsset(id string, quality string, requestID string, opera
 	}
 }
 
-func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset int64, generation int, requestID string) {
+func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset int64, generation int, requestID string, parentOperation uint64) {
 	log.Printf("transfer: asset_preview_seek id=%s start_offset=%d generation=%d", id, startOffset, generation)
 	if id == "" || quality == "" {
-		m.sendError("media", requestID, "asset_preview_seek: id and quality required")
+		m.sendMediaErrorIfActive(parentOperation, requestID, "asset_preview_seek: id and quality required")
 		return
 	}
 	if startOffset < 0 {
-		m.sendError("media", requestID, "asset_preview_seek: start_offset must be >= 0")
+		m.sendMediaErrorIfActive(parentOperation, requestID, "asset_preview_seek: start_offset must be >= 0")
 		return
 	}
 	normalizedQuality, ok := normalizePreviewQuality(quality)
 	if !ok || normalizedQuality != "video" {
-		m.sendError("media", requestID, "asset_preview_seek: video quality required")
+		m.sendMediaErrorIfActive(parentOperation, requestID, "asset_preview_seek: video quality required")
 		return
 	}
 	if generation <= 0 || uint64(generation) > uint64(^uint32(0)) {
-		m.sendError("media", requestID, "asset_preview_seek: generation out of range")
+		m.sendMediaErrorIfActive(parentOperation, requestID, "asset_preview_seek: generation out of range")
 		return
 	}
 	if m.gallery == nil {
-		m.sendError("media", requestID, "share unavailable: client not initialized")
+		m.sendMediaErrorIfActive(parentOperation, requestID, "share unavailable: client not initialized")
+		return
+	}
+	if !m.isCurrentMediaOperation(parentOperation, id, normalizedQuality) {
 		return
 	}
 
@@ -734,13 +749,13 @@ func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset 
 	if readErr != nil {
 		pr.Close()
 		log.Printf("transfer: seek validation failed id=%s start_offset=%d: %v", id, startOffset, readErr)
-		m.sendError("media", requestID, "preview seek failed: "+readErr.Error())
+		m.sendMediaErrorIfActive(parentOperation, requestID, "preview seek failed: "+readErr.Error())
 		return
 	}
 
 	// Validation succeeded. Atomically accept only a strictly newer generation;
 	// a delayed older seek is stale and must not replace the active media stream.
-	ctx, mediaOperation, accepted := m.beginMediaIfNewer(id, normalizedQuality, uint32(generation))
+	ctx, mediaOperation, accepted := m.beginMediaIfNewer(parentOperation, id, normalizedQuality, uint32(generation))
 	if !accepted {
 		_ = pr.Close()
 		return
@@ -757,7 +772,7 @@ func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset 
 		ByteOffset     int64  `json:"byte_offset"`
 		Scope          string `json:"scope"`
 		RequestID      string `json:"request_id,omitempty"`
-		OperationID    uint64 `json:"operation_id"`
+		OperationID    string `json:"operation_id"`
 	}{
 		Type:           "asset_preview_header",
 		ID:             id,
@@ -767,7 +782,7 @@ func (m *Manager) handleAssetPreviewSeek(id string, quality string, startOffset 
 		ByteOffset:     startOffset,
 		Scope:          "media",
 		RequestID:      requestID,
-		OperationID:    mediaOperation,
+		OperationID:    operationIDString(mediaOperation),
 	}
 	headerData, _ := json.Marshal(header)
 	if err := m.sendMediaControlIfCurrent(mediaOperation, string(headerData)); err != nil {
@@ -842,7 +857,7 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 				transferErr = err
 				log.Printf("transfer: preview read failed generation=%d bytes=%d: %v", generation, totalBytes, err)
 				if ctx.Err() == nil {
-					m.sendError("media", requestID, "preview failed: "+err.Error())
+					m.sendMediaErrorIfActive(mediaOperation, requestID, "preview failed: "+err.Error())
 				}
 			}
 			break
@@ -862,8 +877,8 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 			Generation  int    `json:"generation"`
 			Scope       string `json:"scope"`
 			RequestID   string `json:"request_id,omitempty"`
-			OperationID uint64 `json:"operation_id"`
-		}{Type: "asset_preview_end", ID: id, Generation: int(generation), Scope: "media", RequestID: requestID, OperationID: mediaOperation}
+			OperationID string `json:"operation_id"`
+		}{Type: "asset_preview_end", ID: id, Generation: int(generation), Scope: "media", RequestID: requestID, OperationID: operationIDString(mediaOperation)}
 		endData, _ := json.Marshal(end)
 		_ = m.sendMediaControlIfCurrent(mediaOperation, string(endData))
 	}
@@ -943,19 +958,25 @@ func normalizePreviewQuality(quality string) (string, bool) {
 }
 
 func (m *Manager) acquireBulk(requestID string) (uint64, bool) {
-	if !m.bulkTransfer.CompareAndSwap(false, true) {
-		m.sendError("bulk", requestID, "transfer in progress")
+	m.bulkMu.Lock()
+	defer m.bulkMu.Unlock()
+	if m.bulkTransfer.Load() {
+		m.sendOperationError("bulk", requestID, m.bulkOperation.Load(), "transfer in progress")
 		return 0, false
 	}
-	operation := m.operationSequence.Add(1)
+	operation := m.nextOperationID()
 	m.bulkOperation.Store(operation)
+	m.bulkTransfer.Store(true)
 	return operation, true
 }
 
 func (m *Manager) releaseBulk(operation uint64) {
-	if m.bulkOperation.CompareAndSwap(operation, 0) {
+	m.bulkMu.Lock()
+	if m.bulkOperation.Load() == operation {
+		m.bulkOperation.Store(0)
 		m.bulkTransfer.Store(false)
 	}
+	m.bulkMu.Unlock()
 }
 
 func (m *Manager) beginMedia(id, quality string, generation uint32) (context.Context, uint64) {
@@ -965,14 +986,20 @@ func (m *Manager) beginMedia(id, quality string, generation uint32) (context.Con
 	return ctx, operation
 }
 
-func (m *Manager) beginMediaIfNewer(id, quality string, generation uint32) (context.Context, uint64, bool) {
+func (m *Manager) beginMediaIfNewer(parentOperation uint64, id, quality string, generation uint32) (context.Context, uint64, bool) {
 	m.mediaMu.Lock()
 	defer m.mediaMu.Unlock()
-	if m.mediaID != id || m.mediaQuality != "video" || quality != "video" || generation <= m.currentGeneration.Load() {
+	if m.mediaOperation.Load() != parentOperation || m.mediaID != id || m.mediaQuality != "video" || quality != "video" || generation <= m.currentGeneration.Load() {
 		return nil, 0, false
 	}
 	ctx, operation := m.beginMediaLocked(id, quality, generation)
 	return ctx, operation, true
+}
+
+func (m *Manager) isCurrentMediaOperation(operation uint64, id, quality string) bool {
+	m.mediaMu.Lock()
+	defer m.mediaMu.Unlock()
+	return operation != 0 && m.mediaOperation.Load() == operation && m.mediaID == id && m.mediaQuality == quality
 }
 
 func (m *Manager) beginMediaLocked(id, quality string, generation uint32) (context.Context, uint64) {
@@ -981,13 +1008,25 @@ func (m *Manager) beginMediaLocked(id, quality string, generation uint32) (conte
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.mediaCancel = cancel
-	operation := m.operationSequence.Add(1)
+	operation := m.nextOperationID()
 	m.mediaOperation.Store(operation)
 	m.mediaID = id
 	m.mediaQuality = quality
 	m.currentGeneration.Store(generation)
 	m.mediaTransfer.Store(true)
 	return ctx, operation
+}
+
+func (m *Manager) nextOperationID() uint64 {
+	for {
+		if operation := m.operationSequence.Add(1); operation != 0 {
+			return operation
+		}
+	}
+}
+
+func operationIDString(operation uint64) string {
+	return strconv.FormatUint(operation, 10)
 }
 
 func (m *Manager) finishMedia(operation uint64) {
@@ -1049,6 +1088,45 @@ func (m *Manager) sendMediaControlIfCurrent(operation uint64, text string) error
 		return context.Canceled
 	}
 	return m.control.SendText(text)
+}
+
+func (m *Manager) sendMediaErrorIfActive(operation uint64, requestID, message string) {
+	m.mediaMu.Lock()
+	defer m.mediaMu.Unlock()
+	if m.mediaOperation.Load() != operation {
+		return
+	}
+	m.sendOperationError("media", requestID, operation, message)
+}
+
+func (m *Manager) sendBulkErrorIfActive(operation uint64, requestID, message string) {
+	m.bulkMu.Lock()
+	defer m.bulkMu.Unlock()
+	if m.bulkOperation.Load() != operation || !m.bulkTransfer.Load() {
+		return
+	}
+	m.sendOperationError("bulk", requestID, operation, message)
+}
+
+func (m *Manager) sendOperationError(scope, requestID string, operation uint64, message string) {
+	if operation == 0 {
+		return
+	}
+	errMsg := struct {
+		Type        string `json:"type"`
+		Scope       string `json:"scope"`
+		RequestID   string `json:"request_id,omitempty"`
+		OperationID string `json:"operation_id"`
+		Message     string `json:"message"`
+	}{
+		Type:        "error",
+		Scope:       scope,
+		RequestID:   requestID,
+		OperationID: operationIDString(operation),
+		Message:     message,
+	}
+	data, _ := json.Marshal(errMsg)
+	_ = m.control.SendText(string(data))
 }
 
 func (m *Manager) sendError(scope, requestID, message string) {

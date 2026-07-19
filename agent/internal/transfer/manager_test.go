@@ -223,6 +223,22 @@ func (m *mockDC) errorFieldsContaining(substr string) (scope, requestID string, 
 	return "", "", false
 }
 
+func (m *mockDC) operationErrorFieldsContaining(substr string) (scope, requestID, operationID string, ok bool) {
+	for _, msg := range m.textSnapshot() {
+		var parsed struct {
+			Type        string `json:"type"`
+			Scope       string `json:"scope"`
+			RequestID   string `json:"request_id"`
+			OperationID string `json:"operation_id"`
+			Message     string `json:"message"`
+		}
+		if json.Unmarshal([]byte(msg), &parsed) == nil && parsed.Type == "error" && strings.Contains(parsed.Message, substr) {
+			return parsed.Scope, parsed.RequestID, parsed.OperationID, true
+		}
+	}
+	return "", "", "", false
+}
+
 func (m *mockDC) hasErrorContaining(substr string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -543,6 +559,38 @@ type outOfOrderGalleryClient struct {
 	oldInfoRelease chan struct{}
 	oldSeekStarted chan struct{}
 	oldSeekRelease chan struct{}
+	oldSeekErr     error
+}
+
+type previewErrorAfterCancelClient struct {
+	firstStarted chan struct{}
+	firstRelease chan struct{}
+}
+
+func (m *previewErrorAfterCancelClient) ListGallery(context.Context) (Gallery, error) {
+	return Gallery{}, nil
+}
+func (m *previewErrorAfterCancelClient) GetThumbnail(context.Context, string, io.Writer) (int64, error) {
+	return 0, nil
+}
+func (m *previewErrorAfterCancelClient) GetAssetInfo(context.Context, string) (string, int64, string, error) {
+	return "preview.jpg", 3, "image/jpeg", nil
+}
+func (m *previewErrorAfterCancelClient) HeadVideoPlayback(context.Context, string) (int64, error) {
+	return 3, nil
+}
+func (m *previewErrorAfterCancelClient) GetAsset(ctx context.Context, id, _ string, w io.Writer) (int64, error) {
+	if id == "first" {
+		close(m.firstStarted)
+		<-ctx.Done()
+		<-m.firstRelease
+		return 0, io.ErrUnexpectedEOF
+	}
+	n, err := w.Write([]byte("new"))
+	return int64(n), err
+}
+func (m *previewErrorAfterCancelClient) GetAssetRange(context.Context, string, string, int64, io.Writer) (int64, error) {
+	return 0, nil
 }
 
 func (m *outOfOrderGalleryClient) ListGallery(context.Context) (Gallery, error) {
@@ -569,6 +617,9 @@ func (m *outOfOrderGalleryClient) GetAssetRange(_ context.Context, _ string, _ s
 	if start == 20 {
 		close(m.oldSeekStarted)
 		<-m.oldSeekRelease
+		if m.oldSeekErr != nil {
+			return 0, m.oldSeekErr
+		}
 	}
 	n, err := w.Write([]byte{byte(start)})
 	return int64(n), err
@@ -595,6 +646,193 @@ func TestChunkEnvelopeFixtureRoundTripsOperationAndGeneration(t *testing.T) {
 	newerOperation, _, _, err := decodeChunkFrame(newer)
 	require.NoError(t, err)
 	require.Equal(t, uint64(0x0102030405060709), newerOperation)
+}
+
+func TestOperationIDJSONUsesExactDecimalString(t *testing.T) {
+	const maxOperationID = ^uint64(0)
+	require.Equal(t, "18446744073709551615", operationIDString(maxOperationID))
+
+	encoded, err := json.Marshal(struct {
+		OperationID string `json:"operation_id"`
+	}{OperationID: operationIDString(maxOperationID)})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"operation_id":"18446744073709551615"}`, string(encoded))
+
+	manager := &Manager{}
+	manager.operationSequence.Store(maxOperationID)
+	require.Equal(t, uint64(1), manager.nextOperationID(), "zero remains reserved across counter wrap")
+}
+
+func TestDelayedSeekFromOldOperationCannotReplaceReopenedSameVideo(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &outOfOrderGalleryClient{
+		oldInfoStarted: make(chan struct{}), oldInfoRelease: make(chan struct{}),
+		oldSeekStarted: make(chan struct{}), oldSeekRelease: make(chan struct{}),
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	openVideo, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "video", "quality": "video", "generation": 1,
+	})
+	manager.HandleMessage(openVideo)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
+	firstOperation := operationIDFromText(t, channels.control.getTextByType("asset_preview_header"))
+
+	oldSeek, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 20,
+		"generation": 100, "operation_id": firstOperation,
+	})
+	go manager.HandleMessage(oldSeek)
+	select {
+	case <-client.oldSeekStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old seek validation did not start")
+	}
+
+	manager.HandleMessage(openVideo)
+	require.Eventually(t, func() bool { return channels.control.countTextType("asset_preview_header") == 2 }, time.Second, time.Millisecond)
+	var operations []string
+	for _, message := range channels.control.textSnapshot() {
+		var header struct {
+			Type        string `json:"type"`
+			OperationID string `json:"operation_id"`
+		}
+		_ = json.Unmarshal([]byte(message), &header)
+		if header.Type == "asset_preview_header" {
+			operations = append(operations, header.OperationID)
+		}
+	}
+	require.Len(t, operations, 2)
+	require.NotEqual(t, operations[0], operations[1])
+	currentOperation := operations[1]
+	close(client.oldSeekRelease)
+	require.Never(t, func() bool { return channels.control.countTextType("asset_preview_header") > 2 }, 100*time.Millisecond, time.Millisecond)
+	require.Equal(t, currentOperation, operationIDString(manager.mediaOperation.Load()))
+}
+
+func TestSeekRequiresCurrentParentOperationID(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:  Gallery{Items: []GalleryItem{{ID: "video", Name: "video.mp4", Size: 5, MimeType: "video/mp4"}}},
+		file:     []byte("video"),
+		headSize: 5,
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	openVideo, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "video", "quality": "video", "generation": 1,
+	})
+	manager.HandleMessage(openVideo)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
+	currentOperation := operationIDFromText(t, channels.control.getTextByType("asset_preview_header"))
+	currentHeaders := channels.control.countTextType("asset_preview_header")
+	invalidOffset, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": -1,
+		"generation": 2, "operation_id": currentOperation,
+	})
+	manager.HandleMessage(invalidOffset)
+	scope, requestID, errorOperation, ok := channels.control.operationErrorFieldsContaining("start_offset")
+	require.True(t, ok)
+	require.Equal(t, "media", scope)
+	require.Empty(t, requestID)
+	require.Equal(t, currentOperation, errorOperation)
+
+	missing, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 1, "generation": 2,
+	})
+	manager.HandleMessage(missing)
+	scope, _, ok = channels.control.errorFieldsContaining("operation_id required")
+	require.True(t, ok)
+	require.Equal(t, "media", scope)
+
+	mismatched, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 1,
+		"generation": 3, "operation_id": "999999",
+	})
+	manager.HandleMessage(mismatched)
+	require.Equal(t, currentHeaders, channels.control.countTextType("asset_preview_header"))
+	require.Equal(t, currentOperation, operationIDString(manager.mediaOperation.Load()))
+}
+
+func TestAcceptedSeekRotatesOperationAndNextSeekReferencesIt(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:  Gallery{Items: []GalleryItem{{ID: "video", Name: "video.mp4", Size: 5, MimeType: "video/mp4"}}},
+		file:     []byte("video"),
+		headSize: 5,
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	openVideo, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "video", "quality": "video", "generation": 1,
+	})
+	manager.HandleMessage(openVideo)
+	require.Eventually(t, func() bool { return channels.control.countTextType("asset_preview_end") == 1 }, time.Second, time.Millisecond)
+	parent := lastOperationIDForType(t, channels.control, "asset_preview_header")
+
+	firstSeek, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 1,
+		"generation": 2, "operation_id": parent,
+	})
+	manager.HandleMessage(firstSeek)
+	require.Eventually(t, func() bool { return channels.control.countTextType("asset_preview_end") == 2 }, time.Second, time.Millisecond)
+	firstSeekOperation := lastOperationIDForType(t, channels.control, "asset_preview_header")
+	require.NotEqual(t, parent, firstSeekOperation)
+	require.Equal(t, firstSeekOperation, lastOperationIDForType(t, channels.control, "asset_preview_end"))
+
+	secondSeek, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 2,
+		"generation": 3, "operation_id": firstSeekOperation,
+	})
+	manager.HandleMessage(secondSeek)
+	require.Eventually(t, func() bool { return channels.control.countTextType("asset_preview_end") == 3 }, time.Second, time.Millisecond)
+	secondSeekOperation := lastOperationIDForType(t, channels.control, "asset_preview_header")
+	require.NotEqual(t, firstSeekOperation, secondSeekOperation)
+	require.Equal(t, secondSeekOperation, lastOperationIDForType(t, channels.control, "asset_preview_end"))
+}
+
+func TestDelayedSeekValidationErrorIsSuppressedAfterReplacement(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &outOfOrderGalleryClient{
+		oldInfoStarted: make(chan struct{}), oldInfoRelease: make(chan struct{}),
+		oldSeekStarted: make(chan struct{}), oldSeekRelease: make(chan struct{}),
+		oldSeekErr: io.ErrUnexpectedEOF,
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	openVideo, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "video", "quality": "video", "generation": 1,
+	})
+	manager.HandleMessage(openVideo)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
+	oldOperation := operationIDFromText(t, channels.control.getTextByType("asset_preview_header"))
+	seek, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 20,
+		"generation": 2, "operation_id": oldOperation,
+	})
+	go manager.HandleMessage(seek)
+	select {
+	case <-client.oldSeekStarted:
+	case <-time.After(time.Second):
+		t.Fatal("seek validation did not start")
+	}
+	manager.HandleMessage(openVideo)
+	close(client.oldSeekRelease)
+	require.Never(t, func() bool { return channels.control.hasErrorContaining("preview seek failed") }, 100*time.Millisecond, time.Millisecond)
+}
+
+func TestOldPreviewReadErrorIsSuppressedAfterReplacement(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &previewErrorAfterCancelClient{firstStarted: make(chan struct{}), firstRelease: make(chan struct{})}
+	manager := NewGalleryManager(channels, client, 0)
+	first, _ := json.Marshal(map[string]any{"type": "asset_preview_request", "id": "first", "quality": "preview"})
+	second, _ := json.Marshal(map[string]any{"type": "asset_preview_request", "id": "second", "quality": "preview"})
+	manager.HandleMessage(first)
+	select {
+	case <-client.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first preview did not start")
+	}
+	manager.HandleMessage(second)
+	close(client.firstRelease)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
+	require.Never(t, func() bool { return channels.control.hasErrorContaining("preview failed") }, 100*time.Millisecond, time.Millisecond)
 }
 
 func TestOlderPreviewMetadataCannotEmitHeaderAfterReplacement(t *testing.T) {
@@ -644,13 +882,14 @@ func TestDelayedOlderSeekCannotReplaceNewerGeneration(t *testing.T) {
 	manager.mediaMu.Lock()
 	manager.mediaID = "video"
 	manager.mediaQuality = "video"
+	manager.mediaOperation.Store(42)
 	manager.currentGeneration.Store(1)
 	manager.mediaMu.Unlock()
 	oldSeek, _ := json.Marshal(map[string]any{
-		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 20, "generation": 2, "request_id": "seek-2",
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 20, "generation": 2, "request_id": "seek-2", "operation_id": "42",
 	})
 	newSeek, _ := json.Marshal(map[string]any{
-		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 30, "generation": 3, "request_id": "seek-3",
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 30, "generation": 3, "request_id": "seek-3", "operation_id": "42",
 	})
 	go manager.HandleMessage(oldSeek)
 	select {
@@ -680,16 +919,17 @@ func TestVideoSeekUsesCorrelated64KiBPayloadChunks(t *testing.T) {
 	manager.mediaMu.Lock()
 	manager.mediaID = "video"
 	manager.mediaQuality = "video"
+	manager.mediaOperation.Store(42)
 	manager.currentGeneration.Store(1)
 	manager.mediaMu.Unlock()
 
 	seek, _ := json.Marshal(map[string]any{
-		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 0, "generation": 2,
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 0, "generation": 2, "operation_id": "42",
 	})
 	manager.HandleMessage(seek)
 	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
 	var header struct {
-		OperationID uint64 `json:"operation_id"`
+		OperationID string `json:"operation_id"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("asset_preview_header")), &header))
 	frames := channels.media.binarySnapshot()
@@ -698,7 +938,7 @@ func TestVideoSeekUsesCorrelated64KiBPayloadChunks(t *testing.T) {
 	for _, frame := range frames {
 		operationID, generation, payload, err := decodeChunkFrame(frame)
 		require.NoError(t, err)
-		require.Equal(t, header.OperationID, operationID)
+		require.Equal(t, header.OperationID, operationIDString(operationID))
 		require.Equal(t, uint32(2), generation)
 		require.LessOrEqual(t, len(payload), chunkSize)
 		totalPayload += len(payload)
@@ -810,18 +1050,18 @@ func TestFileShareRoutesControlAndBulkWhileMediaStaysIdle(t *testing.T) {
 	require.True(t, channels.control.hasTextType("file_header"))
 	require.True(t, channels.bulk.hasBinaryClass(multilane.ClassBulk))
 	require.Zero(t, channels.media.binaryCount())
-	var expectedOperation uint64
+	var expectedOperation string
 	for _, messageType := range []string{"file_header", "chunk_end"} {
 		var lifecycle struct {
 			Scope       string `json:"scope"`
 			RequestID   string `json:"request_id"`
-			OperationID uint64 `json:"operation_id"`
+			OperationID string `json:"operation_id"`
 		}
 		require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType(messageType)), &lifecycle))
 		require.Equal(t, "bulk", lifecycle.Scope)
 		require.Equal(t, "bulk-1", lifecycle.RequestID)
 		require.NotZero(t, lifecycle.OperationID)
-		if expectedOperation == 0 {
+		if expectedOperation == "" {
 			expectedOperation = lifecycle.OperationID
 		} else {
 			require.Equal(t, expectedOperation, lifecycle.OperationID)
@@ -829,7 +1069,7 @@ func TestFileShareRoutesControlAndBulkWhileMediaStaysIdle(t *testing.T) {
 	}
 	operationID, generation, payload, err := decodeChunkFrame(channels.bulk.binarySnapshot()[0])
 	require.NoError(t, err)
-	require.Equal(t, expectedOperation, operationID)
+	require.Equal(t, expectedOperation, operationIDString(operationID))
 	require.Zero(t, generation)
 	require.Equal(t, []byte("pdf"), payload)
 }
@@ -862,18 +1102,18 @@ func TestPreviewRoutesInteractiveBytesToMediaAndOriginalToBulk(t *testing.T) {
 	require.Eventually(t, func() bool { return channels.media.binaryCount() > 0 }, time.Second, time.Millisecond)
 	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
 	require.True(t, channels.media.hasBinaryClass(multilane.ClassInteractiveMedia))
-	var mediaOperation uint64
+	var mediaOperation string
 	for _, messageType := range []string{"asset_preview_header", "asset_preview_end"} {
 		var lifecycle struct {
 			Scope       string `json:"scope"`
 			RequestID   string `json:"request_id"`
-			OperationID uint64 `json:"operation_id"`
+			OperationID string `json:"operation_id"`
 		}
 		require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType(messageType)), &lifecycle))
 		require.Equal(t, "media", lifecycle.Scope)
 		require.Equal(t, "media-1", lifecycle.RequestID)
 		require.NotZero(t, lifecycle.OperationID)
-		if mediaOperation == 0 {
+		if mediaOperation == "" {
 			mediaOperation = lifecycle.OperationID
 		} else {
 			require.Equal(t, mediaOperation, lifecycle.OperationID)
@@ -881,7 +1121,7 @@ func TestPreviewRoutesInteractiveBytesToMediaAndOriginalToBulk(t *testing.T) {
 	}
 	frameOperation, generation, _, err := decodeChunkFrame(channels.media.binarySnapshot()[0])
 	require.NoError(t, err)
-	require.Equal(t, mediaOperation, frameOperation)
+	require.Equal(t, mediaOperation, operationIDString(frameOperation))
 	require.Zero(t, generation)
 
 	original, _ := json.Marshal(map[string]any{
@@ -1084,7 +1324,7 @@ func TestHandleAssetRequestStreamsByAssetID(t *testing.T) {
 	require.NotEmpty(t, channels.bulk.binarySnapshot())
 	require.True(t, dc.hasTextType("chunk_end"))
 	var header struct {
-		OperationID uint64 `json:"operation_id"`
+		OperationID string `json:"operation_id"`
 		RequestID   string `json:"request_id"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("file_header")), &header))
@@ -1092,7 +1332,7 @@ func TestHandleAssetRequestStreamsByAssetID(t *testing.T) {
 	require.Empty(t, header.RequestID, "wire correlation must not depend on a client request_id")
 	operationID, _, _, err := decodeChunkFrame(channels.bulk.binarySnapshot()[0])
 	require.NoError(t, err)
-	require.Equal(t, header.OperationID, operationID)
+	require.Equal(t, header.OperationID, operationIDString(operationID))
 }
 
 func TestHandleAssetRequestThumbnailQualityStreamsThumbnail(t *testing.T) {
@@ -1136,12 +1376,12 @@ func TestHandleAssetPreviewRequestStreamsPreviewWithoutDownloadHeader(t *testing
 	require.NotEmpty(t, mediaFrames)
 	require.Equal(t, byte(0x10), mediaFrames[0][0], "preview chunks reuse typed file chunk envelope")
 	var header struct {
-		OperationID uint64 `json:"operation_id"`
+		OperationID string `json:"operation_id"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("asset_preview_header")), &header))
 	operationID, generation, payload, err := decodeChunkFrame(channels.media.binarySnapshot()[0])
 	require.NoError(t, err)
-	require.Equal(t, header.OperationID, operationID, "generation-zero images remain correlated")
+	require.Equal(t, header.OperationID, operationIDString(operationID), "generation-zero images remain correlated")
 	require.Zero(t, generation)
 	require.Equal(t, []byte("preview"), payload)
 }
@@ -1167,7 +1407,7 @@ func TestHandleAssetPreviewRequestStreamsVideoPreviewInLargerFrames(t *testing.T
 	require.True(t, dc.hasTextType("asset_preview_header"))
 	require.True(t, dc.hasTextType("asset_preview_end"))
 	var header struct {
-		OperationID uint64 `json:"operation_id"`
+		OperationID string `json:"operation_id"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("asset_preview_header")), &header))
 	require.NotZero(t, header.OperationID)
@@ -1176,7 +1416,7 @@ func TestHandleAssetPreviewRequestStreamsVideoPreviewInLargerFrames(t *testing.T
 	for _, frame := range frames {
 		operationID, generation, payload, err := decodeChunkFrame(frame)
 		require.NoError(t, err)
-		require.Equal(t, header.OperationID, operationID)
+		require.Equal(t, header.OperationID, operationIDString(operationID))
 		require.Zero(t, generation)
 		require.LessOrEqual(t, len(payload), chunkSize)
 	}
@@ -1485,6 +1725,12 @@ func TestStreamFile_DoesNotSendChunkEndOrCountDownloadOnGetFailure(t *testing.T)
 	if !foundTransferFailed {
 		t.Fatal("expected transfer failed error message")
 	}
+	headerOperation := operationIDFromText(t, dc.getTextByType("file_header"))
+	scope, requestID, errorOperation, ok := dc.operationErrorFieldsContaining("transfer failed")
+	require.True(t, ok)
+	require.Equal(t, "bulk", scope)
+	require.Empty(t, requestID)
+	require.Equal(t, headerOperation, errorOperation)
 	if foundChunkEnd {
 		t.Fatal("did not expect chunk_end after GetFile failure")
 	}
@@ -1534,4 +1780,31 @@ func fileHeaderBinaryEnvelope(t *testing.T, dc *mockDC) bool {
 	require.NotEmpty(t, dc.getTextByType("file_header"))
 	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("file_header")), &header))
 	return header.BinaryEnvelope
+}
+
+func operationIDFromText(t *testing.T, message string) string {
+	t.Helper()
+	var lifecycle struct {
+		OperationID string `json:"operation_id"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(message), &lifecycle))
+	require.NotEmpty(t, lifecycle.OperationID)
+	return lifecycle.OperationID
+}
+
+func lastOperationIDForType(t *testing.T, endpoint *mockDC, messageType string) string {
+	t.Helper()
+	messages := endpoint.textSnapshot()
+	for i := len(messages) - 1; i >= 0; i-- {
+		var lifecycle struct {
+			Type        string `json:"type"`
+			OperationID string `json:"operation_id"`
+		}
+		if json.Unmarshal([]byte(messages[i]), &lifecycle) == nil && lifecycle.Type == messageType {
+			require.NotEmpty(t, lifecycle.OperationID)
+			return lifecycle.OperationID
+		}
+	}
+	t.Fatalf("missing %s operation", messageType)
+	return ""
 }
