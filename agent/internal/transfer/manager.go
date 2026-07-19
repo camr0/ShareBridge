@@ -961,7 +961,9 @@ func (m *Manager) acquireBulk(requestID string) (uint64, bool) {
 	m.bulkMu.Lock()
 	defer m.bulkMu.Unlock()
 	if m.bulkTransfer.Load() {
-		m.sendOperationError("bulk", requestID, m.bulkOperation.Load(), "transfer in progress")
+		// This error belongs to the rejected request, not the active download.
+		// Do not attach the active operation_id or the browser could abort it.
+		m.sendError("bulk", requestID, "transfer in progress")
 		return 0, false
 	}
 	operation := m.nextOperationID()

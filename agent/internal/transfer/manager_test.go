@@ -1490,6 +1490,10 @@ func TestConcurrentAssetRequestsOnlyOneStarts(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "bulk", scope)
 	require.Equal(t, "bulk-2", requestID)
+	_, _, operationID, ok := dc.operationErrorFieldsContaining("transfer in progress")
+	require.True(t, ok)
+	require.Empty(t, operationID, "rejected request must not be correlated to the active bulk operation")
+	require.True(t, dc.hasTextType("chunk_end"), "active first bulk request must complete")
 }
 
 func TestConcurrentFileRequestsOnlyOneStarts(t *testing.T) {
@@ -1521,6 +1525,12 @@ func TestConcurrentFileRequestsOnlyOneStarts(t *testing.T) {
 	require.Equal(t, int32(1), client.getCalls.Load())
 	require.Equal(t, 1, dc.countTextType("file_header"))
 	require.True(t, dc.hasErrorContaining("transfer in progress"))
+	scope, requestID, operationID, ok := dc.operationErrorFieldsContaining("transfer in progress")
+	require.True(t, ok)
+	require.Equal(t, "bulk", scope)
+	require.Empty(t, requestID)
+	require.Empty(t, operationID, "rejected request without request_id must not inherit the active operation")
+	require.True(t, dc.hasTextType("chunk_end"), "active first bulk request must complete")
 }
 
 // TestFileHeader_IncludesSHA1 verifies sha1 field is present when FileInfo has a checksum
