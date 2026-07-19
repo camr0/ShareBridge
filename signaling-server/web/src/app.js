@@ -17,12 +17,16 @@ import { createVideoBufferWarningMonitor } from './videoBufferWarning.js'
 // Module state
 let pc, ws, dc
 let transferChannels = null // ChannelSet with independent control, media, and bulk endpoints.
+let transferSessionEpoch = 0
 let currentTransferMode = null // 'direct' or 'relay'
 let pendingCandidates = []
 let remoteDescSet = false
 let relayQuotaExceeded = false
 let quotaPeriodEnd = null
 let activeDownload = null
+let currentBulkOperation = null
+let downloadSupportImpl = null
+let createDownloadPipelineImpl = createDownloadPipeline
 let transferClosureHandled = false
 let requestSequence = 0
 let pendingBulkRequestId = ''
@@ -30,9 +34,10 @@ let pendingMediaRequestId = ''
 let pendingMediaID = ''
 let pendingMediaGeneration = undefined
 const pendingEnds = { media: null, bulk: null }
+let completionTimeoutMs = 5000
 const EARLY_FRAME_MAX_BYTES = 1024 * 1024
 const EARLY_FRAME_MAX_COUNT = 128
-const EARLY_FRAME_TTL_MS = 5000
+let earlyFrameTtlMs = 5000
 const earlyFrames = { media: new Map(), bulk: new Map() }
 const retiredOperations = { media: new Set(), bulk: new Set() }
 let earlyFrameBytes = 0
@@ -61,6 +66,22 @@ function asChannelSet(value) {
     set onclose(handler) { value.onclose = handler },
     close: () => value.close?.(),
   }
+}
+
+function activateTransferSession(value, mode) {
+  const nextChannels = asChannelSet(value)
+  if (transferChannels && transferChannels !== nextChannels) {
+    cleanupCurrentVideoPreview()
+    currentPreview = null
+    clearEarlyFrames()
+    activeDownload = null
+    currentFile = null
+  }
+  transferSessionEpoch += 1
+  transferChannels = nextChannels
+  transferClosureHandled = false
+  currentTransferMode = mode
+  return transferChannels
 }
 const directAttemptCancels = new WeakMap()
 
@@ -358,9 +379,7 @@ export function installSessionMessageHandler({
             throw err
           }
 
-          transferChannels = asChannelSet(result.channel)
-          transferClosureHandled = false
-          currentTransferMode = result.mode
+          activateTransferSession(result.channel, result.mode)
           attachTransferChannel({
             channel: transferChannels,
             mode: result.mode,
@@ -400,11 +419,13 @@ function attachTransferChannel({
   isGalleryMode = () => galleryMode,
 }) {
   let opened = false
+  const sessionEpoch = transferSessionEpoch
+  const isCurrentSession = () => transferChannels === channel && transferSessionEpoch === sessionEpoch
   let controlChain = Promise.resolve()
   let mediaChain = Promise.resolve()
   let bulkChain = Promise.resolve()
   const handleOpen = () => {
-    if (opened) return
+    if (opened || !isCurrentSession()) return
     opened = true
     debugLog('transfer channel opened', { mode, readyState: channel.readyState })
     updateStatus('Transfer channel open!')
@@ -423,15 +444,19 @@ function attachTransferChannel({
 
   channel.onopen = handleOpen
   channel.control.onmessage = (event) => {
-    controlChain = controlChain.then(() => handleControlMessage(event)).catch(handleLaneError)
+    if (!isCurrentSession()) return
+    controlChain = controlChain.then(() => isCurrentSession() && handleControlMessage(event, { isCurrentSession })).catch(handleLaneError)
   }
   channel.media.onmessage = (event) => {
-    mediaChain = mediaChain.then(() => handleMediaMessage(event)).catch(handleLaneError)
+    if (!isCurrentSession()) return
+    mediaChain = mediaChain.then(() => isCurrentSession() && handleMediaMessage(event, { isCurrentSession })).catch(handleLaneError)
   }
   channel.bulk.onmessage = (event) => {
-    bulkChain = bulkChain.then(() => handleBulkMessage(event)).catch(handleLaneError)
+    if (!isCurrentSession()) return
+    bulkChain = bulkChain.then(() => isCurrentSession() && handleBulkMessage(event, { isCurrentSession })).catch(handleLaneError)
   }
   function handleLaneError(err) {
+    if (!isCurrentSession()) return
     console.error('[secure-relay] transfer message handler error:', err)
     channel.close?.()
   }
@@ -687,9 +712,7 @@ function join() {
             throw err
           }
 
-          transferChannels = asChannelSet(result.channel)
-          transferClosureHandled = false
-          currentTransferMode = result.mode
+          activateTransferSession(result.channel, result.mode)
           if (result.mode === 'relay') cancelDirectTransport(pc, 'relay selected')
           attachTransferChannel({
             channel: transferChannels,
@@ -768,7 +791,7 @@ async function sendJoin() {
   pendingNonce = null
 }
 
-async function handleControlMessage(event) {
+async function handleControlMessage(event, { isCurrentSession = () => true } = {}) {
   if (isBinaryTransferData(event?.data)) throw new Error('control lane received binary data')
   debugLog('transfer text message received', {
     length: typeof event.data === 'string' ? event.data.length : undefined,
@@ -793,7 +816,9 @@ async function handleControlMessage(event) {
       {
         const startup = startDownload({ ...msg, operationId: msg.operation_id, requestId: msg.request_id })
         await drainEarlyFrames('bulk', msg.operation_id)
+        if (!isCurrentSession()) return
         await startup
+        if (!isCurrentSession()) return
       }
       break
     case 'asset_preview_header':
@@ -804,11 +829,12 @@ async function handleControlMessage(event) {
         startGalleryPreview(msg)
       }
       await drainEarlyFrames('media', msg.operation_id)
+      if (!isCurrentSession()) return
       break
     case 'asset_preview_end':
       if (!matchesCurrentMedia(msg)) return
       if (shouldDeferEnd('media', msg)) {
-        pendingEnds.media = msg
+        deferOperationEnd('media', msg)
         return
       }
       if (!currentVideoPreview) retireOperation('media', msg.operation_id)
@@ -818,15 +844,19 @@ async function handleControlMessage(event) {
     case 'chunk_end':
       if (!matchesCurrentBulk(msg)) return
       if (shouldDeferEnd('bulk', msg)) {
-        pendingEnds.bulk = msg
+        deferOperationEnd('bulk', msg)
         return
       }
       retireOperation('bulk', msg.operation_id)
-      currentFile.completedBytesSent = BigInt(msg.bytes_sent)
-      await completeDownload()
+      if (!currentBulkOperation || currentBulkOperation.operationId !== msg.operation_id) return
+      currentBulkOperation.completedBytesSent = BigInt(msg.bytes_sent)
+      currentFile.completedBytesSent = currentBulkOperation.completedBytesSent
+      await completeDownload(currentBulkOperation)
+      if (!isCurrentSession()) return
       break
     case 'error':
       await handleError(msg)
+      if (!isCurrentSession()) return
       break
     default:
       debugLog('unhandled transfer message type', { type: msg.type })
@@ -834,7 +864,7 @@ async function handleControlMessage(event) {
   }
 }
 
-async function handleMediaMessage(event) {
+async function handleMediaMessage(event, context) {
   if (!isBinaryTransferData(event?.data)) throw new Error('media lane received text data')
   const frame = decodeBinaryEnvelope(event.data)
   if (frame.type === FRAME_THUMBNAIL) {
@@ -842,15 +872,15 @@ async function handleMediaMessage(event) {
     return
   }
   if (frame.type !== FRAME_FILE_CHUNK) throw new Error('media lane received unsupported frame kind')
-  await routeOrBufferFrame('media', frame)
+  await routeOrBufferFrame('media', frame, context)
 }
 
-async function handleBulkMessage(event) {
+async function handleBulkMessage(event, context) {
   if (!isBinaryTransferData(event?.data)) throw new Error('bulk lane received text data')
   const frame = decodeBinaryEnvelope(event.data)
   if (frame.type !== FRAME_FILE_CHUNK) throw new Error('bulk lane received non-chunk frame')
   if (frame.generation !== 0) throw new Error('bulk chunk generation must be zero')
-  await routeOrBufferFrame('bulk', frame)
+  await routeOrBufferFrame('bulk', frame, context)
 }
 
 // Compatibility entry point retained for focused tests; production installs the
@@ -893,7 +923,7 @@ function acceptHeader(msg, scope) {
     pendingMediaID = ''
     pendingMediaGeneration = undefined
   }
-  pendingEnds[scope] = null
+  clearCompletionTimeout(scope)
   return true
 }
 
@@ -915,7 +945,7 @@ function matchesCurrentMedia(msg) {
     (msg.generation === undefined || msg.generation === (current.generation ?? 0)))
 }
 
-async function routeOrBufferFrame(lane, frame) {
+async function routeOrBufferFrame(lane, frame, { isCurrentSession = () => true } = {}) {
   const current = lane === 'bulk' ? currentFile : (currentVideoPreview || currentPreview)
   if (!current || current.operationId !== frame.operationId) {
     if (retiredOperations[lane].has(frame.operationId)) return
@@ -923,14 +953,20 @@ async function routeOrBufferFrame(lane, frame) {
     return
   }
   if (lane === 'bulk') {
-    const nextWireBytes = (currentFile?.wireBytes ?? 0n) + BigInt(frame.payload.byteLength)
-    if (currentFile?.completedBytesSent !== undefined && nextWireBytes > currentFile.completedBytesSent) {
+    const operation = currentBulkOperation
+    if (!operation || operation.operationId !== frame.operationId) return
+    const nextWireBytes = operation.wireBytes + BigInt(frame.payload.byteLength)
+    if (operation.completedBytesSent !== undefined && nextWireBytes > operation.completedBytesSent) {
       failTransferProtocol('operation received bytes after its declared end')
     }
-    await appendChunk(frame.payload)
-    if (currentFile?.operationId === frame.operationId) {
-      currentFile.wireBytes = nextWireBytes
+    operation.wireBytes = nextWireBytes
+    if (currentFile?.operationId === frame.operationId) currentFile.wireBytes = nextWireBytes
+    const append = appendChunk(frame.payload, operation)
+    await append
+    if (!isCurrentSession()) return
+    if (isCurrentBulkOperation(operation)) {
       await completeDeferredEnd('bulk')
+      if (!isCurrentSession()) return
     }
     return
   }
@@ -950,12 +986,14 @@ async function routeOrBufferFrame(lane, frame) {
     currentVideoPreview.seeking = false
     if (currentVideoPreview.awaitingSeekPlayback) scheduleSeekPlaybackRecovery(currentVideoPreview)
     await completeDeferredEnd('media')
+    if (!isCurrentSession()) return
     return
   }
   currentPreview.chunks.push(frame.payload)
   currentPreview.bytes += frame.payload.byteLength
   currentPreview.wireBytes += BigInt(frame.payload.byteLength)
   await completeDeferredEnd('media')
+  if (!isCurrentSession()) return
 }
 
 function shouldDeferEnd(lane, msg) {
@@ -964,9 +1002,8 @@ function shouldDeferEnd(lane, msg) {
   }
   const expected = BigInt(msg.bytes_sent)
   if (expected > 0xffffffffffffffffn) failTransferProtocol('end bytes_sent exceeds uint64')
-  const current = lane === 'bulk' ? currentFile : (currentVideoPreview || currentPreview)
   const received = lane === 'bulk'
-    ? (current?.wireBytes ?? 0n)
+    ? (currentBulkOperation?.wireBytes ?? 0n)
     : currentVideoPreview
       ? (currentVideoPreview.wireBytes ?? 0n)
       : (currentPreview?.wireBytes ?? 0n)
@@ -980,20 +1017,70 @@ function failTransferProtocol(message) {
 }
 
 async function completeDeferredEnd(lane) {
-  const msg = pendingEnds[lane]
+  const msg = pendingEnds[lane]?.msg
   if (!msg || shouldDeferEnd(lane, msg)) return
-  pendingEnds[lane] = null
+  clearCompletionTimeout(lane, msg.operation_id)
   if (lane === 'bulk') {
     if (!matchesCurrentBulk(msg)) return
     retireOperation('bulk', msg.operation_id)
-    currentFile.completedBytesSent = BigInt(msg.bytes_sent)
-    await completeDownload()
+    const operation = currentBulkOperation
+    if (!operation || operation.operationId !== msg.operation_id) return
+    operation.completedBytesSent = BigInt(msg.bytes_sent)
+    currentFile.completedBytesSent = operation.completedBytesSent
+    await completeDownload(operation)
     return
   }
   if (!matchesCurrentMedia(msg)) return
   if (!currentVideoPreview) retireOperation('media', msg.operation_id)
   else currentVideoPreview.completedBytesSent = BigInt(msg.bytes_sent)
   completeGalleryPreview(msg)
+}
+
+function deferOperationEnd(lane, msg) {
+  clearCompletionTimeout(lane)
+  const sessionEpoch = transferSessionEpoch
+  const channels = transferChannels
+  const timer = setTimeout(() => {
+    if (transferSessionEpoch !== sessionEpoch || transferChannels !== channels) return
+    if (pendingEnds[lane]?.msg !== msg) return
+    pendingEnds[lane] = null
+    void failIncompleteOperation(lane, msg)
+  }, completionTimeoutMs)
+  timer.unref?.()
+  pendingEnds[lane] = { msg, timer }
+}
+
+function clearCompletionTimeout(lane, operationId) {
+  const pending = pendingEnds[lane]
+  if (!pending || (operationId && pending.msg.operation_id !== operationId)) return
+  clearTimeout(pending.timer)
+  pendingEnds[lane] = null
+}
+
+async function failIncompleteOperation(lane, msg) {
+  const sessionEpoch = transferSessionEpoch
+  const channels = transferChannels
+  if (lane === 'bulk') {
+    if (!matchesCurrentBulk(msg)) return
+    const operation = currentBulkOperation
+    if (!operation || operation.operationId !== msg.operation_id) return
+    retireOperation('bulk', msg.operation_id)
+    const pipeline = operation.pipeline
+    if (pipeline?.fail) await pipeline.fail('incomplete-transfer', 'Transfer ended before all bytes arrived')
+    if (transferSessionEpoch !== sessionEpoch || transferChannels !== channels) return
+    discardBulkOperation(operation)
+    if (currentBulkOperation === operation) currentBulkOperation = null
+    if (currentFile?.operationId === msg.operation_id) currentFile = null
+    if (activeDownload === pipeline) activeDownload = null
+    updateStatus('Transfer failed')
+    return
+  }
+  if (!matchesCurrentMedia(msg)) return
+  retireOperation('media', msg.operation_id)
+  if (currentVideoPreview) cleanupCurrentVideoPreview()
+  else currentPreview = null
+  galleryPreviewRequestPending = false
+  updateStatus('Error: preview ended before all bytes arrived')
 }
 
 function bufferEarlyFrame(lane, frame, now = Date.now()) {
@@ -1015,7 +1102,7 @@ function pruneEarlyFrames(now = Date.now()) {
   for (const lane of ['media', 'bulk']) {
     for (const [operationId, entries] of earlyFrames[lane]) {
       const kept = entries.filter((entry) => {
-        if (now - entry.receivedAt <= EARLY_FRAME_TTL_MS) return true
+        if (now - entry.receivedAt <= earlyFrameTtlMs) return true
         earlyFrameBytes -= entry.frame.payload.byteLength
         earlyFrameCount -= 1
         expired = true
@@ -1033,12 +1120,15 @@ function pruneEarlyFrames(now = Date.now()) {
 
 function armEarlyFrameTimer() {
   if (earlyFrameTimer !== null) return
+  const sessionEpoch = transferSessionEpoch
+  const channels = transferChannels
   earlyFrameTimer = setTimeout(() => {
     earlyFrameTimer = null
+    if (transferSessionEpoch !== sessionEpoch || transferChannels !== channels) return
     if (earlyFrameCount === 0) return
     clearEarlyFrames()
     transferChannels?.close?.()
-  }, EARLY_FRAME_TTL_MS + 1)
+  }, earlyFrameTtlMs + 1)
   earlyFrameTimer.unref?.()
 }
 
@@ -1118,11 +1208,12 @@ function renderFileList(files) {
 }
 
 function getFileItem(name) {
-  return document.querySelector(`.file-item[data-name="${CSS.escape(name)}"]`)
+  const escapedName = globalThis.CSS?.escape ? globalThis.CSS.escape(name) : String(name).replace(/["\\]/g, '\\$&')
+  return document.querySelector(`.file-item[data-name="${escapedName}"]`)
 }
 
 function requestFile(name) {
-  if (activeDownload) {
+  if (activeDownload || currentBulkOperation || pendingBulkRequestId) {
     updateStatus('Download in progress, please wait')
     return
   }
@@ -1152,6 +1243,17 @@ async function getDownloadSupport(header) {
 }
 
 async function startDownload(header) {
+  discardBulkOperation(currentBulkOperation)
+  const operation = {
+    operationId: header.operationId,
+    requestId: header.requestId,
+    header,
+    pipeline: null,
+    active: true,
+    wireBytes: 0n,
+    ingestChain: Promise.resolve(),
+  }
+  currentBulkOperation = operation
   galleryAssetRequestPending = false
   currentFile = header
   currentFile.wireBytes = 0n
@@ -1177,7 +1279,14 @@ async function startDownload(header) {
     fileItem.querySelector('.file-hash').textContent = ''
   }
 
-  const support = await getDownloadSupport(header)
+  operation.initPromise = initializeDownloadOperation(operation)
+  await operation.initPromise
+}
+
+async function initializeDownloadOperation(operation) {
+  const { header } = operation
+  const support = await (downloadSupportImpl ?? getDownloadSupport)(header)
+  if (!isCurrentBulkOperation(operation)) return
   renderDownloadWarning(support.warning)
 
   if (support.mode === 'fail') {
@@ -1189,6 +1298,8 @@ async function startDownload(header) {
       avgBytesPerSecond: 0,
       computedSha1: null,
     })
+    discardBulkOperation(operation)
+    if (currentBulkOperation === operation) currentBulkOperation = null
     currentFile = null
     transferStartTime = 0
     galleryAssetRequestPending = false
@@ -1196,24 +1307,35 @@ async function startDownload(header) {
   }
 
   try {
-    activeDownload = await createDownloadPipeline({
+    const pipeline = await createDownloadPipelineImpl({
       header,
-      sinkFactory: async () => buildDownloadSink(header, support),
-      onStateChange: (state) => updateDownloadUI(header, state),
+      sinkFactory: async () => {
+        if (!isCurrentBulkOperation(operation)) throw new Error('stale bulk operation')
+        return buildDownloadSink(header, support)
+      },
+      onStateChange: (state) => {
+        if (isCurrentBulkOperation(operation)) updateDownloadUI(header, state)
+      },
       onTerminalState: (result) => {
+        if (!isCurrentBulkOperation(operation)) return
+        clearCompletionTimeout('bulk', operation.operationId)
+        retireOperation('bulk', operation.operationId)
+        discardEarlyOperation('bulk', operation.operationId)
         finalizeDownloadUI(header, result)
+        operation.active = false
+        operation.pipeline = null
+        currentBulkOperation = null
         activeDownload = null
         currentFile = null
         galleryAssetRequestPending = false
         receivedBytes = 0
         receivedChunkCount = 0
         transferStartTime = 0
-        prePipelineChunks.length = 0
       },
     })
-    while (prePipelineChunks.length) {
-      await activeDownload.append(prePipelineChunks.shift())
-    }
+    if (!isCurrentBulkOperation(operation)) return
+    operation.pipeline = pipeline
+    activeDownload = pipeline
   } catch (err) {
     debugLog('download initialization failed', {
       file: header.name,
@@ -1227,8 +1349,10 @@ async function startDownload(header) {
       avgBytesPerSecond: 0,
       computedSha1: null,
     })
-    activeDownload = null
-    currentFile = null
+    discardBulkOperation(operation)
+    if (currentBulkOperation === operation) currentBulkOperation = null
+    if (currentFile === header) currentFile = null
+    if (activeDownload === operation.pipeline) activeDownload = null
     galleryAssetRequestPending = false
     receivedBytes = 0
     receivedChunkCount = 0
@@ -1236,28 +1360,42 @@ async function startDownload(header) {
   }
 }
 
-const prePipelineChunks = []
-
-async function appendChunk(bytes) {
-  if (!currentFile) return
-  if (!activeDownload) {
-    prePipelineChunks.push(bytes)
-    return
-  }
-  while (prePipelineChunks.length) {
-    await activeDownload.append(prePipelineChunks.shift())
-  }
-  await activeDownload.append(bytes)
+function isCurrentBulkOperation(operation) {
+  return Boolean(operation?.active && currentBulkOperation === operation)
 }
 
-async function completeDownload() {
-  if (!activeDownload || !currentFile) return
+function discardBulkOperation(operation) {
+  if (!operation) return
+  retireOperation('bulk', operation.operationId)
+  discardEarlyOperation('bulk', operation.operationId)
+  operation.active = false
+  operation.pipeline = null
+  clearCompletionTimeout('bulk', operation.operationId)
+}
+
+function enqueueBulkIngest(operation, action) {
+  if (!operation) return Promise.resolve()
+  const run = operation.ingestChain.then(async () => {
+    await operation.initPromise
+    if (!isCurrentBulkOperation(operation) || !operation.pipeline) return
+    await action(operation.pipeline)
+  })
+  operation.ingestChain = run.catch(() => {})
+  return run
+}
+
+function appendChunk(bytes, operation = currentBulkOperation) {
+  return enqueueBulkIngest(operation, (pipeline) => pipeline.append(bytes))
+}
+
+async function completeDownload(operation = currentBulkOperation) {
+  if (!isCurrentBulkOperation(operation)) return
   debugLog('download complete frame received', {
-    file: currentFile.name,
+    file: operation.header.name,
     receivedBytes,
     chunkCount: receivedChunkCount,
   })
-  await activeDownload.complete()
+  await enqueueBulkIngest(operation, (pipeline) => pipeline.complete())
 }
 
 async function buildDownloadSink(header, support) {
@@ -1411,7 +1549,7 @@ function navigateTo(index) {
 }
 
 function openFolder(name) {
-  if (activeDownload) {
+  if (activeDownload || currentBulkOperation) {
     updateStatus('Download in progress, please wait')
     return
   }
@@ -1446,6 +1584,8 @@ function submitPassword() {
 }
 
 async function handleError(msg) {
+  const sessionEpoch = transferSessionEpoch
+  const channels = transferChannels
   const message = msg.message || ''
   debugLog('transfer error message received', {
     message,
@@ -1482,6 +1622,7 @@ async function handleError(msg) {
     }
     if (!matchesCurrentMedia(msg)) return
     retireOperation('media', msg.operation_id)
+    clearCompletionTimeout('media', msg.operation_id)
     galleryPreviewRequestPending = false
     currentPreview = null
     cleanupCurrentVideoPreview()
@@ -1494,8 +1635,16 @@ async function handleError(msg) {
       updateStatus('Download in progress, please wait')
       return
     }
+    const failedBulkOperation = msg.scope === 'bulk' ? currentBulkOperation : null
     updateStatus('Transfer failed')
     await activeDownload.fail('transfer-error', message || 'Transfer failed')
+    if (transferSessionEpoch !== sessionEpoch || transferChannels !== channels) return
+    if (failedBulkOperation && currentBulkOperation === failedBulkOperation) {
+      discardBulkOperation(failedBulkOperation)
+      currentBulkOperation = null
+      activeDownload = null
+      currentFile = null
+    }
     if (!msg.scope) clearClosedTransferSession()
     return
   }
@@ -1517,8 +1666,11 @@ async function handleTransferClosure() {
   if (transferClosureHandled) return
   transferClosureHandled = true
   const download = activeDownload
+  const sessionEpoch = transferSessionEpoch
+  const channels = transferChannels
   if (download?.failForDisconnect) {
     await download.failForDisconnect()
+    if (transferSessionEpoch !== sessionEpoch || transferChannels !== channels) return
     clearClosedTransferSession()
     return
   }
@@ -1528,6 +1680,9 @@ async function handleTransferClosure() {
 
 function cleanupCurrentVideoPreview() {
   if (currentVideoPreview) {
+    clearCompletionTimeout('media', currentVideoPreview.operationId)
+    retireOperation('media', currentVideoPreview.operationId)
+    discardEarlyOperation('media', currentVideoPreview.operationId)
     clearTimeout(currentVideoPreview.seekTimer)
     currentVideoPreview.seekTimer = null
     clearSeekPlaybackRecovery(currentVideoPreview)
@@ -1547,6 +1702,20 @@ function cleanupCurrentVideoPreview() {
     })
   }
   currentVideoPreview = null
+}
+
+function discardEarlyOperation(lane, operationId) {
+  if (!operationId) return
+  const entries = earlyFrames[lane].get(operationId) ?? []
+  for (const entry of entries) {
+    earlyFrameBytes -= entry.frame.payload.byteLength
+    earlyFrameCount -= 1
+  }
+  earlyFrames[lane].delete(operationId)
+  if (earlyFrameCount === 0 && earlyFrameTimer !== null) {
+    clearTimeout(earlyFrameTimer)
+    earlyFrameTimer = null
+  }
 }
 
 const VIDEO_BUFFER_WARNING_CLASS = 'sharebridge-video-buffer-warning'
@@ -1582,6 +1751,7 @@ function clearClosedTransferSession() {
   currentPreview = null
   clearEarlyFrames()
   cleanupCurrentVideoPreview()
+  transferSessionEpoch += 1
   transferChannels = null
   currentTransferMode = null
   getConnectionStatusEl().classList.add('hidden')
@@ -1626,6 +1796,7 @@ function resetUI() {
   sessionPassword = ''
   galleryController?.destroy()
   galleryController = null
+  transferSessionEpoch += 1
   transferChannels = null
   currentTransferMode = null
   ws = null
@@ -1638,6 +1809,8 @@ function resetUI() {
 function clearEarlyFrames() {
   if (earlyFrameTimer !== null) clearTimeout(earlyFrameTimer)
   earlyFrameTimer = null
+  discardBulkOperation(currentBulkOperation)
+  currentBulkOperation = null
   earlyFrames.media.clear()
   earlyFrames.bulk.clear()
   retiredOperations.media.clear()
@@ -1648,8 +1821,8 @@ function clearEarlyFrames() {
   pendingMediaRequestId = ''
   pendingMediaID = ''
   pendingMediaGeneration = undefined
-  pendingEnds.media = null
-  pendingEnds.bulk = null
+  clearCompletionTimeout('media')
+  clearCompletionTimeout('bulk')
 }
 
 function escapeHtml(text) {
@@ -1756,7 +1929,7 @@ function queueGalleryPreload(id) {
 }
 
 function requestGalleryAsset(id) {
-  if (activeDownload || galleryAssetRequestPending) {
+  if (activeDownload || currentBulkOperation || galleryAssetRequestPending) {
     updateStatus('Download in progress, please wait')
     return
   }
@@ -2058,15 +2231,40 @@ export const __test = {
   },
   setActiveDownload(download) {
     activeDownload = download
+    if (currentBulkOperation) currentBulkOperation.pipeline = download
   },
   setCurrentFile(file) {
     currentFile = file
+    if (!file) {
+      discardBulkOperation(currentBulkOperation)
+      currentBulkOperation = null
+    } else {
+      currentBulkOperation = {
+        operationId: file.operationId,
+        requestId: file.requestId,
+        header: file,
+        pipeline: activeDownload,
+        active: true,
+        wireBytes: file.wireBytes ?? 0n,
+        ingestChain: Promise.resolve(),
+        initPromise: Promise.resolve(),
+      }
+    }
   },
+  setDownloadTestDependencies({ getSupport, createPipeline } = {}) {
+    downloadSupportImpl = getSupport ?? null
+    createDownloadPipelineImpl = createPipeline ?? createDownloadPipeline
+  },
+  setCompletionTimeoutMs(value) {
+    completionTimeoutMs = value
+  },
+  setEarlyFrameTtlMs(value) {
+    earlyFrameTtlMs = value
+  },
+  attachTransferChannel,
   setTransferSession({ channels, channel, mode }) {
     const value = channels ?? channel
-    transferChannels = asChannelSet(value)
-    transferClosureHandled = false
-    currentTransferMode = mode
+    activateTransferSession(value, mode)
     if (!value) {
       galleryAssetRequestPending = false
       galleryPreviewRequestPending = false
@@ -2089,6 +2287,9 @@ export const __test = {
   },
   getCurrentVideoPreview() {
     return currentVideoPreview
+  },
+  getCurrentPreview() {
+    return currentPreview
   },
   getTransferSession() {
     return {

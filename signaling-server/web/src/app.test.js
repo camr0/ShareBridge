@@ -21,6 +21,13 @@ function fakeLaneSet() {
   return { readyState: 'open', control: endpoint(), media: endpoint(), bulk: endpoint(), closeCalls: 0, close() { this.closeCalls += 1 } }
 }
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
 test('publishGlobalActions preserves inline button handlers after the move to an ES module', () => {
   const globals = {}
   const join = () => {}
@@ -704,6 +711,7 @@ function withMinimalDocument(fn) {
     ['status', {
       textContent: '',
     }],
+    ['download-warning', { textContent: '', className: '' }],
     ['join-section', {
       classList: {
         removed: [],
@@ -731,6 +739,7 @@ function withMinimalDocument(fn) {
       }
       return el
     },
+    querySelector() { return null },
   }
 
   return Promise.resolve()
@@ -1529,23 +1538,6 @@ test('unknown-size preview end waits for its exact bytes_sent when control overt
   })
 })
 
-test('bulk end waits for the final correlated chunk when control overtakes bulk', async () => {
-  const events = []
-  __test.setCurrentFile({ name: 'file.bin', operationId: '555', requestId: 'bulk-r', wireBytes: 0n })
-  __test.setActiveDownload({
-    append: async (bytes) => events.push(['chunk', [...bytes]]),
-    complete: async () => events.push(['end']),
-  })
-  await __test.handleControlMessage({ data: JSON.stringify({
-    type: 'chunk_end', operation_id: '555', request_id: 'bulk-r', bytes_sent: '2',
-  }) })
-  assert.deepEqual(events, [])
-  await __test.handleBulkMessage({ data: encodeChunkEnvelope('555', 0, new Uint8Array([6, 7])).buffer })
-  assert.deepEqual(events, [['chunk', [6, 7]], ['end']])
-  __test.setActiveDownload(null)
-  __test.setCurrentFile(null)
-})
-
 test('malformed or overrun bytes_sent fails closed', async () => {
   const channels = fakeLaneSet()
   __test.setTransferSession({ channels, mode: 'relay' })
@@ -1561,6 +1553,75 @@ test('malformed or overrun bytes_sent fails closed', async () => {
   }) }), /more bytes than bytes_sent/i)
   __test.setCurrentVideoPreview(null)
   __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('deferred media end times out per operation and stale timeout cannot touch a new session', async () => {
+  await withMinimalDocument(async (elements) => {
+    const firstChannels = fakeLaneSet()
+    __test.setCompletionTimeoutMs(5)
+    __test.setTransferSession({ channels: firstChannels, mode: 'relay' })
+    __test.requestGalleryPreview('slow')
+    const request = JSON.parse(firstChannels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'slow', mimeType: 'image/jpeg', size: 0,
+      operation_id: '570', request_id: request.request_id,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_end', id: 'slow', operation_id: '570', request_id: request.request_id, bytes_sent: '2',
+    }) })
+    await new Promise((resolve) => setTimeout(resolve, 15))
+    assert.equal(__test.getCurrentPreview(), null)
+    assert.match(elements.get('status').textContent, /before all bytes/i)
+
+    __test.requestGalleryPreview('old-session')
+    const oldRequest = JSON.parse(firstChannels.control.sent.at(-1))
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'old-session', mimeType: 'image/jpeg', size: 0,
+      operation_id: '571', request_id: oldRequest.request_id,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_end', id: 'old-session', operation_id: '571', request_id: oldRequest.request_id, bytes_sent: '1',
+    }) })
+    const secondChannels = fakeLaneSet()
+    __test.setTransferSession({ channels: secondChannels, mode: 'direct' })
+    __test.setCurrentVideoPreview({ id: 'new', mediaId: 'new', operationId: '571', requestId: 'new-r', generation: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 15))
+    assert.equal(__test.getCurrentVideoPreview().id, 'new')
+    assert.equal(secondChannels.closeCalls, 0)
+    __test.setCompletionTimeoutMs(5000)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('deferred bulk end timeout fails only its bulk pipeline', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const failures = []
+    __test.setCompletionTimeoutMs(5)
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async () => ({
+        append: async () => {}, complete: async () => {},
+        fail: async (...args) => failures.push(args),
+      }),
+    })
+    __test.requestFile('short.bin')
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'short.bin', size: 2, operation_id: '580', request_id: request.request_id,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '580', request_id: request.request_id, bytes_sent: '2',
+    }) })
+    await new Promise((resolve) => setTimeout(resolve, 15))
+    assert.deepEqual(failures, [['incomplete-transfer', 'Transfer ended before all bytes arrived']])
+    assert.equal(channels.closeCalls, 0)
+    assert.equal(__test.getCurrentFile(), null)
+    __test.setCompletionTimeoutMs(5000)
+    __test.setDownloadTestDependencies()
+    __test.setTransferSession({ channels: null, mode: null })
+  })
 })
 
 test('media routes thumbnails independently of interactive preview state', async () => {
@@ -1662,24 +1723,154 @@ test('a request-scoped second bulk rejection cannot abort the active bulk operat
   })
 })
 
-test('file requests use control and file bytes use bulk while media stays idle', async () => {
+test('rapid file double click sends one bulk request and preserves its request id', async () => {
   await withMinimalDocument(async () => {
     const channels = fakeLaneSet()
-    const appended = []
     __test.setTransferSession({ channels, mode: 'direct' })
+    __test.requestFile('first.bin')
+    const first = JSON.parse(channels.control.sent[0])
+    __test.requestFile('second.bin')
+    assert.equal(channels.control.sent.length, 1)
+    assert.equal(JSON.parse(channels.control.sent[0]).request_id, first.request_id)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('real file lifecycle drains early and initializing chunks in strict order before end', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const support = deferred()
+    const events = []
+    __test.setTransferSession({ channels, mode: 'direct' })
+    __test.setDownloadTestDependencies({
+      getSupport: () => support.promise,
+      createPipeline: async () => ({
+        append: async (bytes) => events.push(['chunk', [...bytes]]),
+        complete: async () => events.push(['end']),
+      }),
+    })
     __test.requestFile('report.pdf')
     const request = JSON.parse(channels.control.sent[0])
-    assert.equal(request.type, 'file_request')
-    assert.match(request.request_id, /^bulk-/)
-
-    __test.setCurrentFile({ name: 'report.pdf', operationId: '900', requestId: request.request_id })
-    __test.setActiveDownload({ append: async (bytes) => appended.push([...bytes]) })
-    await __test.handleBulkMessage({ data: encodeChunkEnvelope('900', 0, new Uint8Array([1, 2, 3])).buffer })
-
-    assert.deepEqual(appended, [[1, 2, 3]])
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('910', 0, new Uint8Array([1])).buffer })
+    const header = __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'report.pdf', size: 3, mimeType: 'application/pdf',
+      operation_id: '910', request_id: request.request_id,
+    }) })
+    const second = __test.handleBulkMessage({ data: encodeChunkEnvelope('910', 0, new Uint8Array([2, 3])).buffer })
+    const end = __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '910', request_id: request.request_id, bytes_sent: '3',
+    }) })
+    assert.deepEqual(events, [])
+    support.resolve({ mode: 'blob', warning: null })
+    await Promise.all([header, second, end])
+    assert.deepEqual(events, [['chunk', [1]], ['chunk', [2, 3]], ['end']])
     assert.deepEqual(channels.media.sent, [])
-    __test.setActiveDownload(null)
-    __test.setCurrentFile(null)
+    __test.setDownloadTestDependencies()
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('failed bulk initialization discards queued bytes before a new download', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const events = []
+    let createCalls = 0
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async () => {
+        createCalls += 1
+        if (createCalls === 1) throw new Error('sink failed')
+        return { append: async (bytes) => events.push([...bytes]), complete: async () => {} }
+      },
+    })
+    __test.requestFile('first.bin')
+    const first = JSON.parse(channels.control.sent[0])
+    const firstHeader = __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'first.bin', size: 1, operation_id: '920', request_id: first.request_id,
+    }) })
+    const staleChunk = __test.handleBulkMessage({ data: encodeChunkEnvelope('920', 0, new Uint8Array([9])).buffer })
+    await Promise.all([firstHeader, staleChunk])
+
+    __test.requestFile('second.bin')
+    const second = JSON.parse(channels.control.sent[1])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'second.bin', size: 1, operation_id: '921', request_id: second.request_id,
+    }) })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('921', 0, new Uint8Array([7])).buffer })
+    assert.deepEqual(events, [[7]])
+    __test.setDownloadTestDependencies()
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('wire receipt precedes a held append so end queues behind it and underdeclared end fails', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const appendGate = deferred()
+    const events = []
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async () => ({
+        append: async () => { events.push('append-start'); await appendGate.promise; events.push('append-end') },
+        complete: async () => events.push('complete'),
+      }),
+    })
+    __test.requestFile('held.bin')
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'held.bin', size: 1, operation_id: '930', request_id: request.request_id,
+    }) })
+    const chunk = __test.handleBulkMessage({ data: encodeChunkEnvelope('930', 0, new Uint8Array([1])).buffer })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const end = __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '930', request_id: request.request_id, bytes_sent: '1',
+    }) })
+    assert.deepEqual(events, ['append-start'])
+    appendGate.resolve()
+    await Promise.all([chunk, end])
+    assert.deepEqual(events, ['append-start', 'append-end', 'complete'])
+
+    await assert.rejects(() => __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '930', request_id: request.request_id, bytes_sent: '0',
+    }) }), /more bytes than bytes_sent/i)
+    assert.equal(channels.closeCalls, 1)
+    __test.setDownloadTestDependencies()
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('delayed old-session sink completion cannot mutate a new session', async () => {
+  await withMinimalDocument(async () => {
+    const first = fakeLaneSet()
+    const second = fakeLaneSet()
+    const appendGate = deferred()
+    let sessionCurrent = true
+    __test.setTransferSession({ channels: first, mode: 'relay' })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async () => ({ append: () => appendGate.promise, complete: async () => {} }),
+    })
+    __test.requestFile('old.bin')
+    const request = JSON.parse(first.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'old.bin', size: 1, operation_id: '940', request_id: request.request_id,
+    }) })
+    const oldChunk = __test.handleBulkMessage(
+      { data: encodeChunkEnvelope('940', 0, new Uint8Array([1])).buffer },
+      { isCurrentSession: () => sessionCurrent },
+    )
+    await Promise.resolve()
+    sessionCurrent = false
+    __test.setTransferSession({ channels: second, mode: 'direct' })
+    __test.setCurrentVideoPreview({ id: 'new', mediaId: 'new', operationId: '940', requestId: 'new-r', generation: 0 })
+    appendGate.resolve()
+    await oldChunk
+    assert.equal(__test.getCurrentVideoPreview().id, 'new')
+    assert.equal(__test.getCurrentFile(), null)
+    assert.equal(second.closeCalls, 0)
+    __test.setDownloadTestDependencies()
     __test.setTransferSession({ channels: null, mode: null })
   })
 })
@@ -1696,6 +1887,84 @@ test('early-frame abuse closes the whole channel set and never drops into a cons
   )
   assert.equal(channels.closeCalls, 1)
   __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('closing a video retires its operation so 129 late frames are ignored', async () => {
+  const channels = fakeLaneSet()
+  __test.setTransferSession({ channels, mode: 'relay' })
+  __test.setCurrentVideoPreview({
+    id: 'old', mediaId: 'old', operationId: '1300', requestId: 'old-r', generation: 1,
+    totalBytesReceived: 0,
+  })
+  __test.cleanupCurrentVideoPreview()
+  for (let i = 0; i < 129; i += 1) {
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('1300', 1, new Uint8Array([i & 0xff])).buffer })
+  }
+  assert.equal(channels.closeCalls, 0)
+  __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('terminal image error retires its operation before late media frames arrive', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.requestGalleryPreview('image')
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'image', mimeType: 'image/jpeg', operation_id: '1310', request_id: request.request_id,
+    }) })
+    await __test.handleError({
+      type: 'error', scope: 'media', operation_id: '1310', request_id: request.request_id, message: 'failed',
+    })
+    for (let i = 0; i < 129; i += 1) {
+      await __test.handleMediaMessage({ data: encodeChunkEnvelope('1310', 0, new Uint8Array([1])).buffer })
+    }
+    assert.equal(channels.closeCalls, 0)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('an early-frame timer from an old session cannot close a reconnected session', async () => {
+  const first = fakeLaneSet()
+  const second = fakeLaneSet()
+  __test.setEarlyFrameTtlMs(5)
+  __test.setTransferSession({ channels: first, mode: 'relay' })
+  await __test.handleMediaMessage({ data: encodeChunkEnvelope('1400', 0, new Uint8Array([1])).buffer })
+  __test.setTransferSession({ channels: second, mode: 'direct' })
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(first.closeCalls, 0)
+  assert.equal(second.closeCalls, 0)
+  __test.setEarlyFrameTtlMs(5000)
+  __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('captured lane handlers discard old-session frames even with a reused operation id', async () => {
+  await withMinimalDocument(async () => {
+    const first = fakeLaneSet()
+    const second = fakeLaneSet()
+    const attach = (channels) => __test.attachTransferChannel({
+      channel: channels,
+      mode: 'relay',
+      updateStatus() {}, hideSection() {}, showSection() {}, requestFileList() {},
+      applyConnectionBadge() {}, onClose() {}, isGalleryMode: () => false,
+    })
+    __test.setTransferSession({ channels: first, mode: 'relay' })
+    attach(first)
+    __test.setTransferSession({ channels: second, mode: 'direct' })
+    attach(second)
+    __test.setCurrentVideoPreview({
+      id: 'new', mediaId: 'new', operationId: '1500', requestId: 'new-r', generation: 0,
+      totalBytesReceived: 0, wireBytes: 0n,
+    })
+    for (let i = 0; i < 129; i += 1) {
+      first.media.onmessage({ data: encodeChunkEnvelope('1500', 0, new Uint8Array([1])).buffer })
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(__test.getCurrentVideoPreview().totalBytesReceived, 0)
+    assert.equal(first.closeCalls, 0)
+    assert.equal(second.closeCalls, 0)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
 })
 
 test('transfer closure cleanup executes once even if several required lanes report closure', async () => {
