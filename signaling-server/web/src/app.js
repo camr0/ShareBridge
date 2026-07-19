@@ -35,11 +35,17 @@ let pendingMediaID = ''
 let pendingMediaGeneration = undefined
 const pendingEnds = { media: null, bulk: null }
 let completionTimeoutMs = 60_000
-const EARLY_FRAME_MAX_BYTES = 1024 * 1024
+// A lane header and its binary frames travel independently. Allow the browser
+// to absorb the agent's full 5 MiB backpressure window plus one 64 KiB chunk
+// while the matching control header catches up.
+const EARLY_FRAME_MAX_BYTES = (5 * 1024 * 1024) + (64 * 1024)
+const EARLY_FRAME_COALESCE_BYTES = 64 * 1024
 const EARLY_FRAME_MAX_COUNT = 128
+const EARLY_FRAME_MAX_OPERATIONS = 128
 let earlyFrameTtlMs = 5000
 const earlyFrames = { media: new Map(), bulk: new Map() }
 const retiredOperations = { media: new Set(), bulk: new Set() }
+const abandonedMediaRequests = new Set()
 let earlyFrameBytes = 0
 let earlyFrameCount = 0
 let earlyFrameTimer = null
@@ -822,6 +828,11 @@ async function handleControlMessage(event, { isCurrentSession = () => true } = {
       }
       break
     case 'asset_preview_header':
+      if (abandonedMediaRequests.delete(msg.request_id)) {
+        retireOperation('media', msg.operation_id)
+        discardEarlyOperation('media', msg.operation_id)
+        return
+      }
       if (!acceptHeader(msg, 'media')) return
       if (msg.mimeType?.startsWith('video/')) {
         startVideoPreview(msg)
@@ -830,6 +841,7 @@ async function handleControlMessage(event, { isCurrentSession = () => true } = {
       }
       await drainEarlyFrames('media', msg.operation_id)
       if (!isCurrentSession()) return
+      if (msg.mimeType?.startsWith('video/')) flushQueuedVideoSeek(currentVideoPreview)
       break
     case 'asset_preview_end':
       if (!matchesCurrentMedia(msg)) return
@@ -1094,15 +1106,40 @@ async function failIncompleteOperation(lane, msg) {
 
 function bufferEarlyFrame(lane, frame, now = Date.now()) {
   pruneEarlyFrames(now)
-  if (frame.payload.byteLength + earlyFrameBytes > EARLY_FRAME_MAX_BYTES || earlyFrameCount >= EARLY_FRAME_MAX_COUNT) {
+  const entries = earlyFrames[lane].get(frame.operationId) ?? []
+  const last = entries[entries.length - 1]
+  const canCoalesce = Boolean(last?.buffer &&
+    last.frame.type === frame.type &&
+    last.frame.generation === frame.generation &&
+    last.length + frame.payload.byteLength <= EARLY_FRAME_COALESCE_BYTES)
+  const isNewOperation = !earlyFrames[lane].has(frame.operationId)
+  const earlyOperationCount = earlyFrames.media.size + earlyFrames.bulk.size
+  if (frame.payload.byteLength + earlyFrameBytes > EARLY_FRAME_MAX_BYTES ||
+    (!canCoalesce && earlyFrameCount >= EARLY_FRAME_MAX_COUNT) ||
+    (isNewOperation && earlyOperationCount >= EARLY_FRAME_MAX_OPERATIONS)) {
     transferChannels?.close?.()
     throw new Error('early frame buffer limit exceeded')
   }
-  const entries = earlyFrames[lane].get(frame.operationId) ?? []
-  entries.push({ frame, receivedAt: now })
+  if (canCoalesce) {
+    last.buffer.set(frame.payload, last.length)
+    last.length += frame.payload.byteLength
+    last.frame.payload = last.buffer.subarray(0, last.length)
+    last.receivedAt = now
+  } else {
+    const buffer = frame.payload.byteLength < EARLY_FRAME_COALESCE_BYTES
+      ? new Uint8Array(EARLY_FRAME_COALESCE_BYTES)
+      : null
+    if (buffer) buffer.set(frame.payload)
+    entries.push({
+      frame: buffer ? { ...frame, payload: buffer.subarray(0, frame.payload.byteLength) } : frame,
+      receivedAt: now,
+      buffer,
+      length: frame.payload.byteLength,
+    })
+    earlyFrameCount += 1
+  }
   earlyFrames[lane].set(frame.operationId, entries)
   earlyFrameBytes += frame.payload.byteLength
-  earlyFrameCount += 1
   armEarlyFrameTimer()
 }
 
@@ -1689,6 +1726,15 @@ async function handleTransferClosure() {
 
 function cleanupCurrentVideoPreview() {
   if (currentVideoPreview) {
+    if (pendingMediaRequestId && pendingMediaID === currentVideoPreview.id) {
+      abandonedMediaRequests.add(pendingMediaRequestId)
+      if (abandonedMediaRequests.size > 64) {
+        abandonedMediaRequests.delete(abandonedMediaRequests.values().next().value)
+      }
+      pendingMediaRequestId = ''
+      pendingMediaID = ''
+      pendingMediaGeneration = undefined
+    }
     clearCompletionTimeout('media', currentVideoPreview.operationId)
     retireOperation('media', currentVideoPreview.operationId)
     discardEarlyOperation('media', currentVideoPreview.operationId)
@@ -1824,6 +1870,7 @@ function clearEarlyFrames() {
   earlyFrames.bulk.clear()
   retiredOperations.media.clear()
   retiredOperations.bulk.clear()
+  abandonedMediaRequests.clear()
   earlyFrameBytes = 0
   earlyFrameCount = 0
   pendingBulkRequestId = ''
@@ -1969,11 +2016,18 @@ function startVideoPreview(header) {
   const vp = currentVideoPreview
   if (!vp) return
 
-  // Check if this header is for the current generation.
-  if (header.generation !== undefined && header.generation !== vp.generation) return
-
+  // Even a superseded seek header advances the agent's operation lifecycle.
+  // Adopt it as the parent for the queued latest seek, but do not rebase the
+  // Service Worker to media the user no longer wants.
+  const superseded = header.generation !== undefined && header.generation !== vp.generation
   vp.operationId = header.operation_id
   vp.requestId = header.request_id
+  if (superseded) {
+    vp.totalBytesReceived = 0
+    vp.wireBytes = 0n
+    vp.completedBytesSent = undefined
+    return
+  }
 
   // Store size/offset from header for seek calculations.
   if (header.size > 0) {
@@ -2093,7 +2147,23 @@ function sendVideoSeek(vp, startOffset, generation = vp?.generation) {
   if (!vp || generation !== vp.generation) return false
   if (!Number.isInteger(startOffset) || startOffset < 0) return false
   const control = controlEndpoint()
-  if (!control || vp.seekSentGeneration === generation || !vp.operationId) return false
+  if (!control || !vp.operationId) return false
+
+  // The agent replaces media operation A with B only after accepting the seek.
+  // Keep later seeks queued until B's header arrives so they reference B rather
+  // than the now-stale A and cannot orphan B's media frames.
+  if (pendingMediaRequestId) {
+    if (pendingMediaID !== vp.id) return false
+    if (vp.queuedSeek?.generation === generation) {
+      vp.queuedSeek.startOffset = startOffset
+      return true
+    }
+    if (pendingMediaGeneration === generation) return false
+    vp.queuedSeek = { startOffset, generation }
+    vp.seekSentGeneration = generation
+    return true
+  }
+  if (vp.seekSentGeneration === generation) return false
 
   vp.seekSentGeneration = generation
   vp.seeking = true
@@ -2110,6 +2180,15 @@ function sendVideoSeek(vp, startOffset, generation = vp?.generation) {
     operation_id: vp.operationId,
   }))
   return true
+}
+
+function flushQueuedVideoSeek(vp) {
+  const queued = vp?.queuedSeek
+  if (!queued) return false
+  vp.queuedSeek = null
+  if (queued.generation !== vp.generation) return false
+  vp.seekSentGeneration = null
+  return sendVideoSeek(vp, queued.startOffset, queued.generation)
 }
 
 function handleMediaRangeRequest(message) {
@@ -2148,6 +2227,31 @@ function scheduleSeekPlaybackRecovery(
     if (!video) return
 
     vp.awaitingSeekPlayback = false
+    // Chrome can cancel the parked Range response during a rapid seek burst
+    // without issuing a replacement fetch for the final target. The Service
+    // Worker still receives that generation's bytes, but no reader drains
+    // them and the element remains unpaused at HAVE_METADATA forever. Reload
+    // the same media URL and restore the target so Chrome attaches a fresh
+    // Range reader to the already-buffered Service Worker generation.
+    if (video.readyState < 2 && typeof video.load === 'function') {
+      const targetTime = video.currentTime
+      let resumed = false
+      const resumeAtTarget = () => {
+        if (resumed) return
+        resumed = true
+        video.removeEventListener?.('loadedmetadata', resumeAtTarget)
+        if (Number.isFinite(targetTime) && targetTime > 0) video.currentTime = targetTime
+        const playResult = typeof video.play === 'function' ? video.play() : null
+        Promise.resolve(playResult).catch(() => {})
+      }
+      video.addEventListener?.('loadedmetadata', resumeAtTarget, { once: true })
+      try {
+        video.load()
+      } catch (_) {
+        resumeAtTarget()
+      }
+      return
+    }
     if (!video.paused) return
     const playResult = typeof video.play === 'function' ? video.play() : null
     Promise.resolve(playResult).catch(() => {})

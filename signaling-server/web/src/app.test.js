@@ -1244,6 +1244,55 @@ test('seek playback recovery calls play when data is flowing but playback stays 
   assert.equal(playCalls, 1)
 })
 
+test('seek playback recovery refetches a stalled unpaused video at the latest target', async () => {
+  let loadCalls = 0
+  let playCalls = 0
+  let loadedMetadata
+  const video = {
+    currentTime: 63.7,
+    paused: false,
+    readyState: 1,
+    addEventListener(type, handler) {
+      assert.equal(type, 'loadedmetadata')
+      loadedMetadata = handler
+    },
+    removeEventListener() {},
+    load() {
+      loadCalls += 1
+      this.currentTime = 0
+    },
+    play() {
+      playCalls += 1
+      return Promise.resolve()
+    },
+  }
+  const vp = {
+    generation: 4,
+    seeking: true,
+    awaitingSeekPlayback: true,
+    totalBytesReceived: 128 * 1024,
+    resumePlaybackTimer: null,
+  }
+
+  __test.scheduleSeekPlaybackRecovery(vp, {
+    delayMs: 0,
+    queryVideo: () => video,
+    isCurrentPreview: () => true,
+    setTimeoutFn(fn) {
+      fn()
+      return 1
+    },
+    clearTimeoutFn() {},
+  })
+
+  assert.equal(loadCalls, 1)
+  assert.equal(typeof loadedMetadata, 'function')
+  loadedMetadata()
+  await Promise.resolve()
+  assert.equal(video.currentTime, 63.7)
+  assert.equal(playCalls, 1)
+})
+
 test('a completed video range remains routed to the next seek range without refreshing the player', async () => {
   const swMessages = []
   const galleryCalls = []
@@ -1729,6 +1778,203 @@ test('accepted video seek replaces operation A with B and ignores stale A frames
     await __test.handleMediaMessage({ data: encodeChunkEnvelope('701', 5, new Uint8Array([2])).buffer })
     assert.deepEqual(swMessages.filter((message) => message.chunk).map((message) => [...message.chunk]), [[2]])
   } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setTransferSession({ channels: null, mode: null })
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+  }
+})
+
+test('rapid seeks serialize operation replacement without orphaning the accepted media stream', async () => {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const channels = fakeLaneSet()
+  const swMessages = []
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (value) => swMessages.push(value) } } },
+  })
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { querySelector: () => null } })
+  const vp = {
+    id: 'video', mediaId: 'video', operationId: '700', requestId: 'initial', generation: 5,
+    totalBytesReceived: 0, seekSentGeneration: null, freshSession: false,
+  }
+  __test.setTransferSession({ channels, mode: 'relay' })
+  __test.setCurrentVideoPreview(vp)
+  try {
+    assert.equal(__test.sendVideoSeek(vp, 100, 5), true)
+    const firstSeek = JSON.parse(channels.control.sent[0])
+
+    vp.generation = 6
+    vp.seekSentGeneration = null
+    assert.equal(__test.sendVideoSeek(vp, 200, 6), true)
+    vp.generation = 7
+    vp.seekSentGeneration = null
+    assert.equal(__test.sendVideoSeek(vp, 300, 7), true)
+    assert.equal(channels.control.sent.length, 1, 'the newer seek waits for the accepted parent operation')
+
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 5,
+      byte_offset: 100, operation_id: '701', request_id: firstSeek.request_id,
+    }) })
+
+    assert.equal(channels.control.sent.length, 2)
+    const secondSeek = JSON.parse(channels.control.sent[1])
+    assert.equal(secondSeek.operation_id, '701')
+    assert.equal(secondSeek.start_offset, 300)
+    assert.equal(secondSeek.generation, 7)
+
+    for (let i = 0; i < 17; i += 1) {
+      await __test.handleMediaMessage({
+        data: encodeChunkEnvelope('701', 5, new Uint8Array(64 * 1024)).buffer,
+      })
+    }
+    assert.equal(channels.closeCalls, 0)
+
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 7,
+      byte_offset: 300, operation_id: '702', request_id: secondSeek.request_id,
+    }) })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('702', 7, new Uint8Array([9])).buffer })
+
+    assert.equal(__test.getCurrentVideoPreview().operationId, '702')
+    assert.deepEqual(swMessages.filter((message) => message.chunk).map((message) => [...message.chunk]), [[9]])
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setTransferSession({ channels: null, mode: null })
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+  }
+})
+
+test('an exact Service Worker range replaces the queued estimate while an older seek is pending', async () => {
+  const channels = fakeLaneSet()
+  const vp = {
+    id: 'video', mediaId: 'video', operationId: '720', requestId: 'initial', generation: 8,
+    totalBytesReceived: 0, seekSentGeneration: null, freshSession: false,
+  }
+  __test.setTransferSession({ channels, mode: 'relay' })
+  __test.setCurrentVideoPreview(vp)
+  try {
+    assert.equal(__test.sendVideoSeek(vp, 100, 8), true)
+    const firstSeek = JSON.parse(channels.control.sent[0])
+
+    vp.generation = 9
+    vp.seekSentGeneration = null
+    assert.equal(__test.sendVideoSeek(vp, 200, 9), true)
+    assert.equal(__test.handleMediaRangeRequest({ mediaId: 'video', startOffset: 333, generation: 9 }), true)
+
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 8,
+      byte_offset: 100, operation_id: '721', request_id: firstSeek.request_id,
+    }) })
+
+    assert.equal(channels.control.sent.length, 2)
+    const exactSeek = JSON.parse(channels.control.sent[1])
+    assert.equal(exactSeek.operation_id, '721')
+    assert.equal(exactSeek.generation, 9)
+    assert.equal(exactSeek.start_offset, 333)
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setTransferSession({ channels: null, mode: null })
+  }
+})
+
+test('closing a video abandons its pending seek without letting late media close bulk', async () => {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const channels = fakeLaneSet()
+  const bulkBytes = []
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage() {} } } },
+  })
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { querySelector: () => null } })
+  const vp = {
+    id: 'video', mediaId: 'video', operationId: '730', requestId: 'initial', generation: 10,
+    totalBytesReceived: 0, seekSentGeneration: null, freshSession: false,
+  }
+  __test.setTransferSession({ channels, mode: 'relay' })
+  __test.setCurrentVideoPreview(vp)
+  __test.setCurrentFile({ name: 'video.mp4', operationId: '830', requestId: 'bulk-r' })
+  __test.setActiveDownload({ append: async (bytes) => bulkBytes.push([...bytes]) })
+  try {
+    assert.equal(__test.sendVideoSeek(vp, 400, 10), true)
+    const seek = JSON.parse(channels.control.sent[0])
+    __test.cleanupCurrentVideoPreview()
+
+    for (let i = 0; i < 17; i += 1) {
+      await __test.handleMediaMessage({
+        data: encodeChunkEnvelope('731', 10, new Uint8Array(64 * 1024)).buffer,
+      })
+    }
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 10,
+      byte_offset: 400, operation_id: '731', request_id: seek.request_id,
+    }) })
+    for (let i = 0; i < 129; i += 1) {
+      await __test.handleMediaMessage({ data: encodeChunkEnvelope('731', 10, new Uint8Array([1])).buffer })
+    }
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('830', 0, new Uint8Array([4])).buffer })
+
+    assert.equal(channels.closeCalls, 0)
+    assert.deepEqual(bulkBytes, [[4]])
+  } finally {
+    __test.setActiveDownload(null)
+    __test.setCurrentFile(null)
+    __test.setTransferSession({ channels: null, mode: null })
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+  }
+})
+
+test('a valid media operation can buffer the sender window before its header without closing bulk', async () => {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const channels = fakeLaneSet()
+  const swMessages = []
+  const bulkBytes = []
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (value) => swMessages.push(value) } } },
+  })
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { querySelector: () => null } })
+  const vp = {
+    id: 'video', mediaId: 'video', operationId: '710', requestId: 'initial', generation: 7,
+    totalBytesReceived: 0, seekSentGeneration: null, freshSession: false,
+  }
+  __test.setTransferSession({ channels, mode: 'direct' })
+  __test.setCurrentVideoPreview(vp)
+  __test.setCurrentFile({ name: 'video.mp4', operationId: '800', requestId: 'bulk-r' })
+  __test.setActiveDownload({ append: async (bytes) => bulkBytes.push([...bytes]) })
+  try {
+    assert.equal(__test.sendVideoSeek(vp, 300, 7), true)
+    const seek = JSON.parse(channels.control.sent[0])
+
+    for (let i = 0; i < 648; i += 1) {
+      await __test.handleMediaMessage({
+        data: encodeChunkEnvelope('711', 7, new Uint8Array(8 * 1024)).buffer,
+      })
+    }
+
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 7,
+      byte_offset: 300, operation_id: '711', request_id: seek.request_id,
+    }) })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('800', 0, new Uint8Array([4])).buffer })
+
+    assert.equal(channels.closeCalls, 0)
+    assert.equal(swMessages.filter((message) => message.chunk).length, 81)
+    assert.deepEqual(bulkBytes, [[4]])
+  } finally {
+    __test.setActiveDownload(null)
+    __test.setCurrentFile(null)
     __test.cleanupCurrentVideoPreview()
     __test.setTransferSession({ channels: null, mode: null })
     if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
