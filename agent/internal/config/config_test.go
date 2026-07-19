@@ -280,6 +280,76 @@ func TestLoad_PartialFileWithEnvFill(t *testing.T) {
 	}
 }
 
+func TestNewManager_MigratesLegacyDirectDefaultToRelay(t *testing.T) {
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	configDir := filepath.Join(homeDir, ".sharebridge")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", homeDir)
+
+	configPath := filepath.Join(configDir, "config.json")
+	legacyConfig := []byte(`{
+  "agent_api_key": "sb_agent_existing",
+  "default_relay_only": false
+}`)
+	if err := os.WriteFile(configPath, legacyConfig, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	if !mgr.Get().DefaultRelayOnly {
+		t.Fatal("DefaultRelayOnly = false after legacy config migration, want true")
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]any
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted["config_version"] != float64(currentConfigVersion) {
+		t.Fatalf("config_version = %v, want %d", persisted["config_version"], currentConfigVersion)
+	}
+	if relayOnly, ok := persisted["default_relay_only"].(bool); !ok || !relayOnly {
+		t.Fatalf("persisted default_relay_only = %v, want true", persisted["default_relay_only"])
+	}
+}
+
+func TestNewManager_PreservesExplicitDirectAfterRelayDefaultMigration(t *testing.T) {
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	configDir := filepath.Join(homeDir, ".sharebridge")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", homeDir)
+
+	configPath := filepath.Join(configDir, "config.json")
+	versionedConfig := []byte(`{
+  "config_version": 1,
+  "agent_api_key": "sb_agent_existing",
+  "default_relay_only": false
+}`)
+	if err := os.WriteFile(configPath, versionedConfig, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	if mgr.Get().DefaultRelayOnly {
+		t.Fatal("DefaultRelayOnly = true for an explicit versioned Direct preference, want false")
+	}
+}
+
 func TestSave(t *testing.T) {
 	tmpDir := t.TempDir()
 	homeDir := filepath.Join(tmpDir, "home")

@@ -11,9 +11,12 @@ import (
 	"strconv"
 )
 
+const currentConfigVersion = 1
+
 // Config holds all agent configuration settings.
 // JSON tags use snake_case for file persistence.
 type Config struct {
+	ConfigVersion       int    `json:"config_version"`
 	SignalingURL        string `json:"signaling_url"`
 	APIKey              string `json:"api_key,omitempty"`
 	AllowedHost         string `json:"allowed_host,omitempty"`    // OpenCloud hostname for CORS
@@ -40,6 +43,7 @@ type Config struct {
 type Manager struct {
 	filePath            string
 	config              *Config
+	configNeedsSave     bool
 	agentAPIKeyFromEnv  bool // if true, don't persist AgentAPIKey to disk
 	immichAPIKeyFromEnv bool // if true, don't persist ImmichAPIKey to disk
 }
@@ -65,6 +69,7 @@ func NewManager() (*Manager, error) {
 	}
 
 	m.config = cfg
+	needsSave := m.configNeedsSave
 
 	// Auto-generate AgentAPIKey if not set (first run or env override not provided)
 	if m.config.AgentAPIKey == "" {
@@ -73,8 +78,11 @@ func NewManager() (*Manager, error) {
 			return nil, fmt.Errorf("generate agent API key: %w", err)
 		}
 		m.config.AgentAPIKey = key
+		needsSave = true
+	}
+	if needsSave {
 		if err := m.save(); err != nil {
-			log.Printf("warning: could not persist auto-generated agent API key: %v", err)
+			log.Printf("warning: could not persist updated agent config: %v", err)
 		}
 	}
 
@@ -93,6 +101,7 @@ func (m *Manager) FilePath() string {
 
 // Save persists the configuration to the config file.
 func (m *Manager) Save(cfg *Config) error {
+	cfg.ConfigVersion = currentConfigVersion
 	m.config = cfg
 	return m.save()
 }
@@ -103,6 +112,7 @@ func (m *Manager) Save(cfg *Config) error {
 func (m *Manager) load() (*Config, error) {
 	// Set defaults for fields where 0 is a valid value (so file can override with 0)
 	cfg := &Config{
+		ConfigVersion:       currentConfigVersion,
 		DefaultExpiry:       24,
 		DefaultMaxDownloads: 10,
 		DefaultRelayOnly:    true,
@@ -119,6 +129,18 @@ func (m *Manager) load() (*Config, error) {
 	} else {
 		if err := json.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("malformed config.json: %w", err)
+		}
+
+		var metadata struct {
+			ConfigVersion int `json:"config_version"`
+		}
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			return nil, fmt.Errorf("read config version: %w", err)
+		}
+		if metadata.ConfigVersion < currentConfigVersion {
+			cfg.ConfigVersion = currentConfigVersion
+			cfg.DefaultRelayOnly = true
+			m.configNeedsSave = true
 		}
 	}
 
