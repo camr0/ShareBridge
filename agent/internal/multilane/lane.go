@@ -93,6 +93,9 @@ func LaneForClass(class TrafficClass) (Lane, error) {
 type Endpoint interface {
 	SendText(string) error
 	SendBinary([]byte) error
+	// SendBinaryClass preserves transport-neutral media sub-priority. The
+	// requested class must map to this endpoint's lane.
+	SendBinaryClass(TrafficClass, []byte) error
 	BufferedAmount() uint64
 	SetOnMessage(func([]byte))
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +37,180 @@ func TestSecureRelayChannelExposesAllLogicalLanes(t *testing.T) {
 	}
 	if channel.Endpoint(multilane.Lane(0x03)) != nil {
 		t.Fatal("reserved lane unexpectedly has an endpoint")
+	}
+}
+
+func TestSecureRelayEndpointThumbnailPriorityAndLaneValidation(t *testing.T) {
+	channel, err := NewSecureRelayChannel(SecureRelayConfig{RelayURL: "ws://relay.test", RelayJWT: "token", StaticPrivate: mustGenerateKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = channel.scheduler.Close()
+	classes := make(chan multilane.TrafficClass, 8)
+	release := make(chan struct{}, 8)
+	channel.scheduler = multilane.NewScheduler(func(class multilane.TrafficClass, _ multilane.Kind, _ []byte) error {
+		classes <- class
+		<-release
+		return nil
+	})
+	t.Cleanup(func() { _ = channel.scheduler.Close() })
+
+	media := channel.Endpoint(multilane.LaneMedia)
+	if err := media.SendBinaryClass(multilane.ClassBulk, []byte{1}); err == nil {
+		t.Fatal("media endpoint accepted bulk traffic class")
+	}
+
+	errs := make(chan error, 8)
+	go func() {
+		errs <- media.SendBinaryClass(multilane.ClassInteractiveMedia, make([]byte, multilane.BaseQuantumBytes))
+	}()
+	first := <-classes
+	for i := 0; i < 5; i++ {
+		go func() {
+			errs <- media.SendBinaryClass(multilane.ClassInteractiveMedia, make([]byte, multilane.BaseQuantumBytes))
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		go func() {
+			errs <- media.SendBinaryClass(multilane.ClassThumbnail, make([]byte, multilane.BaseQuantumBytes))
+		}()
+	}
+	// Hold the active write until all remaining producers have entered the
+	// adapter's bounded scheduler, making both media subqueues continuously busy.
+	time.Sleep(20 * time.Millisecond)
+	release <- struct{}{}
+	got := []multilane.TrafficClass{first}
+	for len(got) < 8 {
+		got = append(got, <-classes)
+		release <- struct{}{}
+	}
+	for range got {
+		if err := <-errs; err != nil {
+			t.Fatalf("SendBinaryClass: %v", err)
+		}
+	}
+	want := []multilane.TrafficClass{
+		multilane.ClassInteractiveMedia, multilane.ClassInteractiveMedia,
+		multilane.ClassInteractiveMedia, multilane.ClassThumbnail,
+	}
+	if !slices.Equal(got[1:5], want) {
+		t.Fatalf("continuously busy media classes = %v, want %v", got[1:5], want)
+	}
+}
+
+func TestSecureRelayEndpointsScheduleConcurrentMediaAndBulkThreeToOne(t *testing.T) {
+	channel, _ := NewSecureRelayChannel(SecureRelayConfig{RelayURL: "ws://relay.test", RelayJWT: "token", StaticPrivate: mustGenerateKey()})
+	_ = channel.scheduler.Close()
+	classes := make(chan multilane.TrafficClass, 9)
+	release := make(chan struct{}, 9)
+	channel.scheduler = multilane.NewScheduler(func(class multilane.TrafficClass, _ multilane.Kind, _ []byte) error {
+		classes <- class
+		<-release
+		return nil
+	})
+	t.Cleanup(func() { _ = channel.scheduler.Close() })
+	results := make(chan error, 9)
+	media := channel.Endpoint(multilane.LaneMedia)
+	bulk := channel.Endpoint(multilane.LaneBulk)
+	go func() { results <- media.SendBinary(make([]byte, multilane.BaseQuantumBytes)) }()
+	got := []multilane.TrafficClass{<-classes}
+	for i := 0; i < 6; i++ {
+		go func() { results <- media.SendBinary(make([]byte, multilane.BaseQuantumBytes)) }()
+	}
+	for i := 0; i < 2; i++ {
+		go func() { results <- bulk.SendBinary(make([]byte, multilane.BaseQuantumBytes)) }()
+	}
+	time.Sleep(20 * time.Millisecond)
+	release <- struct{}{}
+	for len(got) < 9 {
+		got = append(got, <-classes)
+		release <- struct{}{}
+	}
+	for range got {
+		if err := <-results; err != nil {
+			t.Fatalf("endpoint send: %v", err)
+		}
+	}
+	want := []multilane.TrafficClass{
+		multilane.ClassInteractiveMedia, multilane.ClassInteractiveMedia,
+		multilane.ClassInteractiveMedia, multilane.ClassBulk,
+	}
+	if !slices.Equal(got[1:5], want) {
+		t.Fatalf("continuously busy outer classes = %v, want %v", got[1:5], want)
+	}
+}
+
+func TestSecureRelayEndpointRejectsOversizeBeforeWriterAndKeepsSessionUsable(t *testing.T) {
+	channel, _ := NewSecureRelayChannel(SecureRelayConfig{RelayURL: "ws://relay.test", RelayJWT: "token", StaticPrivate: mustGenerateKey()})
+	_ = channel.scheduler.Close()
+	writes := 0
+	channel.scheduler = multilane.NewScheduler(func(_ multilane.TrafficClass, _ multilane.Kind, _ []byte) error { writes++; return nil })
+	t.Cleanup(func() { _ = channel.scheduler.Close() })
+	control := channel.Endpoint(multilane.LaneControl)
+	if err := control.SendBinary(make([]byte, MaxRelayPayloadBytes+1)); err == nil {
+		t.Fatal("boundary+1 payload was accepted")
+	}
+	if writes != 0 {
+		t.Fatalf("oversize payload reached writer %d times", writes)
+	}
+	if err := control.SendBinary(make([]byte, MaxRelayPayloadBytes)); err != nil {
+		t.Fatalf("exact boundary rejected: %v", err)
+	}
+	if err := control.SendBinary([]byte{1}); err != nil {
+		t.Fatalf("following payload rejected: %v", err)
+	}
+	if writes != 2 {
+		t.Fatalf("writes = %d, want 2", writes)
+	}
+}
+
+func TestSecureRelayEndpointBackpressureAndWriterFailureUnblockAll(t *testing.T) {
+	channel, _ := NewSecureRelayChannel(SecureRelayConfig{RelayURL: "ws://relay.test", RelayJWT: "token", StaticPrivate: mustGenerateKey()})
+	_ = channel.scheduler.Close()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	wantErr := fmt.Errorf("relay writer failed")
+	channel.scheduler = multilane.NewScheduler(func(_ multilane.TrafficClass, _ multilane.Kind, _ []byte) error {
+		entered <- struct{}{}
+		<-release
+		return wantErr
+	})
+	t.Cleanup(func() { _ = channel.scheduler.Close() })
+
+	bulk := channel.Endpoint(multilane.LaneBulk)
+	results := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		go func() { results <- bulk.SendBinary(make([]byte, multilane.BaseQuantumBytes)) }()
+	}
+	<-entered
+	select {
+	case err := <-results:
+		t.Fatalf("sender returned before writer released: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	for i := 0; i < 5; i++ {
+		if err := <-results; err == nil {
+			t.Fatal("sender was not unblocked with an error")
+		}
+	}
+}
+
+func TestSecureRelayChannelStartFailureClosesLifecycleOnce(t *testing.T) {
+	channel, _ := NewSecureRelayChannel(SecureRelayConfig{RelayURL: "ws://127.0.0.1:1", RelayJWT: "token", StaticPrivate: mustGenerateKey()})
+	closed := 0
+	channel.SetOnClose(func() { closed++ })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := channel.Start(ctx); err == nil {
+		t.Fatal("Start unexpectedly succeeded")
+	}
+	_ = channel.Close()
+	if closed != 1 {
+		t.Fatalf("onClose calls = %d, want 1", closed)
+	}
+	if err := channel.Endpoint(multilane.LaneControl).SendText("after failure"); err == nil {
+		t.Fatal("scheduler remained usable after failed Start")
 	}
 }
 
@@ -220,7 +395,7 @@ func TestSecureRelayChannel_SendBinary(t *testing.T) {
 			t.Fatalf("Decrypt binary: %v", err)
 		}
 		binLane, binPayload, err := multilane.DecodeEnvelope(binPlain)
-		if err != nil || binLane != multilane.LaneBulk || string(binPayload) != "binary-data" {
+		if err != nil || binLane != multilane.LaneMedia || string(binPayload) != "binary-data" {
 			t.Fatalf("binary envelope lane=%d payload=%s err=%v", binLane, binPayload, err)
 		}
 
@@ -245,7 +420,7 @@ func TestSecureRelayChannel_SendBinary(t *testing.T) {
 	defer channel.Close()
 
 	// Send binary
-	if err := channel.Endpoint(multilane.LaneBulk).SendBinary([]byte("binary-data")); err != nil {
+	if err := channel.Endpoint(multilane.LaneMedia).SendBinaryClass(multilane.ClassThumbnail, []byte("binary-data")); err != nil {
 		t.Fatalf("SendBinary: %v", err)
 	}
 
@@ -438,19 +613,6 @@ func TestSecureRelayChannel_CloseCallsOnClose(t *testing.T) {
 	}
 }
 
-func TestSecureRelayChannel_EndpointsExposeNoNativeBufferedAmount(t *testing.T) {
-	channel, _ := NewSecureRelayChannel(SecureRelayConfig{
-		RelayURL:      "ws://test",
-		RelayJWT:      "token",
-		StaticPrivate: mustGenerateKey(),
-	})
-	for _, lane := range []multilane.Lane{multilane.LaneControl, multilane.LaneMedia, multilane.LaneBulk} {
-		if channel.Endpoint(lane).BufferedAmount() != 0 {
-			t.Fatalf("Endpoint(%d).BufferedAmount should return 0", lane)
-		}
-	}
-}
-
 func TestSecureRelayChannel_HandshakeFailure(t *testing.T) {
 	serverStatic, _ := ecdh.P256().GenerateKey(rand.Reader)
 
@@ -470,6 +632,8 @@ func TestSecureRelayChannel_HandshakeFailure(t *testing.T) {
 		RelayJWT:      "relay.jwt.token",
 		StaticPrivate: serverStatic,
 	})
+	closed := 0
+	channel.SetOnClose(func() { closed++ })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -480,6 +644,13 @@ func TestSecureRelayChannel_HandshakeFailure(t *testing.T) {
 	// Should contain noise error about expected 65 bytes
 	if !strings.Contains(err.Error(), "expected 65 bytes") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = channel.Close()
+	if closed != 1 {
+		t.Fatalf("onClose calls = %d, want 1", closed)
+	}
+	if err := channel.Endpoint(multilane.LaneControl).SendText("after failed handshake"); err == nil {
+		t.Fatal("scheduler remained usable after failed Noise handshake")
 	}
 }
 
@@ -565,6 +736,46 @@ func TestSecureRelayChannel_InvalidEncryptedLaneClosesWholeSet(t *testing.T) {
 		// success - one invalid encrypted lane closes the shared relay set
 	case <-time.After(2 * time.Second):
 		t.Fatal("onClose was not called after invalid encrypted lane")
+	}
+}
+
+func TestSecureRelayChannelRejectsTrailingFrameInWebSocketMessage(t *testing.T) {
+	serverStatic, _ := ecdh.P256().GenerateKey(rand.Reader)
+	onCloseCalled := make(chan struct{}, 1)
+	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _ := websocket.Accept(w, r, nil)
+		defer conn.CloseNow()
+		ctx := r.Context()
+		_, _, _ = conn.Read(ctx)
+		initiator, _ := noise.NewInitiator()
+		msg1, _ := initiator.WriteMessage1()
+		_ = conn.Write(ctx, websocket.MessageBinary, mustFrame(FrameHandshake, msg1))
+		_, msg2Frame, _ := conn.Read(ctx)
+		msg2, _ := mustDecodeFramePayload(msg2Frame, FrameHandshake)
+		_ = initiator.ReadMessage2(msg2)
+		msg3, _ := initiator.WriteMessage3()
+		_ = conn.Write(ctx, websocket.MessageBinary, mustFrame(FrameHandshake, msg3))
+		iSend, _ := initiator.Split()
+		first, _ := iSend.Encrypt(nil, mustEnvelope(t, multilane.LaneControl, []byte("one")))
+		second, _ := iSend.Encrypt(nil, mustEnvelope(t, multilane.LaneControl, []byte("two")))
+		combined := append(mustFrame(FrameText, first), mustFrame(FrameText, second)...)
+		_ = conn.Write(ctx, websocket.MessageBinary, combined)
+	}))
+	defer relayServer.Close()
+
+	channel, _ := NewSecureRelayChannel(SecureRelayConfig{
+		RelayURL: "ws" + strings.TrimPrefix(relayServer.URL, "http"), RelayJWT: "relay.jwt.token", StaticPrivate: serverStatic,
+	})
+	channel.SetOnClose(func() { onCloseCalled <- struct{}{} })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := channel.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-onCloseCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onClose was not called after trailing relay frame")
 	}
 }
 

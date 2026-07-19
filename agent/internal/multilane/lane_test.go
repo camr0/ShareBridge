@@ -19,6 +19,7 @@ func (endpoint *testEndpoint) SendText(text string) error {
 }
 
 func (*testEndpoint) SendBinary([]byte) error                    { return nil }
+func (*testEndpoint) SendBinaryClass(TrafficClass, []byte) error { return nil }
 func (*testEndpoint) BufferedAmount() uint64                     { return 0 }
 func (endpoint *testEndpoint) SetOnMessage(handler func([]byte)) { endpoint.onMessage = handler }
 

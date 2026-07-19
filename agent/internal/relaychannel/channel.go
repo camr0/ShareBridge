@@ -38,6 +38,12 @@ type SecureRelayChannel struct {
 // framing and Noise overhead.
 const relayWebSocketReadLimit = 10 * 1024 * 1024
 
+const (
+	noiseAEADOverheadBytes = 16
+	// MaxRelayPayloadBytes leaves room for the encrypted lane byte and AES-GCM tag.
+	MaxRelayPayloadBytes = MaxFramePayload - 1 - noiseAEADOverheadBytes
+)
+
 func NewSecureRelayChannel(cfg SecureRelayConfig) (*SecureRelayChannel, error) {
 	if cfg.RelayURL == "" || cfg.RelayJWT == "" || cfg.StaticPrivate == nil {
 		return nil, fmt.Errorf("relaychannel: missing required config")
@@ -66,6 +72,17 @@ func (c *SecureRelayChannel) Endpoint(lane multilane.Lane) multilane.Endpoint {
 }
 
 func (c *SecureRelayChannel) Start(ctx context.Context) error {
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		_ = c.scheduler.Close()
+		if c.conn != nil {
+			c.conn.CloseNow()
+		}
+		c.notifyClose()
+	}()
 	conn, _, err := websocket.Dial(ctx, c.cfg.RelayURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial relay websocket: %w", err)
@@ -100,6 +117,7 @@ func (c *SecureRelayChannel) Start(ctx context.Context) error {
 	if c.onOpen != nil {
 		c.onOpen()
 	}
+	started = true
 	return nil
 }
 
@@ -159,10 +177,15 @@ func (c *SecureRelayChannel) readLoop(ctx context.Context) {
 			log.Printf("relaychannel: read loop ended: %v", err)
 			return
 		}
-		frame, _, err := DecodeOneFrame(data)
+		frame, rest, err := DecodeOneFrame(data)
 		if err != nil {
 			log.Printf("relaychannel: invalid relay frame bytes=%d: %v", len(data), err)
 			c.conn.Close(websocket.StatusPolicyViolation, "invalid relay frame")
+			return
+		}
+		if len(rest) != 0 {
+			log.Printf("relaychannel: trailing relay frame bytes=%d", len(rest))
+			c.conn.Close(websocket.StatusPolicyViolation, "multiple relay frames in websocket message")
 			return
 		}
 		if frame.Kind != FrameText && frame.Kind != FrameBinary {
@@ -269,11 +292,29 @@ type relayEndpoint struct {
 }
 
 func (e *relayEndpoint) SendText(text string) error {
-	return e.owner.scheduler.Send(context.Background(), classForLane(e.lane), multilane.KindText, []byte(text))
+	return e.send(classForLane(e.lane), multilane.KindText, []byte(text))
 }
 
 func (e *relayEndpoint) SendBinary(data []byte) error {
-	return e.owner.scheduler.Send(context.Background(), classForLane(e.lane), multilane.KindBinary, data)
+	return e.send(classForLane(e.lane), multilane.KindBinary, data)
+}
+
+func (e *relayEndpoint) SendBinaryClass(class multilane.TrafficClass, data []byte) error {
+	lane, err := multilane.LaneForClass(class)
+	if err != nil {
+		return err
+	}
+	if lane != e.lane {
+		return fmt.Errorf("relaychannel: traffic class %d maps to lane %d, not endpoint lane %d", class, lane, e.lane)
+	}
+	return e.send(class, multilane.KindBinary, data)
+}
+
+func (e *relayEndpoint) send(class multilane.TrafficClass, kind multilane.Kind, payload []byte) error {
+	if len(payload) > MaxRelayPayloadBytes {
+		return fmt.Errorf("relaychannel: payload is %d bytes, maximum is %d", len(payload), MaxRelayPayloadBytes)
+	}
+	return e.owner.scheduler.Send(context.Background(), class, kind, payload)
 }
 
 func (e *relayEndpoint) BufferedAmount() uint64 { return 0 }

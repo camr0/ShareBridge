@@ -1,5 +1,5 @@
 import { NoiseXX } from '../noise-p256/index.js'
-import { FRAME_HANDSHAKE, FRAME_TEXT, FRAME_BINARY, FrameDecoder, writeFrame } from './frame.js'
+import { FRAME_HANDSHAKE, FRAME_TEXT, FRAME_BINARY, MAX_FRAME_PAYLOAD, FrameDecoder, writeFrame } from './frame.js'
 import { createChannelSet } from './channelSet.js'
 import { LaneScheduler } from './laneScheduler.js'
 import {
@@ -18,6 +18,9 @@ const DEBUG = typeof location !== 'undefined' && (
   location.search.includes('debug=1') ||
   (typeof localStorage !== 'undefined' && localStorage.getItem('sharebridge_debug'))
 )
+
+const NOISE_AEAD_OVERHEAD_BYTES = 16
+export const MAX_RELAY_PAYLOAD_BYTES = MAX_FRAME_PAYLOAD - 1 - NOISE_AEAD_OVERHEAD_BYTES
 
 function debugLog(...args) {
   if (DEBUG) console.log('[secure-relay]', ...args)
@@ -55,6 +58,15 @@ export class SecureRelayChannel {
   }
 
   async start() {
+    try {
+      return await this._start()
+    } catch (error) {
+      this._closeAll(error?.message ?? 'relay start failed')
+      throw error
+    }
+  }
+
+  async _start() {
     debugLog('SecureRelayChannel.start() called')
     this._noise = await NoiseXX.createInitiator()
     this._channelSet = createChannelSet()
@@ -276,6 +288,9 @@ class RelayLaneEndpoint {
   send(value) {
     const isText = typeof value === 'string'
     const payload = isText ? new TextEncoder().encode(value) : toUint8Array(value)
+    if (payload.byteLength > MAX_RELAY_PAYLOAD_BYTES) {
+      throw new RangeError(`relay payload is ${payload.byteLength} bytes; maximum is ${MAX_RELAY_PAYLOAD_BYTES}`)
+    }
     const completion = this._owner._scheduler.send({
       className: this.className,
       kind: isText ? FRAME_TEXT : FRAME_BINARY,
@@ -286,9 +301,19 @@ class RelayLaneEndpoint {
   }
 
   sendThumbnail(value) {
+    return this.sendBinaryClass(TRAFFIC_CLASS_THUMBNAIL, value)
+  }
+
+  sendBinaryClass(className, value) {
+    if (laneForClass(className) !== this.lane) {
+      throw new RangeError(`traffic class ${className} does not map to relay lane ${this.lane}`)
+    }
     const payload = toUint8Array(value)
+    if (payload.byteLength > MAX_RELAY_PAYLOAD_BYTES) {
+      throw new RangeError(`relay payload is ${payload.byteLength} bytes; maximum is ${MAX_RELAY_PAYLOAD_BYTES}`)
+    }
     const completion = this._owner._scheduler.send({
-      className: TRAFFIC_CLASS_THUMBNAIL,
+      className,
       kind: FRAME_BINARY,
       payload,
     })

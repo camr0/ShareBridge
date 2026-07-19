@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { NoiseXX } from '../noise-p256/index.js'
 import { FRAME_HANDSHAKE, FRAME_TEXT, FRAME_BINARY, writeFrame, FrameDecoder } from './frame.js'
-import { SecureRelayChannel } from './secureRelayChannel.js'
+import { MAX_RELAY_PAYLOAD_BYTES, SecureRelayChannel } from './secureRelayChannel.js'
 import { generateKeypair } from '../noise-p256/keys.js'
 import {
   LANE_CONTROL,
@@ -62,7 +62,6 @@ test('SecureRelayChannel performs Noise handshake, pins static key, and exchange
     expectedStaticPub: responderStatic.publicKeyBytes,
     websocketFactory: () => socket,
   })
-
   channel.onopen = () => seen.push('open')
   channel.onmessage = (event) => seen.push(event.data)
 
@@ -130,6 +129,80 @@ test('SecureRelayChannel exposes the required logical lane endpoints', () => {
   assert.notEqual(channel.media, channel.bulk)
 })
 
+test('relay endpoints enforce plaintext cap before encryption and keep the session usable', async () => {
+  const socket = createMockRelaySocket()
+  socket.readyState = 1
+  let encryptCalls = 0
+  const channel = new SecureRelayChannel({
+    relayURL: 'ws://relay.test', relayToken: 'token', expectedStaticPub: new Uint8Array(65), websocketFactory: () => socket,
+  })
+  channel._socket = socket
+  channel._sendCipher = { async encrypt() { encryptCalls++; return new Uint8Array([1]) } }
+
+  assert.throws(() => channel.control.send(new Uint8Array(MAX_RELAY_PAYLOAD_BYTES + 1)), /maximum/i)
+  assert.equal(encryptCalls, 0)
+  await channel.control.send(new Uint8Array(MAX_RELAY_PAYLOAD_BYTES))
+  await channel.control.send(new Uint8Array([1]))
+  assert.equal(encryptCalls, 2)
+  assert.notEqual(channel.readyState, 'closed')
+  channel.close()
+})
+
+test('media endpoint schedules interactive and thumbnail traffic three to one on the media lane', async () => {
+  const socket = createMockRelaySocket()
+  socket.readyState = 1
+  const plaintexts = []
+  const channel = new SecureRelayChannel({
+    relayURL: 'ws://relay.test', relayToken: 'token', expectedStaticPub: new Uint8Array(65), websocketFactory: () => socket,
+  })
+  channel._socket = socket
+  channel._sendCipher = { async encrypt(_ad, plaintext) { plaintexts.push(new Uint8Array(plaintext)); return new Uint8Array([1]) } }
+  const interactive = Array.from({ length: 6 }, () => channel.media.send(new Uint8Array(64 * 1024).fill(0x10)))
+  const thumbnails = Array.from({ length: 2 }, () => channel.media.sendThumbnail(new Uint8Array(64 * 1024).fill(0x20)))
+  await Promise.all([...interactive, ...thumbnails])
+  const decoded = plaintexts.map(decodeLaneEnvelope)
+  assert.ok(decoded.every(({ lane }) => lane === LANE_MEDIA))
+  assert.deepEqual(decoded.slice(0, 4).map(({ payload }) => payload[0]), [0x10, 0x10, 0x10, 0x20])
+  assert.throws(() => channel.media.sendBinaryClass('bulk', new Uint8Array([1])), /does not map/i)
+  channel.close()
+})
+
+test('relay adapter backpressure and writer failure reject every sender', async () => {
+  const socket = createMockRelaySocket()
+  socket.readyState = 1
+  let rejectWriter
+  const blocked = new Promise((_resolve, reject) => { rejectWriter = reject })
+  let encryptCalls = 0
+  const channel = new SecureRelayChannel({
+    relayURL: 'ws://relay.test', relayToken: 'token', expectedStaticPub: new Uint8Array(65), websocketFactory: () => socket,
+  })
+  channel._socket = socket
+  channel._sendCipher = { encrypt() { encryptCalls++; return blocked } }
+  const sends = Array.from({ length: 5 }, () => channel.bulk.send(new Uint8Array(64 * 1024)))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(encryptCalls, 1)
+  rejectWriter(new Error('writer failed'))
+  const results = await Promise.allSettled(sends)
+  assert.ok(results.every(({ status }) => status === 'rejected'))
+  assert.equal(channel.readyState, 'closed')
+})
+
+test('start failure cleans socket, scheduler, timer, and close callback exactly once', async () => {
+  let closes = 0
+  const channel = new SecureRelayChannel({
+    relayURL: 'ws://relay.test',
+    relayToken: 'token',
+    expectedStaticPub: new Uint8Array(65),
+    websocketFactory: () => { throw new Error('factory failed') },
+  })
+  channel.onclose = () => { closes++ }
+  await assert.rejects(() => channel.start(), /factory failed/i)
+  channel.close()
+  assert.equal(closes, 1)
+  assert.equal(channel.readyState, 'closed')
+  await assert.rejects(() => channel.control.send(new Uint8Array([1])), /closed/i)
+})
+
 test('SecureRelayChannel fails closed on responder static-key mismatch', async () => {
   const socket = createMockRelaySocket()
   const responderStatic = await generateKeypair()
@@ -141,6 +214,8 @@ test('SecureRelayChannel fails closed on responder static-key mismatch', async (
     expectedStaticPub: wrongStatic.publicKeyBytes,
     websocketFactory: () => socket,
   })
+  let closeCalls = 0
+  channel.onclose = () => { closeCalls++ }
 
   socket.readyState = 1
   const started = channel.start()
@@ -152,6 +227,8 @@ test('SecureRelayChannel fails closed on responder static-key mismatch', async (
   socket.pushMessage(writeFrame(FRAME_HANDSHAKE, await responder.writeMessage2()))
 
   await assert.rejects(() => started, /unexpected agent static key/i)
+  channel.close()
+  assert.equal(closeCalls, 1)
 })
 
 test('SecureRelayChannel reports one close after websocket opens', async () => {
