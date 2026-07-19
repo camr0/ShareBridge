@@ -20,6 +20,7 @@ import (
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/immich"
+	"sharebridge/agent/internal/multilane"
 	"sharebridge/agent/internal/peer"
 	"sharebridge/agent/internal/relaychannel"
 	"sharebridge/agent/internal/signaling"
@@ -33,17 +34,12 @@ type nonceEntry struct {
 	expiresAt time.Time
 }
 
-// relayTransferChannel is the interface for relay transfer channels.
-// It matches transfer.DataChannel plus lifecycle methods.
+// relayTransferChannel is a multi-lane transfer session with a startable relay
+// lifecycle. Application handlers are installed only after transport v2 is
+// ready.
 type relayTransferChannel interface {
+	multilane.ChannelSet
 	Start(ctx context.Context) error
-	SendBinary(data []byte) error
-	SendText(text string) error
-	BufferedAmount() uint64
-	Close() error
-	SetOnMessage(handler func([]byte))
-	SetOnOpen(handler func())
-	SetOnClose(handler func())
 }
 
 // relayChannelConfig holds configuration for creating a relay channel.
@@ -753,6 +749,68 @@ func (d *Daemon) handlePasswordSubmit(connID, sessionCode, password string) {
 	_ = d.signaling.Send(context.Background(), map[string]any{"type": "auth_ok", "conn_id": connID, "code": sessionCode})
 }
 
+// wireDirectTransferSession waits for Peer.SetOnOpen, which is fired only after
+// all three direct lanes are open and the transport v2 handshake has completed.
+func (d *Daemon) wireDirectTransferSession(session *Session, peerID string, channels multilane.ChannelSet) {
+	channels.SetOnOpen(func() {
+		log.Printf("DataChannel lanes ready for peer %s (session %s)", peerID, session.Code)
+		d.activateTransferSession(session, peerID, channels)
+	})
+}
+
+// wireRelayTransferSession installs the application-version responder over the
+// already Noise-authenticated relay transport. The transfer manager is not
+// created until transport_hello version 2 has been acknowledged.
+func (d *Daemon) wireRelayTransferSession(session *Session, channels multilane.ChannelSet) {
+	multilane.InstallHandshakeResponder(channels, func() {
+		d.activateTransferSession(session, "", channels)
+	})
+}
+
+func (d *Daemon) activateTransferSession(session *Session, peerID string, channels multilane.ChannelSet) {
+	var tm *transfer.Manager
+	if session.ShareType == "immich" {
+		galleryBackend, ok := session.immichClient.(transfer.GalleryBackend)
+		if !ok {
+			log.Printf("Immich session %s has no gallery transfer backend", session.Code)
+			_ = channels.Close()
+			return
+		}
+		tm = transfer.NewGalleryManager(channels, galleryBackend, session.MaxDownloads)
+	} else {
+		tm = transfer.NewManager(channels, session.webdavClient, session.MaxDownloads)
+	}
+	session.mu.Lock()
+	downloads := session.Downloads
+	session.mu.Unlock()
+	tm.SetDownloadCount(downloads)
+
+	tm.OnSessionExpired = func() {
+		message := map[string]any{
+			"type":       "session_expired",
+			"session_id": session.Code,
+		}
+		if peerID != "" {
+			message["peer_id"] = peerID
+		}
+		_ = d.signaling.Send(context.Background(), message)
+	}
+	tm.OnDownloadComplete = func(bytesTransferred int64) {
+		session.mu.Lock()
+		session.Downloads++
+		newCount := session.Downloads
+		session.mu.Unlock()
+
+		if _, err := d.store.IncrementDownloads(session.Code); err != nil {
+			log.Printf("warning: could not persist download count: %v", err)
+		}
+		_ = d.signaling.DownloadComplete(context.Background(), session.Code, bytesTransferred)
+		log.Printf("download complete for session %s (count: %d)", session.Code, newCount)
+	}
+
+	tm.HandleOpen()
+}
+
 // createPeer creates a WebRTC peer connection for a browser joining a session.
 func (d *Daemon) createPeer(connID, sessionCode string) {
 	d.mu.RLock()
@@ -804,50 +862,7 @@ func (d *Daemon) createPeer(connID, sessionCode string) {
 		})
 	})
 
-	// Create transfer manager
-	var tm *transfer.Manager
-	if session.ShareType == "immich" {
-		galleryBackend, ok := session.immichClient.(transfer.GalleryBackend)
-		if !ok {
-			log.Printf("Immich session %s has no gallery transfer backend", sessionCode)
-			return
-		}
-		tm = transfer.NewGalleryManager(p, galleryBackend, session.MaxDownloads)
-	} else {
-		tm = transfer.NewManager(p, session.webdavClient, session.MaxDownloads)
-	}
-	tm.SetDownloadCount(session.Downloads)
-
-	// Wire transfer callbacks
-	tm.OnSessionExpired = func() {
-		d.signaling.Send(context.Background(), map[string]any{
-			"type":       "session_expired",
-			"session_id": sessionCode,
-			"peer_id":    connID,
-		})
-	}
-	tm.OnDownloadComplete = func(bytesTransferred int64) {
-		// Update session download count
-		session.mu.Lock()
-		session.Downloads++
-		newCount := session.Downloads
-		session.mu.Unlock()
-
-		// Persist to store
-		if _, err := d.store.IncrementDownloads(sessionCode); err != nil {
-			log.Printf("warning: could not persist download count: %v", err)
-		}
-
-		// Notify server for tier tracking
-		d.signaling.DownloadComplete(context.Background(), sessionCode, bytesTransferred)
-
-		log.Printf("download complete for session %s (count: %d)", sessionCode, newCount)
-	}
-
-	p.SetOnOpen(func() {
-		log.Printf("DataChannel open for peer %s (session %s)", connID, sessionCode)
-		tm.HandleOpen()
-	})
+	d.wireDirectTransferSession(session, connID, p)
 
 	// Create offer and send to signaling server
 	sdp, err := p.CreateOffer()
@@ -855,8 +870,6 @@ func (d *Daemon) createPeer(connID, sessionCode string) {
 		log.Printf("create offer for session %s: %v", sessionCode, err)
 		return
 	}
-	p.SetOnMessage(tm.HandleMessage)
-
 	d.signaling.Send(context.Background(), map[string]any{
 		"type":       "offer",
 		"session_id": sessionCode,
@@ -999,44 +1012,18 @@ func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
 		channel = rc
 	}
 
-	// Create transfer manager for this relay channel
-	var tm *transfer.Manager
-	if session.ShareType == "immich" {
-		galleryBackend, ok := session.immichClient.(transfer.GalleryBackend)
-		if !ok {
-			log.Printf("Immich session %s has no gallery transfer backend", msg.Code)
-			return
-		}
-		tm = transfer.NewGalleryManager(channel, galleryBackend, session.MaxDownloads)
-	} else {
-		tm = transfer.NewManager(channel, session.webdavClient, session.MaxDownloads)
-	}
-	tm.SetDownloadCount(session.Downloads)
+	d.wireRelayTransferSession(session, channel)
 
-	// Wire transfer callbacks
-	tm.OnSessionExpired = func() {
-		_ = d.signaling.Send(context.Background(), map[string]any{
-			"type":       "session_expired",
-			"session_id": msg.Code,
-		})
-	}
-	tm.OnDownloadComplete = func(bytesTransferred int64) {
-		session.mu.Lock()
-		session.Downloads++
-		session.mu.Unlock()
-		if _, err := d.store.IncrementDownloads(msg.Code); err != nil {
-			log.Printf("persist download count: %v", err)
-		}
-		_ = d.signaling.DownloadComplete(context.Background(), msg.Code, bytesTransferred)
-	}
-
-	// Wire channel callbacks
-	channel.SetOnMessage(tm.HandleMessage)
-	channel.SetOnOpen(tm.HandleOpen)
+	// Any required-lane closure is a terminal channel-set closure. Guard the
+	// daemon cleanup too so repeated transport notifications cannot tear down a
+	// replacement entry with the same SID.
+	var removeOnce sync.Once
 	channel.SetOnClose(func() {
-		session.mu.Lock()
-		delete(session.relayChannels, msg.SID)
-		session.mu.Unlock()
+		removeOnce.Do(func() {
+			session.mu.Lock()
+			delete(session.relayChannels, msg.SID)
+			session.mu.Unlock()
+		})
 	})
 
 	// Add channel to session
@@ -1389,7 +1376,12 @@ func (d *Daemon) closeSessionResourcesWithError(session *Session, message string
 			log.Printf("marshal session close error: %v", err)
 		} else {
 			for sid, rc := range session.relayChannels {
-				if err := rc.SendText(string(msg)); err != nil {
+				control := rc.Endpoint(multilane.LaneControl)
+				if control == nil {
+					log.Printf("notify relay channel %s before close: missing control lane", sid)
+					continue
+				}
+				if err := control.SendText(string(msg)); err != nil {
 					log.Printf("notify relay channel %s before close: %v", sid, err)
 				}
 			}

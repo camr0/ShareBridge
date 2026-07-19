@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/immich"
+	"sharebridge/agent/internal/multilane"
 	"sharebridge/agent/internal/peer"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
@@ -1130,13 +1131,91 @@ func TestDaemonGetsRelayStaticKey(t *testing.T) {
 // mockRelayChannel implements relayTransferChannel for testing.
 type mockRelayChannel struct {
 	startFn      func(context.Context) error
-	sendBinaryFn func([]byte) error
-	sendTextFn   func(string) error
-	bufferedFn   func() uint64
 	closeFn      func() error
-	onMessage    func([]byte)
 	onOpen       func()
 	onClose      func()
+	mu           sync.Mutex
+	endpoints    map[multilane.Lane]*mockRelayEndpoint
+	endpointHits map[multilane.Lane]int
+	closeCalls   int
+}
+
+type mockRelayEndpoint struct {
+	mu         sync.Mutex
+	onMessage  func([]byte)
+	sentText   []string
+	sentClass  []multilane.TrafficClass
+	sendTextFn func(string) error
+}
+
+func (m *mockRelayEndpoint) SendBinary([]byte) error { return nil }
+func (m *mockRelayEndpoint) SendText(text string) error {
+	m.mu.Lock()
+	m.sentText = append(m.sentText, text)
+	sendTextFn := m.sendTextFn
+	m.mu.Unlock()
+	if sendTextFn != nil {
+		return sendTextFn(text)
+	}
+	return nil
+}
+func (m *mockRelayEndpoint) SendBinaryClass(class multilane.TrafficClass, _ []byte) error {
+	m.mu.Lock()
+	m.sentClass = append(m.sentClass, class)
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockRelayEndpoint) BufferedAmount() uint64 { return 0 }
+func (m *mockRelayEndpoint) SetOnMessage(handler func([]byte)) {
+	m.mu.Lock()
+	m.onMessage = handler
+	m.mu.Unlock()
+}
+func (m *mockRelayEndpoint) deliver(text string) {
+	m.mu.Lock()
+	handler := m.onMessage
+	m.mu.Unlock()
+	if handler != nil {
+		handler([]byte(text))
+	}
+}
+func (m *mockRelayEndpoint) texts() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.sentText...)
+}
+
+func (m *mockRelayChannel) ensureEndpoints() {
+	if m.endpoints != nil {
+		return
+	}
+	m.endpoints = map[multilane.Lane]*mockRelayEndpoint{
+		multilane.LaneControl: {},
+		multilane.LaneMedia:   {},
+		multilane.LaneBulk:    {},
+	}
+	m.endpointHits = make(map[multilane.Lane]int)
+}
+
+func (m *mockRelayChannel) Endpoint(lane multilane.Lane) multilane.Endpoint {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureEndpoints()
+	m.endpointHits[lane]++
+	return m.endpoints[lane]
+}
+
+func (m *mockRelayChannel) endpoint(lane multilane.Lane) *mockRelayEndpoint {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureEndpoints()
+	return m.endpoints[lane]
+}
+
+func (m *mockRelayChannel) hits(lane multilane.Lane) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.endpointHits[lane]
 }
 
 func (m *mockRelayChannel) Start(ctx context.Context) error {
@@ -1146,36 +1225,14 @@ func (m *mockRelayChannel) Start(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockRelayChannel) SendBinary(data []byte) error {
-	if m.sendBinaryFn != nil {
-		return m.sendBinaryFn(data)
-	}
-	return nil
-}
-
-func (m *mockRelayChannel) SendText(text string) error {
-	if m.sendTextFn != nil {
-		return m.sendTextFn(text)
-	}
-	return nil
-}
-
-func (m *mockRelayChannel) BufferedAmount() uint64 {
-	if m.bufferedFn != nil {
-		return m.bufferedFn()
-	}
-	return 0
-}
-
 func (m *mockRelayChannel) Close() error {
+	m.mu.Lock()
+	m.closeCalls++
+	m.mu.Unlock()
 	if m.closeFn != nil {
 		return m.closeFn()
 	}
 	return nil
-}
-
-func (m *mockRelayChannel) SetOnMessage(handler func([]byte)) {
-	m.onMessage = handler
 }
 
 func (m *mockRelayChannel) SetOnOpen(handler func()) {
@@ -1417,16 +1474,17 @@ func TestSyncImmichSharesRemovedShareNotifiesRelayChannelBeforeClose(t *testing.
 		peers:         map[string]*peer.Peer{},
 		relayChannels: map[string]relayTransferChannel{},
 	}
-	session.relayChannels["sid-1"] = &mockRelayChannel{
-		sendTextFn: func(text string) error {
-			events = append(events, "send:"+text)
-			return nil
-		},
+	channel := &mockRelayChannel{
 		closeFn: func() error {
 			events = append(events, "close")
 			return nil
 		},
 	}
+	channel.endpoint(multilane.LaneControl).sendTextFn = func(text string) error {
+		events = append(events, "send:"+text)
+		return nil
+	}
+	session.relayChannels["sid-1"] = channel
 	d.sessions["IMMICHOLD1"] = session
 
 	require.NoError(t, d.syncImmichShares(context.Background()))
@@ -1606,6 +1664,95 @@ func TestHandleRelayPrepare_StartsRelayTransferChannel(t *testing.T) {
 	if channel == nil {
 		t.Fatal("relay channel not added to session")
 	}
+}
+
+func TestHandleRelayPrepare_RelayLaneManagerWaitsForTransportV2Handshake(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{
+		Code:          "SHARE123",
+		ShareType:     "opencloud",
+		CreatedAt:     time.Now(),
+		peers:         make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions[session.Code] = session
+
+	channel := &mockRelayChannel{}
+	d.newRelayChannel = func(relayChannelConfig) (relayTransferChannel, error) {
+		return channel, nil
+	}
+
+	d.handleRelayPrepare(signaling.Message{
+		Type: "relay_prepare", SID: "sid-123", Code: session.Code, RelayJWT: "relay.jwt.token",
+	})
+
+	// The responder may claim the control lane, but application construction must
+	// not touch media or bulk until transport_hello version 2 succeeds.
+	require.Equal(t, 1, channel.hits(multilane.LaneControl))
+	require.Zero(t, channel.hits(multilane.LaneMedia))
+	require.Zero(t, channel.hits(multilane.LaneBulk))
+	require.Empty(t, channel.endpoint(multilane.LaneControl).texts())
+
+	channel.endpoint(multilane.LaneControl).deliver(`{"type":"transport_hello","version":2}`)
+
+	require.Equal(t, 1, channel.hits(multilane.LaneMedia))
+	require.Equal(t, 1, channel.hits(multilane.LaneBulk))
+	controlText := strings.Join(channel.endpoint(multilane.LaneControl).texts(), "\n")
+	require.Contains(t, controlText, `"type":"transport_ready"`)
+	require.Contains(t, controlText, `"type":"hello"`)
+	// File-only OpenCloud/Nextcloud sessions keep media ready but idle.
+	require.Empty(t, channel.endpoint(multilane.LaneMedia).texts())
+	require.Empty(t, channel.endpoint(multilane.LaneMedia).sentClass)
+}
+
+func TestDirectLaneManagerCreatedOnlyAfterChannelSetReady(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{Code: "SHARE123", ShareType: "opencloud", CreatedAt: time.Now()}
+	channels := &mockRelayChannel{}
+
+	d.wireDirectTransferSession(session, "peer-123", channels)
+
+	require.Zero(t, channels.hits(multilane.LaneControl))
+	require.Zero(t, channels.hits(multilane.LaneMedia))
+	require.Zero(t, channels.hits(multilane.LaneBulk))
+	require.NotNil(t, channels.onOpen)
+
+	channels.onOpen()
+
+	require.Equal(t, 1, channels.hits(multilane.LaneControl))
+	require.Equal(t, 1, channels.hits(multilane.LaneMedia))
+	require.Equal(t, 1, channels.hits(multilane.LaneBulk))
+	require.Contains(t, strings.Join(channels.endpoint(multilane.LaneControl).texts(), "\n"), `"type":"hello"`)
+}
+
+func TestRelayRequiredLaneCloseTearsSessionDownOnce(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{
+		Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions[session.Code] = session
+	channel := &mockRelayChannel{}
+	d.newRelayChannel = func(relayChannelConfig) (relayTransferChannel, error) { return channel, nil }
+	d.handleRelayPrepare(signaling.Message{
+		Type: "relay_prepare", SID: "sid-123", Code: session.Code, RelayJWT: "relay.jwt.token",
+	})
+
+	require.NotNil(t, channel.onClose)
+	channel.onClose()
+	session.mu.Lock()
+	_, exists := session.relayChannels["sid-123"]
+	session.relayChannels["sid-123"] = channel
+	session.mu.Unlock()
+	require.False(t, exists)
+
+	// A transport may surface the same terminal close from multiple required
+	// lanes. The daemon session teardown remains single-shot.
+	channel.onClose()
+	session.mu.Lock()
+	_, exists = session.relayChannels["sid-123"]
+	session.mu.Unlock()
+	require.True(t, exists)
 }
 
 // TestHandleRelayPrepare_RelayOnlySessionDoesNotCreateDirectPeer tests that
