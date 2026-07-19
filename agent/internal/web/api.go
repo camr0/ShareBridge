@@ -210,6 +210,10 @@ func (ws *WebServer) revokeShareHandler(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
+type shareFormData struct {
+	DefaultRelayOnly bool
+}
+
 // shareFormHandler renders the share form modal.
 func (ws *WebServer) shareFormHandler(w http.ResponseWriter, r *http.Request) {
 	// Parse share-form template
@@ -219,8 +223,15 @@ func (ws *WebServer) shareFormHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	data := shareFormData{DefaultRelayOnly: true}
+	if ws.daemon != nil {
+		if cfg := ws.daemon.GetConfig(); cfg != nil {
+			data.DefaultRelayOnly = cfg.DefaultRelayOnly
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := tmpl.ExecuteTemplate(w, "share-form", nil); err != nil {
+	if err := tmpl.ExecuteTemplate(w, "share-form", data); err != nil {
 		http.Error(w, fmt.Sprintf("render share form: %v", err), http.StatusInternalServerError)
 		return
 	}

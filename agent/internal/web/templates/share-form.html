@@ -32,35 +32,32 @@
             <fieldset>
                 <legend>Connection Mode</legend>
 
-                <div class="mode-option selected" id="direct-option">
+                <div class="mode-option{{if .DefaultRelayOnly}} selected{{end}}" id="relay-option">
                     <div class="mode-option-header">
-                        <input type="radio" id="mode-direct" name="relay_only" value="false" checked>
+                        <input type="radio" id="mode-relay" name="relay_only" value="true"{{if .DefaultRelayOnly}} checked{{end}}>
                         <div>
-                            <div class="mode-option-title">Direct (recommended)</div>
-                            <div class="mode-option-desc">Fast, free, uses TURN only as fallback</div>
+                            <div class="mode-option-title">Relay (recommended)</div>
+                            <div class="mode-option-desc">End-to-end encrypted, hides your IP, and provides consistent performance</div>
                         </div>
-                    </div>
-                    <div class="mode-option-warning amber">
-                        Warning: Your IP address will be visible to recipients if direct connection succeeds
-                    </div>
-                </div>
-
-                <div class="mode-option" id="relay-option">
-                    <div class="mode-option-header">
-                        <input type="radio" id="mode-relay" name="relay_only" value="true">
-                        <div>
-                            <div class="mode-option-title">Relay (hide IP)</div>
-                            <div class="mode-option-desc">All traffic via TURN server, IP never exposed</div>
-                        </div>
-                    </div>
-                    <div class="mode-option-warning red">
-                        Warning: Requires TURN server. Connection will fail if TURN is not configured.
                     </div>
                     <div id="quota-container"
                          hx-get="/api/quota-inline"
                          hx-trigger="load"
                          hx-target="this"
                          hx-swap="innerHTML">
+                    </div>
+                </div>
+
+                <div class="mode-option{{if not .DefaultRelayOnly}} selected{{end}}" id="direct-option">
+                    <div class="mode-option-header">
+                        <input type="radio" id="mode-direct" name="relay_only" value="false"{{if not .DefaultRelayOnly}} checked{{end}}>
+                        <div>
+                            <div class="mode-option-title">Direct</div>
+                            <div class="mode-option-desc">Peer-to-peer, quota-free</div>
+                        </div>
+                    </div>
+                    <div class="mode-option-warning amber">
+                        Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.
                     </div>
                 </div>
             </fieldset>

@@ -4,11 +4,79 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
 	"sharebridge/agent/internal/config"
 )
+
+func TestShareForm_RelayRecommendedAndSelectedByDefault(t *testing.T) {
+	cfg := &config.Config{DefaultRelayOnly: true}
+	ws, _ := newV1TestServer(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/share-form", nil)
+	rec := httptest.NewRecorder()
+
+	ws.shareFormHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	relayIndex := strings.Index(body, "Relay (recommended)")
+	directIndex := strings.Index(body, `>Direct<`)
+	if relayIndex == -1 || directIndex == -1 || relayIndex >= directIndex {
+		t.Errorf("Relay (recommended) must appear before Direct")
+	}
+	assertRadioChecked(t, body, "mode-relay", "true", true)
+	assertRadioChecked(t, body, "mode-direct", "false", false)
+
+	for _, want := range []string{
+		"End-to-end encrypted, hides your IP, and provides consistent performance",
+		"Peer-to-peer, quota-free",
+		"Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
+	}
+	for _, old := range []string{"TURN", "Fast, free", "Requires TURN server"} {
+		if strings.Contains(body, old) {
+			t.Errorf("body contains obsolete copy %q", old)
+		}
+	}
+}
+
+func TestShareForm_PreservesSavedDirectDefault(t *testing.T) {
+	cfg := &config.Config{DefaultRelayOnly: false}
+	ws, _ := newV1TestServer(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/share-form", nil)
+	rec := httptest.NewRecorder()
+
+	ws.shareFormHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	assertRadioChecked(t, rec.Body.String(), "mode-direct", "false", true)
+	assertRadioChecked(t, rec.Body.String(), "mode-relay", "true", false)
+}
+
+func assertRadioChecked(t *testing.T, body, id, value string, wantChecked bool) {
+	t.Helper()
+
+	pattern := regexp.MustCompile(`<input\s+[^>]*id="` + regexp.QuoteMeta(id) + `"[^>]*value="` + regexp.QuoteMeta(value) + `"[^>]*>`)
+	input := pattern.FindString(body)
+	if input == "" {
+		t.Fatalf("radio id=%q value=%q not found", id, value)
+	}
+	if got := strings.Contains(input, "checked"); got != wantChecked {
+		t.Errorf("radio id=%q checked = %t, want %t: %s", id, got, wantChecked, input)
+	}
+}
 
 func TestCreateShareForm_RequiresShareType(t *testing.T) {
 	cfg := &config.Config{AgentAPIKey: "key", DefaultExpiry: 24}

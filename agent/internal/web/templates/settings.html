@@ -99,8 +99,8 @@
                 <label for="default-mode">
                     Default Connection Mode
                     <select id="default-mode" name="default_relay_only">
-                        <option value="false" {{if not .Config.DefaultRelayOnly}}selected{{end}}>Direct (recommended)</option>
-                        <option value="true"  {{if .Config.DefaultRelayOnly}}selected{{end}}>Relay (hide IP)</option>
+                        <option value="true"  {{if .Config.DefaultRelayOnly}}selected{{end}}>Relay (recommended)</option>
+                        <option value="false" {{if not .Config.DefaultRelayOnly}}selected{{end}}>Direct</option>
                     </select>
                 </label>
             </div>
