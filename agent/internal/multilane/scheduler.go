@@ -125,7 +125,10 @@ func (s *Scheduler) Send(ctx context.Context, class TrafficClass, kind Kind, pay
 			s.signalLocked()
 		}
 		s.mu.Unlock()
-		return ctx.Err()
+		if removed {
+			return ctx.Err()
+		}
+		return <-request.done
 	}
 }
 

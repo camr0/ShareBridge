@@ -4,6 +4,7 @@ import {
   TRAFFIC_CLASS_INTERACTIVE_MEDIA,
   TRAFFIC_CLASS_THUMBNAIL,
 } from './multiLaneProtocol.js';
+import { FRAME_BINARY, FRAME_TEXT } from './frame.js';
 
 export const BASE_QUANTUM_BYTES = 64 * 1024;
 export const CONTROL_BURST_LIMIT = 8;
@@ -55,6 +56,7 @@ export class LaneScheduler {
 
   async send({ className, kind, payload, signal }) {
     if (!caps.has(className)) throw new RangeError(`unknown traffic class: ${className}`);
+    if (kind !== FRAME_TEXT && kind !== FRAME_BINARY) throw new RangeError(`unknown frame kind: ${kind}`);
     if (!(payload instanceof Uint8Array)) throw new TypeError('payload must be a Uint8Array');
     if (payload.length > caps.get(className)) throw new RangeError(`request too large for ${className} queue`);
     if (this.terminal) throw this.terminal;

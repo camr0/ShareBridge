@@ -80,6 +80,25 @@ test('scheduler rejects an oversized request clearly', async () => {
   await scheduler.close();
 });
 
+test('scheduler accepts frame kinds and rejects unknown kinds before admission', async () => {
+  const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.kind); } });
+  await Promise.all([
+    scheduler.send({ className: TRAFFIC_CLASS_CONTROL, kind: FRAME_TEXT, payload: payload() }),
+    scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload() }),
+  ]);
+  assert.deepEqual(writes, [FRAME_TEXT, FRAME_BINARY]);
+  await assert.rejects(scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: 0xff, payload: payload(0, BULK_QUEUE_CAP_BYTES) }), /kind/i);
+  await assert.rejects(scheduler.send({ className: TRAFFIC_CLASS_BULK, payload: payload(0, BULK_QUEUE_CAP_BYTES) }), /kind/i);
+  assert.equal(scheduler.bytes.get(TRAFFIC_CLASS_BULK), 0);
+  assert.equal(scheduler.queues.get(TRAFFIC_CLASS_BULK).length, 0);
+  assert.equal(scheduler.waiting.get(TRAFFIC_CLASS_BULK).length, 0);
+
+  const replacement = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload() });
+  await replacement;
+  assert.equal(writes.at(-1), FRAME_BINARY);
+  await scheduler.close();
+});
+
 test('cancellation restores queue capacity', async () => {
   const gate = deferred(); let writes = 0;
   const scheduler = new LaneScheduler({ write: async () => { writes++; if (writes === 1) await gate.promise; } });
@@ -88,7 +107,18 @@ test('cancellation restores queue capacity', async () => {
   const cancellable = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(2), signal: controller.signal });
   const queued = Array.from({ length: 2 }, (_, i) => scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(i + 3) }));
   const replacement = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(9) });
-  await tick(); controller.abort(); await assert.rejects(cancellable, /abort/i); gate.resolve();
+  await tick();
+  assert.equal(writes, 1); assert.equal(scheduler.active.payload[0], 1);
+  assert.deepEqual(scheduler.queues.get(TRAFFIC_CLASS_BULK).map((request) => request.payload[0]), [2, 3, 4]);
+  assert.equal(scheduler.waiting.get(TRAFFIC_CLASS_BULK).length, 1);
+
+  controller.abort(); await assert.rejects(cancellable, /abort/i); await tick();
+  assert.equal(writes, 1, 'active writer must still be held');
+  assert.deepEqual(scheduler.queues.get(TRAFFIC_CLASS_BULK).map((request) => request.payload[0]), [3, 4, 9]);
+  assert.equal(scheduler.waiting.get(TRAFFIC_CLASS_BULK).length, 0);
+  assert.equal(scheduler.bytes.get(TRAFFIC_CLASS_BULK), BULK_QUEUE_CAP_BYTES);
+
+  gate.resolve();
   await Promise.all([first, ...queued, replacement]); assert.equal(writes, 4); await scheduler.close();
 });
 

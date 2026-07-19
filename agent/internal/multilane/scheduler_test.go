@@ -332,6 +332,34 @@ func TestSchedulerCancellationRestoresCapacity(t *testing.T) {
 	}
 }
 
+func TestSchedulerCancellationAfterActivationWaitsForWriter(t *testing.T) {
+	writerResult := errors.New("writer result")
+	active := make(chan struct{})
+	release := make(chan struct{})
+	s := NewScheduler(func(TrafficClass, Kind, []byte) error {
+		close(active)
+		<-release
+		return writerResult
+	})
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Send(ctx, ClassBulk, KindBinary, []byte{1}) }()
+	<-active
+	cancel()
+	select {
+	case err := <-done:
+		close(release)
+		t.Fatalf("Send returned while active writer was blocked: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, writerResult) {
+		t.Fatalf("Send error = %v, want writer result", err)
+	}
+}
+
 func TestSchedulerWriterFailureAndCloseAreTerminal(t *testing.T) {
 	boom := errors.New("boom")
 	failureGate := make(chan struct{})
