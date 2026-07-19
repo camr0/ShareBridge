@@ -25,15 +25,38 @@
 				@update:model-value="form.maxDownloads = Number($event)"
 			/>
 
-			<NcCheckboxRadioSwitch
-				data-testid="relay-only-input"
-				v-model="form.relayOnly"
-			>
-				Relay mode only
-			</NcCheckboxRadioSwitch>
+			<fieldset class="sb-connection-mode">
+				<legend>Connection Mode</legend>
+				<label class="sb-mode-option" data-testid="relay-option" for="mode-relay">
+					<input
+						id="mode-relay"
+						data-testid="mode-relay"
+						type="radio"
+						:name="connectionModeName"
+						:checked="form.relayOnly"
+						@change="form.relayOnly = true">
+					<span>
+						<strong>Relay (recommended)</strong>
+						<small>End-to-end encrypted, hides your IP, and provides consistent performance</small>
+					</span>
+				</label>
+				<label class="sb-mode-option" data-testid="direct-option" for="mode-direct">
+					<input
+						id="mode-direct"
+						data-testid="mode-direct"
+						type="radio"
+						:name="connectionModeName"
+						:checked="!form.relayOnly"
+						@change="form.relayOnly = false">
+					<span>
+						<strong>Direct</strong>
+						<small>Peer-to-peer, quota-free</small>
+					</span>
+				</label>
+			</fieldset>
 
-			<NcNoteCard v-if="form.relayOnly && !turnAvailable" data-testid="turn-warning" type="warning">
-				Relay mode requires a TURN server. Shares may not connect without one.
+			<NcNoteCard v-if="!form.relayOnly" data-testid="direct-advisory" type="info">
+				Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.
 			</NcNoteCard>
 
 			<NcNoteCard v-if="error" data-testid="error-msg" type="error">
@@ -52,21 +75,23 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed } from 'vue'
-import { NcDialog, NcPasswordField, NcTextField, NcCheckboxRadioSwitch, NcNoteCard, NcButton } from '@nextcloud/vue'
+import { ref, reactive, computed, getCurrentInstance } from 'vue'
+import { NcDialog, NcPasswordField, NcTextField, NcNoteCard, NcButton } from '@nextcloud/vue'
 import { useNextcloudOCS } from '../composables/useNextcloudOCS'
 import { useAgentClient } from '../composables/useAgentClient'
 import type { CreateShareResult } from '../types'
 
 const PRESET_EXPIRY_HOURS = [1, 6, 12, 24, 72, 168, 720]
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
 	filePath: string
 	turnAvailable?: boolean
 	defaultExpiryHours?: number
 	defaultMaxDownloads?: number
 	defaultRelayOnly?: boolean
-}>()
+}>(), {
+	defaultRelayOnly: undefined,
+})
 const emit = defineEmits<{
 	close: []
 	created: [result: CreateShareResult]
@@ -77,11 +102,12 @@ const { createShare } = useAgentClient()
 
 const loading = ref(false)
 const error = ref('')
+const connectionModeName = `sharebridge-connection-mode-${getCurrentInstance()?.uid ?? 'default'}`
 const form = reactive({
 	expiryHours: props.defaultExpiryHours ?? 24,
 	password: '',
 	maxDownloads: props.defaultMaxDownloads ?? 0,
-	relayOnly: props.defaultRelayOnly ?? false,
+	relayOnly: props.defaultRelayOnly ?? true,
 })
 
 const expiryOptions = computed(() => {
@@ -158,5 +184,36 @@ const submit = async () => {
 	border-color: var(--color-primary-element);
 	outline: none;
 	box-shadow: 0 0 0 2px var(--color-primary-element-light);
+}
+
+.sb-connection-mode {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+.sb-connection-mode legend {
+	margin-bottom: 4px;
+	font-weight: 600;
+}
+
+.sb-mode-option {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	cursor: pointer;
+}
+
+.sb-mode-option span {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.sb-mode-option small {
+	color: var(--color-text-maxcontrast);
 }
 </style>

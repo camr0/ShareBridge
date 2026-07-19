@@ -57,26 +57,50 @@ describe('CreateShareModal', () => {
         expect(wrapper.find('[data-testid="max-downloads-input"]').exists()).toBe(true)
     })
 
-    it('renders relay-only checkbox', () => {
+    it('renders Relay first and Direct second with Relay selected by default', () => {
         const wrapper = mountModal()
-        expect(wrapper.find('[data-testid="relay-only-input"]').exists()).toBe(true)
+
+        const options = wrapper.findAll('[data-testid$="-option"]')
+        expect(options).toHaveLength(2)
+        expect(options[0].attributes('data-testid')).toBe('relay-option')
+        expect(options[1].attributes('data-testid')).toBe('direct-option')
+
+        const relay = wrapper.find<HTMLInputElement>('[data-testid="mode-relay"]')
+        const direct = wrapper.find<HTMLInputElement>('[data-testid="mode-direct"]')
+        expect(relay.attributes('type')).toBe('radio')
+        expect(direct.attributes('type')).toBe('radio')
+        expect(relay.element.checked).toBe(true)
+        expect(direct.element.checked).toBe(false)
+        expect(relay.attributes('name')).toBe(direct.attributes('name'))
+        expect(relay.attributes('name')).toBeTruthy()
+        expect(options[0].text()).toContain('Relay (recommended)')
+        expect(options[0].text()).toContain('End-to-end encrypted, hides your IP, and provides consistent performance')
+        expect(options[1].text()).toContain('Direct')
+        expect(options[1].text()).toContain('Peer-to-peer, quota-free')
     })
 
-    it('shows TURN warning when relay is checked and TURN is not available', async () => {
+    it('does not render TURN availability copy', () => {
         const wrapper = mountModal({ turnAvailable: false })
-        // Manually set form.relayOnly to true to trigger the warning
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ;(wrapper.vm as any).form.relayOnly = true
-        await wrapper.vm.$nextTick()
-        expect(wrapper.find('[data-testid="turn-warning"]').exists()).toBe(true)
+        expect(wrapper.text()).not.toContain('TURN')
     })
 
-    it('does not show TURN warning when relay is checked but TURN is available', async () => {
-        const wrapper = mountModal({ turnAvailable: true })
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ;(wrapper.vm as any).form.relayOnly = true
-        await wrapper.vm.$nextTick()
-        expect(wrapper.find('[data-testid="turn-warning"]').exists()).toBe(false)
+    it('shows the Direct advisory only after Direct is selected', async () => {
+        const wrapper = mountModal()
+        expect(wrapper.find('[data-testid="direct-advisory"]').exists()).toBe(false)
+
+        await wrapper.find<HTMLInputElement>('[data-testid="mode-direct"]').setValue(true)
+
+        expect(wrapper.find<HTMLInputElement>('[data-testid="mode-relay"]').element.checked).toBe(false)
+        expect(wrapper.find<HTMLInputElement>('[data-testid="mode-direct"]').element.checked).toBe(true)
+        expect(wrapper.find('[data-testid="direct-advisory"]').text()).toBe(
+            'Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.',
+        )
+    })
+
+    it('selects Direct when defaultRelayOnly is explicitly false', () => {
+        const wrapper = mountModal({ defaultRelayOnly: false })
+        expect(wrapper.find<HTMLInputElement>('[data-testid="mode-relay"]').element.checked).toBe(false)
+        expect(wrapper.find<HTMLInputElement>('[data-testid="mode-direct"]').element.checked).toBe(true)
     })
 
     it('emits close when Cancel is clicked', async () => {
@@ -85,7 +109,7 @@ describe('CreateShareModal', () => {
         expect(wrapper.emitted('close')).toBeTruthy()
     })
 
-    it('on submit: calls createOCSShare, createShare, saveNcShareId, then emits created', async () => {
+    it('on submit: defaults to relay-only and completes share creation', async () => {
         const wrapper = mountModal()
         await wrapper.find('[data-testid="create-btn"]').trigger('click')
         await flushPromises()
@@ -93,9 +117,21 @@ describe('CreateShareModal', () => {
         expect(mockCreateOCSShare).toHaveBeenCalledWith('/Documents/report.pdf', expect.any(Number))
         expect(mockCreateShare).toHaveBeenCalledWith(expect.objectContaining({
             share_url: 'https://nc.example.com/s/XYZ',
+            relay_only: true,
         }))
         expect(mockSaveNcShareId).toHaveBeenCalledWith('ABC123', '42')
         expect(wrapper.emitted('created')).toBeTruthy()
+    })
+
+    it('on submit: sends relay_only false after Direct is selected', async () => {
+        const wrapper = mountModal()
+        await wrapper.find<HTMLInputElement>('[data-testid="mode-direct"]').setValue(true)
+        await wrapper.find('[data-testid="create-btn"]').trigger('click')
+        await flushPromises()
+
+        expect(mockCreateShare).toHaveBeenCalledWith(expect.objectContaining({
+            relay_only: false,
+        }))
     })
 
     it('shows error when OCS share creation fails with PASSWORD_REQUIRED', async () => {
