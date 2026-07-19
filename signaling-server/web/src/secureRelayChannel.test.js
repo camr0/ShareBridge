@@ -334,10 +334,23 @@ test('SecureRelayChannel encrypts lane ids and dispatches decrypted media', asyn
   }
   assert.deepEqual(scheduledLanes.slice(0, 4), [LANE_MEDIA, LANE_MEDIA, LANE_MEDIA, LANE_BULK])
 
+  let postErrorDeliveries = 0
+  channel.media.onmessage = () => { postErrorDeliveries++ }
   const closed = new Promise((resolve) => { channel.onclose = resolve })
   const invalid = await rSend.encrypt(new Uint8Array(0), new Uint8Array([0x03, 1]))
-  socket.pushMessage(writeFrame(FRAME_BINARY, invalid))
+  const validAfterInvalid = await rSend.encrypt(
+    new Uint8Array(0),
+    encodeLaneEnvelope(LANE_MEDIA, new Uint8Array([99])),
+  )
+  const invalidFrame = writeFrame(FRAME_BINARY, invalid)
+  const validFrame = writeFrame(FRAME_BINARY, validAfterInvalid)
+  const combined = new Uint8Array(invalidFrame.length + validFrame.length)
+  combined.set(invalidFrame)
+  combined.set(validFrame, invalidFrame.length)
+  socket.pushMessage(combined)
   await closed
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(postErrorDeliveries, 0)
   assert.equal(channel.readyState, 'closed')
   assert.equal(channel.control.readyState, 'closed')
   assert.equal(channel.media.readyState, 'closed')

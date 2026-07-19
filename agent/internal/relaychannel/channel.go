@@ -277,11 +277,13 @@ func (c *SecureRelayChannel) abortTransport() {
 }
 
 func (c *SecureRelayChannel) notifyClose() {
+	var callback func()
 	c.closeOnce.Do(func() {
-		if c.onClose != nil {
-			c.onClose()
-		}
+		callback = c.onClose
 	})
+	if callback != nil {
+		callback()
+	}
 }
 
 type relayEndpoint struct {

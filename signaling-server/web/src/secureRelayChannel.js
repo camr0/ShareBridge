@@ -186,6 +186,7 @@ export class SecureRelayChannel {
           console.error('[secure-relay] Handshake frame error:', err)
           this.close('handshake frame error')
           this._handshakeReject?.(err)
+          return
         }
         continue
       }
@@ -213,6 +214,7 @@ export class SecureRelayChannel {
       } catch (err) {
         console.error('[secure-relay] decrypt/forward error:', err.message, err.stack)
         this.close('decrypt/forward error')
+        return
       }
     }
   }

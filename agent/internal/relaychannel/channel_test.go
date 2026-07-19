@@ -214,6 +214,35 @@ func TestSecureRelayChannelStartFailureClosesLifecycleOnce(t *testing.T) {
 	}
 }
 
+func TestSecureRelayChannelOnCloseMayCallCloseReentrantly(t *testing.T) {
+	channel, _ := NewSecureRelayChannel(SecureRelayConfig{RelayURL: "ws://relay.test", RelayJWT: "token", StaticPrivate: mustGenerateKey()})
+	callbackReturned := make(chan struct{})
+	closeReturned := make(chan struct{})
+	calls := 0
+	channel.SetOnClose(func() {
+		calls++
+		_ = channel.Close()
+		close(callbackReturned)
+	})
+	go func() {
+		_ = channel.Close()
+		close(closeReturned)
+	}()
+	for name, done := range map[string]<-chan struct{}{
+		"callback": callbackReturned,
+		"Close":    closeReturned,
+	} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("%s deadlocked during re-entrant close", name)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("onClose calls = %d, want 1", calls)
+	}
+}
+
 func TestSecureRelayChannel_HandshakeAndRoundTrip(t *testing.T) {
 	serverStatic, err := ecdh.P256().GenerateKey(rand.Reader)
 	if err != nil {
