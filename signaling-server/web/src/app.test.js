@@ -1588,7 +1588,35 @@ test('deferred media end times out per operation and stale timeout cannot touch 
     await new Promise((resolve) => setTimeout(resolve, 15))
     assert.equal(__test.getCurrentVideoPreview().id, 'new')
     assert.equal(secondChannels.closeCalls, 0)
-    __test.setCompletionTimeoutMs(5000)
+    __test.setCompletionTimeoutMs(60_000)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('deferred end timeout refreshes on correlated chunk progress then fires after silence', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    __test.setCompletionTimeoutMs(20)
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.requestGalleryPreview('slow-progress')
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'slow-progress', mimeType: 'image/jpeg', size: 0,
+      operation_id: '575', request_id: request.request_id,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_end', id: 'slow-progress', operation_id: '575',
+      request_id: request.request_id, bytes_sent: '4',
+    }) })
+    await new Promise((resolve) => setTimeout(resolve, 12))
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('575', 0, new Uint8Array([1])).buffer })
+    await new Promise((resolve) => setTimeout(resolve, 12))
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('575', 0, new Uint8Array([2])).buffer })
+    assert.equal(__test.getCurrentPreview()?.id, 'slow-progress', 'progress past the original deadline must keep the operation alive')
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.equal(__test.getCurrentPreview(), null, 'silence after the latest progress must time out')
+    assert.equal(channels.closeCalls, 0)
+    __test.setCompletionTimeoutMs(60_000)
     __test.setTransferSession({ channels: null, mode: null })
   })
 })
@@ -1618,7 +1646,7 @@ test('deferred bulk end timeout fails only its bulk pipeline', async () => {
     assert.deepEqual(failures, [['incomplete-transfer', 'Transfer ended before all bytes arrived']])
     assert.equal(channels.closeCalls, 0)
     assert.equal(__test.getCurrentFile(), null)
-    __test.setCompletionTimeoutMs(5000)
+    __test.setCompletionTimeoutMs(60_000)
     __test.setDownloadTestDependencies()
     __test.setTransferSession({ channels: null, mode: null })
   })

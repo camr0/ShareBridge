@@ -34,7 +34,7 @@ let pendingMediaRequestId = ''
 let pendingMediaID = ''
 let pendingMediaGeneration = undefined
 const pendingEnds = { media: null, bulk: null }
-let completionTimeoutMs = 5000
+let completionTimeoutMs = 60_000
 const EARLY_FRAME_MAX_BYTES = 1024 * 1024
 const EARLY_FRAME_MAX_COUNT = 128
 let earlyFrameTtlMs = 5000
@@ -961,6 +961,7 @@ async function routeOrBufferFrame(lane, frame, { isCurrentSession = () => true }
     }
     operation.wireBytes = nextWireBytes
     if (currentFile?.operationId === frame.operationId) currentFile.wireBytes = nextWireBytes
+    refreshCompletionTimeout('bulk', frame.operationId)
     const append = appendChunk(frame.payload, operation)
     await append
     if (!isCurrentSession()) return
@@ -983,6 +984,7 @@ async function routeOrBufferFrame(lane, frame, { isCurrentSession = () => true }
     })
     currentVideoPreview.totalBytesReceived += frame.payload.byteLength
     currentVideoPreview.wireBytes = nextWireBytes
+    refreshCompletionTimeout('media', frame.operationId)
     currentVideoPreview.seeking = false
     if (currentVideoPreview.awaitingSeekPlayback) scheduleSeekPlaybackRecovery(currentVideoPreview)
     await completeDeferredEnd('media')
@@ -992,6 +994,7 @@ async function routeOrBufferFrame(lane, frame, { isCurrentSession = () => true }
   currentPreview.chunks.push(frame.payload)
   currentPreview.bytes += frame.payload.byteLength
   currentPreview.wireBytes += BigInt(frame.payload.byteLength)
+  refreshCompletionTimeout('media', frame.operationId)
   await completeDeferredEnd('media')
   if (!isCurrentSession()) return
 }
@@ -1055,6 +1058,12 @@ function clearCompletionTimeout(lane, operationId) {
   if (!pending || (operationId && pending.msg.operation_id !== operationId)) return
   clearTimeout(pending.timer)
   pendingEnds[lane] = null
+}
+
+function refreshCompletionTimeout(lane, operationId) {
+  const pending = pendingEnds[lane]
+  if (!pending || pending.msg.operation_id !== operationId) return
+  deferOperationEnd(lane, pending.msg)
 }
 
 async function failIncompleteOperation(lane, msg) {
