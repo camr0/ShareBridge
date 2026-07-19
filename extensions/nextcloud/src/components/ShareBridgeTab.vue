@@ -34,7 +34,11 @@
 					/>
 				</div>
 
-				<NcButton data-testid="create-share-btn" type="primary" @click="showModal = true">
+				<NcButton
+					data-testid="create-share-btn"
+					type="primary"
+					:disabled="loadingAgentSettings"
+					@click="openCreateModal">
 					Create ShareBridge Share
 				</NcButton>
 			</template>
@@ -75,6 +79,7 @@ const shares = ref<Share[]>([])
 const loadingShares = ref(false)
 const error = ref('')
 const showModal = ref(false)
+const loadingAgentSettings = ref(true)
 const turnAvailable = ref(false)
 const defaultExpiryHours = ref(24)
 const defaultMaxDownloads = ref(0)
@@ -93,6 +98,7 @@ const loadShares = async () => {
 }
 
 const applyAgentSettings = async () => {
+	loadingAgentSettings.value = true
 	try {
 		const s = await getSettings()
 		turnAvailable.value = s.turn_available
@@ -101,6 +107,14 @@ const applyAgentSettings = async () => {
 		defaultRelayOnly.value = s.default_relay_only
 	} catch {
 		// agent unreachable — form defaults stay as-is
+	} finally {
+		loadingAgentSettings.value = false
+	}
+}
+
+const openCreateModal = () => {
+	if (!loadingAgentSettings.value) {
+		showModal.value = true
 	}
 }
 

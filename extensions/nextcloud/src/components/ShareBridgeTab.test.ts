@@ -127,6 +127,37 @@ describe('ShareBridgeTab', () => {
         expect(modal.find<HTMLInputElement>('[data-testid="mode-relay"]').element.checked).toBe(true)
     })
 
+    it('waits for agent settings before opening with the saved Direct preference', async () => {
+        useSettingsStore().$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
+        let resolveSettings: (settings: {
+            default_expiry_hours: number
+            default_max_downloads: number
+            default_relay_only: boolean
+            turn_available: boolean
+        }) => void
+        mockGetSettings.mockImplementationOnce(() => new Promise(resolve => { resolveSettings = resolve }))
+
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
+        await flushPromises()
+
+        const createButton = wrapper.find('[data-testid="create-share-btn"]')
+        await createButton.trigger('click')
+        expect(wrapper.findComponent({ name: 'CreateShareModal' }).exists()).toBe(false)
+
+        resolveSettings!({
+            default_expiry_hours: 24,
+            default_max_downloads: 0,
+            default_relay_only: false,
+            turn_available: false,
+        })
+        await flushPromises()
+        await createButton.trigger('click')
+
+        const modal = wrapper.findComponent({ name: 'CreateShareModal' })
+        expect(modal.exists()).toBe(true)
+        expect(modal.find<HTMLInputElement>('[data-testid="mode-direct"]').element.checked).toBe(true)
+    })
+
     it('preserves an explicitly false relay default from agent settings', async () => {
         useSettingsStore().$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
 
