@@ -183,6 +183,30 @@ The transfer manager replaces its global lock with separate media and bulk state
 Thumbnails use the media lane but do not consume the active interactive-media slot.
 Their producer is bounded by the thumbnail subqueue and scheduler.
 
+### OpenCloud and Nextcloud file shares
+
+The multi-lane contract applies to every recipient session, not only Immich gallery
+shares. OpenCloud and Nextcloud currently have no preview or video protocol, so
+their routing is:
+
+- control: `hello`, `list_request`, `file_list`, `file_request`, `file_header`,
+  `chunk_end`, and scoped `error` messages;
+- media: open and ready but unused;
+- bulk: file-chunk frames for the active download.
+
+There is no distinct browser-agent control channel today. These JSON messages and
+binary file chunks currently share one WebRTC DataChannel or encrypted relay
+WebSocket. The multi-lane change therefore moves existing file-share JSON traffic
+onto the new control endpoint and file bytes onto bulk; it does not introduce a
+second file-share protocol.
+
+All three lanes remain required even when media is unused. A uniform readiness and
+closure contract avoids mode-dependent transport negotiation and lets OpenCloud or
+Nextcloud add previews later without another connection redesign. The OpenCloud and
+Nextcloud extensions only create and manage shares through the agent API; their
+recipient transfer behavior uses the common ShareBridge web page, so extension UI
+and agent-API contracts remain unchanged.
+
 ## Protocol Version and Errors
 
 The control lane begins with a protocol-version handshake. A single-lane peer and a
@@ -248,6 +272,10 @@ operation.
 - a bulk failure does not prevent a later preview;
 - a second bulk request is rejected while the first remains active;
 - media and bulk bytes never cross pipelines.
+- OpenCloud and Nextcloud-style file sessions route list and lifecycle JSON over
+  control and file bytes over bulk while leaving media idle;
+- file-mode sessions still require all three lanes and close consistently if the
+  unused media lane fails.
 
 Run the complete browser, agent, and signaling-server suites. Then verify both
 direct and relay sessions manually with throttling: start a large download, open an
