@@ -251,6 +251,29 @@ func (m *mockSignalingClient) sentContains(fragment string) bool {
 	return false
 }
 
+func (m *mockSignalingClient) messagesSnapshot() []map[string]any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]map[string]any, len(m.sendMessages))
+	for i, message := range m.sendMessages {
+		result[i] = make(map[string]any, len(message))
+		for key, value := range message {
+			result[i][key] = value
+		}
+	}
+	return result
+}
+
+func (m *mockSignalingClient) hasSentMessage(msgType string, expectedFields map[string]any) bool {
+	return hasSentMessage(m.messagesSnapshot(), msgType, expectedFields)
+}
+
+func (m *mockSignalingClient) registeredSnapshot() []signaling.RegisterShareOptions {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]signaling.RegisterShareOptions(nil), m.registered...)
+}
+
 func (m *mockSignalingClient) registeredCode(code string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -458,15 +481,16 @@ func TestCreateSessionManualImmichRegistersRelayOnlyShare(t *testing.T) {
 	require.True(t, stored.RelayOnly)
 	require.True(t, stored.IsPasswordProtected)
 
-	require.Len(t, sig.registered, 1)
+	registered := sig.registeredSnapshot()
+	require.Len(t, registered, 1)
 	require.Equal(t, signaling.RegisterShareOptions{
 		ShareURL:            "immich://IMMICHMANUAL1",
 		PreferredCode:       "IMMICHMANUAL1",
 		ShareType:           "immich",
 		IsPasswordProtected: true,
 		RelayOnly:           true,
-		RelayStaticPub:      sig.registered[0].RelayStaticPub,
-	}, sig.registered[0])
+		RelayStaticPub:      registered[0].RelayStaticPub,
+	}, registered[0])
 }
 
 func TestCreateSessionManualImmichRejectsNonImmichURL(t *testing.T) {
@@ -499,7 +523,7 @@ func TestCreateSessionManualImmichReturnsExistingSessionWithoutReregistering(t *
 	require.NoError(t, err)
 	require.Equal(t, "IMMICHMANUAL1", code)
 	require.Same(t, existing, d.GetSession("IMMICHMANUAL1"))
-	require.Empty(t, sig.registered)
+	require.Empty(t, sig.registeredSnapshot())
 }
 
 // TestCreateSessionWithInvalidHost tests session creation with invalid host.
@@ -1295,11 +1319,11 @@ func TestHandleJoin_SendsAuthOKAfterHMACVerification(t *testing.T) {
 	d.handleJoin("conn-1", "SHARE123", joinedHMAC)
 
 	// Check that auth_ok was sent with correct fields
-	if !hasSentMessage(sig.sendMessages, "auth_ok", map[string]any{
+	if !sig.hasSentMessage("auth_ok", map[string]any{
 		"conn_id": "conn-1",
 		"code":    "SHARE123",
 	}) {
-		t.Fatalf("expected auth_ok to be sent, got %#v", sig.sendMessages)
+		t.Fatalf("expected auth_ok to be sent, got %#v", sig.messagesSnapshot())
 	}
 }
 
@@ -1335,17 +1359,17 @@ func TestHandleJoin_RelayOnlySkipsDirectPeerCreation(t *testing.T) {
 	d.handleJoin("conn-1", "SHARE123", joinedHMAC)
 	time.Sleep(100 * time.Millisecond)
 
-	if !hasSentMessage(sig.sendMessages, "auth_ok", map[string]any{
+	if !sig.hasSentMessage("auth_ok", map[string]any{
 		"conn_id": "conn-1",
 		"code":    "SHARE123",
 	}) {
-		t.Fatalf("expected auth_ok to be sent, got %#v", sig.sendMessages)
+		t.Fatalf("expected auth_ok to be sent, got %#v", sig.messagesSnapshot())
 	}
-	if hasSentMessage(sig.sendMessages, "offer", map[string]any{
+	if sig.hasSentMessage("offer", map[string]any{
 		"session_id": "SHARE123",
 		"peer_id":    "conn-1",
 	}) {
-		t.Fatalf("relay_only session should not create direct offer, got %#v", sig.sendMessages)
+		t.Fatalf("relay_only session should not create direct offer, got %#v", sig.messagesSnapshot())
 	}
 }
 
@@ -1493,7 +1517,53 @@ func TestSyncImmichSharesRemovedShareNotifiesRelayChannelBeforeClose(t *testing.
 	require.Len(t, events, 2)
 	require.Equal(t, "close", events[1])
 	require.Contains(t, events[0], `"type":"error"`)
+	require.Contains(t, events[0], `"scope":"connection"`)
 	require.Contains(t, events[0], `"message":"share has been removed"`)
+}
+
+func TestSessionResourceCloseCallbacksCanReenterDaemonAndSessionLocks(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Daemon, *Session)
+	}{
+		{name: "stop", run: func(d *Daemon, _ *Session) { _ = d.Stop() }},
+		{name: "revoke", run: func(d *Daemon, session *Session) { _ = d.RevokeSession(session.Code) }},
+		{name: "expiry", run: func(d *Daemon, _ *Session) { d.pruneExpiredSessions() }},
+		{name: "removed share", run: func(d *Daemon, session *Session) {
+			d.closeSessionResourcesWithError(session, "share has been removed")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, _ := newTestDaemon(t)
+			session := &Session{
+				Code: "SHARE123", ExpiresAt: time.Now().Add(-time.Minute), CreatedAt: time.Now(),
+				peers: make(map[string]*peer.Peer), relayChannels: make(map[string]relayTransferChannel),
+			}
+			channel := &mockRelayChannel{}
+			channel.closeFn = func() error {
+				// Real channel close callbacks synchronously reenter session cleanup;
+				// also touch the daemon lock to catch broad-lock closure.
+				d.mu.RLock()
+				d.mu.RUnlock()
+				session.mu.Lock()
+				session.mu.Unlock()
+				return nil
+			}
+			session.relayChannels["sid-123"] = channel
+			d.sessions[session.Code] = session
+
+			done := make(chan struct{})
+			go func() {
+				test.run(d, session)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("resource close deadlocked while callback reentered daemon/session locks")
+			}
+		})
+	}
 }
 
 func TestSyncImmichSharesUnregisterFailureLeavesRemovedSessionInMemory(t *testing.T) {
@@ -1710,7 +1780,7 @@ func TestDirectLaneManagerCreatedOnlyAfterChannelSetReady(t *testing.T) {
 	session := &Session{Code: "SHARE123", ShareType: "opencloud", CreatedAt: time.Now()}
 	channels := &mockRelayChannel{}
 
-	d.wireDirectTransferSession(session, "peer-123", channels)
+	d.wireDirectTransferSession(session, "peer-123", channels, func() bool { return true })
 
 	require.Zero(t, channels.hits(multilane.LaneControl))
 	require.Zero(t, channels.hits(multilane.LaneMedia))
@@ -1723,6 +1793,166 @@ func TestDirectLaneManagerCreatedOnlyAfterChannelSetReady(t *testing.T) {
 	require.Equal(t, 1, channels.hits(multilane.LaneMedia))
 	require.Equal(t, 1, channels.hits(multilane.LaneBulk))
 	require.Contains(t, strings.Join(channels.endpoint(multilane.LaneControl).texts(), "\n"), `"type":"hello"`)
+}
+
+func TestDirectStaleReadyDoesNotActivateTransferManager(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{Code: "SHARE123", ShareType: "opencloud", CreatedAt: time.Now()}
+	channels := &mockRelayChannel{}
+	d.wireDirectTransferSession(session, "peer-123", channels, func() bool { return false })
+
+	channels.onOpen()
+	channels.onOpen()
+
+	require.Zero(t, channels.hits(multilane.LaneControl))
+	require.Zero(t, channels.hits(multilane.LaneMedia))
+	require.Zero(t, channels.hits(multilane.LaneBulk))
+}
+
+func TestCreatePeerAbandonsNewPeerWhenSessionRemovedDuringCreation(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	session := &Session{
+		Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions[session.Code] = session
+	created, err := peer.New(nil, false)
+	require.NoError(t, err)
+	creationStarted := make(chan struct{})
+	releaseCreation := make(chan struct{})
+	d.newPeer = func([]webrtc.ICEServer, bool) (*peer.Peer, error) {
+		close(creationStarted)
+		<-releaseCreation
+		return created, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		d.createPeer("peer-123", session.Code)
+		close(done)
+	}()
+	<-creationStarted
+	d.mu.Lock()
+	delete(d.sessions, session.Code)
+	d.mu.Unlock()
+	close(releaseCreation)
+	<-done
+
+	session.mu.Lock()
+	require.Empty(t, session.peers)
+	session.mu.Unlock()
+	require.False(t, sig.sentContains(`"type":"offer"`))
+}
+
+func TestCreatePeerDuplicateCloseCannotDeleteReplacement(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{
+		Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions[session.Code] = session
+
+	d.createPeer("peer-123", session.Code)
+	session.mu.Lock()
+	first := session.peers["peer-123"]
+	session.mu.Unlock()
+	require.NotNil(t, first)
+	d.createPeer("peer-123", session.Code)
+	session.mu.Lock()
+	replacement := session.peers["peer-123"]
+	session.mu.Unlock()
+	require.NotNil(t, replacement)
+	require.NotSame(t, first, replacement)
+
+	require.NoError(t, first.Close())
+	session.mu.Lock()
+	current := session.peers["peer-123"]
+	session.mu.Unlock()
+	require.Same(t, replacement, current)
+}
+
+func TestRelayPrepareAbandonsChannelWhenSessionRemovedDuringCreation(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{
+		Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions[session.Code] = session
+	channel := &mockRelayChannel{}
+	creationStarted := make(chan struct{})
+	releaseCreation := make(chan struct{})
+	d.newRelayChannel = func(relayChannelConfig) (relayTransferChannel, error) {
+		close(creationStarted)
+		<-releaseCreation
+		return channel, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		d.handleRelayPrepare(signaling.Message{
+			Type: "relay_prepare", SID: "sid-123", Code: session.Code, RelayJWT: "relay.jwt.token",
+		})
+		close(done)
+	}()
+	<-creationStarted
+	d.mu.Lock()
+	delete(d.sessions, session.Code)
+	d.mu.Unlock()
+	close(releaseCreation)
+	<-done
+
+	session.mu.Lock()
+	require.Empty(t, session.relayChannels)
+	session.mu.Unlock()
+	channel.mu.Lock()
+	require.Equal(t, 1, channel.closeCalls)
+	channel.mu.Unlock()
+}
+
+func TestNewTransportsAreRejectedAfterSessionResourcesBeginClosing(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*Daemon, *Session, *mockRelayChannel)
+	}{
+		{
+			name: "direct",
+			run: func(d *Daemon, session *Session, _ *mockRelayChannel) {
+				d.newPeer = peer.New
+				d.createPeer("peer-123", session.Code)
+			},
+		},
+		{
+			name: "relay",
+			run: func(d *Daemon, session *Session, channel *mockRelayChannel) {
+				d.newRelayChannel = func(relayChannelConfig) (relayTransferChannel, error) { return channel, nil }
+				d.handleRelayPrepare(signaling.Message{
+					Type: "relay_prepare", SID: "sid-123", Code: session.Code, RelayJWT: "relay.jwt.token",
+				})
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, sig := newTestDaemon(t)
+			session := &Session{
+				Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+				relayChannels: make(map[string]relayTransferChannel),
+			}
+			d.sessions[session.Code] = session
+			d.closeSessionResources(session)
+			channel := &mockRelayChannel{}
+
+			test.run(d, session, channel)
+
+			session.mu.Lock()
+			require.Empty(t, session.peers)
+			require.Empty(t, session.relayChannels)
+			session.mu.Unlock()
+			require.False(t, sig.sentContains(`"type":"offer"`))
+			if test.name == "relay" {
+				channel.mu.Lock()
+				require.Equal(t, 1, channel.closeCalls)
+				channel.mu.Unlock()
+			}
+		})
+	}
 }
 
 func TestRelayRequiredLaneCloseTearsSessionDownOnce(t *testing.T) {
@@ -1753,6 +1983,119 @@ func TestRelayRequiredLaneCloseTearsSessionDownOnce(t *testing.T) {
 	_, exists = session.relayChannels["sid-123"]
 	session.mu.Unlock()
 	require.True(t, exists)
+}
+
+func TestRelayStaleCloseDoesNotDeleteReplacementWithSameSID(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{
+		Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions[session.Code] = session
+	oldChannel := &mockRelayChannel{}
+	newChannel := &mockRelayChannel{}
+	channels := []relayTransferChannel{oldChannel, newChannel}
+	d.newRelayChannel = func(relayChannelConfig) (relayTransferChannel, error) {
+		channel := channels[0]
+		channels = channels[1:]
+		return channel, nil
+	}
+	message := signaling.Message{Type: "relay_prepare", SID: "sid-123", Code: session.Code, RelayJWT: "relay.jwt.token"}
+	d.handleRelayPrepare(message)
+	d.handleRelayPrepare(message)
+
+	oldChannel.onClose()
+
+	session.mu.Lock()
+	got := session.relayChannels["sid-123"]
+	session.mu.Unlock()
+	require.True(t, got == newChannel, "replacement relay channel was deleted")
+}
+
+func TestRelayStaleFailedStartDoesNotDeleteReplacementWithSameSID(t *testing.T) {
+	d, _ := newTestDaemon(t)
+	session := &Session{
+		Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
+	}
+	d.sessions[session.Code] = session
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	oldChannel := &mockRelayChannel{startFn: func(context.Context) error {
+		close(startEntered)
+		<-releaseStart
+		return errors.New("stale start failed")
+	}}
+	newChannel := &mockRelayChannel{}
+	var factoryMu sync.Mutex
+	channels := []relayTransferChannel{oldChannel, newChannel}
+	d.newRelayChannel = func(relayChannelConfig) (relayTransferChannel, error) {
+		factoryMu.Lock()
+		defer factoryMu.Unlock()
+		channel := channels[0]
+		channels = channels[1:]
+		return channel, nil
+	}
+	message := signaling.Message{Type: "relay_prepare", SID: "sid-123", Code: session.Code, RelayJWT: "relay.jwt.token"}
+	done := make(chan struct{})
+	go func() {
+		d.handleRelayPrepare(message)
+		close(done)
+	}()
+	<-startEntered
+	d.handleRelayPrepare(message)
+	close(releaseStart)
+	<-done
+
+	session.mu.Lock()
+	got := session.relayChannels["sid-123"]
+	session.mu.Unlock()
+	require.True(t, got == newChannel, "replacement relay channel was deleted by stale start failure")
+}
+
+func TestRelayStaleHandshakeDoesNotActivateReplacementOrRemovedSession(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		stale func(*Daemon, *Session, *mockRelayChannel)
+	}{
+		{
+			name: "replaced",
+			stale: func(_ *Daemon, session *Session, _ *mockRelayChannel) {
+				session.mu.Lock()
+				session.relayChannels["sid-123"] = &mockRelayChannel{}
+				session.mu.Unlock()
+			},
+		},
+		{
+			name: "removed",
+			stale: func(d *Daemon, session *Session, _ *mockRelayChannel) {
+				d.mu.Lock()
+				delete(d.sessions, session.Code)
+				d.mu.Unlock()
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, _ := newTestDaemon(t)
+			session := &Session{
+				Code: "SHARE123", CreatedAt: time.Now(), peers: make(map[string]*peer.Peer),
+				relayChannels: make(map[string]relayTransferChannel),
+			}
+			d.sessions[session.Code] = session
+			channel := &mockRelayChannel{}
+			d.newRelayChannel = func(relayChannelConfig) (relayTransferChannel, error) { return channel, nil }
+			d.handleRelayPrepare(signaling.Message{
+				Type: "relay_prepare", SID: "sid-123", Code: session.Code, RelayJWT: "relay.jwt.token",
+			})
+			test.stale(d, session, channel)
+
+			channel.endpoint(multilane.LaneControl).deliver(`{"type":"transport_hello","version":2}`)
+
+			require.Zero(t, channel.hits(multilane.LaneMedia))
+			require.Zero(t, channel.hits(multilane.LaneBulk))
+			require.NotContains(t, strings.Join(channel.endpoint(multilane.LaneControl).texts(), "\n"), `"type":"hello"`)
+		})
+	}
 }
 
 // TestHandleRelayPrepare_RelayOnlySessionDoesNotCreateDirectPeer tests that
@@ -1813,12 +2156,9 @@ func TestHandleRelayPrepare_RelayOnlySessionDoesNotCreateDirectPeer(t *testing.T
 		t.Fatalf("relay-only session should not create direct peers, got %d peers", peerCount)
 	}
 
-	// Verify relay channel was added to session
-	session.mu.Lock()
-	channel := session.relayChannels["sid-relayonly"]
-	session.mu.Unlock()
-
-	if channel == nil {
-		t.Fatal("relay channel should be added to session")
-	}
+	require.Eventually(t, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.relayChannels["sid-relayonly"] != nil
+	}, 2*time.Second, time.Millisecond, "relay channel should be added to session")
 }

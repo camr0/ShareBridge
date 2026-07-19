@@ -206,6 +206,7 @@ type Session struct {
 	webdavClient        *cloudwebdav.Client
 	peers               map[string]*peer.Peer           // peerID -> Peer
 	relayChannels       map[string]relayTransferChannel // sid -> relay channel
+	closing             bool
 	mu                  sync.Mutex
 }
 
@@ -230,6 +231,7 @@ type Daemon struct {
 
 	// Factory for creating relay channels (injected for testing)
 	newRelayChannel func(cfg relayChannelConfig) (relayTransferChannel, error)
+	newPeer         func(iceServers []webrtc.ICEServer, relayOnly bool) (*peer.Peer, error)
 
 	newImmichPoller func() (immichPoller, error)
 
@@ -331,23 +333,15 @@ func (d *Daemon) Start(ctx context.Context) <-chan error {
 
 // Stop gracefully shuts down the daemon.
 func (d *Daemon) Stop() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// Close all peer connections and relay channels
+	d.mu.RLock()
+	sessions := make([]*Session, 0, len(d.sessions))
 	for _, session := range d.sessions {
-		session.mu.Lock()
-		for peerID, peerConn := range session.peers {
-			if err := peerConn.Close(); err != nil {
-				log.Printf("close peer %s: %v", peerID, err)
-			}
-		}
-		for sid, rc := range session.relayChannels {
-			if err := rc.Close(); err != nil {
-				log.Printf("close relay channel %s: %v", sid, err)
-			}
-		}
-		session.mu.Unlock()
+		sessions = append(sessions, session)
+	}
+	d.mu.RUnlock()
+
+	for _, session := range sessions {
+		d.closeSessionResources(session)
 	}
 
 	// Stop web server
@@ -531,20 +525,7 @@ func (d *Daemon) RevokeSession(code string) error {
 	delete(d.sessions, code)
 	d.mu.Unlock()
 
-	// Close all peer connections
-	session.mu.Lock()
-	for peerID, peerConn := range session.peers {
-		if err := peerConn.Close(); err != nil {
-			log.Printf("close peer %s: %v", peerID, err)
-		}
-	}
-	// Close all relay channels
-	for sid, rc := range session.relayChannels {
-		if err := rc.Close(); err != nil {
-			log.Printf("close relay channel %s: %v", sid, err)
-		}
-	}
-	session.mu.Unlock()
+	d.closeSessionResources(session)
 
 	// Remove from store
 	if err := d.store.DeleteSession(code); err != nil {
@@ -751,20 +732,64 @@ func (d *Daemon) handlePasswordSubmit(connID, sessionCode, password string) {
 
 // wireDirectTransferSession waits for Peer.SetOnOpen, which is fired only after
 // all three direct lanes are open and the transport v2 handshake has completed.
-func (d *Daemon) wireDirectTransferSession(session *Session, peerID string, channels multilane.ChannelSet) {
+func (d *Daemon) wireDirectTransferSession(session *Session, peerID string, channels multilane.ChannelSet, isCurrent func() bool) {
+	var activateOnce sync.Once
 	channels.SetOnOpen(func() {
-		log.Printf("DataChannel lanes ready for peer %s (session %s)", peerID, session.Code)
-		d.activateTransferSession(session, peerID, channels)
+		activateOnce.Do(func() {
+			if isCurrent != nil && !isCurrent() {
+				return
+			}
+			log.Printf("DataChannel lanes ready for peer %s (session %s)", peerID, session.Code)
+			d.activateTransferSession(session, peerID, channels)
+		})
 	})
 }
 
 // wireRelayTransferSession installs the application-version responder over the
 // already Noise-authenticated relay transport. The transfer manager is not
 // created until transport_hello version 2 has been acknowledged.
-func (d *Daemon) wireRelayTransferSession(session *Session, channels multilane.ChannelSet) {
-	multilane.InstallHandshakeResponder(channels, func() {
-		d.activateTransferSession(session, "", channels)
+func (d *Daemon) wireRelayTransferSession(session *Session, sid string, channel relayTransferChannel) {
+	var activateOnce sync.Once
+	multilane.InstallHandshakeResponder(channel, func() {
+		activateOnce.Do(func() {
+			if !d.relayChannelCurrent(session, sid, channel) {
+				return
+			}
+			d.activateTransferSession(session, "", channel)
+		})
 	})
+}
+
+func (d *Daemon) relayChannelCurrent(session *Session, sid string, channel relayTransferChannel) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.sessions[session.Code] != session {
+		return false
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return !session.closing && session.relayChannels[sid] == channel
+}
+
+func (d *Daemon) directPeerCurrent(session *Session, peerID string, candidate *peer.Peer) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.sessions[session.Code] != session {
+		return false
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return !session.closing && session.peers[peerID] == candidate
+}
+
+func (d *Daemon) removeRelayChannelIfCurrent(session *Session, sid string, channel relayTransferChannel) bool {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.relayChannels[sid] != channel {
+		return false
+	}
+	delete(session.relayChannels, sid)
+	return true
 }
 
 func (d *Daemon) activateTransferSession(session *Session, peerID string, channels multilane.ChannelSet) {
@@ -834,26 +859,30 @@ func (d *Daemon) createPeer(connID, sessionCode string) {
 	}
 
 	// Create new peer connection
-	p, err := peer.New(iceServers, session.RelayOnly)
+	newPeer := d.newPeer
+	if newPeer == nil {
+		newPeer = peer.New
+	}
+	p, err := newPeer(iceServers, session.RelayOnly)
 	if err != nil {
 		log.Printf("create peer for session %s: %v", sessionCode, err)
 		return
 	}
 
-	// Add peer to session
-	session.mu.Lock()
-	session.peers[connID] = p
-	session.mu.Unlock()
-
 	// Set up peer callbacks
 	p.SetOnClose(func() {
 		log.Printf("peer %s closed (session %s)", connID, sessionCode)
 		session.mu.Lock()
-		delete(session.peers, connID)
+		if session.peers[connID] == p {
+			delete(session.peers, connID)
+		}
 		session.mu.Unlock()
 	})
 
 	p.SetOnICECandidate(func(init webrtc.ICECandidateInit) {
+		if !d.directPeerCurrent(session, connID, p) {
+			return
+		}
 		d.signaling.Send(context.Background(), map[string]any{
 			"type":       "ice_candidate",
 			"session_id": sessionCode,
@@ -862,12 +891,51 @@ func (d *Daemon) createPeer(connID, sessionCode string) {
 		})
 	})
 
-	d.wireDirectTransferSession(session, connID, p)
+	d.wireDirectTransferSession(session, connID, p, func() bool {
+		return d.directPeerCurrent(session, connID, p)
+	})
+
+	// Register only while the looked-up session is still current. Replacing a
+	// duplicate connection ID is identity-safe because the old close callback
+	// cannot delete the new entry.
+	d.mu.RLock()
+	if d.sessions[sessionCode] != session {
+		d.mu.RUnlock()
+		_ = p.Close()
+		return
+	}
+	session.mu.Lock()
+	if session.closing {
+		session.mu.Unlock()
+		d.mu.RUnlock()
+		_ = p.Close()
+		return
+	}
+	if session.peers == nil {
+		session.peers = make(map[string]*peer.Peer)
+	}
+	oldPeer := session.peers[connID]
+	session.peers[connID] = p
+	session.mu.Unlock()
+	d.mu.RUnlock()
+	if oldPeer != nil && oldPeer != p {
+		_ = oldPeer.Close()
+	}
 
 	// Create offer and send to signaling server
 	sdp, err := p.CreateOffer()
 	if err != nil {
 		log.Printf("create offer for session %s: %v", sessionCode, err)
+		session.mu.Lock()
+		if session.peers[connID] == p {
+			delete(session.peers, connID)
+		}
+		session.mu.Unlock()
+		_ = p.Close()
+		return
+	}
+	if !d.directPeerCurrent(session, connID, p) {
+		_ = p.Close()
 		return
 	}
 	d.signaling.Send(context.Background(), map[string]any{
@@ -1012,7 +1080,7 @@ func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
 		channel = rc
 	}
 
-	d.wireRelayTransferSession(session, channel)
+	d.wireRelayTransferSession(session, msg.SID, channel)
 
 	// Any required-lane closure is a terminal channel-set closure. Guard the
 	// daemon cleanup too so repeated transport notifications cannot tear down a
@@ -1020,27 +1088,46 @@ func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
 	var removeOnce sync.Once
 	channel.SetOnClose(func() {
 		removeOnce.Do(func() {
-			session.mu.Lock()
-			delete(session.relayChannels, msg.SID)
-			session.mu.Unlock()
+			d.removeRelayChannelIfCurrent(session, msg.SID, channel)
 		})
 	})
 
-	// Add channel to session
+	// Add the channel only if the session from the initial lookup is still
+	// current. A duplicate SID replaces and closes the old channel outside all
+	// daemon/session locks.
+	d.mu.RLock()
+	if d.sessions[msg.Code] != session {
+		d.mu.RUnlock()
+		_ = channel.Close()
+		return
+	}
 	session.mu.Lock()
+	if session.closing {
+		session.mu.Unlock()
+		d.mu.RUnlock()
+		_ = channel.Close()
+		return
+	}
 	if session.relayChannels == nil {
 		session.relayChannels = make(map[string]relayTransferChannel)
 	}
+	oldChannel := session.relayChannels[msg.SID]
 	session.relayChannels[msg.SID] = channel
 	session.mu.Unlock()
+	d.mu.RUnlock()
+	if oldChannel != nil && oldChannel != channel {
+		_ = oldChannel.Close()
+	}
 
 	// Start relay channel (asynchronously handles handshake)
 	log.Printf("relay_prepare: starting relay channel for session %s sid=%s", msg.Code, msg.SID)
 	if err := channel.Start(context.Background()); err != nil {
 		log.Printf("start relay channel sid=%s: %v", msg.SID, err)
-		session.mu.Lock()
-		delete(session.relayChannels, msg.SID)
-		session.mu.Unlock()
+		d.removeRelayChannelIfCurrent(session, msg.SID, channel)
+		return
+	}
+	if !d.relayChannelCurrent(session, msg.SID, channel) {
+		_ = channel.Close()
 		return
 	}
 	log.Printf("relay_prepare: relay channel started successfully for session %s sid=%s", msg.Code, msg.SID)
@@ -1253,7 +1340,9 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 			return err
 		}
 		d.mu.Lock()
-		delete(d.sessions, session.Code)
+		if d.sessions[session.Code] == session {
+			delete(d.sessions, session.Code)
+		}
 		d.mu.Unlock()
 		if d.OnSessionRemoved != nil {
 			d.OnSessionRemoved(session.Code)
@@ -1362,34 +1451,58 @@ func (d *Daemon) closeSessionResources(session *Session) {
 	d.closeSessionResourcesWithError(session, "")
 }
 
+type namedPeer struct {
+	id   string
+	peer *peer.Peer
+}
+
+type namedRelayChannel struct {
+	sid     string
+	channel relayTransferChannel
+}
+
 func (d *Daemon) closeSessionResourcesWithError(session *Session, message string) {
 	session.mu.Lock()
-	defer session.mu.Unlock()
+	session.closing = true
+	peers := make([]namedPeer, 0, len(session.peers))
 	for peerID, peerConn := range session.peers {
-		if err := peerConn.Close(); err != nil {
-			log.Printf("close peer %s: %v", peerID, err)
-		}
+		peers = append(peers, namedPeer{id: peerID, peer: peerConn})
 	}
+	relays := make([]namedRelayChannel, 0, len(session.relayChannels))
+	for sid, channel := range session.relayChannels {
+		relays = append(relays, namedRelayChannel{sid: sid, channel: channel})
+	}
+	// Detach first so synchronous close callbacks can safely reenter and stale
+	// callbacks cannot affect replacement resources.
+	session.peers = make(map[string]*peer.Peer)
+	session.relayChannels = make(map[string]relayTransferChannel)
+	session.mu.Unlock()
+
 	if message != "" {
-		msg, err := json.Marshal(map[string]string{"type": "error", "message": message})
+		msg, err := json.Marshal(map[string]string{"type": "error", "scope": "connection", "message": message})
 		if err != nil {
 			log.Printf("marshal session close error: %v", err)
 		} else {
-			for sid, rc := range session.relayChannels {
-				control := rc.Endpoint(multilane.LaneControl)
+			for _, relay := range relays {
+				control := relay.channel.Endpoint(multilane.LaneControl)
 				if control == nil {
-					log.Printf("notify relay channel %s before close: missing control lane", sid)
+					log.Printf("notify relay channel %s before close: missing control lane", relay.sid)
 					continue
 				}
 				if err := control.SendText(string(msg)); err != nil {
-					log.Printf("notify relay channel %s before close: %v", sid, err)
+					log.Printf("notify relay channel %s before close: %v", relay.sid, err)
 				}
 			}
 		}
 	}
-	for sid, rc := range session.relayChannels {
-		if err := rc.Close(); err != nil {
-			log.Printf("close relay channel %s: %v", sid, err)
+	for _, direct := range peers {
+		if err := direct.peer.Close(); err != nil {
+			log.Printf("close peer %s: %v", direct.id, err)
+		}
+	}
+	for _, relay := range relays {
+		if err := relay.channel.Close(); err != nil {
+			log.Printf("close relay channel %s: %v", relay.sid, err)
 		}
 	}
 }
@@ -1413,45 +1526,31 @@ func (d *Daemon) runExpiryPruner(ctx context.Context) {
 func (d *Daemon) pruneExpiredSessions() {
 	now := time.Now()
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
+	type expiredSession struct {
+		code    string
+		session *Session
+	}
+	var expired []expiredSession
 	for code, session := range d.sessions {
 		if !session.ExpiresAt.IsZero() && session.ExpiresAt.Before(now) {
-			log.Printf("session %s expired at %s", code, session.ExpiresAt)
-
-			// Close all peer connections
-			session.mu.Lock()
-			for peerID, peerConn := range session.peers {
-				if err := peerConn.Close(); err != nil {
-					log.Printf("close peer %s: %v", peerID, err)
-				}
-			}
-			// Close all relay channels
-			for sid, rc := range session.relayChannels {
-				if err := rc.Close(); err != nil {
-					log.Printf("close relay channel %s: %v", sid, err)
-				}
-			}
-			session.mu.Unlock()
-
-			// Remove from in-memory map
 			delete(d.sessions, code)
+			expired = append(expired, expiredSession{code: code, session: session})
+		}
+	}
+	d.mu.Unlock()
 
-			// Remove from store
-			if err := d.store.DeleteSession(code); err != nil {
-				log.Printf("warning: could not delete expired session: %v", err)
-			}
-
-			// Notify server of deregistration
-			d.signaling.Send(context.Background(), map[string]string{
-				"type": "deregister",
-				"code": code,
-			})
-
-			// Notify callback
-			if d.OnSessionRemoved != nil {
-				d.OnSessionRemoved(code)
-			}
+	for _, item := range expired {
+		log.Printf("session %s expired at %s", item.code, item.session.ExpiresAt)
+		d.closeSessionResources(item.session)
+		if err := d.store.DeleteSession(item.code); err != nil {
+			log.Printf("warning: could not delete expired session: %v", err)
+		}
+		_ = d.signaling.Send(context.Background(), map[string]string{
+			"type": "deregister",
+			"code": item.code,
+		})
+		if d.OnSessionRemoved != nil {
+			d.OnSessionRemoved(item.code)
 		}
 	}
 }
