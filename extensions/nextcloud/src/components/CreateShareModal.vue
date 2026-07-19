@@ -27,9 +27,9 @@
 
 			<fieldset class="sb-connection-mode">
 				<legend>Connection Mode</legend>
-				<label class="sb-mode-option" data-testid="relay-option" for="mode-relay">
+				<label class="sb-mode-option" data-testid="relay-option" :for="relayModeId">
 					<input
-						id="mode-relay"
+						:id="relayModeId"
 						data-testid="mode-relay"
 						type="radio"
 						:name="connectionModeName"
@@ -40,9 +40,9 @@
 						<small>End-to-end encrypted, hides your IP, and provides consistent performance</small>
 					</span>
 				</label>
-				<label class="sb-mode-option" data-testid="direct-option" for="mode-direct">
+				<label class="sb-mode-option" data-testid="direct-option" :for="directModeId">
 					<input
-						id="mode-direct"
+						:id="directModeId"
 						data-testid="mode-direct"
 						type="radio"
 						:name="connectionModeName"
@@ -55,7 +55,7 @@
 				</label>
 			</fieldset>
 
-			<NcNoteCard v-if="!form.relayOnly" data-testid="direct-advisory" type="info">
+			<NcNoteCard v-if="!form.relayOnly" data-testid="direct-advisory" type="warning">
 				Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.
 			</NcNoteCard>
 
@@ -103,6 +103,8 @@ const { createShare } = useAgentClient()
 const loading = ref(false)
 const error = ref('')
 const connectionModeName = `sharebridge-connection-mode-${getCurrentInstance()?.uid ?? 'default'}`
+const relayModeId = `${connectionModeName}-relay`
+const directModeId = `${connectionModeName}-direct`
 const form = reactive({
 	expiryHours: props.defaultExpiryHours ?? 24,
 	password: '',

@@ -114,6 +114,29 @@ describe('ShareBridgeTab', () => {
         expect(wrapper.find('[data-testid="create-share-btn"]').exists()).toBe(true)
     })
 
+    it('passes no relay default when agent settings fail to load', async () => {
+        useSettingsStore().$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
+        mockGetSettings.mockRejectedValueOnce(new Error('Network error'))
+
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
+        await flushPromises()
+        await wrapper.find('[data-testid="create-share-btn"]').trigger('click')
+
+        const modal = wrapper.findComponent({ name: 'CreateShareModal' })
+        expect(modal.props('defaultRelayOnly')).toBeUndefined()
+        expect(modal.find<HTMLInputElement>('[data-testid="mode-relay"]').element.checked).toBe(true)
+    })
+
+    it('preserves an explicitly false relay default from agent settings', async () => {
+        useSettingsStore().$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
+
+        const wrapper = mount(ShareBridgeTab, { props: { node: makeNode() } })
+        await flushPromises()
+        await wrapper.find('[data-testid="create-share-btn"]').trigger('click')
+
+        expect(wrapper.findComponent({ name: 'CreateShareModal' }).props('defaultRelayOnly')).toBe(false)
+    })
+
     it('shows connection error when listShares throws', async () => {
         useSettingsStore().$patch({ loaded: true, agentUrl: 'http://localhost:7878', apiKey: 'sb_key' })
         mockListShares.mockRejectedValueOnce(new Error('Network error'))

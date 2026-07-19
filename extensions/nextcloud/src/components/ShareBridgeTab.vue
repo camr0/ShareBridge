@@ -78,7 +78,7 @@ const showModal = ref(false)
 const turnAvailable = ref(false)
 const defaultExpiryHours = ref(24)
 const defaultMaxDownloads = ref(0)
-const defaultRelayOnly = ref(false)
+const defaultRelayOnly = ref<boolean | undefined>(undefined)
 
 const loadShares = async () => {
 	loadingShares.value = true

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { setActivePinia, createPinia } from 'pinia'
+import { NcNoteCard } from '@nextcloud/vue'
 import { useSettingsStore } from '../stores/settings'
 import CreateShareModal from './CreateShareModal.vue'
 
@@ -95,6 +96,31 @@ describe('CreateShareModal', () => {
         expect(wrapper.find('[data-testid="direct-advisory"]').text()).toBe(
             'Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.',
         )
+        expect(wrapper.findComponent(NcNoteCard).props('type')).toBe('warning')
+    })
+
+    it('uses distinct radio IDs and groups for multiple modal instances', async () => {
+        const first = mountModal()
+        const second = mountModal()
+
+        const firstRelay = first.find<HTMLInputElement>('[data-testid="mode-relay"]')
+        const firstDirect = first.find<HTMLInputElement>('[data-testid="mode-direct"]')
+        const secondRelay = second.find<HTMLInputElement>('[data-testid="mode-relay"]')
+        const secondDirect = second.find<HTMLInputElement>('[data-testid="mode-direct"]')
+
+        expect(firstRelay.attributes('id')).not.toBe(secondRelay.attributes('id'))
+        expect(firstDirect.attributes('id')).not.toBe(secondDirect.attributes('id'))
+        expect(first.find('[data-testid="relay-option"]').attributes('for')).toBe(firstRelay.attributes('id'))
+        expect(first.find('[data-testid="direct-option"]').attributes('for')).toBe(firstDirect.attributes('id'))
+        expect(second.find('[data-testid="relay-option"]').attributes('for')).toBe(secondRelay.attributes('id'))
+        expect(second.find('[data-testid="direct-option"]').attributes('for')).toBe(secondDirect.attributes('id'))
+        expect(firstRelay.attributes('name')).not.toBe(secondRelay.attributes('name'))
+
+        await firstDirect.setValue(true)
+        expect(firstRelay.element.checked).toBe(false)
+        expect(firstDirect.element.checked).toBe(true)
+        expect(secondRelay.element.checked).toBe(true)
+        expect(secondDirect.element.checked).toBe(false)
     })
 
     it('selects Direct when defaultRelayOnly is explicitly false', () => {
