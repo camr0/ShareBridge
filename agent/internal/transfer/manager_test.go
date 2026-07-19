@@ -25,6 +25,7 @@ type mockDC struct {
 	buffered      uint64
 	closed        bool
 	onMessage     func([]byte)
+	textErrorType string
 	mu            sync.Mutex
 }
 
@@ -43,6 +44,12 @@ func (m *mockDC) SendBinaryClass(class multilane.TrafficClass, data []byte) erro
 func (m *mockDC) SendText(text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var message struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(text), &message) == nil && message.Type == m.textErrorType {
+		return fmt.Errorf("forced %s send failure", message.Type)
+	}
 	m.textMessages = append(m.textMessages, text)
 	return nil
 }
@@ -172,6 +179,22 @@ func (m *mockDC) binaryCount() int {
 	return len(m.binaryData)
 }
 
+func (m *mockDC) binarySnapshot() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([][]byte, len(m.binaryData))
+	for i, data := range m.binaryData {
+		result[i] = append([]byte(nil), data...)
+	}
+	return result
+}
+
+func (m *mockDC) textSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.textMessages...)
+}
+
 func (m *mockDC) hasBinaryClass(class multilane.TrafficClass) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -247,6 +270,7 @@ func (m *mockOpenCloudClient) GetFile(filePath string, w io.Writer) (int64, erro
 func (m *mockOpenCloudClient) GetSHA1(subpath string) string { return "" }
 
 type mockGalleryClient struct {
+	mu           sync.Mutex
 	gallery      Gallery
 	thumbnail    []byte
 	file         []byte
@@ -274,7 +298,9 @@ func (m *mockGalleryClient) GetAssetInfo(ctx context.Context, id string) (string
 }
 
 func (m *mockGalleryClient) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
+	m.mu.Lock()
 	m.assetQuality = quality
+	m.mu.Unlock()
 	n, err := w.Write(m.file)
 	return int64(n), err
 }
@@ -284,13 +310,21 @@ func (m *mockGalleryClient) HeadVideoPlayback(ctx context.Context, id string) (i
 }
 
 func (m *mockGalleryClient) GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error) {
+	m.mu.Lock()
 	m.assetQuality = quality
 	m.rangeStart = startOffset
+	m.mu.Unlock()
 	if startOffset >= int64(len(m.file)) {
 		return 0, io.EOF
 	}
 	n, err := w.Write(m.file[startOffset:])
 	return int64(n), err
+}
+
+func (m *mockGalleryClient) getAssetQuality() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.assetQuality
 }
 
 type blockingGalleryClient struct {
@@ -504,7 +538,217 @@ func (m *replacingGalleryClient) GetAssetRange(context.Context, string, string, 
 	return 0, nil
 }
 
+type outOfOrderGalleryClient struct {
+	oldInfoStarted chan struct{}
+	oldInfoRelease chan struct{}
+	oldSeekStarted chan struct{}
+	oldSeekRelease chan struct{}
+}
+
+func (m *outOfOrderGalleryClient) ListGallery(context.Context) (Gallery, error) {
+	return Gallery{}, nil
+}
+func (m *outOfOrderGalleryClient) GetThumbnail(context.Context, string, io.Writer) (int64, error) {
+	return 0, nil
+}
+func (m *outOfOrderGalleryClient) GetAssetInfo(_ context.Context, id string) (string, int64, string, error) {
+	if id == "old" {
+		close(m.oldInfoStarted)
+		<-m.oldInfoRelease
+	}
+	return id + ".jpg", 3, "image/jpeg", nil
+}
+func (m *outOfOrderGalleryClient) HeadVideoPlayback(context.Context, string) (int64, error) {
+	return 3, nil
+}
+func (m *outOfOrderGalleryClient) GetAsset(_ context.Context, id, _ string, w io.Writer) (int64, error) {
+	n, err := w.Write([]byte(id))
+	return int64(n), err
+}
+func (m *outOfOrderGalleryClient) GetAssetRange(_ context.Context, _ string, _ string, start int64, w io.Writer) (int64, error) {
+	if start == 20 {
+		close(m.oldSeekStarted)
+		<-m.oldSeekRelease
+	}
+	n, err := w.Write([]byte{byte(start)})
+	return int64(n), err
+}
+
 // TestHandleOpen_SendsHello verifies hello is sent without password_required
+func TestChunkEnvelopeFixtureRoundTripsOperationAndGeneration(t *testing.T) {
+	frame := encodeChunkFrame(0x0102030405060708, 0x11121314, []byte{0xaa, 0xbb})
+	require.Equal(t, []byte{
+		0x10, 0x01,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x11, 0x12, 0x13, 0x14,
+		0xaa, 0xbb,
+	}, frame)
+
+	operationID, generation, payload, err := decodeChunkFrame(frame)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0x0102030405060708), operationID)
+	require.Equal(t, uint32(0x11121314), generation)
+	require.Equal(t, []byte{0xaa, 0xbb}, payload)
+
+	newer := encodeChunkFrame(0x0102030405060709, 0x11121314, []byte{0xaa, 0xbb})
+	require.NotEqual(t, frame, newer, "old and replacement operations must be distinguishable before either header arrives")
+	newerOperation, _, _, err := decodeChunkFrame(newer)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0x0102030405060709), newerOperation)
+}
+
+func TestOlderPreviewMetadataCannotEmitHeaderAfterReplacement(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &outOfOrderGalleryClient{
+		oldInfoStarted: make(chan struct{}), oldInfoRelease: make(chan struct{}),
+		oldSeekStarted: make(chan struct{}), oldSeekRelease: make(chan struct{}),
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	oldRequest, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "old", "quality": "preview", "request_id": "old-request",
+	})
+	newRequest, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "new", "quality": "preview", "request_id": "new-request",
+	})
+	go manager.HandleMessage(oldRequest)
+	select {
+	case <-client.oldInfoStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old metadata lookup did not block")
+	}
+	manager.HandleMessage(newRequest)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_header") }, time.Second, time.Millisecond)
+	close(client.oldInfoRelease)
+	require.Never(t, func() bool {
+		for _, message := range channels.control.textSnapshot() {
+			var header struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+			}
+			_ = json.Unmarshal([]byte(message), &header)
+			if header.Type == "asset_preview_header" && header.ID == "old" {
+				return true
+			}
+		}
+		return false
+	}, 100*time.Millisecond, time.Millisecond)
+}
+
+func TestDelayedOlderSeekCannotReplaceNewerGeneration(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &outOfOrderGalleryClient{
+		oldInfoStarted: make(chan struct{}), oldInfoRelease: make(chan struct{}),
+		oldSeekStarted: make(chan struct{}), oldSeekRelease: make(chan struct{}),
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	manager.mediaMu.Lock()
+	manager.mediaID = "video"
+	manager.mediaQuality = "video"
+	manager.currentGeneration.Store(1)
+	manager.mediaMu.Unlock()
+	oldSeek, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 20, "generation": 2, "request_id": "seek-2",
+	})
+	newSeek, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 30, "generation": 3, "request_id": "seek-3",
+	})
+	go manager.HandleMessage(oldSeek)
+	select {
+	case <-client.oldSeekStarted:
+	case <-time.After(time.Second):
+		t.Fatal("older seek validation did not block")
+	}
+	manager.HandleMessage(newSeek)
+	require.Eventually(t, func() bool { return manager.currentGeneration.Load() == 3 }, time.Second, time.Millisecond)
+	close(client.oldSeekRelease)
+	require.Never(t, func() bool { return manager.currentGeneration.Load() == 2 }, 100*time.Millisecond, time.Millisecond)
+
+	for _, message := range channels.control.textSnapshot() {
+		var header struct {
+			Type       string `json:"type"`
+			Generation int    `json:"generation"`
+		}
+		_ = json.Unmarshal([]byte(message), &header)
+		require.False(t, header.Type == "asset_preview_header" && header.Generation == 2)
+	}
+}
+
+func TestVideoSeekUsesCorrelated64KiBPayloadChunks(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{file: bytes.Repeat([]byte{0xcc}, 200*1024)}
+	manager := NewGalleryManager(channels, client, 0)
+	manager.mediaMu.Lock()
+	manager.mediaID = "video"
+	manager.mediaQuality = "video"
+	manager.currentGeneration.Store(1)
+	manager.mediaMu.Unlock()
+
+	seek, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 0, "generation": 2,
+	})
+	manager.HandleMessage(seek)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
+	var header struct {
+		OperationID uint64 `json:"operation_id"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("asset_preview_header")), &header))
+	frames := channels.media.binarySnapshot()
+	require.GreaterOrEqual(t, len(frames), 4)
+	var totalPayload int
+	for _, frame := range frames {
+		operationID, generation, payload, err := decodeChunkFrame(frame)
+		require.NoError(t, err)
+		require.Equal(t, header.OperationID, operationID)
+		require.Equal(t, uint32(2), generation)
+		require.LessOrEqual(t, len(payload), chunkSize)
+		totalPayload += len(payload)
+	}
+	require.Equal(t, 200*1024, totalPayload)
+}
+
+func TestChunkEndSendFailureDoesNotCountBulkDownload(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		manager func(*mockChannelSet) *Manager
+		request map[string]any
+	}{
+		{
+			name: "file",
+			manager: func(channels *mockChannelSet) *Manager {
+				return NewManager(channels, &mockOpenCloudClient{
+					listFilesResult: []cloudwebdav.FileInfo{{Name: "file.bin", RequestPath: "file.bin", Size: 3}},
+					file:            []byte("abc"),
+				}, 0)
+			},
+			request: map[string]any{"type": "file_request", "path": "file.bin"},
+		},
+		{
+			name: "asset",
+			manager: func(channels *mockChannelSet) *Manager {
+				return NewGalleryManager(channels, &mockGalleryClient{
+					gallery: Gallery{Items: []GalleryItem{{ID: "asset", Name: "asset.jpg", Size: 3}}},
+					file:    []byte("abc"),
+				}, 0)
+			},
+			request: map[string]any{"type": "asset_request", "id": "asset", "quality": "original"},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			channels := newMockChannelSet()
+			channels.control.textErrorType = "chunk_end"
+			manager := testCase.manager(channels)
+			var completed atomic.Bool
+			manager.OnDownloadComplete = func(int64) { completed.Store(true) }
+			request, _ := json.Marshal(testCase.request)
+			manager.HandleMessage(request)
+			require.Eventually(t, func() bool { return channels.bulk.binaryCount() > 0 }, time.Second, time.Millisecond)
+			require.Eventually(t, func() bool { return !manager.bulkTransfer.Load() }, time.Second, time.Millisecond)
+			require.Zero(t, manager.downloads.Load())
+			require.False(t, completed.Load())
+		})
+	}
+}
+
 func TestHandleOpen_SendsHello(t *testing.T) {
 	channels := newMockChannelSet()
 	dc := channels.control
@@ -566,15 +810,28 @@ func TestFileShareRoutesControlAndBulkWhileMediaStaysIdle(t *testing.T) {
 	require.True(t, channels.control.hasTextType("file_header"))
 	require.True(t, channels.bulk.hasBinaryClass(multilane.ClassBulk))
 	require.Zero(t, channels.media.binaryCount())
+	var expectedOperation uint64
 	for _, messageType := range []string{"file_header", "chunk_end"} {
 		var lifecycle struct {
-			Scope     string `json:"scope"`
-			RequestID string `json:"request_id"`
+			Scope       string `json:"scope"`
+			RequestID   string `json:"request_id"`
+			OperationID uint64 `json:"operation_id"`
 		}
 		require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType(messageType)), &lifecycle))
 		require.Equal(t, "bulk", lifecycle.Scope)
 		require.Equal(t, "bulk-1", lifecycle.RequestID)
+		require.NotZero(t, lifecycle.OperationID)
+		if expectedOperation == 0 {
+			expectedOperation = lifecycle.OperationID
+		} else {
+			require.Equal(t, expectedOperation, lifecycle.OperationID)
+		}
 	}
+	operationID, generation, payload, err := decodeChunkFrame(channels.bulk.binarySnapshot()[0])
+	require.NoError(t, err)
+	require.Equal(t, expectedOperation, operationID)
+	require.Zero(t, generation)
+	require.Equal(t, []byte("pdf"), payload)
 }
 
 func TestGalleryRoutesThumbnailsToThumbnailMediaClass(t *testing.T) {
@@ -605,15 +862,27 @@ func TestPreviewRoutesInteractiveBytesToMediaAndOriginalToBulk(t *testing.T) {
 	require.Eventually(t, func() bool { return channels.media.binaryCount() > 0 }, time.Second, time.Millisecond)
 	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
 	require.True(t, channels.media.hasBinaryClass(multilane.ClassInteractiveMedia))
+	var mediaOperation uint64
 	for _, messageType := range []string{"asset_preview_header", "asset_preview_end"} {
 		var lifecycle struct {
-			Scope     string `json:"scope"`
-			RequestID string `json:"request_id"`
+			Scope       string `json:"scope"`
+			RequestID   string `json:"request_id"`
+			OperationID uint64 `json:"operation_id"`
 		}
 		require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType(messageType)), &lifecycle))
 		require.Equal(t, "media", lifecycle.Scope)
 		require.Equal(t, "media-1", lifecycle.RequestID)
+		require.NotZero(t, lifecycle.OperationID)
+		if mediaOperation == 0 {
+			mediaOperation = lifecycle.OperationID
+		} else {
+			require.Equal(t, mediaOperation, lifecycle.OperationID)
+		}
 	}
+	frameOperation, generation, _, err := decodeChunkFrame(channels.media.binarySnapshot()[0])
+	require.NoError(t, err)
+	require.Equal(t, mediaOperation, frameOperation)
+	require.Zero(t, generation)
 
 	original, _ := json.Marshal(map[string]any{
 		"type": "asset_request", "id": "asset-1", "quality": "original", "request_id": "bulk-1",
@@ -731,10 +1000,8 @@ func TestBulkAndMediaErrorsIncludeScopeAndRequestID(t *testing.T) {
 	require.Equal(t, "bulk", scope)
 	require.Equal(t, "bulk-7", requestID)
 
-	channels.control.mu.Lock()
-	defer channels.control.mu.Unlock()
 	var foundMedia bool
-	for _, message := range channels.control.textMessages {
+	for _, message := range channels.control.textSnapshot() {
 		var parsed map[string]any
 		_ = json.Unmarshal([]byte(message), &parsed)
 		if parsed["type"] == "error" && parsed["scope"] == "media" && parsed["request_id"] == "media-9" {
@@ -759,8 +1026,9 @@ func TestHandleOpen_ImmichGallerySendsThumbnailListAndData(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	require.True(t, dc.hasTextType("thumbnail_list"))
-	require.Len(t, channels.media.binaryData, 1)
-	require.Equal(t, byte(0x11), channels.media.binaryData[0][0], "thumbnail frames use typed binary envelope")
+	mediaFrames := channels.media.binarySnapshot()
+	require.Len(t, mediaFrames, 1)
+	require.Equal(t, byte(0x11), mediaFrames[0][0], "thumbnail frames use typed binary envelope")
 	completed := dc.getTextByType("thumbnail_complete")
 	require.NotEmpty(t, completed)
 	var result struct {
@@ -793,9 +1061,7 @@ func TestHandleOpen_ImmichGalleryFetchesThumbnailsConcurrently(t *testing.T) {
 	}
 	close(client.release)
 	require.Eventually(t, func() bool {
-		channels.media.mu.Lock()
-		defer channels.media.mu.Unlock()
-		return len(channels.media.binaryData) == 3
+		return len(channels.media.binarySnapshot()) == 3
 	}, time.Second, 10*time.Millisecond)
 	require.GreaterOrEqual(t, client.maxConcurrent.Load(), int32(2))
 }
@@ -815,8 +1081,18 @@ func TestHandleAssetRequestStreamsByAssetID(t *testing.T) {
 
 	require.True(t, dc.hasTextType("file_header"))
 	require.True(t, fileHeaderBinaryEnvelope(t, dc))
-	require.NotEmpty(t, channels.bulk.binaryData)
+	require.NotEmpty(t, channels.bulk.binarySnapshot())
 	require.True(t, dc.hasTextType("chunk_end"))
+	var header struct {
+		OperationID uint64 `json:"operation_id"`
+		RequestID   string `json:"request_id"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("file_header")), &header))
+	require.NotZero(t, header.OperationID)
+	require.Empty(t, header.RequestID, "wire correlation must not depend on a client request_id")
+	operationID, _, _, err := decodeChunkFrame(channels.bulk.binarySnapshot()[0])
+	require.NoError(t, err)
+	require.Equal(t, header.OperationID, operationID)
 }
 
 func TestHandleAssetRequestThumbnailQualityStreamsThumbnail(t *testing.T) {
@@ -832,8 +1108,12 @@ func TestHandleAssetRequestThumbnailQualityStreamsThumbnail(t *testing.T) {
 	mgr.HandleMessage(req)
 	time.Sleep(50 * time.Millisecond)
 
-	require.Len(t, channels.bulk.binaryData, 1)
-	require.Equal(t, []byte{0x10, 't', 'n'}, channels.bulk.binaryData[0])
+	require.Len(t, channels.bulk.binarySnapshot(), 1)
+	operationID, generation, payload, err := decodeChunkFrame(channels.bulk.binarySnapshot()[0])
+	require.NoError(t, err)
+	require.NotZero(t, operationID)
+	require.Zero(t, generation)
+	require.Equal(t, []byte("tn"), payload)
 }
 
 func TestHandleAssetPreviewRequestStreamsPreviewWithoutDownloadHeader(t *testing.T) {
@@ -851,9 +1131,19 @@ func TestHandleAssetPreviewRequestStreamsPreviewWithoutDownloadHeader(t *testing
 	require.False(t, dc.hasTextType("file_header"))
 	require.True(t, dc.hasTextType("asset_preview_header"))
 	require.True(t, dc.hasTextType("asset_preview_end"))
-	require.Equal(t, "preview", client.assetQuality)
-	require.NotEmpty(t, channels.media.binaryData)
-	require.Equal(t, byte(0x10), channels.media.binaryData[0][0], "preview chunks reuse typed file chunk envelope")
+	require.Equal(t, "preview", client.getAssetQuality())
+	mediaFrames := channels.media.binarySnapshot()
+	require.NotEmpty(t, mediaFrames)
+	require.Equal(t, byte(0x10), mediaFrames[0][0], "preview chunks reuse typed file chunk envelope")
+	var header struct {
+		OperationID uint64 `json:"operation_id"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("asset_preview_header")), &header))
+	operationID, generation, payload, err := decodeChunkFrame(channels.media.binarySnapshot()[0])
+	require.NoError(t, err)
+	require.Equal(t, header.OperationID, operationID, "generation-zero images remain correlated")
+	require.Zero(t, generation)
+	require.Equal(t, []byte("preview"), payload)
 }
 
 func TestHandleAssetPreviewRequestStreamsVideoPreviewInLargerFrames(t *testing.T) {
@@ -876,7 +1166,20 @@ func TestHandleAssetPreviewRequestStreamsVideoPreviewInLargerFrames(t *testing.T
 
 	require.True(t, dc.hasTextType("asset_preview_header"))
 	require.True(t, dc.hasTextType("asset_preview_end"))
-	require.Len(t, channels.media.binaryData, 1)
+	var header struct {
+		OperationID uint64 `json:"operation_id"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("asset_preview_header")), &header))
+	require.NotZero(t, header.OperationID)
+	frames := channels.media.binarySnapshot()
+	require.Len(t, frames, 4)
+	for _, frame := range frames {
+		operationID, generation, payload, err := decodeChunkFrame(frame)
+		require.NoError(t, err)
+		require.Equal(t, header.OperationID, operationID)
+		require.Zero(t, generation)
+		require.LessOrEqual(t, len(payload), chunkSize)
+	}
 }
 
 func TestHandleFileRequestHeaderIncludesBinaryEnvelope(t *testing.T) {
@@ -912,7 +1215,7 @@ func TestHandleAssetRequestRejectsUnsupportedQuality(t *testing.T) {
 
 	require.True(t, dc.hasErrorContaining("unsupported asset quality"))
 	require.False(t, dc.hasTextType("file_header"))
-	require.Empty(t, channels.bulk.binaryData)
+	require.Empty(t, channels.bulk.binarySnapshot())
 }
 
 func TestConcurrentAssetRequestsOnlyOneStarts(t *testing.T) {
@@ -1110,14 +1413,12 @@ func TestHandleFileRequest_NestedPath(t *testing.T) {
 	}
 
 	var headerName string
-	dc.mu.Lock()
-	for _, msg := range dc.textMessages {
+	for _, msg := range dc.textSnapshot() {
 		var parsed map[string]interface{}
 		if json.Unmarshal([]byte(msg), &parsed) == nil && parsed["type"] == "file_header" {
 			headerName, _ = parsed["name"].(string)
 		}
 	}
-	dc.mu.Unlock()
 	if headerName != "file.txt" {
 		t.Errorf("expected file_header name 'file.txt', got %q", headerName)
 	}
@@ -1170,12 +1471,9 @@ func TestStreamFile_DoesNotSendChunkEndOrCountDownloadOnGetFailure(t *testing.T)
 	mgr.HandleMessage(req)
 	time.Sleep(50 * time.Millisecond)
 
-	dc.mu.Lock()
-	defer dc.mu.Unlock()
-
 	foundChunkEnd := false
 	foundTransferFailed := false
-	for _, msg := range dc.textMessages {
+	for _, msg := range dc.textSnapshot() {
 		if strings.Contains(msg, `"type":"chunk_end"`) {
 			foundChunkEnd = true
 		}
