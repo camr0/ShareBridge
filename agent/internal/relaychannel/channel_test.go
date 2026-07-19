@@ -16,8 +16,28 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"sharebridge/agent/internal/multilane"
 	"sharebridge/agent/internal/noise"
 )
+
+func TestSecureRelayChannelExposesAllLogicalLanes(t *testing.T) {
+	channel, err := NewSecureRelayChannel(SecureRelayConfig{
+		RelayURL:      "ws://relay.test",
+		RelayJWT:      "token",
+		StaticPrivate: mustGenerateKey(),
+	})
+	if err != nil {
+		t.Fatalf("NewSecureRelayChannel: %v", err)
+	}
+	for _, lane := range []multilane.Lane{multilane.LaneControl, multilane.LaneMedia, multilane.LaneBulk} {
+		if channel.Endpoint(lane) == nil {
+			t.Fatalf("Endpoint(%d) is nil", lane)
+		}
+	}
+	if channel.Endpoint(multilane.Lane(0x03)) != nil {
+		t.Fatal("reserved lane unexpectedly has an endpoint")
+	}
+}
 
 func TestSecureRelayChannel_HandshakeAndRoundTrip(t *testing.T) {
 	serverStatic, err := ecdh.P256().GenerateKey(rand.Reader)
@@ -78,7 +98,7 @@ func TestSecureRelayChannel_HandshakeAndRoundTrip(t *testing.T) {
 		}
 
 		iSend, iRecv := initiator.Split()
-		textCipher, err := iSend.Encrypt(nil, []byte(`{"type":"list_request","path":""}`))
+		textCipher, err := iSend.Encrypt(nil, mustEnvelope(t, multilane.LaneControl, []byte(`{"type":"list_request","path":""}`)))
 		if err != nil {
 			t.Fatalf("Encrypt text: %v", err)
 		}
@@ -98,8 +118,9 @@ func TestSecureRelayChannel_HandshakeAndRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Decrypt reply: %v", err)
 		}
-		if string(replyPlain) != `{"type":"hello"}` {
-			t.Fatalf("reply plaintext = %s", replyPlain)
+		replyLane, replyPayload, err := multilane.DecodeEnvelope(replyPlain)
+		if err != nil || replyLane != multilane.LaneControl || string(replyPayload) != `{"type":"hello"}` {
+			t.Fatalf("reply envelope lane=%d payload=%s err=%v", replyLane, replyPayload, err)
 		}
 	}))
 	defer relayServer.Close()
@@ -198,12 +219,13 @@ func TestSecureRelayChannel_SendBinary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Decrypt binary: %v", err)
 		}
-		if string(binPlain) != "binary-data" {
-			t.Fatalf("binary plaintext = %s", binPlain)
+		binLane, binPayload, err := multilane.DecodeEnvelope(binPlain)
+		if err != nil || binLane != multilane.LaneBulk || string(binPayload) != "binary-data" {
+			t.Fatalf("binary envelope lane=%d payload=%s err=%v", binLane, binPayload, err)
 		}
 
 		// Send reply
-		replyCipher, _ := iSend.Encrypt(nil, []byte("ok"))
+		replyCipher, _ := iSend.Encrypt(nil, mustEnvelope(t, multilane.LaneMedia, []byte("ok")))
 		conn.Write(ctx, websocket.MessageBinary, mustFrame(FrameText, replyCipher))
 	}))
 	defer relayServer.Close()
@@ -215,7 +237,7 @@ func TestSecureRelayChannel_SendBinary(t *testing.T) {
 	})
 
 	gotMessages := make(chan []byte, 1)
-	channel.SetOnMessage(func(data []byte) { gotMessages <- data })
+	channel.Endpoint(multilane.LaneMedia).SetOnMessage(func(data []byte) { gotMessages <- data })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -223,7 +245,7 @@ func TestSecureRelayChannel_SendBinary(t *testing.T) {
 	defer channel.Close()
 
 	// Send binary
-	if err := channel.SendBinary([]byte("binary-data")); err != nil {
+	if err := channel.Endpoint(multilane.LaneBulk).SendBinary([]byte("binary-data")); err != nil {
 		t.Fatalf("SendBinary: %v", err)
 	}
 
@@ -303,7 +325,11 @@ func TestSecureRelayChannel_ConcurrentSendsAreSerialized(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Decrypt encrypted frame %d: %v", i, err)
 			}
-			out = append(out, string(plain))
+			lane, decoded, err := multilane.DecodeEnvelope(plain)
+			if err != nil || (lane != multilane.LaneMedia && lane != multilane.LaneBulk) {
+				t.Fatalf("DecodeEnvelope frame %d: lane=%d err=%v", i, lane, err)
+			}
+			out = append(out, fmt.Sprintf("%d:%s", lane, decoded))
 		}
 		received <- out
 	}))
@@ -329,7 +355,11 @@ func TestSecureRelayChannel_ConcurrentSendsAreSerialized(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if err := channel.SendText(fmt.Sprintf("msg-%02d", i)); err != nil {
+			lane := multilane.LaneMedia
+			if i%2 == 1 {
+				lane = multilane.LaneBulk
+			}
+			if err := channel.Endpoint(lane).SendText(fmt.Sprintf("msg-%02d", i)); err != nil {
 				t.Errorf("SendText(%d): %v", i, err)
 			}
 		}(i)
@@ -346,7 +376,11 @@ func TestSecureRelayChannel_ConcurrentSendsAreSerialized(t *testing.T) {
 			seen[msg] = true
 		}
 		for i := 0; i < sends; i++ {
-			want := fmt.Sprintf("msg-%02d", i)
+			lane := multilane.LaneMedia
+			if i%2 == 1 {
+				lane = multilane.LaneBulk
+			}
+			want := fmt.Sprintf("%d:msg-%02d", lane, i)
 			if !seen[want] {
 				t.Fatalf("missing %q in %#v", want, got)
 			}
@@ -404,15 +438,16 @@ func TestSecureRelayChannel_CloseCallsOnClose(t *testing.T) {
 	}
 }
 
-func TestSecureRelayChannel_BufferedAmount(t *testing.T) {
+func TestSecureRelayChannel_EndpointsExposeNoNativeBufferedAmount(t *testing.T) {
 	channel, _ := NewSecureRelayChannel(SecureRelayConfig{
 		RelayURL:      "ws://test",
 		RelayJWT:      "token",
 		StaticPrivate: mustGenerateKey(),
 	})
-	// BufferedAmount always returns 0 for WebSocket transport (no concept of buffering)
-	if channel.BufferedAmount() != 0 {
-		t.Fatalf("BufferedAmount should return 0")
+	for _, lane := range []multilane.Lane{multilane.LaneControl, multilane.LaneMedia, multilane.LaneBulk} {
+		if channel.Endpoint(lane).BufferedAmount() != 0 {
+			t.Fatalf("Endpoint(%d).BufferedAmount should return 0", lane)
+		}
 	}
 }
 
@@ -490,7 +525,7 @@ func TestSecureRelayChannel_OnOpenCallback(t *testing.T) {
 	}
 }
 
-func TestSecureRelayChannel_InvalidFrameInReadLoop(t *testing.T) {
+func TestSecureRelayChannel_InvalidEncryptedLaneClosesWholeSet(t *testing.T) {
 	serverStatic, _ := ecdh.P256().GenerateKey(rand.Reader)
 	onCloseCalled := make(chan struct{}, 1)
 
@@ -508,8 +543,9 @@ func TestSecureRelayChannel_InvalidFrameInReadLoop(t *testing.T) {
 		msg3, _ := initiator.WriteMessage3()
 		conn.Write(ctx, websocket.MessageBinary, mustFrame(FrameHandshake, msg3))
 
-		// Send invalid frame (unknown kind)
-		conn.Write(ctx, websocket.MessageBinary, []byte{0xff, 0, 0, 0, 0})
+		iSend, _ := initiator.Split()
+		ciphertext, _ := iSend.Encrypt(nil, []byte{0x03, 0x01})
+		conn.Write(ctx, websocket.MessageBinary, mustFrame(FrameBinary, ciphertext))
 	}))
 	defer relayServer.Close()
 
@@ -526,13 +562,22 @@ func TestSecureRelayChannel_InvalidFrameInReadLoop(t *testing.T) {
 
 	select {
 	case <-onCloseCalled:
-		// success - onClose should be called when invalid frame causes close
+		// success - one invalid encrypted lane closes the shared relay set
 	case <-time.After(2 * time.Second):
-		t.Fatal("onClose was not called after invalid frame")
+		t.Fatal("onClose was not called after invalid encrypted lane")
 	}
 }
 
 // Helper functions for tests
+
+func mustEnvelope(t *testing.T, lane multilane.Lane, payload []byte) []byte {
+	t.Helper()
+	encoded, err := multilane.EncodeEnvelope(lane, payload)
+	if err != nil {
+		t.Fatalf("EncodeEnvelope: %v", err)
+	}
+	return encoded
+}
 
 func mustFrame(kind byte, payload []byte) []byte {
 	frame, err := WriteFrame(kind, payload)

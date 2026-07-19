@@ -1,5 +1,18 @@
 import { NoiseXX } from '../noise-p256/index.js'
 import { FRAME_HANDSHAKE, FRAME_TEXT, FRAME_BINARY, FrameDecoder, writeFrame } from './frame.js'
+import { createChannelSet } from './channelSet.js'
+import { LaneScheduler } from './laneScheduler.js'
+import {
+  LANE_BULK,
+  LANE_CONTROL,
+  LANE_MEDIA,
+  TRAFFIC_CLASS_BULK,
+  TRAFFIC_CLASS_CONTROL,
+  TRAFFIC_CLASS_INTERACTIVE_MEDIA,
+  TRAFFIC_CLASS_THUMBNAIL,
+  decodeLaneEnvelope,
+  encodeLaneEnvelope,
+} from './multiLaneProtocol.js'
 
 const DEBUG = typeof location !== 'undefined' && (
   location.search.includes('debug=1') ||
@@ -21,6 +34,19 @@ export class SecureRelayChannel {
     this._noise = null
     this._sendCipher = null
     this._recvCipher = null
+    this._scheduler = new LaneScheduler({ write: (request) => this._writeScheduled(request) })
+    this.control = new RelayLaneEndpoint(this, LANE_CONTROL, TRAFFIC_CLASS_CONTROL)
+    this.media = new RelayLaneEndpoint(this, LANE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA)
+    this.bulk = new RelayLaneEndpoint(this, LANE_BULK, TRAFFIC_CLASS_BULK)
+    this._endpoints = new Map([
+      [LANE_CONTROL, this.control],
+      [LANE_MEDIA, this.media],
+      [LANE_BULK, this.bulk],
+    ])
+    this._channelSet = null
+    this.ready = null
+    this._closed = false
+    this._receiveChain = Promise.resolve()
     this.readyState = 'connecting'
     this.bufferedAmount = 0
     this.onopen = null
@@ -31,6 +57,15 @@ export class SecureRelayChannel {
   async start() {
     debugLog('SecureRelayChannel.start() called')
     this._noise = await NoiseXX.createInitiator()
+    this._channelSet = createChannelSet()
+    this._channelSet.onclose = (error) => this._closeAll(error?.message ?? 'channel set closed')
+    this._channelSet.attach('control', this.control)
+    this._channelSet.attach('media', this.media)
+    this._channelSet.attach('bulk', this.bulk)
+    this.ready = this._channelSet.ready
+    // start() reports handshake failures; keep the shared ready promise from
+    // becoming a second unhandled rejection when Noise fails first.
+    this.ready.catch(() => {})
     debugLog('NoiseXX initiator created')
     this._socket = this._websocketFactory(this._relayURL)
     this._socket.binaryType = 'arraybuffer'
@@ -50,6 +85,7 @@ export class SecureRelayChannel {
         readyState: this.readyState,
         socketReadyState: this._socket?.readyState,
       })
+      this._closeAll(event?.reason || 'relay websocket closed')
     })
 
     await new Promise((resolve, reject) => {
@@ -74,7 +110,6 @@ export class SecureRelayChannel {
         debugLog('WebSocket closed in first phase, readyState:', this.readyState)
         this.readyState = 'closed'
         reject(new Error('websocket closed during handshake'))
-        if (this.onclose) this.onclose()
       }
       this._socket.addEventListener('open', handleOpen, { once: true })
       this._socket.addEventListener('error', (e) => {
@@ -99,7 +134,6 @@ export class SecureRelayChannel {
           debugLog('WebSocket closed during handshake phase 2')
           this.readyState = 'closed'
           reject(new Error('websocket closed during handshake'))
-          if (this.onclose) this.onclose()
         }
       }
       this._socket.addEventListener('close', handleClose, { once: true })
@@ -110,10 +144,22 @@ export class SecureRelayChannel {
     })
     debugLog('Handshake promise resolved, calling cleanup')
     this._handshakeCleanup?.()
+    await this.ready
+    this.readyState = 'open'
+    this.onopen?.()
     debugLog('SecureRelayChannel.start() completed')
   }
 
-  _handleMessage = async (event) => {
+  _handleMessage = (event) => {
+    this._receiveChain = this._receiveChain
+      .then(() => this._processMessage(event))
+      .catch((error) => {
+        console.error('[secure-relay] receive sequence error:', error)
+        this._closeAll('relay receive sequence error')
+      })
+  }
+
+  _processMessage = async (event) => {
     debugLog('WebSocket message received, data length:', event.data?.byteLength || event.data?.length || 'unknown')
     const chunk = new Uint8Array(event.data)
     debugLog('Processing chunk, length:', chunk.length)
@@ -133,18 +179,24 @@ export class SecureRelayChannel {
       }
 
       try {
+        if (frame.kind !== FRAME_TEXT && frame.kind !== FRAME_BINARY) {
+          throw new Error(`unknown frame kind: 0x${frame.kind.toString(16)}`)
+        }
         const plaintext = await this._recvCipher.decrypt(new Uint8Array(0), frame.payload)
+        const { lane, payload } = decodeLaneEnvelope(plaintext)
+        const endpoint = this._endpoints.get(lane)
+        if (!endpoint) throw new Error(`unknown relay lane: ${lane}`)
         if (frame.kind === FRAME_TEXT) {
           debugLog('relay text frame decrypted', { byteLength: plaintext.length })
-          this.onmessage?.({ data: new TextDecoder().decode(plaintext) })
-        } else if (frame.kind === FRAME_BINARY) {
-          debugLog('relay binary frame decrypted', { byteLength: plaintext.length })
-          // Create a proper ArrayBuffer copy to avoid browser-specific issues with underlying buffer
-          const arrayBuffer = new ArrayBuffer(plaintext.length)
-          new Uint8Array(arrayBuffer).set(plaintext)
-          this.onmessage?.({ data: arrayBuffer })
+          endpoint._deliver(new TextDecoder().decode(payload))
         } else {
-          throw new Error(`unknown frame kind: 0x${frame.kind.toString(16)}`)
+          debugLog('relay binary frame decrypted', { byteLength: plaintext.length })
+          const arrayBuffer = new ArrayBuffer(payload.length)
+          new Uint8Array(arrayBuffer).set(payload)
+          endpoint._deliver(arrayBuffer)
+        }
+        if (lane === LANE_CONTROL && this.readyState === 'open') {
+          this.onmessage?.({ data: frame.kind === FRAME_TEXT ? new TextDecoder().decode(payload) : payload.buffer })
         }
       } catch (err) {
         console.error('[secure-relay] decrypt/forward error:', err.message, err.stack)
@@ -163,23 +215,18 @@ export class SecureRelayChannel {
     const msg3 = await this._noise.writeMessage3()
     this._socket.send(writeFrame(FRAME_HANDSHAKE, msg3))
     ;[this._sendCipher, this._recvCipher] = await this._noise.split()
-    this.readyState = 'open'
-    debugLog('Handshake complete, readyState is open')
+    for (const endpoint of this._endpoints.values()) endpoint._open()
+    debugLog('Noise handshake complete; waiting for transport version acknowledgement')
     this._handshakeResolve?.()
-    this.onopen?.()
   }
 
+  // Compatibility shim while application callers migrate to the control endpoint.
   async send(text) {
-    const plaintext = new TextEncoder().encode(text)
-    debugLog('sending relay text frame', { byteLength: plaintext.length })
-    const ciphertext = await this._sendCipher.encrypt(new Uint8Array(0), plaintext)
-    this._socket.send(writeFrame(FRAME_TEXT, ciphertext))
+    return this.control.send(text)
   }
 
   async sendBinary(bytes) {
-    debugLog('sending relay binary frame', { byteLength: bytes.length })
-    const ciphertext = await this._sendCipher.encrypt(new Uint8Array(0), bytes)
-    this._socket.send(writeFrame(FRAME_BINARY, ciphertext))
+    return this.control.send(bytes)
   }
 
   close(reason = 'local close') {
@@ -188,9 +235,96 @@ export class SecureRelayChannel {
       readyState: this.readyState,
       socketReadyState: this._socket?.readyState,
     })
-    this.readyState = 'closing'
-    this._socket?.close()
+    this._closeAll(reason)
   }
+
+  async _writeScheduled({ className, kind, payload }) {
+    try {
+      const lane = laneForClass(className)
+      const plaintext = encodeLaneEnvelope(lane, payload)
+      const ciphertext = await this._sendCipher.encrypt(new Uint8Array(0), plaintext)
+      this._socket.send(writeFrame(kind, ciphertext))
+    } catch (error) {
+      this._closeAll('relay write failed')
+      throw error
+    }
+  }
+
+  _closeAll(reason) {
+    if (this._closed) return
+    this._closed = true
+    this.readyState = 'closed'
+    void this._scheduler.close()
+    for (const endpoint of this._endpoints.values()) endpoint._closeFromOwner()
+    this._socket?.close()
+    this.onclose?.(reason instanceof Error ? reason : new Error(String(reason)))
+  }
+}
+
+class RelayLaneEndpoint {
+  constructor(owner, lane, className) {
+    this._owner = owner
+    this.lane = lane
+    this.className = className
+    this.readyState = 'connecting'
+    this.bufferedAmount = 0
+    this.onopen = null
+    this.onmessage = null
+    this.onclose = null
+  }
+
+  send(value) {
+    const isText = typeof value === 'string'
+    const payload = isText ? new TextEncoder().encode(value) : toUint8Array(value)
+    const completion = this._owner._scheduler.send({
+      className: this.className,
+      kind: isText ? FRAME_TEXT : FRAME_BINARY,
+      payload,
+    })
+    completion.catch(() => this._owner._closeAll('relay lane write failed'))
+    return completion
+  }
+
+  sendThumbnail(value) {
+    const payload = toUint8Array(value)
+    const completion = this._owner._scheduler.send({
+      className: TRAFFIC_CLASS_THUMBNAIL,
+      kind: FRAME_BINARY,
+      payload,
+    })
+    completion.catch(() => this._owner._closeAll('relay thumbnail write failed'))
+    return completion
+  }
+
+  close() { this._owner._closeAll(`required relay lane closed: ${this.lane}`) }
+
+  _open() {
+    if (this.readyState !== 'connecting') return
+    this.readyState = 'open'
+    this.onopen?.()
+  }
+
+  _deliver(data) { this.onmessage?.({ data }) }
+
+  _closeFromOwner() {
+    if (this.readyState === 'closed') return
+    this.readyState = 'closed'
+    this.onclose?.()
+  }
+}
+
+function laneForClass(className) {
+  if (className === TRAFFIC_CLASS_CONTROL) return LANE_CONTROL
+  if (className === TRAFFIC_CLASS_INTERACTIVE_MEDIA || className === TRAFFIC_CLASS_THUMBNAIL) return LANE_MEDIA
+  if (className === TRAFFIC_CLASS_BULK) return LANE_BULK
+  throw new RangeError(`unknown traffic class: ${className}`)
+}
+
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) return value
+  if (value instanceof ArrayBuffer) return new Uint8Array(value)
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+  throw new TypeError('relay lane payload must be text or bytes')
 }
 
 function equalBytes(left, right) {

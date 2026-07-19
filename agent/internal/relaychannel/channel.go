@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/coder/websocket"
+	"sharebridge/agent/internal/multilane"
 	"sharebridge/agent/internal/noise"
 )
 
@@ -20,16 +21,17 @@ type SecureRelayConfig struct {
 }
 
 type SecureRelayChannel struct {
-	cfg    SecureRelayConfig
-	conn   *websocket.Conn
-	noise  *noise.NoiseXX
-	send   *noise.CipherState
-	recv   *noise.CipherState
-	sendMu sync.Mutex
+	cfg       SecureRelayConfig
+	conn      *websocket.Conn
+	noise     *noise.NoiseXX
+	send      *noise.CipherState
+	recv      *noise.CipherState
+	scheduler *multilane.Scheduler
+	endpoints map[multilane.Lane]*relayEndpoint
+	closeOnce sync.Once
 
-	onMessage func([]byte)
-	onOpen    func()
-	onClose   func()
+	onOpen  func()
+	onClose func()
 }
 
 // relayWebSocketReadLimit matches the relay transport frame cap with room for
@@ -40,12 +42,28 @@ func NewSecureRelayChannel(cfg SecureRelayConfig) (*SecureRelayChannel, error) {
 	if cfg.RelayURL == "" || cfg.RelayJWT == "" || cfg.StaticPrivate == nil {
 		return nil, fmt.Errorf("relaychannel: missing required config")
 	}
-	return &SecureRelayChannel{cfg: cfg}, nil
+	c := &SecureRelayChannel{cfg: cfg, endpoints: make(map[multilane.Lane]*relayEndpoint)}
+	for _, lane := range []multilane.Lane{multilane.LaneControl, multilane.LaneMedia, multilane.LaneBulk} {
+		c.endpoints[lane] = &relayEndpoint{owner: c, lane: lane}
+	}
+	c.scheduler = multilane.NewScheduler(c.writeScheduled)
+	return c, nil
 }
 
-func (c *SecureRelayChannel) SetOnMessage(handler func([]byte)) { c.onMessage = handler }
-func (c *SecureRelayChannel) SetOnOpen(handler func())          { c.onOpen = handler }
-func (c *SecureRelayChannel) SetOnClose(handler func())         { c.onClose = handler }
+// SetOnMessage is retained during migration as an alias for the control lane.
+func (c *SecureRelayChannel) SetOnMessage(handler func([]byte)) {
+	c.endpoints[multilane.LaneControl].SetOnMessage(handler)
+}
+func (c *SecureRelayChannel) SetOnOpen(handler func())  { c.onOpen = handler }
+func (c *SecureRelayChannel) SetOnClose(handler func()) { c.onClose = handler }
+
+func (c *SecureRelayChannel) Endpoint(lane multilane.Lane) multilane.Endpoint {
+	endpoint, ok := c.endpoints[lane]
+	if !ok {
+		return nil
+	}
+	return endpoint
+}
 
 func (c *SecureRelayChannel) Start(ctx context.Context) error {
 	conn, _, err := websocket.Dial(ctx, c.cfg.RelayURL, nil)
@@ -131,9 +149,8 @@ func (c *SecureRelayChannel) runHandshake(ctx context.Context) error {
 
 func (c *SecureRelayChannel) readLoop(ctx context.Context) {
 	defer func() {
-		if c.onClose != nil {
-			c.onClose()
-		}
+		_ = c.scheduler.Close()
+		c.notifyClose()
 	}()
 
 	for {
@@ -159,48 +176,132 @@ func (c *SecureRelayChannel) readLoop(ctx context.Context) {
 			c.conn.Close(websocket.StatusPolicyViolation, "relay decrypt failed")
 			return
 		}
-		if c.onMessage != nil {
-			c.onMessage(plain)
+		lane, payload, err := multilane.DecodeEnvelope(plain)
+		if err != nil {
+			log.Printf("relaychannel: invalid encrypted lane envelope: %v", err)
+			c.conn.Close(websocket.StatusPolicyViolation, "invalid encrypted lane")
+			return
 		}
+		endpoint := c.endpoints[lane]
+		if endpoint == nil {
+			c.conn.Close(websocket.StatusPolicyViolation, "unknown encrypted lane")
+			return
+		}
+		endpoint.deliver(payload)
 	}
 }
 
+// SendText and SendBinary are control-lane compatibility shims for callers
+// that have not yet been migrated to ChannelSet.
 func (c *SecureRelayChannel) SendText(text string) error {
-	return c.sendFrame(FrameText, []byte(text))
+	return c.endpoints[multilane.LaneControl].SendText(text)
 }
 
 func (c *SecureRelayChannel) SendBinary(data []byte) error {
-	return c.sendFrame(FrameBinary, data)
+	return c.endpoints[multilane.LaneControl].SendBinary(data)
 }
 
 func (c *SecureRelayChannel) BufferedAmount() uint64 { return 0 }
 
 func (c *SecureRelayChannel) Close() error {
+	_ = c.scheduler.Close()
 	if c.conn == nil {
+		c.notifyClose()
 		return nil
 	}
-	return c.conn.Close(websocket.StatusNormalClosure, "relay closed")
+	err := c.conn.Close(websocket.StatusNormalClosure, "relay closed")
+	c.notifyClose()
+	return err
 }
 
-func (c *SecureRelayChannel) sendFrame(kind byte, plaintext []byte) error {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-
+func (c *SecureRelayChannel) writeScheduled(class multilane.TrafficClass, kind multilane.Kind, payload []byte) error {
+	lane, err := multilane.LaneForClass(class)
+	if err != nil {
+		return err
+	}
+	plaintext, err := multilane.EncodeEnvelope(lane, payload)
+	if err != nil {
+		return err
+	}
+	if c.send == nil || c.conn == nil {
+		return fmt.Errorf("relaychannel: channel is not open")
+	}
 	ciphertext, err := c.send.Encrypt(nil, plaintext)
 	if err != nil {
 		log.Printf("relaychannel: encrypt failed kind=0x%02x plaintext_bytes=%d: %v", kind, len(plaintext), err)
+		c.abortTransport()
 		return err
 	}
-	frame, err := WriteFrame(kind, ciphertext)
+	frame, err := WriteFrame(byte(kind), ciphertext)
 	if err != nil {
 		log.Printf("relaychannel: frame encode failed kind=0x%02x ciphertext_bytes=%d: %v", kind, len(ciphertext), err)
+		c.abortTransport()
 		return err
 	}
 	if err := c.conn.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
 		log.Printf("relaychannel: write failed kind=0x%02x plaintext_bytes=%d ciphertext_bytes=%d frame_bytes=%d: %v", kind, len(plaintext), len(ciphertext), len(frame), err)
+		c.abortTransport()
 		return err
 	}
 	return nil
+}
+
+func (c *SecureRelayChannel) abortTransport() {
+	if c.conn != nil {
+		c.conn.CloseNow()
+	}
+	c.notifyClose()
+}
+
+func (c *SecureRelayChannel) notifyClose() {
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+}
+
+type relayEndpoint struct {
+	owner     *SecureRelayChannel
+	lane      multilane.Lane
+	mu        sync.RWMutex
+	onMessage func([]byte)
+}
+
+func (e *relayEndpoint) SendText(text string) error {
+	return e.owner.scheduler.Send(context.Background(), classForLane(e.lane), multilane.KindText, []byte(text))
+}
+
+func (e *relayEndpoint) SendBinary(data []byte) error {
+	return e.owner.scheduler.Send(context.Background(), classForLane(e.lane), multilane.KindBinary, data)
+}
+
+func (e *relayEndpoint) BufferedAmount() uint64 { return 0 }
+
+func (e *relayEndpoint) SetOnMessage(handler func([]byte)) {
+	e.mu.Lock()
+	e.onMessage = handler
+	e.mu.Unlock()
+}
+
+func (e *relayEndpoint) deliver(payload []byte) {
+	e.mu.RLock()
+	handler := e.onMessage
+	e.mu.RUnlock()
+	if handler != nil {
+		handler(append([]byte(nil), payload...))
+	}
+}
+
+func classForLane(lane multilane.Lane) multilane.TrafficClass {
+	switch lane {
+	case multilane.LaneMedia:
+		return multilane.ClassInteractiveMedia
+	case multilane.LaneBulk:
+		return multilane.ClassBulk
+	default:
+		return multilane.ClassControl
+	}
 }
 
 func decodeFramePayload(raw []byte, wantKind byte) ([]byte, error) {
