@@ -32,10 +32,12 @@ func TestShareForm_RelayRecommendedAndSelectedByDefault(t *testing.T) {
 	}
 	assertRadioChecked(t, body, "mode-relay", "true", true)
 	assertRadioChecked(t, body, "mode-direct", "false", false)
+	assertRadioLabelledBy(t, body, "mode-relay", "mode-relay-title", "Relay (recommended)")
+	assertRadioLabelledBy(t, body, "mode-direct", "mode-direct-title", "Direct")
 
 	for _, want := range []string{
-		"End-to-end encrypted, hides your IP, and provides consistent performance",
-		"Peer-to-peer, quota-free",
+		"End-to-end encrypted, hides your IP, and provides consistent performance.",
+		"Peer-to-peer, quota-free.",
 		"Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.",
 	} {
 		if !strings.Contains(body, want) {
@@ -68,14 +70,37 @@ func TestShareForm_PreservesSavedDirectDefault(t *testing.T) {
 func assertRadioChecked(t *testing.T, body, id, value string, wantChecked bool) {
 	t.Helper()
 
-	pattern := regexp.MustCompile(`<input\s+[^>]*id="` + regexp.QuoteMeta(id) + `"[^>]*value="` + regexp.QuoteMeta(value) + `"[^>]*>`)
-	input := pattern.FindString(body)
-	if input == "" {
-		t.Fatalf("radio id=%q value=%q not found", id, value)
-	}
+	input := findRadioInput(t, body, id, value)
 	if got := strings.Contains(input, "checked"); got != wantChecked {
 		t.Errorf("radio id=%q checked = %t, want %t: %s", id, got, wantChecked, input)
 	}
+}
+
+func assertRadioLabelledBy(t *testing.T, body, id, titleID, title string) {
+	t.Helper()
+
+	input := findRadioInput(t, body, id, "")
+	if !strings.Contains(input, `aria-labelledby="`+titleID+`"`) {
+		t.Errorf("radio id=%q missing aria-labelledby=%q: %s", id, titleID, input)
+	}
+	titlePattern := regexp.MustCompile(`<[^>]+id="` + regexp.QuoteMeta(titleID) + `"[^>]*>\s*` + regexp.QuoteMeta(title) + `\s*</[^>]+>`)
+	if !titlePattern.MatchString(body) {
+		t.Errorf("title id=%q with text %q not found", titleID, title)
+	}
+}
+
+func findRadioInput(t *testing.T, body, id, value string) string {
+	t.Helper()
+
+	pattern := `<input\s+[^>]*id="` + regexp.QuoteMeta(id) + `"[^>]*`
+	if value != "" {
+		pattern += `value="` + regexp.QuoteMeta(value) + `"[^>]*`
+	}
+	input := regexp.MustCompile(pattern + `>`).FindString(body)
+	if input == "" {
+		t.Fatalf("radio id=%q not found", id)
+	}
+	return input
 }
 
 func TestCreateShareForm_RequiresShareType(t *testing.T) {

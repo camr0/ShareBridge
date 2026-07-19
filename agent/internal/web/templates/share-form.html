@@ -34,10 +34,10 @@
 
                 <div class="mode-option{{if .DefaultRelayOnly}} selected{{end}}" id="relay-option">
                     <div class="mode-option-header">
-                        <input type="radio" id="mode-relay" name="relay_only" value="true"{{if .DefaultRelayOnly}} checked{{end}}>
+                        <input type="radio" id="mode-relay" name="relay_only" value="true" aria-labelledby="mode-relay-title"{{if .DefaultRelayOnly}} checked{{end}}>
                         <div>
-                            <div class="mode-option-title">Relay (recommended)</div>
-                            <div class="mode-option-desc">End-to-end encrypted, hides your IP, and provides consistent performance</div>
+                            <div class="mode-option-title" id="mode-relay-title">Relay (recommended)</div>
+                            <div class="mode-option-desc">End-to-end encrypted, hides your IP, and provides consistent performance.</div>
                         </div>
                     </div>
                     <div id="quota-container"
@@ -50,10 +50,10 @@
 
                 <div class="mode-option{{if not .DefaultRelayOnly}} selected{{end}}" id="direct-option">
                     <div class="mode-option-header">
-                        <input type="radio" id="mode-direct" name="relay_only" value="false"{{if not .DefaultRelayOnly}} checked{{end}}>
+                        <input type="radio" id="mode-direct" name="relay_only" value="false" aria-labelledby="mode-direct-title"{{if not .DefaultRelayOnly}} checked{{end}}>
                         <div>
-                            <div class="mode-option-title">Direct</div>
-                            <div class="mode-option-desc">Peer-to-peer, quota-free</div>
+                            <div class="mode-option-title" id="mode-direct-title">Direct</div>
+                            <div class="mode-option-desc">Peer-to-peer, quota-free.</div>
                         </div>
                     </div>
                     <div class="mode-option-warning amber">
