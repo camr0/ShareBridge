@@ -1,7 +1,11 @@
 // Package multilane defines the wire-level lane protocol shared by transports.
 package multilane
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+)
 
 const ProtocolVersion = 2
 
@@ -81,5 +85,89 @@ func LaneForClass(class TrafficClass) (Lane, error) {
 		return LaneBulk, nil
 	default:
 		return 0, fmt.Errorf("unknown traffic class: %d", class)
+	}
+}
+
+// Endpoint is one logical transport lane. Implementations may be backed by a
+// WebRTC DataChannel or by a multiplexed relay connection.
+type Endpoint interface {
+	SendText(string) error
+	SendBinary([]byte) error
+	BufferedAmount() uint64
+	SetOnMessage(func([]byte))
+}
+
+// ChannelSet owns the three required logical transport lanes as one lifecycle.
+type ChannelSet interface {
+	Endpoint(Lane) Endpoint
+	SetOnOpen(func())
+	SetOnClose(func())
+	Close() error
+}
+
+type transportHandshake struct {
+	Type    string `json:"type"`
+	Version int    `json:"version"`
+}
+
+type transportError struct {
+	Type    string `json:"type"`
+	Scope   string `json:"scope"`
+	Message string `json:"message"`
+}
+
+// InstallHandshakeResponder reserves the first control message for transport
+// version negotiation. onReady is responsible for installing the application
+// control handler after the transport_ready acknowledgement has been sent.
+func InstallHandshakeResponder(set ChannelSet, onReady func()) {
+	if set == nil {
+		return
+	}
+	control := set.Endpoint(LaneControl)
+	if control == nil {
+		_ = set.Close()
+		return
+	}
+
+	var first sync.Once
+	control.SetOnMessage(func(data []byte) {
+		first.Do(func() {
+			var hello transportHandshake
+			if err := json.Unmarshal(data, &hello); err != nil || hello.Type != "transport_hello" {
+				sendHandshakeError(control, "expected transport_hello version 2")
+				_ = set.Close()
+				return
+			}
+			if hello.Version != ProtocolVersion {
+				sendHandshakeError(control, fmt.Sprintf("incompatible transport version: %d", hello.Version))
+				_ = set.Close()
+				return
+			}
+
+			response, err := json.Marshal(transportHandshake{
+				Type:    "transport_ready",
+				Version: ProtocolVersion,
+			})
+			if err != nil || control.SendText(string(response)) != nil {
+				_ = set.Close()
+				return
+			}
+
+			control.SetOnMessage(nil)
+			if onReady != nil {
+				onReady()
+			}
+		})
+	})
+}
+
+func sendHandshakeError(control Endpoint, message string) {
+	response, err := json.Marshal(transportError{
+		Type:    "error",
+		Scope:   "connection",
+		Message: message,
+	})
+	if err == nil {
+		_ = control.SendText(string(response))
 	}
 }

@@ -2,8 +2,43 @@ package multilane
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"testing"
 )
+
+type testEndpoint struct {
+	onMessage func([]byte)
+	texts     []string
+	sendErr   error
+}
+
+func (endpoint *testEndpoint) SendText(text string) error {
+	endpoint.texts = append(endpoint.texts, text)
+	return endpoint.sendErr
+}
+
+func (*testEndpoint) SendBinary([]byte) error                    { return nil }
+func (*testEndpoint) BufferedAmount() uint64                     { return 0 }
+func (endpoint *testEndpoint) SetOnMessage(handler func([]byte)) { endpoint.onMessage = handler }
+
+type testChannelSet struct {
+	endpoints map[Lane]*testEndpoint
+	onOpen    func()
+	onClose   func()
+	closed    int
+}
+
+func newTestChannelSet() *testChannelSet {
+	return &testChannelSet{endpoints: map[Lane]*testEndpoint{
+		LaneControl: {}, LaneMedia: {}, LaneBulk: {},
+	}}
+}
+
+func (set *testChannelSet) Endpoint(lane Lane) Endpoint { return set.endpoints[lane] }
+func (set *testChannelSet) SetOnOpen(handler func())    { set.onOpen = handler }
+func (set *testChannelSet) SetOnClose(handler func())   { set.onClose = handler }
+func (set *testChannelSet) Close() error                { set.closed++; return nil }
 
 func TestProtocolConstantsAreStable(t *testing.T) {
 	if ProtocolVersion != 2 {
@@ -106,5 +141,97 @@ func TestLaneForClass(t *testing.T) {
 
 	if _, err := LaneForClass(TrafficClass(0xff)); err == nil {
 		t.Fatal("LaneForClass(unknown) succeeded")
+	}
+}
+
+func TestInstallHandshakeResponderAcknowledgesVersionTwo(t *testing.T) {
+	set := newTestChannelSet()
+	readyCalls := 0
+	InstallHandshakeResponder(set, func() { readyCalls++ })
+
+	set.endpoints[LaneControl].onMessage([]byte(`{"type":"transport_hello","version":2}`))
+
+	if readyCalls != 1 {
+		t.Fatalf("onReady calls = %d, want 1", readyCalls)
+	}
+	if set.closed != 0 {
+		t.Fatalf("Close calls = %d, want 0", set.closed)
+	}
+	if len(set.endpoints[LaneControl].texts) != 1 {
+		t.Fatalf("control sends = %d, want 1", len(set.endpoints[LaneControl].texts))
+	}
+	var response struct {
+		Type    string `json:"type"`
+		Version int    `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(set.endpoints[LaneControl].texts[0]), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Type != "transport_ready" || response.Version != ProtocolVersion {
+		t.Fatalf("response = %+v", response)
+	}
+	if set.endpoints[LaneControl].onMessage != nil {
+		t.Fatal("handshake handler remains installed during onReady handoff")
+	}
+}
+
+func TestInstallHandshakeResponderRejectsInvalidFirstMessage(t *testing.T) {
+	tests := []struct {
+		name    string
+		message []byte
+	}{
+		{name: "malformed", message: []byte(`not json`)},
+		{name: "wrong type", message: []byte(`{"type":"file_request","version":2}`)},
+		{name: "wrong version", message: []byte(`{"type":"transport_hello","version":1}`)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := newTestChannelSet()
+			readyCalls := 0
+			InstallHandshakeResponder(set, func() { readyCalls++ })
+			set.endpoints[LaneControl].onMessage(tt.message)
+			if set.closed != 1 {
+				t.Fatalf("Close calls = %d, want 1", set.closed)
+			}
+			if readyCalls != 0 {
+				t.Fatalf("onReady calls = %d, want 0", readyCalls)
+			}
+		})
+	}
+}
+
+func TestInstallHandshakeResponderReportsIncompatibleVersion(t *testing.T) {
+	set := newTestChannelSet()
+	InstallHandshakeResponder(set, nil)
+
+	set.endpoints[LaneControl].onMessage([]byte(`{"type":"transport_hello","version":1}`))
+
+	if len(set.endpoints[LaneControl].texts) != 1 {
+		t.Fatalf("control sends = %d, want 1", len(set.endpoints[LaneControl].texts))
+	}
+	var response struct {
+		Type    string `json:"type"`
+		Scope   string `json:"scope"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(set.endpoints[LaneControl].texts[0]), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Type != "error" || response.Scope != "connection" || response.Message != "incompatible transport version: 1" {
+		t.Fatalf("response = %+v", response)
+	}
+}
+
+func TestInstallHandshakeResponderClosesWhenAcknowledgementFails(t *testing.T) {
+	set := newTestChannelSet()
+	set.endpoints[LaneControl].sendErr = errors.New("send failed")
+	readyCalls := 0
+	InstallHandshakeResponder(set, func() { readyCalls++ })
+
+	set.endpoints[LaneControl].onMessage([]byte(`{"type":"transport_hello","version":2}`))
+
+	if set.closed != 1 || readyCalls != 0 {
+		t.Fatalf("Close calls = %d, onReady calls = %d; want 1, 0", set.closed, readyCalls)
 	}
 }
