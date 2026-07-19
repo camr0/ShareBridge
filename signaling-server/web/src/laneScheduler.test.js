@@ -42,6 +42,17 @@ test('scheduler resets outer and inner deficits after becoming idle', async () =
   }
 });
 
+test('waiting demand preserves outer and inner byte deficits', async () => {
+  for (const [requests, want] of [
+    [[...Array.from({ length: 6 }, () => [TRAFFIC_CLASS_INTERACTIVE_MEDIA, 512 * 1024]), ...Array.from({ length: 4 }, () => [TRAFFIC_CLASS_BULK, 256 * 1024])], [TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_BULK, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_BULK]],
+    [[...Array.from({ length: 13 }, () => [TRAFFIC_CLASS_INTERACTIVE_MEDIA, 512 * 1024]), ...Array.from({ length: 2 }, () => [TRAFFIC_CLASS_THUMBNAIL, 2 * 1024 * 1024])], [...Array(12).fill(TRAFFIC_CLASS_INTERACTIVE_MEDIA), TRAFFIC_CLASS_THUMBNAIL]],
+  ]) {
+    const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.className); } });
+    await Promise.all(requests.map(([className, size]) => scheduler.send({ className, kind: FRAME_BINARY, payload: payload(0, size) })));
+    assert.deepEqual(writes.slice(0, want.length), want); await scheduler.close();
+  }
+});
+
 test('scheduler uses byte deficits for variable-sized frames', async () => {
   const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.className); } });
   const sends = [
@@ -74,6 +85,29 @@ test('fifth bulk sender waits until one of four queued requests drains', async (
   assert.equal(writes, 1); assert.equal(fifthDone, false); assert.equal(BULK_QUEUE_CAP_BYTES, 256 * 1024);
   gate.resolve(); await Promise.all([...firstFour, fifth]); assert.equal(writes, 5);
   await scheduler.close();
+});
+
+test('bulk admission is FIFO across variable sizes and drains after head abort', async () => {
+  for (const abortHead of [false, true]) {
+    const gate = deferred(); let writes = 0;
+    const scheduler = new LaneScheduler({ write: async () => { writes++; if (writes === 1) await gate.promise; } });
+    const active = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(1, 128 * 1024) });
+    const queued = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(2) });
+    const controller = new AbortController();
+    const older = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(10, 128 * 1024), signal: controller.signal });
+    const later = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(11) });
+    await tick();
+    assert.deepEqual(scheduler.queues.get(TRAFFIC_CLASS_BULK).map((r) => r.payload[0]), [2]);
+    assert.deepEqual(scheduler.waiting.get(TRAFFIC_CLASS_BULK).map((r) => r.payload[0]), [10, 11]);
+    if (abortHead) {
+      controller.abort(); await assert.rejects(older, /abort/i); await tick();
+      assert.deepEqual(scheduler.queues.get(TRAFFIC_CLASS_BULK).map((r) => r.payload[0]), [2, 11]);
+      assert.equal(scheduler.waiting.get(TRAFFIC_CLASS_BULK).length, 0);
+    }
+    gate.resolve();
+    if (abortHead) await Promise.all([active, queued, later]); else await Promise.all([active, queued, older, later]);
+    await scheduler.close();
+  }
 });
 
 test('idle lanes borrow service and media sublanes receive three to one service', async () => {

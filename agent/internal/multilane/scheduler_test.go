@@ -154,6 +154,83 @@ func TestSchedulerIdleResetsOuterAndInnerDeficits(t *testing.T) {
 	}
 }
 
+func TestSchedulerWaitingDemandPreservesOuterAndInnerDeficits(t *testing.T) {
+	tests := []struct {
+		name    string
+		classes []TrafficClass
+		sizes   []int
+		want    []TrafficClass
+	}{
+		{name: "outer", classes: append(repeatClass(ClassInteractiveMedia, 6), repeatClass(ClassBulk, 4)...), sizes: append(repeatInt(512*1024, 6), repeatInt(256*1024, 4)...), want: []TrafficClass{ClassInteractiveMedia, ClassBulk, ClassInteractiveMedia, ClassInteractiveMedia, ClassBulk}},
+		{name: "inner", classes: append(repeatClass(ClassInteractiveMedia, 13), repeatClass(ClassThumbnail, 2)...), sizes: append(repeatInt(512*1024, 13), repeatInt(2*1024*1024, 2)...), want: append(repeatClass(ClassInteractiveMedia, 12), ClassThumbnail)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gate := make(chan struct{})
+			entered := make(chan struct{})
+			var mu sync.Mutex
+			var writes []TrafficClass
+			s := NewScheduler(func(class TrafficClass, _ Kind, _ []byte) error {
+				mu.Lock()
+				writes = append(writes, class)
+				mu.Unlock()
+				if class == ClassControl {
+					close(entered)
+					<-gate
+				}
+				return nil
+			})
+			control := asyncSend(s, context.Background(), ClassControl, 0)
+			<-entered
+			var sends []<-chan error
+			for i, class := range tt.classes {
+				done := make(chan error, 1)
+				size := tt.sizes[i]
+				go func() { done <- s.Send(context.Background(), class, KindBinary, make([]byte, size)) }()
+				sends = append(sends, done)
+			}
+			waitFor(t, "sustained waiting demand", func() bool {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				total := 0
+				for _, ws := range s.admissionWaiters {
+					total += len(ws)
+				}
+				return total >= len(tt.classes)-2
+			})
+			close(gate)
+			_ = <-control
+			for _, done := range sends {
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = s.Close()
+			mu.Lock()
+			got := append([]TrafficClass(nil), writes[1:1+len(tt.want)]...)
+			mu.Unlock()
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Fatalf("sustained service = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func repeatClass(class TrafficClass, count int) []TrafficClass {
+	values := make([]TrafficClass, count)
+	for i := range values {
+		values[i] = class
+	}
+	return values
+}
+func repeatInt(value, count int) []int {
+	values := make([]int, count)
+	for i := range values {
+		values[i] = value
+	}
+	return values
+}
+
 func TestSchedulerUsesByteDeficitsForVariableFrames(t *testing.T) {
 	gate := make(chan struct{})
 	entered := make(chan struct{})

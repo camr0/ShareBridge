@@ -81,7 +81,7 @@ export class LaneScheduler {
   admit(request) {
     if (this.terminal) return Promise.reject(this.terminal);
     const className = request.className;
-    if (this.bytes.get(className) + request.payload.length <= caps.get(className)) {
+    if (this.waiting.get(className).length === 0 && this.bytes.get(className) + request.payload.length <= caps.get(className)) {
       this.enqueue(request);
       return Promise.resolve();
     }
@@ -122,6 +122,8 @@ export class LaneScheduler {
       request.state = 'done';
       request.admission.reject(error);
       this.detachAbort(request);
+      this.drainAdmissions(request.className);
+      if (this.queues.get(request.className).length === 0) this.resetEmptyLane(request.className);
       return;
     }
     if (request.state === 'queued') {
@@ -275,16 +277,26 @@ export class LaneScheduler {
   }
 
   resetEmptyLane(className) {
-    if (className === TRAFFIC_CLASS_INTERACTIVE_MEDIA) this.innerDeficit[0] = 0;
-    if (className === TRAFFIC_CLASS_THUMBNAIL) this.innerDeficit[1] = 0;
-    if (className === TRAFFIC_CLASS_BULK) this.outerDeficit[1] = 0;
-    if (!this.hasMedia()) {
+    if (!this.hasClassDemand(className)) {
+      if (className === TRAFFIC_CLASS_INTERACTIVE_MEDIA) this.innerDeficit[0] = 0;
+      if (className === TRAFFIC_CLASS_THUMBNAIL) this.innerDeficit[1] = 0;
+      if (className === TRAFFIC_CLASS_BULK) this.outerDeficit[1] = 0;
+    }
+    if (!this.hasMediaDemand()) {
       this.outerDeficit[0] = 0;
       this.innerCurrent = 0; this.innerDeficit = [0, 0]; this.innerStarted = false;
     }
-    if (!this.hasMedia() && this.queues.get(TRAFFIC_CLASS_BULK).length === 0) {
+    if (!this.hasMediaDemand() && !this.hasClassDemand(TRAFFIC_CLASS_BULK)) {
       this.outerCurrent = 0; this.outerDeficit = [0, 0]; this.outerStarted = false;
     }
+  }
+
+  hasClassDemand(className) {
+    return this.queues.get(className).length > 0 || this.waiting.get(className).length > 0;
+  }
+
+  hasMediaDemand() {
+    return this.hasClassDemand(TRAFFIC_CLASS_INTERACTIVE_MEDIA) || this.hasClassDemand(TRAFFIC_CLASS_THUMBNAIL);
   }
 
   failQueued(error) {

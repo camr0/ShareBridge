@@ -89,6 +89,7 @@ func classCap(class TrafficClass) (int, bool) {
 
 // Send waits for bounded admitted-byte capacity and for the writer to accept the request.
 // Payload bytes remain caller-owned while admission is blocked and are copied on enqueue.
+// The caller must not mutate payload concurrently with Send; after Send returns, ownership is unrestricted.
 func (s *Scheduler) Send(ctx context.Context, class TrafficClass, kind Kind, payload []byte) error {
 	capBytes, valid := classCap(class)
 	if !valid {
@@ -346,25 +347,35 @@ func (s *Scheduler) popLocked(class TrafficClass) *sendRequest {
 }
 
 func (s *Scheduler) resetEmptyLaneLocked(class TrafficClass) {
-	switch class {
-	case ClassInteractiveMedia:
-		s.innerDeficit[0] = 0
-	case ClassThumbnail:
-		s.innerDeficit[1] = 0
-	case ClassBulk:
-		s.outerDeficit[1] = 0
+	if !s.hasClassDemandLocked(class) {
+		switch class {
+		case ClassInteractiveMedia:
+			s.innerDeficit[0] = 0
+		case ClassThumbnail:
+			s.innerDeficit[1] = 0
+		case ClassBulk:
+			s.outerDeficit[1] = 0
+		}
 	}
-	if !s.hasMediaLocked() {
+	if !s.hasMediaDemandLocked() {
 		s.outerDeficit[0] = 0
 		s.innerCurrent = 0
 		s.innerDeficit = [2]int{}
 		s.innerStarted = false
 	}
-	if !s.hasMediaLocked() && len(s.queues[ClassBulk]) == 0 {
+	if !s.hasMediaDemandLocked() && !s.hasClassDemandLocked(ClassBulk) {
 		s.outerCurrent = 0
 		s.outerDeficit = [2]int{}
 		s.outerStarted = false
 	}
+}
+
+func (s *Scheduler) hasClassDemandLocked(class TrafficClass) bool {
+	return len(s.queues[class]) > 0 || len(s.admissionWaiters[class]) > 0
+}
+
+func (s *Scheduler) hasMediaDemandLocked() bool {
+	return s.hasClassDemandLocked(ClassInteractiveMedia) || s.hasClassDemandLocked(ClassThumbnail)
 }
 
 func (s *Scheduler) enqueueLocked(class TrafficClass, kind Kind, payload []byte) *sendRequest {
@@ -392,6 +403,9 @@ func (s *Scheduler) removeAdmissionWaiterLocked(want *admissionWaiter) bool {
 	for i, waiter := range waiters {
 		if waiter == want {
 			s.admissionWaiters[want.class] = append(waiters[:i], waiters[i+1:]...)
+			if len(s.queues[want.class]) == 0 {
+				s.resetEmptyLaneLocked(want.class)
+			}
 			return true
 		}
 	}
