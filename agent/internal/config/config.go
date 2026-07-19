@@ -105,6 +105,7 @@ func (m *Manager) load() (*Config, error) {
 	cfg := &Config{
 		DefaultExpiry:       24,
 		DefaultMaxDownloads: 10,
+		DefaultRelayOnly:    true,
 		// UIPort: leave as 0, use env fallback with default
 	}
 

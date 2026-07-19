@@ -51,6 +51,9 @@ func TestNewManager_CreatesConfigDir(t *testing.T) {
 	if cfg.DefaultMaxDownloads != 10 {
 		t.Errorf("DefaultMaxDownloads = %d, want 10", cfg.DefaultMaxDownloads)
 	}
+	if !cfg.DefaultRelayOnly {
+		t.Error("DefaultRelayOnly = false, want true")
+	}
 	if cfg.UIPort != 7878 {
 		t.Errorf("UIPort = %d, want 7878", cfg.UIPort)
 	}
