@@ -16,13 +16,52 @@ import { createVideoBufferWarningMonitor } from './videoBufferWarning.js'
 
 // Module state
 let pc, ws, dc
-let transferChannel = null // Unified channel: DirectChannel or SecureRelayChannel
+let transferChannels = null // ChannelSet with independent control, media, and bulk endpoints.
 let currentTransferMode = null // 'direct' or 'relay'
 let pendingCandidates = []
 let remoteDescSet = false
 let relayQuotaExceeded = false
 let quotaPeriodEnd = null
 let activeDownload = null
+let transferClosureHandled = false
+let requestSequence = 0
+let pendingBulkRequestId = ''
+let pendingMediaRequestId = ''
+let pendingMediaID = ''
+let pendingMediaGeneration = undefined
+const pendingEnds = { media: null, bulk: null }
+const EARLY_FRAME_MAX_BYTES = 1024 * 1024
+const EARLY_FRAME_MAX_COUNT = 128
+const EARLY_FRAME_TTL_MS = 5000
+const earlyFrames = { media: new Map(), bulk: new Map() }
+const retiredOperations = { media: new Set(), bulk: new Set() }
+let earlyFrameBytes = 0
+let earlyFrameCount = 0
+let earlyFrameTimer = null
+
+function nextRequestId(scope) {
+  requestSequence += 1
+  return `${scope}-${requestSequence}`
+}
+
+function controlEndpoint() {
+  return transferChannels?.control ?? null
+}
+
+function asChannelSet(value) {
+  if (!value || value.control) return value
+  return {
+    control: value,
+    media: value,
+    bulk: value,
+    get readyState() { return value.readyState },
+    get onopen() { return value.onopen },
+    set onopen(handler) { value.onopen = handler },
+    get onclose() { return value.onclose },
+    set onclose(handler) { value.onclose = handler },
+    close: () => value.close?.(),
+  }
+}
 const directAttemptCancels = new WeakMap()
 
 const DEBUG = typeof location !== 'undefined' && (
@@ -319,10 +358,11 @@ export function installSessionMessageHandler({
             throw err
           }
 
-          transferChannel = result.channel
+          transferChannels = asChannelSet(result.channel)
+          transferClosureHandled = false
           currentTransferMode = result.mode
           attachTransferChannel({
-            channel: transferChannel,
+            channel: transferChannels,
             mode: result.mode,
             updateStatus,
             hideSection,
@@ -360,7 +400,9 @@ function attachTransferChannel({
   isGalleryMode = () => galleryMode,
 }) {
   let opened = false
-  let messageChain = Promise.resolve()
+  let controlChain = Promise.resolve()
+  let mediaChain = Promise.resolve()
+  let bulkChain = Promise.resolve()
   const handleOpen = () => {
     if (opened) return
     opened = true
@@ -374,23 +416,31 @@ function attachTransferChannel({
       showSection('gallery-section')
       updateStatus('Loading gallery...')
     } else {
-      requestFileList(channel, '')
+      requestFileList(channel.control, '')
     }
     ws = detachBrowserSignalingSocket(ws)
   }
 
   channel.onopen = handleOpen
-  channel.onmessage = (event) => {
-    messageChain = messageChain.then(() => handleTransferMessage(event)).catch((err) => {
-      console.error('[secure-relay] transfer message handler error:', err)
-    })
+  channel.control.onmessage = (event) => {
+    controlChain = controlChain.then(() => handleControlMessage(event)).catch(handleLaneError)
+  }
+  channel.media.onmessage = (event) => {
+    mediaChain = mediaChain.then(() => handleMediaMessage(event)).catch(handleLaneError)
+  }
+  channel.bulk.onmessage = (event) => {
+    bulkChain = bulkChain.then(() => handleBulkMessage(event)).catch(handleLaneError)
+  }
+  function handleLaneError(err) {
+    console.error('[secure-relay] transfer message handler error:', err)
+    channel.close?.()
   }
   channel.onclose = () => {
-    if (transferChannel && transferChannel !== channel) {
+    if (transferChannels && transferChannels !== channel) {
       debugLog('ignoring stale transfer channel close', {
         mode,
         channelReadyState: channel.readyState,
-        activeReadyState: transferChannel.readyState,
+        activeReadyState: transferChannels.readyState,
         activeMode: currentTransferMode,
       })
       return
@@ -637,11 +687,12 @@ function join() {
             throw err
           }
 
-          transferChannel = result.channel
+          transferChannels = asChannelSet(result.channel)
+          transferClosureHandled = false
           currentTransferMode = result.mode
           if (result.mode === 'relay') cancelDirectTransport(pc, 'relay selected')
           attachTransferChannel({
-            channel: transferChannel,
+            channel: transferChannels,
             mode: result.mode,
             updateStatus,
             hideSection,
@@ -671,7 +722,7 @@ function join() {
   }
 
   ws.onerror = (event) => {
-    if (isTransferChannelActive(transferChannel)) {
+    if (isTransferChannelActive(transferChannels)) {
       debugLog('ignoring browser signaling WebSocket error after transfer channel became active', event)
       return
     }
@@ -686,7 +737,7 @@ function join() {
   ws.onclose = (event) => {
     handleBrowserSignalingClose({
       event,
-      transferChannel,
+      transferChannel: transferChannels,
       pc,
       resetUI,
       log: debugLog,
@@ -717,84 +768,8 @@ async function sendJoin() {
   pendingNonce = null
 }
 
-async function handleTransferMessage(event) {
-  if (isBinaryTransferData(event.data)) {
-    debugLog('transfer binary message received', {
-      byteLength: event.data.byteLength,
-      currentFile: currentFile?.name || null,
-    })
-    // Legacy path: non-binary-envelope file transfers send raw bytes.
-    // Must check before decodeBinaryEnvelope since raw bytes that happen
-    // to start with 0x10 or 0x11 would be incorrectly framed.
-    if (!currentFile?.binary_envelope && !currentPreview && !galleryController) {
-      await appendChunk(new Uint8Array(event.data))
-      return
-    }
-
-    const frame = decodeBinaryEnvelope(event.data)
-
-    if (galleryController && frame.type === FRAME_THUMBNAIL) {
-      galleryController.handleThumbnailData(frame.index, frame.payload)
-      return
-    }
-
-    if (frame.type !== FRAME_FILE_CHUNK) {
-      return
-    }
-
-    // Route file chunks: active download takes priority over in-flight preview.
-    // A download can start while a preview is still streaming; without this check
-    // download chunks get stolen by the preview handler.
-    if (currentFile?.binary_envelope) {
-      await appendChunk(frame.payload)
-      return
-    }
-
-    if (currentVideoPreview) {
-      // For generation > 0 (seek path): frame format is [0x10][gen_u32be][data].
-      // Decode generation and strip it before forwarding to the SW.
-      // For generation === 0 (initial load): frame is [0x10][data] (legacy).
-      const b = frame.payload
-      let chunk, chunkGeneration
-      if (currentVideoPreview.generation > 0) {
-        // Use multiplication for top byte to avoid JS signed-32-bit overflow from << 24.
-        chunkGeneration = (b[0] * 0x1000000) + (b[1] << 16) + (b[2] << 8) + b[3]
-        chunk = b.slice(4)
-      } else {
-        chunkGeneration = 0
-        chunk = b
-      }
-      navigator.serviceWorker?.controller?.postMessage({
-        mediaId: currentVideoPreview.mediaId,
-        chunk,
-        generation: chunkGeneration > 0 ? chunkGeneration : undefined,
-      })
-      if (chunkGeneration === currentVideoPreview.generation) {
-        currentVideoPreview.totalBytesReceived += chunk.byteLength
-        if (currentVideoPreview.seeking) {
-          currentVideoPreview.seeking = false
-        }
-        if (currentVideoPreview.awaitingSeekPlayback) {
-          scheduleSeekPlaybackRecovery(currentVideoPreview)
-        }
-      }
-      return
-    }
-
-    if (currentPreview) {
-      currentPreview.chunks.push(frame.payload)
-      currentPreview.bytes += frame.payload.byteLength
-      return
-    }
-
-    await appendChunk(frame.payload)
-    // A decoded binary frame is never a control message. In particular, an
-    // agent range can outlive the preview state that initiated it; falling
-    // through would attempt JSON.parse("[object ArrayBuffer]") and discard
-    // every remaining frame in that range.
-    return
-  }
-
+async function handleControlMessage(event) {
+  if (isBinaryTransferData(event?.data)) throw new Error('control lane received binary data')
   debugLog('transfer text message received', {
     length: typeof event.data === 'string' ? event.data.length : undefined,
     preview: typeof event.data === 'string' ? event.data.slice(0, 160) : String(event.data),
@@ -814,19 +789,40 @@ async function handleTransferMessage(event) {
       updateStatus('')
       break
     case 'file_header':
-      await startDownload(msg)
+      if (!acceptHeader(msg, 'bulk')) return
+      {
+        const startup = startDownload({ ...msg, operationId: msg.operation_id, requestId: msg.request_id })
+        await drainEarlyFrames('bulk', msg.operation_id)
+        await startup
+      }
       break
     case 'asset_preview_header':
+      if (!acceptHeader(msg, 'media')) return
       if (msg.mimeType?.startsWith('video/')) {
         startVideoPreview(msg)
       } else {
         startGalleryPreview(msg)
       }
+      await drainEarlyFrames('media', msg.operation_id)
       break
     case 'asset_preview_end':
+      if (!matchesCurrentMedia(msg)) return
+      if (shouldDeferEnd('media', msg)) {
+        pendingEnds.media = msg
+        return
+      }
+      if (!currentVideoPreview) retireOperation('media', msg.operation_id)
+      else currentVideoPreview.completedBytesSent = BigInt(msg.bytes_sent)
       completeGalleryPreview(msg)
       break
     case 'chunk_end':
+      if (!matchesCurrentBulk(msg)) return
+      if (shouldDeferEnd('bulk', msg)) {
+        pendingEnds.bulk = msg
+        return
+      }
+      retireOperation('bulk', msg.operation_id)
+      currentFile.completedBytesSent = BigInt(msg.bytes_sent)
       await completeDownload()
       break
     case 'error':
@@ -835,6 +831,228 @@ async function handleTransferMessage(event) {
     default:
       debugLog('unhandled transfer message type', { type: msg.type })
       break
+  }
+}
+
+async function handleMediaMessage(event) {
+  if (!isBinaryTransferData(event?.data)) throw new Error('media lane received text data')
+  const frame = decodeBinaryEnvelope(event.data)
+  if (frame.type === FRAME_THUMBNAIL) {
+    galleryController?.handleThumbnailData(frame.index, frame.payload)
+    return
+  }
+  if (frame.type !== FRAME_FILE_CHUNK) throw new Error('media lane received unsupported frame kind')
+  await routeOrBufferFrame('media', frame)
+}
+
+async function handleBulkMessage(event) {
+  if (!isBinaryTransferData(event?.data)) throw new Error('bulk lane received text data')
+  const frame = decodeBinaryEnvelope(event.data)
+  if (frame.type !== FRAME_FILE_CHUNK) throw new Error('bulk lane received non-chunk frame')
+  if (frame.generation !== 0) throw new Error('bulk chunk generation must be zero')
+  await routeOrBufferFrame('bulk', frame)
+}
+
+// Compatibility entry point retained for focused tests; production installs the
+// three lane-specific handlers above. Correlation, never active-state priority,
+// decides which consumer receives a chunk.
+async function handleTransferMessage(event) {
+  if (!isBinaryTransferData(event?.data)) return handleControlMessage(event)
+  const frame = decodeBinaryEnvelope(event.data)
+  if (frame.type === FRAME_THUMBNAIL) return handleMediaMessage(event)
+  if (frame.operationId === currentFile?.operationId) return handleBulkMessage(event)
+  return handleMediaMessage(event)
+}
+
+function canonicalOperationId(value) {
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) return null
+  try {
+    const operation = BigInt(value)
+    if (operation > 0xffffffffffffffffn) return null
+    return operation.toString(10)
+  } catch {
+    return null
+  }
+}
+
+function acceptHeader(msg, scope) {
+  const operationId = canonicalOperationId(msg.operation_id)
+  if (!operationId || msg.operation_id !== operationId) return false
+  const pending = scope === 'bulk' ? pendingBulkRequestId : pendingMediaRequestId
+  const current = scope === 'bulk' ? currentFile : (currentVideoPreview || currentPreview)
+  if (!pending) return false
+  if (msg.request_id !== pending) return false
+  if (scope === 'media' && (msg.id !== pendingMediaID ||
+    (pendingMediaGeneration !== undefined && msg.generation !== pendingMediaGeneration))) return false
+  if (current?.operationId && current.operationId !== operationId) {
+    retireOperation(scope, current.operationId)
+  }
+  if (scope === 'bulk') pendingBulkRequestId = ''
+  else {
+    pendingMediaRequestId = ''
+    pendingMediaID = ''
+    pendingMediaGeneration = undefined
+  }
+  pendingEnds[scope] = null
+  return true
+}
+
+function retireOperation(scope, operationId) {
+  if (!operationId) return
+  retiredOperations[scope].add(operationId)
+  if (retiredOperations[scope].size > 64) retiredOperations[scope].delete(retiredOperations[scope].values().next().value)
+}
+
+function matchesCurrentBulk(msg) {
+  return Boolean(currentFile && msg.operation_id === currentFile.operationId &&
+    msg.request_id === currentFile.requestId)
+}
+
+function matchesCurrentMedia(msg) {
+  const current = currentVideoPreview || currentPreview
+  return Boolean(current && msg.operation_id === current.operationId &&
+    msg.request_id === current.requestId &&
+    (msg.generation === undefined || msg.generation === (current.generation ?? 0)))
+}
+
+async function routeOrBufferFrame(lane, frame) {
+  const current = lane === 'bulk' ? currentFile : (currentVideoPreview || currentPreview)
+  if (!current || current.operationId !== frame.operationId) {
+    if (retiredOperations[lane].has(frame.operationId)) return
+    bufferEarlyFrame(lane, frame)
+    return
+  }
+  if (lane === 'bulk') {
+    const nextWireBytes = (currentFile?.wireBytes ?? 0n) + BigInt(frame.payload.byteLength)
+    if (currentFile?.completedBytesSent !== undefined && nextWireBytes > currentFile.completedBytesSent) {
+      failTransferProtocol('operation received bytes after its declared end')
+    }
+    await appendChunk(frame.payload)
+    if (currentFile?.operationId === frame.operationId) {
+      currentFile.wireBytes = nextWireBytes
+      await completeDeferredEnd('bulk')
+    }
+    return
+  }
+  if (frame.generation !== (current.generation ?? 0)) return
+  if (currentVideoPreview) {
+    const nextWireBytes = (currentVideoPreview.wireBytes ?? 0n) + BigInt(frame.payload.byteLength)
+    if (currentVideoPreview.completedBytesSent !== undefined && nextWireBytes > currentVideoPreview.completedBytesSent) {
+      failTransferProtocol('operation received bytes after its declared end')
+    }
+    navigator.serviceWorker?.controller?.postMessage({
+      mediaId: currentVideoPreview.mediaId,
+      chunk: frame.payload,
+      generation: frame.generation > 0 ? frame.generation : undefined,
+    })
+    currentVideoPreview.totalBytesReceived += frame.payload.byteLength
+    currentVideoPreview.wireBytes = nextWireBytes
+    currentVideoPreview.seeking = false
+    if (currentVideoPreview.awaitingSeekPlayback) scheduleSeekPlaybackRecovery(currentVideoPreview)
+    await completeDeferredEnd('media')
+    return
+  }
+  currentPreview.chunks.push(frame.payload)
+  currentPreview.bytes += frame.payload.byteLength
+  currentPreview.wireBytes += BigInt(frame.payload.byteLength)
+  await completeDeferredEnd('media')
+}
+
+function shouldDeferEnd(lane, msg) {
+  if (typeof msg.bytes_sent !== 'string' || !/^(0|[1-9][0-9]*)$/.test(msg.bytes_sent)) {
+    failTransferProtocol('end bytes_sent must be a nonnegative decimal string')
+  }
+  const expected = BigInt(msg.bytes_sent)
+  if (expected > 0xffffffffffffffffn) failTransferProtocol('end bytes_sent exceeds uint64')
+  const current = lane === 'bulk' ? currentFile : (currentVideoPreview || currentPreview)
+  const received = lane === 'bulk'
+    ? (current?.wireBytes ?? 0n)
+    : currentVideoPreview
+      ? (currentVideoPreview.wireBytes ?? 0n)
+      : (currentPreview?.wireBytes ?? 0n)
+  if (received > expected) failTransferProtocol('operation received more bytes than bytes_sent')
+  return received < expected
+}
+
+function failTransferProtocol(message) {
+  transferChannels?.close?.()
+  throw new Error(message)
+}
+
+async function completeDeferredEnd(lane) {
+  const msg = pendingEnds[lane]
+  if (!msg || shouldDeferEnd(lane, msg)) return
+  pendingEnds[lane] = null
+  if (lane === 'bulk') {
+    if (!matchesCurrentBulk(msg)) return
+    retireOperation('bulk', msg.operation_id)
+    currentFile.completedBytesSent = BigInt(msg.bytes_sent)
+    await completeDownload()
+    return
+  }
+  if (!matchesCurrentMedia(msg)) return
+  if (!currentVideoPreview) retireOperation('media', msg.operation_id)
+  else currentVideoPreview.completedBytesSent = BigInt(msg.bytes_sent)
+  completeGalleryPreview(msg)
+}
+
+function bufferEarlyFrame(lane, frame, now = Date.now()) {
+  pruneEarlyFrames(now)
+  if (frame.payload.byteLength + earlyFrameBytes > EARLY_FRAME_MAX_BYTES || earlyFrameCount >= EARLY_FRAME_MAX_COUNT) {
+    transferChannels?.close?.()
+    throw new Error('early frame buffer limit exceeded')
+  }
+  const entries = earlyFrames[lane].get(frame.operationId) ?? []
+  entries.push({ frame, receivedAt: now })
+  earlyFrames[lane].set(frame.operationId, entries)
+  earlyFrameBytes += frame.payload.byteLength
+  earlyFrameCount += 1
+  armEarlyFrameTimer()
+}
+
+function pruneEarlyFrames(now = Date.now()) {
+  let expired = false
+  for (const lane of ['media', 'bulk']) {
+    for (const [operationId, entries] of earlyFrames[lane]) {
+      const kept = entries.filter((entry) => {
+        if (now - entry.receivedAt <= EARLY_FRAME_TTL_MS) return true
+        earlyFrameBytes -= entry.frame.payload.byteLength
+        earlyFrameCount -= 1
+        expired = true
+        return false
+      })
+      if (kept.length) earlyFrames[lane].set(operationId, kept)
+      else earlyFrames[lane].delete(operationId)
+    }
+  }
+  if (expired) {
+    transferChannels?.close?.()
+    throw new Error('early frame expired before control header')
+  }
+}
+
+function armEarlyFrameTimer() {
+  if (earlyFrameTimer !== null) return
+  earlyFrameTimer = setTimeout(() => {
+    earlyFrameTimer = null
+    if (earlyFrameCount === 0) return
+    clearEarlyFrames()
+    transferChannels?.close?.()
+  }, EARLY_FRAME_TTL_MS + 1)
+  earlyFrameTimer.unref?.()
+}
+
+async function drainEarlyFrames(lane, operationId) {
+  const entries = earlyFrames[lane].get(operationId) ?? []
+  earlyFrames[lane].delete(operationId)
+  for (const entry of entries) {
+    earlyFrameBytes -= entry.frame.payload.byteLength
+    earlyFrameCount -= 1
+    await routeOrBufferFrame(lane, entry.frame)
+  }
+  if (earlyFrameCount === 0 && earlyFrameTimer !== null) {
+    clearTimeout(earlyFrameTimer)
+    earlyFrameTimer = null
   }
 }
 
@@ -908,7 +1126,8 @@ function requestFile(name) {
     updateStatus('Download in progress, please wait')
     return
   }
-  if (!transferChannel) {
+  const control = controlEndpoint()
+  if (!control) {
     updateStatus('Connection closed')
     return
   }
@@ -917,9 +1136,10 @@ function requestFile(name) {
     name,
     fullPath,
     mode: currentTransferMode,
-    channelReadyState: transferChannel?.readyState,
+    channelReadyState: control?.readyState,
   })
-  transferChannel.send(JSON.stringify({ type: 'file_request', path: fullPath }))
+  pendingBulkRequestId = nextRequestId('bulk')
+  control.send(JSON.stringify({ type: 'file_request', path: fullPath, request_id: pendingBulkRequestId }))
 }
 
 async function getDownloadSupport(header) {
@@ -934,6 +1154,7 @@ async function getDownloadSupport(header) {
 async function startDownload(header) {
   galleryAssetRequestPending = false
   currentFile = header
+  currentFile.wireBytes = 0n
   receivedBytes = 0
   transferStartTime = Date.now()
   receivedChunkCount = 0
@@ -1182,11 +1403,11 @@ function renderBreadcrumb() {
 function navigateTo(index) {
   // index -1 = share root, 0 = first segment, 1 = second, etc.
   currentPath = index === -1 ? [] : currentPath.slice(0, index + 1)
-  if (!transferChannel) {
+  if (!controlEndpoint()) {
     updateStatus('Connection closed')
     return
   }
-  requestFileList(transferChannel, currentPath.join('/'))
+  requestFileList(controlEndpoint(), currentPath.join('/'))
 }
 
 function openFolder(name) {
@@ -1194,12 +1415,12 @@ function openFolder(name) {
     updateStatus('Download in progress, please wait')
     return
   }
-  if (!transferChannel) {
+  if (!controlEndpoint()) {
     updateStatus('Connection closed')
     return
   }
   currentPath.push(name)
-  requestFileList(transferChannel, currentPath.join('/'))
+  requestFileList(controlEndpoint(), currentPath.join('/'))
 }
 
 function requestFileList(channel, subpath) {
@@ -1233,19 +1454,58 @@ async function handleError(msg) {
     receivedChunkCount,
   })
 
+  if (msg.scope === 'connection') {
+    transferChannels?.close?.()
+    await handleTransferClosure()
+    return
+  }
+
+  if (msg.scope === 'bulk') {
+    if (!msg.operation_id) {
+      if (msg.request_id && msg.request_id !== pendingBulkRequestId) return
+      pendingBulkRequestId = ''
+      galleryAssetRequestPending = false
+      updateStatus(message === 'transfer in progress' ? 'Download in progress, please wait' : 'Error: ' + message)
+      return
+    }
+    if (!matchesCurrentBulk(msg)) return
+    retireOperation('bulk', msg.operation_id)
+  } else if (msg.scope === 'media') {
+    if (!msg.operation_id) {
+      if (msg.request_id && msg.request_id !== pendingMediaRequestId) return
+      pendingMediaRequestId = ''
+      pendingMediaID = ''
+      pendingMediaGeneration = undefined
+      galleryPreviewRequestPending = false
+      updateStatus('Error: ' + message)
+      return
+    }
+    if (!matchesCurrentMedia(msg)) return
+    retireOperation('media', msg.operation_id)
+    galleryPreviewRequestPending = false
+    currentPreview = null
+    cleanupCurrentVideoPreview()
+    updateStatus('Error: ' + message)
+    return
+  }
+
   if (activeDownload?.fail) {
-    if (message === 'transfer in progress') {
+    if (!msg.scope && message === 'transfer in progress') {
       updateStatus('Download in progress, please wait')
       return
     }
     updateStatus('Transfer failed')
     await activeDownload.fail('transfer-error', message || 'Transfer failed')
-    clearClosedTransferSession()
+    if (!msg.scope) clearClosedTransferSession()
     return
   }
 
   galleryAssetRequestPending = false
   galleryPreviewRequestPending = false
+  pendingBulkRequestId = ''
+  pendingMediaRequestId = ''
+  pendingMediaID = ''
+  pendingMediaGeneration = undefined
   queuedGalleryPreviewID = ''
   queuedGalleryPreloadIDs = []
   currentPreview = null
@@ -1254,6 +1514,8 @@ async function handleError(msg) {
 }
 
 async function handleTransferClosure() {
+  if (transferClosureHandled) return
+  transferClosureHandled = true
   const download = activeDownload
   if (download?.failForDisconnect) {
     await download.failForDisconnect()
@@ -1318,8 +1580,9 @@ function clearClosedTransferSession() {
   queuedGalleryPreviewID = ''
   queuedGalleryPreloadIDs = []
   currentPreview = null
+  clearEarlyFrames()
   cleanupCurrentVideoPreview()
-  transferChannel = null
+  transferChannels = null
   currentTransferMode = null
   getConnectionStatusEl().classList.add('hidden')
   getConnectionTypeEl().className = 'connection-badge'
@@ -1354,6 +1617,7 @@ function resetUI() {
   queuedGalleryPreviewID = ''
   queuedGalleryPreloadIDs = []
   currentPreview = null
+  clearEarlyFrames()
   receivedBytes = 0
   receivedChunkCount = 0
   transferStartTime = 0
@@ -1362,13 +1626,30 @@ function resetUI() {
   sessionPassword = ''
   galleryController?.destroy()
   galleryController = null
-  transferChannel = null
+  transferChannels = null
   currentTransferMode = null
   ws = null
   pc = null
   dc = null
   pendingCandidates = []
   remoteDescSet = false
+}
+
+function clearEarlyFrames() {
+  if (earlyFrameTimer !== null) clearTimeout(earlyFrameTimer)
+  earlyFrameTimer = null
+  earlyFrames.media.clear()
+  earlyFrames.bulk.clear()
+  retiredOperations.media.clear()
+  retiredOperations.bulk.clear()
+  earlyFrameBytes = 0
+  earlyFrameCount = 0
+  pendingBulkRequestId = ''
+  pendingMediaRequestId = ''
+  pendingMediaID = ''
+  pendingMediaGeneration = undefined
+  pendingEnds.media = null
+  pendingEnds.bulk = null
 }
 
 function escapeHtml(text) {
@@ -1414,15 +1695,14 @@ function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) 
     queueGalleryPreload(id)
     return
   }
-  if (activeDownload) return
-  if (!transferChannel) {
+  const control = controlEndpoint()
+  if (!control) {
     updateStatus('Connection closed')
     return
   }
 
-  // Keep an active video session exclusively routed to its Service Worker
-  // stream. Image preloads have anonymous binary frames, so interleaving one
-  // would corrupt the video range. A user opening another item replaces it.
+  // Keep one interactive media operation active at a time. Preloads wait while
+  // a video session is active; an explicit user selection replaces it.
   if (currentVideoPreview && currentVideoPreview.id !== id) {
     if (priority !== 'active') {
       queueGalleryPreload(id)
@@ -1457,9 +1737,13 @@ function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) 
     }
   }
 
-  transferChannel.send(JSON.stringify({
+  pendingMediaRequestId = nextRequestId('media')
+  pendingMediaID = id
+  pendingMediaGeneration = quality === 'video' ? currentVideoPreview.generation : undefined
+  control.send(JSON.stringify({
     type: 'asset_preview_request', id, quality,
     generation: quality === 'video' ? currentVideoPreview.generation : undefined,
+    request_id: pendingMediaRequestId,
   }))
 }
 
@@ -1472,31 +1756,30 @@ function queueGalleryPreload(id) {
 }
 
 function requestGalleryAsset(id) {
-  // Guard downloads during an active video seek — the transfer lock is
-  // briefly released during the generation handoff and we don't want a
-  // download to steal it.
-  if (currentVideoPreview?.seeking) {
-    updateStatus('Please wait, seeking...')
-    return
-  }
   if (activeDownload || galleryAssetRequestPending) {
     updateStatus('Download in progress, please wait')
     return
   }
-  if (!transferChannel) {
+  const control = controlEndpoint()
+  if (!control) {
     updateStatus('Connection closed')
     return
   }
   galleryAssetRequestPending = true
-  transferChannel.send(JSON.stringify({ type: 'asset_request', id, quality: 'original' }))
+  pendingBulkRequestId = nextRequestId('bulk')
+  control.send(JSON.stringify({ type: 'asset_request', id, quality: 'original', request_id: pendingBulkRequestId }))
 }
 
 function startGalleryPreview(header) {
   currentPreview = {
     id: header.id,
+    operationId: header.operation_id,
+    requestId: header.request_id,
+    generation: header.generation ?? 0,
     mimeType: header.mimeType || 'image/jpeg',
     chunks: [],
     bytes: 0,
+    wireBytes: 0n,
   }
 }
 
@@ -1507,12 +1790,17 @@ function startVideoPreview(header) {
   // Check if this header is for the current generation.
   if (header.generation !== undefined && header.generation !== vp.generation) return
 
+  vp.operationId = header.operation_id
+  vp.requestId = header.request_id
+
   // Store size/offset from header for seek calculations.
   if (header.size > 0) {
     vp.totalSize = header.size
   }
   vp.streamStartOffset = header.byte_offset || 0
   vp.totalBytesReceived = 0
+  vp.wireBytes = 0n
+  vp.completedBytesSent = undefined
   const freshSession = vp.freshSession ?? vp.generation === 0
 
   navigator.serviceWorker?.controller?.postMessage({
@@ -1622,16 +1910,22 @@ function createSeekHandler(vp, { setTimeoutFn = setTimeout, clearTimeoutFn = cle
 function sendVideoSeek(vp, startOffset, generation = vp?.generation) {
   if (!vp || generation !== vp.generation) return false
   if (!Number.isInteger(startOffset) || startOffset < 0) return false
-  if (!transferChannel || vp.seekSentGeneration === generation) return false
+  const control = controlEndpoint()
+  if (!control || vp.seekSentGeneration === generation || !vp.operationId) return false
 
   vp.seekSentGeneration = generation
   vp.seeking = true
-  transferChannel.send(JSON.stringify({
+  pendingMediaRequestId = nextRequestId('media')
+  pendingMediaID = vp.id
+  pendingMediaGeneration = generation
+  control.send(JSON.stringify({
     type: 'asset_preview_seek',
     id: vp.id,
     quality: 'video',
     start_offset: startOffset,
     generation,
+    request_id: pendingMediaRequestId,
+    operation_id: vp.operationId,
   }))
   return true
 }
@@ -1768,9 +2062,16 @@ export const __test = {
   setCurrentFile(file) {
     currentFile = file
   },
-  setTransferSession({ channel, mode }) {
-    transferChannel = channel
+  setTransferSession({ channels, channel, mode }) {
+    const value = channels ?? channel
+    transferChannels = asChannelSet(value)
+    transferClosureHandled = false
     currentTransferMode = mode
+    if (!value) {
+      galleryAssetRequestPending = false
+      galleryPreviewRequestPending = false
+      clearEarlyFrames()
+    }
   },
   setGallerySession({ galleryMode: nextGalleryMode, sessionCode: nextSessionCode, socket }) {
     galleryMode = nextGalleryMode
@@ -1786,13 +2087,21 @@ export const __test = {
   getCurrentFile() {
     return currentFile
   },
+  getCurrentVideoPreview() {
+    return currentVideoPreview
+  },
   getTransferSession() {
     return {
-      transferChannel,
+      transferChannel: transferChannels?.control ?? null,
+      transferChannels,
       currentTransferMode,
     }
   },
   handleTransferMessage,
+  handleControlMessage,
+  handleMediaMessage,
+  handleBulkMessage,
+  requestFile,
   submitPassword,
   handleTransferClosure,
   handleError,

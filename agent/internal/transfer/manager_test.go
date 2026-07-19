@@ -765,6 +765,7 @@ func TestAcceptedSeekRotatesOperationAndNextSeekReferencesIt(t *testing.T) {
 	})
 	manager.HandleMessage(openVideo)
 	require.Eventually(t, func() bool { return channels.control.countTextType("asset_preview_end") == 1 }, time.Second, time.Millisecond)
+	require.Equal(t, "5", lastBytesSentForType(t, channels.control, "asset_preview_end"))
 	parent := lastOperationIDForType(t, channels.control, "asset_preview_header")
 
 	firstSeek, _ := json.Marshal(map[string]any{
@@ -776,6 +777,7 @@ func TestAcceptedSeekRotatesOperationAndNextSeekReferencesIt(t *testing.T) {
 	firstSeekOperation := lastOperationIDForType(t, channels.control, "asset_preview_header")
 	require.NotEqual(t, parent, firstSeekOperation)
 	require.Equal(t, firstSeekOperation, lastOperationIDForType(t, channels.control, "asset_preview_end"))
+	require.Equal(t, "4", lastBytesSentForType(t, channels.control, "asset_preview_end"))
 
 	secondSeek, _ := json.Marshal(map[string]any{
 		"type": "asset_preview_seek", "id": "video", "quality": "video", "start_offset": 2,
@@ -786,6 +788,7 @@ func TestAcceptedSeekRotatesOperationAndNextSeekReferencesIt(t *testing.T) {
 	secondSeekOperation := lastOperationIDForType(t, channels.control, "asset_preview_header")
 	require.NotEqual(t, firstSeekOperation, secondSeekOperation)
 	require.Equal(t, secondSeekOperation, lastOperationIDForType(t, channels.control, "asset_preview_end"))
+	require.Equal(t, "3", lastBytesSentForType(t, channels.control, "asset_preview_end"))
 }
 
 func TestDelayedSeekValidationErrorIsSuppressedAfterReplacement(t *testing.T) {
@@ -1056,6 +1059,7 @@ func TestFileShareRoutesControlAndBulkWhileMediaStaysIdle(t *testing.T) {
 			Scope       string `json:"scope"`
 			RequestID   string `json:"request_id"`
 			OperationID string `json:"operation_id"`
+			BytesSent   string `json:"bytes_sent"`
 		}
 		require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType(messageType)), &lifecycle))
 		require.Equal(t, "bulk", lifecycle.Scope)
@@ -1065,6 +1069,7 @@ func TestFileShareRoutesControlAndBulkWhileMediaStaysIdle(t *testing.T) {
 			expectedOperation = lifecycle.OperationID
 		} else {
 			require.Equal(t, expectedOperation, lifecycle.OperationID)
+			require.Equal(t, "3", lifecycle.BytesSent)
 		}
 	}
 	operationID, generation, payload, err := decodeChunkFrame(channels.bulk.binarySnapshot()[0])
@@ -1108,6 +1113,7 @@ func TestPreviewRoutesInteractiveBytesToMediaAndOriginalToBulk(t *testing.T) {
 			Scope       string `json:"scope"`
 			RequestID   string `json:"request_id"`
 			OperationID string `json:"operation_id"`
+			BytesSent   string `json:"bytes_sent"`
 		}
 		require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType(messageType)), &lifecycle))
 		require.Equal(t, "media", lifecycle.Scope)
@@ -1117,6 +1123,7 @@ func TestPreviewRoutesInteractiveBytesToMediaAndOriginalToBulk(t *testing.T) {
 			mediaOperation = lifecycle.OperationID
 		} else {
 			require.Equal(t, mediaOperation, lifecycle.OperationID)
+			require.Equal(t, "3", lifecycle.BytesSent)
 		}
 	}
 	frameOperation, generation, _, err := decodeChunkFrame(channels.media.binarySnapshot()[0])
@@ -1130,6 +1137,22 @@ func TestPreviewRoutesInteractiveBytesToMediaAndOriginalToBulk(t *testing.T) {
 	manager.HandleMessage(original)
 	require.Eventually(t, func() bool { return channels.bulk.binaryCount() > 0 }, time.Second, time.Millisecond)
 	require.True(t, channels.bulk.hasBinaryClass(multilane.ClassBulk))
+}
+
+func TestZeroBytePreviewEndCarriesExactBytesSent(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery: Gallery{Items: []GalleryItem{{ID: "empty", Name: "empty.jpg", MimeType: "image/jpeg"}}},
+		file:    []byte{},
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	request, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "empty", "quality": "preview", "request_id": "media-empty",
+	})
+	manager.HandleMessage(request)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
+	require.Equal(t, "0", lastBytesSentForType(t, channels.control, "asset_preview_end"))
+	require.Zero(t, channels.media.binaryCount())
 }
 
 func TestMediaPreviewAndBulkDownloadRunConcurrently(t *testing.T) {
@@ -1816,5 +1839,22 @@ func lastOperationIDForType(t *testing.T, endpoint *mockDC, messageType string) 
 		}
 	}
 	t.Fatalf("missing %s operation", messageType)
+	return ""
+}
+
+func lastBytesSentForType(t *testing.T, endpoint *mockDC, messageType string) string {
+	t.Helper()
+	messages := endpoint.textSnapshot()
+	for i := len(messages) - 1; i >= 0; i-- {
+		var lifecycle struct {
+			Type      string `json:"type"`
+			BytesSent string `json:"bytes_sent"`
+		}
+		if json.Unmarshal([]byte(messages[i]), &lifecycle) == nil && lifecycle.Type == messageType {
+			require.Regexp(t, `^(0|[1-9][0-9]*)$`, lifecycle.BytesSent)
+			return lifecycle.BytesSent
+		}
+	}
+	t.Fatalf("missing %s bytes_sent", messageType)
 	return ""
 }

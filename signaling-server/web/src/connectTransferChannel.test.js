@@ -13,7 +13,11 @@ function createDeferred() {
 test('returns direct channel when direct opens before timeout', async () => {
   const statuses = []
   const directReady = createDeferred()
-  const directChannel = { kind: 'direct', readyState: 'open', close() {} }
+  const directChannel = {
+    kind: 'direct', readyState: 'open',
+    control: { readyState: 'open' }, media: { readyState: 'open' }, bulk: { readyState: 'open' },
+    close() {},
+  }
 
   const resultPromise = connectTransferChannel({
     relayPolicy: { relayAllowed: true, relayOnly: false },
@@ -33,6 +37,10 @@ test('returns direct channel when direct opens before timeout', async () => {
   const connected = await resultPromise
   assert.equal(connected.mode, 'direct')
   assert.equal(connected.channel, directChannel)
+  assert.deepEqual(
+    [connected.channel.control, connected.channel.media, connected.channel.bulk].map((lane) => lane.readyState),
+    ['open', 'open', 'open'],
+  )
   assert.deepEqual(statuses.slice(0, 2), ['connecting-direct', 'direct-attempted'])
 })
 

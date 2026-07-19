@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
+import { encodeChunkEnvelope, encodeThumbnailEnvelope } from './binaryEnvelope.js'
 import {
   installSessionMessageHandler,
   publishGlobalActions,
@@ -14,6 +15,11 @@ import {
   handleBrowserSignalingClose,
   __test,
 } from './app.js'
+
+function fakeLaneSet() {
+  const endpoint = () => ({ readyState: 'open', sent: [], send(value) { this.sent.push(value) }, close() {} })
+  return { readyState: 'open', control: endpoint(), media: endpoint(), bulk: endpoint(), closeCalls: 0, close() { this.closeCalls += 1 } }
+}
 
 test('publishGlobalActions preserves inline button handlers after the move to an ES module', () => {
   const globals = {}
@@ -610,11 +616,11 @@ test('handleTransferMessage accepts a binary frame from another JavaScript realm
   }
 })
 
-test('handleTransferMessage does not parse an unclaimed binary file frame as JSON', async () => {
+test('handleTransferMessage rejects an unclaimed malformed binary file frame', async () => {
   __test.setGalleryController({})
 
   try {
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 9, 8]).buffer })
+    await assert.rejects(() => __test.handleTransferMessage({ data: new Uint8Array([0x10, 9, 8]).buffer }), /too short/i)
   } finally {
     __test.setGalleryController(null)
   }
@@ -777,66 +783,30 @@ test('handleTransferClosure fails an active download before chunk_end', async ()
 
 test('handleTransferMessage appends typed file chunk payload only', async () => {
   const appended = []
-  __test.setCurrentFile({ name: 'photo.jpg', size: 3, binary_envelope: true })
+  __test.setCurrentFile({ name: 'photo.jpg', size: 3, binary_envelope: true, operationId: '42' })
   __test.setActiveDownload({
     async append(bytes) {
       appended.push([...bytes])
     },
   })
 
-  await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1, 2, 3]).buffer })
+  await __test.handleBulkMessage({ data: encodeChunkEnvelope('42', 0, new Uint8Array([1, 2, 3])).buffer })
 
   assert.deepEqual(appended, [[1, 2, 3]])
   __test.setActiveDownload(null)
   __test.setCurrentFile(null)
 })
 
-test('handleTransferMessage appends legacy raw chunk starting with 0x10', async () => {
-  const appended = []
-  __test.setCurrentFile({ name: 'legacy-10.bin', size: 3 })
-  __test.setActiveDownload({
-    async append(bytes) {
-      appended.push([...bytes])
-    },
-  })
-
-  await __test.handleTransferMessage({ data: new Uint8Array([0x10, 8, 7]).buffer })
-
-  assert.deepEqual(appended, [[0x10, 8, 7]])
-  __test.setActiveDownload(null)
-  __test.setCurrentFile(null)
+test('bulk lane rejects a legacy short 0x10 frame', async () => {
+  await assert.rejects(() => __test.handleBulkMessage({ data: new Uint8Array([0x10, 8, 7]).buffer }), /too short/i)
 })
 
-test('handleTransferMessage appends legacy raw chunk starting with 0x11', async () => {
-  const appended = []
-  __test.setCurrentFile({ name: 'legacy-11.bin', size: 3 })
-  __test.setActiveDownload({
-    async append(bytes) {
-      appended.push([...bytes])
-    },
-  })
-
-  await __test.handleTransferMessage({ data: new Uint8Array([0x11, 8, 7]).buffer })
-
-  assert.deepEqual(appended, [[0x11, 8, 7]])
-  __test.setActiveDownload(null)
-  __test.setCurrentFile(null)
+test('bulk lane rejects thumbnail frames', async () => {
+  await assert.rejects(() => __test.handleBulkMessage({ data: encodeThumbnailEnvelope(8, new Uint8Array([7])).buffer }), /non-chunk/i)
 })
 
-test('handleTransferMessage still appends legacy raw file chunks', async () => {
-  const appended = []
-  __test.setCurrentFile({ name: 'legacy.bin', size: 3 })
-  __test.setActiveDownload({
-    async append(bytes) {
-      appended.push([...bytes])
-    },
-  })
-
-  await __test.handleTransferMessage({ data: new Uint8Array([9, 8, 7]).buffer })
-
-  assert.deepEqual(appended, [[9, 8, 7]])
-  __test.setActiveDownload(null)
-  __test.setCurrentFile(null)
+test('bulk lane rejects untyped legacy raw file chunks', async () => {
+  await assert.rejects(() => __test.handleBulkMessage({ data: new Uint8Array([9, 8, 7]).buffer }), /unknown binary frame kind/i)
 })
 
 test('handleError fails the active download and clears the dead session', async () => {
@@ -891,16 +861,16 @@ test('requestGalleryPreview streams preview data into the gallery controller wit
 
     __test.requestGalleryPreview('asset-1')
 
-    assert.deepEqual(sends.map((text) => JSON.parse(text)), [
-      { type: 'asset_preview_request', id: 'asset-1', quality: 'preview' },
-    ])
+    const request = JSON.parse(sends[0])
+    assert.deepEqual({ ...request, request_id: '<dynamic>' },
+      { type: 'asset_preview_request', id: 'asset-1', quality: 'preview', request_id: '<dynamic>' })
 
     await __test.handleTransferMessage({
-      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true }),
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true, operation_id: '11', request_id: request.request_id }),
     })
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1, 2]).buffer })
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 3]).buffer })
-    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1' }) })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('11', 0, new Uint8Array([1, 2])).buffer })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('11', 0, new Uint8Array([3])).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1', operation_id: '11', request_id: request.request_id, bytes_sent: '3' }) })
 
     assert.deepEqual(previews, [{ id: 'asset-1', payload: [1, 2, 3], mimeType: 'image/jpeg' }])
     assert.equal(__test.getCurrentFile(), null)
@@ -944,6 +914,7 @@ test('seek handler resets the SW generation without sending a page-computed byte
     const vp = {
       id: 'asset-1',
       mediaId: 'asset-1',
+      operationId: '77',
       generation: 0,
       totalSize: 1000,
       streamStartOffset: 0,
@@ -971,6 +942,8 @@ test('seek handler resets the SW generation without sending a page-computed byte
       quality: 'video',
       start_offset: 500,
       generation: 1,
+      operation_id: '77',
+      request_id: sent[0].request_id,
     })
   } finally {
     globalThis.document = originalDocument
@@ -1056,6 +1029,7 @@ test('exact Service Worker Range wins over the estimated video seek offset', () 
   })
   const vp = {
     id: 'video-1', mediaId: 'video-1', generation: 3, totalSize: 61289309,
+    operationId: '78',
     totalBytesReceived: 0, streamStartOffset: 0, seekTimer: null, seeking: false,
   }
   __test.setCurrentVideoPreview(vp)
@@ -1105,6 +1079,8 @@ test('exact Service Worker Range wins over the estimated video seek offset', () 
       quality: 'video',
       start_offset: 22970368,
       generation,
+      operation_id: '78',
+      request_id: sent[0].request_id,
     }])
   } finally {
     __test.setCurrentVideoPreview(null)
@@ -1141,6 +1117,7 @@ test('seek fallback sends the estimated offset when Chrome reuses its fetch', ()
   })
   const vp = {
     id: 'video-1', mediaId: 'video-1', generation: 8, totalSize: 1000,
+    operationId: '79',
     totalBytesReceived: 0, streamStartOffset: 0, seekTimer: null, seeking: false,
   }
   __test.setCurrentVideoPreview(vp)
@@ -1162,6 +1139,8 @@ test('seek fallback sends the estimated offset when Chrome reuses its fetch', ()
       quality: 'video',
       start_offset: 500,
       generation: vp.generation,
+      operation_id: '79',
+      request_id: sent[0].request_id,
     }])
   } finally {
     __test.setCurrentVideoPreview(null)
@@ -1214,6 +1193,7 @@ test('closing and reopening the same video starts a fresh higher generation', ()
     assert.deepEqual(swMessages, [{ mediaId: 'video-1', chunk: null }])
     assert.deepEqual(sent, [{
       type: 'asset_preview_request', id: 'video-1', quality: 'video', generation: 4,
+      request_id: sent[0].request_id,
     }])
   } finally {
     __test.cleanupCurrentVideoPreview()
@@ -1266,18 +1246,19 @@ test('a completed video range remains routed to the next seek range without refr
   __test.setGalleryController({ handlePreviewData: (...args) => galleryCalls.push(args) })
   __test.setCurrentVideoPreview({
     id: 'video-1', mediaId: 'video-1', generation: 2, totalBytesReceived: 0,
+    operationId: '82', requestId: 'media-test',
     seekTimer: null, resumePlaybackTimer: null,
   })
 
   try {
     await __test.handleTransferMessage({
-      data: JSON.stringify({ type: 'asset_preview_end', id: 'video-1', generation: 2 }),
+      data: JSON.stringify({ type: 'asset_preview_end', id: 'video-1', generation: 2, operation_id: '82', request_id: 'media-test', bytes_sent: '2' }),
     })
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 0, 0, 0, 2, 9, 8]).buffer })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('82', 2, new Uint8Array([9, 8])).buffer })
 
     assert.deepEqual(swMessages, [
-      { mediaId: 'video-1', chunk: null },
       { mediaId: 'video-1', chunk: new Uint8Array([9, 8]), generation: 2 },
+      { mediaId: 'video-1', chunk: null },
     ])
     assert.deepEqual(galleryCalls, [])
   } finally {
@@ -1418,21 +1399,23 @@ test('requestGalleryPreview queues the latest preview while another preview is s
     __test.requestGalleryPreview('asset-3')
 
     assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1'])
+    const firstRequest = JSON.parse(sends[0])
 
     await __test.handleTransferMessage({
-      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true }),
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true, operation_id: '91', request_id: firstRequest.request_id }),
     })
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1]).buffer })
-    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1' }) })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('91', 0, new Uint8Array([1])).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1', operation_id: '91', request_id: firstRequest.request_id, bytes_sent: '1' }) })
 
     assert.deepEqual(previews, [{ id: 'asset-1', payload: [1] }])
     assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3'])
+    const secondRequest = JSON.parse(sends[1])
 
     await __test.handleTransferMessage({
-      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-3', mimeType: 'image/jpeg', binary_envelope: true }),
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-3', mimeType: 'image/jpeg', binary_envelope: true, operation_id: '92', request_id: secondRequest.request_id }),
     })
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 3]).buffer })
-    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-3' }) })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('92', 0, new Uint8Array([3])).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-3', operation_id: '92', request_id: secondRequest.request_id, bytes_sent: '1' }) })
 
     assert.deepEqual(previews, [
       { id: 'asset-1', payload: [1] },
@@ -1455,20 +1438,22 @@ test('requestGalleryPreview prioritizes active previews over queued preloads', a
     __test.requestGalleryPreview('asset-3', { priority: 'active' })
 
     assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1'])
+    const firstRequest = JSON.parse(sends[0])
 
     await __test.handleTransferMessage({
-      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true }),
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', binary_envelope: true, operation_id: '93', request_id: firstRequest.request_id }),
     })
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 1]).buffer })
-    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1' }) })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('93', 0, new Uint8Array([1])).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-1', operation_id: '93', request_id: firstRequest.request_id, bytes_sent: '1' }) })
 
     assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3'])
+    const secondRequest = JSON.parse(sends[1])
 
     await __test.handleTransferMessage({
-      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-3', mimeType: 'image/jpeg', binary_envelope: true }),
+      data: JSON.stringify({ type: 'asset_preview_header', id: 'asset-3', mimeType: 'image/jpeg', binary_envelope: true, operation_id: '94', request_id: secondRequest.request_id }),
     })
-    await __test.handleTransferMessage({ data: new Uint8Array([0x10, 3]).buffer })
-    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-3' }) })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('94', 0, new Uint8Array([3])).buffer })
+    await __test.handleTransferMessage({ data: JSON.stringify({ type: 'asset_preview_end', id: 'asset-3', operation_id: '94', request_id: secondRequest.request_id, bytes_sent: '1' }) })
 
     assert.deepEqual(sends.map((text) => JSON.parse(text).id), ['asset-1', 'asset-3', 'asset-0'])
     __test.setGalleryController(null)
@@ -1489,6 +1474,237 @@ test('transfer in progress errors do not fail the current gallery download', asy
 
     assert.equal(failCalled, false)
     assert.equal(elements.get('status').textContent, 'Download in progress, please wait')
+    __test.setActiveDownload(null)
+  })
+})
+
+test('control sends preview requests while early media chunks wait for their matching header', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const previews = []
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ handlePreviewData: (id, bytes) => previews.push([id, [...bytes]]) })
+
+    __test.requestGalleryPreview('early-image')
+    const request = JSON.parse(channels.control.sent[0])
+    assert.equal(channels.media.sent.length, 0)
+    assert.equal(channels.bulk.sent.length, 0)
+
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('500', 0, new Uint8Array([1, 2])).buffer })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'early-image', mimeType: 'image/jpeg',
+      operation_id: '500', request_id: request.request_id,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_end', id: 'early-image', operation_id: '500', request_id: request.request_id, bytes_sent: '2',
+    }) })
+
+    assert.deepEqual(previews, [['early-image', [1, 2]]])
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('unknown-size preview end waits for its exact bytes_sent when control overtakes media', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const previews = []
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ handlePreviewData: (id, bytes) => previews.push([id, [...bytes]]) })
+    __test.requestGalleryPreview('unknown-size')
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'unknown-size', mimeType: 'image/jpeg', size: 0,
+      operation_id: '550', request_id: request.request_id,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_end', id: 'unknown-size', operation_id: '550',
+      request_id: request.request_id, bytes_sent: '2',
+    }) })
+    assert.deepEqual(previews, [])
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('550', 0, new Uint8Array([4, 5])).buffer })
+    assert.deepEqual(previews, [['unknown-size', [4, 5]]])
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('bulk end waits for the final correlated chunk when control overtakes bulk', async () => {
+  const events = []
+  __test.setCurrentFile({ name: 'file.bin', operationId: '555', requestId: 'bulk-r', wireBytes: 0n })
+  __test.setActiveDownload({
+    append: async (bytes) => events.push(['chunk', [...bytes]]),
+    complete: async () => events.push(['end']),
+  })
+  await __test.handleControlMessage({ data: JSON.stringify({
+    type: 'chunk_end', operation_id: '555', request_id: 'bulk-r', bytes_sent: '2',
+  }) })
+  assert.deepEqual(events, [])
+  await __test.handleBulkMessage({ data: encodeChunkEnvelope('555', 0, new Uint8Array([6, 7])).buffer })
+  assert.deepEqual(events, [['chunk', [6, 7]], ['end']])
+  __test.setActiveDownload(null)
+  __test.setCurrentFile(null)
+})
+
+test('malformed or overrun bytes_sent fails closed', async () => {
+  const channels = fakeLaneSet()
+  __test.setTransferSession({ channels, mode: 'relay' })
+  __test.setCurrentVideoPreview({
+    id: 'video', mediaId: 'video', operationId: '560', requestId: 'r', generation: 0,
+    totalBytesReceived: 2, wireBytes: 2n,
+  })
+  await assert.rejects(() => __test.handleControlMessage({ data: JSON.stringify({
+    type: 'asset_preview_end', id: 'video', operation_id: '560', request_id: 'r', generation: 0, bytes_sent: '01',
+  }) }), /nonnegative decimal string/i)
+  await assert.rejects(() => __test.handleControlMessage({ data: JSON.stringify({
+    type: 'asset_preview_end', id: 'video', operation_id: '560', request_id: 'r', generation: 0, bytes_sent: '1',
+  }) }), /more bytes than bytes_sent/i)
+  __test.setCurrentVideoPreview(null)
+  __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('media routes thumbnails independently of interactive preview state', async () => {
+  const received = []
+  __test.setGalleryController({ handleThumbnailData: (index, bytes) => received.push([index, [...bytes]]) })
+  await __test.handleMediaMessage({ data: encodeThumbnailEnvelope(7, new Uint8Array([8, 9])).buffer })
+  assert.deepEqual(received, [[7, [8, 9]]])
+  __test.setGalleryController(null)
+})
+
+test('media and bulk chunks interleave without stealing each other bytes', async () => {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const swMessages = []
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (value) => swMessages.push(value) } } },
+  })
+  const bulkBytes = []
+  __test.setCurrentFile({ name: 'archive.zip', operationId: '601', requestId: 'bulk-r' })
+  __test.setActiveDownload({ append: async (bytes) => bulkBytes.push([...bytes]) })
+  __test.setCurrentVideoPreview({
+    id: 'video', mediaId: 'video', operationId: '602', requestId: 'media-r', generation: 4,
+    totalBytesReceived: 0, seeking: true, awaitingSeekPlayback: false,
+  })
+  try {
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('602', 4, new Uint8Array([2])).buffer })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('601', 0, new Uint8Array([1])).buffer })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('602', 4, new Uint8Array([4])).buffer })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('601', 0, new Uint8Array([3])).buffer })
+    assert.deepEqual(bulkBytes, [[1], [3]])
+    assert.deepEqual(swMessages.map((message) => [...message.chunk]), [[2], [4]])
+  } finally {
+    __test.setActiveDownload(null)
+    __test.setCurrentFile(null)
+    __test.setCurrentVideoPreview(null)
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+  }
+})
+
+test('accepted video seek replaces operation A with B and ignores stale A frames', async () => {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const channels = fakeLaneSet()
+  const swMessages = []
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { serviceWorker: { controller: { postMessage: (value) => swMessages.push(value) } } },
+  })
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: { querySelector: () => null } })
+  const vp = {
+    id: 'video', mediaId: 'video', operationId: '700', requestId: 'initial', generation: 5,
+    totalBytesReceived: 0, seekSentGeneration: null, freshSession: false,
+  }
+  __test.setTransferSession({ channels, mode: 'relay' })
+  __test.setCurrentVideoPreview(vp)
+  try {
+    assert.equal(__test.sendVideoSeek(vp, 100, 5), true)
+    const seek = JSON.parse(channels.control.sent[0])
+    assert.equal(seek.operation_id, '700')
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 4,
+      byte_offset: 50, operation_id: '699', request_id: seek.request_id,
+    }) })
+    assert.equal(__test.getCurrentVideoPreview().operationId, '700')
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 5,
+      byte_offset: 100, operation_id: '701', request_id: seek.request_id,
+    }) })
+    assert.equal(__test.getCurrentVideoPreview().operationId, '701')
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'video', mimeType: 'video/mp4', generation: 5,
+      byte_offset: 0, operation_id: '700', request_id: 'initial',
+    }) })
+    assert.equal(__test.getCurrentVideoPreview().operationId, '701')
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('700', 5, new Uint8Array([1])).buffer })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('701', 5, new Uint8Array([2])).buffer })
+    assert.deepEqual(swMessages.filter((message) => message.chunk).map((message) => [...message.chunk]), [[2]])
+  } finally {
+    __test.cleanupCurrentVideoPreview()
+    __test.setTransferSession({ channels: null, mode: null })
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else delete globalThis.document
+  }
+})
+
+test('a request-scoped second bulk rejection cannot abort the active bulk operation', async () => {
+  await withMinimalDocument(async () => {
+    let failed = false
+    __test.setCurrentFile({ name: 'active.bin', operationId: '800', requestId: 'first' })
+    __test.setActiveDownload({ fail: async () => { failed = true } })
+    await __test.handleError({ type: 'error', scope: 'bulk', request_id: 'second', message: 'transfer in progress' })
+    await __test.handleError({ type: 'error', scope: 'bulk', operation_id: '799', request_id: 'old', message: 'stale' })
+    assert.equal(failed, false)
+    __test.setActiveDownload(null)
+    __test.setCurrentFile(null)
+  })
+})
+
+test('file requests use control and file bytes use bulk while media stays idle', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const appended = []
+    __test.setTransferSession({ channels, mode: 'direct' })
+    __test.requestFile('report.pdf')
+    const request = JSON.parse(channels.control.sent[0])
+    assert.equal(request.type, 'file_request')
+    assert.match(request.request_id, /^bulk-/)
+
+    __test.setCurrentFile({ name: 'report.pdf', operationId: '900', requestId: request.request_id })
+    __test.setActiveDownload({ append: async (bytes) => appended.push([...bytes]) })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('900', 0, new Uint8Array([1, 2, 3])).buffer })
+
+    assert.deepEqual(appended, [[1, 2, 3]])
+    assert.deepEqual(channels.media.sent, [])
+    __test.setActiveDownload(null)
+    __test.setCurrentFile(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('early-frame abuse closes the whole channel set and never drops into a consumer', async () => {
+  const channels = fakeLaneSet()
+  __test.setTransferSession({ channels, mode: 'relay' })
+  for (let i = 0; i < 128; i += 1) {
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope(String(1000 + i), 0, new Uint8Array()).buffer })
+  }
+  await assert.rejects(
+    () => __test.handleMediaMessage({ data: encodeChunkEnvelope('1200', 0, new Uint8Array()).buffer }),
+    /buffer limit exceeded/i,
+  )
+  assert.equal(channels.closeCalls, 1)
+  __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('transfer closure cleanup executes once even if several required lanes report closure', async () => {
+  await withMinimalDocument(async () => {
+    let failures = 0
+    __test.setTransferSession({ channels: fakeLaneSet(), mode: 'relay' })
+    __test.setActiveDownload({ failForDisconnect: async () => { failures += 1 } })
+    await Promise.all([__test.handleTransferClosure(), __test.handleTransferClosure(), __test.handleTransferClosure()])
+    assert.equal(failures, 1)
     __test.setActiveDownload(null)
   })
 })

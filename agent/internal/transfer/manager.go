@@ -638,7 +638,8 @@ func (m *Manager) streamFile(filePath, requestID string, operationID uint64) {
 		Scope       string `json:"scope"`
 		RequestID   string `json:"request_id,omitempty"`
 		OperationID string `json:"operation_id"`
-	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationIDString(operationID)}
+		BytesSent   string `json:"bytes_sent"`
+	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationIDString(operationID), BytesSent: strconv.FormatInt(totalBytes, 10)}
 	endData, _ := json.Marshal(end)
 	if err := m.control.SendText(string(endData)); err != nil {
 		return
@@ -695,7 +696,8 @@ func (m *Manager) streamAsset(id string, quality string, requestID string, opera
 		Scope       string `json:"scope"`
 		RequestID   string `json:"request_id,omitempty"`
 		OperationID string `json:"operation_id"`
-	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationIDString(operationID)}
+		BytesSent   string `json:"bytes_sent"`
+	}{Type: "chunk_end", Scope: "bulk", RequestID: requestID, OperationID: operationIDString(operationID), BytesSent: strconv.FormatInt(totalBytes, 10)}
 	endData, _ := json.Marshal(end)
 	if err := m.control.SendText(string(endData)); err != nil {
 		return
@@ -878,7 +880,8 @@ func (m *Manager) streamAssetPreviewFromReader(ctx context.Context, id string, r
 			Scope       string `json:"scope"`
 			RequestID   string `json:"request_id,omitempty"`
 			OperationID string `json:"operation_id"`
-		}{Type: "asset_preview_end", ID: id, Generation: int(generation), Scope: "media", RequestID: requestID, OperationID: operationIDString(mediaOperation)}
+			BytesSent   string `json:"bytes_sent"`
+		}{Type: "asset_preview_end", ID: id, Generation: int(generation), Scope: "media", RequestID: requestID, OperationID: operationIDString(mediaOperation), BytesSent: strconv.FormatInt(totalBytes, 10)}
 		endData, _ := json.Marshal(end)
 		_ = m.sendMediaControlIfCurrent(mediaOperation, string(endData))
 	}
