@@ -1,9 +1,12 @@
 package peer
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/pion/webrtc/v4"
 	"sharebridge/agent/internal/multilane"
 )
 
@@ -42,7 +45,7 @@ func TestPeerReadyAfterEveryLaneAndVersionHelloExactlyOnce(t *testing.T) {
 
 	var opened atomic.Int32
 	var applicationMessages atomic.Int32
-	p.OnOpen = func() { opened.Add(1) }
+	p.SetOnOpen(func() { opened.Add(1) })
 	p.SetOnMessage(func([]byte) { applicationMessages.Add(1) })
 	p.laneOpened(multilane.LaneBulk)
 	p.laneOpened(multilane.LaneControl)
@@ -75,11 +78,160 @@ func TestPeerAnyRequiredLaneCloseClosesSessionOnce(t *testing.T) {
 	}
 
 	var closed atomic.Int32
-	p.OnClosed = func() { closed.Add(1) }
+	p.SetOnClose(func() { closed.Add(1) })
 	p.laneClosed(multilane.LaneMedia)
 	p.laneClosed(multilane.LaneBulk)
 	if got := closed.Load(); got != 1 {
 		t.Fatalf("OnClosed calls = %d, want 1", got)
+	}
+}
+
+func TestPeerCloseCallbackMayReenterClose(t *testing.T) {
+	p, err := New(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	p.SetOnClose(func() {
+		_ = p.Close()
+		close(done)
+	})
+
+	go p.notifyClosed()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("re-entrant close callback deadlocked")
+	}
+}
+
+func TestPeerCannotOpenAfterTerminalClose(t *testing.T) {
+	p, err := New(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.CreateOffer(); err != nil {
+		t.Fatal(err)
+	}
+	p.endpoints[multilane.LaneControl].dc = &recordingDataChannel{}
+	var opened atomic.Int32
+	p.SetOnOpen(func() { opened.Add(1) })
+	p.notifyClosed()
+
+	p.laneOpened(multilane.LaneControl)
+	p.laneOpened(multilane.LaneMedia)
+	p.laneOpened(multilane.LaneBulk)
+	p.endpoints[multilane.LaneControl].deliver([]byte(`{"type":"transport_hello","version":2}`))
+
+	if got := opened.Load(); got != 0 {
+		t.Fatalf("OnOpen calls after close = %d, want 0", got)
+	}
+}
+
+func TestPeerLatestApplicationHandlerWinsAfterHandshake(t *testing.T) {
+	p, err := New(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	if _, err := p.CreateOffer(); err != nil {
+		t.Fatal(err)
+	}
+	p.endpoints[multilane.LaneControl].dc = &recordingDataChannel{}
+	p.SetOnMessage(func([]byte) { t.Error("stale handler called") })
+	p.laneOpened(multilane.LaneControl)
+	p.laneOpened(multilane.LaneMedia)
+	p.laneOpened(multilane.LaneBulk)
+	p.endpoints[multilane.LaneControl].deliver([]byte(`{"type":"transport_hello","version":2}`))
+
+	called := make(chan struct{}, 1)
+	p.SetOnMessage(func([]byte) { called <- struct{}{} })
+	p.endpoints[multilane.LaneControl].deliver([]byte(`{"type":"list_request"}`))
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("latest handler was not called")
+	}
+}
+
+func TestPeerCloseWaitsForRunningOpenCallback(t *testing.T) {
+	p, err := New(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	if _, err := p.CreateOffer(); err != nil {
+		t.Fatal(err)
+	}
+	p.endpoints[multilane.LaneControl].dc = &recordingDataChannel{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closed := make(chan struct{}, 1)
+	p.SetOnOpen(func() {
+		close(started)
+		<-release
+	})
+	p.SetOnClose(func() { closed <- struct{}{} })
+	p.laneOpened(multilane.LaneControl)
+	p.laneOpened(multilane.LaneMedia)
+	p.laneOpened(multilane.LaneBulk)
+
+	helloDone := make(chan struct{})
+	go func() {
+		p.endpoints[multilane.LaneControl].deliver([]byte(`{"type":"transport_hello","version":2}`))
+		close(helloDone)
+	}()
+	<-started
+	p.notifyClosed()
+	select {
+	case <-closed:
+		t.Fatal("close callback ran before open callback completed")
+	default:
+	}
+	close(release)
+	<-helloDone
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("deferred close callback did not run")
+	}
+}
+
+func TestPeerConcurrentHandlerRegistrationAndHandshake(t *testing.T) {
+	p, err := New(nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	if _, err := p.CreateOffer(); err != nil {
+		t.Fatal(err)
+	}
+	p.endpoints[multilane.LaneControl].dc = &recordingDataChannel{}
+	p.laneOpened(multilane.LaneControl)
+	p.laneOpened(multilane.LaneMedia)
+	p.laneOpened(multilane.LaneBulk)
+
+	var registrations sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		registrations.Add(1)
+		go func() {
+			defer registrations.Done()
+			p.SetOnOpen(func() {})
+			p.SetOnClose(func() {})
+			p.SetOnICECandidate(func(webrtc.ICECandidateInit) {})
+			p.SetOnMessage(func([]byte) {})
+		}()
+	}
+	p.endpoints[multilane.LaneControl].deliver([]byte(`{"type":"transport_hello","version":2}`))
+	registrations.Wait()
+
+	called := make(chan struct{}, 1)
+	p.SetOnMessage(func([]byte) { called <- struct{}{} })
+	p.endpoints[multilane.LaneControl].deliver([]byte(`{"type":"list_request"}`))
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("final handler did not win after concurrent registration")
 	}
 }
 

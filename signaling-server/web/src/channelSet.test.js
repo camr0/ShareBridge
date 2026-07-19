@@ -100,6 +100,33 @@ test('fails when a required lane is still missing at the handshake deadline', as
   assert.equal(set.readyState, 'closed')
 })
 
+test('does not start the missing-lane deadline until the first channel arrives', async () => {
+  const set = createChannelSet({ handshakeTimeoutMs: 5 })
+  let settled = false
+  set.ready.then(() => { settled = true }, () => { settled = true })
+
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(settled, false)
+
+  set.attach('control', fakeChannel('control'))
+  await assert.rejects(set.ready, /timed out.*media.*bulk/i)
+})
+
+test('late handshake delivery cannot reopen a channel set after timeout', async () => {
+  const set = createChannelSet({ handshakeTimeoutMs: 5 })
+  const channels = attachRequired(set, 'connecting')
+  channels.bulk.open()
+  channels.media.open()
+  channels.control.open()
+  const staleHandshakeHandler = channels.control.onmessage
+
+  await assert.rejects(set.ready, /acknowledgement not received/i)
+  staleHandshakeHandler({ data: JSON.stringify({ type: 'transport_ready', version: 2 }) })
+
+  assert.equal(set.readyState, 'closed')
+  assert.equal(channels.control.closeCalls, 1)
+})
+
 test('rejects a version mismatch and closes every attached lane', async () => {
   const set = createChannelSet({ handshakeTimeoutMs: 100 })
   const channels = attachRequired(set)

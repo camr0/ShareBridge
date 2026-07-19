@@ -7,6 +7,7 @@ import {
   publishGlobalActions,
   applyConnectionBadge,
   initializeIceConfigTransport,
+  cancelDirectTransport,
   assertJoinNotActive,
   isTransferChannelActive,
   detachBrowserSignalingSocket,
@@ -220,6 +221,57 @@ test('direct transport resolves only after all labeled lanes and version handsha
   assert.equal(resolved.length, 1)
   assert.equal(resolved[0].readyState, 'open')
   assert.deepEqual(sent, [{ type: 'knock' }])
+})
+
+test('relay selection cancels direct resources and ignores late direct success and failure', async () => {
+  let peerCloseCalls = 0
+  const peer = {
+    connectionState: 'new',
+    close() {
+      peerCloseCalls += 1
+      this.connectionState = 'closed'
+    },
+  }
+  let readyCalls = 0
+  let failureCalls = 0
+  initializeIceConfigTransport({
+    msg: { ice_servers: [], relay_only: false },
+    ws: { send() {} },
+    createPeerConnection: () => peer,
+    onDirectChannel: () => { readyCalls += 1 },
+    onDirectFailure: () => { failureCalls += 1 },
+  })
+
+  const makeChannel = (label) => ({
+    label,
+    readyState: 'connecting',
+    bufferedAmount: 0,
+    closeCalls: 0,
+    send() {},
+    close() {
+      this.closeCalls += 1
+      this.readyState = 'closed'
+    },
+  })
+  const channels = ['control', 'media', 'bulk'].map(makeChannel)
+  channels.forEach((channel) => peer.ondatachannel({ channel }))
+  channels.forEach((channel) => {
+    channel.readyState = 'open'
+    channel.onopen()
+  })
+  const staleReady = channels[0].onmessage
+
+  cancelDirectTransport(peer, 'relay selected')
+  cancelDirectTransport(peer, 'duplicate relay selection')
+  staleReady({ data: JSON.stringify({ type: 'transport_ready', version: 2 }) })
+  peer.onconnectionstatechange()
+  await Promise.resolve()
+  await Promise.resolve()
+
+  assert.equal(readyCalls, 0)
+  assert.equal(failureCalls, 0)
+  assert.equal(peerCloseCalls, 1)
+  assert.ok(channels.every((channel) => channel.closeCalls === 1))
 })
 
 test('assertJoinNotActive throws loudly when join re-enters on an active socket', () => {

@@ -506,13 +506,13 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 			peers[connID] = p
 			mu.Unlock()
 
-			p.OnClosed = func() {
+			p.SetOnClose(func() {
 				log.Printf("peer closed (conn %s, session %s)", connID, sessionCode)
 				mu.Lock()
 				delete(peers, connID)
 				mu.Unlock()
-			}
-			p.OnICECandidate = func(init webrtc.ICECandidateInit) {
+			})
+			p.SetOnICECandidate(func(init webrtc.ICECandidateInit) {
 				if err := sig.Send(ctx, map[string]any{
 					"type":       "ice_candidate",
 					"session_id": sessionCode,
@@ -521,7 +521,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 				}); err != nil {
 					log.Printf("send ICE candidate: %v", err)
 				}
-			}
+			})
 
 			// Get persisted download count from store
 			existingSession := st.GetSession(code)
@@ -553,10 +553,10 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 					log.Printf("warning: could not send download_complete: %v", err)
 				}
 			}
-			p.OnOpen = func() {
+			p.SetOnOpen(func() {
 				log.Printf("DataChannel open! (conn %s, session %s)", connID, sessionCode)
 				tm.HandleOpen()
-			}
+			})
 
 			// CreateOffer creates the DataChannel internally — SetOnMessage must come after
 			sdp, err := p.CreateOffer()

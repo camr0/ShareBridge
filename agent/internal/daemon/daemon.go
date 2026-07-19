@@ -788,21 +788,21 @@ func (d *Daemon) createPeer(connID, sessionCode string) {
 	session.mu.Unlock()
 
 	// Set up peer callbacks
-	p.OnClosed = func() {
+	p.SetOnClose(func() {
 		log.Printf("peer %s closed (session %s)", connID, sessionCode)
 		session.mu.Lock()
 		delete(session.peers, connID)
 		session.mu.Unlock()
-	}
+	})
 
-	p.OnICECandidate = func(init webrtc.ICECandidateInit) {
+	p.SetOnICECandidate(func(init webrtc.ICECandidateInit) {
 		d.signaling.Send(context.Background(), map[string]any{
 			"type":       "ice_candidate",
 			"session_id": sessionCode,
 			"peer_id":    connID,
 			"candidate":  init,
 		})
-	}
+	})
 
 	// Create transfer manager
 	var tm *transfer.Manager
@@ -844,10 +844,10 @@ func (d *Daemon) createPeer(connID, sessionCode string) {
 		log.Printf("download complete for session %s (count: %d)", sessionCode, newCount)
 	}
 
-	p.OnOpen = func() {
+	p.SetOnOpen(func() {
 		log.Printf("DataChannel open for peer %s (session %s)", connID, sessionCode)
 		tm.HandleOpen()
-	}
+	})
 
 	// Create offer and send to signaling server
 	sdp, err := p.CreateOffer()

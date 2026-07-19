@@ -21,7 +21,8 @@ class BrowserChannelSet {
       this._resolveReady = resolve
       this._rejectReady = reject
     })
-    this._timer = setTimeout(() => this._onTimeout(), handshakeTimeoutMs)
+    this._handshakeTimeoutMs = handshakeTimeoutMs
+    this._timer = null
   }
 
   get control() { return this._channels.get('control') ?? null }
@@ -51,6 +52,8 @@ class BrowserChannelSet {
       throw error
     }
 
+    this._armTimeout()
+
     this._channels.set(label, channel)
     channel.onopen = () => this._maybeBeginHandshake()
     channel.onclose = () => this._fail(new Error(`required channel closed: ${label}`))
@@ -65,6 +68,15 @@ class BrowserChannelSet {
 
   close() {
     this._fail(new Error('channel set closed'))
+  }
+
+  fail(error) {
+    this._fail(error instanceof Error ? error : new Error(String(error)))
+  }
+
+  _armTimeout() {
+    if (this._timer !== null || this._closed || this._settled) return
+    this._timer = setTimeout(() => this._onTimeout(), this._handshakeTimeoutMs)
   }
 
   _maybeBeginHandshake() {
@@ -82,6 +94,7 @@ class BrowserChannelSet {
   }
 
   _handleHandshakeMessage(data) {
+    if (this._closed || this._settled || this.readyState !== 'handshaking') return
     let message
     try {
       message = JSON.parse(data)

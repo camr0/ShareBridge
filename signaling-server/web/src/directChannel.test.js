@@ -85,6 +85,31 @@ test('direct set reports missing lanes and tears down when any required lane clo
   assert.ok(channels.every((channel) => channel.closeCalled))
 })
 
+test('direct set rejects a null channel immediately', async () => {
+  const set = createDirectChannelSet({ handshakeTimeoutMs: 100 })
+  assert.throws(() => set.accept(null), /invalid.*channel/i)
+  await assert.rejects(set.ready, /invalid.*channel/i)
+  assert.equal(set.readyState, 'closed')
+})
+
+test('direct set fires onopen exactly once after readiness', async () => {
+  const set = createDirectChannelSet({ handshakeTimeoutMs: 100 })
+  let opens = 0
+  set.onopen = () => { opens += 1 }
+  const channels = ['control', 'media', 'bulk'].map(createMockRTCDataChannel)
+  channels.forEach((channel) => set.accept(channel))
+  channels.forEach((channel) => {
+    channel.readyState = 'open'
+    channel.onopen()
+  })
+  channels[0].onmessage({ data: JSON.stringify({ type: 'transport_ready', version: 2 }) })
+  await set.ready
+  channels[0].onmessage?.({ data: JSON.stringify({ type: 'transport_ready', version: 2 }) })
+  await Promise.resolve()
+
+  assert.equal(opens, 1)
+})
+
 test('DirectChannel normalizes RTCDataChannel into the shared channel contract', () => {
   const rtc = createMockRTCDataChannel()
   const channel = new DirectChannel(rtc)

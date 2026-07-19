@@ -22,15 +22,18 @@ type Peer struct {
 	pc        *webrtc.PeerConnection
 	endpoints map[multilane.Lane]*directEndpoint
 
-	mu             sync.Mutex
-	opened         map[multilane.Lane]bool
-	handshakeArmed bool
-	ready          bool
-	onMessage      func([]byte)
-	closeOnce      sync.Once
-	OnOpen         func()
-	OnClosed       func()
-	OnICECandidate func(init webrtc.ICECandidateInit)
+	mu                  sync.Mutex
+	opened              map[multilane.Lane]bool
+	handshakeArmed      bool
+	ready               bool
+	onMessage           func([]byte)
+	closed              bool
+	openCallbackRunning bool
+	closePending        bool
+	closeNotified       bool
+	onOpen              func()
+	onClosed            func()
+	onICECandidate      func(init webrtc.ICECandidateInit)
 }
 
 // New creates a PeerConnection with the given ICE servers.
@@ -52,8 +55,14 @@ func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
 	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c != nil && p.OnICECandidate != nil {
-			p.OnICECandidate(c.ToJSON())
+		if c == nil {
+			return
+		}
+		p.mu.Lock()
+		handler := p.onICECandidate
+		p.mu.Unlock()
+		if handler != nil {
+			handler(c.ToJSON())
 		}
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -95,7 +104,7 @@ func (p *Peer) CreateOffer() (string, error) {
 
 func (p *Peer) laneOpened(lane multilane.Lane) {
 	p.mu.Lock()
-	if !lane.Valid() || p.opened[lane] {
+	if p.closed || !lane.Valid() || p.opened[lane] {
 		p.mu.Unlock()
 		return
 	}
@@ -109,13 +118,29 @@ func (p *Peer) laneOpened(lane multilane.Lane) {
 
 	multilane.InstallHandshakeResponder(p, func() {
 		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return
+		}
 		p.ready = true
-		onMessage := p.onMessage
-		onOpen := p.OnOpen
+		p.control().SetOnMessage(p.onMessage)
+		onOpen := p.onOpen
+		p.openCallbackRunning = true
 		p.mu.Unlock()
-		p.control().SetOnMessage(onMessage)
 		if onOpen != nil {
 			onOpen()
+		}
+
+		p.mu.Lock()
+		p.openCallbackRunning = false
+		var onClosed func()
+		if p.closePending && !p.closeNotified {
+			p.closeNotified = true
+			onClosed = p.onClosed
+		}
+		p.mu.Unlock()
+		if onClosed != nil {
+			onClosed()
 		}
 	})
 }
@@ -126,11 +151,23 @@ func (p *Peer) laneClosed(multilane.Lane) {
 }
 
 func (p *Peer) notifyClosed() {
-	p.closeOnce.Do(func() {
-		if p.OnClosed != nil {
-			p.OnClosed()
-		}
-	})
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	if p.openCallbackRunning {
+		p.closePending = true
+		p.mu.Unlock()
+		return
+	}
+	p.closeNotified = true
+	onClosed := p.onClosed
+	p.mu.Unlock()
+	if onClosed != nil {
+		onClosed()
+	}
 }
 
 // Endpoint returns a required lane, or nil for an unknown lane.
@@ -138,8 +175,23 @@ func (p *Peer) Endpoint(lane multilane.Lane) multilane.Endpoint {
 	return p.endpoints[lane]
 }
 
-func (p *Peer) SetOnOpen(handler func())  { p.OnOpen = handler }
-func (p *Peer) SetOnClose(handler func()) { p.OnClosed = handler }
+func (p *Peer) SetOnOpen(handler func()) {
+	p.mu.Lock()
+	p.onOpen = handler
+	p.mu.Unlock()
+}
+
+func (p *Peer) SetOnClose(handler func()) {
+	p.mu.Lock()
+	p.onClosed = handler
+	p.mu.Unlock()
+}
+
+func (p *Peer) SetOnICECandidate(handler func(webrtc.ICECandidateInit)) {
+	p.mu.Lock()
+	p.onICECandidate = handler
+	p.mu.Unlock()
+}
 
 // Compatibility shims keep existing transfer callers on control until routing
 // moves to explicit endpoints.

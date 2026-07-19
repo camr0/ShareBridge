@@ -64,10 +64,19 @@ export function createDirectChannelSet(options) {
 class DirectChannelSet {
   constructor(options) {
     this._set = createChannelSet(options)
-    this.ready = this._set.ready.then(() => this)
+    this._openNotified = false
+    this.ready = this._set.ready.then(() => {
+      this._fireOpen()
+      return this
+    })
   }
 
   accept(rtcDataChannel) {
+    if (!rtcDataChannel || typeof rtcDataChannel.send !== 'function' || typeof rtcDataChannel.close !== 'function') {
+      const error = new TypeError('invalid RTCDataChannel')
+      this._set.fail(error)
+      throw error
+    }
     const label = rtcDataChannel?.label
     const channel = new DirectChannel(rtcDataChannel, LANE_BY_LABEL[label])
     this._set.attach(label, channel)
@@ -84,7 +93,10 @@ class DirectChannelSet {
   }
 
   get onopen() { return this._onopen ?? null }
-  set onopen(handler) { this._onopen = handler }
+  set onopen(handler) {
+    this._onopen = handler
+    if (this.readyState === 'open') this._fireOpen()
+  }
   get onmessage() { return this.control?.onmessage ?? null }
   set onmessage(handler) {
     if (this.control) this.control.onmessage = handler
@@ -95,6 +107,12 @@ class DirectChannelSet {
   send(value) { return this.control.send(value) }
   sendBinary(bytes) { return this.control.sendBinary(bytes) }
   close() { return this._set.close() }
+
+  _fireOpen() {
+    if (this._openNotified || typeof this._onopen !== 'function') return
+    this._openNotified = true
+    this._onopen()
+  }
 }
 
 // extend the adapter with a helper used by app.js and tests

@@ -23,6 +23,7 @@ let remoteDescSet = false
 let relayQuotaExceeded = false
 let quotaPeriodEnd = null
 let activeDownload = null
+const directAttemptCancels = new WeakMap()
 
 const DEBUG = typeof location !== 'undefined' && (
   location.search.includes('debug=1') ||
@@ -183,13 +184,24 @@ export function initializeIceConfigTransport({
 
   const peer = createPeerConnection({ iceServers: buildDirectIceServers(msg.ice_servers) })
   const directSet = createDirectChannelSet()
+  let directAttemptActive = true
   let directFailureReported = false
   const reportDirectFailure = (error) => {
-    if (directFailureReported) return
+    if (!directAttemptActive || directFailureReported) return
     directFailureReported = true
     onDirectFailure(error)
   }
-  directSet.ready.then(onDirectChannel).catch(reportDirectFailure)
+  directAttemptCancels.set(peer, (reason) => {
+    if (!directAttemptActive) return
+    directAttemptActive = false
+    debugLog('cancelling direct attempt', { reason })
+    directSet.close()
+    peer.close()
+  })
+  directSet.ready.then((set) => {
+    if (directAttemptActive) onDirectChannel(set)
+    else set.close()
+  }).catch(reportDirectFailure)
   debugLog('created RTCPeerConnection for direct path')
 
   peer.onicecandidate = (e) => {
@@ -224,6 +236,16 @@ export function initializeIceConfigTransport({
   debugLog('sending initial knock from browser for non-relay_only session')
   ws.send(JSON.stringify({ type: 'knock' }))
   return peer
+}
+
+export function cancelDirectTransport(peer, reason = 'direct attempt cancelled') {
+  if (!peer) return
+  const cancel = directAttemptCancels.get(peer)
+  if (cancel) {
+    cancel(reason)
+    return
+  }
+  peer.close?.()
 }
 
 // Export for testing - creates a message handler with injected dependencies
@@ -596,10 +618,16 @@ function join() {
                 debugLog('connectTransferChannel status', { status: s })
                 if (s === 'connecting-direct') updateStatus('Connecting directly...')
                 else if (s === 'connecting-relay') updateStatus('Connecting via relay...')
-                else if (s === 'falling-back-to-relay') updateStatus('Direct failed, using relay...')
+                else if (s === 'falling-back-to-relay') {
+                  cancelDirectTransport(pc, 'falling back to relay')
+                  updateStatus('Direct failed, using relay...')
+                }
                 else if (s === 'connected-direct') updateStatus('Connected directly')
                 else if (s === 'connected-relay') updateStatus('Connected via relay')
-                else if (s === 'failed') updateStatus('Connection failed')
+                else if (s === 'failed') {
+                  cancelDirectTransport(pc, 'direct connection failed')
+                  updateStatus('Connection failed')
+                }
               },
             })
             debugLog('relay_policy: connectTransferChannel resolved', { mode: result?.mode, readyState: result?.channel?.readyState })
@@ -611,6 +639,7 @@ function join() {
 
           transferChannel = result.channel
           currentTransferMode = result.mode
+          if (result.mode === 'relay') cancelDirectTransport(pc, 'relay selected')
           attachTransferChannel({
             channel: transferChannel,
             mode: result.mode,
