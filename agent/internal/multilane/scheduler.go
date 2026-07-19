@@ -343,8 +343,10 @@ func (s *Scheduler) hasMediaLocked() bool {
 }
 
 func (s *Scheduler) popLocked(class TrafficClass) *sendRequest {
-	request := s.queues[class][0]
-	s.queues[class] = s.queues[class][1:]
+	queue := s.queues[class]
+	request := queue[0]
+	queue[0] = nil
+	s.queues[class] = queue[1:]
 	if len(s.queues[class]) == 0 {
 		s.resetEmptyLaneLocked(class)
 	}
@@ -396,6 +398,7 @@ func (s *Scheduler) admitWaitersLocked(class TrafficClass) {
 	waiters := s.admissionWaiters[class]
 	for len(waiters) > 0 && s.bytes[class]+len(waiters[0].payload) <= capBytes {
 		waiter := waiters[0]
+		waiters[0] = nil
 		waiters = waiters[1:]
 		waiter.request = s.enqueueLocked(waiter.class, waiter.kind, waiter.payload)
 		waiter.ready <- nil
@@ -407,7 +410,9 @@ func (s *Scheduler) removeAdmissionWaiterLocked(want *admissionWaiter) bool {
 	waiters := s.admissionWaiters[want.class]
 	for i, waiter := range waiters {
 		if waiter == want {
-			s.admissionWaiters[want.class] = append(waiters[:i], waiters[i+1:]...)
+			copy(waiters[i:], waiters[i+1:])
+			waiters[len(waiters)-1] = nil
+			s.admissionWaiters[want.class] = waiters[:len(waiters)-1]
 			if len(s.queues[want.class]) == 0 {
 				s.resetEmptyLaneLocked(want.class)
 			}
@@ -419,8 +424,9 @@ func (s *Scheduler) removeAdmissionWaiterLocked(want *admissionWaiter) bool {
 
 func (s *Scheduler) failAdmissionWaitersLocked(err error) {
 	for class, waiters := range s.admissionWaiters {
-		for _, waiter := range waiters {
+		for i, waiter := range waiters {
 			waiter.ready <- err
+			waiters[i] = nil
 		}
 		s.admissionWaiters[class] = nil
 	}
@@ -430,7 +436,9 @@ func (s *Scheduler) removeQueuedLocked(want *sendRequest) bool {
 	queue := s.queues[want.class]
 	for i, request := range queue {
 		if request == want {
-			s.queues[want.class] = append(queue[:i], queue[i+1:]...)
+			copy(queue[i:], queue[i+1:])
+			queue[len(queue)-1] = nil
+			s.queues[want.class] = queue[:len(queue)-1]
 			if len(s.queues[want.class]) == 0 {
 				s.resetEmptyLaneLocked(want.class)
 			}
@@ -442,9 +450,10 @@ func (s *Scheduler) removeQueuedLocked(want *sendRequest) bool {
 
 func (s *Scheduler) failQueuedLocked(err error) {
 	for class, queue := range s.queues {
-		for _, request := range queue {
+		for i, request := range queue {
 			s.bytes[class] -= len(request.payload)
 			request.done <- err
+			queue[i] = nil
 		}
 		s.queues[class] = nil
 	}

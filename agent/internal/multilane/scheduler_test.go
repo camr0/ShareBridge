@@ -832,3 +832,81 @@ func TestSchedulerWriterFailureAndCloseAreTerminal(t *testing.T) {
 	close(gate)
 	_ = <-first
 }
+
+func TestSchedulerRemovedPointerSlotsAreCleared(t *testing.T) {
+	bare := func() *Scheduler {
+		return &Scheduler{queues: make(map[TrafficClass][]*sendRequest), bytes: make(map[TrafficClass]int), admissionWaiters: make(map[TrafficClass][]*admissionWaiter), notify: make(chan struct{})}
+	}
+	request := func(marker byte) *sendRequest {
+		return &sendRequest{class: ClassBulk, kind: KindBinary, payload: []byte{marker}, done: make(chan error, 1)}
+	}
+	waiter := func(marker byte) *admissionWaiter {
+		return &admissionWaiter{class: ClassBulk, kind: KindBinary, payload: []byte{marker}, ready: make(chan error, 1)}
+	}
+
+	t.Run("queue head pop", func(t *testing.T) {
+		s := bare()
+		backing := []*sendRequest{request(1), request(2)}
+		s.queues[ClassBulk] = backing
+		_ = s.popLocked(ClassBulk)
+		if backing[0] != nil {
+			t.Fatal("popped queue head retained in backing array")
+		}
+	})
+	t.Run("queued middle cancellation", func(t *testing.T) {
+		s := bare()
+		removed := request(2)
+		backing := []*sendRequest{request(1), removed, request(3)}
+		s.queues[ClassBulk] = backing
+		if !s.removeQueuedLocked(removed) {
+			t.Fatal("request not removed")
+		}
+		if backing[2] != nil {
+			t.Fatal("removed queued request retained in backing tail")
+		}
+	})
+	t.Run("admission middle cancellation", func(t *testing.T) {
+		s := bare()
+		removed := waiter(2)
+		backing := []*admissionWaiter{waiter(1), removed, waiter(3)}
+		s.admissionWaiters[ClassBulk] = backing
+		if !s.removeAdmissionWaiterLocked(removed) {
+			t.Fatal("waiter not removed")
+		}
+		if backing[2] != nil {
+			t.Fatal("removed admission waiter retained in backing tail")
+		}
+	})
+	t.Run("batch admission heads", func(t *testing.T) {
+		s := bare()
+		backing := []*admissionWaiter{waiter(1), waiter(2), waiter(3)}
+		s.admissionWaiters[ClassBulk] = backing
+		s.admitWaitersLocked(ClassBulk)
+		for i, retained := range backing {
+			if retained != nil {
+				t.Fatalf("admitted waiter %d retained in backing array", i)
+			}
+		}
+	})
+	t.Run("terminal resets", func(t *testing.T) {
+		s := bare()
+		requestBacking := []*sendRequest{request(1), request(2)}
+		waiterBacking := []*admissionWaiter{waiter(1), waiter(2)}
+		s.queues[ClassBulk] = requestBacking
+		s.admissionWaiters[ClassBulk] = waiterBacking
+		s.bytes[ClassBulk] = 2
+		err := errors.New("terminal")
+		s.failAdmissionWaitersLocked(err)
+		s.failQueuedLocked(err)
+		for i, retained := range requestBacking {
+			if retained != nil {
+				t.Fatalf("failed request %d retained", i)
+			}
+		}
+		for i, retained := range waiterBacking {
+			if retained != nil {
+				t.Fatalf("failed waiter %d retained", i)
+			}
+		}
+	})
+}
