@@ -32,15 +32,24 @@ type sendRequest struct {
 	done    chan error
 }
 
+type admissionWaiter struct {
+	class   TrafficClass
+	kind    Kind
+	payload []byte // caller-owned until admission; copied by admitWaitersLocked
+	ready   chan error
+	request *sendRequest
+}
+
 // Scheduler serializes bounded traffic-class queues with byte-weighted DRR.
 type Scheduler struct {
-	mu       sync.Mutex
-	writer   WriteFunc
-	queues   map[TrafficClass][]*sendRequest
-	bytes    map[TrafficClass]int // queued plus currently writing
-	notify   chan struct{}
-	terminal error
-	active   *sendRequest
+	mu               sync.Mutex
+	writer           WriteFunc
+	queues           map[TrafficClass][]*sendRequest
+	bytes            map[TrafficClass]int // queued plus currently writing
+	admissionWaiters map[TrafficClass][]*admissionWaiter
+	notify           chan struct{}
+	terminal         error
+	active           *sendRequest
 
 	controlBurst int
 	outerCurrent int
@@ -53,10 +62,11 @@ type Scheduler struct {
 
 func NewScheduler(writer WriteFunc) *Scheduler {
 	s := &Scheduler{
-		writer: writer,
-		queues: make(map[TrafficClass][]*sendRequest),
-		bytes:  make(map[TrafficClass]int),
-		notify: make(chan struct{}),
+		writer:           writer,
+		queues:           make(map[TrafficClass][]*sendRequest),
+		bytes:            make(map[TrafficClass]int),
+		admissionWaiters: make(map[TrafficClass][]*admissionWaiter),
+		notify:           make(chan struct{}),
 	}
 	go s.pump()
 	return s
@@ -77,7 +87,8 @@ func classCap(class TrafficClass) (int, bool) {
 	}
 }
 
-// Send waits for bounded queue capacity and for the writer to accept the request.
+// Send waits for bounded admitted-byte capacity and for the writer to accept the request.
+// Payload bytes remain caller-owned while admission is blocked and are copied on enqueue.
 func (s *Scheduler) Send(ctx context.Context, class TrafficClass, kind Kind, payload []byte) error {
 	capBytes, valid := classCap(class)
 	if !valid {
@@ -86,31 +97,50 @@ func (s *Scheduler) Send(ctx context.Context, class TrafficClass, kind Kind, pay
 	if len(payload) > capBytes {
 		return fmt.Errorf("%w: class %d payload is %d bytes, cap is %d", ErrRequestTooLarge, class, len(payload), capBytes)
 	}
+	if kind != KindText && kind != KindBinary {
+		return fmt.Errorf("unknown kind: %d", kind)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	request := &sendRequest{class: class, kind: kind, payload: append([]byte(nil), payload...), done: make(chan error, 1)}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-	for {
-		s.mu.Lock()
-		if s.terminal != nil {
-			err := s.terminal
-			s.mu.Unlock()
-			return err
-		}
-		if s.bytes[class]+len(request.payload) <= capBytes {
-			s.queues[class] = append(s.queues[class], request)
-			s.bytes[class] += len(request.payload)
-			s.signalLocked()
-			s.mu.Unlock()
-			break
-		}
-		changed := s.notify
+	s.mu.Lock()
+	if s.terminal != nil {
+		err := s.terminal
+		s.mu.Unlock()
+		return err
+	}
+	var request *sendRequest
+	if len(s.admissionWaiters[class]) == 0 && s.bytes[class]+len(payload) <= capBytes {
+		request = s.enqueueLocked(class, kind, payload)
+		s.mu.Unlock()
+	} else {
+		waiter := &admissionWaiter{class: class, kind: kind, payload: payload, ready: make(chan error, 1)}
+		s.admissionWaiters[class] = append(s.admissionWaiters[class], waiter)
 		s.mu.Unlock()
 		select {
+		case err := <-waiter.ready:
+			if err != nil {
+				return err
+			}
+			request = waiter.request
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-changed:
+			s.mu.Lock()
+			removed := s.removeAdmissionWaiterLocked(waiter)
+			if removed {
+				s.admitWaitersLocked(class)
+			}
+			s.mu.Unlock()
+			if removed {
+				return ctx.Err()
+			}
+			if err := <-waiter.ready; err != nil {
+				return err
+			}
+			request = waiter.request
 		}
 	}
 
@@ -122,7 +152,7 @@ func (s *Scheduler) Send(ctx context.Context, class TrafficClass, kind Kind, pay
 		removed := s.removeQueuedLocked(request)
 		if removed {
 			s.bytes[class] -= len(request.payload)
-			s.signalLocked()
+			s.admitWaitersLocked(class)
 		}
 		s.mu.Unlock()
 		if removed {
@@ -138,6 +168,7 @@ func (s *Scheduler) Close() error {
 	defer s.mu.Unlock()
 	if s.terminal == nil {
 		s.terminal = ErrSchedulerClosed
+		s.failAdmissionWaitersLocked(ErrSchedulerClosed)
 		s.failQueuedLocked(ErrSchedulerClosed)
 		s.signalLocked()
 	}
@@ -158,7 +189,10 @@ func (s *Scheduler) pump() {
 				s.bytes[request.class] -= len(request.payload)
 				if err != nil && s.terminal == nil {
 					s.terminal = err
+					s.failAdmissionWaitersLocked(err)
 					s.failQueuedLocked(err)
+				} else if err == nil && s.terminal == nil {
+					s.admitWaitersLocked(request.class)
 				}
 				s.signalLocked()
 				s.mu.Unlock()
@@ -305,7 +339,72 @@ func (s *Scheduler) hasMediaLocked() bool {
 func (s *Scheduler) popLocked(class TrafficClass) *sendRequest {
 	request := s.queues[class][0]
 	s.queues[class] = s.queues[class][1:]
+	if len(s.queues[class]) == 0 {
+		s.resetEmptyLaneLocked(class)
+	}
 	return request
+}
+
+func (s *Scheduler) resetEmptyLaneLocked(class TrafficClass) {
+	switch class {
+	case ClassInteractiveMedia:
+		s.innerDeficit[0] = 0
+	case ClassThumbnail:
+		s.innerDeficit[1] = 0
+	case ClassBulk:
+		s.outerDeficit[1] = 0
+	}
+	if !s.hasMediaLocked() {
+		s.outerDeficit[0] = 0
+		s.innerCurrent = 0
+		s.innerDeficit = [2]int{}
+		s.innerStarted = false
+	}
+	if !s.hasMediaLocked() && len(s.queues[ClassBulk]) == 0 {
+		s.outerCurrent = 0
+		s.outerDeficit = [2]int{}
+		s.outerStarted = false
+	}
+}
+
+func (s *Scheduler) enqueueLocked(class TrafficClass, kind Kind, payload []byte) *sendRequest {
+	request := &sendRequest{class: class, kind: kind, payload: append([]byte(nil), payload...), done: make(chan error, 1)}
+	s.bytes[class] += len(request.payload)
+	s.queues[class] = append(s.queues[class], request)
+	s.signalLocked()
+	return request
+}
+
+func (s *Scheduler) admitWaitersLocked(class TrafficClass) {
+	capBytes, _ := classCap(class)
+	waiters := s.admissionWaiters[class]
+	for len(waiters) > 0 && s.bytes[class]+len(waiters[0].payload) <= capBytes {
+		waiter := waiters[0]
+		waiters = waiters[1:]
+		waiter.request = s.enqueueLocked(waiter.class, waiter.kind, waiter.payload)
+		waiter.ready <- nil
+	}
+	s.admissionWaiters[class] = waiters
+}
+
+func (s *Scheduler) removeAdmissionWaiterLocked(want *admissionWaiter) bool {
+	waiters := s.admissionWaiters[want.class]
+	for i, waiter := range waiters {
+		if waiter == want {
+			s.admissionWaiters[want.class] = append(waiters[:i], waiters[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) failAdmissionWaitersLocked(err error) {
+	for class, waiters := range s.admissionWaiters {
+		for _, waiter := range waiters {
+			waiter.ready <- err
+		}
+		s.admissionWaiters[class] = nil
+	}
 }
 
 func (s *Scheduler) removeQueuedLocked(want *sendRequest) bool {
@@ -313,6 +412,9 @@ func (s *Scheduler) removeQueuedLocked(want *sendRequest) bool {
 	for i, request := range queue {
 		if request == want {
 			s.queues[want.class] = append(queue[:i], queue[i+1:]...)
+			if len(s.queues[want.class]) == 0 {
+				s.resetEmptyLaneLocked(want.class)
+			}
 			return true
 		}
 	}

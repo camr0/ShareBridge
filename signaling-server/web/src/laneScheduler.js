@@ -63,7 +63,8 @@ export class LaneScheduler {
     if (signal?.aborted) throw abortError();
 
     const completion = deferred();
-    const request = { className, kind, payload: new Uint8Array(payload), signal, completion, state: 'new', abortHandler: null };
+    // Queue caps bound admitted payload bytes. A blocked payload remains caller-owned until enqueue.
+    const request = { className, kind, payload, signal, completion, state: 'new', abortHandler: null };
     await this.admit(request);
     return completion.promise;
   }
@@ -93,6 +94,7 @@ export class LaneScheduler {
   }
 
   enqueue(request) {
+    request.payload = new Uint8Array(request.payload);
     request.state = 'queued';
     this.bytes.set(request.className, this.bytes.get(request.className) + request.payload.length);
     this.queues.get(request.className).push(request);
@@ -130,6 +132,7 @@ export class LaneScheduler {
       request.state = 'done';
       request.completion.reject(error);
       this.detachAbort(request);
+      if (queue.length === 0) this.resetEmptyLane(request.className);
       this.drainAdmissions(request.className);
     }
   }
@@ -264,7 +267,25 @@ export class LaneScheduler {
     return this.queues.get(TRAFFIC_CLASS_INTERACTIVE_MEDIA).length > 0 || this.queues.get(TRAFFIC_CLASS_THUMBNAIL).length > 0;
   }
 
-  pop(className) { return this.queues.get(className).shift(); }
+  pop(className) {
+    const queue = this.queues.get(className);
+    const request = queue.shift();
+    if (queue.length === 0) this.resetEmptyLane(className);
+    return request;
+  }
+
+  resetEmptyLane(className) {
+    if (className === TRAFFIC_CLASS_INTERACTIVE_MEDIA) this.innerDeficit[0] = 0;
+    if (className === TRAFFIC_CLASS_THUMBNAIL) this.innerDeficit[1] = 0;
+    if (className === TRAFFIC_CLASS_BULK) this.outerDeficit[1] = 0;
+    if (!this.hasMedia()) {
+      this.outerDeficit[0] = 0;
+      this.innerCurrent = 0; this.innerDeficit = [0, 0]; this.innerStarted = false;
+    }
+    if (!this.hasMedia() && this.queues.get(TRAFFIC_CLASS_BULK).length === 0) {
+      this.outerCurrent = 0; this.outerDeficit = [0, 0]; this.outerStarted = false;
+    }
+  }
 
   failQueued(error) {
     for (const className of classes) {

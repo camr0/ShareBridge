@@ -97,6 +97,110 @@ func TestSchedulerWeightedOuterServiceStartsThreeMediaToOneBulk(t *testing.T) {
 	}
 }
 
+func TestSchedulerIdleResetsOuterAndInnerDeficits(t *testing.T) {
+	tests := []struct {
+		name  string
+		fresh []TrafficClass
+		want  []TrafficClass
+	}{
+		{name: "outer", fresh: []TrafficClass{ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassBulk, ClassBulk}, want: []TrafficClass{ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassBulk}},
+		{name: "inner", fresh: []TrafficClass{ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassThumbnail, ClassThumbnail}, want: []TrafficClass{ClassInteractiveMedia, ClassInteractiveMedia, ClassInteractiveMedia, ClassThumbnail}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gate := make(chan struct{})
+			entered := make(chan struct{})
+			var mu sync.Mutex
+			var writes []TrafficClass
+			s := NewScheduler(func(class TrafficClass, _ Kind, _ []byte) error {
+				mu.Lock()
+				writes = append(writes, class)
+				mu.Unlock()
+				if class == ClassControl {
+					close(entered)
+					<-gate
+				}
+				return nil
+			})
+			if err := s.Send(context.Background(), ClassInteractiveMedia, KindBinary, bytesOf(testFrameSize, 1)); err != nil {
+				t.Fatal(err)
+			}
+			control := asyncSend(s, context.Background(), ClassControl, 0)
+			<-entered
+			var sends []<-chan error
+			for i, class := range tt.fresh {
+				sends = append(sends, asyncSend(s, context.Background(), class, byte(i+2)))
+			}
+			waitFor(t, "fresh traffic admission", func() bool {
+				return queueBytes(s, ClassInteractiveMedia)+queueBytes(s, ClassThumbnail)+queueBytes(s, ClassBulk) == len(tt.fresh)*testFrameSize
+			})
+			close(gate)
+			if err := <-control; err != nil {
+				t.Fatal(err)
+			}
+			for _, done := range sends {
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = s.Close()
+			mu.Lock()
+			got := append([]TrafficClass(nil), writes[2:6]...)
+			mu.Unlock()
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Fatalf("fresh service = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSchedulerUsesByteDeficitsForVariableFrames(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var mu sync.Mutex
+	var writes []TrafficClass
+	s := NewScheduler(func(class TrafficClass, _ Kind, _ []byte) error {
+		mu.Lock()
+		writes = append(writes, class)
+		n := len(writes)
+		mu.Unlock()
+		if n == 1 {
+			close(entered)
+			<-gate
+		}
+		return nil
+	})
+	control := asyncSend(s, context.Background(), ClassControl, 0)
+	<-entered
+	var sends []<-chan error
+	for i := 0; i < 4; i++ {
+		done := make(chan error, 1)
+		go func() { done <- s.Send(context.Background(), ClassInteractiveMedia, KindBinary, make([]byte, 96*1024)) }()
+		sends = append(sends, done)
+	}
+	for i := 0; i < 2; i++ {
+		sends = append(sends, asyncSend(s, context.Background(), ClassBulk, byte(i+1)))
+	}
+	waitFor(t, "variable traffic admission", func() bool {
+		return queueBytes(s, ClassInteractiveMedia) == 4*96*1024 && queueBytes(s, ClassBulk) == 2*testFrameSize
+	})
+	close(gate)
+	_ = <-control
+	for _, done := range sends {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = s.Close()
+	mu.Lock()
+	got := append([]TrafficClass(nil), writes[1:4]...)
+	mu.Unlock()
+	want := []TrafficClass{ClassInteractiveMedia, ClassInteractiveMedia, ClassBulk}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("service = %v, want byte-weighted %v", got, want)
+	}
+}
+
 func TestSchedulerLimitsControlBurstToEight(t *testing.T) {
 	gate := make(chan struct{})
 	entered := make(chan struct{})
@@ -196,6 +300,177 @@ func TestSchedulerBulkCapacityBlocksFifthSenderUntilDrain(t *testing.T) {
 	if err := <-fifth; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestSchedulerBulkAdmissionWaitersAreFIFO(t *testing.T) {
+	permits := make(chan struct{})
+	entered := make(chan byte, 8)
+	var sends []<-chan error
+	s := NewScheduler(func(_ TrafficClass, _ Kind, payload []byte) error { entered <- payload[0]; <-permits; return nil })
+	for i := byte(1); i <= 4; i++ {
+		sends = append(sends, asyncSend(s, context.Background(), ClassBulk, i))
+		want := int(i) * testFrameSize
+		waitFor(t, "ordered initial admission", func() bool { return queueBytes(s, ClassBulk) == want })
+	}
+	if got := <-entered; got != 1 {
+		t.Fatalf("first write = %d", got)
+	}
+	waitFor(t, "full admitted bulk capacity", func() bool { return queueBytes(s, ClassBulk) == BulkQueueCapBytes })
+	for i := byte(10); i <= 12; i++ {
+		sends = append(sends, asyncSend(s, context.Background(), ClassBulk, i))
+		want := int(i - 9)
+		waitFor(t, "FIFO admission waiter", func() bool { s.mu.Lock(); defer s.mu.Unlock(); return len(s.admissionWaiters[ClassBulk]) == want })
+	}
+	order := []byte{1}
+	for i := 0; i < 6; i++ {
+		permits <- struct{}{}
+		order = append(order, <-entered)
+	}
+	permits <- struct{}{}
+	for _, done := range sends {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []byte{1, 2, 3, 4, 10, 11, 12}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("write order = %v, want %v", order, want)
+	}
+	_ = s.Close()
+}
+
+func TestSchedulerAdmissionWaiterCancellationAndClose(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	s := NewScheduler(func(_ TrafficClass, _ Kind, _ []byte) error {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-gate
+		return nil
+	})
+	var admitted []<-chan error
+	for i := 0; i < 4; i++ {
+		admitted = append(admitted, asyncSend(s, context.Background(), ClassBulk, byte(i+1)))
+	}
+	<-entered
+	waitFor(t, "full capacity", func() bool { return queueBytes(s, ClassBulk) == BulkQueueCapBytes })
+	ctx, cancel := context.WithCancel(context.Background())
+	canceled := asyncSend(s, ctx, ClassBulk, 10)
+	waiting := asyncSend(s, context.Background(), ClassBulk, 11)
+	waitFor(t, "two admission waiters", func() bool { s.mu.Lock(); defer s.mu.Unlock(); return len(s.admissionWaiters[ClassBulk]) == 2 })
+	cancel()
+	if err := <-canceled; !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiter cancellation = %v", err)
+	}
+	waitFor(t, "canceled waiter removal", func() bool { s.mu.Lock(); defer s.mu.Unlock(); return len(s.admissionWaiters[ClassBulk]) == 1 })
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waiting; !errors.Is(err, ErrSchedulerClosed) {
+		t.Fatalf("waiting close error = %v", err)
+	}
+	close(gate)
+	for _, done := range admitted {
+		<-done
+	}
+}
+
+func TestSchedulerWriterFailureUnblocksAdmissionWaiters(t *testing.T) {
+	boom := errors.New("admission writer failure")
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	s := NewScheduler(func(_ TrafficClass, _ Kind, _ []byte) error {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-gate
+		return boom
+	})
+	for i := 0; i < 4; i++ {
+		_ = asyncSend(s, context.Background(), ClassBulk, byte(i+1))
+	}
+	<-entered
+	waitFor(t, "full capacity", func() bool { return queueBytes(s, ClassBulk) == BulkQueueCapBytes })
+	waiting := asyncSend(s, context.Background(), ClassBulk, 9)
+	waitFor(t, "admission waiter", func() bool { s.mu.Lock(); defer s.mu.Unlock(); return len(s.admissionWaiters[ClassBulk]) == 1 })
+	close(gate)
+	if err := <-waiting; !errors.Is(err, boom) {
+		t.Fatalf("waiting writer error = %v", err)
+	}
+}
+
+func TestSchedulerBlockedPayloadCopiesOnlyWhenAdmitted(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var mu sync.Mutex
+	var markers []byte
+	s := NewScheduler(func(_ TrafficClass, _ Kind, payload []byte) error {
+		mu.Lock()
+		markers = append(markers, payload[0])
+		n := len(markers)
+		mu.Unlock()
+		if n == 1 {
+			close(entered)
+			<-gate
+		}
+		return nil
+	})
+	var sends []<-chan error
+	for i := 1; i <= 4; i++ {
+		sends = append(sends, asyncSend(s, context.Background(), ClassBulk, byte(i)))
+	}
+	<-entered
+	waitFor(t, "full bulk capacity", func() bool { return queueBytes(s, ClassBulk) == BulkQueueCapBytes })
+	original := bytesOf(testFrameSize, 7)
+	blocked := make(chan error, 1)
+	go func() { blocked <- s.Send(context.Background(), ClassBulk, KindBinary, original) }()
+	waitFor(t, "blocked admission", func() bool { s.mu.Lock(); defer s.mu.Unlock(); return len(s.admissionWaiters[ClassBulk]) == 1 })
+	original[0] = 9
+	close(gate)
+	for _, done := range sends {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := <-blocked; err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	mu.Lock()
+	got := markers[len(markers)-1]
+	mu.Unlock()
+	if got != 9 {
+		t.Fatalf("blocked payload marker = %d, want admission-time value 9", got)
+	}
+}
+
+func TestSchedulerRejectsInvalidKindAndPreCanceledContextBeforeAdmission(t *testing.T) {
+	var mu sync.Mutex
+	writes := 0
+	s := NewScheduler(func(TrafficClass, Kind, []byte) error { mu.Lock(); writes++; mu.Unlock(); return nil })
+	if err := s.Send(context.Background(), ClassBulk, Kind(0xff), []byte{1}); err == nil {
+		t.Fatal("invalid kind succeeded")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Send(ctx, ClassBulk, KindBinary, []byte{1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled Send = %v", err)
+	}
+	if err := s.Send(context.Background(), ClassBulk, KindBinary, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := writes
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("writer calls = %d, want only valid request", got)
+	}
+	_ = s.Close()
 }
 
 func TestSchedulerIdleLanesBorrowAndMediaSublanesAreWeighted(t *testing.T) {

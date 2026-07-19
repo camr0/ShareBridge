@@ -30,6 +30,29 @@ test('scheduler starts continuously queued media and bulk at three to one', asyn
   await scheduler.close();
 });
 
+test('scheduler resets outer and inner deficits after becoming idle', async () => {
+  for (const [fresh, want] of [
+    [[TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_BULK, TRAFFIC_CLASS_BULK], [TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_BULK]],
+    [[TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_THUMBNAIL, TRAFFIC_CLASS_THUMBNAIL], [TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_THUMBNAIL]],
+  ]) {
+    const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.className); } });
+    await scheduler.send({ className: TRAFFIC_CLASS_INTERACTIVE_MEDIA, kind: FRAME_BINARY, payload: payload() });
+    await Promise.all(fresh.map((className) => scheduler.send({ className, kind: FRAME_BINARY, payload: payload() })));
+    assert.deepEqual(writes.slice(1, 5), want); await scheduler.close();
+  }
+});
+
+test('scheduler uses byte deficits for variable-sized frames', async () => {
+  const writes = []; const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.className); } });
+  const sends = [
+    ...Array.from({ length: 4 }, () => scheduler.send({ className: TRAFFIC_CLASS_INTERACTIVE_MEDIA, kind: FRAME_BINARY, payload: payload(0, 96 * 1024) })),
+    ...Array.from({ length: 2 }, () => scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload() })),
+  ];
+  await Promise.all(sends);
+  assert.deepEqual(writes.slice(0, 3), [TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_INTERACTIVE_MEDIA, TRAFFIC_CLASS_BULK]);
+  await scheduler.close();
+});
+
 test('scheduler limits a control burst to eight while data waits', async () => {
   const writes = [];
   const scheduler = new LaneScheduler({ write: async (request) => { writes.push(request.className); } });
@@ -72,6 +95,15 @@ test('scheduler copies payloads and exports native high water', async () => {
   const original = payload(7); const sent = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: original });
   original[0] = 99; gate.resolve(); await sent;
   assert.equal(seen, 7); assert.equal(NATIVE_BUFFER_HIGH_WATER_BYTES, 256 * 1024); await scheduler.close();
+});
+
+test('blocked payload remains caller-owned until admission and is copied on enqueue', async () => {
+  const gate = deferred(); const seen = [];
+  const scheduler = new LaneScheduler({ write: async (request) => { seen.push(request.payload[0]); if (seen.length === 1) await gate.promise; } });
+  const admitted = Array.from({ length: 4 }, (_, i) => scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(i + 1) }));
+  const original = payload(7); const blocked = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: original });
+  await tick(); original[0] = 9; gate.resolve(); await Promise.all([...admitted, blocked]);
+  assert.equal(seen.at(-1), 9); await scheduler.close();
 });
 
 test('scheduler rejects an oversized request clearly', async () => {
@@ -137,4 +169,12 @@ test('writer failure and close reject queued and future senders', async () => {
   await tick(); await closing.close(); await assert.rejects(queued, /closed/i);
   await assert.rejects(closing.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload() }), /closed/i);
   await closing.close(); gate.resolve(); await active;
+});
+
+test('abort after writer activation waits for writer completion', async () => {
+  const gate = deferred(); const active = deferred(); const controller = new AbortController();
+  const scheduler = new LaneScheduler({ write: async () => { active.resolve(); await gate.promise; return 'accepted'; } });
+  const sent = scheduler.send({ className: TRAFFIC_CLASS_BULK, kind: FRAME_BINARY, payload: payload(), signal: controller.signal });
+  await active.promise; controller.abort(); let settled = false; sent.finally(() => { settled = true; }); await tick(); assert.equal(settled, false);
+  gate.resolve(); await sent; assert.equal(settled, true); await scheduler.close();
 });
