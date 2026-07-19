@@ -75,9 +75,9 @@ describe('CreateShareModal', () => {
         expect(relay.attributes('name')).toBe(direct.attributes('name'))
         expect(relay.attributes('name')).toBeTruthy()
         expect(options[0].text()).toContain('Relay (recommended)')
-        expect(options[0].text()).toContain('End-to-end encrypted, hides your IP, and provides consistent performance')
+        expect(options[0].find('small').text()).toBe('End-to-end encrypted, hides your IP, and provides consistent performance.')
         expect(options[1].text()).toContain('Direct')
-        expect(options[1].text()).toContain('Peer-to-peer, quota-free')
+        expect(options[1].find('small').text()).toBe('Peer-to-peer, quota-free.')
     })
 
     it('does not render TURN availability copy', () => {

@@ -37,7 +37,7 @@
 						@change="form.relayOnly = true">
 					<span>
 						<strong>Relay (recommended)</strong>
-						<small>End-to-end encrypted, hides your IP, and provides consistent performance</small>
+						<small>End-to-end encrypted, hides your IP, and provides consistent performance.</small>
 					</span>
 				</label>
 				<label class="sb-mode-option" data-testid="direct-option" :for="directModeId">
@@ -50,7 +50,7 @@
 						@change="form.relayOnly = false">
 					<span>
 						<strong>Direct</strong>
-						<small>Peer-to-peer, quota-free</small>
+						<small>Peer-to-peer, quota-free.</small>
 					</span>
 				</label>
 			</fieldset>
