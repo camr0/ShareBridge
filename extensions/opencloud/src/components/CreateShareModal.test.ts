@@ -190,6 +190,43 @@ describe('CreateShareModal', () => {
     )
   })
 
+  it('submits relay_only false after Direct is selected', async () => {
+    const shareUrl = 'https://opencloud.example.com/s/DIRECT'
+    mockCreateLink.mockResolvedValue({ webUrl: shareUrl })
+    mockCreateShare.mockResolvedValue({
+      code: 'direct123',
+      public_url: 'https://share.example.com/s/direct123',
+      expires_at: '2026-04-10T12:00:00Z',
+    })
+
+    const wrapper = mountModal()
+    const directRadio = findEl('mode-direct') as HTMLInputElement
+    const createButton = findEl('create-btn') as HTMLButtonElement
+    directRadio.click()
+    createButton.click()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await wrapper.vm.$nextTick()
+
+    expect(mockCreateShare).toHaveBeenCalledWith(
+      expect.objectContaining({ share_url: shareUrl, relay_only: false })
+    )
+  })
+
+  it('keeps connection mode selections independent across modal instances', async () => {
+    const firstWrapper = mountModal()
+    mountModal()
+    const relayRadios = document.querySelectorAll<HTMLInputElement>('[data-testid="mode-relay"]')
+    const directRadios = document.querySelectorAll<HTMLInputElement>('[data-testid="mode-direct"]')
+
+    expect(Array.from(relayRadios, radio => radio.checked)).toEqual([true, true])
+
+    directRadios[0].click()
+    await firstWrapper.vm.$nextTick()
+
+    expect(directRadios[0].checked).toBe(true)
+    expect(relayRadios[1].checked).toBe(true)
+  })
+
   it('selects Direct when defaultRelayOnly is explicitly false', () => {
     mountModal({ defaultRelayOnly: false })
     expect((findEl('mode-relay') as HTMLInputElement)?.checked).toBe(false)

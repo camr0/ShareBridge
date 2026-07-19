@@ -35,7 +35,6 @@
             <input
               data-testid="mode-relay"
               type="radio"
-              name="connection-mode"
               :checked="form.relayOnly"
               @change="form.relayOnly = true"
             />
@@ -49,7 +48,6 @@
             <input
               data-testid="mode-direct"
               type="radio"
-              name="connection-mode"
               :checked="!form.relayOnly"
               @change="form.relayOnly = false"
             />
