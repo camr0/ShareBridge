@@ -1,4 +1,4 @@
-import { DirectChannel, waitForDirectChannelOpen } from './directChannel.js'
+import { createDirectChannelSet, waitForDirectChannelOpen } from './directChannel.js'
 import { SecureRelayChannel } from './secureRelayChannel.js'
 import { connectTransferChannel, buildDirectIceServers, decodeRelayPolicyToken } from './connectTransferChannel.js'
 import { detectDownloadSupport } from './downloadCapabilities.js'
@@ -182,6 +182,14 @@ export function initializeIceConfigTransport({
   }
 
   const peer = createPeerConnection({ iceServers: buildDirectIceServers(msg.ice_servers) })
+  const directSet = createDirectChannelSet()
+  let directFailureReported = false
+  const reportDirectFailure = (error) => {
+    if (directFailureReported) return
+    directFailureReported = true
+    onDirectFailure(error)
+  }
+  directSet.ready.then(onDirectChannel).catch(reportDirectFailure)
   debugLog('created RTCPeerConnection for direct path')
 
   peer.onicecandidate = (e) => {
@@ -198,16 +206,18 @@ export function initializeIceConfigTransport({
 
   peer.ondatachannel = (e) => {
     dc = e.channel
-    dc.binaryType = 'arraybuffer'
-    debugLog('received RTCDataChannel from direct peer')
-    const directChannel = new DirectChannel(dc)
-    onDirectChannel(directChannel)
+    debugLog('received RTCDataChannel from direct peer', { label: dc.label })
+    try {
+      directSet.accept(dc)
+    } catch (error) {
+      reportDirectFailure(error)
+    }
   }
 
   peer.onconnectionstatechange = () => {
     debugLog('RTCPeerConnection state change', peer.connectionState)
     if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
-      onDirectFailure()
+      reportDirectFailure(new Error(`PeerConnection ${peer.connectionState}`))
     }
   }
 

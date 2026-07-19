@@ -2,14 +2,32 @@ package peer
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/pion/webrtc/v4"
+	"sharebridge/agent/internal/multilane"
 )
 
-// Peer manages a single WebRTC peer connection with a browser.
+var requiredLanes = []struct {
+	lane  multilane.Lane
+	label string
+}{
+	{multilane.LaneControl, "control"},
+	{multilane.LaneMedia, "media"},
+	{multilane.LaneBulk, "bulk"},
+}
+
+// Peer manages one WebRTC PeerConnection containing the three required lanes.
 type Peer struct {
-	pc             *webrtc.PeerConnection
-	dc             *webrtc.DataChannel
+	pc        *webrtc.PeerConnection
+	endpoints map[multilane.Lane]*directEndpoint
+
+	mu             sync.Mutex
+	opened         map[multilane.Lane]bool
+	handshakeArmed bool
+	ready          bool
+	onMessage      func([]byte)
+	closeOnce      sync.Once
 	OnOpen         func()
 	OnClosed       func()
 	OnICECandidate func(init webrtc.ICECandidateInit)
@@ -18,9 +36,7 @@ type Peer struct {
 // New creates a PeerConnection with the given ICE servers.
 // If relayOnly is true, forces ICETransportPolicyRelay to hide the agent's IP.
 func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
-	config := webrtc.Configuration{
-		ICEServers: iceServers,
-	}
+	config := webrtc.Configuration{ICEServers: iceServers}
 	if relayOnly {
 		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
 	}
@@ -29,44 +45,43 @@ func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new peer connection: %w", err)
 	}
-
-	p := &Peer{pc: pc}
+	p := &Peer{
+		pc:        pc,
+		endpoints: make(map[multilane.Lane]*directEndpoint, len(requiredLanes)),
+		opened:    make(map[multilane.Lane]bool, len(requiredLanes)),
+	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
-			return // ICE gathering complete
-		}
-		if p.OnICECandidate != nil {
+		if c != nil && p.OnICECandidate != nil {
 			p.OnICECandidate(c.ToJSON())
 		}
 	})
-
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		switch state {
-		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
-			if p.OnClosed != nil {
-				p.OnClosed()
-			}
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+			p.notifyClosed()
 		}
 	})
-
 	return p, nil
 }
 
-// CreateOffer creates a DataChannel, generates an SDP offer, and sets it as
-// the local description. Returns the SDP string to send to the browser.
+// CreateOffer creates all required lane channels before generating the offer.
 func (p *Peer) CreateOffer() (string, error) {
-	dc, err := p.pc.CreateDataChannel("data", nil)
-	if err != nil {
-		return "", fmt.Errorf("create data channel: %w", err)
+	if len(p.endpoints) != 0 {
+		return "", fmt.Errorf("create offer: data channels already created")
 	}
-	p.dc = dc
-
-	dc.OnOpen(func() {
-		if p.OnOpen != nil {
-			p.OnOpen()
+	for _, required := range requiredLanes {
+		dc, err := p.pc.CreateDataChannel(required.label, nil)
+		if err != nil {
+			_ = p.Close()
+			return "", fmt.Errorf("create %s data channel: %w", required.label, err)
 		}
-	})
+		adapter := &pionDataChannel{dc: dc}
+		endpoint := &directEndpoint{lane: required.lane, dc: adapter}
+		p.endpoints[required.lane] = endpoint
+		dc.OnOpen(func() { p.laneOpened(required.lane) })
+		dc.OnClose(func() { p.laneClosed(required.lane) })
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) { endpoint.deliver(msg.Data) })
+	}
 
 	offer, err := p.pc.CreateOffer(nil)
 	if err != nil {
@@ -78,42 +93,147 @@ func (p *Peer) CreateOffer() (string, error) {
 	return offer.SDP, nil
 }
 
-// SetAnswer applies the browser's SDP answer as the remote description.
-func (p *Peer) SetAnswer(sdp string) error {
-	return p.pc.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeAnswer,
-		SDP:  sdp,
+func (p *Peer) laneOpened(lane multilane.Lane) {
+	p.mu.Lock()
+	if !lane.Valid() || p.opened[lane] {
+		p.mu.Unlock()
+		return
+	}
+	p.opened[lane] = true
+	if len(p.opened) != len(requiredLanes) || p.handshakeArmed {
+		p.mu.Unlock()
+		return
+	}
+	p.handshakeArmed = true
+	p.mu.Unlock()
+
+	multilane.InstallHandshakeResponder(p, func() {
+		p.mu.Lock()
+		p.ready = true
+		onMessage := p.onMessage
+		onOpen := p.OnOpen
+		p.mu.Unlock()
+		p.control().SetOnMessage(onMessage)
+		if onOpen != nil {
+			onOpen()
+		}
 	})
 }
 
-// AddICECandidate adds an ICE candidate received from the browser.
+func (p *Peer) laneClosed(multilane.Lane) {
+	p.notifyClosed()
+	_ = p.pc.Close()
+}
+
+func (p *Peer) notifyClosed() {
+	p.closeOnce.Do(func() {
+		if p.OnClosed != nil {
+			p.OnClosed()
+		}
+	})
+}
+
+// Endpoint returns a required lane, or nil for an unknown lane.
+func (p *Peer) Endpoint(lane multilane.Lane) multilane.Endpoint {
+	return p.endpoints[lane]
+}
+
+func (p *Peer) SetOnOpen(handler func())  { p.OnOpen = handler }
+func (p *Peer) SetOnClose(handler func()) { p.OnClosed = handler }
+
+// Compatibility shims keep existing transfer callers on control until routing
+// moves to explicit endpoints.
+func (p *Peer) SendBinary(data []byte) error { return p.control().SendBinary(data) }
+func (p *Peer) SendText(text string) error   { return p.control().SendText(text) }
+func (p *Peer) BufferedAmount() uint64       { return p.control().BufferedAmount() }
+func (p *Peer) SetOnMessage(handler func([]byte)) {
+	p.mu.Lock()
+	p.onMessage = handler
+	ready := p.ready
+	p.mu.Unlock()
+	if ready {
+		p.control().SetOnMessage(handler)
+	}
+}
+
+func (p *Peer) control() *directEndpoint { return p.endpoints[multilane.LaneControl] }
+
+// SetAnswer applies the browser's SDP answer as the remote description.
+func (p *Peer) SetAnswer(sdp string) error {
+	return p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp})
+}
+
 func (p *Peer) AddICECandidate(init webrtc.ICECandidateInit) error {
 	return p.pc.AddICECandidate(init)
 }
 
-// Close shuts down the peer connection.
 func (p *Peer) Close() error {
-	return p.pc.Close()
+	err := p.pc.Close()
+	p.notifyClosed()
+	return err
 }
 
-// SendBinary sends a binary message over the DataChannel.
-func (p *Peer) SendBinary(data []byte) error {
-	return p.dc.Send(data)
+// LaneLabelsForTest reports the stable offer creation order.
+func (p *Peer) LaneLabelsForTest() []string {
+	labels := make([]string, 0, len(requiredLanes))
+	for _, required := range requiredLanes {
+		if _, ok := p.endpoints[required.lane]; ok {
+			labels = append(labels, required.label)
+		}
+	}
+	return labels
 }
 
-// SendText sends a text message over the DataChannel.
-func (p *Peer) SendText(text string) error {
-	return p.dc.SendText(text)
+type dataChannel interface {
+	SendText(string) error
+	Send([]byte) error
+	BufferedAmount() uint64
+	OnMessage(func([]byte))
 }
 
-// BufferedAmount returns the number of bytes currently buffered for sending.
-func (p *Peer) BufferedAmount() uint64 {
-	return p.dc.BufferedAmount()
-}
+type pionDataChannel struct{ dc *webrtc.DataChannel }
 
-// SetOnMessage sets the callback for receiving messages on the DataChannel.
-func (p *Peer) SetOnMessage(handler func(data []byte)) {
-	p.dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		handler(msg.Data)
+func (d *pionDataChannel) SendText(value string) error { return d.dc.SendText(value) }
+func (d *pionDataChannel) Send(value []byte) error     { return d.dc.Send(value) }
+func (d *pionDataChannel) BufferedAmount() uint64      { return d.dc.BufferedAmount() }
+func (d *pionDataChannel) OnMessage(handler func([]byte)) {
+	d.dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if handler != nil {
+			handler(msg.Data)
+		}
 	})
+}
+
+type directEndpoint struct {
+	lane      multilane.Lane
+	dc        dataChannel
+	mu        sync.RWMutex
+	onMessage func([]byte)
+}
+
+func (e *directEndpoint) SendText(text string) error   { return e.dc.SendText(text) }
+func (e *directEndpoint) SendBinary(data []byte) error { return e.dc.Send(data) }
+func (e *directEndpoint) SendBinaryClass(class multilane.TrafficClass, data []byte) error {
+	lane, err := multilane.LaneForClass(class)
+	if err != nil {
+		return err
+	}
+	if lane != e.lane {
+		return fmt.Errorf("traffic class %d maps to lane %d, not endpoint lane %d", class, lane, e.lane)
+	}
+	return e.dc.Send(data)
+}
+func (e *directEndpoint) BufferedAmount() uint64 { return e.dc.BufferedAmount() }
+func (e *directEndpoint) SetOnMessage(handler func([]byte)) {
+	e.mu.Lock()
+	e.onMessage = handler
+	e.mu.Unlock()
+}
+func (e *directEndpoint) deliver(data []byte) {
+	e.mu.RLock()
+	handler := e.onMessage
+	e.mu.RUnlock()
+	if handler != nil {
+		handler(append([]byte(nil), data...))
+	}
 }

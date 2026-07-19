@@ -179,6 +179,49 @@ test('relay_only ice_config skips direct peer creation and leaves initial knock 
   assert.deepEqual(sent, [])
 })
 
+test('direct transport resolves only after all labeled lanes and version handshake', async () => {
+  const sent = []
+  const peer = { connectionState: 'new' }
+  const resolved = []
+  initializeIceConfigTransport({
+    msg: { ice_servers: [], relay_only: false },
+    ws: { send: (payload) => sent.push(JSON.parse(payload)) },
+    createPeerConnection: () => peer,
+    onDirectChannel: (set) => resolved.push(set),
+    onDirectFailure: () => {},
+  })
+
+  const makeChannel = (label) => ({
+    label,
+    readyState: 'connecting',
+    bufferedAmount: 0,
+    sent: [],
+    send(value) { this.sent.push(value) },
+    close() { this.readyState = 'closed' },
+  })
+  const bulk = makeChannel('bulk')
+  const control = makeChannel('control')
+  const media = makeChannel('media')
+  peer.ondatachannel({ channel: bulk })
+  peer.ondatachannel({ channel: control })
+  peer.ondatachannel({ channel: media })
+  assert.equal(resolved.length, 0)
+
+  for (const channel of [bulk, media, control]) {
+    channel.readyState = 'open'
+    channel.onopen()
+  }
+  await Promise.resolve()
+  assert.equal(resolved.length, 0)
+  control.onmessage({ data: JSON.stringify({ type: 'transport_ready', version: 2 }) })
+  await Promise.resolve()
+  await Promise.resolve()
+
+  assert.equal(resolved.length, 1)
+  assert.equal(resolved[0].readyState, 'open')
+  assert.deepEqual(sent, [{ type: 'knock' }])
+})
+
 test('assertJoinNotActive throws loudly when join re-enters on an active socket', () => {
   const logs = []
   assert.throws(
