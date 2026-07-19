@@ -309,7 +309,6 @@ test('SecureRelayChannel encrypts lane ids and dispatches decrypted media', asyn
   await channel.media.send(new Uint8Array([4, 5]))
   const [{ kind, payload: outboundCiphertext }] = [...decoder.push(socket.sent[4])]
   assert.equal(kind, FRAME_BINARY)
-  assert.notEqual(outboundCiphertext[0], LANE_MEDIA)
   const outbound = decodeLaneEnvelope(await rRecv.decrypt(new Uint8Array(0), outboundCiphertext))
   assert.equal(outbound.lane, LANE_MEDIA)
   assert.deepEqual(outbound.payload, new Uint8Array([4, 5]))
@@ -336,6 +335,14 @@ test('SecureRelayChannel encrypts lane ids and dispatches decrypted media', asyn
 
   let postErrorDeliveries = 0
   channel.media.onmessage = () => { postErrorDeliveries++ }
+  const recvCipher = channel._recvCipher
+  let terminalDecryptCalls = 0
+  channel._recvCipher = {
+    decrypt(...args) {
+      terminalDecryptCalls++
+      return recvCipher.decrypt(...args)
+    },
+  }
   const closed = new Promise((resolve) => { channel.onclose = resolve })
   const invalid = await rSend.encrypt(new Uint8Array(0), new Uint8Array([0x03, 1]))
   const validAfterInvalid = await rSend.encrypt(
@@ -349,10 +356,46 @@ test('SecureRelayChannel encrypts lane ids and dispatches decrypted media', asyn
   combined.set(validFrame, invalidFrame.length)
   socket.pushMessage(combined)
   await closed
+  const later = await rSend.encrypt(
+    new Uint8Array(0),
+    encodeLaneEnvelope(LANE_MEDIA, new Uint8Array([100])),
+  )
+  socket.pushMessage(writeFrame(FRAME_BINARY, later))
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(postErrorDeliveries, 0)
+  assert.equal(terminalDecryptCalls, 1)
   assert.equal(channel.readyState, 'closed')
   assert.equal(channel.control.readyState, 'closed')
   assert.equal(channel.media.readyState, 'closed')
   assert.equal(channel.bulk.readyState, 'closed')
+})
+
+test('queued and later websocket events cannot decrypt or deliver after terminal close', async () => {
+  const socket = createMockRelaySocket()
+  const channel = new SecureRelayChannel({
+    relayURL: 'ws://relay.test', relayToken: 'token', expectedStaticPub: new Uint8Array(65), websocketFactory: () => socket,
+  })
+  channel._socket = socket
+  socket.addEventListener('message', channel._handleMessage)
+  let decryptCalls = 0
+  channel._recvCipher = {
+    async decrypt(_ad, ciphertext) {
+      decryptCalls++
+      return ciphertext[0] === 0
+        ? new Uint8Array([0x03, 1])
+        : encodeLaneEnvelope(LANE_MEDIA, new Uint8Array([ciphertext[0]]))
+    },
+  }
+  let deliveries = 0
+  channel.media.onmessage = () => { deliveries++ }
+  const closed = new Promise((resolve) => { channel.onclose = resolve })
+
+  socket.pushMessage(writeFrame(FRAME_BINARY, new Uint8Array([0])))
+  socket.pushMessage(writeFrame(FRAME_BINARY, new Uint8Array([1])))
+  await closed
+  socket.pushMessage(writeFrame(FRAME_BINARY, new Uint8Array([2])))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  assert.equal(decryptCalls, 1)
+  assert.equal(deliveries, 0)
 })

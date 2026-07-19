@@ -163,19 +163,26 @@ export class SecureRelayChannel {
   }
 
   _handleMessage = (event) => {
+    if (this._closed) return
     this._receiveChain = this._receiveChain
-      .then(() => this._processMessage(event))
+      .then(() => {
+        if (this._closed) return undefined
+        return this._processMessage(event)
+      })
       .catch((error) => {
+        if (this._closed) return
         console.error('[secure-relay] receive sequence error:', error)
         this._closeAll('relay receive sequence error')
       })
   }
 
   _processMessage = async (event) => {
+    if (this._closed) return
     debugLog('WebSocket message received, data length:', event.data?.byteLength || event.data?.length || 'unknown')
     const chunk = new Uint8Array(event.data)
     debugLog('Processing chunk, length:', chunk.length)
     for (const frame of this._decoder.push(chunk)) {
+      if (this._closed) return
       debugLog('Frame decoded, kind:', frame.kind, 'payload length:', frame.payload?.length)
       if (frame.kind === FRAME_HANDSHAKE) {
         debugLog('Handling handshake frame')
@@ -196,6 +203,7 @@ export class SecureRelayChannel {
           throw new Error(`unknown frame kind: 0x${frame.kind.toString(16)}`)
         }
         const plaintext = await this._recvCipher.decrypt(new Uint8Array(0), frame.payload)
+        if (this._closed) return
         const { lane, payload } = decodeLaneEnvelope(plaintext)
         const endpoint = this._endpoints.get(lane)
         if (!endpoint) throw new Error(`unknown relay lane: ${lane}`)
@@ -268,6 +276,9 @@ export class SecureRelayChannel {
     if (this._closed) return
     this._closed = true
     this.readyState = 'closed'
+    this._socket?.removeEventListener?.('message', this._handleMessage)
+    this._decoder = new FrameDecoder()
+    this._receiveChain = Promise.resolve()
     void this._scheduler.close()
     for (const endpoint of this._endpoints.values()) endpoint._closeFromOwner()
     this._socket?.close()
@@ -331,7 +342,10 @@ class RelayLaneEndpoint {
     this.onopen?.()
   }
 
-  _deliver(data) { this.onmessage?.({ data }) }
+  _deliver(data) {
+    if (this.readyState === 'closed' || this._owner._closed) return
+    this.onmessage?.({ data })
+  }
 
   _closeFromOwner() {
     if (this.readyState === 'closed') return
