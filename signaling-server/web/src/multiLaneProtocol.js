@@ -44,6 +44,6 @@ export function decodeLaneEnvelope(encoded) {
 
   return {
     lane,
-    payload: encoded.slice(1),
+    payload: new Uint8Array(encoded.subarray(1)),
   };
 }

@@ -41,6 +41,14 @@ test('lane envelope is byte-for-byte compatible and copies payloads', () => {
   assert.equal(decoded.payload[0], 0x00);
 });
 
+test('decoding copies payload bytes from a Node Buffer', () => {
+  const encoded = Buffer.from([LANE_MEDIA, 4, 5]);
+  const { payload } = decodeLaneEnvelope(encoded);
+
+  encoded[1] = 9;
+  assert.deepEqual(payload, new Uint8Array([4, 5]));
+});
+
 test('lane envelope accepts a valid lane with an empty payload', () => {
   const encoded = encodeLaneEnvelope(LANE_CONTROL, new Uint8Array());
   assert.deepEqual(encoded, new Uint8Array([LANE_CONTROL]));
