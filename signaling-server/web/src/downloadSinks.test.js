@@ -81,6 +81,87 @@ test('createStreamingSink finalizes as intact when SHA-1 matches', async () => {
   assert.deepEqual(result, { ok: true, code: 'intact', computedSha1: 'abc123' })
 })
 
+test('createStreamingSink can finalize without waiting for writer close settlement', async () => {
+  let closeCalls = 0
+  const sink = await createStreamingSink({
+    fileName: 'album.zip',
+    mimeType: 'application/zip',
+    tailBytes: 4,
+    deferCloseSettlement: true,
+    createWriter: async () => ({
+      async write() {},
+      close() {
+        closeCalls += 1
+        return new Promise(() => {})
+      },
+      async abort() {},
+    }),
+    createHasher: async () => ({
+      update() {},
+      digest() { return 'abc123' },
+    }),
+  })
+
+  await sink.append(new Uint8Array([1, 2, 3, 4]))
+  const result = await Promise.race([
+    sink.finalize({ expectedSha1: null, expectedSize: 4, receivedBytes: 4 }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('finalize stayed pending')), 20)),
+  ])
+
+  assert.equal(closeCalls, 1)
+  assert.deepEqual(result, { ok: true, code: 'done', computedSha1: null })
+})
+
+test('createStreamingSink consumes and reports a deferred writer close rejection', async () => {
+  const closeErrors = []
+  const sink = await createStreamingSink({
+    fileName: 'album.zip',
+    mimeType: 'application/zip',
+    tailBytes: 4,
+    deferCloseSettlement: true,
+    onDeferredCloseError(error) { closeErrors.push(error.message) },
+    createWriter: async () => ({
+      async write() {},
+      close() { return Promise.reject(new Error('late close failure')) },
+      async abort() {},
+    }),
+    createHasher: async () => ({
+      update() {},
+      digest() { return 'abc123' },
+    }),
+  })
+
+  await sink.append(new Uint8Array([1, 2, 3, 4]))
+  const result = await sink.finalize({ expectedSha1: null, expectedSize: 4, receivedBytes: 4 })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(result, { ok: true, code: 'done', computedSha1: null })
+  assert.deepEqual(closeErrors, ['late close failure'])
+})
+
+test('createStreamingSink waits for writer close by default', async () => {
+  const sink = await createStreamingSink({
+    fileName: 'ordinary.bin',
+    mimeType: 'application/octet-stream',
+    tailBytes: 4,
+    createWriter: async () => ({
+      async write() {},
+      close() { return Promise.reject(new Error('close failed')) },
+      async abort() {},
+    }),
+    createHasher: async () => ({
+      update() {},
+      digest() { return 'abc123' },
+    }),
+  })
+
+  await sink.append(new Uint8Array([1, 2, 3, 4]))
+  await assert.rejects(
+    () => sink.finalize({ expectedSha1: null, expectedSize: 4, receivedBytes: 4 }),
+    /close failed/,
+  )
+})
+
 test('createStreamingSink aborts when SHA-1 validation fails', async () => {
   let abortReason = null
   const sink = await createStreamingSink({

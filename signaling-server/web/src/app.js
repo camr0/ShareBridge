@@ -1569,6 +1569,17 @@ function failAlbumDownload() {
 }
 
 async function buildDownloadSink(header, support) {
+  const albumCloseOptions = header.batch_id
+    ? {
+        deferCloseSettlement: true,
+        onDeferredCloseError: (error) => debugLog('album writer close rejected after finalization', {
+          batch_id: header.batch_id,
+          operation_id: header.operation_id,
+          part_index: header.part_index,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      }
+    : {}
   if (support.mode === 'experimental-streaming') {
     return createStreamingSink({
       fileName: header.name,
@@ -1576,6 +1587,7 @@ async function buildDownloadSink(header, support) {
       tailBytes: 1024 * 1024,
       createWriter: createSafariBrowserStreamWriter,
       createHasher: createIncrementalSha1,
+      ...albumCloseOptions,
     })
   }
 
@@ -1586,6 +1598,7 @@ async function buildDownloadSink(header, support) {
       tailBytes: 1024 * 1024,
       createWriter: createBrowserStreamWriter,
       createHasher: createIncrementalSha1,
+      ...albumCloseOptions,
     })
   }
 
