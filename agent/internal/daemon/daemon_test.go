@@ -10,6 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +27,41 @@ import (
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
 )
+
+func TestImmichTransferAdapterMapsAlbumDownloadAndStreamsArchive(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/shared-links/me":
+			_, _ = w.Write([]byte(`{"type":"ALBUM","album":{"id":"album-1","albumName":"Summer"}}`))
+		case "/api/download/info":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"totalSize":4,"archives":[{"assetIds":["asset-1"],"size":4}]}`))
+		case "/api/download/archive":
+			_, _ = w.Write([]byte("zip!"))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	u, err := url.Parse(ts.URL)
+	require.NoError(t, err)
+	client, err := immich.New(immich.Config{BaseURL: ts.URL, AllowedHost: u.Host, ShareKey: "sharekey"})
+	require.NoError(t, err)
+	adapter := immichTransferAdapter{client: client}
+
+	download, err := adapter.GetAlbumDownload(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "Summer", download.AlbumName)
+	require.Equal(t, int64(4), download.TotalSize)
+	require.Equal(t, []string{"asset-1"}, download.Archives[0].AssetIDs)
+	require.Equal(t, int64(4), download.Archives[0].EstimatedSize)
+
+	var archive bytes.Buffer
+	n, err := adapter.StreamAlbumArchive(t.Context(), []string{"asset-1"}, &archive)
+	require.NoError(t, err)
+	require.Equal(t, int64(4), n)
+	require.Equal(t, "zip!", archive.String())
+}
 
 // mockConfigManager implements ConfigManagerInterface for testing.
 type mockConfigManager struct {
