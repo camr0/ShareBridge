@@ -18,7 +18,7 @@
 
 ## Transfer roadmap
 
-- After multi-lane transport, add Immich `Download All` by relaying Immich's ordered `/api/download/info` and `/api/download/archive` ZIP flow. Count a successful multi-part album batch as one ShareBridge download.
+- Completed: Immich `Download All` relays Immich's ordered `/api/download/info` and `/api/download/archive` ZIP flow. A successful multi-part album batch counts as one ShareBridge download.
 - Add a serial browser download-job queue so user requests made during an active download wait in order instead of being rejected.
 - Design parallel bulk downloads later using transfer IDs and a higher bulk concurrency limit.
 - Revisit WebTransport as a relay adapter behind the three-lane API once its browser and deployment ecosystem is mature enough; retain WebRTC for direct peer-to-peer sessions.

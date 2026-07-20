@@ -113,7 +113,7 @@ go test ./internal/transfer ./internal/daemon -run 'Test.*AlbumDownload' -count=
 
 Expected: FAIL because the album batch protocol is absent.
 
-- [ ] **Step 3: Extend the gallery backend boundary**
+- [ ] **Step 3: Add the optional album-download backend capability**
 
 Add transfer-layer types and methods:
 
@@ -129,14 +129,14 @@ type AlbumDownload struct {
 	Archives  []AlbumArchive
 }
 
-type GalleryBackend interface {
-	// existing methods...
+type AlbumDownloadBackend interface {
 	GetAlbumDownload(ctx context.Context) (AlbumDownload, error)
 	StreamAlbumArchive(ctx context.Context, assetIDs []string, w io.Writer) (int64, error)
 }
 ```
 
-Map these methods in `immichTransferAdapter` to the client methods from Task 1.
+Make the gallery manager use this focused optional capability and map it in
+`immichTransferAdapter` to the client methods from Task 1.
 
 - [ ] **Step 4: Implement the reserved batch lifecycle**
 
