@@ -9,6 +9,7 @@ export function createGalleryController({
   onPreviewRequest,
   onPreviewClose,
   onDownloadRequest,
+  onAlbumDownloadRequest,
 }) {
   const state = {
     items: [],
@@ -23,9 +24,20 @@ export function createGalleryController({
     lightboxGrid: null,
     lightboxDownloadButton: null,
     videoPlaybackSequence: 0,
+    albumDownloadPhase: 'idle',
+    albumDownloadPartIndex: undefined,
+    albumDownloadPartCount: undefined,
   }
 
   const handleClick = (event) => {
+    const albumDownload = event.target?.closest?.('.gallery-download-all')
+    if (albumDownload) {
+      event.preventDefault?.()
+      event.stopPropagation?.()
+      onAlbumDownloadRequest?.()
+      return
+    }
+
     const download = event.target?.closest?.('.gallery-download')
     if (download?.dataset?.galleryId) {
       event.preventDefault?.()
@@ -85,6 +97,11 @@ export function createGalleryController({
     state.loadedThumbs = 0
     state.unavailableThumbs = 0
     root.innerHTML = renderGalleryShell(msg.albumName || 'Shared album', msg.albumDescription || '', state.items)
+    setAlbumDownloadState({
+      phase: state.albumDownloadPhase,
+      partIndex: state.albumDownloadPartIndex,
+      partCount: state.albumDownloadPartCount,
+    })
     updateThumbnailProgress()
     initLightbox()
   }
@@ -116,6 +133,36 @@ export function createGalleryController({
   function handleThumbnailComplete(msg) {
     state.unavailableThumbs = Math.max(0, Number(msg.failed) || 0)
     updateThumbnailProgress()
+  }
+
+  function setAlbumDownloadState({ phase = 'idle', partIndex, partCount } = {}) {
+    state.albumDownloadPhase = phase
+    state.albumDownloadPartIndex = partIndex
+    state.albumDownloadPartCount = partCount
+    const button = root.querySelector?.('.gallery-download-all')
+    if (!button) return
+    if (phase === 'starting') {
+      button.textContent = 'Starting…'
+      button.disabled = true
+      return
+    }
+    if (phase === 'downloading') {
+      button.textContent = partIndex && partCount ? `Downloading ${partIndex}/${partCount}` : 'Downloading…'
+      button.disabled = true
+      return
+    }
+    if (phase === 'failed') {
+      button.textContent = 'Retry Download'
+      button.disabled = state.items.length === 0
+      return
+    }
+    if (phase === 'complete') {
+      button.textContent = 'Download Complete'
+      button.disabled = state.items.length === 0
+      return
+    }
+    button.textContent = 'Download All'
+    button.disabled = state.items.length === 0
   }
 
   function handlePreviewData(id, payload, mimeType = 'image/jpeg') {
@@ -424,7 +471,7 @@ export function createGalleryController({
     state.lightboxDownloadButton = button
   }
 
-  return { handleThumbnailList, handleThumbnailData, handleThumbnailComplete, handlePreviewData, destroy, state }
+  return { handleThumbnailList, handleThumbnailData, handleThumbnailComplete, handlePreviewData, setAlbumDownloadState, destroy, state }
 }
 
 export function renderGalleryShell(albumName, albumDescription, items) {
@@ -435,7 +482,10 @@ export function renderGalleryShell(albumName, albumDescription, items) {
         <h2>${escapeHTML(albumName)}</h2>
         ${albumDescription ? `<p>${escapeHTML(albumDescription)}</p>` : ''}
       </div>
-      <span>${count} item${count === 1 ? '' : 's'}</span>
+      <div class="gallery-summary">
+        <span>${count} item${count === 1 ? '' : 's'}</span>
+        <button class="gallery-download-all" type="button"${count === 0 ? ' disabled' : ''}>Download All</button>
+      </div>
     </section>
     <section class="gallery-progress${count === 0 ? ' hidden' : ''}" aria-live="polite">
       <div class="gallery-progress-row">

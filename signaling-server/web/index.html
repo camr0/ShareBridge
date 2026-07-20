@@ -181,6 +181,31 @@
       font-size: 0.85rem;
       white-space: nowrap;
     }
+    .gallery-summary {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+    }
+    .gallery-download-all {
+      width: auto;
+      margin: 0;
+      padding: 0.4rem 0.7rem;
+      border: 1px solid #52525b;
+      border-radius: 6px;
+      background: transparent;
+      color: #d4d4d8;
+      font-size: 0.8rem;
+      white-space: nowrap;
+    }
+    .gallery-download-all:hover:not(:disabled),
+    .gallery-download-all:focus-visible {
+      border-color: #71717a;
+      background: #27272a;
+    }
+    .gallery-download-all:disabled {
+      cursor: default;
+      opacity: 0.55;
+    }
     .gallery-progress {
       margin: -0.25rem 0 1rem;
     }
@@ -285,6 +310,8 @@
       text-align: center;
     }
     @media (max-width: 640px) {
+      .gallery-header { align-items: flex-start; }
+      .gallery-summary { flex-direction: column; align-items: flex-end; gap: 0.35rem; }
       .gallery-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>

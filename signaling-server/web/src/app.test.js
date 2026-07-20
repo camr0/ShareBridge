@@ -857,6 +857,369 @@ test('requestGalleryAsset ignores repeated requests while one is pending', async
   })
 })
 
+test('requestAlbumDownload sends once, marks starting, and blocks every additional bulk request locally', async () => {
+  await withMinimalDocument(async (elements) => {
+    const channels = fakeLaneSet()
+    const states = []
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+
+    __test.requestAlbumDownload()
+    __test.requestAlbumDownload()
+    __test.requestGalleryAsset('asset-1')
+    __test.requestFile('ordinary.bin')
+
+    assert.equal(channels.control.sent.length, 1)
+    const request = JSON.parse(channels.control.sent[0])
+    assert.deepEqual({ ...request, request_id: '<dynamic>' }, {
+      type: 'album_download_request', request_id: '<dynamic>',
+    })
+    assert.match(request.request_id, /^bulk-/)
+    assert.deepEqual(states, [{ phase: 'starting' }])
+    assert.equal(elements.get('status').textContent, 'Download in progress, please wait')
+
+    await __test.handleError({ type: 'error', scope: 'bulk', request_id: request.request_id, message: 'album unavailable' })
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('album parts use exact chunk_end sizes and acknowledge only terminal sink success', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const states = []
+    const supportHeaders = []
+    const pipelines = []
+    __test.setTransferSession({ channels, mode: 'direct' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+    __test.setDownloadTestDependencies({
+      getSupport: async (header) => {
+        supportHeaders.push(header)
+        return { mode: 'blob', warning: null }
+      },
+      createPipeline: async (options) => {
+        const record = { options, chunks: [], completions: [] }
+        pipelines.push(record)
+        return {
+          append: async (bytes) => record.chunks.push([...bytes]),
+          complete: async (completion) => record.completions.push(completion),
+        }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer+1.zip', size: 0, estimated_size: 4,
+      mimeType: 'application/zip', scope: 'bulk', binary_envelope: true,
+      operation_id: '42', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 1, part_count: 2,
+    }) })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('42', 0, new Uint8Array([1, 2, 3])).buffer })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '42', request_id: request.request_id, bytes_sent: '3',
+    }) })
+
+    assert.equal(supportHeaders[0].size, 4, 'estimated size selects browser capability/UX')
+    assert.equal(pipelines[0].options.header.size, 0, 'the pipeline retains the unknown wire size')
+    assert.deepEqual(pipelines[0].chunks, [[1, 2, 3]])
+    assert.deepEqual(pipelines[0].completions, [{ expectedSize: 3 }])
+    assert.equal(channels.control.sent.length, 1, 'chunk_end alone cannot acknowledge an unfinished sink')
+
+    pipelines[0].options.onTerminalState({ ok: true, code: 'complete', statusClass: 'done', statusText: '✓ saved' })
+    assert.deepEqual(JSON.parse(channels.control.sent[1]), {
+      type: 'album_archive_ack', batch_id: request.request_id, part_index: 1, operation_id: '42', ok: true,
+    })
+
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer+2.zip', size: 0, estimated_size: 9,
+      mimeType: 'application/zip', scope: 'bulk', binary_envelope: true,
+      operation_id: '43', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 2, part_count: 2,
+    }) })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('43', 0, new Uint8Array([4, 5, 6, 7])).buffer })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '43', request_id: request.request_id, bytes_sent: '4',
+    }) })
+    pipelines[1].options.onTerminalState({ ok: true, code: 'complete', statusClass: 'done', statusText: '✓ saved' })
+
+    assert.deepEqual(JSON.parse(channels.control.sent[2]), {
+      type: 'album_archive_ack', batch_id: request.request_id, part_index: 2, operation_id: '43', ok: true,
+    })
+    assert.notDeepEqual(states.at(-1), { phase: 'complete' }, 'part 2 sink success still waits for batch completion')
+
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'album_download_complete', batch_id: request.request_id, part_count: 2, bytes_sent: '7',
+    }) })
+    assert.deepEqual(states.at(-1), { phase: 'complete' })
+
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('failed album sink sends one negative acknowledgement and rejects later parts', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const states = []
+    const pipelines = []
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        pipelines.push(options)
+        return { append: async () => {}, complete: async () => {} }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer+1.zip', size: 0, estimated_size: 1,
+      operation_id: '52', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 1, part_count: 2,
+    }) })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('52', 0, new Uint8Array([1])).buffer })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '52', request_id: request.request_id, bytes_sent: '1',
+    }) })
+    pipelines[0].onTerminalState({ ok: false, code: 'write-failed', statusClass: 'failed', statusText: '✗ failed' })
+    pipelines[0].onTerminalState({ ok: false, code: 'write-failed', statusClass: 'failed', statusText: '✗ failed' })
+
+    assert.deepEqual(JSON.parse(channels.control.sent[1]), {
+      type: 'album_archive_ack', batch_id: request.request_id, part_index: 1, operation_id: '52', ok: false,
+    })
+    assert.equal(channels.control.sent.length, 2, 'a terminal callback cannot duplicate its acknowledgement')
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer+2.zip', size: 0, estimated_size: 1,
+      operation_id: '53', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 2, part_count: 2,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'album_download_complete', batch_id: request.request_id, part_count: 2, bytes_sent: '2',
+    }) })
+    assert.equal(pipelines.length, 1)
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('request-scoped album error between acknowledged parts fails the batch', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const states = []
+    let pipelineOptions
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        pipelineOptions = options
+        return { append: async () => {}, complete: async () => {} }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer+1.zip', size: 0, estimated_size: 1,
+      operation_id: '54', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 1, part_count: 2,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '54', request_id: request.request_id, bytes_sent: '0',
+    }) })
+    pipelineOptions.onTerminalState({ ok: true, code: 'complete', statusClass: 'done', statusText: '✓ saved' })
+
+    await __test.handleError({
+      type: 'error', scope: 'bulk', request_id: request.request_id, message: 'next archive failed',
+    })
+
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('ordinary file terminal success sends no album acknowledgement', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    let pipelineOptions
+    let completion
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        pipelineOptions = options
+        return { append: async () => {}, complete: async (value) => { completion = value } }
+      },
+    })
+
+    __test.requestFile('ordinary.bin')
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'ordinary.bin', size: 3,
+      operation_id: '55', request_id: request.request_id,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '55', request_id: request.request_id, bytes_sent: '0',
+    }) })
+    pipelineOptions.onTerminalState({ ok: true, code: 'complete', statusClass: 'done', statusText: '✓ saved' })
+
+    assert.equal(channels.control.sent.length, 1)
+    assert.deepEqual(completion, { expectedSize: 3 }, 'ordinary files retain the authoritative header size')
+    __test.setDownloadTestDependencies()
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('album acknowledgement timeout after local finalization fails the active batch', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const states = []
+    let pipelineOptions
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        pipelineOptions = options
+        return { append: async () => {}, complete: async () => {} }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer.zip', size: 0, estimated_size: 1,
+      operation_id: '57', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 1, part_count: 1,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '57', request_id: request.request_id, bytes_sent: '0',
+    }) })
+    pipelineOptions.onTerminalState({ ok: true, code: 'complete', statusClass: 'done', statusText: '✓ saved' })
+
+    await __test.handleError({
+      type: 'error', scope: 'bulk', operation_id: '57', request_id: request.request_id,
+      message: 'album archive acknowledgement timed out',
+    })
+
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('album chunk_end rejects a byte count outside the browser safe integer range', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ setAlbumDownloadState() {} })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async () => ({ append: async () => {}, complete: async () => {} }),
+    })
+
+    __test.requestAlbumDownload()
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer.zip', size: 0, estimated_size: 1,
+      operation_id: '56', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 1, part_count: 1,
+    }) })
+
+    await assert.rejects(() => __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '56', request_id: request.request_id,
+      bytes_sent: '9007199254740992',
+    }) }), /safe integer range/i)
+    assert.equal(channels.closeCalls, 1)
+
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('media remains independently routable during an album batch', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const previews = []
+    const bulkChunks = []
+    let albumPipeline
+    __test.setTransferSession({ channels, mode: 'direct' })
+    __test.setGalleryController({
+      setAlbumDownloadState() {},
+      handlePreviewData: (id, bytes) => previews.push([id, [...bytes]]),
+    })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        albumPipeline = options
+        return { append: async (bytes) => bulkChunks.push([...bytes]), complete: async () => {} }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const albumRequest = JSON.parse(channels.control.sent[0])
+    __test.requestGalleryPreview('asset-1')
+    const previewRequest = JSON.parse(channels.control.sent[1])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer.zip', size: 0, estimated_size: 1,
+      operation_id: '62', request_id: albumRequest.request_id, batch_id: albumRequest.request_id,
+      part_index: 1, part_count: 1,
+    }) })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_header', id: 'asset-1', mimeType: 'image/jpeg', size: 1,
+      operation_id: '63', request_id: previewRequest.request_id,
+    }) })
+    await __test.handleMediaMessage({ data: encodeChunkEnvelope('63', 0, new Uint8Array([9])).buffer })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('62', 0, new Uint8Array([7])).buffer })
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'asset_preview_end', id: 'asset-1', operation_id: '63', request_id: previewRequest.request_id, bytes_sent: '1',
+    }) })
+
+    assert.deepEqual(previews, [['asset-1', [9]]])
+    assert.deepEqual(bulkChunks, [[7]])
+    albumPipeline.onTerminalState({ ok: false, code: 'cleanup', statusClass: 'failed', statusText: '✗ failed' })
+
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('disconnect marks a pending album batch failed before gallery reset', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const states = []
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({
+      setAlbumDownloadState: (state) => states.push(state),
+      destroy() {},
+    })
+
+    __test.requestAlbumDownload()
+    __test.setActiveDownload({ failForDisconnect: async () => ({ ok: false, code: 'disconnected' }) })
+    await __test.handleTransferClosure()
+
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+    __test.setActiveDownload(null)
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
 test('requestGalleryPreview streams preview data into the gallery controller without starting a download', async () => {
   await withMinimalDocument(async () => {
     const sends = []

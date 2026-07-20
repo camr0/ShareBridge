@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createGalleryController } from './gallery.js'
+import { createGalleryController, renderGalleryShell } from './gallery.js'
 
 function fakeRoot() {
   return {
@@ -10,6 +10,82 @@ function fakeRoot() {
     querySelector() { return null },
   }
 }
+
+test('gallery summary renders Download All immediately after an escaped item count', () => {
+  const html = renderGalleryShell('<Summer & Sun>', 'Beach <script>alert(1)</script>', [
+    { id: 'asset-1', name: '<photo>.jpg', mimeType: 'image/jpeg' },
+  ])
+
+  assert.match(html, /<div class="gallery-summary">\s*<span>1 item<\/span>\s*<button class="gallery-download-all" type="button">Download All<\/button>/)
+  assert.doesNotMatch(html, /<Summer & Sun>|<script>|<photo>/)
+  assert.match(html, /&lt;Summer &amp; Sun&gt;/)
+  assert.match(html, /Beach &lt;script&gt;alert\(1\)&lt;\/script&gt;/)
+  assert.match(html, /&lt;photo&gt;\.jpg/)
+})
+
+test('gallery disables Download All for an empty album', () => {
+  const html = renderGalleryShell('Empty', '', [])
+
+  assert.match(html, /<button class="gallery-download-all" type="button" disabled>Download All<\/button>/)
+})
+
+test('gallery Download All click requests the album without opening an item', () => {
+  const albumRequests = []
+  const previews = []
+  const downloads = []
+  let clickHandler = null
+  const root = fakeRoot()
+  root.addEventListener = (event, handler) => {
+    if (event === 'click') clickHandler = handler
+  }
+  createGalleryController({
+    root,
+    createObjectURL: () => 'blob:thumb',
+    revokeObjectURL: () => {},
+    onAlbumDownloadRequest: () => albumRequests.push('album'),
+    onPreviewRequest: (id) => previews.push(id),
+    onDownloadRequest: (id) => downloads.push(id),
+  })
+
+  let defaultPrevented = false
+  let propagationStopped = false
+  clickHandler?.({
+    preventDefault: () => { defaultPrevented = true },
+    stopPropagation: () => { propagationStopped = true },
+    target: {
+      closest: (selector) => selector === '.gallery-download-all' ? {} : null,
+    },
+  })
+
+  assert.equal(defaultPrevented, true)
+  assert.equal(propagationStopped, true)
+  assert.deepEqual(albumRequests, ['album'])
+  assert.deepEqual(previews, [])
+  assert.deepEqual(downloads, [])
+})
+
+test('gallery controller renders album download lifecycle labels and disabled state', () => {
+  const button = { textContent: '', disabled: false }
+  const root = fakeRoot()
+  root.querySelector = (selector) => selector === '.gallery-download-all' ? button : null
+  const controller = createGalleryController({ root })
+  controller.handleThumbnailList({ items: [{ id: 'asset-1', name: 'photo.jpg', mimeType: 'image/jpeg' }] })
+
+  controller.setAlbumDownloadState({ phase: 'idle' })
+  assert.deepEqual({ label: button.textContent, disabled: button.disabled }, { label: 'Download All', disabled: false })
+
+  controller.setAlbumDownloadState({ phase: 'starting' })
+  assert.deepEqual({ label: button.textContent, disabled: button.disabled }, { label: 'Starting…', disabled: true })
+
+  controller.setAlbumDownloadState({ phase: 'downloading', partIndex: 1, partCount: 2 })
+  assert.deepEqual({ label: button.textContent, disabled: button.disabled }, { label: 'Downloading 1/2', disabled: true })
+
+  controller.setAlbumDownloadState({ phase: 'failed' })
+  assert.deepEqual({ label: button.textContent, disabled: button.disabled }, { label: 'Retry Download', disabled: false })
+
+  controller.setAlbumDownloadState({ phase: 'complete' })
+  assert.deepEqual({ label: button.textContent, disabled: button.disabled }, { label: 'Download Complete', disabled: false })
+})
 
 test('gallery renders thumbnail shells from thumbnail_list', () => {
   const root = fakeRoot()
