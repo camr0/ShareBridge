@@ -1528,6 +1528,9 @@ function sendAlbumArchiveAck(operation, ok) {
   const control = controlEndpoint()
   if (!control || control.readyState !== 'open') return false
   const header = operation.header
+  const originEpoch = transferSessionEpoch
+  const originChannels = transferChannels
+  const originBatchId = header.batch_id
   try {
     const delivery = control.send(JSON.stringify({
       type: 'album_archive_ack',
@@ -1539,6 +1542,8 @@ function sendAlbumArchiveAck(operation, ok) {
     if (delivery && typeof delivery.then === 'function') {
       void Promise.resolve(delivery).catch((err) => {
         debugLog('album acknowledgement delivery failed', err instanceof Error ? err.message : String(err))
+        if (transferSessionEpoch !== originEpoch || transferChannels !== originChannels ||
+          controlEndpoint() !== control || albumDownloadBatch?.batchId !== originBatchId) return
         failAlbumDownload()
       })
     }

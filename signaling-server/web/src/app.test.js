@@ -1341,6 +1341,60 @@ test('rejected relay album acknowledgement is observed and fails the batch', asy
   })
 })
 
+test('delayed relay acknowledgement rejection cannot fail a replacement session batch', async () => {
+  await withMinimalDocument(async () => {
+    const oldChannels = fakeLaneSet()
+    const newChannels = fakeLaneSet()
+    const oldAck = deferred()
+    const states = []
+    let pipelineOptions
+    const originalOldSend = oldChannels.control.send.bind(oldChannels.control)
+    oldChannels.control.send = (value) => {
+      const message = JSON.parse(value)
+      originalOldSend(value)
+      return message.type === 'album_archive_ack' ? oldAck.promise : Promise.resolve()
+    }
+    __test.setTransferSession({ channels: oldChannels, mode: 'relay' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        pipelineOptions = options
+        return { append: async () => {}, complete: async () => {} }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const oldRequest = JSON.parse(oldChannels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Old.zip', size: 0, estimated_size: 1,
+      operation_id: '61', request_id: oldRequest.request_id, batch_id: oldRequest.request_id,
+      part_index: 1, part_count: 1,
+    }) })
+    pipelineOptions.onTerminalState({ ok: true, code: 'complete', statusClass: 'done', statusText: '✓ saved' })
+
+    __test.setTransferSession({ channels: newChannels, mode: 'relay' })
+    __test.requestAlbumDownload()
+    const newRequest = JSON.parse(newChannels.control.sent[0])
+    assert.notEqual(newRequest.request_id, oldRequest.request_id)
+    assert.deepEqual(states.at(-1), { phase: 'starting' })
+
+    oldAck.reject(new Error('old relay write failed'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    assert.deepEqual(states.at(-1), { phase: 'starting' })
+    __test.requestAlbumDownload()
+    assert.equal(newChannels.control.sent.length, 1, 'the replacement batch remains active')
+
+    await __test.handleError({
+      type: 'error', scope: 'bulk', request_id: newRequest.request_id, message: 'cleanup',
+    })
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
 test('requestGalleryPreview streams preview data into the gallery controller without starting a download', async () => {
   await withMinimalDocument(async () => {
     const sends = []
