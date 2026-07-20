@@ -67,6 +67,82 @@ test('missing checksum still resolves as done when byte count matches', async ()
   assert.equal(result.statusText, '✓ done')
 })
 
+test('streamed downloads use the exact size provided at completion', async () => {
+  let finalizeOptions = null
+  const pipeline = await createDownloadPipeline({
+    header: { name: 'album.zip', size: 0, mimeType: 'application/zip', sha1: '' },
+    sinkFactory: async () => ({
+      append() {},
+      finalize: async (options) => {
+        finalizeOptions = options
+        return options.receivedBytes === options.expectedSize
+          ? { ok: true, code: 'done', computedSha1: null }
+          : { ok: false, code: 'size-mismatch', computedSha1: null }
+      },
+      abort() {},
+    }),
+    now: () => 1000,
+    scheduleTimeout: () => 1,
+    clearScheduledTimeout: () => {},
+  })
+
+  await pipeline.append(new Uint8Array([1, 2, 3]))
+  const result = await pipeline.complete({ expectedSize: 3 })
+
+  assert.equal(finalizeOptions.expectedSize, 3)
+  assert.equal(result.ok, true)
+})
+
+test('streamed downloads fail when the exact completion size does not match', async () => {
+  let finalizeOptions = null
+  const pipeline = await createDownloadPipeline({
+    header: { name: 'album.zip', size: 0, mimeType: 'application/zip', sha1: '' },
+    sinkFactory: async () => ({
+      append() {},
+      finalize: async (options) => {
+        finalizeOptions = options
+        return options.receivedBytes === options.expectedSize
+          ? { ok: true, code: 'done', computedSha1: null }
+          : { ok: false, code: 'size-mismatch', computedSha1: null }
+      },
+      abort() {},
+    }),
+    now: () => 1000,
+    scheduleTimeout: () => 1,
+    clearScheduledTimeout: () => {},
+  })
+
+  await pipeline.append(new Uint8Array([1, 2, 3]))
+  const result = await pipeline.complete({ expectedSize: 4 })
+
+  assert.equal(finalizeOptions.expectedSize, 4)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'size-mismatch')
+})
+
+test('known-size downloads use the header size when completion omits an override', async () => {
+  let finalizeOptions = null
+  const pipeline = await createDownloadPipeline({
+    header: { name: 'known.bin', size: 3, mimeType: 'application/octet-stream', sha1: '' },
+    sinkFactory: async () => ({
+      append() {},
+      finalize: async (options) => {
+        finalizeOptions = options
+        return { ok: true, code: 'done', computedSha1: null }
+      },
+      abort() {},
+    }),
+    now: () => 1000,
+    scheduleTimeout: () => 1,
+    clearScheduledTimeout: () => {},
+  })
+
+  await pipeline.append(new Uint8Array([1, 2, 3]))
+  await pipeline.complete()
+
+  assert.equal(finalizeOptions.expectedSize, 3)
+})
+
 test('stalled transfers fail after 60 seconds without a new chunk', async () => {
   const timers = []
   let terminal = null
