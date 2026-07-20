@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createDownloadPipeline } from './downloadPipeline.js'
+import { createBlobSink } from './downloadSinks.js'
 
 test('small files that fit entirely inside the tail are not written before validation', async () => {
   const events = []
@@ -141,6 +142,31 @@ test('known-size downloads use the header size when completion omits an override
   await pipeline.complete()
 
   assert.equal(finalizeOptions.expectedSize, 3)
+})
+
+test('zero header size remains strict when completion omits an override', async () => {
+  let saveCalls = 0
+  const pipeline = await createDownloadPipeline({
+    header: { name: 'album.zip', size: 0, mimeType: 'application/zip', sha1: '' },
+    sinkFactory: (header) => createBlobSink({
+      fileName: header.name,
+      mimeType: header.mimeType,
+      subtleDigest: async () => new ArrayBuffer(0),
+      triggerBrowserSave: () => {
+        saveCalls += 1
+      },
+    }),
+    now: () => 1000,
+    scheduleTimeout: () => 1,
+    clearScheduledTimeout: () => {},
+  })
+
+  await pipeline.append(new Uint8Array([1, 2, 3]))
+  const result = await pipeline.complete()
+
+  assert.equal(saveCalls, 0)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'size-mismatch')
 })
 
 test('stalled transfers fail after 60 seconds without a new chunk', async () => {
