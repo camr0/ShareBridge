@@ -1151,6 +1151,39 @@ test('album chunk_end rejects a byte count outside the browser safe integer rang
   })
 })
 
+test('ordinary chunk_end keeps BigInt correlation beyond the Number safe integer boundary', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    let completeCalls = 0
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async () => ({
+        append: async () => {},
+        complete: async () => { completeCalls += 1 },
+      }),
+    })
+
+    __test.requestFile('large.bin')
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'large.bin', size: 1,
+      operation_id: '58', request_id: request.request_id,
+    }) })
+
+    await assert.doesNotReject(() => __test.handleControlMessage({ data: JSON.stringify({
+      type: 'chunk_end', operation_id: '58', request_id: request.request_id,
+      bytes_sent: '9007199254740992',
+    }) }))
+    assert.equal(channels.closeCalls, 0)
+    assert.equal(completeCalls, 0, 'BigInt correlation still waits for the declared bytes')
+    assert.equal(__test.getCurrentFile()?.operationId, '58')
+
+    __test.setDownloadTestDependencies()
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
 test('media remains independently routable during an album batch', async () => {
   await withMinimalDocument(async () => {
     const channels = fakeLaneSet()
@@ -1215,6 +1248,94 @@ test('disconnect marks a pending album batch failed before gallery reset', async
 
     assert.deepEqual(states.at(-1), { phase: 'failed' })
     __test.setActiveDownload(null)
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('disconnect cleanup survives a direct album acknowledgement send throwing', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const states = []
+    let pipelineOptions
+    const originalSend = channels.control.send.bind(channels.control)
+    channels.control.send = (value) => {
+      const message = JSON.parse(value)
+      if (message.type === 'album_archive_ack') throw new Error('RTCDataChannel is closed')
+      return originalSend(value)
+    }
+    __test.setTransferSession({ channels, mode: 'direct' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        pipelineOptions = options
+        return {
+          append: async () => {},
+          complete: async () => {},
+          failForDisconnect: async () => {
+            const result = { ok: false, code: 'disconnected', statusClass: 'failed', statusText: '✗ disconnected' }
+            pipelineOptions.onTerminalState(result)
+            return result
+          },
+        }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer.zip', size: 0, estimated_size: 1,
+      operation_id: '59', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 1, part_count: 1,
+    }) })
+
+    await assert.doesNotReject(() => __test.handleTransferClosure())
+    assert.equal(__test.getCurrentFile(), null)
+    assert.equal(__test.getTransferSession().transferChannel, null)
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+
+    __test.setDownloadTestDependencies()
+    __test.setGalleryController(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  })
+})
+
+test('rejected relay album acknowledgement is observed and fails the batch', async () => {
+  await withMinimalDocument(async () => {
+    const channels = fakeLaneSet()
+    const states = []
+    let pipelineOptions
+    const originalSend = channels.control.send.bind(channels.control)
+    channels.control.send = (value) => {
+      const message = JSON.parse(value)
+      originalSend(value)
+      return message.type === 'album_archive_ack'
+        ? Promise.reject(new Error('relay write failed'))
+        : Promise.resolve()
+    }
+    __test.setTransferSession({ channels, mode: 'relay' })
+    __test.setGalleryController({ setAlbumDownloadState: (state) => states.push(state) })
+    __test.setDownloadTestDependencies({
+      getSupport: async () => ({ mode: 'blob', warning: null }),
+      createPipeline: async (options) => {
+        pipelineOptions = options
+        return { append: async () => {}, complete: async () => {} }
+      },
+    })
+
+    __test.requestAlbumDownload()
+    const request = JSON.parse(channels.control.sent[0])
+    await __test.handleControlMessage({ data: JSON.stringify({
+      type: 'file_header', name: 'Summer.zip', size: 0, estimated_size: 1,
+      operation_id: '60', request_id: request.request_id, batch_id: request.request_id,
+      part_index: 1, part_count: 1,
+    }) })
+    pipelineOptions.onTerminalState({ ok: true, code: 'complete', statusClass: 'done', statusText: '✓ saved' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    assert.deepEqual(states.at(-1), { phase: 'failed' })
+    __test.setDownloadTestDependencies()
     __test.setGalleryController(null)
     __test.setTransferSession({ channels: null, mode: null })
   })

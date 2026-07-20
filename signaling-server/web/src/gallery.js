@@ -140,29 +140,36 @@ export function createGalleryController({
     state.albumDownloadPartIndex = partIndex
     state.albumDownloadPartCount = partCount
     const button = root.querySelector?.('.gallery-download-all')
-    if (!button) return
+    const liveStatus = root.querySelector?.('.gallery-download-all-status')
+    let label = 'Download All'
+    let announcement = 'Ready to download album'
+    let busy = false
+    let disabled = state.items.length === 0
     if (phase === 'starting') {
-      button.textContent = 'Starting…'
-      button.disabled = true
-      return
+      label = 'Starting…'
+      announcement = 'Starting album download'
+      busy = true
+      disabled = true
+    } else if (phase === 'downloading') {
+      label = partIndex && partCount ? `Downloading ${partIndex}/${partCount}` : 'Downloading…'
+      announcement = partIndex && partCount
+        ? `Downloading album part ${partIndex} of ${partCount}`
+        : 'Downloading album'
+      busy = true
+      disabled = true
+    } else if (phase === 'failed') {
+      label = 'Retry Download'
+      announcement = 'Album download failed'
+    } else if (phase === 'complete') {
+      label = 'Download Complete'
+      announcement = 'Album download complete'
     }
-    if (phase === 'downloading') {
-      button.textContent = partIndex && partCount ? `Downloading ${partIndex}/${partCount}` : 'Downloading…'
-      button.disabled = true
-      return
+    if (button) {
+      button.textContent = label
+      button.disabled = disabled
+      button.setAttribute?.('aria-busy', String(busy))
     }
-    if (phase === 'failed') {
-      button.textContent = 'Retry Download'
-      button.disabled = state.items.length === 0
-      return
-    }
-    if (phase === 'complete') {
-      button.textContent = 'Download Complete'
-      button.disabled = state.items.length === 0
-      return
-    }
-    button.textContent = 'Download All'
-    button.disabled = state.items.length === 0
+    if (liveStatus) liveStatus.textContent = announcement
   }
 
   function handlePreviewData(id, payload, mimeType = 'image/jpeg') {
@@ -484,7 +491,8 @@ export function renderGalleryShell(albumName, albumDescription, items) {
       </div>
       <div class="gallery-summary">
         <span>${count} item${count === 1 ? '' : 's'}</span>
-        <button class="gallery-download-all" type="button"${count === 0 ? ' disabled' : ''}>Download All</button>
+        <button class="gallery-download-all" type="button" aria-describedby="gallery-download-all-status" aria-busy="false"${count === 0 ? ' disabled' : ''}>Download All</button>
+        <span id="gallery-download-all-status" class="gallery-download-all-status" role="status" aria-live="polite">Ready to download album</span>
       </div>
     </section>
     <section class="gallery-progress${count === 0 ? ' hidden' : ''}" aria-live="polite">

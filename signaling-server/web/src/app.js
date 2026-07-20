@@ -864,7 +864,7 @@ async function handleControlMessage(event, { isCurrentSession = () => true } = {
       if (!currentBulkOperation || currentBulkOperation.operationId !== msg.operation_id) return
       currentBulkOperation.completedBytesSent = BigInt(msg.bytes_sent)
       currentFile.completedBytesSent = currentBulkOperation.completedBytesSent
-      await completeDownload(currentBulkOperation, exactByteCount(msg.bytes_sent))
+      await completeDownload(currentBulkOperation, bulkCompletionSize(currentBulkOperation, msg.bytes_sent))
       if (!isCurrentSession()) return
       break
     case 'album_download_complete':
@@ -1042,7 +1042,7 @@ function shouldDeferEnd(lane, msg) {
   }
   const expected = BigInt(msg.bytes_sent)
   if (expected > 0xffffffffffffffffn) failTransferProtocol('end bytes_sent exceeds uint64')
-  if (lane === 'bulk' && expected > BigInt(Number.MAX_SAFE_INTEGER)) {
+  if (lane === 'bulk' && currentBulkOperation?.header?.batch_id && expected > BigInt(Number.MAX_SAFE_INTEGER)) {
     failTransferProtocol('end bytes_sent exceeds browser safe integer range')
   }
   const received = lane === 'bulk'
@@ -1062,6 +1062,10 @@ function exactByteCount(value) {
   return Number(bytes)
 }
 
+function bulkCompletionSize(operation, bytesSent) {
+  return operation?.header?.batch_id ? exactByteCount(bytesSent) : operation?.header?.size
+}
+
 function failTransferProtocol(message) {
   transferChannels?.close?.()
   throw new Error(message)
@@ -1078,7 +1082,7 @@ async function completeDeferredEnd(lane) {
     if (!operation || operation.operationId !== msg.operation_id) return
     operation.completedBytesSent = BigInt(msg.bytes_sent)
     currentFile.completedBytesSent = operation.completedBytesSent
-    await completeDownload(operation, exactByteCount(msg.bytes_sent))
+    await completeDownload(operation, bulkCompletionSize(operation, msg.bytes_sent))
     return
   }
   if (!matchesCurrentMedia(msg)) return
@@ -1504,18 +1508,9 @@ function finishAlbumPart(operation, ok) {
   const batch = albumDownloadBatch
   if (!batch || batch.batchId !== header.batch_id || batch.terminalState) return
 
-  const control = controlEndpoint()
-  if (control) {
-    control.send(JSON.stringify({
-      type: 'album_archive_ack',
-      batch_id: header.batch_id,
-      part_index: header.part_index,
-      operation_id: operation.operationId,
-      ok,
-    }))
-  }
+  const ackSent = sendAlbumArchiveAck(operation, ok)
 
-  if (!ok || !control) {
+  if (!ok || !ackSent) {
     failAlbumDownload()
     return
   }
@@ -1527,6 +1522,31 @@ function finishAlbumPart(operation, ok) {
     partIndex: batch.partIndex,
     partCount: batch.partCount,
   })
+}
+
+function sendAlbumArchiveAck(operation, ok) {
+  const control = controlEndpoint()
+  if (!control || control.readyState !== 'open') return false
+  const header = operation.header
+  try {
+    const delivery = control.send(JSON.stringify({
+      type: 'album_archive_ack',
+      batch_id: header.batch_id,
+      part_index: header.part_index,
+      operation_id: operation.operationId,
+      ok,
+    }))
+    if (delivery && typeof delivery.then === 'function') {
+      void Promise.resolve(delivery).catch((err) => {
+        debugLog('album acknowledgement delivery failed', err instanceof Error ? err.message : String(err))
+        failAlbumDownload()
+      })
+    }
+    return true
+  } catch (err) {
+    debugLog('album acknowledgement send failed', err instanceof Error ? err.message : String(err))
+    return false
+  }
 }
 
 function completeAlbumDownload(msg) {
@@ -1826,7 +1846,11 @@ async function handleTransferClosure() {
   const sessionEpoch = transferSessionEpoch
   const channels = transferChannels
   if (download?.failForDisconnect) {
-    await download.failForDisconnect()
+    try {
+      await download.failForDisconnect()
+    } catch (err) {
+      debugLog('download disconnect cleanup failed', err instanceof Error ? err.message : String(err))
+    }
     if (transferSessionEpoch !== sessionEpoch || transferChannels !== channels) return
     if (isAlbumDownloadActive()) {
       failAlbumDownload()
