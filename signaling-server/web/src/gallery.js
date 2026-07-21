@@ -360,7 +360,6 @@ export function createGalleryController({
       const video = createElement('video')
       video.className = 'lg-object lg-video'
       video.controls = true
-      video.muted = true
       video.playsInline = true
       video.setAttribute('playsinline', '')
       video.style.maxWidth = '100%'
@@ -428,7 +427,6 @@ export function createGalleryController({
     const video = document.createElement('video')
     video.className = 'lg-object lg-video'
     video.controls = true
-    video.muted = true
     video.playsInline = true
     video.setAttribute('playsinline', '')
     video.style.maxWidth = '100%'
