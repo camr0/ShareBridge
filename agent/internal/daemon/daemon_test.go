@@ -337,8 +337,9 @@ func (m *mockSignalingClient) unregisteredCode(code string) bool {
 func newTestDaemon(t *testing.T) (*Daemon, *mockSignalingClient) {
 	t.Helper()
 	cfg := &config.Config{
-		SignalingURL: "ws://localhost:8080",
-		APIKey:       "test-key",
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		DefaultRelayOnly:  true,
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
@@ -1694,6 +1695,7 @@ func TestLoadSessionsFromStoreWiresPersistedImmichSession(t *testing.T) {
 		ImmichURL:         "http://immich.lan:2283",
 		ImmichAllowedHost: "immich.lan:2283",
 		ImmichAPIKey:      "api",
+		DefaultRelayOnly:  true,
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
