@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -245,6 +246,106 @@ func TestListGalleryIncludesPasswordInAlbumRequest(t *testing.T) {
 	_, err = client.ListGallery(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "secret", albumPassword)
+}
+
+func TestGetAlbumDownloadInfoUsesSharedAlbumAndPreservesArchiveOrder(t *testing.T) {
+	var paths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		require.Equal(t, "sharekey", r.URL.Query().Get("key"))
+		require.Equal(t, "secret", r.URL.Query().Get("password"))
+		switch r.URL.Path {
+		case "/api/shared-links/me":
+			require.Equal(t, http.MethodGet, r.Method)
+			_ = json.NewEncoder(w).Encode(SharedLink{
+				Type:  "ALBUM",
+				Album: &Album{ID: "album-1", Name: "Summer"},
+			})
+		case "/api/download/info":
+			require.Equal(t, http.MethodPost, r.Method)
+			require.Equal(t, "application/json", r.Header.Get("Content-Type"))
+			var body map[string]any
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			require.Equal(t, map[string]any{"albumId": "album-1"}, body)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"totalSize":30,"archives":[{"assetIds":["asset-2","asset-1"],"size":20},{"assetIds":["asset-3"],"size":10}]}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{
+		BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey", Password: "secret",
+	})
+	require.NoError(t, err)
+
+	download, err := client.GetAlbumDownloadInfo(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, []string{"/api/shared-links/me", "/api/download/info"}, paths)
+	require.Equal(t, "Summer", download.AlbumName)
+	require.Equal(t, int64(30), download.TotalSize)
+	require.Equal(t, []DownloadArchive{
+		{AssetIDs: []string{"asset-2", "asset-1"}, Size: 20},
+		{AssetIDs: []string{"asset-3"}, Size: 10},
+	}, download.Archives)
+}
+
+func TestGetAlbumDownloadInfoRejectsNonAlbumShare(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(SharedLink{Type: "INDIVIDUAL"})
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	_, err = client.GetAlbumDownloadInfo(t.Context())
+	require.ErrorContains(t, err, "album")
+}
+
+func TestDownloadArchiveStreamsEditedAssets(t *testing.T) {
+	body := []byte("zip-stream-bytes")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/api/download/archive", r.URL.Path)
+		require.Equal(t, "sharekey", r.URL.Query().Get("key"))
+		require.Equal(t, "secret", r.URL.Query().Get("password"))
+		require.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		require.Equal(t, "application/octet-stream", r.Header.Get("Accept"))
+		var request struct {
+			AssetIDs []string `json:"assetIds"`
+			Edited   bool     `json:"edited"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.Equal(t, []string{"asset-2", "asset-1"}, request.AssetIDs)
+		require.True(t, request.Edited)
+		_, _ = w.Write(body)
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{
+		BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey", Password: "secret",
+	})
+	require.NoError(t, err)
+	var got bytes.Buffer
+	n, err := client.DownloadArchive(t.Context(), []string{"asset-2", "asset-1"}, &got)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(body)), n)
+	require.Equal(t, body, got.Bytes())
+}
+
+func TestDownloadArchiveBoundsHTTPErrorBody(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(strings.Repeat("x", 32*1024)))
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	_, err = client.DownloadArchive(t.Context(), []string{"asset-1"}, &bytes.Buffer{})
+	require.Error(t, err)
+	require.Less(t, len(err.Error()), 8*1024)
 }
 
 func TestGetThumbnailBuildsAssetURLAndStreamsBody(t *testing.T) {

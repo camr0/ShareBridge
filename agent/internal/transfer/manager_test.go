@@ -295,6 +295,22 @@ type mockGalleryClient struct {
 	rangeStart   int64
 }
 
+type mockAlbumGalleryClient struct {
+	*mockGalleryClient
+	download AlbumDownload
+	archives map[string][]byte
+}
+
+func (m *mockAlbumGalleryClient) GetAlbumDownload(ctx context.Context) (AlbumDownload, error) {
+	return m.download, nil
+}
+
+func (m *mockAlbumGalleryClient) StreamAlbumArchive(ctx context.Context, assetIDs []string, w io.Writer) (int64, error) {
+	data := m.archives[strings.Join(assetIDs, ",")]
+	n, err := w.Write(data)
+	return int64(n), err
+}
+
 func (m *mockGalleryClient) ListGallery(ctx context.Context) (Gallery, error) {
 	return m.gallery, nil
 }
@@ -1188,6 +1204,151 @@ func TestMediaPreviewAndBulkDownloadRunConcurrently(t *testing.T) {
 	}, time.Second, time.Millisecond)
 	close(client.previewRelease)
 	close(client.bulkRelease)
+}
+
+func TestAlbumDownloadStreamsOrderedPartsAfterBrowserAcknowledgementAndCountsOnce(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockAlbumGalleryClient{
+		mockGalleryClient: &mockGalleryClient{},
+		download: AlbumDownload{
+			AlbumName: "Summer",
+			TotalSize: 7,
+			Archives: []AlbumArchive{
+				{AssetIDs: []string{"asset-2", "asset-1"}, EstimatedSize: 4},
+				{AssetIDs: []string{"asset-3"}, EstimatedSize: 3},
+			},
+		},
+		archives: map[string][]byte{
+			"asset-2,asset-1": []byte("part"),
+			"asset-3":         []byte("two"),
+		},
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	var completed []int64
+	manager.OnDownloadComplete = func(bytes int64) { completed = append(completed, bytes) }
+
+	request, _ := json.Marshal(map[string]any{"type": "album_download_request", "request_id": "bulk-album"})
+	manager.HandleMessage(request)
+	require.Eventually(t, func() bool {
+		return channels.control.countTextType("file_header") == 1 && channels.control.countTextType("chunk_end") == 1
+	}, time.Second, time.Millisecond)
+
+	first := albumPartHeaderForIndex(t, channels.control, 1)
+	require.Equal(t, "bulk-album", first.BatchID)
+	require.Equal(t, 2, first.PartCount)
+	require.Equal(t, int64(4), first.EstimatedSize)
+	require.Zero(t, first.Size)
+	require.Equal(t, "application/zip", first.MimeType)
+	require.Regexp(t, `^Summer\+1-\d{8}_\d{6}\.zip$`, first.Name)
+	require.Never(t, func() bool { return channels.control.countTextType("file_header") > 1 }, 25*time.Millisecond, time.Millisecond)
+	secondRequest, _ := json.Marshal(map[string]any{"type": "album_download_request", "request_id": "bulk-other"})
+	manager.HandleMessage(secondRequest)
+	scope, requestID, ok := channels.control.errorFieldsContaining("transfer in progress")
+	require.True(t, ok)
+	require.Equal(t, "bulk", scope)
+	require.Equal(t, "bulk-other", requestID)
+	preview, _ := json.Marshal(map[string]any{
+		"type": "asset_preview_request", "id": "asset-1", "quality": "preview", "request_id": "media-during-album",
+	})
+	manager.HandleMessage(preview)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("asset_preview_end") }, time.Second, time.Millisecond)
+
+	ackFirst, _ := json.Marshal(map[string]any{
+		"type": "album_archive_ack", "batch_id": "bulk-album", "part_index": 1,
+		"operation_id": first.OperationID, "ok": true,
+	})
+	manager.HandleMessage(ackFirst)
+	require.Eventually(t, func() bool {
+		return channels.control.countTextType("file_header") == 2 && channels.control.countTextType("chunk_end") == 2
+	}, time.Second, time.Millisecond)
+
+	second := albumPartHeaderForIndex(t, channels.control, 2)
+	require.NotEqual(t, first.OperationID, second.OperationID)
+	require.Equal(t, int64(3), second.EstimatedSize)
+	require.Regexp(t, `^Summer\+2-\d{8}_\d{6}\.zip$`, second.Name)
+	ackSecond, _ := json.Marshal(map[string]any{
+		"type": "album_archive_ack", "batch_id": "bulk-album", "part_index": 2,
+		"operation_id": second.OperationID, "ok": true,
+	})
+	manager.HandleMessage(ackSecond)
+
+	require.Eventually(t, func() bool { return channels.control.hasTextType("album_download_complete") }, time.Second, time.Millisecond)
+	require.Equal(t, int32(1), manager.downloads.Load())
+	require.Equal(t, []int64{7}, completed)
+	require.False(t, manager.bulkTransfer.Load())
+}
+
+func TestAlbumDownloadNegativeAcknowledgementStopsWithoutCounting(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockAlbumGalleryClient{
+		mockGalleryClient: &mockGalleryClient{},
+		download: AlbumDownload{
+			AlbumName: "Summer",
+			Archives:  []AlbumArchive{{AssetIDs: []string{"asset-1"}, EstimatedSize: 4}},
+		},
+		archives: map[string][]byte{"asset-1": []byte("part")},
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	request, _ := json.Marshal(map[string]any{"type": "album_download_request", "request_id": "bulk-album"})
+	manager.HandleMessage(request)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("chunk_end") }, time.Second, time.Millisecond)
+	header := albumPartHeaderForIndex(t, channels.control, 1)
+	ack, _ := json.Marshal(map[string]any{
+		"type": "album_archive_ack", "batch_id": "bulk-album", "part_index": 1,
+		"operation_id": header.OperationID, "ok": false,
+	})
+	manager.HandleMessage(ack)
+	require.Eventually(t, func() bool { return !manager.bulkTransfer.Load() }, time.Second, time.Millisecond)
+	require.Zero(t, manager.downloads.Load())
+	require.False(t, channels.control.hasTextType("album_download_complete"))
+}
+
+func TestAlbumDownloadAcknowledgementTimeoutStopsWithoutCounting(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockAlbumGalleryClient{
+		mockGalleryClient: &mockGalleryClient{},
+		download: AlbumDownload{
+			AlbumName: "Summer",
+			Archives:  []AlbumArchive{{AssetIDs: []string{"asset-1"}, EstimatedSize: 4}},
+		},
+		archives: map[string][]byte{"asset-1": []byte("part")},
+	}
+	manager := NewGalleryManager(channels, client, 0)
+	manager.albumAckTimeout = 5 * time.Millisecond
+	request, _ := json.Marshal(map[string]any{"type": "album_download_request", "request_id": "bulk-album"})
+	manager.HandleMessage(request)
+	require.Eventually(t, func() bool {
+		return channels.control.hasErrorContaining("acknowledgement timed out")
+	}, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !manager.bulkTransfer.Load() }, time.Second, time.Millisecond)
+	require.Zero(t, manager.downloads.Load())
+	require.False(t, channels.control.hasTextType("album_download_complete"))
+}
+
+type albumPartHeader struct {
+	Name          string `json:"name"`
+	Size          int64  `json:"size"`
+	EstimatedSize int64  `json:"estimated_size"`
+	MimeType      string `json:"mimeType"`
+	BatchID       string `json:"batch_id"`
+	PartIndex     int    `json:"part_index"`
+	PartCount     int    `json:"part_count"`
+	OperationID   string `json:"operation_id"`
+}
+
+func albumPartHeaderForIndex(t *testing.T, endpoint *mockDC, partIndex int) albumPartHeader {
+	t.Helper()
+	for _, message := range endpoint.textSnapshot() {
+		var header struct {
+			Type string `json:"type"`
+			albumPartHeader
+		}
+		if json.Unmarshal([]byte(message), &header) == nil && header.Type == "file_header" && header.PartIndex == partIndex {
+			return header.albumPartHeader
+		}
+	}
+	t.Fatalf("missing album part header %d", partIndex)
+	return albumPartHeader{}
 }
 
 func TestNewMediaPreviewReplacesOldMediaWithoutRejectingOrTouchingBulk(t *testing.T) {

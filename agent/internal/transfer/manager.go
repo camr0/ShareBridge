@@ -49,6 +49,22 @@ type GalleryBackend interface {
 	GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error)
 }
 
+type AlbumDownloadBackend interface {
+	GetAlbumDownload(ctx context.Context) (AlbumDownload, error)
+	StreamAlbumArchive(ctx context.Context, assetIDs []string, w io.Writer) (int64, error)
+}
+
+type AlbumArchive struct {
+	AssetIDs      []string
+	EstimatedSize int64
+}
+
+type AlbumDownload struct {
+	AlbumName string
+	TotalSize int64
+	Archives  []AlbumArchive
+}
+
 type Gallery struct {
 	AlbumName        string        `json:"albumName"`
 	AlbumDescription string        `json:"albumDescription"`
@@ -90,24 +106,39 @@ type Manager struct {
 	bulkOperation     atomic.Uint64
 	bulkMu            sync.Mutex
 	currentGeneration atomic.Uint32
+	albumMu           sync.Mutex
+	albumBatch        *albumBatch
+	albumAckTimeout   time.Duration
 
 	OnSessionExpired   func()
 	OnDownloadComplete func(bytesTransferred int64)
 }
 
+type albumBatch struct {
+	requestID string
+	ack       chan albumArchiveAck
+}
+
+type albumArchiveAck struct {
+	partIndex   int
+	operationID uint64
+	ok          bool
+}
+
 // NewManager creates a transfer manager with an optional download limit.
 func NewManager(channels multilane.ChannelSet, client StorageBackend, maxDownloads int) *Manager {
 	m := &Manager{
-		channels:     channels,
-		client:       client,
-		maxDownloads: maxDownloads,
+		channels:        channels,
+		client:          client,
+		maxDownloads:    maxDownloads,
+		albumAckTimeout: 60 * time.Second,
 	}
 	m.installChannels()
 	return m
 }
 
 func NewGalleryManager(channels multilane.ChannelSet, backend GalleryBackend, maxDownloads int) *Manager {
-	m := &Manager{channels: channels, gallery: backend, maxDownloads: maxDownloads}
+	m := &Manager{channels: channels, gallery: backend, maxDownloads: maxDownloads, albumAckTimeout: 60 * time.Second}
 	m.installChannels()
 	return m
 }
@@ -145,6 +176,9 @@ func (m *Manager) HandleMessage(data []byte) {
 		Generation  int    `json:"generation"`
 		RequestID   string `json:"request_id"`
 		OperationID string `json:"operation_id"`
+		BatchID     string `json:"batch_id"`
+		PartIndex   int    `json:"part_index"`
+		OK          bool   `json:"ok"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		m.sendError("connection", "", "invalid message format")
@@ -158,6 +192,10 @@ func (m *Manager) HandleMessage(data []byte) {
 		m.handleFileRequest(msg.Path, msg.RequestID)
 	case "asset_request":
 		m.handleAssetRequest(msg.ID, msg.Quality, msg.RequestID)
+	case "album_download_request":
+		m.handleAlbumDownloadRequest(msg.RequestID)
+	case "album_archive_ack":
+		m.handleAlbumArchiveAck(msg.BatchID, msg.PartIndex, msg.OperationID, msg.OK)
 	case "asset_preview_request":
 		m.handleAssetPreviewRequest(msg.ID, msg.Quality, msg.Generation, msg.RequestID)
 	case "asset_preview_seek":
@@ -174,6 +212,190 @@ func (m *Manager) HandleMessage(data []byte) {
 	default:
 		m.sendError("connection", msg.RequestID, "unknown message type: "+msg.Type)
 	}
+}
+
+func (m *Manager) handleAlbumDownloadRequest(requestID string) {
+	if m.maxDownloads > 0 && int(m.downloads.Load()) >= m.maxDownloads {
+		m.sendError("bulk", requestID, "share has reached its download limit")
+		if m.OnSessionExpired != nil {
+			m.OnSessionExpired()
+		}
+		return
+	}
+	if requestID == "" {
+		m.sendError("bulk", requestID, "album download request_id required")
+		return
+	}
+	backend, ok := m.gallery.(AlbumDownloadBackend)
+	if !ok {
+		m.sendError("bulk", requestID, "album download unavailable")
+		return
+	}
+	operationID, ok := m.acquireBulk(requestID)
+	if !ok {
+		return
+	}
+	batch := &albumBatch{requestID: requestID, ack: make(chan albumArchiveAck, 1)}
+	m.albumMu.Lock()
+	m.albumBatch = batch
+	m.albumMu.Unlock()
+
+	go func() {
+		download, err := backend.GetAlbumDownload(context.Background())
+		if err != nil {
+			m.sendBulkErrorIfActive(operationID, requestID, "album download unavailable: "+err.Error())
+			m.finishAlbumBatch(batch, operationID)
+			return
+		}
+		m.streamAlbumDownload(context.Background(), backend, batch, operationID, download)
+	}()
+}
+
+func (m *Manager) handleAlbumArchiveAck(batchID string, partIndex int, rawOperationID string, ok bool) {
+	operationID, err := strconv.ParseUint(rawOperationID, 10, 64)
+	if err != nil || operationID == 0 {
+		return
+	}
+	m.albumMu.Lock()
+	batch := m.albumBatch
+	m.albumMu.Unlock()
+	if batch == nil || batch.requestID != batchID {
+		return
+	}
+	ack := albumArchiveAck{partIndex: partIndex, operationID: operationID, ok: ok}
+	select {
+	case batch.ack <- ack:
+	default:
+	}
+}
+
+func (m *Manager) streamAlbumDownload(ctx context.Context, backend AlbumDownloadBackend, batch *albumBatch, operationID uint64, download AlbumDownload) {
+	currentOperation := operationID
+	defer func() { m.finishAlbumBatch(batch, currentOperation) }()
+	if len(download.Archives) == 0 {
+		m.sendBulkErrorIfActive(currentOperation, batch.requestID, "album contains no downloadable assets")
+		return
+	}
+
+	var totalBytes int64
+	for index, archive := range download.Archives {
+		if index > 0 {
+			nextOperation, ok := m.advanceBulkOperation(currentOperation)
+			if !ok {
+				return
+			}
+			currentOperation = nextOperation
+		}
+		partIndex := index + 1
+		header := struct {
+			Type           string `json:"type"`
+			Name           string `json:"name"`
+			Size           int64  `json:"size"`
+			EstimatedSize  int64  `json:"estimated_size"`
+			MimeType       string `json:"mimeType"`
+			BinaryEnvelope bool   `json:"binary_envelope"`
+			Scope          string `json:"scope"`
+			RequestID      string `json:"request_id"`
+			OperationID    string `json:"operation_id"`
+			BatchID        string `json:"batch_id"`
+			PartIndex      int    `json:"part_index"`
+			PartCount      int    `json:"part_count"`
+		}{
+			Type: "file_header", Name: albumArchiveName(download.AlbumName, partIndex, len(download.Archives), time.Now()),
+			Size: 0, EstimatedSize: archive.EstimatedSize, MimeType: "application/zip", BinaryEnvelope: true,
+			Scope: "bulk", RequestID: batch.requestID, OperationID: operationIDString(currentOperation),
+			BatchID: batch.requestID, PartIndex: partIndex, PartCount: len(download.Archives),
+		}
+		headerData, _ := json.Marshal(header)
+		if err := m.control.SendText(string(headerData)); err != nil {
+			return
+		}
+
+		partBytes, err := m.streamAlbumArchive(ctx, backend, archive.AssetIDs, currentOperation)
+		if err != nil {
+			m.sendBulkErrorIfActive(currentOperation, batch.requestID, "album archive transfer failed: "+err.Error())
+			return
+		}
+		totalBytes += partBytes
+		end, _ := json.Marshal(struct {
+			Type        string `json:"type"`
+			Scope       string `json:"scope"`
+			RequestID   string `json:"request_id"`
+			OperationID string `json:"operation_id"`
+			BytesSent   string `json:"bytes_sent"`
+		}{"chunk_end", "bulk", batch.requestID, operationIDString(currentOperation), strconv.FormatInt(partBytes, 10)})
+		if err := m.control.SendText(string(end)); err != nil {
+			return
+		}
+
+		timer := time.NewTimer(m.albumAckTimeout)
+		var ack albumArchiveAck
+		select {
+		case ack = <-batch.ack:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			m.sendBulkErrorIfActive(currentOperation, batch.requestID, "album download acknowledgement timed out")
+			return
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		}
+		if !ack.ok || ack.partIndex != partIndex || ack.operationID != currentOperation {
+			return
+		}
+	}
+
+	m.downloads.Add(1)
+	if m.OnDownloadComplete != nil {
+		m.OnDownloadComplete(totalBytes)
+	}
+	complete, _ := json.Marshal(struct {
+		Type      string `json:"type"`
+		BatchID   string `json:"batch_id"`
+		PartCount int    `json:"part_count"`
+		BytesSent string `json:"bytes_sent"`
+	}{"album_download_complete", batch.requestID, len(download.Archives), strconv.FormatInt(totalBytes, 10)})
+	_ = m.control.SendText(string(complete))
+}
+
+func (m *Manager) streamAlbumArchive(ctx context.Context, backend AlbumDownloadBackend, assetIDs []string, operationID uint64) (int64, error) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	go func() {
+		_, err := backend.StreamAlbumArchive(ctx, assetIDs, pw)
+		_ = pw.CloseWithError(err)
+	}()
+	var totalBytes int64
+	buf := make([]byte, chunkSize)
+	for {
+		n, err := pr.Read(buf)
+		if n > 0 {
+			totalBytes += int64(n)
+			if sendErr := m.sendWithBackpressure(ctx, m.bulk, multilane.ClassBulk, encodeChunkFrame(operationID, 0, buf[:n])); sendErr != nil {
+				_ = pr.CloseWithError(sendErr)
+				return totalBytes, sendErr
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return totalBytes, nil
+			}
+			return totalBytes, err
+		}
+	}
+}
+
+func albumArchiveName(albumName string, partIndex, partCount int, now time.Time) string {
+	base := albumName + ".zip"
+	suffix := ""
+	if partCount > 1 {
+		suffix = "+" + strconv.Itoa(partIndex)
+	}
+	return strings.Replace(base, ".zip", suffix+"-"+now.Format("20060102_150405")+".zip", 1)
 }
 
 func (m *Manager) sendGallery() {
@@ -982,6 +1204,26 @@ func (m *Manager) releaseBulk(operation uint64) {
 		m.bulkTransfer.Store(false)
 	}
 	m.bulkMu.Unlock()
+}
+
+func (m *Manager) advanceBulkOperation(current uint64) (uint64, bool) {
+	m.bulkMu.Lock()
+	defer m.bulkMu.Unlock()
+	if !m.bulkTransfer.Load() || m.bulkOperation.Load() != current {
+		return 0, false
+	}
+	next := m.nextOperationID()
+	m.bulkOperation.Store(next)
+	return next, true
+}
+
+func (m *Manager) finishAlbumBatch(batch *albumBatch, operationID uint64) {
+	m.albumMu.Lock()
+	if m.albumBatch == batch {
+		m.albumBatch = nil
+	}
+	m.albumMu.Unlock()
+	m.releaseBulk(operationID)
 }
 
 func (m *Manager) beginMedia(id, quality string, generation uint32) (context.Context, uint64) {

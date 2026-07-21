@@ -3,7 +3,15 @@ import { createSHA1 } from './vendor/hash-wasm.js'
 let genericStreamSaverPromise = null
 let safariStreamSaverPromise = null
 
-export async function createStreamingSink({ fileName, mimeType, tailBytes, createWriter, createHasher }) {
+export async function createStreamingSink({
+  fileName,
+  mimeType,
+  tailBytes,
+  createWriter,
+  createHasher,
+  deferCloseSettlement = false,
+  onDeferredCloseError,
+}) {
   const writer = await createWriter(fileName, mimeType)
   const hasher = await createHasher()
   let tail = new Uint8Array(0)
@@ -42,7 +50,16 @@ export async function createStreamingSink({ fileName, mimeType, tailBytes, creat
       if (tail.length > 0) {
         await writer.write(tail)
       }
-      await writer.close()
+      const closeResult = writer.close()
+      if (deferCloseSettlement) {
+        void Promise.resolve(closeResult).then(undefined, (error) => {
+          try {
+            onDeferredCloseError?.(error)
+          } catch (_callbackError) {}
+        })
+      } else {
+        await closeResult
+      }
 
       return {
         ok: true,

@@ -286,17 +286,13 @@ progress.
 
 ### Immich album download
 
-After multi-lane transport lands, add the approved album flow:
-
-- place a labeled `Download All` button immediately after the item count;
-- call Immich's existing `/api/download/info` and `/api/download/archive` endpoints;
-- mirror Immich's ordered, sequential, potentially multi-ZIP behavior and filenames;
-- reuse the existing browser download pipeline for each ZIP;
-- let the agent retain the authoritative archive order and advance after browser
-  sink acknowledgement;
-- count a fully successful album batch as one ShareBridge download, regardless of
-  the number of ZIP parts;
-- stop the batch without incrementing the counter if any part fails.
+Delivered: the browser starts the ordered Immich ZIP flow with
+`album_download_request`. The agent owns one ordered multipart batch on the serial
+bulk lane and emits one operation per ZIP part, advancing only after the browser's
+terminal sink acknowledgement, `album_archive_ack`. It sends
+`album_download_complete` only after every part succeeds; the complete batch counts
+as one ShareBridge download, while any failed batch counts as zero. Previews and
+video remain on the media lane throughout the batch.
 
 ### Serial user-request queue
 

@@ -1,6 +1,7 @@
 package immich
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -90,6 +91,19 @@ type GalleryItem struct {
 	Duration *float64
 	SHA1     string
 }
+
+type DownloadArchive struct {
+	AssetIDs []string `json:"assetIds"`
+	Size     int64    `json:"size"`
+}
+
+type AlbumDownload struct {
+	AlbumName string
+	TotalSize int64             `json:"totalSize"`
+	Archives  []DownloadArchive `json:"archives"`
+}
+
+const maxHTTPErrorBody = 4 * 1024
 
 func New(cfg Config) (*Client, error) {
 	baseURL, err := url.Parse(cfg.BaseURL)
@@ -191,14 +205,8 @@ func (c *Client) ValidatePassword(ctx context.Context, password string) (bool, e
 // ListGallery returns the album gallery for the shared link.
 // For album-type shares, a second request to /api/albums/{id} populates assets.
 func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
-	log.Printf("immich gallery: GET /api/shared-links/me share=%s", redactKey(c.shareKey))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.buildSharedLinkURL().String(), nil)
+	link, err := c.getSharedLink(ctx)
 	if err != nil {
-		return Gallery{}, err
-	}
-
-	var link SharedLink
-	if err := c.doJSON(req, &link); err != nil {
 		return Gallery{}, err
 	}
 	albumID := ""
@@ -228,6 +236,77 @@ func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
 	}
 	log.Printf("immich gallery: share=%s produced %d items", redactKey(c.shareKey), len(gallery.Items))
 	return gallery, nil
+}
+
+func (c *Client) GetAlbumDownloadInfo(ctx context.Context) (AlbumDownload, error) {
+	link, err := c.getSharedLink(ctx)
+	if err != nil {
+		return AlbumDownload{}, err
+	}
+	if !strings.EqualFold(link.Type, "ALBUM") || link.Album == nil || link.Album.ID == "" {
+		return AlbumDownload{}, fmt.Errorf("shared link is not an album")
+	}
+
+	payload, err := json.Marshal(struct {
+		AlbumID string `json:"albumId"`
+	}{AlbumID: link.Album.ID})
+	if err != nil {
+		return AlbumDownload{}, err
+	}
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/download/info"})
+	c.addSharedLinkParams(u)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	if err != nil {
+		return AlbumDownload{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	result := AlbumDownload{AlbumName: link.Album.Name}
+	if err := c.doJSONStatus(req, http.StatusCreated, &result); err != nil {
+		return AlbumDownload{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) DownloadArchive(ctx context.Context, assetIDs []string, w io.Writer) (int64, error) {
+	payload, err := json.Marshal(struct {
+		AssetIDs []string `json:"assetIds"`
+		Edited   bool     `json:"edited"`
+	}{AssetIDs: assetIDs, Edited: true})
+	if err != nil {
+		return 0, err
+	}
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/download/archive"})
+	c.addSharedLinkParams(u)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/octet-stream")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, responseStatusError(req, resp)
+	}
+	return io.Copy(w, resp.Body)
+}
+
+func (c *Client) getSharedLink(ctx context.Context) (SharedLink, error) {
+	log.Printf("immich gallery: GET /api/shared-links/me share=%s", redactKey(c.shareKey))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.buildSharedLinkURL().String(), nil)
+	if err != nil {
+		return SharedLink{}, err
+	}
+	var link SharedLink
+	if err := c.doJSON(req, &link); err != nil {
+		return SharedLink{}, err
+	}
+	return link, nil
 }
 
 func (c *Client) listAlbumAssets(ctx context.Context, albumID string) ([]Asset, error) {
@@ -353,8 +432,7 @@ func (c *Client) getAsset(ctx context.Context, rawURL string, startOffset int64,
 		return 0, fmt.Errorf("range not satisfiable: start_offset=%d", startOffset)
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		body, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("GET %s returned %s: %s", req.URL.Path, resp.Status, strings.TrimSpace(string(body)))
+		return 0, responseStatusError(req, resp)
 	}
 	return io.Copy(w, resp.Body)
 }
@@ -367,13 +445,32 @@ func (c *Client) doJSON(req *http.Request, out any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("GET %s returned %d: %s", req.URL.Path, resp.StatusCode, strings.TrimSpace(string(body)))
+		return responseStatusError(req, resp)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) doJSONStatus(req *http.Request, status int, out any) error {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != status {
+		return responseStatusError(req, resp)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+func responseStatusError(req *http.Request, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPErrorBody))
+	return fmt.Errorf("%s %s returned %s: %s", req.Method, req.URL.Path, resp.Status, strings.TrimSpace(string(body)))
 }
 
 func (c *Client) buildSharedLinkURL() *url.URL {

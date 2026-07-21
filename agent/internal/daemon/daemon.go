@@ -128,6 +128,29 @@ func (a immichTransferAdapter) GetAssetRange(ctx context.Context, id string, qua
 	return a.GetAsset(ctx, id, quality, w)
 }
 
+func (a immichTransferAdapter) GetAlbumDownload(ctx context.Context) (transfer.AlbumDownload, error) {
+	download, err := a.client.GetAlbumDownloadInfo(ctx)
+	if err != nil {
+		return transfer.AlbumDownload{}, err
+	}
+	archives := make([]transfer.AlbumArchive, len(download.Archives))
+	for i, archive := range download.Archives {
+		archives[i] = transfer.AlbumArchive{
+			AssetIDs:      append([]string(nil), archive.AssetIDs...),
+			EstimatedSize: archive.Size,
+		}
+	}
+	return transfer.AlbumDownload{
+		AlbumName: download.AlbumName,
+		TotalSize: download.TotalSize,
+		Archives:  archives,
+	}, nil
+}
+
+func (a immichTransferAdapter) StreamAlbumArchive(ctx context.Context, assetIDs []string, w io.Writer) (int64, error) {
+	return a.client.DownloadArchive(ctx, assetIDs, w)
+}
+
 type immichPoller interface {
 	PollShares(ctx context.Context) ([]immich.SharedLink, error)
 }

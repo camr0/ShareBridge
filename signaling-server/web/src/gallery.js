@@ -9,6 +9,7 @@ export function createGalleryController({
   onPreviewRequest,
   onPreviewClose,
   onDownloadRequest,
+  onAlbumDownloadRequest,
 }) {
   const state = {
     items: [],
@@ -23,9 +24,20 @@ export function createGalleryController({
     lightboxGrid: null,
     lightboxDownloadButton: null,
     videoPlaybackSequence: 0,
+    albumDownloadPhase: 'idle',
+    albumDownloadPartIndex: undefined,
+    albumDownloadPartCount: undefined,
   }
 
   const handleClick = (event) => {
+    const albumDownload = event.target?.closest?.('.gallery-download-all')
+    if (albumDownload) {
+      event.preventDefault?.()
+      event.stopPropagation?.()
+      onAlbumDownloadRequest?.()
+      return
+    }
+
     const download = event.target?.closest?.('.gallery-download')
     if (download?.dataset?.galleryId) {
       event.preventDefault?.()
@@ -85,6 +97,11 @@ export function createGalleryController({
     state.loadedThumbs = 0
     state.unavailableThumbs = 0
     root.innerHTML = renderGalleryShell(msg.albumName || 'Shared album', msg.albumDescription || '', state.items)
+    setAlbumDownloadState({
+      phase: state.albumDownloadPhase,
+      partIndex: state.albumDownloadPartIndex,
+      partCount: state.albumDownloadPartCount,
+    })
     updateThumbnailProgress()
     initLightbox()
   }
@@ -116,6 +133,43 @@ export function createGalleryController({
   function handleThumbnailComplete(msg) {
     state.unavailableThumbs = Math.max(0, Number(msg.failed) || 0)
     updateThumbnailProgress()
+  }
+
+  function setAlbumDownloadState({ phase = 'idle', partIndex, partCount } = {}) {
+    state.albumDownloadPhase = phase
+    state.albumDownloadPartIndex = partIndex
+    state.albumDownloadPartCount = partCount
+    const button = root.querySelector?.('.gallery-download-all')
+    const liveStatus = root.querySelector?.('.gallery-download-all-status')
+    let label = 'Download All'
+    let announcement = 'Ready to download album'
+    let busy = false
+    let disabled = state.items.length === 0
+    if (phase === 'starting') {
+      label = 'Starting…'
+      announcement = 'Starting album download'
+      busy = true
+      disabled = true
+    } else if (phase === 'downloading') {
+      label = partIndex && partCount ? `Downloading ${partIndex}/${partCount}` : 'Downloading…'
+      announcement = partIndex && partCount
+        ? `Downloading album part ${partIndex} of ${partCount}`
+        : 'Downloading album'
+      busy = true
+      disabled = true
+    } else if (phase === 'failed') {
+      label = 'Retry Download'
+      announcement = 'Album download failed'
+    } else if (phase === 'complete') {
+      label = 'Download Complete'
+      announcement = 'Album download complete'
+    }
+    if (button) {
+      button.textContent = label
+      button.disabled = disabled
+      button.setAttribute?.('aria-busy', String(busy))
+    }
+    if (liveStatus) liveStatus.textContent = announcement
   }
 
   function handlePreviewData(id, payload, mimeType = 'image/jpeg') {
@@ -424,7 +478,7 @@ export function createGalleryController({
     state.lightboxDownloadButton = button
   }
 
-  return { handleThumbnailList, handleThumbnailData, handleThumbnailComplete, handlePreviewData, destroy, state }
+  return { handleThumbnailList, handleThumbnailData, handleThumbnailComplete, handlePreviewData, setAlbumDownloadState, destroy, state }
 }
 
 export function renderGalleryShell(albumName, albumDescription, items) {
@@ -435,7 +489,11 @@ export function renderGalleryShell(albumName, albumDescription, items) {
         <h2>${escapeHTML(albumName)}</h2>
         ${albumDescription ? `<p>${escapeHTML(albumDescription)}</p>` : ''}
       </div>
-      <span>${count} item${count === 1 ? '' : 's'}</span>
+      <div class="gallery-summary">
+        <span>${count} item${count === 1 ? '' : 's'}</span>
+        <button class="gallery-download-all" type="button" aria-describedby="gallery-download-all-status" aria-busy="false"${count === 0 ? ' disabled' : ''}>Download All</button>
+        <span id="gallery-download-all-status" class="gallery-download-all-status" role="status" aria-live="polite">Ready to download album</span>
+      </div>
     </section>
     <section class="gallery-progress${count === 0 ? ' hidden' : ''}" aria-live="polite">
       <div class="gallery-progress-row">

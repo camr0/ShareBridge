@@ -132,6 +132,7 @@ let currentPath = []
 let sessionCode = ''
 let galleryMode = false
 let galleryController = null
+let albumDownloadBatch = null
 let galleryAssetRequestPending = false
 let galleryPreviewRequestPending = false
 let queuedGalleryPreviewID = ''
@@ -863,8 +864,11 @@ async function handleControlMessage(event, { isCurrentSession = () => true } = {
       if (!currentBulkOperation || currentBulkOperation.operationId !== msg.operation_id) return
       currentBulkOperation.completedBytesSent = BigInt(msg.bytes_sent)
       currentFile.completedBytesSent = currentBulkOperation.completedBytesSent
-      await completeDownload(currentBulkOperation)
+      await completeDownload(currentBulkOperation, bulkCompletionSize(currentBulkOperation, msg.bytes_sent))
       if (!isCurrentSession()) return
+      break
+    case 'album_download_complete':
+      completeAlbumDownload(msg)
       break
     case 'error':
       await handleError(msg)
@@ -920,6 +924,9 @@ function canonicalOperationId(value) {
 function acceptHeader(msg, scope) {
   const operationId = canonicalOperationId(msg.operation_id)
   if (!operationId || msg.operation_id !== operationId) return false
+  if (scope === 'bulk' && (msg.batch_id !== undefined || isAlbumDownloadActive())) {
+    return acceptAlbumHeader(msg, operationId)
+  }
   const pending = scope === 'bulk' ? pendingBulkRequestId : pendingMediaRequestId
   const current = scope === 'bulk' ? currentFile : (currentVideoPreview || currentPreview)
   if (!pending) return false
@@ -936,6 +943,24 @@ function acceptHeader(msg, scope) {
     pendingMediaGeneration = undefined
   }
   clearCompletionTimeout(scope)
+  return true
+}
+
+function acceptAlbumHeader(msg, operationId) {
+  const batch = albumDownloadBatch
+  if (!batch || batch.terminalState || retiredOperations.bulk.has(operationId)) return false
+  if (msg.batch_id !== batch.batchId || msg.request_id !== batch.batchId) return false
+  if (!Number.isInteger(msg.part_index) || !Number.isInteger(msg.part_count) ||
+    msg.part_index < 1 || msg.part_count < 1 || msg.part_index > msg.part_count) return false
+  if (msg.part_index !== batch.partIndex + 1) return false
+  if (batch.partCount && msg.part_count !== batch.partCount) return false
+  if (currentBulkOperation || currentFile) return false
+  if (msg.part_index === 1 && pendingBulkRequestId !== batch.batchId) return false
+  if (msg.part_index > 1 && pendingBulkRequestId) return false
+  pendingBulkRequestId = ''
+  batch.partCount = msg.part_count
+  batch.acknowledgedOperationId = ''
+  clearCompletionTimeout('bulk')
   return true
 }
 
@@ -1017,6 +1042,9 @@ function shouldDeferEnd(lane, msg) {
   }
   const expected = BigInt(msg.bytes_sent)
   if (expected > 0xffffffffffffffffn) failTransferProtocol('end bytes_sent exceeds uint64')
+  if (lane === 'bulk' && currentBulkOperation?.header?.batch_id && expected > BigInt(Number.MAX_SAFE_INTEGER)) {
+    failTransferProtocol('end bytes_sent exceeds browser safe integer range')
+  }
   const received = lane === 'bulk'
     ? (currentBulkOperation?.wireBytes ?? 0n)
     : currentVideoPreview
@@ -1024,6 +1052,18 @@ function shouldDeferEnd(lane, msg) {
       : (currentPreview?.wireBytes ?? 0n)
   if (received > expected) failTransferProtocol('operation received more bytes than bytes_sent')
   return received < expected
+}
+
+function exactByteCount(value) {
+  const bytes = BigInt(value)
+  if (bytes > BigInt(Number.MAX_SAFE_INTEGER)) {
+    failTransferProtocol('end bytes_sent exceeds browser safe integer range')
+  }
+  return Number(bytes)
+}
+
+function bulkCompletionSize(operation, bytesSent) {
+  return operation?.header?.batch_id ? exactByteCount(bytesSent) : operation?.header?.size
 }
 
 function failTransferProtocol(message) {
@@ -1042,7 +1082,7 @@ async function completeDeferredEnd(lane) {
     if (!operation || operation.operationId !== msg.operation_id) return
     operation.completedBytesSent = BigInt(msg.bytes_sent)
     currentFile.completedBytesSent = operation.completedBytesSent
-    await completeDownload(operation)
+    await completeDownload(operation, bulkCompletionSize(operation, msg.bytes_sent))
     return
   }
   if (!matchesCurrentMedia(msg)) return
@@ -1259,7 +1299,7 @@ function getFileItem(name) {
 }
 
 function requestFile(name) {
-  if (activeDownload || currentBulkOperation || pendingBulkRequestId) {
+  if (activeDownload || currentBulkOperation || pendingBulkRequestId || isAlbumDownloadActive()) {
     updateStatus('Download in progress, please wait')
     return
   }
@@ -1281,7 +1321,7 @@ function requestFile(name) {
 
 async function getDownloadSupport(header) {
   return detectDownloadSupport({
-    fileSize: header.size,
+    fileSize: header.estimated_size ?? header.size,
     userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
     registerServiceWorker: () => navigator.serviceWorker.register('/src/vendor/streamsaver-sw.js'),
     registerExperimentalServiceWorker: () => navigator.serviceWorker.register('/src/vendor/streamsaver-safari-sw.js'),
@@ -1290,6 +1330,13 @@ async function getDownloadSupport(header) {
 
 async function startDownload(header) {
   discardBulkOperation(currentBulkOperation)
+  if (header.batch_id) {
+    galleryController?.setAlbumDownloadState?.({
+      phase: 'downloading',
+      partIndex: header.part_index,
+      partCount: header.part_count,
+    })
+  }
   const operation = {
     operationId: header.operationId,
     requestId: header.requestId,
@@ -1298,10 +1345,11 @@ async function startDownload(header) {
     active: true,
     wireBytes: 0n,
     ingestChain: Promise.resolve(),
+    albumAcknowledged: false,
   }
   currentBulkOperation = operation
   galleryAssetRequestPending = false
-  currentFile = header
+  currentFile = { ...header, size: header.estimated_size ?? header.size }
   currentFile.wireBytes = 0n
   receivedBytes = 0
   transferStartTime = Date.now()
@@ -1331,12 +1379,13 @@ async function startDownload(header) {
 
 async function initializeDownloadOperation(operation) {
   const { header } = operation
-  const support = await (downloadSupportImpl ?? getDownloadSupport)(header)
+  const displayHeader = { ...header, size: header.estimated_size ?? header.size }
+  const support = await (downloadSupportImpl ?? getDownloadSupport)(displayHeader)
   if (!isCurrentBulkOperation(operation)) return
   renderDownloadWarning(support.warning)
 
   if (support.mode === 'fail') {
-    finalizeDownloadUI(header, {
+    finalizeDownloadUI(displayHeader, {
       ok: false,
       code: 'unsupported',
       statusClass: 'failed',
@@ -1349,6 +1398,7 @@ async function initializeDownloadOperation(operation) {
     currentFile = null
     transferStartTime = 0
     galleryAssetRequestPending = false
+    finishAlbumPart(operation, false)
     return
   }
 
@@ -1360,14 +1410,15 @@ async function initializeDownloadOperation(operation) {
         return buildDownloadSink(header, support)
       },
       onStateChange: (state) => {
-        if (isCurrentBulkOperation(operation)) updateDownloadUI(header, state)
+        if (isCurrentBulkOperation(operation)) updateDownloadUI(displayHeader, state)
       },
       onTerminalState: (result) => {
         if (!isCurrentBulkOperation(operation)) return
         clearCompletionTimeout('bulk', operation.operationId)
         retireOperation('bulk', operation.operationId)
         discardEarlyOperation('bulk', operation.operationId)
-        finalizeDownloadUI(header, result)
+        finalizeDownloadUI(displayHeader, result)
+        finishAlbumPart(operation, result.ok === true)
         operation.active = false
         operation.pipeline = null
         currentBulkOperation = null
@@ -1387,7 +1438,7 @@ async function initializeDownloadOperation(operation) {
       file: header.name,
       error: err instanceof Error ? err.message : String(err),
     })
-    finalizeDownloadUI(header, {
+    finalizeDownloadUI(displayHeader, {
       ok: false,
       code: 'init-failed',
       statusClass: 'failed',
@@ -1397,9 +1448,10 @@ async function initializeDownloadOperation(operation) {
     })
     discardBulkOperation(operation)
     if (currentBulkOperation === operation) currentBulkOperation = null
-    if (currentFile === header) currentFile = null
+    if (currentFile?.operationId === operation.operationId) currentFile = null
     if (activeDownload === operation.pipeline) activeDownload = null
     galleryAssetRequestPending = false
+    finishAlbumPart(operation, false)
     receivedBytes = 0
     receivedChunkCount = 0
     transferStartTime = 0
@@ -1434,17 +1486,100 @@ function appendChunk(bytes, operation = currentBulkOperation) {
   return enqueueBulkIngest(operation, (pipeline) => pipeline.append(bytes))
 }
 
-async function completeDownload(operation = currentBulkOperation) {
+async function completeDownload(operation = currentBulkOperation, exactSize = operation?.header?.size) {
   if (!isCurrentBulkOperation(operation)) return
   debugLog('download complete frame received', {
     file: operation.header.name,
     receivedBytes,
     chunkCount: receivedChunkCount,
   })
-  await enqueueBulkIngest(operation, (pipeline) => pipeline.complete())
+  const expectedSize = operation.header.batch_id ? exactSize : operation.header.size
+  await enqueueBulkIngest(operation, (pipeline) => pipeline.complete({ expectedSize }))
+}
+
+function isAlbumDownloadActive() {
+  return Boolean(albumDownloadBatch && !albumDownloadBatch.terminalState)
+}
+
+function finishAlbumPart(operation, ok) {
+  const header = operation?.header
+  if (!header?.batch_id || operation.albumAcknowledged) return
+  operation.albumAcknowledged = true
+  const batch = albumDownloadBatch
+  if (!batch || batch.batchId !== header.batch_id || batch.terminalState) return
+
+  const ackSent = sendAlbumArchiveAck(operation, ok)
+
+  if (!ok || !ackSent) {
+    failAlbumDownload()
+    return
+  }
+  batch.partIndex = header.part_index
+  batch.partCount = header.part_count
+  batch.acknowledgedOperationId = operation.operationId
+  galleryController?.setAlbumDownloadState?.({
+    phase: 'downloading',
+    partIndex: batch.partIndex,
+    partCount: batch.partCount,
+  })
+}
+
+function sendAlbumArchiveAck(operation, ok) {
+  const control = controlEndpoint()
+  if (!control || control.readyState !== 'open') return false
+  const header = operation.header
+  const originEpoch = transferSessionEpoch
+  const originChannels = transferChannels
+  const originBatchId = header.batch_id
+  try {
+    const delivery = control.send(JSON.stringify({
+      type: 'album_archive_ack',
+      batch_id: header.batch_id,
+      part_index: header.part_index,
+      operation_id: operation.operationId,
+      ok,
+    }))
+    if (delivery && typeof delivery.then === 'function') {
+      void Promise.resolve(delivery).catch((err) => {
+        debugLog('album acknowledgement delivery failed', err instanceof Error ? err.message : String(err))
+        if (transferSessionEpoch !== originEpoch || transferChannels !== originChannels ||
+          controlEndpoint() !== control || albumDownloadBatch?.batchId !== originBatchId) return
+        failAlbumDownload()
+      })
+    }
+    return true
+  } catch (err) {
+    debugLog('album acknowledgement send failed', err instanceof Error ? err.message : String(err))
+    return false
+  }
+}
+
+function completeAlbumDownload(msg) {
+  const batch = albumDownloadBatch
+  if (!batch || batch.terminalState || msg.batch_id !== batch.batchId) return
+  if (!Number.isInteger(msg.part_count) || msg.part_count !== batch.partCount || batch.partIndex !== batch.partCount) return
+  batch.terminalState = 'complete'
+  galleryController?.setAlbumDownloadState?.({ phase: 'complete' })
+}
+
+function failAlbumDownload() {
+  if (!isAlbumDownloadActive()) return
+  albumDownloadBatch.terminalState = 'failed'
+  galleryController?.setAlbumDownloadState?.({ phase: 'failed' })
 }
 
 async function buildDownloadSink(header, support) {
+  const albumCloseOptions = header.batch_id
+    ? {
+        deferCloseSettlement: true,
+        onDeferredCloseError: (error) => debugLog('album writer close rejected after finalization', {
+          batch_id: header.batch_id,
+          operation_id: header.operation_id,
+          part_index: header.part_index,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      }
+    : {}
   if (support.mode === 'experimental-streaming') {
     return createStreamingSink({
       fileName: header.name,
@@ -1452,6 +1587,7 @@ async function buildDownloadSink(header, support) {
       tailBytes: 1024 * 1024,
       createWriter: createSafariBrowserStreamWriter,
       createHasher: createIncrementalSha1,
+      ...albumCloseOptions,
     })
   }
 
@@ -1462,6 +1598,7 @@ async function buildDownloadSink(header, support) {
       tailBytes: 1024 * 1024,
       createWriter: createBrowserStreamWriter,
       createHasher: createIncrementalSha1,
+      ...albumCloseOptions,
     })
   }
 
@@ -1648,13 +1785,25 @@ async function handleError(msg) {
 
   if (msg.scope === 'bulk') {
     if (!msg.operation_id) {
-      if (msg.request_id && msg.request_id !== pendingBulkRequestId) return
+      const isAlbumRequest = isAlbumDownloadActive() && msg.request_id === albumDownloadBatch.batchId
+      if (msg.request_id && msg.request_id !== pendingBulkRequestId && !isAlbumRequest) return
       pendingBulkRequestId = ''
       galleryAssetRequestPending = false
+      if (isAlbumRequest) {
+        failAlbumDownload()
+      }
       updateStatus(message === 'transfer in progress' ? 'Download in progress, please wait' : 'Error: ' + message)
       return
     }
-    if (!matchesCurrentBulk(msg)) return
+    if (!matchesCurrentBulk(msg)) {
+      if (isAlbumDownloadActive() && !currentBulkOperation &&
+        msg.request_id === albumDownloadBatch.batchId &&
+        msg.operation_id === albumDownloadBatch.acknowledgedOperationId) {
+        failAlbumDownload()
+        updateStatus('Transfer failed')
+      }
+      return
+    }
     retireOperation('bulk', msg.operation_id)
   } else if (msg.scope === 'media') {
     if (!msg.operation_id) {
@@ -1715,12 +1864,22 @@ async function handleTransferClosure() {
   const sessionEpoch = transferSessionEpoch
   const channels = transferChannels
   if (download?.failForDisconnect) {
-    await download.failForDisconnect()
+    try {
+      await download.failForDisconnect()
+    } catch (err) {
+      debugLog('download disconnect cleanup failed', err instanceof Error ? err.message : String(err))
+    }
     if (transferSessionEpoch !== sessionEpoch || transferChannels !== channels) return
+    if (isAlbumDownloadActive()) {
+      failAlbumDownload()
+    }
     clearClosedTransferSession()
     return
   }
 
+  if (isAlbumDownloadActive()) {
+    failAlbumDownload()
+  }
   resetUI()
 }
 
@@ -1877,6 +2036,7 @@ function clearEarlyFrames() {
   pendingMediaRequestId = ''
   pendingMediaID = ''
   pendingMediaGeneration = undefined
+  albumDownloadBatch = null
   clearCompletionTimeout('media')
   clearCompletionTimeout('bulk')
 }
@@ -1910,6 +2070,7 @@ function ensureGalleryController() {
       onPreviewRequest: requestGalleryPreview,
       onPreviewClose: handleGalleryPreviewClose,
       onDownloadRequest: requestGalleryAsset,
+      onAlbumDownloadRequest: requestAlbumDownload,
     })
   }
   return galleryController
@@ -1985,7 +2146,7 @@ function queueGalleryPreload(id) {
 }
 
 function requestGalleryAsset(id) {
-  if (activeDownload || currentBulkOperation || galleryAssetRequestPending) {
+  if (activeDownload || currentBulkOperation || pendingBulkRequestId || galleryAssetRequestPending || isAlbumDownloadActive()) {
     updateStatus('Download in progress, please wait')
     return
   }
@@ -1997,6 +2158,29 @@ function requestGalleryAsset(id) {
   galleryAssetRequestPending = true
   pendingBulkRequestId = nextRequestId('bulk')
   control.send(JSON.stringify({ type: 'asset_request', id, quality: 'original', request_id: pendingBulkRequestId }))
+}
+
+function requestAlbumDownload() {
+  if (activeDownload || currentBulkOperation || pendingBulkRequestId || galleryAssetRequestPending || isAlbumDownloadActive()) {
+    updateStatus('Download in progress, please wait')
+    return
+  }
+  const control = controlEndpoint()
+  if (!control) {
+    updateStatus('Connection closed')
+    return
+  }
+  const requestId = nextRequestId('bulk')
+  pendingBulkRequestId = requestId
+  albumDownloadBatch = {
+    batchId: requestId,
+    partIndex: 0,
+    partCount: 0,
+    terminalState: null,
+    acknowledgedOperationId: '',
+  }
+  galleryController?.setAlbumDownloadState?.({ phase: 'starting' })
+  control.send(JSON.stringify({ type: 'album_download_request', request_id: requestId }))
 }
 
 function startGalleryPreview(header) {
@@ -2421,6 +2605,7 @@ export const __test = {
   handleError,
   requestGalleryPreview,
   requestGalleryAsset,
+  requestAlbumDownload,
   startVideoPreview,
   handleGalleryPreviewClose,
   cleanupCurrentVideoPreview,

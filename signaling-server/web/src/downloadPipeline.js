@@ -56,7 +56,7 @@ export async function createDownloadPipeline({
 
       onStateChange(buildProgressState('downloading', { header, receivedBytes, receivedChunkCount }))
     },
-    async complete() {
+    async complete({ expectedSize = header.size } = {}) {
       if (finished) {
         return { ok: false, code: 'already-finished' }
       }
@@ -72,7 +72,7 @@ export async function createDownloadPipeline({
       try {
         result = await sink.finalize({
           expectedSha1: header.sha1 || null,
-          expectedSize: header.size,
+          expectedSize,
           receivedBytes,
         })
       } catch (err) {
