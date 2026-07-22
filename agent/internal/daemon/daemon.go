@@ -1199,7 +1199,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 				PreferredCode:       entry.Code,
 				ShareType:           "immich",
 				IsPasswordProtected: entry.IsPasswordProtected,
-				RelayOnly:           d.config.DefaultRelayOnly,
+				RelayOnly:           entry.RelayOnly,
 				RelayStaticPub:      relayStaticPub,
 			})
 			if err != nil {
@@ -1215,7 +1215,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 				ExpiresAt:           entry.ExpiresAt,
 				MaxDownloads:        entry.MaxDownloads,
 				Downloads:           entry.Downloads,
-				RelayOnly:           d.config.DefaultRelayOnly,
+				RelayOnly:           entry.RelayOnly,
 				CreatedAt:           entry.CreatedAt,
 				immichClient:        client,
 				peers:               make(map[string]*peer.Peer),
@@ -1394,12 +1394,14 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 
 	shareURL := "immich://" + link.Key
 	passwordProtected := link.IsPasswordProtected()
+	relayOnly := d.GetConfig().DefaultRelayOnly
+	log.Printf("registering Immich share %s (relay_only=%v, password_protected=%v)", link.Key, relayOnly, passwordProtected)
 	opts := signaling.RegisterShareOptions{
 		ShareURL:            shareURL,
 		PreferredCode:       link.Key,
 		ShareType:           "immich",
 		IsPasswordProtected: passwordProtected,
-		RelayOnly:           d.config.DefaultRelayOnly,
+		RelayOnly:           relayOnly,
 		RelayStaticPub:      relayStaticPub,
 	}
 	code, _, err := reg.RegisterShareWithOptions(ctx, opts)
@@ -1418,7 +1420,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		ShareURL:            shareURL,
 		ShareType:           "immich",
 		IsPasswordProtected: passwordProtected,
-		RelayOnly:           d.config.DefaultRelayOnly,
+		RelayOnly:           relayOnly,
 		CreatedAt:           now,
 		immichClient:        client,
 		peers:               make(map[string]*peer.Peer),
@@ -1429,7 +1431,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		ShareURL:            shareURL,
 		ShareType:           "immich",
 		IsPasswordProtected: passwordProtected,
-		RelayOnly:           d.config.DefaultRelayOnly,
+		RelayOnly:           relayOnly,
 		CreatedAt:           now,
 	}); err != nil {
 		_ = d.unregisterShare(ctx, code)
