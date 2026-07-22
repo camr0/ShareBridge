@@ -1,5 +1,5 @@
 // signaling-server/web/src/connectTransferChannel.js
-const DEFAULT_DIRECT_TIMEOUT_MS = 5000
+const DEFAULT_DIRECT_TIMEOUT_MS = 10000
 const DEBUG = typeof location !== 'undefined' && (
   location.search.includes('debug=1') ||
   (typeof localStorage !== 'undefined' && localStorage.getItem('sharebridge_debug'))
