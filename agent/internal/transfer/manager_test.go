@@ -192,6 +192,12 @@ func (m *mockDC) countTextType(messageType string) int {
 	return count
 }
 
+func (m *mockDC) textMessageCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.textMessages)
+}
+
 func (m *mockDC) binaryCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2039,7 +2045,8 @@ func TestGalleryMetadataCapsAtUint16ThumbnailBoundary(t *testing.T) {
 	require.Equal(t, "65535", list.Items[65535].ID)
 
 	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"boundary-last","start":65535,"count":120}`))
-	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return channels.control.textMessageCount() == 2 }, time.Second, time.Millisecond)
+	require.True(t, channels.control.hasTextType("thumbnail_batch_complete"))
 	frames := channels.media.binarySnapshot()
 	require.Len(t, frames, 1)
 	require.Equal(t, uint16(65535), binary.BigEndian.Uint16(frames[0][1:3]))
