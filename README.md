@@ -1,0 +1,61 @@
+# ShareBridge
+
+ShareBridge creates browser links for privately hosted OpenCloud files and Immich albums without exposing either backend directly to recipients. It is pre-1.0 software; `v0.8.0` is the first formal [Semantic Versioning](https://semver.org/) release.
+
+## Capabilities
+
+- OpenCloud file and directory shares
+- Immich albums, protected shares, image previews, streamed video playback and seeking
+- Direct WebRTC and end-to-end encrypted secure-relay transfers
+- Independent control, interactive-media, thumbnail, and bulk scheduling
+- Streaming downloads with byte-count and checksum validation
+- Multi-part Immich Download All archives
+- Progressive 120-item gallery loading for large albums
+- Accounts, API keys, session expiry, download limits, and relay quotas
+
+## Architecture
+
+```text
+Recipient browser ↔ signaling/secure-relay server ↔ private ShareBridge agent ↔ OpenCloud or Immich
+```
+
+ShareBridge has three running components:
+
+- The browser opens a share link, renders files or galleries, previews media, and receives downloads.
+- The signaling server coordinates sessions and accounts and provides an encrypted relay when a direct connection is unavailable.
+- The private agent discovers shares and reads data from OpenCloud or Immich on the owner's network.
+
+Direct mode sends data peer-to-peer over WebRTC. Relay mode sends payloads through the signaling server, but Noise encryption remains end-to-end between the browser and agent.
+
+## Repository layout
+
+- `agent/` — private-network agent and backend integrations
+- `signaling-server/` — signaling, accounts, secure relay, and browser application
+- `signaling-server/web/` — browser client
+- `docs/` — architecture, design, operations, and release documentation
+
+The signaling server has additional setup and configuration guidance in [signaling-server/README.md](signaling-server/README.md).
+
+## Development
+
+Run the Go and browser test suites from the repository root:
+
+```bash
+cd agent
+go test ./...
+go vet ./...
+
+cd ../signaling-server
+go test ./...
+
+cd web
+npm test
+```
+
+## Deployment and compatibility
+
+Production deployment is currently operator-managed. See [docs/RELEASING.md](docs/RELEASING.md) for the complete verification, publication, deployment, smoke-test, and rollback checklist.
+
+The ShareBridge product version is independent of its transport protocol, message envelope, configuration schema, and supported Immich API versions. Compatibility changes in those interfaces are documented separately and do not imply matching version numbers.
+
+See the [changelog](CHANGELOG.md) for released behavior, the [roadmap](TODO.md) for unfinished work, and [design specifications](docs/superpowers/specs/) for architectural background. Design documents may include proposals that are not shipped.
