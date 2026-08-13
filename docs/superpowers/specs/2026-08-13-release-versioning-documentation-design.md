@@ -74,7 +74,7 @@ Create `docs/RELEASING.md` as the repeatable operator workflow:
 5. create a GitHub Release using a concise changelog-derived summary;
 6. confirm the versioned and immutable-SHA GHCR agent images;
 7. deploy the signaling server with its established redeploy script;
-8. deploy the agent through the Komodo API and wait for completion;
+8. deploy the agent through the established container platform and wait for completion;
 9. verify the deployed image, signaling connection, and representative live
    file/gallery flows;
 10. document rollback using the prior source tag and immutable agent image.

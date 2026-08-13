@@ -16,7 +16,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Immich share discovery, password-protected albums, image previews, streamed video playback and seeking, and multi-part Download All archives.
 - Direct WebRTC transfers and a secure-relay fallback with end-to-end Noise encryption.
 - Independent control, interactive-media, thumbnail, and bulk lanes with operation correlation, scheduling, and backpressure.
-- Agent container publication to GHCR and deployment support for Versa through Komodo.
+- Agent container publication to GHCR for self-hosted deployments.
 
 ### Changed
 

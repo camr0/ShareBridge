@@ -305,7 +305,7 @@ agent/internal/web/
     └── ...
 ```
 
-This ensures the UI works offline (home server without internet access).
+This ensures the UI works offline (private server without internet access).
 
 ---
 

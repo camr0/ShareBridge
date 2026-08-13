@@ -1533,7 +1533,7 @@ Open a second terminal:
 ```bash
 cd /Users/ali/Git/OpenCloudShare/agent
 AUTH_TOKEN=dev-token \
-SHARE_URL=https://cloud.afrino-ratio.ts.net/s/NtYwGbSLxITQxgY \
+SHARE_URL=https://cloud.example.com/s/NtYwGbSLxITQxgY \
 go run ./cmd/agent
 ```
 

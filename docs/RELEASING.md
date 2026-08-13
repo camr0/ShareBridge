@@ -59,7 +59,7 @@ cd signaling-server
 ./redeploy.sh
 ```
 
-Deploy the `sharebridge-agent` stack through Komodo's `DeployStack` API, then monitor the asynchronous deployment through completion. Never store Komodo credentials or other secrets in this repository.
+Deploy the `sharebridge-agent` container using the operator's established self-hosting platform, then monitor the deployment through completion. Never store deployment credentials or other secrets in this repository.
 
 Verify all of the following:
 
@@ -71,4 +71,4 @@ Verify all of the following:
 
 ## 5. Roll back
 
-For the signaling server, check out the prior source tag and rerun the established server deployment procedure. For the agent, temporarily pin the prior immutable full-SHA GHCR tag in Versa and redeploy through Komodo. Repeat the production smoke tests after either rollback and document why it was required.
+For the signaling server, check out the prior source tag and rerun the established server deployment procedure. For the agent, temporarily pin the prior immutable full-SHA GHCR tag and redeploy it through the established container platform. Repeat the production smoke tests after either rollback and document why it was required.

@@ -204,12 +204,12 @@ func TestCreateAndValidateAPIKey(t *testing.T) {
 	testApp := newTestApp(t)
 	accountID := createTestUser(t, testApp)
 
-	fullKey, keyData, err := pbstore.CreateAPIKey(testApp, accountID, "home server")
+	fullKey, keyData, err := pbstore.CreateAPIKey(testApp, accountID, "private server")
 	require.NoError(t, err)
 	assert.NotEmpty(t, fullKey)
 	assert.NotEmpty(t, keyData.RecordID)
 	assert.Equal(t, accountID, keyData.AccountID)
-	assert.Equal(t, "home server", keyData.Label)
+	assert.Equal(t, "private server", keyData.Label)
 	assert.True(t, keyData.IsActive)
 
 	// Full key format: <record_id>.<secret>

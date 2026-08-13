@@ -106,7 +106,7 @@ Share codes, HMAC pre-challenge flow (knock/nonce/join/auth_failed), quota track
 ### Relay path
 
 ```
-1. Agent starts up (home server)
+1. Agent starts up (private server)
    → connects outbound to wss://relay.sharebridge.app (Cloudflare DNS-only → Caddy → localhost:9001)
    → connects with API key in query param (same as signaling WS: ?api_key=...)
    → relay validates API key against PocketBase (in-process call), registers agent peer ID → account ID mapping

@@ -48,7 +48,7 @@ No custom fields needed for 10a. Future slices (10b, 10c) will add quota and bil
 | `id` | Auto (PocketBase) | Replaces `ak_xxx` format |
 | `account_id` | Relation → users | Required, CascadeDelete: true |
 | `key_hash` | Text | bcrypt hash of full key, not exposed via API |
-| `label` | Text | Optional human-readable name (e.g. "home server") |
+| `label` | Text | Optional human-readable name (e.g. "private server") |
 | `last_used_at` | Date | Nullable, updated on each use |
 | `is_active` | Bool | Default true; false = revoked |
 | `created` | Auto (PocketBase) | |
