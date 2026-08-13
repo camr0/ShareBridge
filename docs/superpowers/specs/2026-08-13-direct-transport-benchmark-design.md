@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-13
 **Status:** Approved for planning
-**Scope:** `agent/cmd/bench` (new), zero production-code changes
+**Scope:** `agent/cmd/benchdirect` (new), zero production-code changes
 
 ## Purpose
 
@@ -32,7 +32,7 @@ expectations. It does **not** change the transport; it measures it.
    it as a black box through existing interfaces. Instrumentation comes from Go
    `pprof`, the already-exposed `BufferedAmount()`, and end-to-end bytes/time.
 2. **No API keys, no signaling server, no TURN, no PocketBase.** Self-contained.
-3. **CLI-runnable.** `go run ./cmd/bench ...` launches headless Chrome itself.
+3. **CLI-runnable.** `go run ./cmd/benchdirect ...` launches headless Chrome itself.
 4. **Single Go binary + installed Chrome.** No Node toolchain on the bench side.
 5. **Controlled latency and loss.** Simulated in-process, no kernel tools, no root.
 
@@ -127,7 +127,7 @@ parameter; latency is phase 1.
 ## Components
 
 ```
-agent/cmd/bench/
+agent/cmd/benchdirect/
   main.go        CLI + orchestration; launches Chrome via chromedp
   shim.go        UDP latency/loss shim (listeners PA/PB, delay queue)
   sdp.go         read + rewrite candidate address/port in offer/answer
@@ -164,7 +164,7 @@ agent/cmd/bench/
 ## CLI Contract
 
 ```
-go run ./cmd/bench \
+go run ./cmd/benchdirect \
   --mode raw|prod            # A or B
   --rtt 0|25|50|100          # added RTT in ms
   --loss 0.0                 # packet loss fraction (phase 2)
@@ -267,7 +267,7 @@ is the ceiling" from "the machine/loopback itself is the ceiling."
 | chromedp flakiness / version drift | Pin chromedp; deterministic `/start`→`/answer` protocol; timeouts + retry; smoke test |
 | Port collisions | Bind shim/HTTP on `127.0.0.1:0` and read assigned ports |
 | Loopback timing noise at RTT 0 | Probe actual RTT first; report it with results |
-| `agent/go.mod` gains chromedp | Go links only imported packages, so `cmd/agent` is unaffected; chromedp is imported only by `cmd/bench` |
+| `agent/go.mod` gains chromedp | Go links only imported packages, so `cmd/agent` is unaffected; chromedp is imported only by `cmd/benchdirect` |
 
 ## Dependencies
 
