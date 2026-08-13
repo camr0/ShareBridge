@@ -23,6 +23,7 @@ type runConfig struct {
 	deadline     time.Duration
 	window       int64
 	minCwnd      int64
+	jitter       time.Duration
 }
 
 type rawResult struct {
@@ -41,6 +42,7 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	if err != nil {
 		return res, fmt.Errorf("new shim: %w", err)
 	}
+	shim.SetJitter(cfg.jitter)
 	defer shim.Close()
 
 	se := webrtc.SettingEngine{}

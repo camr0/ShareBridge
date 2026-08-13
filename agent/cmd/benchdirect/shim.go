@@ -20,10 +20,11 @@ type packet struct {
 // datagram whose source address is not A. Datagrams from A are forwarded to B
 // and vice versa, each after a fixed delay.
 type Shim struct {
-	mu     sync.Mutex
-	conn   *net.UDPConn
-	delay  time.Duration
-	loss   float64
+	mu        sync.Mutex
+	conn      *net.UDPConn
+	delay     time.Duration
+	loss      float64
+	jitter    time.Duration
 	a      *net.UDPAddr
 	b      *net.UDPAddr
 	queue     []packet
@@ -64,6 +65,12 @@ func (s *Shim) SetPeerA(a *net.UDPAddr) {
 	s.mu.Unlock()
 }
 
+func (s *Shim) SetJitter(j time.Duration) {
+	s.mu.Lock()
+	s.jitter = j
+	s.mu.Unlock()
+}
+
 func (s *Shim) readLoop() {
 	defer s.wg.Done()
 	buf := make([]byte, 64*1024)
@@ -101,7 +108,11 @@ func (s *Shim) readLoop() {
 			continue
 		}
 		headEmpty := len(s.queue) == 0
-		s.queue = append(s.queue, packet{data: data, addr: target, due: time.Now().Add(s.delay)})
+		d := s.delay
+		if s.jitter > 0 {
+			d += time.Duration((rand.Float64()*2 - 1) * float64(s.jitter))
+		}
+		s.queue = append(s.queue, packet{data: data, addr: target, due: time.Now().Add(d)})
 		if headEmpty {
 			select {
 			case s.notify <- struct{}{}:

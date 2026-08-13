@@ -117,3 +117,25 @@ In `agent/internal/peer` (the pion `SettingEngine` used for real peer connection
    reverse direction and RTO sensitivity.
 3. Note: ShareBridge's multilane (control/media/bulk DataChannels) shares ONE SCTP association, so it
    does NOT increase throughput — the window is per-association, not per-lane.
+
+## Jitter validation — is the collapse real, or a zero-jitter shim artifact?
+
+Added `--jitter` (per-packet uniform +/- ms). At rtt=100, 10 ms jitter (realistic WAN), 100 MiB:
+
+| mode | minCwnd=0 (default) | minCwnd=4MiB |
+|---|---|---|
+| raw  (5 reps) | 41–252, mean ~147, chaotic | **188–218, mean ~199, tight** |
+| prod (5 reps) | 82–257, mean ~190, chaotic | 122–222, mean ~177 |
+
+- The collapse is NOT a zero-jitter artifact: it fires at 5 ms and 10 ms jitter too (raw default drops to 41).
+- The fix removes the worst-case collapse and the variance in RAW mode (single DataChannel).
+- In PROD mode the improvement is modest — the mean is ~equal; the fix mainly tightens the low end.
+  The manager's 5 MB/10 ms backpressure + the ~5 MB receiver window leave a ~180–200 Mbps
+  second bottleneck at 100 ms that minCwnd does not lift. rwnd/RTT (~377 Mbps) remains the hard cap.
+
+## Bottom line
+`SetSCTPMinCwnd(4 MiB)` is a correct, strictly-better fix that removes the pathological collapse
+(10x in the single-channel case), but it is NOT a complete high-latency cure: steady-state at 100 ms
+RTT is still capped ~180–200 Mbps by the receiver window + backpressure, and the hard ceiling is
+~377 Mbps (rwnd/RTT). Raising high-latency throughput beyond that needs parallel PeerConnections
+(multiply the window) or a non-SCTP transport.

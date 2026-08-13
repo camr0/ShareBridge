@@ -112,6 +112,7 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 	if err != nil {
 		return res, err
 	}
+	shim.SetJitter(cfg.jitter)
 	defer shim.Close()
 
 	se := webrtc.SettingEngine{}

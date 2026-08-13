@@ -23,6 +23,7 @@ func main() {
 	deadline := flag.Int("deadline", 30, "receive deadline in seconds")
 	window := flag.String("window", "5MiB", "backpressure window (raw mode)")
 	mincwnd := flag.String("mincwnd", "0", "minimum SCTP congestion window (e.g. 2MiB), 0 = default")
+	jitter := flag.Int("jitter", 0, "per-packet delay jitter in ms (uniform +/-)")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
 	flag.Parse()
 
@@ -61,6 +62,7 @@ func main() {
 		deadline:     time.Duration(*deadline) * time.Second,
 		window:       windowBytes,
 		minCwnd:      minCwndBytes,
+		jitter:       time.Duration(*jitter) * time.Millisecond,
 	}
 	if err := validateRunConfig(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
