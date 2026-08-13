@@ -15,6 +15,40 @@ type packet struct {
 	due  time.Time
 }
 
+// rateLimiter enforces a byte-rate ceiling using a token bucket.
+type rateLimiter struct {
+	rate   float64 // bytes per second
+	burst  float64 // max tokens (bytes)
+	tokens float64
+	last   time.Time
+}
+
+func newRateLimiter(bytesPerSec float64) *rateLimiter {
+	burst := bytesPerSec * 0.1 // 100ms of buffering (typical router queue)
+	return &rateLimiter{rate: bytesPerSec, burst: burst, tokens: burst, last: time.Now()}
+}
+
+func (r *rateLimiter) take(n int) {
+	if r.rate <= 0 {
+		return
+	}
+	for {
+		now := time.Now()
+		elapsed := now.Sub(r.last).Seconds()
+		r.last = now
+		r.tokens += elapsed * r.rate
+		if r.tokens > r.burst {
+			r.tokens = r.burst
+		}
+		if r.tokens >= float64(n) {
+			r.tokens -= float64(n)
+			return
+		}
+		deficit := float64(n) - r.tokens
+		time.Sleep(time.Duration(deficit / r.rate * float64(time.Second)))
+	}
+}
+
 // Shim is an in-process reflexive NAT that injects latency and loss between two
 // peers. Peer A is configured via SetPeerA; peer B is learned from the first
 // datagram whose source address is not A. Datagrams from A are forwarded to B
@@ -31,9 +65,13 @@ type Shim struct {
 	notify    chan struct{}
 	done      chan struct{}
 	wg        sync.WaitGroup
-	closed    bool
-	forwarded atomic.Int64
-	writeErrs atomic.Int64
+	closed        bool
+	limiter       *rateLimiter
+	maxQueueBytes int64
+	queueBytes    int64
+	forwarded     atomic.Int64
+	writeErrs     atomic.Int64
+	dropped       atomic.Int64
 }
 
 func NewShim(delay time.Duration, loss float64) (*Shim, error) {
@@ -69,6 +107,18 @@ func (s *Shim) SetJitter(j time.Duration) {
 	s.mu.Lock()
 	s.jitter = j
 	s.mu.Unlock()
+}
+
+func (s *Shim) SetBandwidth(bytesPerSec int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bytesPerSec <= 0 {
+		s.limiter = nil
+		s.maxQueueBytes = 0
+		return
+	}
+	s.limiter = newRateLimiter(float64(bytesPerSec))
+	s.maxQueueBytes = bytesPerSec / 10 // 100ms buffer before tail drop
 }
 
 func (s *Shim) readLoop() {
@@ -107,12 +157,18 @@ func (s *Shim) readLoop() {
 			s.mu.Unlock()
 			continue
 		}
+		if s.maxQueueBytes > 0 && s.queueBytes+int64(len(data)) > s.maxQueueBytes {
+			s.dropped.Add(1)
+			s.mu.Unlock()
+			continue
+		}
 		headEmpty := len(s.queue) == 0
 		d := s.delay
 		if s.jitter > 0 {
 			d += time.Duration((rand.Float64()*2 - 1) * float64(s.jitter))
 		}
 		s.queue = append(s.queue, packet{data: data, addr: target, due: time.Now().Add(d)})
+		s.queueBytes += int64(len(data))
 		if headEmpty {
 			select {
 			case s.notify <- struct{}{}:
@@ -140,6 +196,8 @@ func (s *Shim) drainLoop() {
 			head := s.queue[0]
 			wait := time.Until(head.due)
 			s.queue = s.queue[1:]
+			s.queueBytes -= int64(len(head.data))
+			limiter := s.limiter
 			s.mu.Unlock()
 
 			if wait > 0 {
@@ -158,6 +216,9 @@ func (s *Shim) drainLoop() {
 				return
 			default:
 			}
+			if limiter != nil {
+				limiter.take(len(head.data))
+			}
 			if _, err := s.conn.WriteToUDP(head.data, head.addr); err != nil {
 				s.writeErrs.Add(1)
 			} else {
@@ -167,8 +228,8 @@ func (s *Shim) drainLoop() {
 	}
 }
 
-func (s *Shim) Stats() (forwarded, writeErrs int64) {
-	return s.forwarded.Load(), s.writeErrs.Load()
+func (s *Shim) Stats() (forwarded, writeErrs, dropped int64) {
+	return s.forwarded.Load(), s.writeErrs.Load(), s.dropped.Load()
 }
 
 func (s *Shim) Close() error {

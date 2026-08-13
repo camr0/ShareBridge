@@ -158,3 +158,28 @@ With 12 reps @ rtt=100, 10 ms jitter, 100 MiB:
   So the fix matters MORE in production, not less.
 - Distributions stay bimodal even with the fix, but the whole distribution shifts up.
 - n=12 is enough to separate the conditions; the earlier n=5 conclusion was wrong.
+
+## CRITICAL CORRECTION — bandwidth matters (2026-08-13)
+
+The earlier "minCwnd=4MiB ≈ 2x fix" was an artifact of a LOOPBACK shim (infinite bandwidth).
+Added `--bandwidth` (token bucket + 100ms bounded buffer with tail drop) and re-ran at a
+bandwidth-constrained link (8 MB/s, rtt=100, jitter=10):
+
+| minCwnd | throughput |
+|---|---|
+| 0 (default) | 12–16 Mbps |
+| 1 MiB | 9.1 Mbps |
+| 2 MiB | 4.8 Mbps |
+| 4 MiB | 2.4–2.9 Mbps (worse; hangs on large files) |
+
+**minCwnd monotonically DEGRADES throughput on a bandwidth-constrained link.** A 4 MiB floor
+over-drives the link (in-flight >> bandwidth-delay product), filling the bottleneck buffer, causing
+tail drop → SCTP retransmission storm → collapse. This reproduces the real-world symptom: a brief
+spike then crawl to ~1 MB/s.
+
+**Conclusion:** the minCwnd "fix" was WRONG for real networks. The loopback benchmark modeled RTT/loss
+but NOT bandwidth, collapsing two regimes: (1) infinite-bandwidth links where spurious-timeout collapse
+dominates and a floor helps, and (2) bandwidth-constrained links where over-driving dominates and a
+floor hurts. Real downloads are in regime (2). The fix was reverted in peer.go. The correct high-RTT
+improvement (if bandwidth is NOT the limit) is a larger receiver window / parallel connections — not a
+congestion-window floor.
