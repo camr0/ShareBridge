@@ -10,6 +10,9 @@ func TestRunProdSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping browser smoke test in -short mode")
 	}
+	if chromePath() == "" {
+		t.Skip("skipping browser smoke test: Chrome not installed")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	res, err := runProd(ctx, runConfig{
