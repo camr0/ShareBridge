@@ -1,0 +1,15 @@
+{"label":"raw_event_64k_128m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":0,"sent_bytes":134217728,"received_bytes":134217728,"mbps":512.7462031655123}}
+{"label":"raw_poll_64k_128m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":0,"sent_bytes":134217728,"received_bytes":134217728,"mbps":526.9639889696787}}
+{"label":"prod_128m","status":"ok","rc":0,"result":{"mode":"prod","rtt_ms":0,"sent_bytes":134217728,"received_bytes":134217728,"mbps":522.7310374009166}}
+{"label":"raw_event_16k_128m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":0,"sent_bytes":134217728,"received_bytes":134217728,"mbps":513.0156827520306}}
+{"label":"raw_poll_16k_128m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":0,"sent_bytes":134217728,"received_bytes":134217728,"mbps":522.2733712486951}}
+{"label":"raw_poll_rtt25_32m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":25,"sent_bytes":33554432,"received_bytes":33554432,"mbps":444.7977729908865}}
+{"label":"prod_rtt25_32m","status":"ok","rc":0,"result":{"mode":"prod","rtt_ms":25,"sent_bytes":33554432,"received_bytes":33554432,"mbps":423.3330011675953}}
+{"label":"raw_poll_rtt50_16m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":50,"sent_bytes":16777216,"received_bytes":16777216,"mbps":258.4091798940426}}
+{"label":"prod_rtt50_16m","status":"ok","rc":0,"result":{"mode":"prod","rtt_ms":50,"sent_bytes":16777216,"received_bytes":16777216,"mbps":171.590038342902}}
+{"label":"raw_poll_rtt100_8m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":100,"sent_bytes":8388608,"received_bytes":8388608,"mbps":91.40406428172366}}
+{"label":"prod_rtt100_8m","status":"ok","rc":0,"result":{"mode":"prod","rtt_ms":100,"sent_bytes":8388608,"received_bytes":8388608,"mbps":65.27464644122661}}
+{"label":"raw_poll_loss1_16m","status":"ok","rc":0,"result":{"mode":"raw","rtt_ms":25,"sent_bytes":16777216,"received_bytes":16777216,"mbps":4.15033637403754}}
+{"label":"prod_loss1_16m","status":"error","rc":1,"stderr":"bench failed: timed out waiting for receiver: 16646144/16777216 "}
+{"label":"raw_poll_loss5_16m","status":"error","rc":1,"stderr":"bench failed: timed out waiting for receiver: 16187392/16777216 "}
+{"label":"prod_loss5_16m","status":"error","rc":1,"stderr":"bench failed: timed out waiting for receiver: 4980736/16777216 "}

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReportJSONRoundTrip(t *testing.T) {
@@ -49,7 +50,7 @@ func TestParseByteSize(t *testing.T) {
 }
 
 func TestValidateRunConfig(t *testing.T) {
-	valid := runConfig{mode: "raw", rttMs: 25, loss: 0.5, size: 8 << 20, chunk: 16 << 10, backpressure: "event"}
+	valid := runConfig{mode: "raw", rttMs: 25, loss: 0.5, size: 8 << 20, chunk: 16 << 10, backpressure: "event", deadline: 30 * time.Second}
 	cases := []struct {
 		name    string
 		mutate  func(*runConfig)
@@ -68,6 +69,8 @@ func TestValidateRunConfig(t *testing.T) {
 		{"loss above range", func(c *runConfig) { c.loss = 1.1 }, true},
 		{"invalid backpressure", func(c *runConfig) { c.backpressure = "burst" }, true},
 		{"invalid mode", func(c *runConfig) { c.mode = "quic" }, true},
+		{"zero deadline", func(c *runConfig) { c.deadline = 0 }, true},
+		{"negative deadline", func(c *runConfig) { c.deadline = -time.Second }, true},
 		{"prod skips backpressure", func(c *runConfig) { c.mode = "prod"; c.backpressure = "burst" }, false},
 	}
 	for _, tc := range cases {

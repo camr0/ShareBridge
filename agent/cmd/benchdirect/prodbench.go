@@ -210,7 +210,7 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 	mgr := transfer.NewManager(set, benchStorage{size: cfg.size}, 0)
 	go mgr.HandleMessage([]byte(`{"type":"file_request","path":"bench.bin","request_id":"bench"}`))
 
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(cfg.deadline)
 	for {
 		if err := ctx.Err(); err != nil {
 			return res, err

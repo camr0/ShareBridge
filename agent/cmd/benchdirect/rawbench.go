@@ -18,6 +18,7 @@ type runConfig struct {
 	size         int64
 	chunk        int
 	backpressure string
+	deadline     time.Duration
 }
 
 type rawResult struct {
@@ -168,7 +169,7 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	}
 
 	// Wait for the browser to receive everything.
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(cfg.deadline)
 	for {
 		if err := ctx.Err(); err != nil {
 			return res, err

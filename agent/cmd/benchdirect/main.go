@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -19,6 +20,7 @@ func main() {
 	size := flag.String("size", "512MiB", "total bytes to send (e.g. 8MiB)")
 	chunk := flag.String("chunk", "16KiB", "bytes per send (e.g. 16KiB)")
 	backpressure := flag.String("backpressure", "event", "event|poll (mode A only)")
+	deadline := flag.Int("deadline", 30, "receive deadline in seconds")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
 	flag.Parse()
 
@@ -44,6 +46,7 @@ func main() {
 		size:         sizeBytes,
 		chunk:        int(chunkBytes),
 		backpressure: *backpressure,
+		deadline:     time.Duration(*deadline) * time.Second,
 	}
 	if err := validateRunConfig(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -97,6 +100,9 @@ func validateRunConfig(cfg runConfig) error {
 	}
 	if cfg.chunk <= 0 {
 		return fmt.Errorf("invalid -chunk %d: must be > 0", cfg.chunk)
+	}
+	if cfg.deadline <= 0 {
+		return fmt.Errorf("invalid -deadline %v: must be > 0", cfg.deadline)
 	}
 	if math.IsNaN(cfg.loss) || math.IsInf(cfg.loss, 0) {
 		return fmt.Errorf("invalid -loss %v: must be finite", cfg.loss)
