@@ -67,7 +67,10 @@ func main() {
 
 	fmt.Fprintln(os.Stderr, humanSummary(res))
 	if *out == "-" {
-		_ = writeJSON(os.Stdout, res)
+		if err := writeJSON(os.Stdout, res); err != nil {
+			fmt.Fprintln(os.Stderr, "write output:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if err := writeResult(*out, res); err != nil {
