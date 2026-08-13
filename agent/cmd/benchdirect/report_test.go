@@ -45,3 +45,20 @@ func TestParseByteSize(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRunConfig(t *testing.T) {
+	t.Run("rejects invalid loss", func(t *testing.T) {
+		if err := validateRunConfig(runConfig{loss: -0.1, backpressure: "event"}); err == nil {
+			t.Fatal("expected error for negative loss")
+		}
+		if err := validateRunConfig(runConfig{loss: 1.1, backpressure: "event"}); err == nil {
+			t.Fatal("expected error for loss > 1")
+		}
+	})
+
+	t.Run("rejects invalid backpressure", func(t *testing.T) {
+		if err := validateRunConfig(runConfig{loss: 0.5, backpressure: "burst"}); err == nil {
+			t.Fatal("expected error for invalid backpressure")
+		}
+	})
+}

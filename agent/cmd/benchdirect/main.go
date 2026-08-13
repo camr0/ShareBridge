@@ -39,6 +39,10 @@ func main() {
 		chunk:        int(chunkBytes),
 		backpressure: *backpressure,
 	}
+	if err := validateRunConfig(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -66,13 +70,41 @@ func main() {
 		_ = writeJSON(os.Stdout, res)
 		return
 	}
-	f, err := os.Create(*out)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "open output:", err)
+	if err := writeResult(*out, res); err != nil {
+		fmt.Fprintln(os.Stderr, "write output:", err)
 		os.Exit(1)
 	}
-	defer f.Close()
-	_ = writeJSON(f, res)
+}
+
+func validateRunConfig(cfg runConfig) error {
+	if cfg.loss < 0 || cfg.loss > 1 {
+		return fmt.Errorf("invalid -loss %v: must be between 0 and 1", cfg.loss)
+	}
+	switch cfg.backpressure {
+	case "event", "poll":
+		return nil
+	default:
+		return fmt.Errorf("invalid -backpressure %q: must be event or poll", cfg.backpressure)
+	}
+}
+
+func writeResult(out string, res rawResult) (err error) {
+	if out == "-" {
+		return writeJSON(os.Stdout, res)
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		return fmt.Errorf("open output: %w", err)
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("close output: %w", cerr)
+		}
+	}()
+	if err := writeJSON(f, res); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+	return nil
 }
 
 func parseByteSize(s string) (int64, error) {
