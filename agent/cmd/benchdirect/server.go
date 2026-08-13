@@ -23,11 +23,19 @@ func newBenchServer(offerFn func() string, answerCh chan string, fs fs.FS) *benc
 func (s *benchServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"offer": s.offerFn(), "mode": s.mode, "size": s.size, "chunk": s.chunk,
 		})
 	})
 	mux.HandleFunc("/answer", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		var body struct {
 			SDP string `json:"sdp"`
 		}

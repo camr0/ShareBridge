@@ -33,6 +33,12 @@ async function run() {
   await pc.setRemoteDescription({ type: 'offer', sdp: cfg.offer })
   const answer = await pc.createAnswer()
   await pc.setLocalDescription(answer)
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve()
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === 'complete') resolve()
+    }
+  })
   await fetch('/answer', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
