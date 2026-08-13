@@ -139,3 +139,22 @@ Added `--jitter` (per-packet uniform +/- ms). At rtt=100, 10 ms jitter (realisti
 RTT is still capped ~180–200 Mbps by the receiver window + backpressure, and the hard ceiling is
 ~377 Mbps (rwnd/RTT). Raising high-latency throughput beyond that needs parallel PeerConnections
 (multiply the window) or a non-SCTP transport.
+
+## CORRECTION (n=12 per condition) — the fix DOES help prod (~2x)
+
+The earlier 5-rep prod comparison (mean 190 vs 177) was sampling noise on a bimodal distribution.
+With 12 reps @ rtt=100, 10 ms jitter, 100 MiB:
+
+| condition | mean | median | min | max |
+|---|---|---|---|---|
+| raw  default      | 141.6 | 131.6 | 35 | 253 |
+| raw  minCwnd=4MiB | 223.9 | 224.5 | 111 | 314 |
+| prod default      |  93.8 |  80.6 | 55 | 257 |
+| prod minCwnd=4MiB | 172.9 | 155.7 | 88 | 314 |
+
+- minCwnd=4MiB ≈ **+70% raw (median 132→224), ≈ +93% prod (median 81→156)** — roughly doubles both.
+- **prod default is WORSE than raw default** (median 81 vs 132): the 3-lane production path collapses
+  more readily (control/media/bulk share one SCTP association, more interleaving → more spurious RTOs).
+  So the fix matters MORE in production, not less.
+- Distributions stay bimodal even with the fix, but the whole distribution shifts up.
+- n=12 is enough to separate the conditions; the earlier n=5 conclusion was wrong.
