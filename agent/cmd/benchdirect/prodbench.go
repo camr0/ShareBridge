@@ -113,6 +113,7 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 		return res, err
 	}
 	shim.SetJitter(cfg.jitter)
+	shim.SetBandwidth(cfg.bandwidth)
 	defer shim.Close()
 
 	se := webrtc.SettingEngine{}
@@ -250,8 +251,8 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 		d := summary.Samples[i] - summary.Samples[i-1]
 		fmt.Fprintf(&sb, " %.0f", float64(d)*8/0.1/1e6)
 	}
-	fw, we := shim.Stats()
-	fmt.Fprintf(os.Stderr, "trace %s rtt=%d loss=%v mbps/100ms:%s | shim fwd=%d writeErr=%d\n",
-		cfg.mode, cfg.rttMs, cfg.loss, sb.String(), fw, we)
+	fw, we, dropped := shim.Stats()
+	fmt.Fprintf(os.Stderr, "trace %s rtt=%d loss=%v mbps/100ms:%s | shim fwd=%d writeErr=%d drop=%d\n",
+		cfg.mode, cfg.rttMs, cfg.loss, sb.String(), fw, we, dropped)
 	return res, nil
 }

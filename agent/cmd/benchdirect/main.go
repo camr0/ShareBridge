@@ -24,6 +24,7 @@ func main() {
 	window := flag.String("window", "5MiB", "backpressure window (raw mode)")
 	mincwnd := flag.String("mincwnd", "0", "minimum SCTP congestion window (e.g. 2MiB), 0 = default")
 	jitter := flag.Int("jitter", 0, "per-packet delay jitter in ms (uniform +/-)")
+	bandwidth := flag.String("bandwidth", "0", "link bandwidth cap (e.g. 8MB), 0 = unlimited")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
 	flag.Parse()
 
@@ -51,6 +52,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid -mincwnd:", minCwndErr)
 		os.Exit(2)
 	}
+	bandwidthBytes, bandwidthErr := parseByteSize(*bandwidth)
+	if bandwidthErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -bandwidth:", bandwidthErr)
+		os.Exit(2)
+	}
 
 	cfg := runConfig{
 		mode:         *mode,
@@ -63,6 +69,7 @@ func main() {
 		window:       windowBytes,
 		minCwnd:      minCwndBytes,
 		jitter:       time.Duration(*jitter) * time.Millisecond,
+		bandwidth:    bandwidthBytes,
 	}
 	if err := validateRunConfig(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -122,6 +129,9 @@ func validateRunConfig(cfg runConfig) error {
 	}
 	if cfg.minCwnd < 0 {
 		return fmt.Errorf("invalid -mincwnd %d: must be >= 0", cfg.minCwnd)
+	}
+	if cfg.bandwidth < 0 {
+		return fmt.Errorf("invalid -bandwidth %d: must be >= 0", cfg.bandwidth)
 	}
 	if cfg.deadline <= 0 {
 		return fmt.Errorf("invalid -deadline %v: must be > 0", cfg.deadline)
