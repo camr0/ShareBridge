@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -49,13 +50,67 @@ type Album struct {
 }
 
 type Asset struct {
-	ID               string    `json:"id"`
-	OriginalFileName string    `json:"originalFileName"`
-	OriginalMimeType string    `json:"originalMimeType"`
-	Type             string    `json:"type"`
-	Duration         string    `json:"duration"`
-	Checksum         string    `json:"checksum"`
-	ExifInfo         *ExifInfo `json:"exifInfo"`
+	ID               string        `json:"id"`
+	OriginalFileName string        `json:"originalFileName"`
+	OriginalMimeType string        `json:"originalMimeType"`
+	Type             string        `json:"type"`
+	Duration         assetDuration `json:"duration"`
+	Checksum         string        `json:"checksum"`
+	ExifInfo         *ExifInfo     `json:"exifInfo"`
+}
+
+// assetDuration accepts both Immich's legacy timestamp strings and its current
+// integer millisecond representation.
+type assetDuration struct {
+	legacy       string
+	milliseconds *float64
+}
+
+func (d assetDuration) MarshalJSON() ([]byte, error) {
+	if d.milliseconds != nil {
+		return json.Marshal(*d.milliseconds)
+	}
+	if d.legacy != "" {
+		return json.Marshal(d.legacy)
+	}
+	return []byte("null"), nil
+}
+
+func (d *assetDuration) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("null")) {
+		*d = assetDuration{}
+		return nil
+	}
+	if len(data) > 0 && data[0] == '"' {
+		var legacy string
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return fmt.Errorf("decode duration string: %w", err)
+		}
+		*d = assetDuration{legacy: legacy}
+		return nil
+	}
+
+	var milliseconds float64
+	if err := json.Unmarshal(data, &milliseconds); err != nil {
+		return fmt.Errorf("duration must be a string, number, or null: %w", err)
+	}
+	if milliseconds < 0 || math.IsInf(milliseconds, 0) || math.IsNaN(milliseconds) || math.Trunc(milliseconds) != milliseconds {
+		return fmt.Errorf("duration milliseconds must be a non-negative integer")
+	}
+	*d = assetDuration{milliseconds: &milliseconds}
+	return nil
+}
+
+func (d assetDuration) seconds() *float64 {
+	if d.milliseconds != nil {
+		seconds := *d.milliseconds / 1000
+		return &seconds
+	}
+	return parseDurationSeconds(d.legacy)
+}
+
+func legacyAssetDuration(value string) assetDuration {
+	return assetDuration{legacy: value}
 }
 
 type ExifInfo struct {
@@ -340,7 +395,7 @@ func galleryItemFromAsset(asset Asset) GalleryItem {
 		Name:     asset.OriginalFileName,
 		MimeType: asset.OriginalMimeType,
 		Size:     asset.FileSize(),
-		Duration: parseDurationSeconds(asset.Duration),
+		Duration: asset.Duration.seconds(),
 		SHA1:     decodeBase64SHA1(asset.Checksum),
 	}
 	if asset.ExifInfo != nil {

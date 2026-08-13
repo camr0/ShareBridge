@@ -50,6 +50,61 @@ func TestPollSharesUsesAPIKeyAndNormalizesProtection(t *testing.T) {
 	require.True(t, shares[1].IsPasswordProtected())
 }
 
+func TestPollSharesAcceptsNumericDurationMilliseconds(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/shared-links", r.URL.Path)
+		_, _ = w.Write([]byte(`[{"key":"sharekey","type":"ALBUM","assets":[{"id":"asset-1","type":"VIDEO","duration":94500}]}]`))
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), APIKey: "api-key"})
+	require.NoError(t, err)
+	shares, err := client.PollShares(t.Context())
+	require.NoError(t, err)
+	require.Len(t, shares, 1)
+	require.Len(t, shares[0].Assets, 1)
+	require.NotNil(t, shares[0].Assets[0].Duration.seconds())
+	require.Equal(t, 94.5, *shares[0].Assets[0].Duration.seconds())
+}
+
+func TestAssetDurationJSONCompatibility(t *testing.T) {
+	tests := []struct {
+		name        string
+		jsonValue   string
+		wantSeconds *float64
+		wantError   bool
+	}{
+		{name: "legacy timestamp", jsonValue: `"00:01:34.500"`, wantSeconds: float64Ptr(94.5)},
+		{name: "integer milliseconds", jsonValue: `94500`, wantSeconds: float64Ptr(94.5)},
+		{name: "null", jsonValue: `null`},
+		{name: "wrong JSON type", jsonValue: `true`, wantError: true},
+		{name: "negative milliseconds", jsonValue: `-1`, wantError: true},
+		{name: "fractional milliseconds", jsonValue: `1.5`, wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var duration assetDuration
+			err := json.Unmarshal([]byte(tt.jsonValue), &duration)
+			if tt.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			if tt.wantSeconds == nil {
+				require.Nil(t, duration.seconds())
+				return
+			}
+			require.NotNil(t, duration.seconds())
+			require.Equal(t, *tt.wantSeconds, *duration.seconds())
+		})
+	}
+}
+
+func float64Ptr(value float64) *float64 {
+	return &value
+}
+
 func TestPollSharesRejectsRedirectToHostOutsideAllowList(t *testing.T) {
 	disallowed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]SharedLink{{Key: "redirected", Type: "ALBUM"}})
@@ -176,7 +231,7 @@ func TestListGalleryConvertsImmichAssetsToGalleryItems(t *testing.T) {
 				ExifInfo: &ExifInfo{ExifImageWidth: 4000, ExifImageHeight: 3000, FileSizeInByte: 1234},
 			}, {
 				ID: "asset-2", OriginalFileName: "clip.mp4", OriginalMimeType: "video/mp4",
-				Type: "VIDEO", Duration: "00:01:34.500",
+				Type: "VIDEO", Duration: legacyAssetDuration("00:01:34.500"),
 				ExifInfo: &ExifInfo{FileSizeInByte: 4567},
 			}},
 		})
