@@ -37,6 +37,12 @@ type Peer struct {
 	onICECandidate      func(init webrtc.ICECandidateInit)
 }
 
+// sctpMinCwnd is the minimum SCTP congestion window (4 MiB). pion's default
+// (no minimum) lets spurious retransmission timeouts at high RTT collapse the
+// congestion window to ~1 MTU, which craters download throughput (measured ~2x
+// improvement at 100 ms RTT in agent/cmd/benchdirect; see BENCH_RESULTS.md).
+const sctpMinCwnd uint32 = 4 * 1024 * 1024
+
 // New creates a PeerConnection with the given ICE servers.
 // If relayOnly is true, forces ICETransportPolicyRelay to hide the agent's IP.
 func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
@@ -45,7 +51,11 @@ func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
 		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
 	}
 
-	pc, err := webrtc.NewPeerConnection(config)
+	se := webrtc.SettingEngine{}
+	se.SetSCTPMinCwnd(sctpMinCwnd)
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
+
+	pc, err := api.NewPeerConnection(config)
 	if err != nil {
 		return nil, fmt.Errorf("new peer connection: %w", err)
 	}
