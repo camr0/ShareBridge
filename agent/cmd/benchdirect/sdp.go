@@ -15,7 +15,7 @@ func RewriteHostCandidatePort(sdp string, newPort int) (string, int, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 8 || fields[4] != "127.0.0.1" {
+		if len(fields) < 8 || fields[4] != "127.0.0.1" || fields[7] != "host" {
 			continue
 		}
 		port, err := strconv.Atoi(fields[5])
