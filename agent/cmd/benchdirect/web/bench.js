@@ -24,6 +24,7 @@ async function run() {
   pc.ondatachannel = (e) => {
     const ch = e.channel
     ch.binaryType = 'arraybuffer'
+    if (cfg.mode === 'prod' && ch.label !== 'bulk') return
     ch.onmessage = (m) => {
       if (cfg.mode === 'prod') note(m.data.byteLength - 14)
       else note(m.data.byteLength)
