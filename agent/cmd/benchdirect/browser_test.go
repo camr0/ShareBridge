@@ -161,7 +161,7 @@ func TestPageContract(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if keysJSON != `["elapsedMs","mbps","received"]` {
+	if keysJSON != `["elapsedMs","mbps","received","samples"]` {
 		t.Fatalf("summary keys = %s", keysJSON)
 	}
 }

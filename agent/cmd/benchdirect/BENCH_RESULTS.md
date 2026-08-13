@@ -74,3 +74,46 @@ the high-RTT variance is bimodal, not a small-transfer artifact.
 The sender loop is not the bottleneck — but at rtt ≥ 50 ms the *SCTP link itself* is unpredictable
 (bimodal), which is the real risk to direct-mode transfers over WAN latencies. More reps won't fix it;
 explaining it needs a congestion-window/BufferedAmount time series, not bigger files.
+
+## Root cause of high-latency collapse (investigated 2026-08-13)
+
+Instrumentation added: receiver throughput trace (100 ms samples), shim packet counters (`writeErr`),
+`--window` (sender backpressure), `--mincwnd` (pion SCTP min congestion window). Findings:
+
+### 1. The deterministic ceiling is the receiver's advertised window (rwnd) / RTT
+- Fast-mode plateau = ~372–377 Mbps at rtt=100 = **~5 MB in flight** = `rwnd / RTT`.
+- Proved it's NOT the sender's 5 MB backpressure: `--window 5→16→32→64 MiB` did not change the plateau.
+- pion sctp: `ssthresh` is initialized to `RWND()` (the receiver's window), so slow-start stops there.
+- Chrome's usrsctp rwnd ≈ 5 MB. Not tunable from the Go sender side.
+
+### 2. The "slow mode" (5–26 Mbps) is SCTP congestion-window collapse
+- Trace shows clean exponential slow-start (5→16→26→52→110→215→377 Mbps) then **collapse to 0
+  (spurious RTO) and a ratchet-down** 377→105→52→31→16→5 Mbps, each event halving ssthresh.
+- `writeErr=0` in the shim → no packet loss; the collapses are SCTP retransmission-timeout (RTO)
+  events triggered by RTT jitter (delayed SACK + fixed shim delay) at high RTT.
+- pion's default has **no minimum cwnd**, so each RTO drops cwnd to ~1 MTU and it re-slow-starts,
+  repeatedly, from an ever-lower ssthresh.
+
+### 3. THE FIX — `SettingEngine.SetSCTPMinCwnd`
+Dose-response at rtt=100 (raw, poll, 100 MiB):
+
+| minCwnd | Mbps |
+|---|---|
+| 0 (pion default) | 26.7 |
+| 1 MiB | 91.7 |
+| 2 MiB | 159.2 |
+| 4 MiB | 262.2 |
+| 6 MiB | 252.3 |
+| 8 MiB | 121.7 |
+| 12 MiB | 119.0 |
+
+Optimal `minCwnd ≈ 4–6 MiB` (≈ the receiver's rwnd): prevents the collapse without exceeding rwnd
+(overshooting to 8–12 MiB reintroduces zero-window stalls). ~10× improvement over the default.
+
+### Actionable for ShareBridge (production)
+In `agent/internal/peer` (the pion `SettingEngine` used for real peer connections):
+1. `se.SetSCTPMinCwnd(4 * 1024 * 1024)` — the primary fix (10× at high RTT).
+2. `se.SetSCTPRTOMax(...)` and/or `se.SetSCTPMaxReceiveBufferSize(...)` — secondary tuning for the
+   reverse direction and RTO sensitivity.
+3. Note: ShareBridge's multilane (control/media/bulk DataChannels) shares ONE SCTP association, so it
+   does NOT increase throughput — the window is per-association, not per-lane.

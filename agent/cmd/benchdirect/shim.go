@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,11 +26,13 @@ type Shim struct {
 	loss   float64
 	a      *net.UDPAddr
 	b      *net.UDPAddr
-	queue  []packet
-	notify chan struct{}
-	done   chan struct{}
-	wg     sync.WaitGroup
-	closed bool
+	queue     []packet
+	notify    chan struct{}
+	done      chan struct{}
+	wg        sync.WaitGroup
+	closed    bool
+	forwarded atomic.Int64
+	writeErrs atomic.Int64
 }
 
 func NewShim(delay time.Duration, loss float64) (*Shim, error) {
@@ -144,9 +147,17 @@ func (s *Shim) drainLoop() {
 				return
 			default:
 			}
-			_, _ = s.conn.WriteToUDP(head.data, head.addr)
+			if _, err := s.conn.WriteToUDP(head.data, head.addr); err != nil {
+				s.writeErrs.Add(1)
+			} else {
+				s.forwarded.Add(1)
+			}
 		}
 	}
+}
+
+func (s *Shim) Stats() (forwarded, writeErrs int64) {
+	return s.forwarded.Load(), s.writeErrs.Load()
 }
 
 func (s *Shim) Close() error {

@@ -50,7 +50,7 @@ func TestParseByteSize(t *testing.T) {
 }
 
 func TestValidateRunConfig(t *testing.T) {
-	valid := runConfig{mode: "raw", rttMs: 25, loss: 0.5, size: 8 << 20, chunk: 16 << 10, backpressure: "event", deadline: 30 * time.Second}
+	valid := runConfig{mode: "raw", rttMs: 25, loss: 0.5, size: 8 << 20, chunk: 16 << 10, backpressure: "event", deadline: 30 * time.Second, window: 5 << 20}
 	cases := []struct {
 		name    string
 		mutate  func(*runConfig)
@@ -71,6 +71,7 @@ func TestValidateRunConfig(t *testing.T) {
 		{"invalid mode", func(c *runConfig) { c.mode = "quic" }, true},
 		{"zero deadline", func(c *runConfig) { c.deadline = 0 }, true},
 		{"negative deadline", func(c *runConfig) { c.deadline = -time.Second }, true},
+		{"zero window", func(c *runConfig) { c.window = 0 }, true},
 		{"prod skips backpressure", func(c *runConfig) { c.mode = "prod"; c.backpressure = "burst" }, false},
 	}
 	for _, tc := range cases {

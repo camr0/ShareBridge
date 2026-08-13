@@ -21,6 +21,8 @@ func main() {
 	chunk := flag.String("chunk", "16KiB", "bytes per send (e.g. 16KiB)")
 	backpressure := flag.String("backpressure", "event", "event|poll (mode A only)")
 	deadline := flag.Int("deadline", 30, "receive deadline in seconds")
+	window := flag.String("window", "5MiB", "backpressure window (raw mode)")
+	mincwnd := flag.String("mincwnd", "0", "minimum SCTP congestion window (e.g. 2MiB), 0 = default")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
 	flag.Parse()
 
@@ -38,6 +40,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid -chunk: value exceeds platform int range")
 		os.Exit(2)
 	}
+	windowBytes, windowErr := parseByteSize(*window)
+	if windowErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -window:", windowErr)
+		os.Exit(2)
+	}
+	minCwndBytes, minCwndErr := parseByteSize(*mincwnd)
+	if minCwndErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -mincwnd:", minCwndErr)
+		os.Exit(2)
+	}
 
 	cfg := runConfig{
 		mode:         *mode,
@@ -47,6 +59,8 @@ func main() {
 		chunk:        int(chunkBytes),
 		backpressure: *backpressure,
 		deadline:     time.Duration(*deadline) * time.Second,
+		window:       windowBytes,
+		minCwnd:      minCwndBytes,
 	}
 	if err := validateRunConfig(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -100,6 +114,12 @@ func validateRunConfig(cfg runConfig) error {
 	}
 	if cfg.chunk <= 0 {
 		return fmt.Errorf("invalid -chunk %d: must be > 0", cfg.chunk)
+	}
+	if cfg.window <= 0 {
+		return fmt.Errorf("invalid -window %d: must be > 0", cfg.window)
+	}
+	if cfg.minCwnd < 0 {
+		return fmt.Errorf("invalid -mincwnd %d: must be >= 0", cfg.minCwnd)
 	}
 	if cfg.deadline <= 0 {
 		return fmt.Errorf("invalid -deadline %v: must be > 0", cfg.deadline)

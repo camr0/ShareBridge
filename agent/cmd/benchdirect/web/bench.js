@@ -1,4 +1,6 @@
-window.__bench = { received: 0, firstByteTs: 0, lastByteTs: 0 }
+window.__bench = { received: 0, firstByteTs: 0, lastByteTs: 0, samples: [] }
+
+setInterval(() => { window.__bench.samples.push(window.__bench.received) }, 100)
 
 window.__benchSummary = () => {
   const ms = window.__bench.lastByteTs - window.__bench.firstByteTs
@@ -6,6 +8,7 @@ window.__benchSummary = () => {
     received: window.__bench.received,
     elapsedMs: ms,
     mbps: ms > 0 ? (window.__bench.received * 8 / (ms / 1000)) / 1e6 : 0,
+    samples: window.__bench.samples,
   }
 }
 

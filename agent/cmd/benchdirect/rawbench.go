@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -19,6 +21,8 @@ type runConfig struct {
 	chunk        int
 	backpressure string
 	deadline     time.Duration
+	window       int64
+	minCwnd      int64
 }
 
 type rawResult struct {
@@ -41,6 +45,9 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 
 	se := webrtc.SettingEngine{}
 	se.SetIncludeLoopbackCandidate(true)
+	if cfg.minCwnd > 0 {
+		se.SetSCTPMinCwnd(uint32(cfg.minCwnd))
+	}
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -141,7 +148,7 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		}
 		switch cfg.backpressure {
 		case "poll":
-			for dc.BufferedAmount() > 5*1024*1024 {
+			for dc.BufferedAmount() > uint64(cfg.window) {
 				select {
 				case <-ctx.Done():
 					return res, ctx.Err()
@@ -149,7 +156,7 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 				}
 			}
 		default: // "event"
-			for dc.BufferedAmount() > 5*1024*1024 {
+			for dc.BufferedAmount() > uint64(cfg.window) {
 				select {
 				case <-ctx.Done():
 					return res, ctx.Err()
@@ -190,11 +197,20 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		Received  int64   `json:"received"`
 		ElapsedMs float64 `json:"elapsedMs"`
 		Mbps      float64 `json:"mbps"`
+		Samples   []int64 `json:"samples"`
 	}
 	if err := b.eval("window.__benchSummary()", &summary); err != nil {
 		return res, fmt.Errorf("read browser summary: %w", err)
 	}
 	res.Received = summary.Received
 	res.Mbps = summary.Mbps
+	var sb strings.Builder
+	for i := 1; i < len(summary.Samples); i++ {
+		d := summary.Samples[i] - summary.Samples[i-1]
+		fmt.Fprintf(&sb, " %.0f", float64(d)*8/0.1/1e6)
+	}
+	fw, we := shim.Stats()
+	fmt.Fprintf(os.Stderr, "trace %s rtt=%d loss=%v mbps/100ms:%s | shim fwd=%d writeErr=%d\n",
+		cfg.mode, cfg.rttMs, cfg.loss, sb.String(), fw, we)
 	return res, nil
 }
