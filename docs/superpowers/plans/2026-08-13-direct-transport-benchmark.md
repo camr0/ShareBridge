@@ -317,9 +317,10 @@ git commit -m "bench: add UDP latency/loss shim"
 - Produces (consumed by Tasks 4, 5):
 
 ```go
-// RewriteHostCandidatePort replaces the port of the first host candidate whose IP
-// is 127.0.0.1 with newPort, returning the rewritten SDP and the original port.
-func RewriteHostCandidatePort(sdp string, newPort int) (string, int, error)
+// RewriteHostCandidate rewrites the first IPv4 host candidate to a loopback
+// candidate at 127.0.0.1:newPort, removes all other candidates, and returns the
+// original IP and port (for use as a shim forward target).
+func RewriteHostCandidate(sdp string, newPort int) (string, string, int, error)
 ```
 
 - [ ] **Step 1: Write the failing test**
@@ -342,13 +343,13 @@ const sampleSDP = "v=0\r\n" +
 	"a=ice-ufrag:abc\r\n" +
 	"a=ice-pwd:def\r\n"
 
-func TestRewriteHostCandidatePort(t *testing.T) {
-	got, orig, err := RewriteHostCandidatePort(sampleSDP, 5001)
+func TestRewriteHostCandidate(t *testing.T) {
+	got, ip, port, err := RewriteHostCandidate(sampleSDP, 5001)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if orig != 49439 {
-		t.Fatalf("orig port = %d, want 49439", orig)
+	if ip != "127.0.0.1" || port != 49439 {
+		t.Fatalf("orig = %s:%d, want 127.0.0.1:49439", ip, port)
 	}
 	if !strings.Contains(got, "127.0.0.1 5001 typ host") {
 		t.Fatalf("rewritten candidate missing:\n%s", got)
@@ -361,8 +362,40 @@ func TestRewriteHostCandidatePort(t *testing.T) {
 	}
 }
 
+func TestRewriteHostCandidateRewritesNonLoopbackIP(t *testing.T) {
+	sdp := "v=0\r\n" +
+		"a=candidate:2935132940 1 udp 2113937151 192.168.1.224 51357 typ host generation 0\r\n"
+	got, ip, port, err := RewriteHostCandidate(sdp, 5001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip != "192.168.1.224" || port != 51357 {
+		t.Fatalf("orig = %s:%d, want 192.168.1.224:51357", ip, port)
+	}
+	if !strings.Contains(got, "127.0.0.1 5001 typ host") {
+		t.Fatalf("IP+port not rewritten to loopback:\n%s", got)
+	}
+}
+
+func TestRewriteHostCandidateStripsOtherCandidates(t *testing.T) {
+	sdp := "v=0\r\n" +
+		"a=candidate:111 1 udp 2113937151 192.168.1.224 51357 typ host generation 0\r\n" +
+		"a=candidate:222 1 udp 2113939711 2600:4040::1 63045 typ host generation 0\r\n" +
+		"a=candidate:333 1 udp 2113937151 10.0.0.5 7000 typ host generation 0\r\n"
+	got, _, _, err := RewriteHostCandidate(sdp, 5001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(got, "a=candidate:") != 1 {
+		t.Fatalf("expected exactly one candidate, got:\n%s", got)
+	}
+	if !strings.Contains(got, "127.0.0.1 5001 typ host") {
+		t.Fatalf("missing rewritten candidate:\n%s", got)
+	}
+}
+
 func TestRewriteNoHostCandidate(t *testing.T) {
-	_, _, err := RewriteHostCandidatePort("v=0\r\n", 5001)
+	_, _, _, err := RewriteHostCandidate("v=0\r\n", 5001)
 	if err == nil {
 		t.Fatal("expected error for missing host candidate")
 	}
@@ -372,7 +405,7 @@ func TestRewriteNoHostCandidate(t *testing.T) {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cd agent && go test ./cmd/benchdirect/ -run 'TestRewrite' -v`
-Expected: FAIL — `undefined: RewriteHostCandidatePort`.
+Expected: FAIL — `undefined: RewriteHostCandidate`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -383,36 +416,48 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 )
 
-func RewriteHostCandidatePort(sdp string, newPort int) (string, int, error) {
+func isIPv4(s string) bool {
+	ip := net.ParseIP(s)
+	return ip != nil && ip.To4() != nil
+}
+
+func RewriteHostCandidate(sdp string, newPort int) (string, string, int, error) {
 	lines := strings.Split(sdp, "\r\n")
-	rewritten := false
+	out := make([]string, 0, len(lines))
+	origIP := ""
 	origPort := 0
-	for i, line := range lines {
-		if !strings.HasPrefix(line, "a=candidate:") {
-			continue
+	rewritten := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "a=candidate:") {
+			if !rewritten {
+				fields := strings.Fields(line)
+				if len(fields) >= 8 && fields[2] == "udp" && fields[7] == "host" && isIPv4(fields[4]) {
+					port, err := strconv.Atoi(fields[5])
+					if err != nil {
+						return "", "", 0, fmt.Errorf("parse candidate port: %w", err)
+					}
+					origIP = fields[4]
+					origPort = port
+					fields[4] = "127.0.0.1"
+					fields[5] = strconv.Itoa(newPort)
+					out = append(out, strings.Join(fields, " "))
+					rewritten = true
+					continue
+				}
+			}
+			continue // drop this candidate (non-IPv4-host or a later candidate)
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 8 || fields[4] != "127.0.0.1" {
-			continue
-		}
-		port, err := strconv.Atoi(fields[5])
-		if err != nil {
-			return "", 0, fmt.Errorf("parse candidate port: %w", err)
-		}
-		fields[5] = strconv.Itoa(newPort)
-		lines[i] = strings.Join(fields, " ")
-		origPort = port
-		rewritten = true
-		break
+		out = append(out, line)
 	}
 	if !rewritten {
-		return "", 0, fmt.Errorf("no 127.0.0.1 host candidate found")
+		return "", "", 0, fmt.Errorf("no IPv4 host candidate found")
 	}
-	return strings.Join(lines, "\r\n"), origPort, nil
+	return strings.Join(out, "\r\n"), origIP, origPort, nil
 }
 ```
 
@@ -425,7 +470,7 @@ Expected: PASS.
 
 ```bash
 cd agent && git add cmd/benchdirect/sdp.go cmd/benchdirect/sdp_test.go
-git commit -m "bench: add SDP candidate port rewrite"
+git commit -m "bench: add SDP candidate rewrite"
 ```
 
 ---
@@ -698,7 +743,7 @@ git commit -m "bench: add chromedp browser harness and receiver page"
 - Test: `agent/cmd/benchdirect/rawbench_test.go` (smoke test)
 
 **Interfaces:**
-- Consumes: `NewShim`, `Route` (Task 1); `RewriteHostCandidatePort` (Task 2); `startBrowser`, `benchServer` (Task 3).
+- Consumes: `NewShim`, `Route` (Task 1); `RewriteHostCandidate` (Task 2); `startBrowser`, `benchServer` (Task 3).
 - Produces:
 
 ```go
@@ -775,6 +820,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"net"
 	"time"
 
@@ -806,7 +852,10 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	shim := NewShim()
 	defer shim.Close()
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	se := webrtc.SettingEngine{}
+	se.SetIncludeLoopbackCandidate(true)
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return res, err
 	}
@@ -817,6 +866,7 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		return res, err
 	}
 
+	gatherDone := webrtc.GatheringCompletePromise(pc)
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return res, err
@@ -824,20 +874,26 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	if err := pc.SetLocalDescription(offer); err != nil {
 		return res, err
 	}
+	<-gatherDone
+	offerSDP := pc.LocalDescription().SDP
 
 	// Route Chrome→Go through the shim.
 	rA, err := shim.AddRoute(delay, cfg.loss)
 	if err != nil {
 		return res, err
 	}
-	rewrittenOffer, realGoPort, err := RewriteHostCandidatePort(offer.SDP, rA.Addr().Port)
+	rewrittenOffer, goIP, goPort, err := RewriteHostCandidate(offerSDP, rA.Addr().Port)
 	if err != nil {
 		return res, err
 	}
-	rA.SetForward(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: realGoPort})
+	rA.SetForward(&net.UDPAddr{IP: net.ParseIP(goIP), Port: goPort})
 
 	answerCh := make(chan string, 1)
-	srv := newBenchServer(func() string { return rewrittenOffer }, answerCh, webFS)
+	webRoot, err := fs.Sub(webFS, "web")
+	if err != nil {
+		return res, err
+	}
+	srv := newBenchServer(func() string { return rewrittenOffer }, answerCh, webRoot)
 	srv.mode, srv.size, srv.chunk = cfg.mode, cfg.size, cfg.chunk
 	baseURL, err := srv.listen()
 	if err != nil {
@@ -859,11 +915,11 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		if err != nil {
 			return res, err
 		}
-		rewrittenAnswer, realChromePort, err := RewriteHostCandidatePort(answer, rB.Addr().Port)
+		rewrittenAnswer, chromeIP, chromePort, err := RewriteHostCandidate(answer, rB.Addr().Port)
 		if err != nil {
 			return res, err
 		}
-		rB.SetForward(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: realChromePort})
+		rB.SetForward(&net.UDPAddr{IP: net.ParseIP(chromeIP), Port: chromePort})
 		if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: rewrittenAnswer}); err != nil {
 			return res, err
 		}
