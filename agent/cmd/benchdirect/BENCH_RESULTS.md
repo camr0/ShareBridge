@@ -51,3 +51,26 @@ head-of-line-blocking behavior — and it hits both modes identically, so it is 
    throughput via SCTP. 100 ms RTT ≈ 50–80 Mbps; 1% loss ≈ 4 Mbps.
 3. **Harness follow-ups**: rtt=50/100 still need longer transfers (or more reps) to narrow the variance;
    a probed-RTT metric and BufferedAmount time series (spec gap) would explain *why* SCTP collapses.
+
+## 200 MiB latency sweep (loss=0, 3 reps → mean [min–max]) — 2026-08-13 follow-up
+
+Larger transfers were expected to stabilize throughput by reaching SCTP steady state. They did NOT —
+the high-RTT variance is bimodal, not a small-transfer artifact.
+
+| rtt | raw (poll) Mbps | prod Mbps |
+|---|---|---|
+| 25  | 497.21 [445.5–523.4] | 490.92 [452.3–518.2] |
+| 50  | 223.15 [107.8–414.5] | 127.08 [64.4–251.1] |
+| 100 | 109.73 [30.8–267.3] | 37.07 [28.5–47.2] |
+
+- **rtt=25 is stable and equal**: raw ≈ prod ≈ ~490–500 Mbps (same as 64 MiB result).
+- **rtt=50/100 are bimodal**: two regimes — a "slow" ~30–80 Mbps and a "fast" ~250–430 Mbps. The mean
+  is meaningless for bimodal data (rtt=100 raw mean jumped 53.5 → 109.7 across datasets purely because
+  one of three runs hit the fast regime). SCTP's congestion-window trajectory is chaotic at high RTT, so
+  direct-transfer throughput at rtt ≥ 50 ms is a coin flip between fast and slow.
+- raw vs prod still overlap heavily at every rtt; no sender-loop penalty is separable from the noise.
+
+### Revised conclusion
+The sender loop is not the bottleneck — but at rtt ≥ 50 ms the *SCTP link itself* is unpredictable
+(bimodal), which is the real risk to direct-mode transfers over WAN latencies. More reps won't fix it;
+explaining it needs a congestion-window/BufferedAmount time series, not bigger files.

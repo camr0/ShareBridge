@@ -33,6 +33,13 @@ latency)
     bench "prod_rtt${r}_64m"     4 --mode prod --rtt "$r" --loss 0 --size 64MiB --chunk 64KiB --deadline 120
   done
   ;;
+latency200)
+  echo "== latency sweep big files (loss=0, 200 MiB, 3 reps, deadline=180) =="
+  for r in 25 50 100; do
+    bench "raw_poll_rtt${r}_200m" 3 --mode raw  --rtt "$r" --loss 0 --size 200MiB --chunk 64KiB --backpressure poll --deadline 180
+    bench "prod_rtt${r}_200m"     3 --mode prod --rtt "$r" --loss 0 --size 200MiB --chunk 64KiB --deadline 180
+  done
+  ;;
 loss)
   echo "== loss (rtt=25, 8 MiB, deadline=45) =="
   bench "raw_poll_loss1_8m" 2 --mode raw  --rtt 25 --loss 0.01 --size 8MiB --chunk 64KiB --backpressure poll --deadline 45
