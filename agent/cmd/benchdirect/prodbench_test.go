@@ -13,7 +13,7 @@ func TestRunProdSmoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	res, err := runProd(ctx, runConfig{
-		mode: "prod", rttMs: 0, loss: 0, size: 8 << 20, chunk: 64 << 10, backpressure: "poll",
+		mode: "prod", rttMs: 0, loss: 0, size: 8 << 20, chunk: 64 << 10, backpressure: "poll", deadline: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)

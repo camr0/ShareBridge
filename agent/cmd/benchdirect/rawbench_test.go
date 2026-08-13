@@ -13,7 +13,7 @@ func TestRunRawSmoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	res, err := runRaw(ctx, runConfig{
-		mode: "raw", rttMs: 0, loss: 0, size: 8 << 20, chunk: 16 << 10, backpressure: "event",
+		mode: "raw", rttMs: 0, loss: 0, size: 8 << 20, chunk: 16 << 10, backpressure: "event", deadline: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
