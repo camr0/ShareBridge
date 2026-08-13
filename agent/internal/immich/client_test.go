@@ -2,11 +2,14 @@ package immich
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -251,20 +254,18 @@ func TestListGalleryConvertsImmichAssetsToGalleryItems(t *testing.T) {
 }
 
 func TestListGalleryFallsBackToAlbumAPIWhenInlineAssetsEmpty(t *testing.T) {
-	requestCount := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-		switch requestCount {
-		case 1:
-			require.Equal(t, "/api/shared-links/me", r.URL.Path)
+		switch r.URL.Path {
+		case "/api/shared-links/me":
 			require.Equal(t, "sharekey", r.URL.Query().Get("key"))
 			_, _ = w.Write([]byte(`{"key":"sharekey","type":"ALBUM","assets":[],"album":{"id":"album-1","albumName":"Grad Party","description":"Photos"}}`))
-		case 2:
-			require.Equal(t, "/api/albums/album-1", r.URL.Path)
+		case "/api/server/version":
+			_, _ = w.Write([]byte(`{"major":2,"minor":9,"patch":0,"prerelease":null}`))
+		case "/api/albums/album-1":
 			require.Equal(t, "sharekey", r.URL.Query().Get("key"))
 			_, _ = w.Write([]byte(`{"id":"album-1","assets":[{"id":"asset-1","originalFileName":"photo.jpg","originalMimeType":"image/jpeg","type":"IMAGE","exifInfo":{"fileSizeInByte":1234}}]}`))
 		default:
-			t.Fatalf("unexpected request %d", requestCount)
+			t.Fatalf("unexpected request %s", r.URL.Path)
 		}
 	}))
 	defer ts.Close()
@@ -278,20 +279,225 @@ func TestListGalleryFallsBackToAlbumAPIWhenInlineAssetsEmpty(t *testing.T) {
 	require.Equal(t, "asset-1", gallery.Items[0].ID)
 }
 
+func TestListGalleryUsesPaginatedSearchForImmichV3(t *testing.T) {
+	const albumID = "d9e585b3-ffc2-4f23-972c-662d5d5332c3"
+	searchPages := 0
+	versionRequests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/server/version":
+			versionRequests++
+			require.Empty(t, r.URL.RawQuery)
+			_ = json.NewEncoder(w).Encode(map[string]any{"major": 3, "minor": 0, "patch": 0, "prerelease": nil})
+		case "/api/shared-links/me":
+			require.Equal(t, "sharekey", r.URL.Query().Get("key"))
+			require.Equal(t, "secret", r.URL.Query().Get("password"))
+			_ = json.NewEncoder(w).Encode(SharedLink{
+				Key: "sharekey", Type: "ALBUM", Album: &Album{ID: albumID, Name: "Aleena Grad Shoot"}, Assets: []Asset{},
+			})
+		case "/api/search/metadata":
+			searchPages++
+			require.Equal(t, "sharekey", r.URL.Query().Get("key"))
+			require.Equal(t, "secret", r.URL.Query().Get("password"))
+			var body struct {
+				AlbumIDs []string `json:"albumIds"`
+				Page     int      `json:"page"`
+				Size     int      `json:"size"`
+				WithExif bool     `json:"withExif"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			require.Equal(t, []string{albumID}, body.AlbumIDs)
+			require.Equal(t, searchPages, body.Page)
+			require.Equal(t, 1000, body.Size)
+			require.True(t, body.WithExif)
+			start := (body.Page - 1) * body.Size
+			end := min(start+body.Size, 2453)
+			items := make([]Asset, 0, end-start)
+			for i := start; i < end; i++ {
+				items = append(items, Asset{ID: fmt.Sprintf("asset-%04d", i)})
+			}
+			var nextPage any
+			if end < 2453 {
+				nextPage = strconv.Itoa(body.Page + 1)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"albums": map[string]any{"total": 0, "count": 0, "items": []any{}, "facets": []any{}},
+				"assets": map[string]any{"total": len(items), "count": len(items), "items": items, "facets": []any{}, "nextPage": nextPage},
+			})
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey", Password: "secret"})
+	require.NoError(t, err)
+	gallery, err := client.ListGallery(t.Context())
+	require.NoError(t, err)
+	require.Len(t, gallery.Items, 2453)
+	require.Equal(t, "asset-0000", gallery.Items[0].ID)
+	require.Equal(t, "asset-2452", gallery.Items[2452].ID)
+	require.Equal(t, 3, searchPages)
+	_, err = client.getServerVersion(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 1, versionRequests)
+}
+
+func TestListGalleryFallsBackToLegacyAPIWhenVersionDetectionFails(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/shared-links/me":
+			_, _ = w.Write([]byte(`{"type":"ALBUM","assets":[],"album":{"id":"album-1","albumName":"Fallback"}}`))
+		case "/api/server/version":
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		case "/api/albums/album-1":
+			_, _ = w.Write([]byte(`{"assets":[{"id":"legacy-asset"}]}`))
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	gallery, err := client.ListGallery(t.Context())
+	require.NoError(t, err)
+	require.Len(t, gallery.Items, 1)
+	require.Equal(t, "legacy-asset", gallery.Items[0].ID)
+}
+
+func TestListGalleryRetriesVersionDetectionAfterTransientFailure(t *testing.T) {
+	versionRequests := 0
+	legacyRequests := 0
+	searchRequests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/shared-links/me":
+			_, _ = w.Write([]byte(`{"type":"ALBUM","assets":[],"album":{"id":"album-1"}}`))
+		case "/api/server/version":
+			versionRequests++
+			if versionRequests == 1 {
+				http.Error(w, "temporary", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"major":3,"minor":0,"patch":0,"prerelease":null}`))
+		case "/api/albums/album-1":
+			legacyRequests++
+			_, _ = w.Write([]byte(`{"assets":[{"id":"legacy"}]}`))
+		case "/api/search/metadata":
+			searchRequests++
+			_, _ = w.Write([]byte(`{"assets":{"items":[{"id":"v3"}],"nextPage":null}}`))
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	first, err := client.ListGallery(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "legacy", first.Items[0].ID)
+	second, err := client.ListGallery(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "v3", second.Items[0].ID)
+	require.Equal(t, 2, versionRequests)
+	require.Equal(t, 1, legacyRequests)
+	require.Equal(t, 1, searchRequests)
+}
+
+func TestGetServerVersionAllowsWaitingCallerToCancel(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/server/version", r.URL.Path)
+		close(requestStarted)
+		<-releaseRequest
+		_, _ = w.Write([]byte(`{"major":3,"minor":0,"patch":0,"prerelease":null}`))
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL)})
+	require.NoError(t, err)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.getServerVersion(t.Context())
+		firstDone <- err
+	}()
+	<-requestStarted
+
+	waiterCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = client.getServerVersion(waiterCtx)
+	require.ErrorIs(t, err, context.Canceled)
+	close(releaseRequest)
+	require.NoError(t, <-firstDone)
+}
+
+func TestListGalleryFallsBackToSearchWhenLegacyAPIUnavailable(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/shared-links/me":
+			_, _ = w.Write([]byte(`{"type":"ALBUM","assets":[],"album":{"id":"album-1"}}`))
+		case "/api/server/version":
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+		case "/api/albums/album-1":
+			http.NotFound(w, r)
+		case "/api/search/metadata":
+			_, _ = w.Write([]byte(`{"assets":{"items":[{"id":"search-asset"}],"nextPage":null}}`))
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	gallery, err := client.ListGallery(t.Context())
+	require.NoError(t, err)
+	require.Len(t, gallery.Items, 1)
+	require.Equal(t, "search-asset", gallery.Items[0].ID)
+}
+
+func TestSearchAlbumAssetsRejectsRepeatedNextPage(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/search/metadata", r.URL.Path)
+		_, _ = w.Write([]byte(`{"assets":{"items":[],"nextPage":"1"}}`))
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	_, err = client.searchAlbumAssets(t.Context(), "album-1")
+	require.ErrorContains(t, err, "repeated page 1")
+}
+
+func TestSearchAlbumAssetsRejectsInvalidNextPage(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/search/metadata", r.URL.Path)
+		_, _ = w.Write([]byte(`{"assets":{"items":[],"nextPage":"not-a-page"}}`))
+	}))
+	defer ts.Close()
+
+	client, err := New(Config{BaseURL: ts.URL, AllowedHost: mustHost(t, ts.URL), ShareKey: "sharekey"})
+	require.NoError(t, err)
+	_, err = client.searchAlbumAssets(t.Context(), "album-1")
+	require.ErrorContains(t, err, `invalid Immich search nextPage "not-a-page"`)
+}
+
 func TestListGalleryIncludesPasswordInAlbumRequest(t *testing.T) {
 	var albumPassword string
-	requestCount := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-		switch requestCount {
-		case 1:
+		switch r.URL.Path {
+		case "/api/shared-links/me":
 			_, _ = w.Write([]byte(`{"key":"sharekey","type":"ALBUM","assets":[],"album":{"id":"album-1","albumName":"Secret Album"}}`))
-		case 2:
-			require.Equal(t, "/api/albums/album-1", r.URL.Path)
+		case "/api/server/version":
+			_, _ = w.Write([]byte(`{"major":2,"minor":9,"patch":0,"prerelease":null}`))
+		case "/api/albums/album-1":
 			albumPassword = r.URL.Query().Get("password")
 			_, _ = w.Write([]byte(`{"id":"album-1","assets":[]}`))
 		default:
-			t.Fatalf("unexpected request %d", requestCount)
+			t.Fatalf("unexpected request %s", r.URL.Path)
 		}
 	}))
 	defer ts.Close()

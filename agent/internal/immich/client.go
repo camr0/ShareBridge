@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,12 +28,23 @@ type Config struct {
 }
 
 type Client struct {
-	baseURL    *url.URL
-	allowed    string
-	apiKey     string
-	shareKey   string
-	password   string
-	httpClient *http.Client
+	baseURL       *url.URL
+	allowed       string
+	apiKey        string
+	shareKey      string
+	password      string
+	httpClient    *http.Client
+	versionMu     sync.Mutex
+	version       serverVersion
+	versionLoaded bool
+	versionDone   chan struct{}
+}
+
+type serverVersion struct {
+	Major      int  `json:"major"`
+	Minor      int  `json:"minor"`
+	Patch      int  `json:"patch"`
+	Prerelease *int `json:"prerelease"`
 }
 
 type SharedLink struct {
@@ -275,11 +287,10 @@ func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
 
 	assets := link.Assets
 	if len(assets) == 0 && strings.EqualFold(link.Type, "ALBUM") && link.Album != nil && link.Album.ID != "" {
-		albumAssets, err := c.listAlbumAssets(ctx, link.Album.ID)
+		assets, err = c.loadAlbumAssets(ctx, link.Album.ID)
 		if err != nil {
 			return Gallery{}, err
 		}
-		assets = albumAssets
 	}
 
 	gallery := Gallery{Items: make([]GalleryItem, 0, len(assets))}
@@ -291,6 +302,87 @@ func (c *Client) ListGallery(ctx context.Context) (Gallery, error) {
 	}
 	log.Printf("immich gallery: share=%s produced %d items", redactKey(c.shareKey), len(gallery.Items))
 	return gallery, nil
+}
+
+func (c *Client) loadAlbumAssets(ctx context.Context, albumID string) ([]Asset, error) {
+	version, err := c.getServerVersion(ctx)
+	if err == nil {
+		if version.Major >= 3 {
+			log.Printf("immich gallery: using paginated asset search API (Immich v3-compatible)")
+			return c.searchAlbumAssets(ctx, albumID)
+		}
+		log.Printf("immich gallery: using legacy album assets API (Immich v2-compatible)")
+		return c.listAlbumAssets(ctx, albumID)
+	}
+
+	log.Printf("immich gallery: server version detection failed, using capability fallback: %v", err)
+	assets, legacyErr := c.listAlbumAssets(ctx, albumID)
+	if legacyErr == nil && len(assets) > 0 {
+		log.Printf("immich gallery: capability fallback selected legacy album assets API")
+		return assets, nil
+	}
+	if legacyErr != nil {
+		log.Printf("immich gallery: legacy album API failed, trying paginated asset search API: %v", legacyErr)
+	} else {
+		log.Printf("immich gallery: legacy album response empty, trying paginated asset search API")
+	}
+	searchAssets, searchErr := c.searchAlbumAssets(ctx, albumID)
+	if searchErr != nil && legacyErr != nil {
+		return nil, fmt.Errorf("legacy album API failed: %v; paginated asset search API failed: %w", legacyErr, searchErr)
+	}
+	return searchAssets, searchErr
+}
+
+func (c *Client) getServerVersion(ctx context.Context) (serverVersion, error) {
+	for {
+		c.versionMu.Lock()
+		if c.versionLoaded {
+			version := c.version
+			c.versionMu.Unlock()
+			return version, nil
+		}
+		if c.versionDone != nil {
+			done := c.versionDone
+			c.versionMu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return serverVersion{}, ctx.Err()
+			}
+		}
+		c.versionDone = make(chan struct{})
+		done := c.versionDone
+		c.versionMu.Unlock()
+
+		version, err := c.fetchServerVersion(ctx)
+		c.versionMu.Lock()
+		if err == nil {
+			c.version = version
+			c.versionLoaded = true
+		}
+		c.versionDone = nil
+		close(done)
+		c.versionMu.Unlock()
+		if err != nil {
+			return serverVersion{}, err
+		}
+		log.Printf("immich api: detected server version %d.%d.%d", version.Major, version.Minor, version.Patch)
+		return version, nil
+	}
+}
+
+func (c *Client) fetchServerVersion(ctx context.Context) (serverVersion, error) {
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/server/version"})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return serverVersion{}, err
+	}
+	var version serverVersion
+	if err := c.doJSON(req, &version); err != nil {
+		return serverVersion{}, err
+	}
+	return version, nil
 }
 
 func (c *Client) GetAlbumDownloadInfo(ctx context.Context) (AlbumDownload, error) {
@@ -382,6 +474,56 @@ func (c *Client) listAlbumAssets(ctx context.Context, albumID string) ([]Asset, 
 	}
 	log.Printf("immich gallery: album_id=%s returned %d assets", albumID, len(album.Assets))
 	return album.Assets, nil
+}
+
+func (c *Client) searchAlbumAssets(ctx context.Context, albumID string) ([]Asset, error) {
+	const pageSize = 1000
+	page := 1
+	seenPages := map[int]bool{}
+	var assets []Asset
+	for {
+		if seenPages[page] {
+			return nil, fmt.Errorf("Immich search pagination repeated page %d", page)
+		}
+		seenPages[page] = true
+
+		payload, err := json.Marshal(struct {
+			AlbumIDs []string `json:"albumIds"`
+			Page     int      `json:"page"`
+			Size     int      `json:"size"`
+			WithExif bool     `json:"withExif"`
+		}{AlbumIDs: []string{albumID}, Page: page, Size: pageSize, WithExif: true})
+		if err != nil {
+			return nil, err
+		}
+		u := c.baseURL.ResolveReference(&url.URL{Path: "/api/search/metadata"})
+		c.addSharedLinkParams(u)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		var result struct {
+			Assets struct {
+				Items    []Asset `json:"items"`
+				NextPage *string `json:"nextPage"`
+			} `json:"assets"`
+		}
+		if err := c.doJSON(req, &result); err != nil {
+			return nil, err
+		}
+		assets = append(assets, result.Assets.Items...)
+		log.Printf("immich gallery: search page=%d returned=%d accumulated=%d", page, len(result.Assets.Items), len(assets))
+		if result.Assets.NextPage == nil {
+			log.Printf("immich gallery: paginated asset search complete album_id=%s assets=%d", albumID, len(assets))
+			return assets, nil
+		}
+		nextPage, err := strconv.Atoi(*result.Assets.NextPage)
+		if err != nil || nextPage < 1 {
+			return nil, fmt.Errorf("invalid Immich search nextPage %q", *result.Assets.NextPage)
+		}
+		page = nextPage
+	}
 }
 
 func (g *Gallery) setAlbum(album *Album) {
