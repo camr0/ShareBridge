@@ -1041,20 +1041,23 @@ git commit -m "bench: add mode A raw pion DataChannel bench"
 - Create: `agent/cmd/benchdirect/fakebackend.go`
 - Create: `agent/cmd/benchdirect/prodbench.go`
 - Test: `agent/cmd/benchdirect/prodbench_test.go` (smoke test)
+- Modify: `agent/cmd/benchdirect/web/bench.js` (count only the `bulk` lane in prod mode)
 
 **Interfaces:**
-- Consumes: `NewShim` (Task 1); `RewriteHostCandidatePort` (Task 2); `startBrowser`, `benchServer` (Task 3); `runConfig`, `rawResult` (Task 4).
+- Consumes: `NewShim` (Task 1); `RewriteHostCandidate` (Task 2); `startBrowser`, `benchServer` (Task 3); `runConfig`, `rawResult` (Task 4); `multilane.ChannelSet`/`Endpoint`/`LaneForClass` (production interfaces).
 - Produces:
 
 ```go
 func runProd(ctx context.Context, cfg runConfig) (rawResult, error)
 ```
 
-Mode B triggers the real sender via `manager.HandleMessage` with:
+Mode B triggers the real sender via `transfer.Manager.HandleMessage` with:
 
 ```go
 []byte(`{"type":"file_request","path":"bench.bin","request_id":"bench"}`)
 ```
+
+Why not `peer.New`: production `peer.CreateOffer()` returns a candidate-less trickle SDP (it does not wait for ICE gathering and does not expose the gathered SDP), which the shim's non-trickle candidate rewrite cannot consume. So mode B builds a bench-local `ChannelSet` over three pion DataChannels (same loopback + gathering-wait setup as mode A) and passes it to the **real** `transfer.Manager`. The `Manager`'s `sendWithBackpressure` loop, 64 KiB chunk framing, and 5 MiB watermark are still exercised verbatim — `peer.Peer` is only thin glue.
 
 - [ ] **Step 1: Write the failing smoke test**
 
@@ -1131,7 +1134,23 @@ func (b benchStorage) GetFile(filePath string, w io.Writer) (int64, error) {
 func (b benchStorage) GetSHA1(subpath string) string { return "" }
 ```
 
-- [ ] **Step 4: Write `prodbench.go`**
+- [ ] **Step 4: Fix `web/bench.js` to count only the `bulk` lane in prod mode**
+
+The file stream is sent on the `bulk` DataChannel as 14-byte-framed chunks; the Manager also sends a `file_header` JSON message on `control` before streaming. The receiver must count only the `bulk` lane in prod mode (and ignore `control`/`media`), otherwise the control message corrupts the byte count. Replace the `pc.ondatachannel` handler with:
+
+```js
+  pc.ondatachannel = (e) => {
+    const ch = e.channel
+    ch.binaryType = 'arraybuffer'
+    if (cfg.mode === 'prod' && ch.label !== 'bulk') return
+    ch.onmessage = (m) => {
+      if (cfg.mode === 'prod') note(m.data.byteLength - 14)
+      else note(m.data.byteLength)
+    }
+  }
+```
+
+- [ ] **Step 5: Write `prodbench.go`**
 
 ```go
 package main
@@ -1139,43 +1158,130 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"sharebridge/agent/internal/peer"
+	"github.com/pion/webrtc/v4"
+	"sharebridge/agent/internal/multilane"
 	"sharebridge/agent/internal/transfer"
 )
+
+// benchChannelSet wraps three pion DataChannels so the real transfer.Manager can
+// run over a bench-controlled PeerConnection (peer.Peer cannot be used because
+// its CreateOffer returns a candidate-less trickle SDP).
+type benchChannelSet struct {
+	mu        sync.Mutex
+	endpoints map[multilane.Lane]*benchEndpoint
+	onOpen    func()
+	onClose   func()
+}
+
+func (c *benchChannelSet) Endpoint(lane multilane.Lane) multilane.Endpoint { return c.endpoints[lane] }
+func (c *benchChannelSet) SetOnOpen(f func())                               { c.mu.Lock(); c.onOpen = f; c.mu.Unlock() }
+func (c *benchChannelSet) SetOnClose(f func())                              { c.mu.Lock(); c.onClose = f; c.mu.Unlock() }
+func (c *benchChannelSet) AddOnClose(f func()) {
+	if f == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev := c.onClose
+	c.onClose = func() {
+		if prev != nil {
+			prev()
+		}
+		f()
+	}
+}
+func (c *benchChannelSet) Close() error { return nil } // pc.Close handled by caller
+
+type benchEndpoint struct {
+	lane multilane.Lane
+	dc   *webrtc.DataChannel
+}
+
+func (e *benchEndpoint) SendText(s string) error   { return e.dc.SendText(s) }
+func (e *benchEndpoint) SendBinary(b []byte) error { return e.dc.Send(b) }
+func (e *benchEndpoint) BufferedAmount() uint64    { return e.dc.BufferedAmount() }
+func (e *benchEndpoint) SetOnMessage(f func([]byte)) {
+	e.dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if f != nil {
+			f(msg.Data)
+		}
+	})
+}
+func (e *benchEndpoint) SendBinaryClass(class multilane.TrafficClass, b []byte) error {
+	lane, err := multilane.LaneForClass(class)
+	if err != nil {
+		return err
+	}
+	if lane != e.lane {
+		return fmt.Errorf("traffic class %d maps to lane %d, not %d", class, lane, e.lane)
+	}
+	return e.dc.Send(b)
+}
 
 func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 	res := rawResult{Mode: "prod", RTT: cfg.rttMs}
 	delay := time.Duration(cfg.rttMs/2) * time.Millisecond
 
-	shim := NewShim()
+	shim, err := NewShim(delay, cfg.loss)
+	if err != nil {
+		return res, err
+	}
 	defer shim.Close()
 
-	p, err := peer.New(nil, false) // no ICE servers; direct, host candidates only
+	se := webrtc.SettingEngine{}
+	se.SetIncludeLoopbackCandidate(true)
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return res, err
 	}
-	defer p.Close()
+	defer pc.Close()
 
-	offer, err := p.CreateOffer()
+	labels := map[multilane.Lane]string{
+		multilane.LaneControl: "control",
+		multilane.LaneMedia:   "media",
+		multilane.LaneBulk:    "bulk",
+	}
+	set := &benchChannelSet{endpoints: make(map[multilane.Lane]*benchEndpoint, 3)}
+	openCh := make(chan struct{}, 3)
+	for _, lane := range []multilane.Lane{multilane.LaneControl, multilane.LaneMedia, multilane.LaneBulk} {
+		dc, err := pc.CreateDataChannel(labels[lane], nil)
+		if err != nil {
+			return res, err
+		}
+		set.endpoints[lane] = &benchEndpoint{lane: lane, dc: dc}
+		dc.OnOpen(func() { select { case openCh <- struct{}{}: default: } })
+	}
+
+	gatherDone := webrtc.GatheringCompletePromise(pc)
+	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return res, err
 	}
-	rA, err := shim.AddRoute(delay, cfg.loss)
+	if err := pc.SetLocalDescription(offer); err != nil {
+		return res, err
+	}
+	<-gatherDone
+	offerSDP := pc.LocalDescription().SDP
+
+	rewrittenOffer, _, goPort, err := RewriteHostCandidate(offerSDP, shim.Addr().Port)
 	if err != nil {
 		return res, err
 	}
-	rewrittenOffer, realGoPort, err := RewriteHostCandidatePort(offer, rA.Addr().Port)
-	if err != nil {
-		return res, err
-	}
-	rA.SetForward(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: realGoPort})
+	shim.SetPeerA(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: goPort})
 
 	answerCh := make(chan string, 1)
-	srv := newBenchServer(func() string { return rewrittenOffer }, answerCh, webFS)
+	webRoot, err := fs.Sub(webFS, "web")
+	if err != nil {
+		return res, err
+	}
+	srv := newBenchServer(func() string { return rewrittenOffer }, answerCh, webRoot)
 	srv.mode, srv.size, srv.chunk = cfg.mode, cfg.size, cfg.chunk
 	baseURL, err := srv.listen()
 	if err != nil {
@@ -1193,23 +1299,28 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 
 	select {
 	case answer := <-answerCh:
-		rB, err := shim.AddRoute(delay, cfg.loss)
+		rewrittenAnswer, _, _, err := RewriteHostCandidate(answer, shim.Addr().Port)
 		if err != nil {
 			return res, err
 		}
-		rewrittenAnswer, realChromePort, err := RewriteHostCandidatePort(answer, rB.Addr().Port)
-		if err != nil {
-			return res, err
-		}
-		rB.SetForward(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: realChromePort})
-		if err := p.SetAnswer(rewrittenAnswer); err != nil {
+		if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: rewrittenAnswer}); err != nil {
 			return res, err
 		}
 	case <-ctx.Done():
 		return res, ctx.Err()
 	}
 
-	mgr := transfer.NewManager(p, benchStorage{size: cfg.size}, 0)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-openCh:
+		case <-ctx.Done():
+			return res, ctx.Err()
+		case <-time.After(10 * time.Second):
+			return res, fmt.Errorf("timed out waiting for DataChannels to open")
+		}
+	}
+
+	mgr := transfer.NewManager(set, benchStorage{size: cfg.size}, 0)
 	go mgr.HandleMessage([]byte(`{"type":"file_request","path":"bench.bin","request_id":"bench"}`))
 
 	deadline := time.Now().Add(30 * time.Second)
@@ -1241,15 +1352,15 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 }
 ```
 
-- [ ] **Step 5: Run the smoke test to verify it passes**
+- [ ] **Step 6: Run the smoke test to verify it passes**
 
 Run: `cd agent && go test ./cmd/benchdirect/ -run 'TestRunProdSmoke' -v`
 Expected: PASS. The Manager streams `cfg.size` bytes through `sendWithBackpressure`; the page strips the 14-byte chunk envelope and counts payload bytes.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-cd agent && git add cmd/benchdirect/fakebackend.go cmd/benchdirect/prodbench.go cmd/benchdirect/prodbench_test.go
+cd agent && git add cmd/benchdirect/fakebackend.go cmd/benchdirect/prodbench.go cmd/benchdirect/prodbench_test.go cmd/benchdirect/web/bench.js
 git commit -m "bench: add mode B production sender bench"
 ```
 
