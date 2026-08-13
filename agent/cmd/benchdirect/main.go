@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -28,6 +29,10 @@ func main() {
 	chunkBytes, chunkErr := parseByteSize(*chunk)
 	if chunkErr != nil {
 		fmt.Fprintln(os.Stderr, "invalid -chunk:", chunkErr)
+		os.Exit(2)
+	}
+	if !chunkFitsInt(chunkBytes) {
+		fmt.Fprintln(os.Stderr, "invalid -chunk: value exceeds platform int range")
 		os.Exit(2)
 	}
 
@@ -80,6 +85,18 @@ func main() {
 }
 
 func validateRunConfig(cfg runConfig) error {
+	if cfg.rttMs < 0 {
+		return fmt.Errorf("invalid -rtt %d: must be >= 0", cfg.rttMs)
+	}
+	if cfg.size <= 0 {
+		return fmt.Errorf("invalid -size %d: must be > 0", cfg.size)
+	}
+	if cfg.chunk <= 0 {
+		return fmt.Errorf("invalid -chunk %d: must be > 0", cfg.chunk)
+	}
+	if math.IsNaN(cfg.loss) || math.IsInf(cfg.loss, 0) {
+		return fmt.Errorf("invalid -loss %v: must be finite", cfg.loss)
+	}
 	if cfg.loss < 0 || cfg.loss > 1 {
 		return fmt.Errorf("invalid -loss %v: must be between 0 and 1", cfg.loss)
 	}
@@ -89,6 +106,12 @@ func validateRunConfig(cfg runConfig) error {
 	default:
 		return fmt.Errorf("invalid -backpressure %q: must be event or poll", cfg.backpressure)
 	}
+}
+
+// chunkFitsInt reports whether b can be stored in a platform int without
+// truncation.
+func chunkFitsInt(b int64) bool {
+	return b <= int64(int(^uint(0)>>1))
 }
 
 func writeResult(out string, res rawResult) (err error) {

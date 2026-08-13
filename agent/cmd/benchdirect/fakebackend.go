@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 
 	"sharebridge/agent/internal/cloudwebdav"
@@ -9,10 +10,13 @@ import (
 type benchStorage struct{ size int64 }
 
 func (b benchStorage) ListFiles(subpath string) ([]cloudwebdav.FileInfo, error) {
-	return []cloudwebdav.FileInfo{{Name: "bench.bin", Size: b.size}}, nil
+	return []cloudwebdav.FileInfo{{Name: "bench.bin", Size: b.size, RequestPath: "bench.bin"}}, nil
 }
 
 func (b benchStorage) GetFile(filePath string, w io.Writer) (int64, error) {
+	if filePath != "bench.bin" {
+		return 0, fmt.Errorf("unknown file %q", filePath)
+	}
 	buf := make([]byte, 64*1024)
 	var written int64
 	for written < b.size {

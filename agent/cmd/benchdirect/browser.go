@@ -26,10 +26,6 @@ func chromePath() string {
 	return ""
 }
 
-func chromeAvailable() bool {
-	return chromePath() != ""
-}
-
 func startBrowser(parent context.Context) (*browserSession, error) {
 	path := chromePath()
 	if path == "" {

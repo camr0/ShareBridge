@@ -104,7 +104,7 @@ func (e *benchEndpoint) SendBinaryClass(class multilane.TrafficClass, b []byte) 
 
 func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 	res := rawResult{Mode: "prod", RTT: cfg.rttMs}
-	delay := time.Duration(cfg.rttMs/2) * time.Millisecond
+	delay := time.Duration(cfg.rttMs) * time.Millisecond / 2
 
 	shim, err := NewShim(delay, cfg.loss)
 	if err != nil {

@@ -26,8 +26,10 @@ async function run() {
     ch.binaryType = 'arraybuffer'
     if (cfg.mode === 'prod' && ch.label !== 'bulk') return
     ch.onmessage = (m) => {
-      if (cfg.mode === 'prod') note(m.data.byteLength - 14)
-      else note(m.data.byteLength)
+      if (cfg.mode === 'prod') {
+        if (m.data.byteLength < 14) return
+        note(m.data.byteLength - 14)
+      } else note(m.data.byteLength)
     }
   }
 

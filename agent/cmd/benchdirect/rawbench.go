@@ -30,7 +30,7 @@ type rawResult struct {
 
 func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	res := rawResult{Mode: "raw", RTT: cfg.rttMs}
-	delay := time.Duration(cfg.rttMs/2) * time.Millisecond
+	delay := time.Duration(cfg.rttMs) * time.Millisecond / 2
 
 	shim, err := NewShim(delay, cfg.loss)
 	if err != nil {
