@@ -54,16 +54,13 @@ agent/cmd/benchdirect/
 
 ```go
 type Shim struct{ /* internal */ }
-func NewShim() *Shim
-func (s *Shim) AddRoute(delay time.Duration, loss float64) (*Route, error)
+func NewShim(delay time.Duration, loss float64) (*Shim, error)
+func (s *Shim) Addr() *net.UDPAddr
+func (s *Shim) SetPeerA(a *net.UDPAddr)
 func (s *Shim) Close() error
-
-type Route struct{ /* internal */ }
-func (r *Route) Addr() *net.UDPAddr            // listen address (127.0.0.1:0)
-func (r *Route) SetForward(addr *net.UDPAddr)  // target datagrams are forwarded to
 ```
 
-Semantics: a `Route` binds a UDP socket on `127.0.0.1:0`, reads datagrams, holds each for `delay` before forwarding to the target set by `SetForward`. `loss` is the probability (0..1) of dropping a datagram. Order is preserved. Forwarding is safe to enable lazily via `SetForward` (packets received before `SetForward` are dropped).
+Semantics: `Shim` is an in-process reflexive NAT between two peers. It binds one UDP socket on `127.0.0.1:0`, holds each datagram for `delay`, then forwards it. Peer A is configured via `SetPeerA`; peer B is learned automatically from the first datagram whose source address is not A. Datagrams from A are forwarded to B and vice versa. `loss` is the probability (0..1) of dropping a datagram. Order is preserved. A datagram from A received before B is learned is dropped (B is unknown).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -78,7 +75,7 @@ import (
 	"time"
 )
 
-func echoServer(t *testing.T) (*net.UDPConn, *net.UDPAddr) {
+func listenUDP(t *testing.T) (*net.UDPConn, *net.UDPAddr) {
 	t.Helper()
 	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -87,76 +84,101 @@ func echoServer(t *testing.T) (*net.UDPConn, *net.UDPAddr) {
 	return pc, pc.LocalAddr().(*net.UDPAddr)
 }
 
-func TestRouteForwardsAfterDelay(t *testing.T) {
-	target, targetAddr := echoServer(t)
-	defer target.Close()
+func TestShimForwardsBidirectionallyWithDelay(t *testing.T) {
+	peerA, aAddr := listenUDP(t) // "Go"
+	defer peerA.Close()
+	peerB, _ := listenUDP(t) // "Chrome"
+	defer peerB.Close()
 
-	s := NewShim()
+	s, err := NewShim(200*time.Millisecond, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
-	r, err := s.AddRoute(200*time.Millisecond, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.SetForward(targetAddr)
+	s.SetPeerA(aAddr)
 
-	src, err := net.DialUDP("udp4", nil, r.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer src.Close()
-
+	// Chrome → Go: first non-A source learns B, forwards to A after delay.
 	start := time.Now()
-	if _, err := src.Write([]byte("ping")); err != nil {
+	if _, err := peerB.WriteToUDP([]byte("ping"), s.Addr()); err != nil {
 		t.Fatal(err)
 	}
-
 	buf := make([]byte, 4)
-	_ = target.SetReadDeadline(time.Now().Add(time.Second))
-	if _, _, err := target.ReadFromUDP(buf); err != nil {
-		t.Fatalf("no packet received: %v", err)
-	}
-	elapsed := time.Since(start)
-	if elapsed < 200*time.Millisecond {
-		t.Fatalf("packet arrived too early: %v", elapsed)
+	_ = peerA.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := peerA.ReadFromUDP(buf); err != nil {
+		t.Fatalf("peer A did not receive: %v", err)
 	}
 	if string(buf) != "ping" {
-		t.Fatalf("payload corrupted: %q", buf)
+		t.Fatalf("corrupted: %q", buf)
+	}
+	if time.Since(start) < 200*time.Millisecond {
+		t.Fatalf("arrived too early: %v", time.Since(start))
+	}
+
+	// Go → Chrome: source A forwards to learned B after delay.
+	if _, err := peerA.WriteToUDP([]byte("pong"), s.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	buf2 := make([]byte, 4)
+	_ = peerB.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := peerB.ReadFromUDP(buf2); err != nil {
+		t.Fatalf("peer B did not receive: %v", err)
+	}
+	if string(buf2) != "pong" {
+		t.Fatalf("corrupted: %q", buf2)
 	}
 }
 
-func TestRouteDropsWithFullLoss(t *testing.T) {
-	target, targetAddr := echoServer(t)
-	defer target.Close()
+func TestShimDropsWithFullLoss(t *testing.T) {
+	peerA, aAddr := listenUDP(t)
+	defer peerA.Close()
+	peerB, _ := listenUDP(t)
+	defer peerB.Close()
 
-	s := NewShim()
+	s, err := NewShim(0, 1.0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
-	r, err := s.AddRoute(0, 1.0) // 100% loss
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.SetForward(targetAddr)
+	s.SetPeerA(aAddr)
 
-	src, err := net.DialUDP("udp4", nil, r.Addr())
-	if err != nil {
+	if _, err := peerB.WriteToUDP([]byte("ping"), s.Addr()); err != nil {
 		t.Fatal(err)
 	}
-	defer src.Close()
-	if _, err := src.Write([]byte("ping")); err != nil {
-		t.Fatal(err)
-	}
-
 	buf := make([]byte, 4)
-	_ = target.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	if _, _, err := target.ReadFromUDP(buf); err == nil {
+	_ = peerA.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, _, err := peerA.ReadFromUDP(buf); err == nil {
 		t.Fatal("expected packet to be dropped, but it arrived")
+	}
+}
+
+func TestShimDropsFromABeforeBLearned(t *testing.T) {
+	peerA, aAddr := listenUDP(t)
+	defer peerA.Close()
+	peerB, _ := listenUDP(t)
+	defer peerB.Close()
+
+	s, err := NewShim(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetPeerA(aAddr)
+
+	if _, err := peerA.WriteToUDP([]byte("early"), s.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	_ = peerB.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, _, err := peerB.ReadFromUDP(buf); err == nil {
+		t.Fatal("expected packet from A to be dropped before B is learned")
 	}
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd agent && go test ./cmd/benchdirect/ -run 'TestRoute' -v`
-Expected: FAIL — `undefined: NewShim`, `undefined: Shim`, `undefined: Route`.
+Run: `cd agent && go test ./cmd/benchdirect/ -run 'TestShim' -v`
+Expected: FAIL — `undefined: NewShim`, `undefined: Shim`.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -178,124 +200,118 @@ type packet struct {
 	due  time.Time
 }
 
-type Route struct {
+// Shim is an in-process reflexive NAT that injects latency and loss between two
+// peers. Peer A is configured via SetPeerA; peer B is learned from the first
+// datagram whose source address is not A. Datagrams from A are forwarded to B
+// and vice versa, each after a fixed delay.
+type Shim struct {
 	mu     sync.Mutex
 	conn   *net.UDPConn
-	target *net.UDPAddr
 	delay  time.Duration
 	loss   float64
+	a      *net.UDPAddr
+	b      *net.UDPAddr
 	queue  []packet
 	notify chan struct{}
 	closed bool
 }
 
-func (r *Route) Addr() *net.UDPAddr { return r.conn.LocalAddr().(*net.UDPAddr) }
-
-func (r *Route) SetForward(addr *net.UDPAddr) {
-	r.mu.Lock()
-	r.target = addr
-	r.mu.Unlock()
+func NewShim(delay time.Duration, loss float64) (*Shim, error) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, err
+	}
+	s := &Shim{conn: conn, delay: delay, loss: loss, notify: make(chan struct{}, 1)}
+	go s.readLoop()
+	go s.drainLoop()
+	return s, nil
 }
 
-func (r *Route) readLoop() {
+func (s *Shim) Addr() *net.UDPAddr { return s.conn.LocalAddr().(*net.UDPAddr) }
+
+func (s *Shim) SetPeerA(a *net.UDPAddr) {
+	s.mu.Lock()
+	s.a = a
+	s.mu.Unlock()
+}
+
+func (s *Shim) readLoop() {
 	buf := make([]byte, 64*1024)
 	for {
-		n, addr, err := r.conn.ReadFromUDP(buf)
+		n, src, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			return
 		}
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		r.mu.Lock()
-		if r.closed || r.target == nil {
-			r.mu.Unlock()
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
 			continue
 		}
-		if rand.Float64() < r.loss {
-			r.mu.Unlock()
+		if rand.Float64() < s.loss {
+			s.mu.Unlock()
 			continue
 		}
-		headEmpty := len(r.queue) == 0
-		r.queue = append(r.queue, packet{data: data, addr: addr, due: time.Now().Add(r.delay)})
+		var target *net.UDPAddr
+		if s.a != nil && src.Equal(*s.a) {
+			target = s.b // nil until B is learned → drop
+		} else {
+			if s.b == nil {
+				s.b = src
+			}
+			target = s.a
+		}
+		if target == nil {
+			s.mu.Unlock()
+			continue
+		}
+		headEmpty := len(s.queue) == 0
+		s.queue = append(s.queue, packet{data: data, addr: target, due: time.Now().Add(s.delay)})
 		if headEmpty {
 			select {
-			case r.notify <- struct{}{}:
+			case s.notify <- struct{}{}:
 			default:
 			}
 		}
-		r.mu.Unlock()
+		s.mu.Unlock()
 	}
 }
 
-func (r *Route) drainLoop() {
+func (s *Shim) drainLoop() {
 	for {
-		<-r.notify
+		<-s.notify
 		for {
-			r.mu.Lock()
-			if len(r.queue) == 0 {
-				r.mu.Unlock()
+			s.mu.Lock()
+			if len(s.queue) == 0 {
+				s.mu.Unlock()
 				break
 			}
-			head := r.queue[0]
+			head := s.queue[0]
 			wait := time.Until(head.due)
-			target := r.target
-			r.mu.Unlock()
+			s.queue = s.queue[1:]
+			s.mu.Unlock()
 
 			if wait > 0 {
 				time.Sleep(wait)
 			}
-			r.mu.Lock()
-			if len(r.queue) == 0 || r.queue[0].due.After(head.due) {
-				r.mu.Unlock()
-				continue
-			}
-			r.queue = r.queue[1:]
-			r.mu.Unlock()
-			if target != nil {
-				_, _ = r.conn.WriteToUDP(head.data, target)
-			}
+			_, _ = s.conn.WriteToUDP(head.data, head.addr)
 		}
 	}
 }
 
-type Shim struct {
-	mu     sync.Mutex
-	routes []*Route
-}
-
-func NewShim() *Shim { return &Shim{} }
-
-func (s *Shim) AddRoute(delay time.Duration, loss float64) (*Route, error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		return nil, err
-	}
-	r := &Route{conn: conn, delay: delay, loss: loss, notify: make(chan struct{}, 1)}
-	go r.readLoop()
-	go r.drainLoop()
-	s.mu.Lock()
-	s.routes = append(s.routes, r)
-	s.mu.Unlock()
-	return r, nil
-}
-
 func (s *Shim) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, r := range s.routes {
-		r.mu.Lock()
-		r.closed = true
-		r.mu.Unlock()
-		_ = r.conn.Close()
-	}
-	return nil
+	s.closed = true
+	s.mu.Unlock()
+	return s.conn.Close()
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd agent && go test ./cmd/benchdirect/ -run 'TestRoute' -v`
+Run: `cd agent && go test ./cmd/benchdirect/ -run 'TestShim' -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -849,7 +865,10 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	res := rawResult{Mode: "raw", RTT: cfg.rttMs}
 	delay := time.Duration(cfg.rttMs/2) * time.Millisecond
 
-	shim := NewShim()
+	shim, err := NewShim(delay, cfg.loss)
+	if err != nil {
+		return res, err
+	}
 	defer shim.Close()
 
 	se := webrtc.SettingEngine{}
@@ -877,16 +896,12 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	<-gatherDone
 	offerSDP := pc.LocalDescription().SDP
 
-	// Route Chrome→Go through the shim.
-	rA, err := shim.AddRoute(delay, cfg.loss)
+	// Rewrite Go's host candidate to the shim and register Go as peer A.
+	rewrittenOffer, _, goPort, err := RewriteHostCandidate(offerSDP, shim.Addr().Port)
 	if err != nil {
 		return res, err
 	}
-	rewrittenOffer, goIP, goPort, err := RewriteHostCandidate(offerSDP, rA.Addr().Port)
-	if err != nil {
-		return res, err
-	}
-	rA.SetForward(&net.UDPAddr{IP: net.ParseIP(goIP), Port: goPort})
+	shim.SetPeerA(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: goPort})
 
 	answerCh := make(chan string, 1)
 	webRoot, err := fs.Sub(webFS, "web")
@@ -911,15 +926,12 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 
 	select {
 	case answer := <-answerCh:
-		rB, err := shim.AddRoute(delay, cfg.loss)
+		// Rewrite Chrome's host candidate to the shim; the shim auto-learns
+		// Chrome's real address from the first datagram it receives.
+		rewrittenAnswer, _, _, err := RewriteHostCandidate(answer, shim.Addr().Port)
 		if err != nil {
 			return res, err
 		}
-		rewrittenAnswer, chromeIP, chromePort, err := RewriteHostCandidate(answer, rB.Addr().Port)
-		if err != nil {
-			return res, err
-		}
-		rB.SetForward(&net.UDPAddr{IP: net.ParseIP(chromeIP), Port: chromePort})
 		if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: rewrittenAnswer}); err != nil {
 			return res, err
 		}
