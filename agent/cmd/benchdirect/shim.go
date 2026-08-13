@@ -121,6 +121,10 @@ func NewShim() *Shim {
 }
 
 func (s *Shim) AddRoute(delay time.Duration, loss float64) (*Route, error) {
+	if loss < 0 || loss > 1 {
+		return nil, errors.New("loss must be between 0 and 1")
+	}
+
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return nil, err
