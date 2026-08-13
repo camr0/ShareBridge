@@ -22,11 +22,44 @@ type benchChannelSet struct {
 	endpoints map[multilane.Lane]*benchEndpoint
 	onOpen    func()
 	onClose   func()
+	openCount int
+	openFired bool
+	closed    bool
 }
 
 func (c *benchChannelSet) Endpoint(lane multilane.Lane) multilane.Endpoint { return c.endpoints[lane] }
 func (c *benchChannelSet) SetOnOpen(f func())                              { c.mu.Lock(); c.onOpen = f; c.mu.Unlock() }
 func (c *benchChannelSet) SetOnClose(f func())                             { c.mu.Lock(); c.onClose = f; c.mu.Unlock() }
+
+func (c *benchChannelSet) noteOpen() {
+	c.mu.Lock()
+	c.openCount++
+	shouldFire := c.openCount == 3 && c.onOpen != nil && !c.openFired
+	var onOpen func()
+	if shouldFire {
+		c.openFired = true
+		onOpen = c.onOpen
+	}
+	c.mu.Unlock()
+	if onOpen != nil {
+		onOpen()
+	}
+}
+
+func (c *benchChannelSet) noteClose() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	onClose := c.onClose
+	c.mu.Unlock()
+	if onClose != nil {
+		onClose()
+	}
+}
+
 func (c *benchChannelSet) AddOnClose(f func()) {
 	if f == nil {
 		return
@@ -106,7 +139,9 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 			case openCh <- struct{}{}:
 			default:
 			}
+			set.noteOpen()
 		})
+		dc.OnClose(func() { set.noteClose() })
 	}
 
 	gatherDone := webrtc.GatheringCompletePromise(pc)
