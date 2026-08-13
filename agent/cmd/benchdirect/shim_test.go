@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func echoServer(t *testing.T) (*net.UDPConn, *net.UDPAddr) {
+func listenUDP(t *testing.T) (*net.UDPConn, *net.UDPAddr) {
 	t.Helper()
 	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -15,143 +15,92 @@ func echoServer(t *testing.T) (*net.UDPConn, *net.UDPAddr) {
 	return pc, pc.LocalAddr().(*net.UDPAddr)
 }
 
-func TestAddRouteRejectsInvalidLoss(t *testing.T) {
-	s := NewShim()
-	defer s.Close()
+func TestShimForwardsBidirectionallyWithDelay(t *testing.T) {
+	peerA, aAddr := listenUDP(t) // "Go"
+	defer peerA.Close()
+	peerB, _ := listenUDP(t) // "Chrome"
+	defer peerB.Close()
 
-	for _, loss := range []float64{-0.01, 1.01} {
-		if _, err := s.AddRoute(0, loss); err == nil {
-			t.Fatalf("expected error for loss %v", loss)
-		}
-	}
-}
-
-func TestRouteForwardsAfterDelay(t *testing.T) {
-	target, targetAddr := echoServer(t)
-	defer target.Close()
-
-	s := NewShim()
-	defer s.Close()
-	r, err := s.AddRoute(200*time.Millisecond, 0)
+	s, err := NewShim(200*time.Millisecond, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.SetForward(targetAddr)
+	defer s.Close()
+	s.SetPeerA(aAddr)
 
-	src, err := net.DialUDP("udp4", nil, r.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer src.Close()
-
+	// Chrome → Go: first non-A source learns B, forwards to A after delay.
 	start := time.Now()
-	if _, err := src.Write([]byte("ping")); err != nil {
+	if _, err := peerB.WriteToUDP([]byte("ping"), s.Addr()); err != nil {
 		t.Fatal(err)
 	}
-
 	buf := make([]byte, 4)
-	_ = target.SetReadDeadline(time.Now().Add(time.Second))
-	if _, _, err := target.ReadFromUDP(buf); err != nil {
-		t.Fatalf("no packet received: %v", err)
-	}
-	elapsed := time.Since(start)
-	if elapsed < 200*time.Millisecond {
-		t.Fatalf("packet arrived too early: %v", elapsed)
+	_ = peerA.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := peerA.ReadFromUDP(buf); err != nil {
+		t.Fatalf("peer A did not receive: %v", err)
 	}
 	if string(buf) != "ping" {
-		t.Fatalf("payload corrupted: %q", buf)
+		t.Fatalf("corrupted: %q", buf)
+	}
+	if time.Since(start) < 200*time.Millisecond {
+		t.Fatalf("arrived too early: %v", time.Since(start))
+	}
+
+	// Go → Chrome: source A forwards to learned B after delay.
+	if _, err := peerA.WriteToUDP([]byte("pong"), s.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	buf2 := make([]byte, 4)
+	_ = peerB.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := peerB.ReadFromUDP(buf2); err != nil {
+		t.Fatalf("peer B did not receive: %v", err)
+	}
+	if string(buf2) != "pong" {
+		t.Fatalf("corrupted: %q", buf2)
 	}
 }
 
-func TestRouteDropsWithFullLoss(t *testing.T) {
-	target, targetAddr := echoServer(t)
-	defer target.Close()
+func TestShimDropsWithFullLoss(t *testing.T) {
+	peerA, aAddr := listenUDP(t)
+	defer peerA.Close()
+	peerB, _ := listenUDP(t)
+	defer peerB.Close()
 
-	s := NewShim()
+	s, err := NewShim(0, 1.0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
-	r, err := s.AddRoute(0, 1.0) // 100% loss
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.SetForward(targetAddr)
+	s.SetPeerA(aAddr)
 
-	src, err := net.DialUDP("udp4", nil, r.Addr())
-	if err != nil {
+	if _, err := peerB.WriteToUDP([]byte("ping"), s.Addr()); err != nil {
 		t.Fatal(err)
 	}
-	defer src.Close()
-	if _, err := src.Write([]byte("ping")); err != nil {
-		t.Fatal(err)
-	}
-
 	buf := make([]byte, 4)
-	_ = target.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	if _, _, err := target.ReadFromUDP(buf); err == nil {
+	_ = peerA.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, _, err := peerA.ReadFromUDP(buf); err == nil {
 		t.Fatal("expected packet to be dropped, but it arrived")
 	}
 }
 
-func TestRoutePreservesPacketOrder(t *testing.T) {
-	target, targetAddr := echoServer(t)
-	defer target.Close()
+func TestShimDropsFromABeforeBLearned(t *testing.T) {
+	peerA, aAddr := listenUDP(t)
+	defer peerA.Close()
+	peerB, _ := listenUDP(t)
+	defer peerB.Close()
 
-	s := NewShim()
+	s, err := NewShim(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
-	r, err := s.AddRoute(50*time.Millisecond, 0)
-	if err != nil {
+	s.SetPeerA(aAddr)
+
+	if _, err := peerA.WriteToUDP([]byte("early"), s.Addr()); err != nil {
 		t.Fatal(err)
 	}
-	r.SetForward(targetAddr)
-
-	src, err := net.DialUDP("udp4", nil, r.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer src.Close()
-
-	for _, payload := range []string{"one", "two"} {
-		if _, err := src.Write([]byte(payload)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	buf := make([]byte, 3)
-	for _, want := range []string{"one", "two"} {
-		_ = target.SetReadDeadline(time.Now().Add(time.Second))
-		n, _, err := target.ReadFromUDP(buf)
-		if err != nil {
-			t.Fatalf("missing packet %q: %v", want, err)
-		}
-		if got := string(buf[:n]); got != want {
-			t.Fatalf("packet order broken: got %q, want %q", got, want)
-		}
-	}
-}
-
-func TestRouteDropsPacketsReceivedBeforeForward(t *testing.T) {
-	target, _ := echoServer(t)
-	defer target.Close()
-
-	s := NewShim()
-	defer s.Close()
-	r, err := s.AddRoute(0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	src, err := net.DialUDP("udp4", nil, r.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer src.Close()
-
-	if _, err := src.Write([]byte("late")); err != nil {
-		t.Fatal(err)
-	}
-
-	buf := make([]byte, 4)
-	_ = target.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	if _, _, err := target.ReadFromUDP(buf); err == nil {
-		t.Fatal("expected packet sent before SetForward to be dropped, but it arrived")
+	buf := make([]byte, 8)
+	_ = peerB.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, _, err := peerB.ReadFromUDP(buf); err == nil {
+		t.Fatal("expected packet from A to be dropped before B is learned")
 	}
 }
