@@ -193,6 +193,8 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 		}
 	case <-ctx.Done():
 		return res, ctx.Err()
+	case <-time.After(30 * time.Second):
+		return res, fmt.Errorf("timed out waiting for browser answer")
 	}
 
 	for i := 0; i < 3; i++ {
@@ -210,6 +212,9 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
 		var received int64
 		if err := b.eval("window.__bench.received", &received); err != nil {
 			return res, err

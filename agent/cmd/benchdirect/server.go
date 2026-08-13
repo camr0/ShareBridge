@@ -47,7 +47,10 @@ func (s *benchServer) handler() http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		s.answerCh <- body.SDP
+		select {
+		case s.answerCh <- body.SDP:
+		default:
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.Handle("/", http.FileServer(http.FS(s.fs)))

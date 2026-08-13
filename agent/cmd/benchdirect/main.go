@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 func main() {
@@ -49,7 +50,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var (
@@ -85,6 +86,9 @@ func main() {
 }
 
 func validateRunConfig(cfg runConfig) error {
+	if cfg.mode != "raw" && cfg.mode != "prod" {
+		return fmt.Errorf("invalid -mode %q: must be raw or prod", cfg.mode)
+	}
 	if cfg.rttMs < 0 {
 		return fmt.Errorf("invalid -rtt %d: must be >= 0", cfg.rttMs)
 	}
@@ -100,12 +104,14 @@ func validateRunConfig(cfg runConfig) error {
 	if cfg.loss < 0 || cfg.loss > 1 {
 		return fmt.Errorf("invalid -loss %v: must be between 0 and 1", cfg.loss)
 	}
-	switch cfg.backpressure {
-	case "event", "poll":
-		return nil
-	default:
-		return fmt.Errorf("invalid -backpressure %q: must be event or poll", cfg.backpressure)
+	if cfg.mode == "raw" {
+		switch cfg.backpressure {
+		case "event", "poll":
+		default:
+			return fmt.Errorf("invalid -backpressure %q: must be event or poll", cfg.backpressure)
+		}
 	}
+	return nil
 }
 
 // chunkFitsInt reports whether b can be stored in a platform int without
@@ -159,6 +165,9 @@ func parseByteSize(s string) (int64, error) {
 			n, err := strconv.ParseInt(v, 10, 64)
 			if err != nil {
 				return 0, err
+			}
+			if n > math.MaxInt64/unit.mult {
+				return 0, fmt.Errorf("size %q overflows int64", s)
 			}
 			return n * unit.mult, nil
 		}

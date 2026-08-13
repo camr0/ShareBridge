@@ -111,12 +111,16 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		}
 	case <-ctx.Done():
 		return res, ctx.Err()
+	case <-time.After(30 * time.Second):
+		return res, fmt.Errorf("timed out waiting for browser answer")
 	}
 
 	select {
 	case <-openCh:
 	case <-ctx.Done():
 		return res, ctx.Err()
+	case <-time.After(10 * time.Second):
+		return res, fmt.Errorf("timed out waiting for DataChannel to open")
 	}
 
 	// Pump bytes until the channel is open and all data is sent.
@@ -166,6 +170,9 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	// Wait for the browser to receive everything.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
+		if err := ctx.Err(); err != nil {
+			return res, err
+		}
 		var received int64
 		if err := b.eval("window.__bench.received", &received); err != nil {
 			return res, fmt.Errorf("read browser received counter: %w", err)
