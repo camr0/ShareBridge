@@ -1,11 +1,15 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
 	"io/fs"
 	"net"
 	"net/http"
 )
+
+//go:embed web
+var webFS embed.FS
 
 type benchServer struct {
 	offerFn  func() string
