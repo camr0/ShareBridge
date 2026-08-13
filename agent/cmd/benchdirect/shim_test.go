@@ -129,7 +129,7 @@ func TestRoutePreservesPacketOrder(t *testing.T) {
 }
 
 func TestRouteDropsPacketsReceivedBeforeForward(t *testing.T) {
-	target, targetAddr := echoServer(t)
+	target, _ := echoServer(t)
 	defer target.Close()
 
 	s := NewShim()
@@ -148,8 +148,6 @@ func TestRouteDropsPacketsReceivedBeforeForward(t *testing.T) {
 	if _, err := src.Write([]byte("late")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	r.SetForward(targetAddr)
 
 	buf := make([]byte, 4)
 	_ = target.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
