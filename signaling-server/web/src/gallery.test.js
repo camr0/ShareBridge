@@ -11,6 +11,501 @@ function fakeRoot() {
   }
 }
 
+function galleryItems(count) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `asset-${index}`,
+    name: `photo-${index}.jpg`,
+    mimeType: 'image/jpeg',
+  }))
+}
+
+test('pull-v1 initially renders and requests only the first 120 thumbnails', () => {
+  const requests = []
+  const root = fakeRoot()
+  const controller = createGalleryController({
+    root,
+    onThumbnailBatchRequest: (request) => requests.push(request),
+  })
+
+  controller.handleThumbnailList({
+    thumbnailMode: 'pull-v1',
+    items: galleryItems(2453),
+  })
+
+  assert.equal((root.innerHTML.match(/class="gallery-item"/g) || []).length, 120)
+  assert.equal(requests.length, 1)
+  assert.match(requests[0].request_id, /^thumb-/)
+  assert.deepEqual(
+    { type: requests[0].type, start: requests[0].start, count: requests[0].count },
+    { type: 'thumbnail_batch_request', start: 0, count: 120 },
+  )
+  assert.equal(controller.state.renderedCount, 120)
+  assert.equal(controller.state.inFlight.requestId, requests[0].request_id)
+})
+
+test('legacy thumbnail lists render eagerly without sending pull requests', () => {
+  const requests = []
+  const root = fakeRoot()
+  const controller = createGalleryController({
+    root,
+    createObjectURL: () => 'blob:legacy',
+    revokeObjectURL: () => {},
+    onThumbnailBatchRequest: (request) => requests.push(request),
+  })
+
+  controller.handleThumbnailList({ items: galleryItems(121) })
+  controller.handleThumbnailData(120, new Uint8Array([1]))
+  controller.handleThumbnailComplete({ sent: 121, failed: 0 })
+
+  assert.equal((root.innerHTML.match(/class="gallery-item"/g) || []).length, 121)
+  assert.deepEqual(requests, [])
+  assert.equal(controller.state.loadedThumbs, 1)
+})
+
+test('Load More appends one window and deduplicates requests until completion', () => {
+  const requests = []
+  let clickHandler
+  const appended = []
+  const loadMore = { disabled: false, hidden: false, textContent: '', setAttribute() {} }
+  const grid = { insertAdjacentHTML: (_position, html) => appended.push(html), addEventListener() {}, removeEventListener() {} }
+  const root = fakeRoot()
+  root.addEventListener = (event, handler) => { if (event === 'click') clickHandler = handler }
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return grid
+    if (selector === '.gallery-load-more') return loadMore
+    return null
+  }
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ galleryItems: galleryItems(245).map(() => ({})), destroy() {} }),
+    onThumbnailBatchRequest: (request) => requests.push(request),
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(245) })
+  const first = requests[0]
+  controller.handleThumbnailBatchComplete({ ...first, request_id: first.request_id, sent: 120, failed: 0 })
+
+  const event = {
+    preventDefault() {},
+    target: { closest: (selector) => selector === '.gallery-load-more' ? loadMore : null },
+  }
+  clickHandler(event)
+  clickHandler(event)
+
+  assert.equal(requests.length, 2)
+  assert.deepEqual(
+    { start: requests[1].start, count: requests[1].count },
+    { start: 120, count: 120 },
+  )
+  assert.equal((appended[0].match(/class="gallery-item"/g) || []).length, 120)
+  assert.equal(loadMore.disabled, true)
+
+  controller.handleThumbnailBatchComplete({ ...requests[1], request_id: requests[1].request_id, sent: 120, failed: 0 })
+  clickHandler(event)
+  assert.deepEqual(
+    { start: requests[2].start, count: requests[2].count },
+    { start: 240, count: 5 },
+  )
+})
+
+test('intersection sentinel and Load More share the same one-in-flight path', () => {
+  const requests = []
+  let observerCallback
+  let observed = null
+  const sentinel = {}
+  const loadMore = { disabled: false, hidden: false, setAttribute() {} }
+  const grid = { insertAdjacentHTML() {}, addEventListener() {}, removeEventListener() {} }
+  const root = fakeRoot()
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return grid
+    if (selector === '.gallery-sentinel') return sentinel
+    if (selector === '.gallery-load-more') return loadMore
+    return null
+  }
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ galleryItems: galleryItems(240).map(() => ({})), destroy() {} }),
+    createIntersectionObserver: (callback) => {
+      observerCallback = callback
+      return { observe: (node) => { observed = node }, disconnect() {} }
+    },
+    onThumbnailBatchRequest: (request) => requests.push(request),
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(240) })
+  controller.handleThumbnailBatchComplete({ ...requests[0], request_id: requests[0].request_id, sent: 120, failed: 0 })
+
+  observerCallback([{ isIntersecting: true, target: sentinel }])
+  observerCallback([{ isIntersecting: true, target: sentinel }])
+
+  assert.equal(observed, sentinel)
+  assert.equal(requests.length, 2)
+  assert.deepEqual({ start: requests[1].start, count: requests[1].count }, { start: 120, count: 120 })
+})
+
+test('intersection events during a batch queue one next window after completion', () => {
+  const requests = []
+  const appended = []
+  let observerCallback
+  const sentinel = {}
+  const grid = {
+    insertAdjacentHTML: (_position, html) => appended.push(html),
+    addEventListener() {},
+    removeEventListener() {},
+  }
+  const root = fakeRoot()
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return grid
+    if (selector === '.gallery-sentinel') return sentinel
+    return null
+  }
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => ({ galleryItems: galleryItems(360).map(() => ({})), destroy() {} }),
+    createIntersectionObserver: (callback) => {
+      observerCallback = callback
+      return { observe() {}, disconnect() {} }
+    },
+    onThumbnailBatchRequest: (request) => requests.push(request),
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(360) })
+  const first = requests[0]
+
+  observerCallback([{ isIntersecting: true, target: sentinel }])
+  observerCallback([{ isIntersecting: true, target: sentinel }])
+  observerCallback([{ isIntersecting: true, target: sentinel }])
+
+  assert.equal(requests.length, 1)
+  assert.equal(controller.state.pendingExpansion, true)
+
+  controller.handleThumbnailBatchComplete({ ...first, request_id: first.request_id, sent: 120, failed: 0 })
+
+  assert.equal(requests.length, 2)
+  assert.deepEqual({ start: requests[1].start, count: requests[1].count }, { start: 120, count: 120 })
+  assert.equal(controller.state.renderedCount, 240)
+  assert.equal((appended[0].match(/class="gallery-item"/g) || []).length, 120)
+  assert.equal(controller.state.pendingExpansion, false)
+})
+
+for (const [label, failureFactory] of [
+  ['false', () => false],
+  ['synchronous throw', () => { throw new Error('send failed') }],
+  ['rejected promise', () => Promise.reject(new Error('send rejected'))],
+]) {
+  test(`initial thumbnail request recovers from ${label} and retries the same range`, async () => {
+    const requests = []
+    let attempt = 0
+    let clickHandler
+    const loadMore = { disabled: false, hidden: false, textContent: '', setAttribute() {} }
+    const root = fakeRoot()
+    root.addEventListener = (event, handler) => { if (event === 'click') clickHandler = handler }
+    root.querySelector = (selector) => selector === '.gallery-load-more' ? loadMore : null
+    const controller = createGalleryController({
+      root,
+      onThumbnailBatchRequest: (request) => {
+        requests.push(request)
+        attempt += 1
+        return attempt === 1 ? failureFactory() : true
+      },
+    })
+    controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(240) })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    assert.equal(controller.state.inFlight, null)
+    assert.equal(controller.state.requestedThumbs, 0)
+    assert.equal(loadMore.disabled, false)
+    clickHandler({ preventDefault() {}, target: { closest: (selector) => selector === '.gallery-load-more' ? loadMore : null } })
+
+    assert.equal(requests.length, 2)
+    assert.deepEqual(requests.map(({ start, count }) => ({ start, count })), [
+      { start: 0, count: 120 },
+      { start: 0, count: 120 },
+    ])
+    assert.equal(controller.state.renderedCount, 120)
+  })
+}
+
+for (const [label, failureFactory] of [
+  ['false', () => false],
+  ['synchronous throw', () => { throw new Error('send failed') }],
+  ['rejected promise', () => Promise.reject(new Error('send rejected'))],
+]) {
+  test(`Load More recovers from ${label} without permanently appending the range`, async () => {
+    const requests = []
+    const appended = []
+    let failNext = false
+    let clickHandler
+    const loadMore = { disabled: false, hidden: false, textContent: '', setAttribute() {} }
+    const grid = { insertAdjacentHTML: (_position, html) => appended.push(html), addEventListener() {}, removeEventListener() {} }
+    const root = fakeRoot()
+    root.addEventListener = (event, handler) => { if (event === 'click') clickHandler = handler }
+    root.querySelector = (selector) => {
+      if (selector === '.gallery-grid') return grid
+      if (selector === '.gallery-load-more') return loadMore
+      return null
+    }
+    const controller = createGalleryController({
+      root,
+      lightGallery: () => ({ galleryItems: galleryItems(240).map(() => ({})), destroy() {} }),
+      onThumbnailBatchRequest: (request) => {
+        requests.push(request)
+        if (failNext) {
+          failNext = false
+          return failureFactory()
+        }
+        return true
+      },
+    })
+    controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(240) })
+    controller.handleThumbnailBatchComplete({ ...requests[0], sent: 120, failed: 0 })
+    failNext = true
+    const event = { preventDefault() {}, target: { closest: (selector) => selector === '.gallery-load-more' ? loadMore : null } }
+    clickHandler(event)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    assert.equal(controller.state.inFlight, null)
+    assert.equal(controller.state.renderedCount, 120)
+    assert.equal(appended.length, 0)
+    assert.equal(loadMore.disabled, false)
+    clickHandler(event)
+
+    assert.deepEqual(requests.slice(1).map(({ start, count }) => ({ start, count })), [
+      { start: 120, count: 120 },
+      { start: 120, count: 120 },
+    ])
+    assert.equal(controller.state.renderedCount, 240)
+    assert.equal(appended.length, 1)
+  })
+}
+
+test('late rejected thumbnail request cannot roll back a newer gallery', async () => {
+  let rejectOld
+  let calls = 0
+  const controller = createGalleryController({
+    root: fakeRoot(),
+    onThumbnailBatchRequest: () => {
+      calls += 1
+      if (calls === 1) return new Promise((_resolve, reject) => { rejectOld = reject })
+      return true
+    },
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(240) })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(120) })
+  const currentRequest = controller.state.inFlight.requestId
+
+  rejectOld(new Error('old session failed'))
+  await Promise.resolve()
+  await Promise.resolve()
+
+  assert.equal(controller.state.inFlight.requestId, currentRequest)
+  assert.equal(controller.state.requestedThumbs, 120)
+})
+
+test('pull completion correlates the exact range and makes missing frames terminal', () => {
+  const requests = []
+  const root = fakeRoot()
+  const controller = createGalleryController({
+    root,
+    createObjectURL: () => 'blob:thumb',
+    revokeObjectURL: () => {},
+    onThumbnailBatchRequest: (request) => requests.push(request),
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(125) })
+  const request = requests[0]
+  controller.handleThumbnailData(0, new Uint8Array([1]))
+
+  controller.handleThumbnailBatchComplete({ ...request, request_id: 'stale', sent: 1, failed: 119 })
+  controller.handleThumbnailBatchComplete({ ...request, start: 1, sent: 1, failed: 119 })
+  const { start: _start, ...missingStart } = request
+  controller.handleThumbnailBatchComplete({ ...missingStart, request_id: request.request_id, sent: 1, failed: 119 })
+  controller.handleThumbnailBatchComplete({ ...request, start: null, request_id: request.request_id, sent: 1, failed: 119 })
+  assert.ok(controller.state.inFlight)
+
+  controller.handleThumbnailBatchComplete({
+    type: 'thumbnail_batch_complete',
+    request_id: request.request_id,
+    start: 0,
+    count: 120,
+    sent: 1,
+    failed: 119,
+    failed_indices: Array.from({ length: 119 }, (_, offset) => offset + 1),
+  })
+  assert.equal(controller.state.inFlight, null)
+  assert.equal(controller.state.unavailableThumbs, 119)
+  assert.equal(controller.state.terminalIndices.has(1), true)
+
+  controller.handleThumbnailData(1, new Uint8Array([2]))
+  controller.handleThumbnailBatchComplete({ ...request, request_id: request.request_id, sent: 120, failed: 0 })
+  assert.equal(controller.state.loadedThumbs, 1)
+  assert.equal(controller.state.unavailableThumbs, 119)
+  assert.equal(requests.length, 1)
+})
+
+test('batch completion accepts late successful frames and rejects explicit failed indices', () => {
+  const requests = []
+  const controller = createGalleryController({
+    root: fakeRoot(),
+    createObjectURL: () => 'blob:thumb',
+    revokeObjectURL: () => {},
+    onThumbnailBatchRequest: (request) => { requests.push(request); return true },
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(3) })
+  const request = requests[0]
+  controller.handleThumbnailBatchComplete({
+    ...request,
+    sent: 2,
+    failed: 1,
+    failed_indices: [1],
+  })
+
+  assert.equal(controller.state.unavailableThumbs, 1)
+  assert.equal(controller.state.loadedThumbs, 0)
+  controller.handleThumbnailData(0, new Uint8Array([1]))
+  controller.handleThumbnailData(2, new Uint8Array([2]))
+  controller.handleThumbnailData(1, new Uint8Array([3]))
+  controller.handleThumbnailData(0, new Uint8Array([4]))
+
+  assert.equal(controller.state.loadedThumbs, 2)
+  assert.equal(controller.state.unavailableThumbs, 1)
+  assert.deepEqual([...controller.state.pendingSuccessfulIndices], [])
+})
+
+test('thumbnail batch error rolls back the exact request and permits retry', () => {
+  const requests = []
+  let clickHandler
+  const root = fakeRoot()
+  root.addEventListener = (event, handler) => { if (event === 'click') clickHandler = handler }
+  const loadMore = { disabled: false, hidden: false, setAttribute() {} }
+  root.querySelector = (selector) => selector === '.gallery-load-more' ? loadMore : null
+  const controller = createGalleryController({ root, onThumbnailBatchRequest: (request) => { requests.push(request); return true } })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(240) })
+
+  assert.equal(controller.handleThumbnailBatchError({ request_id: 'stale' }), false)
+  assert.equal(controller.handleThumbnailBatchError({ request_id: requests[0].request_id }), true)
+  assert.equal(controller.state.inFlight, null)
+  clickHandler({ preventDefault() {}, target: { closest: (selector) => selector === '.gallery-load-more' ? loadMore : null } })
+  assert.deepEqual(requests.map(({ start, count }) => ({ start, count })), [
+    { start: 0, count: 120 },
+    { start: 0, count: 120 },
+  ])
+})
+
+test('thumbnail_complete after a pull batch error switches to legacy eager handling', () => {
+  const controller = createGalleryController({
+    root: fakeRoot(),
+    createObjectURL: () => 'blob:legacy',
+    revokeObjectURL: () => {},
+    onThumbnailBatchRequest: () => true,
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(3) })
+  controller.handleThumbnailBatchError({ request_id: controller.state.inFlight.requestId })
+  controller.handleThumbnailData(2, new Uint8Array([1]))
+  controller.handleThumbnailComplete({ sent: 2, failed: 1 })
+
+  assert.equal(controller.state.thumbnailMode, '')
+  assert.equal(controller.state.loadedThumbs, 1)
+  assert.equal(controller.state.unavailableThumbs, 1)
+})
+
+test('legacy fallback frames that overtake pull rejection are accepted for the current gallery', () => {
+  const requests = []
+  const controller = createGalleryController({
+    root: fakeRoot(),
+    createObjectURL: () => 'blob:fallback',
+    revokeObjectURL: () => {},
+    onThumbnailBatchRequest: (request) => { requests.push(request); return true },
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(240) })
+
+  controller.handleThumbnailData(130, new Uint8Array([1, 2, 3]))
+  controller.handleThumbnailData(130, new Uint8Array([4]))
+  controller.handleThumbnailData(999, new Uint8Array([5]))
+  assert.equal(controller.state.loadedThumbs, 1)
+  assert.equal(controller.state.urls.get('thumb:asset-130'), 'blob:fallback')
+
+  controller.handleThumbnailBatchError({ request_id: requests[0].request_id })
+
+  assert.equal(controller.state.loadedThumbs, 1)
+  assert.equal(controller.state.urls.get('thumb:asset-130'), 'blob:fallback')
+})
+
+test('valid pull completion incorporates an early current-gallery frame without duplicating it', () => {
+  const requests = []
+  const controller = createGalleryController({
+    root: fakeRoot(),
+    createObjectURL: () => 'blob:stale',
+    revokeObjectURL: () => {},
+    onThumbnailBatchRequest: (request) => { requests.push(request); return true },
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(240) })
+  controller.handleThumbnailData(130, new Uint8Array([1]))
+  controller.handleThumbnailBatchComplete({ ...requests[0], sent: 120, failed: 0, failed_indices: [] })
+  controller.handleThumbnailData(130, new Uint8Array([2]))
+
+  assert.equal(controller.state.loadedThumbs, 1)
+  assert.equal(controller.state.urls.get('thumb:asset-130'), 'blob:stale')
+})
+
+test('dynamic lightbox contains the complete album and opens a tile by global index', () => {
+  let options
+  const opened = []
+  let clickHandler
+  const grid = { addEventListener() {}, removeEventListener() {} }
+  const root = fakeRoot()
+  root.addEventListener = (event, handler) => { if (event === 'click') clickHandler = handler }
+  root.querySelector = (selector) => selector === '.gallery-grid' ? grid : null
+  const controller = createGalleryController({
+    root,
+    lightGallery: (_container, received) => {
+      options = received
+      return { galleryItems: received.dynamicEl.map((item) => ({ ...item })), openGallery: (index) => opened.push(index), destroy() {} }
+    },
+    onThumbnailBatchRequest: () => {},
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(2453) })
+
+  clickHandler({
+    target: {
+      closest: (selector) => selector === '[data-gallery-index]'
+        ? { dataset: { galleryIndex: '130', galleryId: 'asset-130' } }
+        : null,
+    },
+  })
+
+  assert.equal(options.dynamic, true)
+  assert.equal(options.download, false)
+  assert.equal(options.dynamicEl.length, 2453)
+  assert.deepEqual(opened, [130])
+})
+
+test('dynamic lightbox entries use escaped placeholders and the existing video schema', () => {
+  let options
+  const grid = { addEventListener() {}, removeEventListener() {} }
+  const root = fakeRoot()
+  root.querySelector = (selector) => selector === '.gallery-grid' ? grid : null
+  const controller = createGalleryController({
+    root,
+    lightGallery: (_container, received) => {
+      options = received
+      return { galleryItems: received.dynamicEl, destroy() {} }
+    },
+  })
+  controller.handleThumbnailList({ items: [
+    { id: 'image-1', name: '<photo & sun>.jpg', mimeType: 'image/jpeg' },
+    { id: 'video-1', name: '<clip>.mp4', mimeType: 'video/mp4' },
+  ] })
+
+  assert.match(options.dynamicEl[0].src, /^data:image\/gif;base64,/)
+  assert.equal(options.dynamicEl[0].thumb, options.dynamicEl[0].src)
+  assert.equal(options.dynamicEl[0].alt, '&lt;photo &amp; sun&gt;.jpg')
+  assert.equal(options.dynamicEl[0].subHtml, '<p>&lt;photo &amp; sun&gt;.jpg</p>')
+  assert.equal(options.dynamicEl[0].downloadUrl, 'false')
+  assert.equal(options.dynamicEl[1].poster, options.dynamicEl[1].src)
+  assert.deepEqual(JSON.parse(options.dynamicEl[1].video), [
+    { src: options.dynamicEl[1].src, type: 'video/mp4' },
+  ])
+})
+
 test('gallery summary renders Download All immediately after an escaped item count', () => {
   const html = renderGalleryShell('<Summer & Sun>', 'Beach <script>alert(1)</script>', [
     { id: 'asset-1', name: '<photo>.jpg', mimeType: 'image/jpeg' },
@@ -282,7 +777,7 @@ test('gallery updates lightGallery source attributes when thumbnail data arrives
   assert.equal(refreshed, 0)
 })
 
-test('gallery coalesces lightGallery refresh after thumbnail source updates', () => {
+test('gallery updates dynamic lightGallery items without scheduling a DOM refresh', () => {
   const root = fakeRoot()
   const itemNodes = new Map([
     ['asset-1', { dataset: {} }],
@@ -293,6 +788,7 @@ test('gallery coalesces lightGallery refresh after thumbnail source updates', ()
     ['asset-2', { src: '' }],
   ])
   let refreshed = 0
+  const galleryItems = [{}, {}]
   const timers = []
   root.querySelector = (selector) => {
     if (selector === '.gallery-grid') return {}
@@ -304,7 +800,7 @@ test('gallery coalesces lightGallery refresh after thumbnail source updates', ()
   }
   const controller = createGalleryController({
     root,
-    lightGallery: () => ({ refresh: () => { refreshed += 1 }, destroy() {} }),
+    lightGallery: () => ({ galleryItems, refresh: () => { refreshed += 1 }, destroy() {} }),
     createObjectURL: () => `blob:thumb-${timers.length}`,
     revokeObjectURL: () => {},
     setRefreshTimeout: (fn, delay) => {
@@ -325,11 +821,9 @@ test('gallery coalesces lightGallery refresh after thumbnail source updates', ()
   controller.handleThumbnailData(1, new Uint8Array([2]))
 
   assert.equal(refreshed, 0)
-  assert.equal(timers.length, 1)
-  assert.equal(timers[0].delay, 50)
-
-  timers[0].fn()
-  assert.equal(refreshed, 1)
+  assert.equal(timers.length, 0)
+  assert.equal(galleryItems[0].src, 'blob:thumb-0')
+  assert.equal(galleryItems[1].src, 'blob:thumb-0')
 })
 
 test('gallery preview data upgrades the active lightbox image', () => {
@@ -1089,6 +1583,98 @@ test('gallery destroys lightGallery before rerendering and destroying', () => {
   controller.destroy()
 
   assert.deepEqual(destroyed, [1, 2])
+})
+
+test('gallery teardown destroys the lightbox and observer before clearing timers and revoking owned URLs', () => {
+  const events = []
+  let nextURL = 1
+  const grid = { addEventListener() {}, removeEventListener() {} }
+  const sentinel = {}
+  const root = fakeRoot()
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return grid
+    if (selector === '.gallery-sentinel') return sentinel
+    return null
+  }
+  const controller = createGalleryController({
+    root,
+    lightGallery: (_grid, options) => ({
+      galleryItems: options.dynamicEl.map((item) => ({ ...item })),
+      destroy: () => events.push('destroy-lightbox'),
+    }),
+    createIntersectionObserver: () => ({ observe() {}, disconnect: () => events.push('disconnect-observer') }),
+    createObjectURL: () => `blob:${nextURL++}`,
+    revokeObjectURL: (url) => events.push(`revoke:${url}`),
+    clearRefreshTimeout: () => events.push('clear-timer'),
+    onThumbnailBatchRequest: () => {},
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(2) })
+  controller.handleThumbnailData(0, new Uint8Array([1]))
+  controller.handlePreviewData('asset-0', new Uint8Array([2]), 'image/jpeg')
+  controller.state.refreshTimer = 99
+  events.length = 0
+
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(1) })
+
+  assert.deepEqual(events, [
+    'destroy-lightbox',
+    'clear-timer',
+    'disconnect-observer',
+    'revoke:blob:1',
+    'revoke:blob:2',
+  ])
+})
+
+test('preview upgrades preserve the grid thumbnail and use separate URL ownership keys', () => {
+  const img = { src: '' }
+  const grid = { addEventListener() {}, removeEventListener() {} }
+  const root = fakeRoot()
+  root.querySelector = (selector) => {
+    if (selector === '.gallery-grid') return grid
+    if (selector === '[data-thumb-id="asset-0"]') return img
+    return null
+  }
+  let nextURL = 1
+  const lightbox = { galleryItems: [{}], destroy() {} }
+  const controller = createGalleryController({
+    root,
+    lightGallery: () => lightbox,
+    createObjectURL: () => `blob:${nextURL++}`,
+    revokeObjectURL: () => {},
+  })
+  controller.handleThumbnailList({ items: galleryItems(1) })
+  controller.handleThumbnailData(0, new Uint8Array([1]))
+  controller.handlePreviewData('asset-0', new Uint8Array([2]), 'image/jpeg')
+
+  assert.equal(img.src, 'blob:1')
+  assert.equal(controller.state.urls.get('thumb:asset-0'), 'blob:1')
+  assert.equal(controller.state.urls.get('preview:asset-0'), 'blob:2')
+  assert.equal(lightbox.galleryItems[0].src, 'blob:2')
+})
+
+test('a new thumbnail list resets active preview and terminal range state', () => {
+  const controller = createGalleryController({
+    root: fakeRoot(),
+    onThumbnailBatchRequest: () => {},
+  })
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: galleryItems(2) })
+  controller.state.activePreviewID = 'asset-0'
+  controller.state._lastVideoID = 'asset-0'
+  controller.state.terminalIndices.add(0)
+  controller.state.unavailableIndices.add(0)
+  controller.state.pendingExpansion = true
+
+  controller.handleThumbnailList({ thumbnailMode: 'pull-v1', items: [{ id: 'new-1', mimeType: 'image/jpeg' }] })
+
+  assert.equal(controller.state.activePreviewID, '')
+  assert.equal(controller.state._lastVideoID, '')
+  assert.equal(controller.state.pendingExpansion, false)
+  assert.deepEqual([...controller.state.terminalIndices], [])
+  assert.deepEqual([...controller.state.unavailableIndices], [])
+
+  controller.state.pendingExpansion = true
+  controller.destroy()
+  assert.equal(controller.state.pendingExpansion, false)
 })
 
 test('gallery revokes a previous thumbnail URL when replacing it', () => {

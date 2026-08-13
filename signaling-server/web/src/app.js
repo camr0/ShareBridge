@@ -813,10 +813,14 @@ async function handleControlMessage(event, { isCurrentSession = () => true } = {
     case 'thumbnail_list':
       ensureGalleryController()
       galleryController?.handleThumbnailList(msg)
+      if (msg.thumbnailMode === 'pull-v1') updateStatus('')
       break
     case 'thumbnail_complete':
       galleryController?.handleThumbnailComplete(msg)
       updateStatus('')
+      break
+    case 'thumbnail_batch_complete':
+      galleryController?.handleThumbnailBatchComplete(msg)
       break
     case 'file_header':
       if (!acceptHeader(msg, 'bulk')) return
@@ -1807,6 +1811,9 @@ async function handleError(msg) {
     retireOperation('bulk', msg.operation_id)
   } else if (msg.scope === 'media') {
     if (!msg.operation_id) {
+      if (galleryController?.handleThumbnailBatchError?.(msg)) {
+        return
+      }
       if (msg.request_id && msg.request_id !== pendingMediaRequestId) return
       pendingMediaRequestId = ''
       pendingMediaID = ''
@@ -2071,9 +2078,24 @@ function ensureGalleryController() {
       onPreviewClose: handleGalleryPreviewClose,
       onDownloadRequest: requestGalleryAsset,
       onAlbumDownloadRequest: requestAlbumDownload,
+      onThumbnailBatchRequest: requestThumbnailBatch,
     })
   }
   return galleryController
+}
+
+function requestThumbnailBatch(request) {
+  const control = controlEndpoint()
+  if (!control || control.readyState === 'closed' || control.readyState === 'closing') return false
+  try {
+    const result = control.send(JSON.stringify(request))
+    if (result && typeof result.then === 'function') {
+      return Promise.resolve(result).then(() => true, () => false)
+    }
+    return true
+  } catch {
+    return false
+  }
 }
 
 function requestGalleryPreview(id, { priority = 'active', mimeType = '' } = {}) {
@@ -2603,6 +2625,7 @@ export const __test = {
   submitPassword,
   handleTransferClosure,
   handleError,
+  requestThumbnailBatch,
   requestGalleryPreview,
   requestGalleryAsset,
   requestAlbumDownload,

@@ -1,3 +1,5 @@
+let thumbnailRequestSequence = 0
+
 export function createGalleryController({
   root,
   lightGallery = globalThis.lightGallery,
@@ -5,7 +7,11 @@ export function createGalleryController({
   revokeObjectURL = URL.revokeObjectURL,
   setRefreshTimeout = globalThis.setTimeout?.bind(globalThis),
   clearRefreshTimeout = globalThis.clearTimeout?.bind(globalThis),
+  createIntersectionObserver = typeof globalThis.IntersectionObserver === 'function'
+    ? (callback, options) => new globalThis.IntersectionObserver(callback, options)
+    : null,
   lightboxRoot = globalThis.document,
+  onThumbnailBatchRequest,
   onPreviewRequest,
   onPreviewClose,
   onDownloadRequest,
@@ -27,9 +33,30 @@ export function createGalleryController({
     albumDownloadPhase: 'idle',
     albumDownloadPartIndex: undefined,
     albumDownloadPartCount: undefined,
+    thumbnailMode: '',
+    renderedCount: 0,
+    requestedThumbs: 0,
+    inFlight: null,
+    terminalIndices: new Set(),
+    unavailableIndices: new Set(),
+    pendingSuccessfulIndices: new Set(),
+    observer: null,
+    pendingExpansion: false,
+    retryBatch: null,
+    pullRequestErrored: false,
+    initialPullUnresolved: false,
+    generation: 0,
+    ownedURLKeys: new Set(),
   }
 
   const handleClick = (event) => {
+    const loadMore = event.target?.closest?.('.gallery-load-more')
+    if (loadMore) {
+      event.preventDefault?.()
+      requestNextWindow()
+      return
+    }
+
     const albumDownload = event.target?.closest?.('.gallery-download-all')
     if (albumDownload) {
       event.preventDefault?.()
@@ -46,10 +73,15 @@ export function createGalleryController({
       return
     }
 
-    const item = event.target?.closest?.('[data-gallery-id]')
+    const item = event.target?.closest?.('[data-gallery-index]')
+      || event.target?.closest?.('[data-gallery-id]')
     if (item?.dataset?.galleryId) {
-      const index = state.items.findIndex((galleryItem) => galleryItem.id === item.dataset.galleryId)
+      const globalIndex = Number(item.dataset.galleryIndex)
+      const index = Number.isInteger(globalIndex)
+        ? globalIndex
+        : state.items.findIndex((galleryItem) => galleryItem.id === item.dataset.galleryId)
       if (index >= 0) {
+        state.lightbox?.openGallery?.(index)
         requestPreviewByIndex(index)
       } else {
         state.activePreviewID = item.dataset.galleryId
@@ -89,14 +121,38 @@ export function createGalleryController({
   root.addEventListener?.('click', handleClick)
 
   function handleThumbnailList(msg) {
+    state.generation += 1
     destroyLightbox()
+    disconnectObserver()
+    cancelLightboxRefresh()
     revokeAllUrls()
     state.items = msg.items || []
+    state.thumbnailMode = msg.thumbnailMode === 'pull-v1' ? 'pull-v1' : ''
     state.thumbs.clear()
     state.previewRequests.clear()
+    state.activePreviewID = ''
+    state._lastVideoID = ''
     state.loadedThumbs = 0
     state.unavailableThumbs = 0
-    root.innerHTML = renderGalleryShell(msg.albumName || 'Shared album', msg.albumDescription || '', state.items)
+    state.requestedThumbs = 0
+    state.inFlight = null
+    state.pendingExpansion = false
+    state.retryBatch = null
+    state.pullRequestErrored = false
+    state.terminalIndices.clear()
+    state.unavailableIndices.clear()
+    state.pendingSuccessfulIndices.clear()
+    const initialCount = state.thumbnailMode === 'pull-v1'
+      ? Math.min(THUMBNAIL_WINDOW_SIZE, state.items.length)
+      : state.items.length
+    state.initialPullUnresolved = state.thumbnailMode === 'pull-v1' && initialCount > 0
+    state.renderedCount = initialCount
+    root.innerHTML = renderGalleryShell(
+      msg.albumName || 'Shared album',
+      msg.albumDescription || '',
+      state.items.slice(0, initialCount),
+      { totalCount: state.items.length, progressive: state.thumbnailMode === 'pull-v1' },
+    )
     setAlbumDownloadState({
       phase: state.albumDownloadPhase,
       partIndex: state.albumDownloadPartIndex,
@@ -104,35 +160,122 @@ export function createGalleryController({
     })
     updateThumbnailProgress()
     initLightbox()
+    initObserver()
+    updateLoadMoreButton()
+    if (state.thumbnailMode === 'pull-v1' && initialCount > 0) {
+      requestBatch(0, initialCount)
+    }
   }
 
   function handleThumbnailData(index, payload) {
     const item = state.items[index]
     if (!item) return
+    if (state.thumbnailMode === 'pull-v1') {
+      const range = state.inFlight
+      const inActiveRange = range && index >= range.start && index < range.start + range.count
+      const acceptingLegacyFallback = state.pullRequestErrored && !range
+      if (
+        (!inActiveRange && !state.pendingSuccessfulIndices.has(index) && !acceptingLegacyFallback && !state.initialPullUnresolved)
+        || state.terminalIndices.has(index)
+      ) return
+      if (state.thumbs.has(item.id)) return
+    }
     const firstLoad = !state.thumbs.has(item.id)
     state.thumbs.set(item.id, true)
     const blob = new Blob([payload], { type: 'image/jpeg' })
     const url = createObjectURL(blob)
-    const previousUrl = state.urls.get(item.id)
+    const urlKey = `thumb:${item.id}`
+    const previousUrl = state.urls.get(urlKey)
     if (previousUrl) revokeObjectURL(previousUrl)
-    state.urls.set(item.id, url)
+    state.urls.set(urlKey, url)
+    state.ownedURLKeys.add(urlKey)
     const img = root.querySelector?.(`[data-thumb-id="${cssEscape(item.id)}"]`)
     if (img) img.src = url
     const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(item.id)}"]`)
     if (galleryItem?.dataset) {
       galleryItem.dataset.src = url
       galleryItem.dataset.downloadUrl = url
-      scheduleLightboxRefresh()
     }
+    updateLightboxItemThumbnail(index, item, url)
     if (firstLoad) {
       state.loadedThumbs += 1
+      state.pendingSuccessfulIndices.delete(index)
+      if (state.thumbnailMode === 'pull-v1') state.terminalIndices.add(index)
       updateThumbnailProgress()
     }
   }
 
   function handleThumbnailComplete(msg) {
+    if (state.thumbnailMode === 'pull-v1') {
+      if (!state.pullRequestErrored) return
+      state.thumbnailMode = ''
+      state.inFlight = null
+      state.retryBatch = null
+      state.pendingExpansion = false
+      if (state.renderedCount < state.items.length) {
+        const grid = root.querySelector?.('.gallery-grid')
+        grid?.insertAdjacentHTML?.('beforeend', renderItems(state.items.slice(state.renderedCount), state.renderedCount))
+        state.renderedCount = state.items.length
+      }
+      updateLoadMoreButton()
+    }
     state.unavailableThumbs = Math.max(0, Number(msg.failed) || 0)
     updateThumbnailProgress()
+  }
+
+  function handleThumbnailBatchComplete(msg) {
+    const range = state.inFlight
+    if (!range) return false
+    if (
+      msg.request_id !== range.requestId
+      || !Number.isInteger(msg.start)
+      || msg.start !== range.start
+      || !Number.isInteger(msg.count)
+      || msg.count !== range.count
+    ) {
+      return false
+    }
+    const failedIndices = new Set(Array.isArray(msg.failed_indices) ? msg.failed_indices : [])
+    state.initialPullUnresolved = false
+    for (let index = range.start; index < range.start + range.count; index++) {
+      const item = state.items[index]
+      if (!item) continue
+      if (failedIndices.has(index)) {
+        state.terminalIndices.add(index)
+        state.pendingSuccessfulIndices.delete(index)
+        if (!state.thumbs.has(item.id)) {
+          state.unavailableIndices.add(index)
+          markThumbnailUnavailable(index)
+        }
+      } else if (!state.thumbs.has(item.id)) {
+        state.pendingSuccessfulIndices.add(index)
+      } else {
+        state.terminalIndices.add(index)
+      }
+    }
+    state.unavailableThumbs = state.unavailableIndices.size
+    state.inFlight = null
+    updateThumbnailProgress()
+    updateLoadMoreButton()
+    if (state.pendingExpansion) {
+      state.pendingExpansion = false
+      requestNextWindow()
+    }
+    return true
+  }
+
+  function handleThumbnailBatchError(msg) {
+    const range = state.inFlight
+    if (!range || msg.request_id !== range.requestId) return false
+    state.inFlight = null
+    state.requestedThumbs = Math.max(0, state.requestedThumbs - range.count)
+    state.pendingExpansion = false
+    state.retryBatch = { start: range.start, count: range.count }
+    state.pullRequestErrored = true
+    state.initialPullUnresolved = false
+    updateThumbnailProgress()
+    updateLoadMoreButton()
+    return true
   }
 
   function setAlbumDownloadState({ phase = 'idle', partIndex, partCount } = {}) {
@@ -185,7 +328,6 @@ export function createGalleryController({
         galleryItem.dataset.video = videoSrc
         galleryItem.dataset.src = url
         galleryItem.dataset.downloadUrl = 'false'
-        scheduleLightboxRefresh()
       }
 
       updateLightboxItemVideo(id, url, mimeType)
@@ -201,12 +343,12 @@ export function createGalleryController({
     const previousUrl = state.urls.get(`preview:${id}`)
     if (previousUrl) revokeObjectURL(previousUrl)
     state.urls.set(`preview:${id}`, url)
+    state.ownedURLKeys.add(`preview:${id}`)
 
     const galleryItem = root.querySelector?.(`[data-gallery-id="${cssEscape(id)}"]`)
     if (galleryItem?.dataset) {
       galleryItem.dataset.src = url
       galleryItem.dataset.downloadUrl = 'false'
-      scheduleLightboxRefresh()
     }
 
     updateLightboxItemSource(id, url)
@@ -217,16 +359,28 @@ export function createGalleryController({
   }
 
   function destroy() {
-    root.removeEventListener?.('click', handleClick)
+    state.generation += 1
     destroyLightbox()
+    disconnectObserver()
+    cancelLightboxRefresh()
+    state.pendingExpansion = false
+    state.retryBatch = null
+    state.pullRequestErrored = false
+    state.initialPullUnresolved = false
+    state.pendingSuccessfulIndices.clear()
     revokeAllUrls()
+    root.removeEventListener?.('click', handleClick)
   }
 
   function initLightbox() {
     if (!lightGallery || !root.querySelector) return
     const grid = root.querySelector('.gallery-grid')
     if (!grid) return
-    state.lightbox = lightGallery(grid, { selector: '.gallery-item', download: false })
+    state.lightbox = lightGallery(grid, {
+      dynamic: true,
+      dynamicEl: state.items.map(createDynamicLightboxItem),
+      download: false,
+    })
     state.lightboxGrid = grid
     grid.addEventListener?.('lgAfterOpen', handleLightboxSlide)
     grid.addEventListener?.('lgBeforeSlide', handleLightboxBeforeSlide)
@@ -236,7 +390,6 @@ export function createGalleryController({
   }
 
   function destroyLightbox() {
-    cancelLightboxRefresh()
     state.lightboxGrid?.removeEventListener?.('lgAfterOpen', handleLightboxSlide)
     state.lightboxGrid?.removeEventListener?.('lgBeforeSlide', handleLightboxBeforeSlide)
     state.lightboxGrid?.removeEventListener?.('lgAfterSlide', handleLightboxSlide)
@@ -246,30 +399,162 @@ export function createGalleryController({
     state.lightboxDownloadButton = null
     state.lightbox?.destroy?.()
     state.lightbox = null
+    cancelLightboxRefresh()
   }
 
   function revokeAllUrls() {
-    for (const url of state.urls.values()) revokeObjectURL(url)
+    const revoked = new Set()
+    for (const key of state.ownedURLKeys) {
+      const url = state.urls.get(key)
+      if (url && !revoked.has(url)) {
+        revokeObjectURL(url)
+        revoked.add(url)
+      }
+    }
     state.urls.clear()
+    state.ownedURLKeys.clear()
   }
 
   function updateThumbnailProgress() {
     const total = state.items.length
     const completed = Math.min(total, state.loadedThumbs + state.unavailableThumbs)
-    const pct = total === 0 ? 100 : Math.round((completed / total) * 100)
+    const progressTotal = state.thumbnailMode === 'pull-v1' ? state.requestedThumbs : total
+    const pct = progressTotal === 0 ? 100 : Math.min(100, Math.round((completed / progressTotal) * 100))
     const text = root.querySelector?.('.gallery-progress-text')
     const fill = root.querySelector?.('.gallery-progress-fill')
     const progress = root.querySelector?.('.gallery-progress')
     if (text) {
-      text.textContent = state.unavailableThumbs > 0
-        ? `${state.loadedThumbs} / ${total} thumbnails (${state.unavailableThumbs} unavailable)`
-        : `${state.loadedThumbs} / ${total} thumbnails`
+      if (state.thumbnailMode === 'pull-v1') {
+        text.textContent = `${state.requestedThumbs} requested · ${state.loadedThumbs} loaded · ${state.unavailableThumbs} unavailable · ${total} total`
+      } else {
+        text.textContent = state.unavailableThumbs > 0
+          ? `${state.loadedThumbs} / ${total} thumbnails (${state.unavailableThumbs} unavailable)`
+          : `${state.loadedThumbs} / ${total} thumbnails`
+      }
     }
     if (fill?.style) fill.style.width = `${pct}%`
-    if (progress?.classList && total > 0 && completed >= total) {
+    const finished = state.thumbnailMode === 'pull-v1'
+      ? state.renderedCount >= total && !state.inFlight && completed >= state.requestedThumbs
+      : total > 0 && completed >= total
+    if (progress?.classList && finished) {
       progress.classList.add('hidden')
     } else if (progress?.classList) {
       progress.classList.remove('hidden')
+    }
+  }
+
+  function requestBatch(start, count, onAccepted) {
+    if (state.thumbnailMode !== 'pull-v1' || state.inFlight || count <= 0) return false
+    thumbnailRequestSequence += 1
+    const generation = state.generation
+    const request = {
+      type: 'thumbnail_batch_request',
+      request_id: `thumb-${Date.now().toString(36)}-${thumbnailRequestSequence}`,
+      start,
+      count,
+    }
+    state.inFlight = { requestId: request.request_id, start, count }
+    state.requestedThumbs += count
+    updateThumbnailProgress()
+    updateLoadMoreButton()
+    const rollback = () => {
+      if (state.generation !== generation || state.inFlight?.requestId !== request.request_id) return
+      state.inFlight = null
+      state.requestedThumbs = Math.max(0, state.requestedThumbs - count)
+      state.pendingExpansion = false
+      state.retryBatch = { start, count, onAccepted }
+      updateThumbnailProgress()
+      updateLoadMoreButton()
+    }
+    const accept = () => {
+      if (state.generation !== generation || state.inFlight?.requestId !== request.request_id) return
+      state.retryBatch = null
+      onAccepted?.()
+      updateLoadMoreButton()
+    }
+    let result
+    try {
+      result = onThumbnailBatchRequest?.(request)
+    } catch {
+      rollback()
+      return false
+    }
+    if (result && typeof result.then === 'function') {
+      Promise.resolve(result).then((accepted) => {
+        if (accepted === false) rollback()
+        else accept()
+      }, rollback)
+      return true
+    }
+    if (result === false) {
+      rollback()
+      return false
+    }
+    accept()
+    return true
+  }
+
+  function requestNextWindow() {
+    if (state.thumbnailMode !== 'pull-v1') return false
+    if (state.inFlight) {
+      state.pendingExpansion = true
+      return false
+    }
+    if (state.retryBatch) {
+      const retry = state.retryBatch
+      return requestBatch(retry.start, retry.count, retry.onAccepted)
+    }
+    if (state.renderedCount >= state.items.length) return false
+    const start = state.renderedCount
+    const count = Math.min(THUMBNAIL_WINDOW_SIZE, state.items.length - start)
+    return requestBatch(start, count, () => {
+      const grid = root.querySelector?.('.gallery-grid')
+      grid?.insertAdjacentHTML?.('beforeend', renderItems(state.items.slice(start, start + count), start))
+      state.renderedCount += count
+    })
+  }
+
+  function updateLoadMoreButton() {
+    const button = root.querySelector?.('.gallery-load-more')
+    if (!button) return
+    const atEnd = state.renderedCount >= state.items.length && !state.retryBatch
+    button.disabled = Boolean(state.inFlight) || atEnd
+    button.hidden = atEnd
+    button.textContent = state.inFlight ? 'Loading thumbnails…' : 'Load More'
+    button.setAttribute?.('aria-busy', String(Boolean(state.inFlight)))
+  }
+
+  function initObserver() {
+    if (state.thumbnailMode !== 'pull-v1' || !createIntersectionObserver) return
+    const sentinel = root.querySelector?.('.gallery-sentinel')
+    if (!sentinel) return
+    state.observer = createIntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) requestNextWindow()
+    }, { rootMargin: '400px 0px' })
+    state.observer?.observe?.(sentinel)
+  }
+
+  function disconnectObserver() {
+    state.observer?.disconnect?.()
+    state.observer = null
+  }
+
+  function markThumbnailUnavailable(index) {
+    const tile = root.querySelector?.(`[data-gallery-index="${index}"]`)
+    tile?.classList?.add?.('gallery-item-unavailable')
+    tile?.setAttribute?.('aria-disabled', 'true')
+    const img = tile?.querySelector?.('img')
+    if (img) img.alt = `${state.items[index]?.name || 'Asset'} thumbnail unavailable`
+  }
+
+  function updateLightboxItemThumbnail(index, item, url) {
+    const lightboxItem = state.lightbox?.galleryItems?.[index]
+    if (!lightboxItem) return
+    lightboxItem.thumb = url
+    if (item.mimeType?.startsWith('video/')) {
+      lightboxItem.poster = url
+    } else if (!state.urls.has(`preview:${item.id}`)) {
+      lightboxItem.src = url
     }
   }
 
@@ -476,11 +761,21 @@ export function createGalleryController({
     state.lightboxDownloadButton = button
   }
 
-  return { handleThumbnailList, handleThumbnailData, handleThumbnailComplete, handlePreviewData, setAlbumDownloadState, destroy, state }
+  return {
+    handleThumbnailList,
+    handleThumbnailData,
+    handleThumbnailComplete,
+    handleThumbnailBatchComplete,
+    handleThumbnailBatchError,
+    handlePreviewData,
+    setAlbumDownloadState,
+    destroy,
+    state,
+  }
 }
 
-export function renderGalleryShell(albumName, albumDescription, items) {
-  const count = items.length
+export function renderGalleryShell(albumName, albumDescription, items, { totalCount = items.length, progressive = false } = {}) {
+  const count = totalCount
   return `
     <section class="gallery-header">
       <div>
@@ -502,14 +797,25 @@ export function renderGalleryShell(albumName, albumDescription, items) {
       </div>
     </section>
     <section class="gallery-grid">
-      ${items.map(renderItem).join('')}
+      ${renderItems(items, 0)}
     </section>
+    ${progressive ? `
+      <div class="gallery-progressive-controls">
+        <button class="gallery-load-more" type="button" aria-busy="false">Load More</button>
+        <div class="gallery-sentinel" aria-hidden="true"></div>
+      </div>
+    ` : ''}
   `
 }
 
+const THUMBNAIL_WINDOW_SIZE = 120
 const LIGHTBOX_PLACEHOLDER_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='
 
-function renderItem(item) {
+function renderItems(items, startIndex) {
+  return items.map((item, offset) => renderItem(item, startIndex + offset)).join('')
+}
+
+function renderItem(item, globalIndex) {
   const name = item.name || 'Untitled asset'
   const isVideo = item.mimeType?.startsWith('video/')
   const duration = isVideo ? formatDuration(item.duration) : ''
@@ -517,12 +823,28 @@ function renderItem(item) {
     ? ` data-video='[{"src":"${LIGHTBOX_PLACEHOLDER_SRC}","type":"video/mp4"}]'`
     : ''
   return `
-    <button class="gallery-item" type="button" data-gallery-id="${escapeHTML(item.id)}" data-src="${LIGHTBOX_PLACEHOLDER_SRC}" data-download-url="${LIGHTBOX_PLACEHOLDER_SRC}"${videoAttr} aria-label="Open ${escapeHTML(name)}">
+    <button class="gallery-item" type="button" data-gallery-id="${escapeHTML(item.id)}" data-gallery-index="${globalIndex}" data-src="${LIGHTBOX_PLACEHOLDER_SRC}" data-download-url="${LIGHTBOX_PLACEHOLDER_SRC}"${videoAttr} aria-label="Open ${escapeHTML(name)}">
       <img data-thumb-id="${escapeHTML(item.id)}" alt="${escapeHTML(name)}" loading="lazy" decoding="async">
       <span class="gallery-download" role="button" tabindex="0" data-gallery-id="${escapeHTML(item.id)}" aria-label="Download ${escapeHTML(name)}">↓</span>
       ${duration ? `<span class="gallery-duration">${escapeHTML(duration)}</span>` : ''}
     </button>
   `
+}
+
+function createDynamicLightboxItem(item) {
+  const name = escapeHTML(item.name || 'Untitled asset')
+  const entry = {
+    src: LIGHTBOX_PLACEHOLDER_SRC,
+    thumb: LIGHTBOX_PLACEHOLDER_SRC,
+    alt: name,
+    subHtml: `<p>${name}</p>`,
+    downloadUrl: 'false',
+  }
+  if (item.mimeType?.startsWith('video/')) {
+    entry.poster = LIGHTBOX_PLACEHOLDER_SRC
+    entry.video = JSON.stringify([{ src: LIGHTBOX_PLACEHOLDER_SRC, type: 'video/mp4' }])
+  }
+  return entry
 }
 
 function formatDuration(duration) {

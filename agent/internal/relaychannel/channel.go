@@ -29,9 +29,12 @@ type SecureRelayChannel struct {
 	scheduler *multilane.Scheduler
 	endpoints map[multilane.Lane]*relayEndpoint
 	closeOnce sync.Once
+	closeMu   sync.Mutex
+	closed    bool
 
-	onOpen  func()
-	onClose func()
+	onOpen         func()
+	onClose        func()
+	closeListeners []func()
 }
 
 // relayWebSocketReadLimit matches the relay transport frame cap with room for
@@ -60,8 +63,25 @@ func NewSecureRelayChannel(cfg SecureRelayConfig) (*SecureRelayChannel, error) {
 func (c *SecureRelayChannel) SetOnMessage(handler func([]byte)) {
 	c.endpoints[multilane.LaneControl].SetOnMessage(handler)
 }
-func (c *SecureRelayChannel) SetOnOpen(handler func())  { c.onOpen = handler }
-func (c *SecureRelayChannel) SetOnClose(handler func()) { c.onClose = handler }
+func (c *SecureRelayChannel) SetOnOpen(handler func()) { c.onOpen = handler }
+func (c *SecureRelayChannel) SetOnClose(handler func()) {
+	c.closeMu.Lock()
+	c.onClose = handler
+	c.closeMu.Unlock()
+}
+func (c *SecureRelayChannel) AddOnClose(handler func()) {
+	if handler == nil {
+		return
+	}
+	c.closeMu.Lock()
+	if c.closed {
+		c.closeMu.Unlock()
+		handler()
+		return
+	}
+	c.closeListeners = append(c.closeListeners, handler)
+	c.closeMu.Unlock()
+}
 
 func (c *SecureRelayChannel) Endpoint(lane multilane.Lane) multilane.Endpoint {
 	endpoint, ok := c.endpoints[lane]
@@ -277,11 +297,17 @@ func (c *SecureRelayChannel) abortTransport() {
 }
 
 func (c *SecureRelayChannel) notifyClose() {
-	var callback func()
+	var callbacks []func()
 	c.closeOnce.Do(func() {
-		callback = c.onClose
+		c.closeMu.Lock()
+		c.closed = true
+		if c.onClose != nil {
+			callbacks = append(callbacks, c.onClose)
+		}
+		callbacks = append(callbacks, c.closeListeners...)
+		c.closeMu.Unlock()
 	})
-	if callback != nil {
+	for _, callback := range callbacks {
 		callback()
 	}
 }

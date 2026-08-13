@@ -33,6 +33,7 @@ type Peer struct {
 	closeNotified       bool
 	onOpen              func()
 	onClosed            func()
+	closeListeners      []func()
 	onICECandidate      func(init webrtc.ICECandidateInit)
 }
 
@@ -133,14 +134,14 @@ func (p *Peer) laneOpened(lane multilane.Lane) {
 
 		p.mu.Lock()
 		p.openCallbackRunning = false
-		var onClosed func()
+		var callbacks []func()
 		if p.closePending && !p.closeNotified {
 			p.closeNotified = true
-			onClosed = p.onClosed
+			callbacks = p.closeCallbacksLocked()
 		}
 		p.mu.Unlock()
-		if onClosed != nil {
-			onClosed()
+		for _, callback := range callbacks {
+			callback()
 		}
 	})
 }
@@ -163,11 +164,20 @@ func (p *Peer) notifyClosed() {
 		return
 	}
 	p.closeNotified = true
-	onClosed := p.onClosed
+	callbacks := p.closeCallbacksLocked()
 	p.mu.Unlock()
-	if onClosed != nil {
-		onClosed()
+	for _, callback := range callbacks {
+		callback()
 	}
+}
+
+func (p *Peer) closeCallbacksLocked() []func() {
+	callbacks := make([]func(), 0, 1+len(p.closeListeners))
+	if p.onClosed != nil {
+		callbacks = append(callbacks, p.onClosed)
+	}
+	callbacks = append(callbacks, p.closeListeners...)
+	return callbacks
 }
 
 // Endpoint returns a required lane, or nil for an unknown lane.
@@ -184,6 +194,20 @@ func (p *Peer) SetOnOpen(handler func()) {
 func (p *Peer) SetOnClose(handler func()) {
 	p.mu.Lock()
 	p.onClosed = handler
+	p.mu.Unlock()
+}
+
+func (p *Peer) AddOnClose(handler func()) {
+	if handler == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closeNotified {
+		p.mu.Unlock()
+		handler()
+		return
+	}
+	p.closeListeners = append(p.closeListeners, handler)
 	p.mu.Unlock()
 }
 

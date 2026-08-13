@@ -3,9 +3,12 @@ package transfer
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +29,7 @@ type mockDC struct {
 	closed        bool
 	onMessage     func([]byte)
 	textErrorType string
+	binaryError   bool
 	mu            sync.Mutex
 }
 
@@ -36,6 +40,9 @@ func (m *mockDC) SendBinary(data []byte) error {
 func (m *mockDC) SendBinaryClass(class multilane.TrafficClass, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.binaryError {
+		return fmt.Errorf("forced binary send failure")
+	}
 	m.binaryData = append(m.binaryData, append([]byte(nil), data...))
 	m.binaryClasses = append(m.binaryClasses, class)
 	return nil
@@ -107,11 +114,12 @@ func (m *mockDC) reset() {
 }
 
 type mockChannelSet struct {
-	control *mockDC
-	media   *mockDC
-	bulk    *mockDC
-	onOpen  func()
-	onClose func()
+	control        *mockDC
+	media          *mockDC
+	bulk           *mockDC
+	onOpen         func()
+	onClose        func()
+	closeListeners []func()
 }
 
 func newMockChannelSet() *mockChannelSet {
@@ -133,6 +141,17 @@ func (m *mockChannelSet) Endpoint(lane multilane.Lane) multilane.Endpoint {
 
 func (m *mockChannelSet) SetOnOpen(handler func())  { m.onOpen = handler }
 func (m *mockChannelSet) SetOnClose(handler func()) { m.onClose = handler }
+func (m *mockChannelSet) AddOnClose(handler func()) {
+	m.closeListeners = append(m.closeListeners, handler)
+}
+func (m *mockChannelSet) triggerClose() {
+	if m.onClose != nil {
+		m.onClose()
+	}
+	for _, listener := range m.closeListeners {
+		listener()
+	}
+}
 func (m *mockChannelSet) Close() error {
 	_ = m.control.Close()
 	_ = m.media.Close()
@@ -286,13 +305,19 @@ func (m *mockOpenCloudClient) GetFile(filePath string, w io.Writer) (int64, erro
 func (m *mockOpenCloudClient) GetSHA1(subpath string) string { return "" }
 
 type mockGalleryClient struct {
-	mu           sync.Mutex
-	gallery      Gallery
-	thumbnail    []byte
-	file         []byte
-	assetQuality string
-	headSize     int64
-	rangeStart   int64
+	mu               sync.Mutex
+	gallery          Gallery
+	thumbnail        []byte
+	thumbnailIDs     []string
+	thumbnailErr     error
+	thumbnailErrors  map[string]error
+	thumbnailStarted chan struct{}
+	thumbnailRelease chan struct{}
+	thumbnailOnce    sync.Once
+	file             []byte
+	assetQuality     string
+	headSize         int64
+	rangeStart       int64
 }
 
 type mockAlbumGalleryClient struct {
@@ -312,12 +337,47 @@ func (m *mockAlbumGalleryClient) StreamAlbumArchive(ctx context.Context, assetID
 }
 
 func (m *mockGalleryClient) ListGallery(ctx context.Context) (Gallery, error) {
-	return m.gallery, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	gallery := m.gallery
+	gallery.Items = append([]GalleryItem(nil), gallery.Items...)
+	return gallery, nil
+}
+
+func (m *mockGalleryClient) setGallery(gallery Gallery) {
+	m.mu.Lock()
+	m.gallery = gallery
+	m.mu.Unlock()
 }
 
 func (m *mockGalleryClient) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
+	m.mu.Lock()
+	m.thumbnailIDs = append(m.thumbnailIDs, id)
+	m.mu.Unlock()
+	if m.thumbnailStarted != nil {
+		m.thumbnailOnce.Do(func() { close(m.thumbnailStarted) })
+	}
+	if m.thumbnailRelease != nil {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-m.thumbnailRelease:
+		}
+	}
+	if m.thumbnailErr != nil {
+		return 0, m.thumbnailErr
+	}
+	if err := m.thumbnailErrors[id]; err != nil {
+		return 0, err
+	}
 	n, err := w.Write(m.thumbnail)
 	return int64(n), err
+}
+
+func (m *mockGalleryClient) thumbnailIDSnapshot() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.thumbnailIDs...)
 }
 
 func (m *mockGalleryClient) GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) {
@@ -1103,6 +1163,8 @@ func TestGalleryRoutesThumbnailsToThumbnailMediaClass(t *testing.T) {
 	}
 	manager := NewGalleryManager(channels, client, 0)
 	manager.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+	manager.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"thumb-class","start":0,"count":1}`))
 
 	require.Eventually(t, func() bool { return channels.media.binaryCount() == 1 }, time.Second, time.Millisecond)
 	require.True(t, channels.media.hasBinaryClass(multilane.ClassThumbnail))
@@ -1435,7 +1497,7 @@ func TestBulkAndMediaErrorsIncludeScopeAndRequestID(t *testing.T) {
 	require.True(t, foundMedia)
 }
 
-func TestHandleOpen_ImmichGallerySendsThumbnailListAndData(t *testing.T) {
+func TestHandleOpen_ImmichGalleryAdvertisesPullModeWithoutImmediateFetch(t *testing.T) {
 	channels := newMockChannelSet()
 	dc := channels.control
 	client := &mockGalleryClient{
@@ -1446,22 +1508,23 @@ func TestHandleOpen_ImmichGallerySendsThumbnailListAndData(t *testing.T) {
 		thumbnail: []byte{0xff, 0xd8, 0xff},
 	}
 	mgr := NewGalleryManager(channels, client, 0)
+	require.Equal(t, 5*time.Second, mgr.thumbnailGrace)
+	mgr.thumbnailGrace = 100 * time.Millisecond
 	mgr.HandleOpen()
-	time.Sleep(50 * time.Millisecond)
+	require.Eventually(t, func() bool { return dc.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
 
-	require.True(t, dc.hasTextType("thumbnail_list"))
-	mediaFrames := channels.media.binarySnapshot()
-	require.Len(t, mediaFrames, 1)
-	require.Equal(t, byte(0x11), mediaFrames[0][0], "thumbnail frames use typed binary envelope")
-	completed := dc.getTextByType("thumbnail_complete")
-	require.NotEmpty(t, completed)
-	var result struct {
-		Sent   int `json:"sent"`
-		Failed int `json:"failed"`
+	var list struct {
+		ThumbnailMode string `json:"thumbnailMode"`
 	}
-	require.NoError(t, json.Unmarshal([]byte(completed), &result))
-	require.Equal(t, 1, result.Sent)
-	require.Zero(t, result.Failed)
+	require.NoError(t, json.Unmarshal([]byte(dc.getTextByType("thumbnail_list")), &list))
+	require.Equal(t, "pull-v1", list.ThumbnailMode)
+	require.Never(t, func() bool { return len(client.thumbnailIDSnapshot()) != 0 }, 50*time.Millisecond, time.Millisecond)
+	require.Empty(t, channels.media.binarySnapshot())
+	require.Empty(t, dc.getTextByType("thumbnail_complete"))
+
+	require.Eventually(t, func() bool { return dc.hasTextType("thumbnail_complete") }, time.Second, time.Millisecond)
+	require.Equal(t, []string{"asset-1"}, client.thumbnailIDSnapshot())
+	require.Len(t, channels.media.binarySnapshot(), 1)
 }
 
 func TestHandleOpen_ImmichGalleryFetchesThumbnailsConcurrently(t *testing.T) {
@@ -1477,6 +1540,9 @@ func TestHandleOpen_ImmichGalleryFetchesThumbnailsConcurrently(t *testing.T) {
 	}
 	mgr := NewGalleryManager(channels, client, 0)
 	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+	request, _ := json.Marshal(map[string]any{"type": "thumbnail_batch_request", "request_id": "thumb-concurrent", "start": 0, "count": 3})
+	mgr.HandleMessage(request)
 
 	select {
 	case <-client.started:
@@ -1488,6 +1554,496 @@ func TestHandleOpen_ImmichGalleryFetchesThumbnailsConcurrently(t *testing.T) {
 		return len(channels.media.binarySnapshot()) == 3
 	}, time.Second, 10*time.Millisecond)
 	require.GreaterOrEqual(t, client.maxConcurrent.Load(), int32(2))
+}
+
+func TestThumbnailBatchRequestFetchesOnlyRequestedRangeAndCorrelatesCompletion(t *testing.T) {
+	channels := newMockChannelSet()
+	items := make([]GalleryItem, 250)
+	for index := range items {
+		items[index] = GalleryItem{ID: fmt.Sprintf("asset-%03d", index)}
+	}
+	client := &mockGalleryClient{gallery: Gallery{Items: items}, thumbnail: []byte("thumb")}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"thumb-2","start":120,"count":120}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+
+	fetched := client.thumbnailIDSnapshot()
+	require.Len(t, fetched, 120)
+	fetchedSet := make(map[string]bool, len(fetched))
+	for _, id := range fetched {
+		fetchedSet[id] = true
+	}
+	for index := 120; index < 240; index++ {
+		require.Truef(t, fetchedSet[fmt.Sprintf("asset-%03d", index)], "asset index %d was not fetched", index)
+	}
+
+	frames := channels.media.binarySnapshot()
+	require.Len(t, frames, 120)
+	framedIndices := make(map[uint16]bool, len(frames))
+	for _, frame := range frames {
+		require.GreaterOrEqual(t, len(frame), 3)
+		require.Equal(t, binaryFrameThumbnail, frame[0])
+		framedIndices[binary.BigEndian.Uint16(frame[1:3])] = true
+	}
+	for index := 120; index < 240; index++ {
+		require.Truef(t, framedIndices[uint16(index)], "thumbnail index %d was not framed", index)
+	}
+
+	var completion struct {
+		RequestID string `json:"request_id"`
+		Start     int    `json:"start"`
+		Count     int    `json:"count"`
+		Sent      int    `json:"sent"`
+		Failed    int    `json:"failed"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("thumbnail_batch_complete")), &completion))
+	require.Equal(t, "thumb-2", completion.RequestID)
+	require.Equal(t, 120, completion.Start)
+	require.Equal(t, 120, completion.Count)
+	require.Equal(t, completion.Count, completion.Sent+completion.Failed)
+	require.Equal(t, 120, completion.Sent)
+	require.Zero(t, completion.Failed)
+}
+
+func TestFirstValidThumbnailRequestCancelsLegacyFallback(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:   Gallery{Items: []GalleryItem{{ID: "asset-1"}}},
+		thumbnail: []byte("thumb"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = 30 * time.Millisecond
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"pull-wins","start":0,"count":1}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+	require.Never(t, func() bool { return channels.control.hasTextType("thumbnail_complete") }, 80*time.Millisecond, time.Millisecond)
+	require.Len(t, client.thumbnailIDSnapshot(), 1)
+}
+
+func TestInvalidThumbnailRequestsDoNotCancelLegacyFallback(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:   Gallery{Items: []GalleryItem{{ID: "asset-1"}}},
+		thumbnail: []byte("thumb"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = 60 * time.Millisecond
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+
+	requests := []string{
+		`{"type":"thumbnail_batch_request","start":0,"count":1}`,
+		`{"type":"thumbnail_batch_request","request_id":"negative","start":-1,"count":1}`,
+		`{"type":"thumbnail_batch_request","request_id":"zero","start":0,"count":0}`,
+		`{"type":"thumbnail_batch_request","request_id":"large","start":0,"count":121}`,
+		`{"type":"thumbnail_batch_request","request_id":"outside","start":1,"count":1}`,
+	}
+	for _, request := range requests {
+		mgr.HandleMessage([]byte(request))
+	}
+	require.Equal(t, len(requests), channels.control.countTextType("error"))
+	for _, message := range channels.control.textSnapshot() {
+		var parsed struct {
+			Type  string `json:"type"`
+			Scope string `json:"scope"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(message), &parsed))
+		if parsed.Type == "error" {
+			require.Equal(t, "media", parsed.Scope)
+		}
+	}
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_complete") }, time.Second, time.Millisecond)
+	require.False(t, channels.control.hasTextType("thumbnail_batch_complete"))
+	require.Len(t, client.thumbnailIDSnapshot(), 1)
+}
+
+func TestThumbnailRequestRejectsSecondBatchWhileFirstIsActive(t *testing.T) {
+	channels := newMockChannelSet()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client := &mockGalleryClient{
+		gallery:          Gallery{Items: []GalleryItem{{ID: "asset-1"}, {ID: "asset-2"}}},
+		thumbnail:        []byte("thumb"),
+		thumbnailStarted: started,
+		thumbnailRelease: release,
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"active-1","start":0,"count":1}`))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first thumbnail batch did not start")
+	}
+
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"active-2","start":1,"count":1}`))
+	scope, requestID, ok := channels.control.errorFieldsContaining("active")
+	require.True(t, ok)
+	require.Equal(t, "media", scope)
+	require.Equal(t, "active-2", requestID)
+	close(release)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+	require.Equal(t, []string{"asset-1"}, client.thumbnailIDSnapshot())
+}
+
+func TestThumbnailFinalBatchClampsToAdvertisedGallery(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery: Gallery{Items: []GalleryItem{
+			{ID: "asset-0"}, {ID: "asset-1"}, {ID: "asset-2"}, {ID: "asset-3"}, {ID: "asset-4"},
+		}},
+		thumbnail: []byte("thumb"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"final","start":3,"count":120}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+
+	var completion struct {
+		RequestID string `json:"request_id"`
+		Start     int    `json:"start"`
+		Count     int    `json:"count"`
+		Sent      int    `json:"sent"`
+		Failed    int    `json:"failed"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("thumbnail_batch_complete")), &completion))
+	require.Equal(t, "final", completion.RequestID)
+	require.Equal(t, 3, completion.Start)
+	require.Equal(t, 2, completion.Count)
+	require.Equal(t, completion.Count, completion.Sent+completion.Failed)
+	require.ElementsMatch(t, []string{"asset-3", "asset-4"}, client.thumbnailIDSnapshot())
+}
+
+func TestThumbnailMediaSendFailuresCountAsFailed(t *testing.T) {
+	channels := newMockChannelSet()
+	channels.media.binaryError = true
+	client := &mockGalleryClient{
+		gallery:   Gallery{Items: []GalleryItem{{ID: "asset-0"}, {ID: "asset-1"}}},
+		thumbnail: []byte("thumb"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"send-fail","start":0,"count":2}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+
+	var completion struct {
+		Count  int `json:"count"`
+		Sent   int `json:"sent"`
+		Failed int `json:"failed"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("thumbnail_batch_complete")), &completion))
+	require.Equal(t, 2, completion.Count)
+	require.Zero(t, completion.Sent)
+	require.Equal(t, 2, completion.Failed)
+}
+
+func TestThumbnailFetchFailuresCountAsFailed(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:      Gallery{Items: []GalleryItem{{ID: "asset-0"}, {ID: "asset-1"}}},
+		thumbnailErr: fmt.Errorf("thumbnail unavailable"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"fetch-fail","start":0,"count":2}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+
+	var completion struct {
+		Count  int `json:"count"`
+		Sent   int `json:"sent"`
+		Failed int `json:"failed"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("thumbnail_batch_complete")), &completion))
+	require.Equal(t, 2, completion.Count)
+	require.Zero(t, completion.Sent)
+	require.Equal(t, 2, completion.Failed)
+	require.Zero(t, channels.media.binaryCount())
+}
+
+func TestThumbnailBatchCompletionIncludesExactFailedGlobalIndices(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:         Gallery{Items: []GalleryItem{{ID: "asset-0"}, {ID: "asset-1"}, {ID: "asset-2"}, {ID: "asset-3"}}},
+		thumbnail:       []byte("thumb"),
+		thumbnailErrors: map[string]error{"asset-1": fmt.Errorf("missing"), "asset-3": fmt.Errorf("missing")},
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.sendGallery()
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"failed-indices","start":1,"count":3}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+
+	var completion struct {
+		Sent          int   `json:"sent"`
+		Failed        int   `json:"failed"`
+		FailedIndices []int `json:"failed_indices"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("thumbnail_batch_complete")), &completion))
+	require.Equal(t, 1, completion.Sent)
+	require.Equal(t, 2, completion.Failed)
+	require.Equal(t, []int{1, 3}, completion.FailedIndices)
+}
+
+func TestTransportCloseCancelsThumbnailFallback(t *testing.T) {
+	channels := newMockChannelSet()
+	ownerClosed := false
+	channels.SetOnClose(func() { ownerClosed = true })
+	client := &mockGalleryClient{gallery: Gallery{Items: []GalleryItem{{ID: "asset"}}}, thumbnail: []byte("thumb")}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = 20 * time.Millisecond
+	mgr.sendGallery()
+	channels.triggerClose()
+
+	require.True(t, ownerClosed, "additive manager listener must preserve the owner close callback")
+	require.Never(t, func() bool {
+		return len(client.thumbnailIDSnapshot()) != 0 || channels.control.hasTextType("thumbnail_complete")
+	}, 60*time.Millisecond, time.Millisecond)
+}
+
+func TestTransportCloseCancelsActiveThumbnailBatchAndSuppressesCompletion(t *testing.T) {
+	channels := newMockChannelSet()
+	started := make(chan struct{})
+	client := &mockGalleryClient{
+		gallery: Gallery{Items: []GalleryItem{{ID: "asset-0"}, {ID: "asset-1"}}}, thumbnail: []byte("thumb"),
+		thumbnailStarted: started, thumbnailRelease: make(chan struct{}),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.sendGallery()
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"disconnect","start":0,"count":2}`))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("thumbnail batch did not start")
+	}
+	channels.triggerClose()
+
+	require.Never(t, func() bool {
+		return channels.media.binaryCount() != 0 || channels.control.hasTextType("thumbnail_batch_complete")
+	}, 60*time.Millisecond, time.Millisecond)
+}
+
+func TestThumbnailBatchClearsActiveStateAfterCompletion(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:   Gallery{Items: []GalleryItem{{ID: "asset-0"}, {ID: "asset-1"}}},
+		thumbnail: []byte("thumb"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"sequential-1","start":0,"count":1}`))
+	require.Eventually(t, func() bool { return channels.control.countTextType("thumbnail_batch_complete") == 1 }, time.Second, time.Millisecond)
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"sequential-2","start":1,"count":1}`))
+	require.Eventually(t, func() bool { return channels.control.countTextType("thumbnail_batch_complete") == 2 }, time.Second, time.Millisecond)
+
+	require.False(t, channels.control.hasErrorContaining("active"))
+	require.ElementsMatch(t, []string{"asset-0", "asset-1"}, client.thumbnailIDSnapshot())
+}
+
+func TestThumbnailBatchRejectsReusedRequestIDAfterCompletion(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:   Gallery{Items: []GalleryItem{{ID: "asset-0"}, {ID: "asset-1"}}},
+		thumbnail: []byte("thumb"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.HandleOpen()
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_list") }, time.Second, time.Millisecond)
+
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"duplicate","start":0,"count":1}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"duplicate","start":1,"count":1}`))
+
+	scope, requestID, ok := channels.control.errorFieldsContaining("request_id already used")
+	require.True(t, ok)
+	require.Equal(t, "media", scope)
+	require.Equal(t, "duplicate", requestID)
+	require.Never(t, func() bool {
+		return channels.media.binaryCount() != 1 || len(client.thumbnailIDSnapshot()) != 1
+	}, 50*time.Millisecond, time.Millisecond)
+	require.Equal(t, 1, channels.control.countTextType("thumbnail_batch_complete"))
+
+	mgr.sendGallery()
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"duplicate","start":1,"count":1}`))
+	require.Eventually(t, func() bool {
+		return channels.control.countTextType("thumbnail_batch_complete") == 2
+	}, time.Second, time.Millisecond)
+	require.Equal(t, 2, channels.media.binaryCount(), "a new gallery advertisement resets seen request IDs")
+	require.Len(t, client.thumbnailIDSnapshot(), 2)
+}
+
+func TestLegacyFallbackRejectsPullRequestsAfterLegacyStarts(t *testing.T) {
+	channels := newMockChannelSet()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client := &mockGalleryClient{
+		gallery:          Gallery{Items: []GalleryItem{{ID: "asset-1"}}},
+		thumbnail:        []byte("thumb"),
+		thumbnailStarted: started,
+		thumbnailRelease: release,
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = 10 * time.Millisecond
+	mgr.HandleOpen()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("legacy fallback did not begin")
+	}
+
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"too-late","start":0,"count":1}`))
+	scope, requestID, ok := channels.control.errorFieldsContaining("legacy")
+	require.True(t, ok)
+	require.Equal(t, "media", scope)
+	require.Equal(t, "too-late", requestID)
+	close(release)
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_complete") }, time.Second, time.Millisecond)
+	require.False(t, channels.control.hasTextType("thumbnail_batch_complete"))
+	require.Len(t, client.thumbnailIDSnapshot(), 1)
+}
+
+func TestThumbnailTimeoutBoundarySelectsExactlyOneMode(t *testing.T) {
+	for iteration := 0; iteration < 25; iteration++ {
+		channels := newMockChannelSet()
+		client := &mockGalleryClient{
+			gallery:   Gallery{Items: []GalleryItem{{ID: "asset-1"}}},
+			thumbnail: []byte("thumb"),
+		}
+		mgr := NewGalleryManager(channels, client, 0)
+		mgr.thumbnailGrace = time.Hour
+		mgr.sendGallery()
+		mgr.galleryMu.Lock()
+		generation := mgr.galleryGeneration
+		mgr.galleryMu.Unlock()
+
+		start := make(chan struct{})
+		var racers sync.WaitGroup
+		racers.Add(2)
+		go func() {
+			defer racers.Done()
+			<-start
+			mgr.startLegacyThumbnailFallback(generation)
+		}()
+		go func() {
+			defer racers.Done()
+			<-start
+			mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"boundary","start":0,"count":1}`))
+		}()
+		close(start)
+		racers.Wait()
+		require.Eventually(t, func() bool {
+			return channels.control.countTextType("thumbnail_complete")+channels.control.countTextType("thumbnail_batch_complete") == 1
+		}, time.Second, time.Millisecond)
+		require.Equal(t, 1, channels.control.countTextType("thumbnail_complete")+channels.control.countTextType("thumbnail_batch_complete"))
+		require.Len(t, channels.media.binarySnapshot(), 1)
+		require.Len(t, client.thumbnailIDSnapshot(), 1)
+	}
+}
+
+func TestObsoleteThumbnailFallbackCannotSelectLegacyForNewGallery(t *testing.T) {
+	channels := newMockChannelSet()
+	client := &mockGalleryClient{
+		gallery:   Gallery{Items: []GalleryItem{{ID: "old"}}},
+		thumbnail: []byte("thumb"),
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.sendGallery()
+	mgr.galleryMu.Lock()
+	oldGeneration := mgr.galleryGeneration
+	mgr.galleryMu.Unlock()
+
+	client.setGallery(Gallery{Items: []GalleryItem{{ID: "new"}}})
+	mgr.sendGallery()
+	mgr.startLegacyThumbnailFallback(oldGeneration)
+
+	require.Never(t, func() bool { return channels.control.hasTextType("thumbnail_complete") }, 50*time.Millisecond, time.Millisecond)
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"new-gallery","start":0,"count":1}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+	require.Equal(t, []string{"new"}, client.thumbnailIDSnapshot())
+}
+
+func TestReadvertisingGalleryCancelsActiveThumbnailBatch(t *testing.T) {
+	channels := newMockChannelSet()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client := &mockGalleryClient{
+		gallery:          Gallery{Items: []GalleryItem{{ID: "old"}}},
+		thumbnail:        []byte("thumb"),
+		thumbnailStarted: started,
+		thumbnailRelease: release,
+	}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+	mgr.sendGallery()
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"old-batch","start":0,"count":1}`))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("old thumbnail batch did not start")
+	}
+
+	client.setGallery(Gallery{Items: []GalleryItem{{ID: "new"}}})
+	mgr.sendGallery()
+	close(release)
+
+	require.Never(t, func() bool {
+		return channels.media.binaryCount() != 0 || channels.control.hasTextType("thumbnail_batch_complete")
+	}, 50*time.Millisecond, time.Millisecond)
+	require.Equal(t, 2, channels.control.countTextType("thumbnail_list"))
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"new-batch","start":0,"count":1}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+	require.Len(t, channels.media.binarySnapshot(), 1)
+}
+
+func TestGalleryMetadataCapsAtUint16ThumbnailBoundary(t *testing.T) {
+	channels := newMockChannelSet()
+	items := make([]GalleryItem, 65537)
+	for index := range items {
+		items[index] = GalleryItem{ID: strconv.Itoa(index)}
+	}
+	client := &mockGalleryClient{gallery: Gallery{Items: items}, thumbnail: []byte("thumb")}
+	mgr := NewGalleryManager(channels, client, 0)
+	mgr.thumbnailGrace = time.Hour
+
+	var logs bytes.Buffer
+	previousLogOutput := log.Writer()
+	t.Cleanup(func() { log.SetOutput(previousLogOutput) })
+	log.SetOutput(&logs)
+	mgr.sendGallery()
+	require.Contains(t, logs.String(), "truncating gallery")
+
+	var list struct {
+		Items []GalleryItem `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(channels.control.getTextByType("thumbnail_list")), &list))
+	require.Len(t, list.Items, 65536)
+	require.Equal(t, "65535", list.Items[65535].ID)
+
+	mgr.HandleMessage([]byte(`{"type":"thumbnail_batch_request","request_id":"boundary-last","start":65535,"count":120}`))
+	require.Eventually(t, func() bool { return channels.control.hasTextType("thumbnail_batch_complete") }, time.Second, time.Millisecond)
+	frames := channels.media.binarySnapshot()
+	require.Len(t, frames, 1)
+	require.Equal(t, uint16(65535), binary.BigEndian.Uint16(frames[0][1:3]))
+	require.Equal(t, []string{"65535"}, client.thumbnailIDSnapshot())
 }
 
 func TestHandleAssetRequestStreamsByAssetID(t *testing.T) {

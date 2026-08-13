@@ -494,6 +494,28 @@ test('handleTransferMessage routes thumbnail_list to the gallery controller', as
   __test.setGalleryController(null)
 })
 
+test('pull thumbnail_list clears the initial gallery loading status', async () => {
+  const originalDocument = globalThis.document
+  const status = { textContent: 'Loading gallery...' }
+  globalThis.document = {
+    getElementById(id) {
+      assert.equal(id, 'status')
+      return status
+    },
+  }
+  __test.setGalleryController({ handleThumbnailList() {} })
+
+  try {
+    await __test.handleTransferMessage({
+      data: JSON.stringify({ type: 'thumbnail_list', thumbnailMode: 'pull-v1', items: [] }),
+    })
+    assert.equal(status.textContent, '')
+  } finally {
+    globalThis.document = originalDocument
+    __test.setGalleryController(null)
+  }
+})
+
 test('thumbnail_complete clears the gallery loading status', async () => {
   const completed = []
   const originalDocument = globalThis.document
@@ -519,6 +541,80 @@ test('thumbnail_complete clears the gallery loading status', async () => {
     globalThis.document = originalDocument
     __test.setGalleryController(null)
   }
+})
+
+test('thumbnail_batch_complete routes to the progressive gallery controller', async () => {
+  const completed = []
+  __test.setGalleryController({
+    handleThumbnailBatchComplete(msg) {
+      completed.push(msg)
+    },
+  })
+
+  await __test.handleTransferMessage({ data: JSON.stringify({
+    type: 'thumbnail_batch_complete',
+    request_id: 'thumb-1',
+    start: 0,
+    count: 120,
+    sent: 119,
+    failed: 1,
+  }) })
+
+  assert.deepEqual(completed, [{
+    type: 'thumbnail_batch_complete',
+    request_id: 'thumb-1',
+    start: 0,
+    count: 120,
+    sent: 119,
+    failed: 1,
+  }])
+  __test.setGalleryController(null)
+})
+
+test('thumbnail batch requests are sent as JSON on the current control endpoint', () => {
+  const channels = fakeLaneSet()
+  __test.setTransferSession({ channels, mode: 'relay' })
+
+  __test.requestThumbnailBatch({
+    type: 'thumbnail_batch_request',
+    request_id: 'thumb-2',
+    start: 120,
+    count: 120,
+  })
+
+  assert.deepEqual(JSON.parse(channels.control.sent[0]), {
+    type: 'thumbnail_batch_request',
+    request_id: 'thumb-2',
+    start: 120,
+    count: 120,
+  })
+  __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('thumbnail batch request reports synchronous and asynchronous control send failures', async () => {
+  const channels = fakeLaneSet()
+  __test.setTransferSession({ channels, mode: 'relay' })
+  channels.control.send = () => { throw new Error('closed') }
+  assert.equal(__test.requestThumbnailBatch({ type: 'thumbnail_batch_request' }), false)
+
+  channels.control.send = () => Promise.reject(new Error('rejected'))
+  assert.equal(await __test.requestThumbnailBatch({ type: 'thumbnail_batch_request' }), false)
+
+  channels.control.send = () => Promise.resolve()
+  assert.equal(await __test.requestThumbnailBatch({ type: 'thumbnail_batch_request' }), true)
+  __test.setTransferSession({ channels: null, mode: null })
+})
+
+test('media-scoped thumbnail batch errors route by request id without consuming preview state', async () => {
+  const errors = []
+  __test.setGalleryController({
+    handleThumbnailBatchError(msg) { errors.push(msg); return true },
+  })
+
+  await __test.handleError({ type: 'error', scope: 'media', request_id: 'thumb-9', message: 'pull rejected' })
+
+  assert.deepEqual(errors, [{ type: 'error', scope: 'media', request_id: 'thumb-9', message: 'pull rejected' }])
+  __test.setGalleryController(null)
 })
 
 test('gallery mode recreates its controller after reset before handling thumbnail_list', async () => {

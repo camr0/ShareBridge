@@ -32,6 +32,18 @@ func TestCreateOfferCreatesRequiredLaneLabels(t *testing.T) {
 	}
 }
 
+func TestPeerAddOnClosePreservesOwnerAndRunsAfterClose(t *testing.T) {
+	p := &Peer{}
+	var owner, listener, late atomic.Int32
+	p.SetOnClose(func() { owner.Add(1) })
+	p.AddOnClose(func() { listener.Add(1) })
+	p.notifyClosed()
+	p.AddOnClose(func() { late.Add(1) })
+	if owner.Load() != 1 || listener.Load() != 1 || late.Load() != 1 {
+		t.Fatalf("close callbacks owner=%d listener=%d late=%d, want all 1", owner.Load(), listener.Load(), late.Load())
+	}
+}
+
 func TestPeerReadyAfterEveryLaneAndVersionHelloExactlyOnce(t *testing.T) {
 	p, err := New(nil, false)
 	if err != nil {

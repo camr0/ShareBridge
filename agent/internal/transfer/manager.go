@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,20 @@ const (
 )
 
 const maxConcurrentGalleryThumbnails = 6
+
+const (
+	maxAdvertisedGalleryItems = 65536
+	maxThumbnailBatchSize     = 120
+	defaultThumbnailGrace     = 5 * time.Second
+)
+
+type thumbnailMode uint8
+
+const (
+	thumbnailModeWaiting thumbnailMode = iota
+	thumbnailModePull
+	thumbnailModeLegacy
+)
 
 const (
 	binaryFrameFileChunk = byte(0x10)
@@ -97,18 +112,29 @@ type Manager struct {
 	maxDownloads  int
 	downloads     atomic.Int32
 
-	mediaMu           sync.Mutex
-	mediaCancel       context.CancelFunc
-	mediaID           string
-	mediaQuality      string
-	operationSequence atomic.Uint64
-	mediaOperation    atomic.Uint64
-	bulkOperation     atomic.Uint64
-	bulkMu            sync.Mutex
-	currentGeneration atomic.Uint32
-	albumMu           sync.Mutex
-	albumBatch        *albumBatch
-	albumAckTimeout   time.Duration
+	mediaMu                 sync.Mutex
+	mediaCancel             context.CancelFunc
+	mediaID                 string
+	mediaQuality            string
+	operationSequence       atomic.Uint64
+	mediaOperation          atomic.Uint64
+	bulkOperation           atomic.Uint64
+	bulkMu                  sync.Mutex
+	currentGeneration       atomic.Uint32
+	albumMu                 sync.Mutex
+	albumBatch              *albumBatch
+	albumAckTimeout         time.Duration
+	galleryMu               sync.Mutex
+	galleryItems            []GalleryItem
+	galleryGeneration       uint64
+	galleryContext          context.Context
+	galleryCancel           context.CancelFunc
+	thumbnailMode           thumbnailMode
+	thumbnailBatchActive    bool
+	thumbnailBatchRequestID string
+	thumbnailSeenRequestIDs map[string]struct{}
+	thumbnailFallback       *time.Timer
+	thumbnailGrace          time.Duration
 
 	OnSessionExpired   func()
 	OnDownloadComplete func(bytesTransferred int64)
@@ -132,13 +158,20 @@ func NewManager(channels multilane.ChannelSet, client StorageBackend, maxDownloa
 		client:          client,
 		maxDownloads:    maxDownloads,
 		albumAckTimeout: 60 * time.Second,
+		thumbnailGrace:  defaultThumbnailGrace,
 	}
 	m.installChannels()
 	return m
 }
 
 func NewGalleryManager(channels multilane.ChannelSet, backend GalleryBackend, maxDownloads int) *Manager {
-	m := &Manager{channels: channels, gallery: backend, maxDownloads: maxDownloads, albumAckTimeout: 60 * time.Second}
+	m := &Manager{
+		channels:        channels,
+		gallery:         backend,
+		maxDownloads:    maxDownloads,
+		albumAckTimeout: 60 * time.Second,
+		thumbnailGrace:  defaultThumbnailGrace,
+	}
 	m.installChannels()
 	return m
 }
@@ -153,6 +186,25 @@ func (m *Manager) installChannels() {
 	if m.control != nil {
 		m.control.SetOnMessage(m.HandleMessage)
 	}
+	if lifecycle, ok := m.channels.(multilane.CloseListenerChannelSet); ok {
+		lifecycle.AddOnClose(m.handleClose)
+	}
+}
+
+func (m *Manager) handleClose() {
+	m.galleryMu.Lock()
+	if m.thumbnailFallback != nil {
+		m.thumbnailFallback.Stop()
+		m.thumbnailFallback = nil
+	}
+	if m.galleryCancel != nil {
+		m.galleryCancel()
+		m.galleryCancel = nil
+	}
+	m.galleryGeneration++
+	m.thumbnailBatchActive = false
+	m.thumbnailBatchRequestID = ""
+	m.galleryMu.Unlock()
 }
 
 // HandleOpen sends the hello message when DataChannel opens.
@@ -178,6 +230,8 @@ func (m *Manager) HandleMessage(data []byte) {
 		OperationID string `json:"operation_id"`
 		BatchID     string `json:"batch_id"`
 		PartIndex   int    `json:"part_index"`
+		Start       int    `json:"start"`
+		Count       int    `json:"count"`
 		OK          bool   `json:"ok"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -196,6 +250,8 @@ func (m *Manager) HandleMessage(data []byte) {
 		m.handleAlbumDownloadRequest(msg.RequestID)
 	case "album_archive_ack":
 		m.handleAlbumArchiveAck(msg.BatchID, msg.PartIndex, msg.OperationID, msg.OK)
+	case "thumbnail_batch_request":
+		m.handleThumbnailBatchRequest(msg.Start, msg.Count, msg.RequestID)
 	case "asset_preview_request":
 		m.handleAssetPreviewRequest(msg.ID, msg.Quality, msg.Generation, msg.RequestID)
 	case "asset_preview_seek":
@@ -404,10 +460,37 @@ func (m *Manager) sendGallery() {
 		m.sendError("media", "", "share unavailable: "+err.Error())
 		return
 	}
+	if len(gallery.Items) > maxAdvertisedGalleryItems {
+		log.Printf("transfer gallery: truncating gallery metadata from %d to %d items for uint16 thumbnail indices", len(gallery.Items), maxAdvertisedGalleryItems)
+		gallery.Items = gallery.Items[:maxAdvertisedGalleryItems]
+	}
+
+	m.galleryMu.Lock()
+	if m.thumbnailFallback != nil {
+		m.thumbnailFallback.Stop()
+	}
+	if m.galleryCancel != nil {
+		m.galleryCancel()
+	}
+	m.galleryGeneration++
+	if m.galleryGeneration == 0 {
+		m.galleryGeneration++
+	}
+	generation := m.galleryGeneration
+	m.galleryContext, m.galleryCancel = context.WithCancel(context.Background())
+	m.galleryItems = append(m.galleryItems[:0], gallery.Items...)
+	m.thumbnailMode = thumbnailModeWaiting
+	m.thumbnailBatchActive = false
+	m.thumbnailBatchRequestID = ""
+	m.thumbnailSeenRequestIDs = make(map[string]struct{})
+	m.thumbnailFallback = nil
+	m.galleryMu.Unlock()
+
 	data, _ := json.Marshal(struct {
-		Type string `json:"type"`
+		Type          string `json:"type"`
+		ThumbnailMode string `json:"thumbnailMode"`
 		Gallery
-	}{Type: "thumbnail_list", Gallery: gallery})
+	}{Type: "thumbnail_list", ThumbnailMode: "pull-v1", Gallery: gallery})
 	log.Printf("transfer gallery: sending thumbnail_list items=%d bytes=%d", len(gallery.Items), len(data))
 	if err := m.control.SendText(string(data)); err != nil {
 		log.Printf("transfer gallery: send thumbnail_list failed: %v", err)
@@ -415,15 +498,122 @@ func (m *Manager) sendGallery() {
 	}
 	log.Printf("transfer gallery: thumbnail_list sent items=%d", len(gallery.Items))
 
-	sentThumbs, failedThumbs := m.sendGalleryThumbnails(context.Background(), gallery.Items)
-	log.Printf("transfer gallery: thumbnail stream finished sent=%d failed_fetch=%d", sentThumbs, failedThumbs)
-	data, _ = json.Marshal(struct {
-		Type   string `json:"type"`
-		Sent   int    `json:"sent"`
-		Failed int    `json:"failed"`
-	}{Type: "thumbnail_complete", Sent: sentThumbs, Failed: failedThumbs})
-	if err := m.control.SendText(string(data)); err != nil {
+	m.galleryMu.Lock()
+	if m.galleryGeneration == generation && m.thumbnailMode == thumbnailModeWaiting {
+		m.thumbnailFallback = time.AfterFunc(m.thumbnailGrace, func() {
+			m.startLegacyThumbnailFallback(generation)
+		})
+	}
+	m.galleryMu.Unlock()
+}
+
+func (m *Manager) startLegacyThumbnailFallback(generation uint64) {
+	m.galleryMu.Lock()
+	if m.galleryGeneration != generation || m.thumbnailMode != thumbnailModeWaiting {
+		m.galleryMu.Unlock()
+		return
+	}
+	if m.thumbnailFallback != nil {
+		m.thumbnailFallback.Stop()
+	}
+	m.thumbnailMode = thumbnailModeLegacy
+	m.thumbnailFallback = nil
+	items := append([]GalleryItem(nil), m.galleryItems...)
+	ctx := m.galleryContext
+	m.galleryMu.Unlock()
+
+	sent, failed, failedIndices := m.sendGalleryThumbnails(ctx, generation, items, 0)
+	log.Printf("transfer gallery: legacy thumbnail stream finished sent=%d failed=%d", sent, failed)
+	data, _ := json.Marshal(struct {
+		Type          string `json:"type"`
+		Sent          int    `json:"sent"`
+		Failed        int    `json:"failed"`
+		FailedIndices []int  `json:"failed_indices,omitempty"`
+	}{Type: "thumbnail_complete", Sent: sent, Failed: failed, FailedIndices: failedIndices})
+	m.galleryMu.Lock()
+	if m.galleryGeneration != generation || m.thumbnailMode != thumbnailModeLegacy || ctx.Err() != nil {
+		m.galleryMu.Unlock()
+		return
+	}
+	err := m.control.SendText(string(data))
+	m.galleryMu.Unlock()
+	if err != nil {
 		log.Printf("transfer gallery: send thumbnail_complete failed: %v", err)
+	}
+}
+
+func (m *Manager) handleThumbnailBatchRequest(start, count int, requestID string) {
+	if requestID == "" {
+		m.sendError("media", requestID, "thumbnail batch request_id required")
+		return
+	}
+	if start < 0 || count < 1 || count > maxThumbnailBatchSize {
+		m.sendError("media", requestID, "thumbnail batch range invalid")
+		return
+	}
+
+	m.galleryMu.Lock()
+	if start >= len(m.galleryItems) {
+		m.galleryMu.Unlock()
+		m.sendError("media", requestID, "thumbnail batch start outside gallery")
+		return
+	}
+	if m.thumbnailMode == thumbnailModeLegacy {
+		m.galleryMu.Unlock()
+		m.sendError("media", requestID, "thumbnail batch unavailable after legacy stream started")
+		return
+	}
+	if _, seen := m.thumbnailSeenRequestIDs[requestID]; seen {
+		m.galleryMu.Unlock()
+		m.sendError("media", requestID, "thumbnail batch request_id already used")
+		return
+	}
+	if m.thumbnailBatchActive {
+		m.galleryMu.Unlock()
+		m.sendError("media", requestID, "thumbnail batch already active")
+		return
+	}
+	if m.thumbnailMode == thumbnailModeWaiting {
+		m.thumbnailMode = thumbnailModePull
+		if m.thumbnailFallback != nil {
+			m.thumbnailFallback.Stop()
+			m.thumbnailFallback = nil
+		}
+	}
+	end := min(start+count, len(m.galleryItems))
+	items := append([]GalleryItem(nil), m.galleryItems[start:end]...)
+	generation := m.galleryGeneration
+	ctx := m.galleryContext
+	m.thumbnailSeenRequestIDs[requestID] = struct{}{}
+	m.thumbnailBatchActive = true
+	m.thumbnailBatchRequestID = requestID
+	m.galleryMu.Unlock()
+	go m.sendThumbnailBatch(ctx, generation, start, items, requestID)
+}
+
+func (m *Manager) sendThumbnailBatch(ctx context.Context, generation uint64, start int, items []GalleryItem, requestID string) {
+	sent, failed, failedIndices := m.sendGalleryThumbnails(ctx, generation, items, start)
+	log.Printf("transfer gallery: thumbnail batch start=%d count=%d sent=%d failed=%d", start, len(items), sent, failed)
+	data, _ := json.Marshal(struct {
+		Type          string `json:"type"`
+		RequestID     string `json:"request_id,omitempty"`
+		Start         int    `json:"start"`
+		Count         int    `json:"count"`
+		Sent          int    `json:"sent"`
+		Failed        int    `json:"failed"`
+		FailedIndices []int  `json:"failed_indices,omitempty"`
+	}{Type: "thumbnail_batch_complete", RequestID: requestID, Start: start, Count: len(items), Sent: sent, Failed: failed, FailedIndices: failedIndices})
+	m.galleryMu.Lock()
+	if m.galleryGeneration != generation || m.thumbnailMode != thumbnailModePull || m.thumbnailBatchRequestID != requestID || ctx.Err() != nil {
+		m.galleryMu.Unlock()
+		return
+	}
+	err := m.control.SendText(string(data))
+	m.thumbnailBatchActive = false
+	m.thumbnailBatchRequestID = ""
+	m.galleryMu.Unlock()
+	if err != nil {
+		log.Printf("transfer gallery: send thumbnail_batch_complete failed: %v", err)
 	}
 }
 
@@ -439,14 +629,13 @@ type thumbnailResult struct {
 	err   error
 }
 
-func (m *Manager) sendGalleryThumbnails(ctx context.Context, items []GalleryItem) (int, int) {
+func (m *Manager) sendGalleryThumbnails(ctx context.Context, generation uint64, items []GalleryItem, indexOffset int) (int, int, []int) {
 	total := len(items)
-	if total > 65536 {
-		total = 65536
-	}
 	if total == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
 
 	workers := maxConcurrentGalleryThumbnails
 	if total < workers {
@@ -461,47 +650,93 @@ func (m *Manager) sendGalleryThumbnails(ctx context.Context, items []GalleryItem
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
+				if workCtx.Err() != nil {
+					return
+				}
 				var buf bytes.Buffer
-				_, err := m.gallery.GetThumbnail(ctx, job.item.ID, &buf)
-				results <- thumbnailResult{
+				_, err := m.gallery.GetThumbnail(workCtx, job.item.ID, &buf)
+				result := thumbnailResult{
 					index: job.index,
 					id:    job.item.ID,
 					data:  buf.Bytes(),
 					err:   err,
+				}
+				select {
+				case results <- result:
+				case <-workCtx.Done():
+					return
 				}
 			}
 		}()
 	}
 
 	go func() {
+		defer close(jobs)
 		for i := 0; i < total; i++ {
-			jobs <- thumbnailJob{index: i, item: items[i]}
+			select {
+			case jobs <- thumbnailJob{index: indexOffset + i, item: items[i]}:
+			case <-workCtx.Done():
+				return
+			}
 		}
-		close(jobs)
+	}()
+
+	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
 	sentThumbs := 0
 	failedThumbs := 0
-	sendFailed := false
+	failedIndices := make([]int, 0)
+	accounted := make(map[int]struct{}, total)
 	for result := range results {
+		accounted[result.index] = struct{}{}
 		if result.err != nil {
 			failedThumbs++
+			failedIndices = append(failedIndices, result.index)
 			log.Printf("transfer gallery: thumbnail fetch failed index=%d id=%s: %v", result.index, result.id, result.err)
 			continue
 		}
-		if sendFailed {
-			continue
-		}
-		if err := m.sendWithBackpressure(context.Background(), m.media, multilane.ClassThumbnail, encodeThumbnailFrame(uint16(result.index), result.data)); err != nil {
+		if err := m.sendThumbnailWithBackpressure(workCtx, generation, encodeThumbnailFrame(uint16(result.index), result.data)); err != nil {
 			log.Printf("transfer gallery: thumbnail send failed index=%d id=%s bytes=%d: %v", result.index, result.id, len(result.data), err)
-			sendFailed = true
+			failedThumbs++
+			failedIndices = append(failedIndices, result.index)
+			cancelWork()
 			continue
 		}
 		sentThumbs++
 	}
-	return sentThumbs, failedThumbs
+	if ctx.Err() == nil {
+		for index := indexOffset; index < indexOffset+total; index++ {
+			if _, ok := accounted[index]; !ok {
+				failedThumbs++
+				failedIndices = append(failedIndices, index)
+			}
+		}
+	}
+	sort.Ints(failedIndices)
+	return sentThumbs, failedThumbs, failedIndices
+}
+
+func (m *Manager) sendThumbnailWithBackpressure(ctx context.Context, generation uint64, data []byte) error {
+	for m.media.BufferedAmount() > maxBuffer {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleepInterval):
+		}
+	}
+
+	m.galleryMu.Lock()
+	defer m.galleryMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.galleryGeneration != generation {
+		return context.Canceled
+	}
+	return m.media.SendBinaryClass(multilane.ClassThumbnail, data)
 }
 
 func (m *Manager) handleListRequest(subpath, requestID string) {

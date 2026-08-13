@@ -108,6 +108,12 @@ type ChannelSet interface {
 	Close() error
 }
 
+// CloseListenerChannelSet supports additive lifecycle observers without
+// replacing the owner callback installed through SetOnClose.
+type CloseListenerChannelSet interface {
+	AddOnClose(func())
+}
+
 type transportHandshake struct {
 	Type    string `json:"type"`
 	Version int    `json:"version"`

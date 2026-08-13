@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,18 @@ func TestSecureRelayChannelExposesAllLogicalLanes(t *testing.T) {
 	}
 	if channel.Endpoint(multilane.Lane(0x03)) != nil {
 		t.Fatal("reserved lane unexpectedly has an endpoint")
+	}
+}
+
+func TestSecureRelayAddOnClosePreservesOwnerAndRunsAfterClose(t *testing.T) {
+	channel := &SecureRelayChannel{}
+	var owner, listener, late atomic.Int32
+	channel.SetOnClose(func() { owner.Add(1) })
+	channel.AddOnClose(func() { listener.Add(1) })
+	channel.notifyClose()
+	channel.AddOnClose(func() { late.Add(1) })
+	if owner.Load() != 1 || listener.Load() != 1 || late.Load() != 1 {
+		t.Fatalf("close callbacks owner=%d listener=%d late=%d, want all 1", owner.Load(), listener.Load(), late.Load())
 	}
 }
 
