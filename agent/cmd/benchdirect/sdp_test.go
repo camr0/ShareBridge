@@ -13,13 +13,13 @@ const sampleSDP = "v=0\r\n" +
 	"a=ice-ufrag:abc\r\n" +
 	"a=ice-pwd:def\r\n"
 
-func TestRewriteHostCandidatePort(t *testing.T) {
-	got, orig, err := RewriteHostCandidatePort(sampleSDP, 5001)
+func TestRewriteHostCandidate(t *testing.T) {
+	got, ip, port, err := RewriteHostCandidate(sampleSDP, 5001)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if orig != 49439 {
-		t.Fatalf("orig port = %d, want 49439", orig)
+	if ip != "127.0.0.1" || port != 49439 {
+		t.Fatalf("orig = %s:%d, want 127.0.0.1:49439", ip, port)
 	}
 	if !strings.Contains(got, "127.0.0.1 5001 typ host") {
 		t.Fatalf("rewritten candidate missing:\n%s", got)
@@ -32,32 +32,41 @@ func TestRewriteHostCandidatePort(t *testing.T) {
 	}
 }
 
-func TestRewriteNoHostCandidate(t *testing.T) {
-	_, _, err := RewriteHostCandidatePort("v=0\r\n", 5001)
-	if err == nil {
-		t.Fatal("expected error for missing host candidate")
-	}
-}
-
-func TestRewriteIgnoresNonHost127001Candidate(t *testing.T) {
+func TestRewriteHostCandidateRewritesNonLoopbackIP(t *testing.T) {
 	sdp := "v=0\r\n" +
-		"a=candidate:1 1 udp 2130706431 127.0.0.1 6000 typ srflx generation 0\r\n" +
-		"a=candidate:2 1 udp 2130706431 127.0.0.1 7000 typ host generation 0\r\n"
-
-	got, orig, err := RewriteHostCandidatePort(sdp, 5001)
+		"a=candidate:2935132940 1 udp 2113937151 192.168.1.224 51357 typ host generation 0\r\n"
+	got, ip, port, err := RewriteHostCandidate(sdp, 5001)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if orig != 7000 {
-		t.Fatalf("orig port = %d, want 7000", orig)
+	if ip != "192.168.1.224" || port != 51357 {
+		t.Fatalf("orig = %s:%d, want 192.168.1.224:51357", ip, port)
 	}
-	if !strings.Contains(got, "127.0.0.1 6000 typ srflx generation 0") {
-		t.Fatalf("non-host candidate was rewritten:\n%s", got)
+	if !strings.Contains(got, "127.0.0.1 5001 typ host") {
+		t.Fatalf("IP+port not rewritten to loopback:\n%s", got)
 	}
-	if !strings.Contains(got, "127.0.0.1 5001 typ host generation 0") {
-		t.Fatalf("host candidate missing rewrite:\n%s", got)
+}
+
+func TestRewriteHostCandidateStripsOtherCandidates(t *testing.T) {
+	sdp := "v=0\r\n" +
+		"a=candidate:111 1 udp 2113937151 192.168.1.224 51357 typ host generation 0\r\n" +
+		"a=candidate:222 1 udp 2113939711 2600:4040::1 63045 typ host generation 0\r\n" +
+		"a=candidate:333 1 udp 2113937151 10.0.0.5 7000 typ host generation 0\r\n"
+	got, _, _, err := RewriteHostCandidate(sdp, 5001)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(got, "127.0.0.1 7000 typ host generation 0") {
-		t.Fatalf("original host port still present:\n%s", got)
+	if strings.Count(got, "a=candidate:") != 1 {
+		t.Fatalf("expected exactly one candidate, got:\n%s", got)
+	}
+	if !strings.Contains(got, "127.0.0.1 5001 typ host") {
+		t.Fatalf("missing rewritten candidate:\n%s", got)
+	}
+}
+
+func TestRewriteNoHostCandidate(t *testing.T) {
+	_, _, _, err := RewriteHostCandidate("v=0\r\n", 5001)
+	if err == nil {
+		t.Fatal("expected error for missing host candidate")
 	}
 }
