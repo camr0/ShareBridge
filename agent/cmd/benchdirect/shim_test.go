@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -102,5 +103,85 @@ func TestShimDropsFromABeforeBLearned(t *testing.T) {
 	_ = peerB.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
 	if _, _, err := peerB.ReadFromUDP(buf); err == nil {
 		t.Fatal("expected packet from A to be dropped before B is learned")
+	}
+}
+
+func TestShimRejectsInvalidLoss(t *testing.T) {
+	for _, loss := range []float64{-0.1, 1.5} {
+		s, err := NewShim(0, loss)
+		if err == nil {
+			if s != nil {
+				_ = s.Close()
+			}
+			t.Fatalf("expected error for loss=%v", loss)
+		}
+	}
+}
+
+func TestShimIgnoresThirdPartyAfterBLearned(t *testing.T) {
+	peerA, aAddr := listenUDP(t)
+	defer peerA.Close()
+	peerB, _ := listenUDP(t)
+	defer peerB.Close()
+	peerC, _ := listenUDP(t)
+	defer peerC.Close()
+
+	s, err := NewShim(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetPeerA(aAddr)
+
+	if _, err := peerB.WriteToUDP([]byte("learn"), s.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	bufA := make([]byte, 16)
+	_ = peerA.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := peerA.ReadFromUDP(bufA); err != nil {
+		t.Fatalf("peer A did not receive learning packet: %v", err)
+	}
+
+	if _, err := peerC.WriteToUDP([]byte("third-party"), s.Addr()); err != nil {
+		t.Fatal(err)
+	}
+
+	bufB := make([]byte, 32)
+	_ = peerA.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, err := peerA.ReadFromUDP(bufA); err == nil {
+		t.Fatalf("peer A unexpectedly received third-party packet: %q", string(bufA[:n]))
+	} else if !errors.Is(err, net.ErrClosed) {
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			t.Fatalf("peer A read failed unexpectedly: %v", err)
+		}
+	}
+	_ = peerB.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, err := peerB.ReadFromUDP(bufB); err == nil {
+		t.Fatalf("peer B unexpectedly received third-party packet: %q", string(bufB[:n]))
+	} else if !errors.Is(err, net.ErrClosed) {
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			t.Fatalf("peer B read failed unexpectedly: %v", err)
+		}
+	}
+}
+
+func TestShimCloseReturns(t *testing.T) {
+	s, err := NewShim(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Close()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Close did not return promptly")
 	}
 }

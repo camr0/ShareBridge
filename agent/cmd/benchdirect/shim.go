@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"math/rand"
 	"net"
 	"sync"
@@ -26,15 +27,27 @@ type Shim struct {
 	b      *net.UDPAddr
 	queue  []packet
 	notify chan struct{}
+	done   chan struct{}
+	wg     sync.WaitGroup
 	closed bool
 }
 
 func NewShim(delay time.Duration, loss float64) (*Shim, error) {
+	if loss < 0 || loss > 1 {
+		return nil, errors.New("loss must be between 0 and 1")
+	}
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return nil, err
 	}
-	s := &Shim{conn: conn, delay: delay, loss: loss, notify: make(chan struct{}, 1)}
+	s := &Shim{
+		conn:   conn,
+		delay:  delay,
+		loss:   loss,
+		notify: make(chan struct{}, 1),
+		done:   make(chan struct{}),
+	}
+	s.wg.Add(2)
 	go s.readLoop()
 	go s.drainLoop()
 	return s, nil
@@ -49,6 +62,7 @@ func (s *Shim) SetPeerA(a *net.UDPAddr) {
 }
 
 func (s *Shim) readLoop() {
+	defer s.wg.Done()
 	buf := make([]byte, 64*1024)
 	for {
 		n, src, err := s.conn.ReadFromUDP(buf)
@@ -68,13 +82,16 @@ func (s *Shim) readLoop() {
 			continue
 		}
 		var target *net.UDPAddr
-		if s.a != nil && src.Port == s.a.Port && src.IP.Equal(s.a.IP) {
+		if s.a != nil && src.IP.Equal(s.a.IP) && src.Port == s.a.Port {
 			target = s.b
-		} else {
-			if s.b == nil {
-				s.b = src
-			}
+		} else if s.b != nil && src.IP.Equal(s.b.IP) && src.Port == s.b.Port {
 			target = s.a
+		} else if s.b == nil {
+			s.b = src
+			target = s.a
+		} else {
+			s.mu.Unlock()
+			continue
 		}
 		if target == nil {
 			s.mu.Unlock()
@@ -93,8 +110,13 @@ func (s *Shim) readLoop() {
 }
 
 func (s *Shim) drainLoop() {
+	defer s.wg.Done()
 	for {
-		<-s.notify
+		select {
+		case <-s.done:
+			return
+		case <-s.notify:
+		}
 		for {
 			s.mu.Lock()
 			if len(s.queue) == 0 {
@@ -107,7 +129,20 @@ func (s *Shim) drainLoop() {
 			s.mu.Unlock()
 
 			if wait > 0 {
-				time.Sleep(wait)
+				timer := time.NewTimer(wait)
+				select {
+				case <-s.done:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
+			}
+			select {
+			case <-s.done:
+				return
+			default:
 			}
 			_, _ = s.conn.WriteToUDP(head.data, head.addr)
 		}
@@ -116,7 +151,14 @@ func (s *Shim) drainLoop() {
 
 func (s *Shim) Close() error {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
 	s.closed = true
+	close(s.done)
 	s.mu.Unlock()
-	return s.conn.Close()
+	err := s.conn.Close()
+	s.wg.Wait()
+	return err
 }
