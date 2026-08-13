@@ -477,6 +477,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/chromedp/chromedp"
 )
 
 // Skip when Chrome is unavailable or under -short, so the unit suite stays
@@ -493,6 +495,9 @@ func TestBrowserLaunchesAndEvaluates(t *testing.T) {
 	}
 	defer b.close()
 
+	if err := chromedp.Run(b.ctx, chromedp.Navigate("data:text/html,<title>benchdirect</title>")); err != nil {
+		t.Fatal(err)
+	}
 	var title string
 	if err := b.eval("document.title", &title); err != nil {
 		t.Fatal(err)
