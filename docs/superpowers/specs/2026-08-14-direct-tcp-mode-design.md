@@ -134,7 +134,7 @@ A port is not required to be static across agent restarts: the control plane sto
 
 ## 8. Certificate Architecture (reused from FRP §9)
 
-Unchanged: the agent generates and holds its TLS private key locally (it never leaves the agent), submits a wildcard CSR for `*.<agent-namespace>.sharebridgeusercontent.com`, and the control plane's certificate coordinator completes DNS-01 ACME issuance and returns only the public chain. Renewal, atomic reload, CA abstraction, and CT handling are identical to the FRP spec. TLS is the end-to-end encryption; the custom Noise layer is not used for the new data plane.
+Unchanged: the agent generates and holds its TLS private key locally (it never leaves the agent), submits a wildcard CSR for `*.<agent-namespace>.sharebridgeusercontent.com`, and the control plane's certificate coordinator completes DNS-01 ACME issuance and returns only the public chain. Renewal, atomic reload, CA abstraction, and CT handling are identical to the FRP spec. TLS is the end-to-end encryption; the custom Noise layer is not used for the new data plane. The certificate coordinator and DDNS updater remain OSS code behind provider-neutral interfaces (FRP §9.4); DNS-provider and CA credentials are operator-supplied secrets (env/config), never committed to the repo — self-hosters bring their own domain, DNS provider, and CA credentials (FRP §18.3).
 
 ## 9. Agent HTTPS Server (reused from FRP §15)
 
@@ -200,20 +200,20 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - The open signal only activates agent-registered, source-verified shares; the agent never opens arbitrary ports or reach arbitrary local services.
 - Reachability via UPnP/NAT-PMP/PCP automatic port mapping — no manual router configuration, ever.
 - 443 preferred; non-standard port acceptable (cosmetic `:port` in URL).
-- Direct-first with relay fallback; `relayOnly` forces relay.
+- Direct is the default mode with relay as automatic fallback; `relayOnly` forces relay (hide IP). Speed parity (≥ relay throughput) is validated by the benchdirect spike before direct becomes the default.
 - IP exposure is an accepted, already-disclosed property of direct mode.
 - Content remains on `sharebridgeusercontent.com` for browser site isolation.
 - The custom Noise/browser-framing layer is retired for migrated shares.
 - The public port is closed by default and opened on demand by the control plane for an active share access; the open/close switch is the UPnP mapping.
+- Sequencing: build the agent HTTPS server + direct wiring first (the custom Secure Relay remains the fallback), then migrate the relay to FRP L4 passthrough and delete Noise/WebRTC. There is no legacy-compatibility constraint (pre-release, no external users), so this is a clean v2 rewrite.
+- The direct transport (UPnP + on-demand + endpoint reporting) is packaged as a reusable internal library behind a narrow transport interface (sibling to the FRP tunnel); DDNS and the HTTP/reverse-proxy layer are separate concerns.
 
 ## 15. Open Questions
 
 1. Select the concrete UPnP/NAT-PMP library and its self-probe method.
 2. Decide the DDNS provider and TTL policy.
-3. Decide whether direct mode is enabled by default for new shares, or opt-in (the current relay-default doc makes relay the default; this spec's fallback ladder implies direct-first, which needs a product decision).
-4. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
-5. Package the NAT-traversal + on-demand-listener + endpoint-reporting logic as a reusable internal transport library (a "WebTCP"-style package) behind a narrow interface — the direct-mode implementation of a transport interface whose relay-mode sibling is the FRP tunnel. Scope: UPnP/NAT-PMP/PCP mapping, on-demand open/close, public-IP discovery, and endpoint reporting only. DDNS is a control-plane concern (the library reports the endpoint; the control plane updates records), and the HTTP/reverse-proxy layer is the agent application server (FRP §15), not part of the transport library. Making it a public open-source library is a separate, later decision.
-6. Sequencing: migrate the relay to FRP-style L4 passthrough (unblocking Noise removal) vs ship direct-TCP first. The unified agent server (§3.1) implies the two should be built together for maximum reuse.
+3. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
+4. Whether to publish the "WebTCP"-style transport library publicly (internal packaging is decided in §14).
 
 ## 16. References
 
