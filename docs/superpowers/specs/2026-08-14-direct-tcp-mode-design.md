@@ -80,7 +80,7 @@ The agent obtains a public endpoint **automatically, with zero router configurat
 3. Verify the mapping with a self-probe.
 4. Report `publicIP:port` to the control plane over the authenticated control channel.
 
-Go libraries: `github.com/huin/goupnp` (UPnP) and `github.com/jackpal/gateway` (NAT-PMP/PCP).
+Go libraries: `github.com/huin/goupnp` (UPnP IGD port mapping — primary, covers most consumer routers) with `github.com/jackpal/go-nat-pmp` (NAT-PMP — fallback for Apple/older routers). PCP (RFC 6887) can be added later if needed. `github.com/jackpal/gateway` provides gateway IP discovery only, not port mapping.
 
 Requirements for direct mode: the home router exposes a public IP (no CGNAT) and supports UPnP/NAT-PMP/PCP (default on essentially all consumer routers). If either is absent, the agent reports "no endpoint" and the control plane uses relay.
 
@@ -214,11 +214,12 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 2. Decide the DDNS provider and TTL policy.
 3. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
 4. Whether to publish the "WebTCP"-style transport library publicly (internal packaging is decided in §14).
+5. Frontend model: keep the custom ShareBridge recipient frontend (unified UX, strongest isolation, future identity/office) vs a route-minimized transparent proxy to the source's own share page (Immich Public Proxy model — much less code, non-unified UX, route-filter maintenance). The agent HTTPS server is frontend-agnostic, so this is decoupled from the transport and can be decided later.
 
 ## 16. References
 
 - FRP native-HTTPS spec: `docs/superpowers/specs/2026-07-25-native-https-tls-passthrough-design.md`
 - Relay-default UX: `docs/superpowers/specs/2026-07-18-relay-default-design.md`
 - SCTP collapse root cause: `agent/cmd/benchdirect/BENCH_RESULTS.md`
-- UPnP: `github.com/huin/goupnp`; NAT-PMP/PCP: `github.com/jackpal/gateway`
+- UPnP IGD: `github.com/huin/goupnp`; NAT-PMP: `github.com/jackpal/go-nat-pmp`; gateway discovery: `github.com/jackpal/gateway`
 - ngrok/zrok (reference for the outbound-tunnel relay pattern; not used — stock frontends terminate TLS at the edge, and they are generic proxies — FRP §3 and §23.6)
