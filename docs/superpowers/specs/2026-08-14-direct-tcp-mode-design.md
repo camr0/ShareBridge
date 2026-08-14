@@ -214,7 +214,7 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 2. Decide the DDNS provider and TTL policy.
 3. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
 4. Whether to publish the "WebTCP"-style transport library publicly (internal packaging is decided in §14).
-5. Frontend model: keep the custom ShareBridge recipient frontend (unified UX, strongest isolation, future identity/office) vs a route-minimized transparent proxy to the source's own share page (Immich Public Proxy model — much less code, non-unified UX, route-filter maintenance). The agent HTTPS server is frontend-agnostic, so this is decoupled from the transport and can be decided later.
+5. Frontend model: (a) custom ShareBridge frontend — lean (Immich Public Proxy-style: server-side fetch of the share's assets + minimal gallery, ~one API call) or rich (current full connector); vs (b) transparent route-proxy to the source's own share page (11notes/immich-share-proxy style — least code, non-unified UX, route-filter maintenance). The agent HTTPS server is frontend-agnostic, so this is decoupled from the transport and can be decided later.
 
 ## 16. References
 
