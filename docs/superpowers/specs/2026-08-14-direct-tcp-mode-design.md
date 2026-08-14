@@ -130,7 +130,7 @@ A port is not required to be static across agent restarts: the control plane sto
 - The control plane updates the A record when the agent reports a changed public IP (dynamic DNS).
 - DNS readiness is part of agent enrollment (as in FRP §8), not share creation.
 - Short TTL (e.g. 60s) bounds the propagation window after an IP change. A stale A record is harmless: the agent's origin→share binding rejects unrelated hostnames, and a wrong IP simply fails to connect (then falls back to relay for new sessions).
-- The agent namespace is a random, replaceable value (privacy: not linked to identity — FRP §7.3). Per-share origins are permanent and tombstoned (FRP §7.4). Namespace rotation is possible but infrequent: each namespace is a separate wildcard certificate order, and Let's Encrypt's default 50-certs/registered-domain/week limit makes high-frequency rotation impractical (FRP §9.5).
+- The agent namespace is a random, replaceable value (privacy: not linked to identity — FRP §7.3). **One wildcard certificate per agent namespace covers unlimited share origins** — creating a share requires no certificate; it is just a DNS entry + route already covered by the wildcard. Per-share origins are permanent and tombstoned (FRP §7.4). The Let's Encrypt default of 50 certificates/registered-domain/week bounds *agent enrollment* rate (one cert per new agent namespace), not share creation; Google Public CA (100 orders/hour) and ZeroSSL (unlimited) are the scale candidates (FRP §9.5). Namespace rotation is possible but infrequent for the same reason.
 
 ## 8. Certificate Architecture (reused from FRP §9)
 
@@ -212,7 +212,7 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 2. Decide the DDNS provider and TTL policy.
 3. Decide whether direct mode is enabled by default for new shares, or opt-in (the current relay-default doc makes relay the default; this spec's fallback ladder implies direct-first, which needs a product decision).
 4. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
-5. Package the NAT-traversal + on-demand-listener + endpoint-reporting logic as a reusable internal transport library (a "WebTCP"-style package) behind a narrow interface, rather than embedding it in the agent HTTP layer. Making it a public open-source library is a separate, later decision.
+5. Package the NAT-traversal + on-demand-listener + endpoint-reporting logic as a reusable internal transport library (a "WebTCP"-style package) behind a narrow interface — the direct-mode implementation of a transport interface whose relay-mode sibling is the FRP tunnel. Scope: UPnP/NAT-PMP/PCP mapping, on-demand open/close, public-IP discovery, and endpoint reporting only. DDNS is a control-plane concern (the library reports the endpoint; the control plane updates records), and the HTTP/reverse-proxy layer is the agent application server (FRP §15), not part of the transport library. Making it a public open-source library is a separate, later decision.
 6. Sequencing: migrate the relay to FRP-style L4 passthrough (unblocking Noise removal) vs ship direct-TCP first. The unified agent server (§3.1) implies the two should be built together for maximum reuse.
 
 ## 16. References
@@ -221,3 +221,4 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - Relay-default UX: `docs/superpowers/specs/2026-07-18-relay-default-design.md`
 - SCTP collapse root cause: `agent/cmd/benchdirect/BENCH_RESULTS.md`
 - UPnP: `github.com/huin/goupnp`; NAT-PMP/PCP: `github.com/jackpal/gateway`
+- ngrok/zrok (reference for the outbound-tunnel relay pattern; not used — stock frontends terminate TLS at the edge, and they are generic proxies — FRP §3 and §23.6)
