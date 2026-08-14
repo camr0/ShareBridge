@@ -12,16 +12,18 @@ Direct mode currently uses WebRTC DataChannels (SCTP), which collapse to ~8 MB/s
 
 This spec makes direct mode run over **ordinary browser HTTPS against the agent's own hostname**, terminating TLS at the agent, so the file data flows **peer-to-peer with no relay in the data path**. It reuses the FRP spec's certificate and DNS architecture unchanged — only the data plane (§13 of that spec) changes: instead of an SNI gateway + FRP tunnel, the agent makes itself directly reachable via **UPnP/NAT-PMP/PCP automatic port mapping** (opened on demand, closed by default — see §5.1) and the content hostname resolves straight to the agent's public IP.
 
-The relay (FRP) remains as the automatic fallback and as the "hide my IP" mode.
+The relay (today the custom Secure Relay) remains as the automatic fallback and as the "hide my IP" mode. The FRP L4-passthrough design is a candidate relay transport that would share the agent HTTPS server (§3.1).
 
 ## 2. Motivation
 
-Direct mode has two distinct value propositions that the current WebRTC implementation fails to deliver:
+Direct mode is already quota-free and relay-independent — WebRTC direct transfers bypass the relay VPS today. The problem is purely a transport issue: WebRTC DataChannels (SCTP) collapse to ~8 MB/s at high latency due to userspace congestion control (see `agent/cmd/benchdirect/BENCH_RESULTS.md`), while the relay's kernel TCP reaches 20–30 MB/s.
 
-1. **Quota-free bandwidth.** File bytes bypass the relay VPS, so there is no server bandwidth cost.
-2. **Independence from the relay.** The transfer continues even if the relay VPS is down; only negotiation/redirect needs the control plane.
+Replacing SCTP with a direct kernel-TCP (native HTTPS) connection therefore:
 
-The current direct mode is technically quota-free, but its ~8 MB/s SCTP ceiling makes it unattractive ("may be slower due to browser protocol limitations" — see `2026-07-18-relay-default-design.md`). Replacing SCTP with kernel TCP recovers throughput at least equal to the relay (20–30 MB/s) and likely higher, because the direct path skips the relay's extra network hop (lower RTT → higher TCP window-delay product).
+1. **Recovers throughput** — at least equal to the relay (20–30 MB/s) and likely higher, because the direct path skips the relay's extra network hop (lower RTT → higher TCP window-delay product).
+2. **Enables native HTTP semantics** — real `Range`/`206`, browser video seeking, standard downloads, and — because the agent becomes a first-class HTTPS server — a credible path to Collabora/ONLYOFFICE document editing (iframes, WebSockets, cookies, redirects), which SCTP/WebRTC cannot support natively.
+
+The existing quota-free and relay-independent properties are preserved, not newly introduced.
 
 ## 3. High-Level Architecture
 
@@ -47,12 +49,24 @@ The current direct mode is technically quota-free, but its ~8 MB/s SCTP ceiling 
 
 The data plane has no intermediary server. The control plane's only runtime roles are: the canonical-link redirect, DNS record updates, and certificate issuance. It never sees file bytes.
 
+## 3.1 Terminology and the Unified Agent Server
+
+- **Control plane** = the hosted ShareBridge backend (the signaling server: database, redirects, certificate coordinator, route signals).
+- **Agent** = the software on the owner's home device. It terminates TLS, serves the recipient page and content, and enforces origin→share binding. The agent independently re-validates source authorization; the control plane's signal only activates a route the agent already knows.
+
+Direct and relay share **one agent HTTPS server** (TLS termination, page, content, binding). The two modes differ only in how the browser's connection reaches that server:
+
+- **Direct**: browser → agent public IP:port (UPnP-mapped, on demand).
+- **Relay**: browser → hosted L4 gateway → outbound tunnel → the same agent server (the FRP design).
+
+This unified model is the point of the FRP spec and is what lets the custom Noise layer be deleted: both paths are browser↔agent TLS end-to-end, so TLS is the single encryption layer and the Noise/browser-framing protocol is retired (FRP §19.4).
+
 ## 4. Transport Selection — Fallback Ladder
 
 Share resolution produces, in order:
 
 1. **Direct** — when the agent reports a live, reachable public endpoint (UPnP mapping succeeded).
-2. **Relay (FRP)** — fallback when the agent has no reachable endpoint (CGNAT, UPnP disabled/unavailable, no usable port).
+2. **Relay** — fallback when the agent has no reachable endpoint (CGNAT, UPnP disabled/unavailable, no usable port). This is the existing custom Secure Relay today; the FRP L4-passthrough design is a candidate replacement that would share the agent HTTPS server (§3.1).
 3. **`relayOnly`** — the existing user flag forces relay regardless of direct availability, to hide the home IP.
 
 Selection is made by the control plane at redirect time from the agent's latest endpoint report. A share that falls back to relay does not "fail" — it simply routes through the VPS. The user never configures a router in any path.
@@ -91,6 +105,8 @@ What this buys:
 - A browser cannot set a custom `User-Agent`, so there is no literal "ShareBridge user-agent" check. The effective markers a legitimate browser presents are: the **random origin hostname** (SNI, unguessable, rejected-before-serving per §11 binding) and **presence in the short-lived open window** (timed to a real user action). Post-handshake, the native share code + binding authorize content.
 - For public shares, "approved" = "possesses the link" (per-user identity is a separate future feature, FRP §7.6). On-demand opening therefore defends against *untargeted* scanning, not against someone who already holds the link.
 
+**Strict open-signal validation:** the agent never opens a port merely because the control plane asked. The open signal only activates a route for a share the agent has independently registered and source-verified; it cannot create arbitrary listeners or reach arbitrary local services (the HTTPS server is never a generic proxy). A hijacked control plane is therefore bounded to toggling routes for shares that already exist, and the agent rate-limits open signals per unit time.
+
 Tradeoffs:
 
 - **First-load latency:** control-channel round trip + UPnP mapping (~1–3s) before the redirect. Hideable with a brief "preparing secure connection" interstitial on the control plane.
@@ -114,6 +130,7 @@ A port is not required to be static across agent restarts: the control plane sto
 - The control plane updates the A record when the agent reports a changed public IP (dynamic DNS).
 - DNS readiness is part of agent enrollment (as in FRP §8), not share creation.
 - Short TTL (e.g. 60s) bounds the propagation window after an IP change. A stale A record is harmless: the agent's origin→share binding rejects unrelated hostnames, and a wrong IP simply fails to connect (then falls back to relay for new sessions).
+- The agent namespace is a random, replaceable value (privacy: not linked to identity — FRP §7.3). Per-share origins are permanent and tombstoned (FRP §7.4). Namespace rotation is possible but infrequent: each namespace is a separate wildcard certificate order, and Let's Encrypt's default 50-certs/registered-domain/week limit makes high-frequency rotation impractical (FRP §9.5).
 
 ## 8. Certificate Architecture (reused from FRP §9)
 
@@ -179,6 +196,8 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 
 - Direct mode becomes P2P native HTTPS, terminating TLS at the agent.
 - Reuse the FRP spec's certificate and DNS architecture unchanged.
+- Direct and relay share one agent HTTPS server; the relay migrates to FRP-style L4 passthrough so TLS is the single e2e encryption layer and the Noise/browser-framing protocol is deleted.
+- The open signal only activates agent-registered, source-verified shares; the agent never opens arbitrary ports or reach arbitrary local services.
 - Reachability via UPnP/NAT-PMP/PCP automatic port mapping — no manual router configuration, ever.
 - 443 preferred; non-standard port acceptable (cosmetic `:port` in URL).
 - Direct-first with relay fallback; `relayOnly` forces relay.
@@ -193,6 +212,8 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 2. Decide the DDNS provider and TTL policy.
 3. Decide whether direct mode is enabled by default for new shares, or opt-in (the current relay-default doc makes relay the default; this spec's fallback ladder implies direct-first, which needs a product decision).
 4. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
+5. Package the NAT-traversal + on-demand-listener + endpoint-reporting logic as a reusable internal transport library (a "WebTCP"-style package) behind a narrow interface, rather than embedding it in the agent HTTP layer. Making it a public open-source library is a separate, later decision.
+6. Sequencing: migrate the relay to FRP-style L4 passthrough (unblocking Noise removal) vs ship direct-TCP first. The unified agent server (§3.1) implies the two should be built together for maximum reuse.
 
 ## 16. References
 
