@@ -10,7 +10,7 @@
 
 Direct mode currently uses WebRTC DataChannels (SCTP), which collapse to ~8 MB/s at high latency due to userspace congestion control (see `agent/cmd/benchdirect/BENCH_RESULTS.md`). The relay path uses kernel TCP and reaches 20–30 MB/s — but it burns VPS bandwidth, which is the exact cost direct mode exists to avoid.
 
-This spec makes direct mode run over **ordinary browser HTTPS against the agent's own hostname**, terminating TLS at the agent, so the file data flows **peer-to-peer with no relay in the data path**. It reuses the FRP spec's certificate and DNS architecture unchanged — only the data plane (§13 of that spec) changes: instead of an SNI gateway + FRP tunnel, the agent makes itself directly reachable via **UPnP/NAT-PMP/PCP automatic port mapping** and the content hostname resolves straight to the agent's public IP.
+This spec makes direct mode run over **ordinary browser HTTPS against the agent's own hostname**, terminating TLS at the agent, so the file data flows **peer-to-peer with no relay in the data path**. It reuses the FRP spec's certificate and DNS architecture unchanged — only the data plane (§13 of that spec) changes: instead of an SNI gateway + FRP tunnel, the agent makes itself directly reachable via **UPnP/NAT-PMP/PCP automatic port mapping** (opened on demand, closed by default — see §5.1) and the content hostname resolves straight to the agent's public IP.
 
 The relay (FRP) remains as the automatic fallback and as the "hide my IP" mode.
 
@@ -70,6 +70,33 @@ Go libraries: `github.com/huin/goupnp` (UPnP) and `github.com/jackpal/gateway` (
 
 Requirements for direct mode: the home router exposes a public IP (no CGNAT) and supports UPnP/NAT-PMP/PCP (default on essentially all consumer routers). If either is absent, the agent reports "no endpoint" and the control plane uses relay.
 
+## 5.1 On-Demand Port Opening (Closed by Default)
+
+To avoid advertising an open port at the home IP to random scanners (Shodan, masscan, opportunistic probes), the public port is **closed by default** and opened only for a legitimate, in-flight share access.
+
+The open/close switch is the **UPnP mapping, not the local listener**: the agent's TLS listener stays up internally, but the external port mapping exists only during an active access window.
+
+```text
+recipient opens canonical link (presenting the bearer token = the "request for access")
+→ control plane validates share active, sends "open" to agent (short lease)
+→ agent creates UPnP mapping, acks
+→ control plane 302-redirects the browser (only after the ack, so the port is live)
+→ agent validates SNI + origin binding, serves content
+→ agent removes the mapping when: lease expires unused, or last session ends + inactivity timeout
+```
+
+What this buys:
+
+- Random port scanners see the port closed almost always; the home IP is not a visible open-port target.
+- A browser cannot set a custom `User-Agent`, so there is no literal "ShareBridge user-agent" check. The effective markers a legitimate browser presents are: the **random origin hostname** (SNI, unguessable, rejected-before-serving per §11 binding) and **presence in the short-lived open window** (timed to a real user action). Post-handshake, the native share code + binding authorize content.
+- For public shares, "approved" = "possesses the link" (per-user identity is a separate future feature, FRP §7.6). On-demand opening therefore defends against *untargeted* scanning, not against someone who already holds the link.
+
+Tradeoffs:
+
+- **First-load latency:** control-channel round trip + UPnP mapping (~1–3s) before the redirect. Hideable with a brief "preparing secure connection" interstitial on the control plane.
+- **Concurrent recipients:** the mapping stays open while any session is active.
+- **Reconnect/resume:** a generous inactivity timeout (e.g. 5–15 min) keeps the port open between a video's range requests; a lapsed port is recovered by the browser re-opening the canonical link.
+
 ## 6. Port Strategy
 
 DNS carries no port; `https://host` defaults to 443. Strategy:
@@ -101,6 +128,7 @@ The agent is the authoritative recipient web server: TLS termination, `Host`/ori
 ```text
 Recipient → GET https://sharebridge.app/s/<token>
   → control plane resolves active share + agent endpoint
+  → control plane signals agent to open the port on demand; waits for ack
   → 302 to https://<origin>.<namespace>.sharebridgeusercontent.com[:port]/s/<token>
   → browser connects directly to the agent's public IP:port
   → agent terminates TLS, validates (Host, route kind, native code), serves content
@@ -117,6 +145,7 @@ The native share code remains the bearer capability. No redundant bootstrap toke
 - Strict agent-side origin→share binding (FRP §11) is the enforcement point.
 - Content served from a separate registered domain (`sharebridgeusercontent.com`), so a compromised agent is browser-isolated from control-plane cookies, storage, and service workers.
 - **Lockdown mode**: the agent can immediately stop listening and revoke all active origins, closing the public socket on demand.
+- **Closed-by-default port**: the public port is open only during a control-plane-triggered access window (§5.1), so the home IP is not a visible open-port target for scanners.
 
 ### 11.2 Accepted Tradeoffs (deliberate)
 
@@ -131,6 +160,8 @@ The native share code remains the bearer capability. No redundant bootstrap toke
 - **Agent offline:** control plane serves the existing "agent offline" page; no redirect to a dead endpoint.
 - **Port remapped at restart:** stored endpoint is stale; control plane uses the latest report, falling back to relay for the overlap.
 - **Cert not ready:** direct shares are not published until cert + DNS readiness pass (FRP §20.3).
+- **Open-ack timeout:** if the agent does not ack the open signal within a short timeout, the control plane falls back to relay for that session instead of redirecting to a closed port.
+- **Lapsed port:** a recipient whose port closed due to inactivity re-opens the canonical link, which re-triggers on-demand opening.
 
 ## 13. Validation Before Implementation Commitment
 
@@ -154,6 +185,7 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - IP exposure is an accepted, already-disclosed property of direct mode.
 - Content remains on `sharebridgeusercontent.com` for browser site isolation.
 - The custom Noise/browser-framing layer is retired for migrated shares.
+- The public port is closed by default and opened on demand by the control plane for an active share access; the open/close switch is the UPnP mapping.
 
 ## 15. Open Questions
 
