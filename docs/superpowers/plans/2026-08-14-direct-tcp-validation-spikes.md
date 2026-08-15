@@ -295,7 +295,7 @@ func TestGenerateWildcardCSR_SAN(t *testing.T) {
 
 func TestValidateSAN(t *testing.T) {
 	// A self-signed cert with the expected wildcard SAN, generated in-test.
-	certPEM, err := selfSignedWildcard("*.v7q4km2x9pz6dn3w.sharebridgeusercontent.com")
+	certPEM, err := testSelfSignedCert("*.v7q4km2x9pz6dn3w.sharebridgeusercontent.com")
 	if err != nil {
 		t.Fatalf("self-signed: %v", err)
 	}
@@ -307,7 +307,10 @@ func TestValidateSAN(t *testing.T) {
 	}
 }
 
-func selfSignedWildcard(cn string) ([]byte, error) {
+// testSelfSignedCert builds a throwaway self-signed certificate used ONLY to
+// exercise ValidateSAN in tests. It is never served to a browser; the real
+// certificate is issued by a public ACME CA (Let's Encrypt / Google / ZeroSSL).
+func testSelfSignedCert(cn string) ([]byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -411,6 +414,8 @@ Expected: PASS.
 
 Run: `cd signaling-server && go run ./cmd/spike-cert` with a real (or test) `sharebridgeusercontent.com` subdomain + DNS credentials.
 Expected: a valid wildcard certificate issued and `ValidateSAN` passes. Record the CA used, issuance latency, and any rate-limit/terms surprises.
+
+CA choice: start with **Let's Encrypt** (simplest, free, no account); its 50-cert/week/domain limit only bounds agent-enrollment rate. Google Public CA (100 orders/hour) and ZeroSSL (unlimited) remain the scale candidates behind the provider abstraction (spec §8, FRP §9.4) — no need to decide scale now.
 
 - [ ] **Step 7: Write the findings doc and commit**
 
