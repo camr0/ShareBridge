@@ -52,6 +52,15 @@ func LoadOrCreateAgent(app core.App, apiKeyID string) (*core.Record, bool, error
 	return nil, false, fmt.Errorf("agent create failed after retries")
 }
 
+// generateOriginLabel returns a fresh 48-bit random origin label as a
+// lowercase-hex string (12 chars). It is a package-level variable so tests can
+// stub it to force the unique-constraint collision path in AllocateOrigin.
+var generateOriginLabel = func() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // SaveCertReady marks an agent record as having a successfully installed
 // certificate and records the leaf fingerprint + expiry for later renewal.
 func SaveCertReady(app core.App, rec *core.Record, fingerprint string, notAfter time.Time) error {
@@ -68,9 +77,7 @@ func AllocateOrigin(app core.App, namespace, baseDomain string, session *core.Re
 	var origin string
 	err := app.RunInTransaction(func(txApp core.App) error {
 		for i := 0; i < 8; i++ {
-			b := make([]byte, 6)
-			_, _ = rand.Read(b)
-			candidate := hex.EncodeToString(b) + "." + namespace + "." + baseDomain
+			candidate := generateOriginLabel() + "." + namespace + "." + baseDomain
 			session.Set("origin", candidate)
 			session.Set("is_active", true)
 			if err := txApp.Save(session); err != nil {
@@ -87,11 +94,17 @@ func AllocateOrigin(app core.App, namespace, baseDomain string, session *core.Re
 	return origin, err
 }
 
-// isUniqueViolation reports whether err is a SQLite UNIQUE constraint failure
-// (modernc.org/sqlite surfaces it as "UNIQUE constraint failed: <col>").
+// isUniqueViolation reports whether err is a SQLite UNIQUE constraint failure.
+//
+// It matches both forms the error can reach this code in:
+//   - the raw modernc.org/sqlite text ("UNIQUE constraint failed: <col>"), and
+//   - the normalized validation error PocketBase's Save surfaces from that
+//     constraint failure ("<field>: Value must be unique").
 func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint failed") ||
+		strings.Contains(msg, "value must be unique")
 }
