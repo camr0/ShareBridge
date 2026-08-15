@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
@@ -14,7 +15,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "raw", "raw|prod")
+	mode := flag.String("mode", "raw", "raw|prod|https|fetch")
 	rtt := flag.Int("rtt", 0, "added RTT in ms")
 	loss := flag.Float64("loss", 0, "packet loss fraction 0..1")
 	size := flag.String("size", "512MiB", "total bytes to send (e.g. 8MiB)")
@@ -26,6 +27,8 @@ func main() {
 	jitter := flag.Int("jitter", 0, "per-packet delay jitter in ms (uniform +/-)")
 	bandwidth := flag.String("bandwidth", "0", "link bandwidth cap (e.g. 8MB), 0 = unlimited")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
+	url := flag.String("url", "", "fetch target URL (fetch mode)")
+	reps := flag.Int("reps", 12, "number of fetch reps (fetch mode)")
 	flag.Parse()
 
 	sizeBytes, sizeErr := parseByteSize(*size)
@@ -75,6 +78,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+	if cfg.mode == "fetch" {
+		if *url == "" {
+			fmt.Fprintln(os.Stderr, "invalid -url: must be non-empty for fetch mode")
+			os.Exit(2)
+		}
+		if *reps < 1 {
+			fmt.Fprintln(os.Stderr, "invalid -reps: must be >= 1")
+			os.Exit(2)
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -88,6 +101,25 @@ func main() {
 		res, err = runRaw(ctx, cfg)
 	case "prod":
 		res, err = runProd(ctx, cfg)
+	case "https":
+		if err := runHTTPServer(ctx, cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "bench failed:", err)
+			os.Exit(1)
+		}
+		return
+	case "fetch":
+		results, ferr := fetch(ctx, *url, cfg.size, cfg.rttMs, *reps)
+		if ferr != nil {
+			fmt.Fprintln(os.Stderr, "bench failed:", ferr)
+			os.Exit(1)
+		}
+		med, mn, mx, p95 := summarize(results)
+		fmt.Fprintf(os.Stderr, "fetch median=%.2f min=%.2f max=%.2f p95=%.2f Mbps\n", med, mn, mx, p95)
+		if err := writeFetchResult(*out, results); err != nil {
+			fmt.Fprintln(os.Stderr, "write output:", err)
+			os.Exit(1)
+		}
+		return
 	default:
 		fmt.Fprintln(os.Stderr, "invalid -mode:", cfg.mode)
 		os.Exit(2)
@@ -112,8 +144,8 @@ func main() {
 }
 
 func validateRunConfig(cfg runConfig) error {
-	if cfg.mode != "raw" && cfg.mode != "prod" {
-		return fmt.Errorf("invalid -mode %q: must be raw or prod", cfg.mode)
+	if cfg.mode != "raw" && cfg.mode != "prod" && cfg.mode != "https" && cfg.mode != "fetch" {
+		return fmt.Errorf("invalid -mode %q: must be raw, prod, https, or fetch", cfg.mode)
 	}
 	if cfg.rttMs < 0 {
 		return fmt.Errorf("invalid -rtt %d: must be >= 0", cfg.rttMs)
@@ -172,6 +204,27 @@ func writeResult(out string, res rawResult) (err error) {
 		}
 	}()
 	if err := writeJSON(f, res); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+	return nil
+}
+
+// writeFetchResult writes the []fetchResult array as JSON, mirroring the
+// rawResult path while leaving the raw/prod JSON shape untouched.
+func writeFetchResult(out string, res []fetchResult) (err error) {
+	if out == "-" {
+		return json.NewEncoder(os.Stdout).Encode(res)
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		return fmt.Errorf("open output: %w", err)
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("close output: %w", cerr)
+		}
+	}()
+	if err := json.NewEncoder(f).Encode(res); err != nil {
 		return fmt.Errorf("write output: %w", err)
 	}
 	return nil
