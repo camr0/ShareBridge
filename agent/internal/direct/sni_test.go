@@ -11,6 +11,7 @@ import (
 )
 
 const testNamespace = "v7q4km2x9pz6dn3w"
+const testBaseDomain = "sharebridgeusercontent.com"
 const directOrigin = "r7k2m9p4x6.v7q4km2x9pz6dn3w.sharebridgeusercontent.com"
 const relayOrigin = "r7k2m9p4x6.relay.v7q4km2x9pz6dn3w.sharebridgeusercontent.com"
 
@@ -46,7 +47,7 @@ func get(t *testing.T, c *http.Client, srvURL, host, path string) (*http.Respons
 }
 
 func TestBinder_EndToEndAuthorization(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 	if err := b.Allow(directOrigin, RouteDirect, "code-1"); err != nil {
 		t.Fatalf("Allow: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestBinder_EndToEndAuthorization(t *testing.T) {
 }
 
 func TestBinder_EmptySNIRejected(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 	_ = b.Allow(directOrigin, RouteDirect, "code-1")
 	srv := startBindServer(t, b)
 
@@ -109,7 +110,7 @@ func TestBinder_EmptySNIRejected(t *testing.T) {
 }
 
 func TestBinder_Normalization(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 	// Register with uppercase + trailing dot; requests arrive lowercase/no-dot.
 	if err := b.Allow("R7K2M9P4X6.V7Q4KM2X9PZ6DN3W.sharebridgeusercontent.com.", RouteDirect, "code-1"); err != nil {
 		t.Fatalf("Allow: %v", err)
@@ -129,7 +130,7 @@ func TestBinder_Normalization(t *testing.T) {
 }
 
 func TestBinder_Revocation(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 	_ = b.Allow(directOrigin, RouteDirect, "code-1")
 	if bd, err := b.AdmitSNI(directOrigin); err != nil || bd.Origin != directOrigin {
 		t.Fatalf("AdmitSNI before revoke: %v", err)
@@ -141,7 +142,7 @@ func TestBinder_Revocation(t *testing.T) {
 }
 
 func TestBinder_DuplicateAndMalformedHost(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 	_ = b.Allow(directOrigin, RouteDirect, "code-1")
 	bd, _ := b.AdmitSNI(directOrigin)
 
@@ -162,7 +163,7 @@ func TestBinder_DuplicateAndMalformedHost(t *testing.T) {
 }
 
 func TestBinder_AbsoluteFormRequestTarget(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 	_ = b.Allow(directOrigin, RouteDirect, "code-1")
 	bd, _ := b.AdmitSNI(directOrigin)
 
@@ -178,7 +179,7 @@ func TestBinder_AbsoluteFormRequestTarget(t *testing.T) {
 }
 
 func TestBinder_WrongRouteKindAndWrongCode(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 
 	// Wrong route kind at registration time is rejected.
 	if err := b.Allow(directOrigin, RouteRelay, "code-1"); !errors.Is(err, ErrWrongRouteKind) {
@@ -205,8 +206,26 @@ func TestBinder_WrongRouteKindAndWrongCode(t *testing.T) {
 	}
 }
 
+func TestNewBinderUsesBaseDomain(t *testing.T) {
+	b := NewBinder("sbdeadbeef", "example.com")
+	if err := b.Allow("demo.sbdeadbeef.example.com", RouteDirect, "abc"); err != nil {
+		t.Fatalf("Allow with base domain: %v", err)
+	}
+	// The relay suffix must also derive from the configured domain.
+	if err := b.Allow("demo.relay.sbdeadbeef.example.com", RouteRelay, "abc"); err != nil {
+		t.Fatalf("Allow relay with base domain: %v", err)
+	}
+}
+
+func TestBinderRejectsForeignDomain(t *testing.T) {
+	b := NewBinder("sbdeadbeef", "example.com")
+	if err := b.Allow("demo.sbdeadbeef.other.com", RouteDirect, "abc"); err == nil {
+		t.Fatalf("expected rejection for a foreign domain")
+	}
+}
+
 func TestBinder_BothNamespaces(t *testing.T) {
-	b := NewBinder(testNamespace)
+	b := NewBinder(testNamespace, testBaseDomain)
 	if err := b.Allow(directOrigin, RouteDirect, "code-d"); err != nil {
 		t.Fatalf("Allow direct: %v", err)
 	}

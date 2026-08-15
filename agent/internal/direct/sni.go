@@ -52,11 +52,11 @@ type Binder struct {
 	active       map[string]Binding
 }
 
-func NewBinder(namespace string) *Binder {
+func NewBinder(namespace, baseDomain string) *Binder {
 	return &Binder{
 		namespace:    namespace,
-		directSuffix: "." + namespace + ".sharebridgeusercontent.com",
-		relaySuffix:  ".relay." + namespace + ".sharebridgeusercontent.com",
+		directSuffix: "." + namespace + "." + baseDomain,
+		relaySuffix:  ".relay." + namespace + "." + baseDomain,
 		active:       map[string]Binding{},
 	}
 }

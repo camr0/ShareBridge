@@ -24,7 +24,8 @@ import (
 func main() {
 	var (
 		ns        = flag.String("ns", "", "agent namespace (e.g. sbe2eXXXX)")
-		origin    = flag.String("origin", "", "origin hostname, e.g. demo.<ns>.sharebridgeusercontent.com")
+		domain    = flag.String("domain", "sharebridgeusercontent.com", "base content domain")
+		origin    = flag.String("origin", "", "origin hostname, e.g. demo.<ns>.<domain>")
 		code      = flag.String("code", "", "share code to authorize (e.g. abc123)")
 		keyFile   = flag.String("key", "key.pem", "TLS private key PEM path")
 		chainFile = flag.String("chain", "chain.pem", "TLS chain PEM path")
@@ -46,7 +47,7 @@ func main() {
 	}
 
 	// 2. SNI/origin→share binding.
-	binder := direct.NewBinder(*ns)
+	binder := direct.NewBinder(*ns, *domain)
 	if err := binder.Allow(*origin, direct.RouteDirect, *code); err != nil {
 		log.Fatalf("binder.Allow: %v", err)
 	}
