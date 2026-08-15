@@ -327,7 +327,7 @@ func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
 		_, ext, proto, internal, client, _, desc, _, err := m.client.GetGenericPortMappingEntry(uint16(i))
 		if err != nil {
 			if isEndOfList(err) {
-				break // index past the last entry
+				return out, nil // end-of-list reached cleanly
 			}
 			// A real enumeration error must NOT be treated as an empty list —
 			// otherwise an occupied 443 could look free (fail closed).
@@ -341,18 +341,18 @@ func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
 			Description:    desc,
 		})
 	}
-	return out, nil
+	// Reached the 256-entry cap without an end-of-list fault — the list is
+	// incomplete, so fail closed rather than returning a partial view.
+	return nil, fmt.Errorf("port mapping enumeration exceeded 256 entries without end-of-list")
 }
 
-// isEndOfList recognizes the IGD fault for "no entry at this index"
-// (SpecifiedArrayIndexInvalid / Invalid Args). Any other error is a real
-// enumeration failure and must not be mistaken for end-of-list.
+// isEndOfList recognizes ONLY the specific IGD fault for "no entry at this
+// index" (SpecifiedArrayIndexInvalid, error code 713). Any other error —
+// including a generic SOAP invalid-argument fault — is a real enumeration
+// failure and must not be mistaken for end-of-list.
 func isEndOfList(err error) bool {
 	s := err.Error()
-	return strings.Contains(s, "713") ||
-		strings.Contains(s, "SpecifiedArrayIndexInvalid") ||
-		strings.Contains(s, "Invalid Args") ||
-		strings.Contains(s, "InvalidArgs")
+	return strings.Contains(s, "713") || strings.Contains(s, "SpecifiedArrayIndexInvalid")
 }
 
 // NATPMPMapper maps ports using NAT-PMP (Apple/older routers).
@@ -687,7 +687,7 @@ Write `docs/superpowers/spikes/2026-08-14-upnp-reachability.md` with:
 1. **Result:** which mapper succeeded (UPnP WANIP / WANPPP / NAT-PMP), the observed external IP, the requested external port, and the **granted** external port (they may differ for NAT-PMP).
 2. **Port strategy:** whether 443 was free or fell back to a high port, and confirmation that no pre-existing foreign mapping was clobbered (spec §6).
 3. **Off-LAN probe result:** reachable or not, from what vantage (cellular, not hairpin). Explicitly separate "library discovery succeeded" from "external probe reached the mapping" — a discovery success with a failed probe is recorded as a failure.
-4. **Self-probe trust boundary (spec §5):** in production the external probe is performed by the **control plane, not the agent** (hairpin NAT makes a LAN self-probe unreliable). The control plane probes only the `publicIP:port` the agent just reported — restricted to public IPs that match the agent's own `GetExternalIPAddress` result — with a control-plane-generated nonce that the agent's HTTPS server echoes only for the share being opened, and probes are rate-limited per agent. This spike is single-process, so a real control-plane probe is out of scope; the phone-on-cellular check is the manual stand-in for that probe.
+4. **Self-probe trust boundary (spec §5):** in production the external probe is performed by the **control plane, not the agent** (hairpin NAT makes a LAN self-probe unreliable). The control plane probes only the `publicIP:port` the agent just reported — restricted to public IPs that match the agent's own `GetExternalIPAddress` result **and an independently observed source address (STUN); a mismatch forces relay-only** — with a control-plane-generated nonce that the agent's HTTPS server echoes only for the share being opened, and probes are rate-limited per agent. This spike is single-process, so a real control-plane probe is out of scope; the phone-on-cellular check is the manual stand-in for that probe.
 5. **Representative-router matrix:** define and fill in this minimum matrix, recording a pass/fail (and the failure mode) per cell rather than treating library discovery as reachability:
 
 | Dimension | Values to cover |
@@ -1277,10 +1277,12 @@ func exactDNSNames(csr *x509.CertificateRequest, want []string) bool {
 	for _, w := range want {
 		wantSet[w] = true
 	}
+	seen := make(map[string]bool, len(csr.DNSNames))
 	for _, n := range csr.DNSNames {
-		if !wantSet[n] {
-			return false
+		if !wantSet[n] || seen[n] {
+			return false // unauthorized, missing, or duplicate SAN
 		}
+		seen[n] = true
 	}
 	return true
 }
@@ -1440,6 +1442,7 @@ func waitGone(name string, timeout time.Duration) error {
 		time.Sleep(5 * time.Second)
 	}
 	return fmt.Errorf("record %s still resolves after %s", name, timeout)
+}
 
 // resolveAuthoritative discovers the zone's NS records via a recursive
 // resolver, then queries each authoritative server directly for the A record.
@@ -1677,7 +1680,9 @@ Shaping is applied between the server and client. Loopback shaping is unreliable
 Linux (`tc netem`, on the machine hosting the server or a router hop):
 
 ```bash
-# eth0 = the interface carrying the benchmark traffic. delay is ONE-WAY (RTT=2×delay).
+# delay is ONE-WAY (egress). For RTT≈100ms apply 50ms in EACH direction — either
+# shape both hosts' egress, or add ingress+egress on one host. Verify with `ping`
+# and RECORD the measured RTT (the gate uses the measured value, not a nominal 100ms).
 sudo tc qdisc add dev eth0 root netem delay 50ms loss 0.01% rate 200mbit
 # ... run the benchmark ...
 sudo tc qdisc del dev eth0 root
@@ -1711,7 +1716,7 @@ import (
 func TestHTTPSRangeAndFullFetch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	url, err := serveFile(ctx, 1<<20) // 1 MiB
+	url, err := serveFile(ctx, 1<<20, "127.0.0.1") // 1 MiB
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1838,12 +1843,12 @@ func (r *sizeReader) Seek(offset int64, whence int) (int64, error) {
 // size-byte file served via http.ServeContent (real Range/206) over TLS on a
 // plain TCP listener — exactly the agent's data-plane semantics (kernel TCP +
 // TLS + Range). Returns the base URL.
-func serveFile(ctx context.Context, size int64) (string, error) {
+func serveFile(ctx context.Context, size int64, host string) (string, error) {
 	cert, err := selfSignedCert()
 	if err != nil {
 		return "", err
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if err != nil {
 		return "", err
 	}
@@ -1982,7 +1987,7 @@ Only `main.go` changes (leave `server.go`, `rawbench.go`, `shim.go` untouched):
 2. Add flags: `--url` (string, fetch target), `--reps` (int, default **12**).
 3. `validateRunConfig` (and the dispatch switch) accept the new modes: `https` requires `--size > 0`; `fetch` requires `--url != ""` and `--reps >= 1`. The existing `raw|prod` validation is unchanged.
 4. The dispatch switch gains:
-   - `case "https":` call `runHTTPServer(ctx, cfg)` → runs `serveFile(ctx, cfg.size)`, prints the listen URL to stderr, and blocks until signal.
+   - `case "https":` call `runHTTPServer(ctx, cfg)` → runs `serveFile(ctx, cfg.size, "0.0.0.0")` (bind all interfaces so a remote client can reach it; print the port and tell the operator to substitute the server's reachable host), and blocks until signal.
    - `case "fetch":` call `fetch(ctx, cfg.url, cfg.size, cfg.rttMs, cfg.reps)`, then print `summarize(...)` (median/min/max/p95) to stderr and write the `[]fetchResult` array as JSON to `--out` (a new writer beside the existing `rawResult` path; the `raw`/`prod` JSON shape is unchanged).
 
 - [ ] **Step 7: Run direct-TCP vs relay at RTT ≥ 50 ms (same payload, same shaping)**
@@ -2635,6 +2640,7 @@ func (p *OnDemandPort) loop() {
 		}
 		closing = false
 		closeFail = 0
+		grantedPort = 0
 		p.setCloseErr(nil)
 		return true
 	}
