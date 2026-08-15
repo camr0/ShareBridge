@@ -536,3 +536,140 @@ func TestOwnershipTokenInDescription(t *testing.T) {
 		t.Fatalf("DeleteOwnedMapping (internal client mismatch) = %v, want ErrForeignMapping", err)
 	}
 }
+
+// --- transition callback helpers ---
+
+type stateTransition struct {
+	from, to    PortState
+	grantedPort int
+}
+
+// transitionRecorder is a SetTransitionCallback consumer that captures every
+// state transition (fired synchronously on the state loop) for assertion.
+type transitionRecorder struct {
+	mu   sync.Mutex
+	seen []stateTransition
+}
+
+func (r *transitionRecorder) cb(old, new PortState, grantedPort int) {
+	r.mu.Lock()
+	r.seen = append(r.seen, stateTransition{old, new, grantedPort})
+	r.mu.Unlock()
+}
+
+func (r *transitionRecorder) snapshot() []stateTransition {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]stateTransition, len(r.seen))
+	copy(out, r.seen)
+	return out
+}
+
+func assertTransitions(t *testing.T, got, want []stateTransition) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("transitions = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("transition %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// An immediate, successful Close must observe the same StateOpen →
+// StateClosing → StateClosed sequence as the timer-driven close path, with the
+// granted external port on the open/closing transitions and 0 once closed.
+func TestOnDemandPort_StateTransitionsOnImmediateClose(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	rm := &recordingMapper{remap: 52000}
+	p := newTestPort(fc, rm, time.Minute)
+	defer p.Close()
+
+	rec := &transitionRecorder{}
+	p.SetTransitionCallback(rec.cb)
+
+	if err := p.OpenFor("share-1", time.Minute); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	if p.State() != StateOpen {
+		t.Fatalf("State = %v, want StateOpen", p.State())
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if p.State() != StateClosed {
+		t.Fatalf("State = %v, want StateClosed", p.State())
+	}
+
+	assertTransitions(t, rec.snapshot(), []stateTransition{
+		{StateClosed, StateOpen, 52000},
+		{StateOpen, StateClosing, 52000},
+		{StateClosing, StateClosed, 0},
+	})
+}
+
+// A close whose deletion repeatedly fails must report StateClosing while
+// retrying, then StateCloseFailed once retries are exhausted — both with the
+// granted external port still in effect.
+func TestOnDemandPort_StateCloseFailedTransition(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	rm := &recordingMapper{alwaysFailDel: true, remap: 52000}
+	p := newTestPort(fc, rm, time.Minute)
+	defer p.Close()
+
+	rec := &transitionRecorder{}
+	p.SetTransitionCallback(rec.cb)
+
+	if err := p.OpenFor("share-1", time.Minute); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	if err := p.Close(); !errors.Is(err, ErrDeleteRetry) {
+		t.Fatalf("Close: want ErrDeleteRetry, got %v", err)
+	}
+	if p.State() != StateClosing {
+		t.Fatalf("State = %v, want StateClosing while retrying", p.State())
+	}
+	// Drive the delete-retry timer to escalation (close-failed).
+	for i := 0; i < maxCloseAttempts; i++ {
+		fc.advance(closeRetryDelay + time.Millisecond)
+		waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= i+2 || d >= maxCloseAttempts })
+	}
+	waitFor(t, func() bool { return p.State() == StateCloseFailed })
+
+	assertTransitions(t, rec.snapshot(), []stateTransition{
+		{StateClosed, StateOpen, 52000},
+		{StateOpen, StateClosing, 52000},
+		{StateClosing, StateCloseFailed, 52000},
+	})
+}
+
+// Regression: a second OpenFor (a fresh admitted signal) while a session is
+// active must not reset the idle deadline to zero — that previously armed an
+// immediate close which dropped the active session mid-transfer.
+func TestOnDemandPort_SecondOpenForKeepsActiveSession(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	rm := &recordingMapper{}
+	p := newTestPort(fc, rm, 30*time.Second) // idle timeout 30s
+	defer p.Close()
+
+	if err := p.OpenFor("share-1", time.Minute); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	if _, err := p.BeginSession("share-1"); err != nil {
+		t.Fatalf("BeginSession: %v", err)
+	}
+	// A second signal arrives while the first recipient is mid-transfer.
+	if err := p.OpenFor("share-2", time.Minute); err != nil {
+		t.Fatalf("second OpenFor: %v", err)
+	}
+	// Well under the idle timeout the port must stay open (the old bug armed
+	// a zero-duration timer that closed it immediately).
+	fc.advance(closeRetryDelay + time.Millisecond)
+	if !p.Open() {
+		t.Fatalf("port must stay open after second OpenFor with an active session")
+	}
+	// The session's idle deadline still governs: idle past the timeout closes.
+	fc.advance(30*time.Second + time.Second)
+	waitFor(t, func() bool { return !p.Open() })
+}

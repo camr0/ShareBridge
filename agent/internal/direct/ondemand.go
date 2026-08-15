@@ -312,7 +312,7 @@ func (p *OnDemandPort) loop() {
 			arm(closeRetryDelay)
 		case open && len(sessions) > 0:
 			next := renewAt
-			if idleAt.Before(next) {
+			if !idleAt.IsZero() && idleAt.Before(next) {
 				next = idleAt
 			}
 			arm(until(now, next))
@@ -413,11 +413,15 @@ func (p *OnDemandPort) loop() {
 				}
 
 				// Fast path: already open. A fresh signal means a fresh
-				// recipient, so clear the inactivity-close deadline; renew the
-				// router lease only when the requested lease extends beyond the
-				// current lease expiry.
+				// recipient, so clear the inactivity-close deadline — but only
+				// while no session is active. With active sessions idleAt is
+				// owned by session activity; zeroing it would discard the
+				// active sessions' idle deadline (a zero idleAt would make
+				// rearm arm an immediate close).
 				wasOpen := true
-				idleAt = time.Time{}
+				if len(sessions) == 0 {
+					idleAt = time.Time{}
+				}
 				if now.Add(l).After(deadline) {
 					granted, err := p.mapper.AddPortMapping(grantedPort, p.intPort, p.desc(), int(l.Seconds()))
 					if err != nil {
@@ -427,6 +431,7 @@ func (p *OnDemandPort) loop() {
 						continue
 					}
 					grantedPort = granted
+					renewFailed = false
 					deadline = now.Add(l)
 					renewAt = deadline.Add(-p.renewWindow)
 				}
@@ -472,6 +477,7 @@ func (p *OnDemandPort) loop() {
 					closeFail = 0
 					sessions = map[string]time.Time{}
 					idleAt = time.Time{}
+					p.setState(StateClosing, grantedPort)
 					if tryDelete() {
 						c.reply <- portReply{}
 					} else {
@@ -516,7 +522,7 @@ func (p *OnDemandPort) loop() {
 			case open && len(sessions) > 0:
 				now := p.clock.Now()
 				switch {
-				case !now.Before(idleAt):
+				case !idleAt.IsZero() && !now.Before(idleAt):
 					startClose()
 				case renewFailed:
 					// a prior renewal failed; wait for lease expiry, then close
@@ -537,6 +543,7 @@ func (p *OnDemandPort) loop() {
 						rearm()
 					} else {
 						grantedPort = granted
+						renewFailed = false
 						deadline = now.Add(lease)
 						renewAt = deadline.Add(-p.renewWindow)
 						rearm()
