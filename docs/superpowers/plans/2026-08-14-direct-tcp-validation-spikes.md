@@ -4,7 +4,7 @@
 
 **Goal:** Prove the four feasibility gates for the direct-TCP data plane before committing to the full build.
 
-**Architecture:** Four independent spikes, each a small Go program plus a minimal testable unit, each ending in a written finding committed to `docs/superpowers/spikes/`. No production transport path is modified; the legacy WebRTC/relay data plane stays untouched.
+**Architecture:** Four spikes, each a small Go program plus a minimal testable unit, each ending in a written finding committed to `docs/superpowers/spikes/`. Tasks 1–3 are independent; Task 4 depends on Task 1's `PortMapper`. No production transport path is modified; the legacy WebRTC/relay data plane stays untouched.
 
 **Tech Stack:** Go (agent and signaling-server are both Go), `github.com/huin/goupnp` (UPnP IGD), `github.com/jackpal/go-nat-pmp` (NAT-PMP), ACME DNS-01, the existing `agent/cmd/benchdirect` harness.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Zero manual router configuration — reachability is UPnP/NAT-PMP/PCP only (spec §5).
+- Zero manual router configuration — reachability is UPnP/NAT-PMP only (PCP is future work; spec §5).
 - The public port is closed by default and opened on demand; the switch is the UPnP mapping (spec §5.1).
 - 443 is preferred but a non-standard port is acceptable (spec §6); never require the user to forward a port.
 - The agent's TLS private key never leaves the agent; the control plane completes DNS-01 and returns only the public chain (spec §8).
@@ -690,4 +690,4 @@ After all four tasks, the spikes together answer whether direct-TCP is viable:
 - Task 3 → direct-TCP matches or exceeds relay throughput (no SCTP collapse).
 - Task 4 → closed-by-default + on-demand + SNI binding behave as designed.
 
-Any blocker here (per spec §13: "Failure of a certificate or raw-TLS spike is a design blocker") returns to the spec before Phase 2. Otherwise Phase 2 (agent HTTPS server + direct wiring + Immich migration) gets its own plan.
+Any blocker here returns to the spec before Phase 2. Specifically: a failed certificate/DNS spike blocks the direct path entirely (no cert = no direct HTTPS); a failed throughput spike means direct does not become the default (relay remains); a failed UPnP spike does not block the direction but determines how often direct is available; a failed binding spike must be fixed before any production direct serving. Otherwise Phase 2 (agent HTTPS server + direct wiring + Immich migration) gets its own plan.
