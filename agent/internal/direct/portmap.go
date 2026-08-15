@@ -1,0 +1,289 @@
+package direct
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+
+	"github.com/huin/goupnp/dcps/internetgateway1"
+	"github.com/jackpal/gateway"
+	"github.com/jackpal/go-nat-pmp"
+)
+
+// DescriptionPrefix marks mappings this agent created, so it never deletes or
+// overwrites a mapping owned by another service (spec §6).
+const DescriptionPrefix = "sharebridge"
+
+var (
+	// ErrListingUnsupported is returned by ListPortMappings for devices
+	// (NAT-PMP) that cannot enumerate their mappings.
+	ErrListingUnsupported = errors.New("port mapping listing not supported")
+	// ErrForeignMapping is returned when refusing to delete a mapping this
+	// agent did not create.
+	ErrForeignMapping = errors.New("refusing to delete a port mapping this agent did not create")
+)
+
+// PortMapping is one existing mapping on the router.
+type PortMapping struct {
+	ExternalPort   int
+	InternalPort   int
+	InternalClient string
+	Protocol       string
+	Description    string
+}
+
+// PortMapper maps an external port on the router to the agent's internal
+// address. AddPortMapping returns the external port actually granted, which
+// may differ from the requested one (NAT-PMP may remap).
+type PortMapper interface {
+	AddPortMapping(externalPort, internalPort int, description string, leaseSeconds int) (int, error)
+	DeletePortMapping(externalPort int) error
+	ExternalIP() (string, error)
+	ListPortMappings() ([]PortMapping, error)
+}
+
+// upnpConnection abstracts WANIPConnection1 and WANPPPConnection1, which have
+// identical method sets but distinct generated types.
+type upnpConnection interface {
+	AddPortMapping(NewRemoteHost string, NewExternalPort uint16, NewProtocol string, NewInternalPort uint16, NewInternalClient string, NewEnabled bool, NewPortMappingDescription string, NewLeaseDuration uint32) error
+	DeletePortMapping(NewRemoteHost string, NewExternalPort uint16, NewProtocol string) error
+	GetExternalIPAddress() (string, error)
+	GetGenericPortMappingEntry(NewPortMappingIndex uint16) (NewRemoteHost string, NewExternalPort uint16, NewProtocol string, NewInternalPort uint16, NewInternalClient string, NewEnabled bool, NewPortMappingDescription string, NewLeaseDuration uint32, err error)
+}
+
+// UPnPMapper maps ports using UPnP IGD (WANIPConnection1 or WANPPPConnection1).
+type UPnPMapper struct {
+	client     upnpConnection
+	internalIP string
+}
+
+func NewUPnPMapper(ctx context.Context) (*UPnPMapper, error) {
+	client, err := discoverUPnPClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	internal, err := lanAddressTowardsGateway()
+	if err != nil {
+		return nil, fmt.Errorf("resolve LAN address toward gateway: %w", err)
+	}
+	return &UPnPMapper{client: client, internalIP: internal}, nil
+}
+
+// discoverUPnPClient tries WANIP then WANPPP (some routers expose only one).
+func discoverUPnPClient(ctx context.Context) (upnpConnection, error) {
+	if clients, _, err := internetgateway1.NewWANIPConnection1ClientsCtx(ctx); err == nil && len(clients) > 0 {
+		return clients[0], nil
+	}
+	if clients, _, err := internetgateway1.NewWANPPPConnection1ClientsCtx(ctx); err == nil && len(clients) > 0 {
+		return clients[0], nil
+	}
+	return nil, fmt.Errorf("no UPnP IGD gateway (WANIPConnection or WANPPPConnection) found")
+}
+
+func (m *UPnPMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
+	// The internal client is this host's real LAN address (not 0.0.0.0),
+	// resolved toward the gateway so the router forwards to the right host.
+	if err := m.client.AddPortMapping("", uint16(ext), "TCP", uint16(internal), m.internalIP, true, desc, uint32(lease)); err != nil {
+		return 0, err
+	}
+	return ext, nil
+}
+
+func (m *UPnPMapper) DeletePortMapping(ext int) error {
+	return m.client.DeletePortMapping("", uint16(ext), "TCP")
+}
+
+func (m *UPnPMapper) ExternalIP() (string, error) {
+	return m.client.GetExternalIPAddress()
+}
+
+func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
+	var out []PortMapping
+	for i := 0; i < 256; i++ {
+		_, ext, proto, internal, client, _, desc, _, err := m.client.GetGenericPortMappingEntry(uint16(i))
+		if err != nil {
+			if isEndOfList(err) {
+				return out, nil // end-of-list reached cleanly
+			}
+			// A real enumeration error must NOT be treated as an empty list —
+			// otherwise an occupied 443 could look free (fail closed).
+			return nil, fmt.Errorf("enumerate port mapping %d: %w", i, err)
+		}
+		out = append(out, PortMapping{
+			ExternalPort:   int(ext),
+			InternalPort:   int(internal),
+			InternalClient: client,
+			Protocol:       proto,
+			Description:    desc,
+		})
+	}
+	// Reached the 256-entry cap without an end-of-list fault — the list is
+	// incomplete, so fail closed rather than returning a partial view.
+	return nil, fmt.Errorf("port mapping enumeration exceeded 256 entries without end-of-list")
+}
+
+// isEndOfList recognizes ONLY the specific IGD fault for "no entry at this
+// index" (SpecifiedArrayIndexInvalid, error code 713). Any other error —
+// including a generic SOAP invalid-argument fault — is a real enumeration
+// failure and must not be mistaken for end-of-list.
+func isEndOfList(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "713") || strings.Contains(s, "SpecifiedArrayIndexInvalid")
+}
+
+// NATPMPMapper maps ports using NAT-PMP (Apple/older routers).
+type NATPMPMapper struct {
+	client *natpmp.Client
+
+	mu       sync.Mutex
+	internal int // internal port of the active mapping (0 = none)
+	external int // granted external port of the active mapping
+}
+
+func NewNATPMPMapper(gatewayIP net.IP) *NATPMPMapper {
+	return &NATPMPMapper{client: natpmp.NewClient(gatewayIP)}
+}
+
+func (m *NATPMPMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
+	// The returned MappedExternalPort is the router's chosen port; it may
+	// differ from the requested ext, so it must be retained and returned.
+	result, err := m.client.AddPortMapping("tcp", internal, ext, lease)
+	if err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	m.internal, m.external = internal, int(result.MappedExternalPort)
+	m.mu.Unlock()
+	return int(result.MappedExternalPort), nil
+}
+
+func (m *NATPMPMapper) DeletePortMapping(ext int) error {
+	// NAT-PMP has no separate delete; re-issuing the mapping with a zero lease
+	// removes it. `ext` is used only if no mapping was recorded by a prior
+	// AddPortMapping.
+	m.mu.Lock()
+	internal, external := m.internal, m.external
+	m.mu.Unlock()
+	if external == 0 {
+		external = ext
+	}
+	_, err := m.client.AddPortMapping("tcp", internal, external, 0)
+	return err
+}
+
+func (m *NATPMPMapper) ExternalIP() (string, error) {
+	resp, err := m.client.GetExternalAddress()
+	if err != nil {
+		return "", err
+	}
+	ip := resp.ExternalIPAddress
+	return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]), nil
+}
+
+func (m *NATPMPMapper) ListPortMappings() ([]PortMapping, error) {
+	return nil, ErrListingUnsupported
+}
+
+// MapperForRouter returns the first available mapper, trying UPnP then NAT-PMP.
+// The NAT-PMP gateway address is discovered via github.com/jackpal/gateway,
+// never hardcoded.
+func MapperForRouter(ctx context.Context) (PortMapper, error) {
+	if m, err := NewUPnPMapper(ctx); err == nil {
+		return m, nil
+	}
+	gw, err := gateway.DiscoverGateway()
+	if err != nil {
+		return nil, fmt.Errorf("no UPnP IGD or NAT-PMP gateway found: %w", err)
+	}
+	return NewNATPMPMapper(gw), nil
+}
+
+// ChooseExternalPort picks the external port for a new mapping honoring spec
+// §6: prefer `preferred` (443), but never clobber an existing mapping — fall
+// back to the first free dynamic-range port when `preferred` is occupied.
+// When listing is unsupported (NAT-PMP), 443 is treated as unsafe (assumed
+// occupied) and any other preferred port is used as-is.
+func ChooseExternalPort(mapper PortMapper, preferred int) (int, error) {
+	mappings, err := mapper.ListPortMappings()
+	switch {
+	case errors.Is(err, ErrListingUnsupported):
+		if preferred == 443 {
+			return firstFreePort(nil), nil
+		}
+		return preferred, nil
+	case err != nil:
+		return 0, fmt.Errorf("list port mappings: %w", err)
+	}
+	if occupied(mappings, preferred) {
+		p := firstFreePort(mappings)
+		if p == 0 {
+			return 0, fmt.Errorf("no free port in dynamic range 49152-65535")
+		}
+		return p, nil
+	}
+	return preferred, nil
+}
+
+// DeleteOwnedMapping removes a mapping only if this agent created it. Mappers
+// without listing support (NAT-PMP) are deleted best-effort: their mappings
+// expire on their own and we tracked the granted port ourselves.
+func DeleteOwnedMapping(mapper PortMapper, externalPort int) error {
+	mappings, err := mapper.ListPortMappings()
+	switch {
+	case errors.Is(err, ErrListingUnsupported):
+		return mapper.DeletePortMapping(externalPort)
+	case err != nil:
+		return fmt.Errorf("list port mappings: %w", err)
+	}
+	for _, m := range mappings {
+		if m.ExternalPort == externalPort && !strings.HasPrefix(m.Description, DescriptionPrefix) {
+			return ErrForeignMapping
+		}
+	}
+	return mapper.DeletePortMapping(externalPort)
+}
+
+// lanAddressTowardsGateway returns this host's IP on the interface that routes
+// toward the default gateway — the address the router must forward the mapped
+// port to (never 0.0.0.0, which some routers reject).
+func lanAddressTowardsGateway() (string, error) {
+	gw, err := gateway.DiscoverGateway()
+	if err != nil {
+		return "", err
+	}
+	return localAddrTowards(gw)
+}
+
+func localAddrTowards(dst net.IP) (string, error) {
+	conn, err := net.Dial("udp", net.JoinHostPort(dst.String(), "9"))
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	host, _, err := net.SplitHostPort(conn.LocalAddr().String())
+	return host, err
+}
+
+func occupied(mappings []PortMapping, port int) bool {
+	for _, m := range mappings {
+		if m.ExternalPort == port {
+			return true
+		}
+	}
+	return false
+}
+
+// firstFreePort returns the first port in the IANA dynamic range (49152-65535)
+// not present in mappings. A deterministic scan (rather than a random pick)
+// keeps the spike testable; a random high port is equally valid in production.
+func firstFreePort(mappings []PortMapping) int {
+	for p := 49152; p <= 65535; p++ {
+		if !occupied(mappings, p) {
+			return p
+		}
+	}
+	return 0
+}

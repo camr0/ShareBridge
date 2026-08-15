@@ -1,10 +1,13 @@
 module sharebridge/agent
 
-go 1.26.1
+go 1.26.2
 
 require (
 	github.com/chromedp/chromedp v0.16.0
 	github.com/coder/websocket v1.8.14
+	github.com/huin/goupnp v1.3.0
+	github.com/jackpal/gateway v1.2.0
+	github.com/jackpal/go-nat-pmp v1.0.2
 	github.com/pion/webrtc/v4 v4.2.11
 )
 
@@ -17,6 +20,7 @@ require (
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gobwas/ws v1.4.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
+	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
