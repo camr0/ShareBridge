@@ -133,9 +133,11 @@ required for correct renewals.
 ## 5. Endpoint Reporting, DDNS, and the Runtime Share Flow
 
 ### Endpoint reporting & DDNS
-The agent reports `{ ip, port }` whenever its endpoint changes: on enrollment
-(port 0), on IP change (periodic external-IP check via UPnP `GetExternalIPAddress`,
-STUN fallback), and on port open/close. Control stores the values; on IP change it
+The agent reports `{ ip, port }` whenever its endpoint changes. On **port open** the
+`open_ack` itself carries the fresh `public_ip` + `granted_port` (serving as the
+open report); `report_endpoint` covers the remaining transitions — enrollment
+(port 0), IP change (periodic external-IP check via UPnP `GetExternalIPAddress`,
+STUN fallback), and port close (port 0). Control stores the values; on IP change it
 runs DDNS to update the wildcard A record (TTL 60s).
 
 ### Share creation & origin
@@ -150,10 +152,11 @@ recipient → GET https://sharebridge.app/s/<code>
   1. control resolves session → api_key_id (agent) + origin
   2. guard: agent enrolled + cert ready + connected, else "direct unavailable"
   3. control builds OpenSignal { agent, share=code, route=direct, nonce, seq, lease, expiry }
+     (lease short, e.g. 120s — v2 spec §5; SignalGate bounds it ≤15 min)
   4. control sends open_signal over WS; waits for open_ack (timeout ~2–3s)
   5. agent: SignalGate.Admit (version/agent/expiry/nonce/seq/lockdown/local-authz/rate-limit)
           → OnDemandPort.OpenFor(code, lease)
-  6. agent → open_ack { granted_port }   ← live port from THIS open
+  6. agent → open_ack { share_id, granted_port, public_ip }   ← live port from THIS open
   7. control 302 → https://<origin>[:granted_port]/s/<code>   (port omitted if 443)
   8. browser → agent; Binder admits SNI, authorizes Host + code; serves placeholder
 ```
@@ -180,9 +183,17 @@ lease fresh). This makes repeat open-signals cheap idempotent acks and removes t
 round-trip).
 
 **Rate limit:** `SignalGate` currently caps 3 signals/share/min, which would reject
-concurrent recipients of a hot share. Raise it (exact ceiling in the plan) so
-legitimate bursts pass; the limit's real job is bounding cold-opens/abuse, and a
-no-op ack is cheap.
+concurrent recipients of a hot share. Drop the tight per-share cap in favor of a
+generous global ceiling (e.g., ~60/min) so legitimate bursts pass; the limit's real
+job is bounding cold-opens/abuse, and a no-op ack is cheap. Exact numbers land in
+the plan.
+
+### Placeholder content
+The agent serves a minimal HTML page (showing the share is being served P2P over
+direct HTTPS, with the origin and granted port) plus a synthetic byte stream (size
+as a query parameter, so throughput can be eyeballed). The handler strips the
+`/s/<code>` prefix and routes the remainder — deliberately decoupled from the real
+gallery UI (item 2).
 
 ## 6. Security Properties
 
