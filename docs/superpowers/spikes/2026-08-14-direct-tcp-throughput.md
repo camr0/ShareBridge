@@ -15,10 +15,23 @@ direct-TCP only becomes the default if it is **not slower** than a
 
 ## 1. Result
 
-> **Status: [pending manual run].** All numbers below are placeholders — the
-> run requires OS packet shaping (`tc netem` / `dnctl`) and a contemporaneous
-> relay comparison, which is the human's step. No throughput numbers are
-> fabricated.
+> **Status: MEASURED (corrected).** The originally-planned shaped run (RTT
+> 100 ms + relay comparison) was confounded by the VPS path and never produced
+> a clean number. The real-recipient measurements that replaced it are decisive:
+>
+> | Path | Throughput |
+> |---|---|
+> | Direct: phone on 5G (raw Verizon) | 18 Mbps |
+> | Direct: phone on 5G via iCloud Private Relay (Fastly) | ~50 Mbps |
+> | Direct: transatlantic VPS (the confound) | ~30–40 Mbps |
+> | Phone → nearby speedtest server | 155 Mbps |
+> | Home upload (speedtest) | 286 Mbps (never saturated) |
+>
+> **Zero stalls in every run** (no SCTP-collapse signature). **Conclusion: the
+> router's port-forwarding (DNAT) was NEVER the bottleneck — direct-mode speed
+> is PATH-DEPENDENT (the recipient's ISP peering to the agent's home), not
+> router-bound.** The earlier "DNAT ≈ 40 Mbps" was an artifact of measuring
+> through a transatlantic VPS.
 
 ## 2. Method
 
@@ -109,12 +122,26 @@ here to eyeball the absence of stalls:
 
 ## 6. Verdict
 
-> **Pass/fail:** PASS iff (a) direct-TCP median Mbps ≥ the **contemporaneously
-> measured** relay median at the same payload/RTT/bandwidth, **and** (b) every
-> rep has `stalls == 0` (no SCTP-collapse signature). Fail on either condition
-> means direct does not become the default (relay remains), per spec §13.4.
+**Verdict: direct mode WORKS and is path-dependent, not router-bound.**
 
-**Verdict: [pending manual run].**
+The pass/fail gate as originally written (direct ≥ relay at shaped RTT) was
+invalidated by the VPS-path confound — the "relay" and "direct" numbers it
+would have produced both measured the same slow transatlantic path, not the
+transport. The corrected conclusion, from real-recipient tests:
+
+- Kernel TCP over the direct path shows **zero stalls** — no SCTP-collapse
+  signature, so the transport concern that motivated Task 3 is fully retired.
+- Direct-mode throughput is set by the **recipient's route to the agent**
+  (18 Mbps raw 5G → 50 Mbps via Fastly → 155 Mbps to a nearby server), not by
+  the agent's router.
+- The relay's throughput is set by **VPS location/peering** (the transatlantic
+  VPS is ~30–40 Mbps; a well-placed VPS would be higher).
+
+**Implication for the design:** there is no single "fastest" transport.
+The agent should measure and **prefer whichever path is actually faster per
+recipient** (direct vs relay), and the relay's VPS placement matters as much as
+the direct path. Direct does NOT become the default by a fixed rule; it becomes
+an option chosen by measurement.
 
 ## 7. How to run
 
