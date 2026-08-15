@@ -2399,18 +2399,23 @@ func (c *Controller) HandleReportEndpoint(ctx context.Context, apiKeyID, ip stri
 	}
 	prev := rec.GetString("endpoint_ip")
 
+	// Empty IP: no endpoint yet — do NOT mark ready or save.
+	if ip == "" {
+		return
+	}
+
 	// DDNS is only attempted on a changed IP; endpoint_ip is saved ONLY after
 	// DDNS succeeds, so a failed update is retried on the next report.
-	if ip != "" && ip != prev {
+	if ip != prev {
 		ns := rec.GetString("namespace")
 		if _, err := c.ddnsFn(ctx, "*."+ns+"."+c.cfg.BaseDomain, ip, 60); err != nil {
 			// leave endpoint_ip unchanged → next report retries
 			return
 		}
 	}
-	// Mark DDNS ready whether we just provisioned it or it was already
-	// provisioned in a prior epoch (same IP) — a replacement socket must reach
-	// readiness without re-provisioning.
+	// Mark DDNS ready: we just provisioned it (new IP) OR it was already
+	// provisioned in a prior epoch (same non-empty IP) — a replacement socket
+	// must reach readiness without re-provisioning.
 	c.epochMu.Lock()
 	if e := c.epochs[apiKeyID]; e != nil {
 		e.ddnsReady = true
