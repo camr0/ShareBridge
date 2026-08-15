@@ -1,6 +1,13 @@
 package direct
 
-import "testing"
+import (
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/huin/goupnp/soap"
+)
 
 // fakeMapper implements PortMapper without any network, letting us assert the
 // contract (granted-port reporting, enumeration, ownership) in-process.
@@ -154,5 +161,44 @@ func TestDeleteOwnedMapping_DeletesOwn(t *testing.T) {
 	}
 	if _, ok := f.mappings[443]; ok {
 		t.Fatalf("own mapping not removed: %v", f.mappings)
+	}
+}
+
+// newSoapFault builds a real *soap.SOAPFaultError by unmarshalling a minimal
+// SOAP <detail> fragment, so TestIsEndOfList exercises isEndOfList against the
+// actual parsed goupnp fault type (not a hand-rolled stand-in).
+func newSoapFault(t *testing.T, code int, desc string) *soap.SOAPFaultError {
+	t.Helper()
+	fragment := fmt.Sprintf(
+		`<Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>%d</errorCode><errorDescription>%s</errorDescription></UPnPError></detail></Fault>`,
+		code, desc,
+	)
+	var f soap.SOAPFaultError
+	if err := xml.Unmarshal([]byte(fragment), &f); err != nil {
+		t.Fatalf("xml.Unmarshal fault fragment: %v", err)
+	}
+	return &f
+}
+
+func TestIsEndOfList(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"errorcode 713", newSoapFault(t, 713, ""), true},
+		{"errorcode 714", newSoapFault(t, 714, ""), true},
+		{"description fallback SpecifiedArrayIndexInvalid", newSoapFault(t, 0, "SpecifiedArrayIndexInvalid"), true},
+		{"description fallback NoSuchEntryInArray", newSoapFault(t, 0, "NoSuchEntryInArray"), true},
+		{"unrelated errorcode 725", newSoapFault(t, 725, "OnlyPermanentLeasesSupported"), false},
+		{"plain error containing digits 713", errors.New("mapping 47130 in use"), false},
+		{"plain error with description text", errors.New("SpecifiedArrayIndexInvalid"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isEndOfList(tt.err); got != tt.want {
+				t.Fatalf("isEndOfList(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }

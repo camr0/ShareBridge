@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/huin/goupnp/dcps/internetgateway1"
+	"github.com/huin/goupnp/soap"
 	"github.com/jackpal/gateway"
 	"github.com/jackpal/go-nat-pmp"
 )
@@ -125,13 +126,27 @@ func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
 	return nil, fmt.Errorf("port mapping enumeration exceeded 256 entries without end-of-list")
 }
 
-// isEndOfList recognizes ONLY the specific IGD fault for "no entry at this
-// index" (SpecifiedArrayIndexInvalid, error code 713). Any other error —
-// including a generic SOAP invalid-argument fault — is a real enumeration
-// failure and must not be mistaken for end-of-list.
+// isEndOfList reports whether err is the UPnP IGD "end of list" fault.
+// It matches the parsed SOAP fault structurally — error code 713
+// (SpecifiedArrayIndexInvalid) or 714 (NoSuchEntryInArray), with the
+// errorDescription as a fallback for routers that omit the numeric code.
+// Any other error (including a generic SOAP invalid-argument fault, or an
+// error whose text merely contains the digits "713") is a real enumeration
+// failure and must NOT be mistaken for end-of-list.
 func isEndOfList(err error) bool {
-	s := err.Error()
-	return strings.Contains(s, "713") || strings.Contains(s, "SpecifiedArrayIndexInvalid")
+	var soapErr *soap.SOAPFaultError
+	if !errors.As(err, &soapErr) {
+		return false
+	}
+	switch soapErr.Detail.UPnPError.Errorcode {
+	case 713, 714:
+		return true
+	}
+	switch soapErr.Detail.UPnPError.ErrorDescription {
+	case "SpecifiedArrayIndexInvalid", "NoSuchEntryInArray":
+		return true
+	}
+	return false
 }
 
 // NATPMPMapper maps ports using NAT-PMP (Apple/older routers).
