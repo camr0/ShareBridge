@@ -89,6 +89,14 @@ Requirements for direct mode: the home router exposes a public IP (no CGNAT) and
 
 **Lease management:** the agent requests a short lease (60–120s) and renews it while the port is open, so a crash leaves at most the lease window of exposure before the router reclaims the mapping. On graceful shutdown the agent sends `DeletePortMapping` explicitly. Some routers enforce leases laxly (keeping the mapping until a router reboot), so the on-demand/closed-by-default model (§5.1) is the primary defense — the port is only mapped during active sessions.
 
+**Self-probe and trust boundary:** the external probe is performed by the control plane, not the agent itself (hairpin NAT makes a LAN self-probe unreliable). To prevent the probe from becoming an SSRF/scanning primitive, the control plane:
+
+1. Probes only the `publicIP:port` the agent just reported, and only when that IP is a public address (rejecting private, reserved, link-local, and multicast ranges) that matches the agent's own `GetExternalIPAddress` result.
+2. Includes a control-plane-generated nonce in the probe request; the agent's HTTPS server answers the nonce only for the share being opened, so a correct echo proves the mapping reaches *this* agent and not some other host on the IP.
+3. Rate-limits probes per agent.
+
+The agent never asks the control plane to probe arbitrary hosts, and the control plane never probes an address the agent did not just claim as its own.
+
 ## 5.1 On-Demand Port Opening (Closed by Default)
 
 To avoid advertising an open port at the home IP to random scanners (Shodan, masscan, opportunistic probes), the public port is **closed by default** and opened only for a legitimate, in-flight share access.
@@ -112,6 +120,8 @@ What this buys:
 
 **Strict open-signal validation:** the agent never opens a port merely because the control plane asked. The open signal only activates a route for a share the agent has independently registered and source-verified; it cannot create arbitrary listeners or reach arbitrary local services (the HTTPS server is never a generic proxy). A hijacked control plane is therefore bounded to toggling routes for shares that already exist, and the agent rate-limits open signals per unit time. (This bounds *port-opening* abuse only; a control plane that also holds DNS/ACME authority has a wider capability — see §11.3.)
 
+**Signal format:** an open signal is a short-lived, versioned, idempotent message bound to `(agent, share, route, nonce)`, carrying an expiration and a per-share open lease. The agent (a) drops signals that are expired, replayed, or already applied; (b) re-verifies the share is currently registered and source-authorized locally (the signal activates, never creates, a route); (c) refuses all open signals while in lockdown; and (d) rate-limits signals per unit time and per share.
+
 Tradeoffs:
 
 - **First-load latency:** control-channel round trip + UPnP mapping (~1–3s) before the redirect. Hideable with a brief "preparing secure connection" interstitial on the control plane.
@@ -122,9 +132,10 @@ Tradeoffs:
 
 DNS carries no port; `https://host` defaults to 443. Strategy:
 
-1. **443 preferred** — when UPnP can map external 443, URLs are clean (no `:port`).
-2. **Non-standard port fallback** — when 443 is unavailable (blocked by ISP, or already mapped to another service), the agent maps any free port (e.g. 8443) and the redirect URL includes it: `https://…:8443/…`. The wildcard certificate is valid for any port, so this is purely cosmetic.
-3. The agent must never require the user to forward a port manually.
+1. **Never clobber existing mappings** — before mapping 443, the agent queries the router's existing port mappings (where the device supports listing them) and refuses to delete or overwrite any mapping it did not create. If 443 is already mapped (to another service or a stale ShareBridge mapping), the agent falls back to a random high external port instead of disrupting it.
+2. **443 preferred** — when UPnP can map external 443 cleanly, URLs are clean (no `:port`).
+3. **Non-standard port fallback** — when 443 is unavailable (blocked by ISP, or already mapped), the agent maps any free port (e.g. 8443) and the redirect URL includes it: `https://…:8443/…`. The wildcard certificate is valid for any port, so this is purely cosmetic.
+4. The agent must never require the user to forward a port manually.
 
 A port is not required to be static across agent restarts: the control plane stores the agent's *current* endpoint and emits redirects accordingly.
 
@@ -173,7 +184,7 @@ The native share code remains the bearer capability. No redundant bootstrap toke
 - No server bandwidth in the data path; transfer survives relay-VPS outage.
 - Strict agent-side origin→share binding (FRP §11) is the enforcement point.
 - Content served from a separate registered domain (`sharebridgeusercontent.com`), so a compromised agent is browser-isolated from control-plane cookies, storage, and service workers.
-- **Lockdown mode**: the agent can immediately stop listening and revoke all active origins, closing the public socket on demand.
+- **Lockdown mode**: the agent immediately (a) removes the UPnP mapping, (b) revokes all active origins, and (c) closes all established direct TCP/TLS connections it is serving (tracked separately from relay connections, so relay sessions can continue if desired). Removing the mapping alone does not reliably terminate in-flight NAT flows, so connection tracking + explicit close is required.
 - **Closed-by-default port**: the public port is open only during a control-plane-triggered access window (§5.1), so the home IP is not a visible open-port target for scanners.
 
 ### 11.2 Accepted Tradeoffs (deliberate)
@@ -194,6 +205,7 @@ The confidentiality guarantee ("control plane cannot read file data") holds **un
 - **Port remapped at restart:** stored endpoint is stale; control plane uses the latest report, falling back to relay for the overlap.
 - **Cert not ready:** direct shares are not published until cert + DNS readiness pass (FRP §20.3).
 - **Open-ack timeout:** if the agent does not ack the open signal within a short timeout, the control plane falls back to relay for that session instead of redirecting to a closed port.
+- **Direct connection failure (TLS timeout, ISP block, stale DNS, path firewall):** a 302 to a dead direct endpoint cannot be retried server-side — the browser has already left. The canonical page therefore serves an interstitial that (a) attempts the direct connection while hiding the open latency, and (b) on a bounded timeout with no completed TLS handshake, redirects the browser to the relay hostname for the same share. This is the *recipient-path* reachability check: an agent/control-plane self-probe alone does not prove the recipient's own path works.
 - **Lapsed port:** a recipient whose port closed due to inactivity re-opens the canonical link, which re-triggers on-demand opening.
 
 ## 13. Validation Before Implementation Commitment
@@ -222,7 +234,7 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - Two DNS namespaces per agent under one domain: the clean `<namespace>` resolves to the agent IP (direct, the default) and `relay.<namespace>` resolves to the gateway (relay). One certificate with two wildcard SANs covers both — no additional certificate or rate-limit cost.
 - The custom Noise/browser-framing layer is retired for migrated shares.
 - The public port is closed by default and opened on demand by the control plane for an active share access; the open/close switch is the UPnP mapping.
-- Lockdown mode is a prominent red button in the agent dashboard: it immediately removes the UPnP mapping, revokes all active origins, and notifies the control plane to deactivate shares — reversible via an explicit unlock. A separate, less prominent action stops the agent process entirely.
+- Lockdown mode is a prominent red button in the agent dashboard: it immediately removes the UPnP mapping, revokes all active origins, closes established direct connections, and notifies the control plane to deactivate shares — reversible via an explicit unlock. A separate, less prominent action stops the agent process entirely.
 - Sequencing: build the agent HTTPS server + direct wiring first (the custom Secure Relay remains the fallback), then migrate the relay to FRP L4 passthrough and delete Noise/WebRTC. There is no legacy-compatibility constraint (pre-release, no external users), so this is a clean v2 rewrite.
 - The direct transport (UPnP + on-demand + endpoint reporting) is packaged as a reusable internal library behind a narrow transport interface (sibling to the FRP tunnel); DDNS and the HTTP/reverse-proxy layer are separate concerns.
 - UPnP: `huin/goupnp` (IGD, primary) + `jackpal/go-nat-pmp` (NAT-PMP, fallback); PCP later if needed.
