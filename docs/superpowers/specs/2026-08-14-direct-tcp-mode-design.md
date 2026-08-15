@@ -61,6 +61,8 @@ Direct and relay share **one agent HTTPS server** (TLS termination, page, conten
 
 This unified model is the point of the FRP spec and is what lets the custom Noise layer be deleted: both paths are browser↔agent TLS end-to-end, so TLS is the single encryption layer and the Noise/browser-framing protocol is retired (FRP §19.4).
 
+**Repo layout:** the monorepo gains a third top-level folder in Phase 3 — `agent/` (home server), `control/` (VPS, the control plane — today's `signaling-server/`, renamed), and `relay/` (VPS — `sharebridge-relay-gateway` + `sharebridge-relay-frps`). Phases 1–2 only touch `agent/` and `control/`.
+
 ## 4. Transport Selection — Fallback Ladder
 
 Share resolution produces, in order:
@@ -83,6 +85,8 @@ The agent obtains a public endpoint **automatically, with zero router configurat
 Go libraries: `github.com/huin/goupnp` (UPnP IGD port mapping — primary, covers most consumer routers) with `github.com/jackpal/go-nat-pmp` (NAT-PMP — fallback for Apple/older routers). PCP (RFC 6887) can be added later if needed. `github.com/jackpal/gateway` provides gateway IP discovery only, not port mapping.
 
 Requirements for direct mode: the home router exposes a public IP (no CGNAT) and supports UPnP/NAT-PMP/PCP (default on essentially all consumer routers). If either is absent, the agent reports "no endpoint" and the control plane uses relay.
+
+**Lease management:** the agent requests a short lease (60–120s) and renews it while the port is open, so a crash leaves at most the lease window of exposure before the router reclaims the mapping. On graceful shutdown the agent sends `DeletePortMapping` explicitly. Some routers enforce leases laxly (keeping the mapping until a router reboot), so the on-demand/closed-by-default model (§5.1) is the primary defense — the port is only mapped during active sessions.
 
 ## 5.1 On-Demand Port Opening (Closed by Default)
 
@@ -205,6 +209,7 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - Content remains on `sharebridgeusercontent.com` for browser site isolation.
 - The custom Noise/browser-framing layer is retired for migrated shares.
 - The public port is closed by default and opened on demand by the control plane for an active share access; the open/close switch is the UPnP mapping.
+- Lockdown mode is a prominent red button in the agent dashboard: it immediately removes the UPnP mapping, revokes all active origins, and notifies the control plane to deactivate shares — reversible via an explicit unlock. A separate, less prominent action stops the agent process entirely.
 - Sequencing: build the agent HTTPS server + direct wiring first (the custom Secure Relay remains the fallback), then migrate the relay to FRP L4 passthrough and delete Noise/WebRTC. There is no legacy-compatibility constraint (pre-release, no external users), so this is a clean v2 rewrite.
 - The direct transport (UPnP + on-demand + endpoint reporting) is packaged as a reusable internal library behind a narrow transport interface (sibling to the FRP tunnel); DDNS and the HTTP/reverse-proxy layer are separate concerns.
 - UPnP: `huin/goupnp` (IGD, primary) + `jackpal/go-nat-pmp` (NAT-PMP, fallback); PCP later if needed.
@@ -214,9 +219,8 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 ## 15. Open Questions
 
 1. Select and register the content domain (`sharebridgeusercontent.com` is the working name but not yet purchased — FRP §27.1); add it to Cloudflare once bought.
-2. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
-3. Whether to publish the "WebTCP"-style transport library publicly (internal packaging is decided in §14).
-4. Frontend model: (a) custom ShareBridge frontend — lean (Immich Public Proxy-style: server-side fetch of the share's assets + minimal gallery, ~one API call) or rich (current full connector); vs (b) transparent route-proxy to the source's own share page (11notes/immich-share-proxy style — least code, non-unified UX, route-filter maintenance). The agent HTTPS server is frontend-agnostic, so this is decoupled from the transport and can be decided later.
+2. Whether to publish the "WebTCP"-style transport library publicly (internal packaging is decided in §14).
+3. Frontend model: (a) custom ShareBridge frontend — lean (Immich Public Proxy-style: server-side fetch of the share's assets + minimal gallery, ~one API call) or rich (current full connector); vs (b) transparent route-proxy to the source's own share page (11notes/immich-share-proxy style — least code, non-unified UX, route-filter maintenance). The agent HTTPS server is frontend-agnostic, so this is decoupled from the transport and can be decided later.
 
 ## 16. References
 
