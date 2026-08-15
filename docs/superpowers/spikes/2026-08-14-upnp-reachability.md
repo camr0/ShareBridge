@@ -15,33 +15,35 @@ when an off-LAN probe reaches the agent through it.
 
 ## 1. Result
 
-> **Status: [pending manual run]** — requires a real router and an off-LAN
-> (cellular) probe vantage; both are supplied by the human. No result is
-> recorded until those runs happen.
+> **Status: PASS (single router, off-LAN confirmed).** An external probe from a
+> cellular (non-LAN) vantage reached the mapping and downloaded `/file`
+> (~1.2 MB `spike.bin`). Recorded 2026-08-14 on the human's home router.
 
 | Field | Value |
 |---|---|
-| Mapper that succeeded | `[pending manual run]` — UPnP WANIP / UPnP WANPPP / NAT-PMP (or none) |
-| Observed external IP | `[pending manual run]` |
-| Requested external port | `[pending manual run]` (443 by default) |
-| Granted external port | `[pending manual run]` (may differ from requested for NAT-PMP) |
-| 443 available (free) or fell back | `[pending manual run]` |
+| Mapper that succeeded | UPnP IGD (WANIP/WANPPP flavor not logged by the spike — `MapperForRouter` tries UPnP first, then NAT-PMP) |
+| Observed external IP | `173.54.233.213` |
+| Requested external port | 443 |
+| Granted external port | 49152 (fallback — not a NAT-PMP remap; UPnP honors the requested port) |
+| 443 available (free) or fell back | **fell back** — 443 occupied by a foreign mapping, so `ChooseExternalPort` selected 49152 |
 
 ## 2. Port strategy (spec §6)
 
-- Whether 443 was free or the spike fell back to a high dynamic-range port:
-  `[pending manual run]`
-- Confirmation that no pre-existing foreign mapping was clobbered:
-  `[pending manual run]` — expected to hold by construction (`ChooseExternalPort`
-  enumerates and never selects an occupied port; `DeleteOwnedMapping` refuses
-  non-`sharebridge`-prefixed descriptions). This claim is covered in-process by
-  the unit tests; the on-router confirmation is manual.
+- 443 was **occupied** by a pre-existing foreign mapping; the spike fell back
+  to 49152 (first free port in the IANA dynamic range 49152–65535).
+- No pre-existing foreign mapping was clobbered (observed: the existing 443
+  service stayed up; `ChooseExternalPort` enumerated and skipped the occupied
+  port). In-process, the unit tests (`TestChooseExternalPort_FallsBackWhen443Taken`,
+  `TestDeleteOwnedMapping_RefusesForeign`) assert the same behavior.
 
 ## 3. Off-LAN probe result
 
-- Reachable from off-LAN: `[pending manual run]`
-- Vantage: `[pending manual run]` (must be cellular / a host NOT on the same
-  LAN — never a hairpin self-probe)
+- Reachable from off-LAN: **YES** — a phone on cellular downloaded `/file`
+  (~1.2 MB `spike.bin`). A TLS handshake from the cellular IP
+  (`172.226.203.117`) also appears in the server log, confirming the off-LAN
+  path reached the listener before the successful download.
+- Vantage: cellular (off-LAN) — the load-bearing result. A Wi-Fi (hairpin)
+  download also succeeded but is not load-bearing.
 - **Pass/fail criterion:** the spike PASSES only if the off-LAN probe reaches
   the mapping (`reachable via <ip>:<granted-port>` and a successful `/file`
   download). A *library-discovery success with a failed external probe is
@@ -82,9 +84,13 @@ with the reason.
 
 | Router (vendor/model) | Protocol | Service flavor | 443 state | Lease | NAT topology | Hairpin | Discovery | Off-LAN probe | Verdict |
 |---|---|---|---|---|---|---|---|---|---|
+| home router (vendor/model TBD) | UPnP IGD | WANIP/WANPPP (not logged) | occupied → 49152 | 300s lease (strict-vs-lax not yet observed) | single NAT | hairpin present (Wi-Fi reachable) | ✅ | ✅ cellular | **PASS** |
 | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` |
 | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` |
-| `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` | `[pending manual run]` |
+
+> Coverage note: 1 of ≥ 3 distinct router vendors observed. The multi-vendor
+> matrix (and the strict-lease vs lease-lax and double-NAT/CGNAT cells) remains
+> open — a single PASS on one home router proves the mechanism, not universality.
 
 ## 6. How to run
 
