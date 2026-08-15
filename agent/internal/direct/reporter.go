@@ -3,10 +3,11 @@ package direct
 import "sync"
 
 type Reporter struct {
-	mu   sync.Mutex
-	ip   string
-	send func(ip string, port int, status string)
-	ch   chan endpointEvent // queued sends: never blocks the state loop
+	mu     sync.Mutex
+	ip     string
+	send   func(ip string, port int, status string)
+	ch     chan endpointEvent // queued sends: never blocks the state loop
+	closed bool
 }
 
 type endpointEvent struct{ ip string; port int; status string }
@@ -23,6 +24,18 @@ func (r *Reporter) drain() {
 	}
 }
 
+// Close terminates the drain goroutine by closing the event channel. It is
+// idempotent and safe to call multiple times. After Close, OnTransition drops
+// events without sending, so nothing is ever sent on the closed channel.
+func (r *Reporter) Close() {
+	r.mu.Lock()
+	if !r.closed {
+		r.closed = true
+		close(r.ch)
+	}
+	r.mu.Unlock()
+}
+
 func (r *Reporter) SetIP(ip string) {
 	r.mu.Lock()
 	r.ip = ip
@@ -30,16 +43,31 @@ func (r *Reporter) SetIP(ip string) {
 }
 
 func (r *Reporter) OnTransition(old, new PortState, grantedPort int) {
-	r.mu.Lock()
-	ip := r.ip
-	r.mu.Unlock()
+	var e endpointEvent
 	switch new {
 	case StateClosed:
-		r.ch <- endpointEvent{ip, 0, ""}
+		e = endpointEvent{port: 0}
 	case StateOpen:
-		r.ch <- endpointEvent{ip, grantedPort, ""}
+		e = endpointEvent{port: grantedPort}
 	case StateCloseFailed:
-		r.ch <- endpointEvent{ip, grantedPort, "close_failed"}
+		e = endpointEvent{port: grantedPort, status: "close_failed"}
+	default:
+		return // StateClosing (and anything else): no report.
 	}
-	// StateClosing: no report (intermediate).
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	e.ip = r.ip
+	// Non-blocking enqueue: reports are advisory, so dropping an event when the
+	// buffer is full is acceptable. This guarantees OnTransition never blocks the
+	// state loop even if the `send` consumer stalls — the 64-slot buffer absorbs
+	// bursts, and the next transition re-reports if an event is dropped.
+	select {
+	case r.ch <- e:
+	default:
+	}
+	r.mu.Unlock()
 }
