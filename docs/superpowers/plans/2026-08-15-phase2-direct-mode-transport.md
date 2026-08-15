@@ -60,7 +60,7 @@
 | `signaling-server/internal/handler/agent_ws.go` (modify) | Route new message types; wire controller; soft-delete |
 | `signaling-server/internal/handler/rest.go` (modify) | Soft-delete in all lookups |
 | `signaling-server/internal/handler/browser_ws.go` (modify) | is_active filter |
-| `signaling-server/internal/handler/apikeys.go` (modify) | Rotation re-points; revocation deletes agent |
+| `signaling-server/internal/handler/api_keys.go` (modify) | Rotation re-points; revocation deletes agent |
 | `signaling-server/internal/hub/hub.go` (modify) | Compare-and-delete register/unregister (fence old conn) |
 | `signaling-server/internal/config/config.go` (modify) | Cloudflare/ACME/base-domain env |
 | `signaling-server/cmd/server/main.go` (modify) | Wire controller + coordinator + redirect; soft-delete expiry |
@@ -100,6 +100,10 @@ func (s *DirectServer) Handler() http.Handler
 func (s *DirectServer) Start(ctx context.Context, listenAddr string) error
 
 // agent/internal/cert — Manager
+// NOTE: the AGENT config gains `BaseDomain string` (env CONTENT_BASE_DOMAIN,
+// default "sharebridgeusercontent.com"). The control plane owns the same value
+// (its own config); `enrolled` carries only the namespace, so the agent must
+// get baseDomain from its own config, or CSR/Binder/control will disagree.
 type Manager struct{ /* ... */ }
 func NewManager(dataDir, baseDomain string, roots *x509.CertPool) *Manager
 func (m *Manager) SetNamespace(namespace string) error
@@ -119,6 +123,8 @@ func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error)
 func (c *Coordinator) Issue(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) (chainPEM []byte, err error)
 func (c *Coordinator) HasLeafFingerprint(apiKeyID, leafFP string) bool
 func (c *Coordinator) ChainByLeaf(apiKeyID, leafFP string) (chain []byte, notAfter time.Time, ok bool)
+func (c *Coordinator) LatestChain(apiKeyID string) (chain []byte, leafFP string, notAfter time.Time, ok bool)
+func (c *Coordinator) SetIssueFn(fn func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error)) // test-only stub
 
 // signaling-server/internal/directctl — Controller
 type Controller struct{ /* ... */ }
@@ -132,6 +138,17 @@ func (c *Controller) HandleOpenAck(apiKeyID string, ack OpenAck)
 func (c *Controller) Redirect(w http.ResponseWriter, r *http.Request, code string) error
 func (c *Controller) AgentDisconnected(apiKeyID string, conn *websocket.Conn)
 func (c *Controller) AllocateOriginFor(app core.App, apiKeyID string, session *core.Record) (string, error)
+func (c *Controller) EmitOpen(ctx context.Context, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error)
+func (c *Controller) Probe(ctx context.Context, origin, code, apiKeyID string, ack OpenAck) error
+
+// OpenAck (control side) and openWaiter are SHARED types — declared here so
+// Task 10's Controller skeleton can reference them before Task 13 defines
+// EmitOpen.
+type OpenAck struct {
+	ShareID string; Nonce string; Seq uint64; GrantedPort int
+	PublicIP string; WasAlreadyOpen bool; Status, Error string
+}
+type openWaiter struct{ apiKeyID string; shareID string; seq uint64; ch chan OpenAck }
 
 // signaling-server/internal/directctl — OpenAck (control side)
 type OpenAck struct {
@@ -177,8 +194,15 @@ func newTestController(t *testing.T) (core.App, *Controller) {
 		t.Fatalf("agents schema: %v", err)
 	}
 
-	// A stub coordinator that never issues real certs.
-	coord := &certcoordinator.Coordinator{}
+	// A coordinator with a stub issuer returning a fixed chain, so tests can
+	// Issue and then report a real leaf fingerprint.
+	coord, err := certcoordinator.NewCoordinator(certcoordinator.CoordinatorConfig{AccountKeyPath: filepath.Join(t.TempDir(), "acct.pem")})
+	if err != nil {
+		t.Fatalf("coordinator: %v", err)
+	}
+	coord.SetIssueFn(func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error) {
+		return mustTestChain(t), nil
+	})
 	ctrl := NewController(app, hub.New(), coord, nil, Config{BaseDomain: "example.com"})
 	ctrl.allowPrivate = true   // loopback probe allowed in tests
 	ctrl.sendFn = func(ctx context.Context, conn *websocket.Conn, msg any) error { return nil }
@@ -201,6 +225,24 @@ func (c *Controller) captureSend(fn func()) map[string]any {
 	fn()
 	c.sendFn = old
 	return got
+}
+
+// mustTestChain mints a valid, future-dated self-signed leaf so the
+// coordinator's leafNotAfter parses to a future time (a hardcoded/garbage PEM
+// would yield a zero NotAfter and ChainByLeaf would reject it).
+func mustTestChain(t *testing.T) []byte {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1),
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour)}
+	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func leafFPOf(chainPEM []byte) string {
+	block, _ := pem.Decode(chainPEM)
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:])
 }
 ```
 
@@ -236,11 +278,18 @@ func TestCreateAgentsBackfillsActive(t *testing.T) {
 	if err := CreateCollections(app); err != nil {
 		t.Fatalf("base: %v", err)
 	}
-	// Insert a pre-existing session (simulates a DB migrated from v1).
+	// Insert a pre-existing session (simulates a DB migrated from v1). The
+	// sessions.api_key_id relation is required, so create an api_keys record first.
+	apiKeys, _ := app.FindCollectionByNameOrId("api_keys")
+	key := core.NewRecord(apiKeys)
+	key.Set("key_hash", "x")
+	if err := app.Save(key); err != nil {
+		t.Fatalf("save key: %v", err)
+	}
 	sessions, _ := app.FindCollectionByNameOrId("sessions")
-	existing := NewRecord(sessions) // helper below
+	existing := core.NewRecord(sessions)
 	existing.Set("code", "oldcode1")
-	existing.Set("api_key_id", "")
+	existing.Set("api_key_id", key.Id)
 	existing.Set("agent_id", "")
 	if err := app.Save(existing); err != nil {
 		t.Fatalf("save existing: %v", err)
@@ -336,7 +385,7 @@ func CreateAgents(app core.App) error {
 		&core.BoolField{Name: "is_active"},
 	)
 	sessionsCol.Indexes = append(sessionsCol.Indexes,
-		"CREATE UNIQUE INDEX `idx_sessions_origin` ON `{{COLLECTION}}` (`origin`)",
+		"CREATE UNIQUE INDEX `idx_sessions_origin` ON `{{COLLECTION}}` (`origin`) WHERE `origin` IS NOT NULL AND `origin` != ''",
 	)
 	if err := app.Save(sessionsCol); err != nil {
 		return fmt.Errorf("save sessions fields: %w", err)
@@ -673,12 +722,16 @@ func (m *Manager) installLocked(chainPEM, keyPEM []byte) error {
 	if err != nil {
 		return err
 	}
-	leaf := cert.Certificate[0]
-	m.cert = &cert
+	// Persist BEFORE swapping the in-memory cert so a write failure cannot
+	// leave a cert active that is not on disk (split runtime/reported state).
 	m.chainPEM = chainPEM
 	m.keyPEM = keyPEM
-	m.leafDER = leaf
-	return m.persistChain()
+	if err := m.persistChain(); err != nil {
+		return err
+	}
+	m.cert = &cert
+	m.leafDER = cert.Certificate[0]
+	return nil
 }
 
 func (m *Manager) Certificate() (*tls.Certificate, error) {
@@ -798,6 +851,8 @@ type PortMapper interface {
 
 `UPnPMapper.InternalIP() string { return m.internalIP }`; `NATPMPMapper.InternalIP() string { return "" }`.
 
+> **Update existing test fakes:** any fake `PortMapper` in `portmap_test.go` / `ondemand_test.go` must add `InternalIP() string` to satisfy the widened interface, or the package will not compile.
+
 ```go
 // DeleteOwnedMapping removes the mapping at externalPort only if it EXACTLY
 // matches want (description, internal port, internal client, protocol).
@@ -828,9 +883,9 @@ func DeleteOwnedMapping(mapper PortMapper, externalPort int, want PortMapping) e
 ```go
 // ondemand_test.go (append)
 func TestOpenForFastPathRenewsOnlyWhenLeaseTooShort(t *testing.T) {
-	// fake mapper + fake clock: open for 60s; advance 10s; OpenFor(60s) must NOT
-	// call AddPortMapping again (requested lease fits within remaining 50s).
-	// Then OpenFor(300s) MUST renew (requested exceeds remaining lease).
+	// fake mapper + fake clock: open for 60s; advance 10s → 50s remaining.
+	// OpenFor(30s) fits within 50s → must NOT call AddPortMapping again.
+	// OpenFor(120s) exceeds the remaining 50s → MUST renew.
 }
 
 func TestColdOpenCleansLingeringMapping(t *testing.T) {
@@ -950,15 +1005,18 @@ case opOpenFor:
 		deadline = now.Add(l)
 		renewAt = deadline.Add(-p.renewWindow)
 		if !renewAt.After(now) { renewAt = now.Add(p.renewWindow) }
+		idleAt = time.Time{}
 		p.setState(StateOpen, grantedPort)
 		rearm()
 		c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: false}
 		continue
 	}
 
-	// Fast path: already open. Renew the router lease only when the requested
-	// lease extends beyond the current lease expiry; otherwise no router call.
+	// Fast path: already open. A fresh signal means a fresh recipient, so clear
+	// the inactivity-close deadline; renew the router lease only when the
+	// requested lease extends beyond the current lease expiry.
 	wasOpen := true
+	idleAt = time.Time{}
 	if now.Add(l).After(deadline) {
 		granted, err := p.mapper.AddPortMapping(grantedPort, p.intPort, p.desc(), int(l.Seconds()))
 		if err != nil {
@@ -1428,8 +1486,25 @@ type Reporter struct {
 	send func(ip string, port int, status string)
 }
 
+type Reporter struct {
+	mu   sync.Mutex
+	ip   string
+	send func(ip string, port int, status string)
+	ch   chan endpointEvent // queued sends: never blocks the state loop
+}
+
+type endpointEvent struct{ ip string; port int; status string }
+
 func NewReporter(send func(ip string, port int, status string)) *Reporter {
-	return &Reporter{send: send}
+	r := &Reporter{send: send, ch: make(chan endpointEvent, 64)}
+	go r.drain()
+	return r
+}
+
+func (r *Reporter) drain() {
+	for e := range r.ch {
+		r.send(e.ip, e.port, e.status)
+	}
 }
 
 func (r *Reporter) SetIP(ip string) {
@@ -1444,11 +1519,11 @@ func (r *Reporter) OnTransition(old, new PortState, grantedPort int) {
 	r.mu.Unlock()
 	switch new {
 	case StateClosed:
-		r.send(ip, 0, "")
+		r.ch <- endpointEvent{ip, 0, ""}
 	case StateOpen:
-		r.send(ip, grantedPort, "")
+		r.ch <- endpointEvent{ip, grantedPort, ""}
 	case StateCloseFailed:
-		r.send(ip, grantedPort, "close_failed")
+		r.ch <- endpointEvent{ip, grantedPort, "close_failed"}
 	}
 	// StateClosing: no report (intermediate).
 }
@@ -1548,23 +1623,29 @@ func GenerateNamespace() string {
 }
 
 func LoadOrCreateAgent(app core.App, apiKeyID string) (*core.Record, bool, error) {
-	recs, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": apiKeyID})
-	if err != nil {
-		return nil, false, err
+	for i := 0; i < 3; i++ {
+		recs, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": apiKeyID})
+		if err != nil {
+			return nil, false, err
+		}
+		if len(recs) > 0 {
+			return recs[0], false, nil
+		}
+		col, _ := app.FindCollectionByNameOrId("agents")
+		rec := core.NewRecord(col)
+		rec.Set("api_key_id", apiKeyID)
+		rec.Set("namespace", GenerateNamespace())
+		rec.Set("cert_status", "pending")
+		rec.Set("endpoint_port", 0)
+		if err := app.Save(rec); err != nil {
+			if i == 2 {
+				return nil, false, err
+			}
+			continue // lost a unique-constraint race → retry the lookup
+		}
+		return rec, true, nil
 	}
-	if len(recs) > 0 {
-		return recs[0], false, nil
-	}
-	col, _ := app.FindCollectionByNameOrId("agents")
-	rec := core.NewRecord(col)
-	rec.Set("api_key_id", apiKeyID)
-	rec.Set("namespace", GenerateNamespace())
-	rec.Set("cert_status", "pending")
-	rec.Set("endpoint_port", 0)
-	if err := app.Save(rec); err != nil {
-		return nil, false, err
-	}
-	return rec, true, nil
+	return nil, false, fmt.Errorf("agent create failed after retries")
 }
 
 func SaveCertReady(app core.App, rec *core.Record, fingerprint string, notAfter time.Time) error {
@@ -1587,7 +1668,10 @@ func AllocateOrigin(app core.App, namespace, baseDomain string, session *core.Re
 			session.Set("origin", candidate)
 			session.Set("is_active", true)
 			if err := txApp.Save(session); err != nil {
-				continue // unique violation → retry with a new label
+				if isUniqueViolation(err) {
+					continue // collision → retry with a new label
+				}
+				return err // real validation/DB error — do not mask it
 			}
 			origin = candidate
 			return nil
@@ -1747,6 +1831,7 @@ type Coordinator struct {
 	inflight map[string]bool
 	csrIdx   map[string]cachedChain // apiKeyID + ":" + csrFP
 	leafIdx  map[string]cachedChain // apiKeyID + ":" + leafFP
+	latest   map[string]string      // apiKeyID -> leafFP of the latest issued chain
 	last     map[string]time.Time
 	issueFn  func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error)
 }
@@ -1755,7 +1840,7 @@ func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error) {
 	c := &Coordinator{
 		cfg: cfg, sem: make(chan struct{}, maxIssuanceConcurrency),
 		inflight: map[string]bool{}, csrIdx: map[string]cachedChain{},
-		leafIdx: map[string]cachedChain{}, last: map[string]time.Time{},
+		leafIdx: map[string]cachedChain{}, latest: map[string]string{}, last: map[string]time.Time{},
 	}
 	c.issueFn = c.completeCSR
 	key, err := c.loadOrCreateAccountKey()
@@ -1821,6 +1906,7 @@ func (c *Coordinator) Issue(ctx context.Context, csrPEM []byte, namespace, apiKe
 	c.mu.Lock()
 	c.csrIdx[ck] = cachedChain{chain: chain, notAfter: na}
 	c.leafIdx[apiKeyID+":"+leafFP] = cachedChain{chain: chain, notAfter: na}
+	c.latest[apiKeyID] = leafFP
 	c.mu.Unlock()
 	return append([]byte(nil), chain...), nil
 }
@@ -1832,16 +1918,30 @@ func (c *Coordinator) HasLeafFingerprint(apiKeyID, leafFP string) bool {
 	return ok && ch.notAfter.After(time.Now())
 }
 
-// ChainByLeaf returns the cached chain + NotAfter for re-delivery and so the
-// control derives not_after from its own records, never trusting the agent.
 func (c *Coordinator) ChainByLeaf(apiKeyID, leafFP string) ([]byte, time.Time, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ch, ok := c.leafIdx[apiKeyID+":"+leafFP]
-	if !ok {
+	if !ok || !ch.notAfter.After(time.Now()) {
 		return nil, time.Time{}, false
 	}
 	return append([]byte(nil), ch.chain...), ch.notAfter, true
+}
+
+// LatestChain returns the most recently issued chain for an agent (for
+// re-delivery when the agent reports an older, still-valid fingerprint).
+func (c *Coordinator) LatestChain(apiKeyID string) ([]byte, string, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	leafFP, ok := c.latest[apiKeyID]
+	if !ok {
+		return nil, "", time.Time{}, false
+	}
+	ch, ok := c.leafIdx[apiKeyID+":"+leafFP]
+	if !ok {
+		return nil, "", time.Time{}, false
+	}
+	return append([]byte(nil), ch.chain...), leafFP, ch.notAfter, true
 }
 
 func (c *Coordinator) hasCSRFingerprint(apiKeyID, csrFP string) bool {
@@ -1987,9 +2087,13 @@ func TestEpochReadinessGatedOnDDNSAndTLS(t *testing.T) {
 	if sent["type"] != "enrolled" { t.Fatalf("expected enrolled") }
 	if sent["namespace"] == "" { t.Fatalf("namespace empty") }
 
-	// tls_ready before DDNS → no enrollment_ready yet.
+	// tls_ready before DDNS → no enrollment_ready yet. Seed a real chain so
+	// ChainByLeaf accepts the reported fingerprint.
+	chain, err := ctrl.coord.Issue(context.Background(), []byte("csr"), "sbdeadbeef", "key-1")
+	if err != nil { t.Fatal(err) }
+	fp := leafFPOf(chain)
 	sent2 := ctrl.captureSend(func() {
-		ctrl.HandleTLSReady(context.Background(), nil, "key-1", "fp-1", time.Now().Add(90*24*time.Hour).Format(time.RFC3339))
+		ctrl.HandleTLSReady(context.Background(), nil, "key-1", fp, time.Now().Add(90*24*time.Hour).Format(time.RFC3339))
 	})
 	if sent2 != nil && sent2["type"] == "enrollment_ready" {
 		t.Fatalf("must not be ready before DDNS")
@@ -2094,19 +2198,23 @@ func (c *Controller) epochReady(apiKeyID string) bool {
 
 func (c *Controller) AgentDisconnected(apiKeyID string, conn *websocket.Conn) {
 	c.epochMu.Lock()
+	matched := false
 	if e, ok := c.epochs[apiKeyID]; ok && e.conn == conn {
 		delete(c.epochs, apiKeyID)
+		matched = true
 	}
 	c.epochMu.Unlock()
-	// Reset sequence for this epoch (compare-and-delete already handled).
+	if !matched {
+		return // a stale old-socket disconnect must not disrupt the replacement
+	}
 	c.seqMu.Lock()
 	delete(c.seq, apiKeyID)
 	c.seqMu.Unlock()
-	// Cancel any in-flight open waiters for this agent.
+	// Drop this epoch's waiters WITHOUT closing their channels (closing would
+	// make EmitOpen receive a zero ack and treat it as success).
 	c.waiterMu.Lock()
 	for nonce, w := range c.waiters {
 		if w.apiKeyID == apiKeyID {
-			close(w.ch)
 			delete(c.waiters, nonce)
 		}
 	}
@@ -2174,6 +2282,10 @@ func (c *Controller) HandleTLSReady(ctx context.Context, conn *websocket.Conn, a
 		return
 	}
 	// If the agent is behind the latest chain, re-deliver the latest.
+	latest, latestFP, _, ok2 := c.coord.LatestChain(apiKeyID)
+	if ok2 && fingerprint != latestFP {
+		c.sendFn(ctx, conn, map[string]string{"type": "cert_issue", "chain_pem": string(latest)})
+	}
 	_ = chain
 
 	c.epochMu.Lock()
@@ -2304,13 +2416,16 @@ func (c *Controller) HandleReportEndpoint(ctx context.Context, apiKeyID, ip stri
 			// leave endpoint_ip unchanged → next report retries
 			return
 		}
-		c.epochMu.Lock()
-		if e := c.epochs[apiKeyID]; e != nil {
-			e.ddnsReady = true
-			c.maybeReadyLocked(e.conn, apiKeyID, e)
-		}
-		c.epochMu.Unlock()
 	}
+	// Mark DDNS ready whether we just provisioned it or it was already
+	// provisioned in a prior epoch (same IP) — a replacement socket must reach
+	// readiness without re-provisioning.
+	c.epochMu.Lock()
+	if e := c.epochs[apiKeyID]; e != nil {
+		e.ddnsReady = true
+		c.maybeReadyLocked(e.conn, apiKeyID, e)
+	}
+	c.epochMu.Unlock()
 
 	rec.Set("endpoint_ip", ip)
 	rec.Set("endpoint_port", port)
@@ -2663,12 +2778,15 @@ func TestProbeSendsSNIAndHost(t *testing.T) {
 	_, ctrl := newTestController(t)
 	ctrl.allowPrivate = true
 	var gotHost, gotSNI string
-	var gotRedirect bool
 	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHost = r.Host
 		gotSNI = r.TLS.ServerName
 		if r.URL.Query().Get("nonce") != "n1" {
 			w.WriteHeader(403)
+			return
+		}
+		if r.URL.Query().Get("redirect") == "1" {
+			http.Redirect(w, r, "https://should-not-be-followed/", http.StatusFound)
 			return
 		}
 		w.WriteHeader(200)
@@ -2679,10 +2797,28 @@ func TestProbeSendsSNIAndHost(t *testing.T) {
 
 	u, _ := url.Parse(ts.URL)
 	port := mustPort(t, u.Port())
-	_ = ctrl.Probe(context.Background(), "demo.sb1.example.com", "abc", "key-1", OpenAck{PublicIP: "127.0.0.1", GrantedPort: port, Nonce: "n1"})
+	err := ctrl.Probe(context.Background(), "demo.sb1.example.com", "abc", "key-1", OpenAck{PublicIP: "127.0.0.1", GrantedPort: port, Nonce: "n1"})
+	if err != nil { t.Fatalf("probe: %v", err) }
 	if gotHost != "demo.sb1.example.com" { t.Fatalf("Host = %q", gotHost) }
 	if gotSNI != "demo.sb1.example.com" { t.Fatalf("SNI = %q", gotSNI) }
-	_ = gotRedirect
+}
+
+func TestProbeDoesNotFollowRedirect(t *testing.T) {
+	_, ctrl := newTestController(t)
+	ctrl.allowPrivate = true
+	var targetHit bool
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/followed" { targetHit = true; return }
+		http.Redirect(w, r, "/followed", http.StatusFound)
+	}))
+	ts.StartTLS()
+	defer ts.Close()
+	u, _ := url.Parse(ts.URL)
+	port := mustPort(t, u.Port())
+	// A redirect means the nonce is not echoed → the probe must fail, and the
+	// redirect target must NOT have been fetched.
+	_ = ctrl.Probe(context.Background(), "demo.sb1.example.com", "abc", "key-1", OpenAck{PublicIP: "127.0.0.1", GrantedPort: port, Nonce: "n1"})
+	if targetHit { t.Fatalf("probe followed a redirect") }
 }
 ```
 
@@ -2712,6 +2848,7 @@ var ssrfDeny = mustParseCIDRs(
 	"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
 	"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
 	"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	"192.31.196.0/24", "192.52.193.0/24", "192.175.48.0/24",
 )
 
 func mustParseCIDRs(cidrs ...string) []*net.IPNet {
@@ -2834,10 +2971,10 @@ import (
 func TestRedirect302ToOriginNoStore(t *testing.T) {
 	app, ctrl := newTestController(t)
 	seedSessionAndEpoch(t, app, ctrl) // code "abc" → apiKey "key-1", origin "demo.sb1.example.com", epoch ready
-	ctrl.EmitOpen = func(ctx, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error) {
+	ctrl.emitOpenFn = func(ctx context.Context, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error) {
 		return OpenAck{ShareID: shareID, GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok", Nonce: "n", Seq: 1}, nil
 	}
-	ctrl.Probe = func(ctx, origin, code, apiKeyID string, ack OpenAck) error { return nil }
+	ctrl.probeFn = func(ctx context.Context, origin, code, apiKeyID string, ack OpenAck) error { return nil }
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/s/abc", nil)
@@ -2963,9 +3100,9 @@ git commit -m "feat(control): redirect handler (live session lookup, epoch readi
 - Modify: `agent/internal/daemon/daemon.go` + `agent/cmd/agent/main.go` (call sites)
 - Test: `agent/internal/signaling/client_test.go`
 
-**Interfaces:** as in the original Task 4 (message fields, send helpers, `RegisterShareWithOptions` returns `(code, origin string, reconnected bool, err error)`).
+**Interfaces:** the agent-side `signaling.Message` fields + send helpers (`SubmitCSR`, `ReportEndpoint`, `OpenAck`, `TLSReady`, `TLSError`) and `RegisterShareWithOptions` returning `(code, origin string, reconnected bool, err error)`. **Plus the control-side `agentMsg` extension:**
 
-- [ ] **Step 1: Write the failing test** (as in original Task 4, plus origin return).
+- [ ] **Step 1: Write the failing test** (message-field round-trip + send-helper shape + origin return).
 
 - [ ] **Step 2: Run test, verify it fails.**
 
@@ -2982,6 +3119,38 @@ type OpenAck struct {
 	Status         string `json:"status"`
 	Error          string `json:"error,omitempty"`
 }
+```
+
+**Control-side `agentMsg` extension** (in `signaling-server/internal/handler/agent_ws.go`): add the fields the control needs to parse, and convert `open_ack` to `directctl.OpenAck` with validation:
+
+```go
+// agentMsg additions (json tags must match the agent's signaling.Message):
+	CSRPEM         string `json:"csr_pem,omitempty"`
+	Fingerprint    string `json:"fingerprint,omitempty"`
+	NotAfter       string `json:"not_after,omitempty"`
+	IP             string `json:"ip,omitempty"`
+	Port           int    `json:"port,omitempty"`
+	Status         string `json:"status,omitempty"`
+	Nonce          string `json:"nonce,omitempty"`
+	Seq            uint64 `json:"seq,omitempty"`
+	ShareID        string `json:"share_id,omitempty"`
+	Route          string `json:"route,omitempty"`
+	LeaseSeconds   int    `json:"lease_seconds,omitempty"`
+	Version        int    `json:"version,omitempty"`
+	GrantedPort    int    `json:"granted_port,omitempty"`
+	PublicIP       string `json:"public_ip,omitempty"`
+	WasAlreadyOpen bool   `json:"was_already_open,omitempty"`
+	Error          string `json:"error,omitempty"`
+
+// open_ack routing in agent_ws.go:
+case "open_ack":
+	ack := directctl.OpenAck{ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
+		GrantedPort: msg.GrantedPort, PublicIP: msg.PublicIP,
+		WasAlreadyOpen: msg.WasAlreadyOpen, Status: msg.Status, Error: msg.Error}
+	// validate: status ∈ {"ok","error"}, seq > 0, nonce != "", then dispatch
+	if ack.Status != "ok" && ack.Status != "error" { continue }
+	if ack.Nonce == "" || ack.Seq == 0 { continue }
+	ctrl.HandleOpenAck(apiKeyID, ack)
 ```
 
 - [ ] **Step 4: Run tests + build, verify pass.**
@@ -3058,10 +3227,11 @@ func (d *Daemon) canRegisterDirect() bool { return d.direct != nil && d.direct.r
 
 `directState` gets an `origin map[string]string` (code → origin) for revoke on delete. Wire:
 
-1. **Reconnect loop:** wrap the signaling connect + listen in a loop with `signaling.NewBackoff()`; on disconnect, `d.direct.gate.Reset()` and re-enroll (the daemon re-sends `hello`, re-handles `enrolled`).
-2. **Renewal scheduler:** a goroutine (e.g. every hour) checks `d.direct.cert.NeedsRenewal()`; when true, `GenerateCSR` (key reuse) + `SubmitCSR`.
-3. **Origin binding:** on `share_registered` (with origin), `d.direct.binder.Allow(origin, direct.RouteDirect, code)` and record `d.direct.origin[code] = origin`. On revoke/expiry, `d.direct.binder.Revoke(origin)`.
-4. **Enrollment handlers** (`enrolled`, `cert_issue`, `cert_error`, `enrollment_ready`, `open_signal`) as in the original Tasks 7/15, but now using `d.direct` and the corrected `agent_id` (the gate is constructed with `st.GetAgentID()`, and the control echoes the same `hello.agent_id`).
+1. **Construction (startup):** `d.direct.cert.Load()` restores the persisted namespace/key/chain. Derive a stable per-agent ownership token from the agent ID (e.g. `"sharebridge-" + shortHash(st.GetAgentID())`) and construct the port as `direct.NewOnDemandPortOwned(mapper, 443, 8443, 5*time.Minute, token, mapper.InternalIP())`. Use `d.config.BaseDomain` (new config field, env `CONTENT_BASE_DOMAIN`, default `sharebridgeusercontent.com`) for `NewBinder`, `NewDirectServer`, and `cert.NewManager`.
+2. **Reconnect loop:** wrap the signaling connect + listen in a loop with `signaling.NewBackoff()`; on disconnect, `d.direct.gate.Reset()` and re-enroll (the daemon re-sends `hello`, re-handles `enrolled`).
+3. **Renewal scheduler:** a goroutine (e.g. every hour) checks `d.direct.cert.NeedsRenewal()`; when true, `GenerateCSR` (key reuse) + `SubmitCSR`.
+4. **Origin binding + persistence:** `store.SessionEntry` gains `Origin string json:"origin,omitempty"`. On `share_registered` (with origin), `d.direct.binder.Allow(origin, direct.RouteDirect, code)`, record `d.direct.origin[code] = origin`, and persist it on the session entry. On `loadSessionsFromStore` re-registration, re-`binder.Allow` the restored origin. On revoke/expiry, `d.direct.binder.Revoke(origin)` and clear `d.direct.origin[code]`.
+5. **Enrollment handlers** (`enrolled`, `cert_issue`, `cert_error`, `enrollment_ready`, `open_signal`) as described in the enrollment gate (Task 7, above) and the open-signal handler (Task 18, below), but now using `d.direct` and the corrected `agent_id` (the gate is constructed with `st.GetAgentID()`, and the control echoes the same `hello.agent_id`).
 
 - [ ] **Step 4: Run tests + build, verify pass**
 
@@ -3132,7 +3302,12 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
 		return
 	}
-	ip, _ := d.direct.mapper.ExternalIP() // FRESH on every ack
+	ip, err := d.direct.mapper.ExternalIP() // FRESH on every ack
+	if err != nil || ip == "" {
+		d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "no_public_ip"})
+		return
+	}
 	d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
 		GrantedPort: d.direct.port.GrantedPort(), PublicIP: ip,
@@ -3154,7 +3329,7 @@ git commit -m "feat(agent): open_signal handler with fresh-IP reporting"
 ## Task 19: Control — rotation re-point + revocation deletes agent + main.go wiring
 
 **Files:**
-- Modify: `signaling-server/internal/handler/apikeys.go`
+- Modify: `signaling-server/internal/handler/api_keys.go`
 - Modify: `signaling-server/internal/config/config.go`
 - Modify: `signaling-server/cmd/server/main.go`
 - Modify: `signaling-server/internal/handler/agent_ws.go` (thread `ctrl`; route new messages; `AgentDisconnected`)
@@ -3181,11 +3356,12 @@ func TestRevokeDeletesAgent(t *testing.T) {
 In `RotateAPIKey`, inside the transaction (before revoking the old key):
 
 ```go
-// Re-point the agent to the new key (namespace + cert survive).
-agentRecs, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": oldKeyID})
+// Re-point the agent to the new key (namespace + cert survive), INSIDE the
+// surrounding app.RunInTransaction(func(txApp core.App) error { ... }).
+agentRecs, err := txApp.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": oldKeyID})
 if err == nil && len(agentRecs) > 0 {
 	agentRecs[0].Set("api_key_id", newKeyID)
-	if err := app.Save(agentRecs[0]); err != nil {
+	if err := txApp.Save(agentRecs[0]); err != nil {
 		return err
 	}
 }
