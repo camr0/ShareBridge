@@ -70,9 +70,8 @@ type nonceUse struct {
 }
 
 const (
-	signalWindow      = time.Minute
-	maxSignalsPerWin  = 10
-	maxPerSharePerWin = 3
+	signalWindow     = time.Minute
+	maxSignalsPerWin = 60
 
 	maxLease          = 15 * time.Minute                // per-share open lease ceiling
 	maxSignalLifetime = 5 * time.Minute                 // how far in the future ExpiresAt may be
@@ -94,6 +93,35 @@ func (g *SignalGate) SetLockdown(on bool) {
 	g.mu.Lock()
 	g.lockdown = on
 	g.mu.Unlock()
+}
+
+// Reset clears all gate state for a new epoch. Sequence numbers, nonces,
+// applied leases, and the rate-limit window all restart, so a signal carrying
+// a low sequence number is once again admissible.
+func (g *SignalGate) Reset() {
+	g.mu.Lock()
+	g.highest = 0
+	g.seen = map[string]nonceUse{}
+	g.applied = map[string]time.Time{}
+	g.winStart = time.Time{}
+	g.winCount = 0
+	g.perShare = map[string]int{}
+	g.mu.Unlock()
+}
+
+// VerifyNonce reports whether nonce was recently admitted for shareID, pruning
+// expired entries so an idle agent cannot echo an old nonce indefinitely.
+func (g *SignalGate) VerifyNonce(nonce, shareID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := g.now()
+	for n, u := range g.seen {
+		if now.Sub(u.seenAt) > nonceRetention {
+			delete(g.seen, n)
+		}
+	}
+	u, ok := g.seen[nonce]
+	return ok && u.shareID == shareID
 }
 
 // Admit validates one open signal. It returns nil when the signal may proceed
@@ -167,9 +195,6 @@ func (g *SignalGate) rateLimit(now time.Time, shareID string) error {
 		g.perShare = map[string]int{}
 	}
 	if g.winCount >= maxSignalsPerWin {
-		return ErrSignalRate
-	}
-	if g.perShare[shareID] >= maxPerSharePerWin {
 		return ErrSignalRate
 	}
 	g.winCount++
