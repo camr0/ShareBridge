@@ -94,7 +94,14 @@ func (g *SignalGate) VerifyNonce(nonce, shareID string) bool // enforces nonce e
 
 // agent/internal/direct — server
 type CertProvider interface { Certificate() (*tls.Certificate, error) }
-func NewDirectServer(namespace, baseDomain string, port *OnDemandPort, certs CertProvider, gate *SignalGate, maxContentBytes int64) *DirectServer
+// SessionTracker is the session interface DirectServer needs; *OnDemandPort
+// satisfies it. (Task 6 introduced this interface for testability.)
+type SessionTracker interface {
+	BeginSession(shareID string) (string, error)
+	Activity(sessionID string)
+	EndSession(sessionID string)
+}
+func NewDirectServer(namespace, baseDomain string, port SessionTracker, certs CertProvider, gate *SignalGate, maxContentBytes int64) *DirectServer
 func (s *DirectServer) TLSConfig() *tls.Config
 func (s *DirectServer) Handler() http.Handler
 func (s *DirectServer) Start(ctx context.Context, listenAddr string) error
