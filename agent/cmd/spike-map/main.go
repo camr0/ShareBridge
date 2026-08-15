@@ -39,7 +39,14 @@ func main() {
 		log.Fatalf("AddPortMapping: %v", err)
 	}
 	defer func() {
-		if err := direct.DeleteOwnedMapping(mapper, granted); err != nil {
+		want := direct.PortMapping{
+			ExternalPort:   granted,
+			InternalPort:   *intPort,
+			InternalClient: mapper.InternalIP(),
+			Protocol:       "TCP",
+			Description:    "sharebridge-bench",
+		}
+		if err := direct.DeleteOwnedMapping(mapper, granted, want); err != nil {
 			log.Printf("delete mapping: %v", err)
 		}
 	}()

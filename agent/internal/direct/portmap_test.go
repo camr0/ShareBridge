@@ -52,6 +52,8 @@ func (f *fakeMapper) DeletePortMapping(ext int) error {
 
 func (f *fakeMapper) ExternalIP() (string, error) { return f.externalIP, f.err }
 
+func (f *fakeMapper) InternalIP() string { return "192.168.1.20" }
+
 func (f *fakeMapper) ListPortMappings() ([]PortMapping, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -138,29 +140,58 @@ func TestChooseExternalPort_FallsBackWhen443Taken(t *testing.T) {
 
 // Spec §6: never delete a mapping this agent didn't create.
 func TestDeleteOwnedMapping_RefusesForeign(t *testing.T) {
-	f := &fakeMapper{mappings: map[int]PortMapping{
-		443: {ExternalPort: 443, Description: "existing-nginx"},
-	}}
-	if err := DeleteOwnedMapping(f, 443); err != ErrForeignMapping {
-		t.Fatalf("DeleteOwnedMapping = %v, want ErrForeignMapping", err)
+	want := PortMapping{ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.20", Protocol: "TCP", Description: "sharebridge-test"}
+
+	tests := []struct {
+		name    string
+		mapping PortMapping
+	}{
+		{"description mismatch", PortMapping{ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.20", Protocol: "TCP", Description: "existing-nginx"}},
+		{"internal port mismatch", PortMapping{ExternalPort: 443, InternalPort: 80, InternalClient: "192.168.1.20", Protocol: "TCP", Description: "sharebridge-test"}},
+		{"internal client mismatch", PortMapping{ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.99", Protocol: "TCP", Description: "sharebridge-test"}},
+		{"protocol mismatch", PortMapping{ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.20", Protocol: "UDP", Description: "sharebridge-test"}},
 	}
-	if len(f.deleted) != 0 {
-		t.Fatalf("foreign mapping was deleted: %v", f.deleted)
-	}
-	if _, ok := f.mappings[443]; !ok {
-		t.Fatalf("foreign mapping disappeared: %v", f.mappings)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeMapper{mappings: map[int]PortMapping{443: tt.mapping}}
+			if err := DeleteOwnedMapping(f, 443, want); err != ErrForeignMapping {
+				t.Fatalf("DeleteOwnedMapping = %v, want ErrForeignMapping", err)
+			}
+			if len(f.deleted) != 0 {
+				t.Fatalf("foreign mapping was deleted: %v", f.deleted)
+			}
+			if _, ok := f.mappings[443]; !ok {
+				t.Fatalf("foreign mapping disappeared: %v", f.mappings)
+			}
+		})
 	}
 }
 
 func TestDeleteOwnedMapping_DeletesOwn(t *testing.T) {
+	want := PortMapping{ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.20", Protocol: "TCP", Description: "sharebridge-test"}
 	f := &fakeMapper{mappings: map[int]PortMapping{
-		443: {ExternalPort: 443, Description: "sharebridge-test"},
+		443: {ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.20", Protocol: "TCP", Description: "sharebridge-test"},
 	}}
-	if err := DeleteOwnedMapping(f, 443); err != nil {
+	if err := DeleteOwnedMapping(f, 443, want); err != nil {
 		t.Fatalf("DeleteOwnedMapping: %v", err)
 	}
 	if _, ok := f.mappings[443]; ok {
 		t.Fatalf("own mapping not removed: %v", f.mappings)
+	}
+}
+
+// Deleting a mapping that is not present is idempotent (spec §6): it must not
+// error, and must not touch unrelated mappings.
+func TestDeleteOwnedMapping_IdempotentWhenAbsent(t *testing.T) {
+	want := PortMapping{ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.20", Protocol: "TCP", Description: "sharebridge-test"}
+	f := &fakeMapper{mappings: map[int]PortMapping{
+		444: {ExternalPort: 444, InternalPort: 8443, InternalClient: "192.168.1.20", Protocol: "TCP", Description: "sharebridge-test"},
+	}}
+	if err := DeleteOwnedMapping(f, 443, want); err != nil {
+		t.Fatalf("DeleteOwnedMapping (absent) = %v, want nil", err)
+	}
+	if _, ok := f.mappings[444]; !ok {
+		t.Fatalf("unrelated mapping disappeared: %v", f.mappings)
 	}
 }
 

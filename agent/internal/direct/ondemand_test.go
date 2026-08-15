@@ -85,6 +85,9 @@ type recordingMapper struct {
 	remap          int   // if non-zero, AddPortMapping returns this instead of ext
 	addErr         error // if set, AddPortMapping returns this error
 	addPorts       []int // ext argument of every AddPortMapping call
+	addDescs       []string
+	events         []string      // "add:<ext>"/"del:<ext>" in call order
+	listMappings   []PortMapping // if non-nil, ListPortMappings returns these (else ErrListingUnsupported)
 }
 
 func (r *recordingMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
@@ -93,6 +96,8 @@ func (r *recordingMapper) AddPortMapping(ext, internal int, desc string, lease i
 	r.opened++
 	r.lastLease = lease
 	r.addPorts = append(r.addPorts, ext)
+	r.addDescs = append(r.addDescs, desc)
+	r.events = append(r.events, fmt.Sprintf("add:%d", ext))
 	if r.addErr != nil {
 		return 0, r.addErr
 	}
@@ -105,6 +110,7 @@ func (r *recordingMapper) DeletePortMapping(ext int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.delCalls++
+	r.events = append(r.events, fmt.Sprintf("del:%d", ext))
 	if r.alwaysFailDel || r.delCalls <= r.delFails {
 		return fmt.Errorf("delete failed (attempt %d)", r.delCalls)
 	}
@@ -113,8 +119,36 @@ func (r *recordingMapper) DeletePortMapping(ext int) error {
 }
 func (r *recordingMapper) ExternalIP() (string, error) { return "203.0.113.7", nil }
 
+func (r *recordingMapper) InternalIP() string { return "" }
+
 func (r *recordingMapper) ListPortMappings() ([]PortMapping, error) {
-	return nil, ErrListingUnsupported
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.listMappings == nil {
+		return nil, ErrListingUnsupported
+	}
+	out := make([]PortMapping, len(r.listMappings))
+	copy(out, r.listMappings)
+	return out, nil
+}
+
+// lastDesc returns the description argument of the most recent AddPortMapping.
+func (r *recordingMapper) lastDesc() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.addDescs) == 0 {
+		return ""
+	}
+	return r.addDescs[len(r.addDescs)-1]
+}
+
+// eventsSnapshot returns a copy of the add/delete call sequence.
+func (r *recordingMapper) eventsSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.events))
+	copy(out, r.events)
+	return out
 }
 
 func (r *recordingMapper) snapshot() (opened, closed, delCalls, lastLease int) {
@@ -134,19 +168,26 @@ func (r *recordingMapper) ports() []int {
 
 // --- helpers ---
 
-func newTestPort(fc *fakeClock, mapper PortMapper, idleTimeout time.Duration) *OnDemandPort {
+func newOwnedTestPort(fc *fakeClock, mapper PortMapper, extPort, intPort int, idleTimeout time.Duration, descPrefix, intClient string) *OnDemandPort {
 	p := &OnDemandPort{
 		mapper:      mapper,
-		extPort:     8443,
-		intPort:     8443,
+		extPort:     extPort,
+		intPort:     intPort,
 		idleTimeout: idleTimeout,
 		renewWindow: 2 * time.Second,
 		clock:       fc,
+		descPrefix:  descPrefix,
+		intClient:   intClient,
 		cmds:        make(chan portCommand),
 		done:        make(chan struct{}),
+		state:       StateClosed,
 	}
 	go p.loop()
 	return p
+}
+
+func newTestPort(fc *fakeClock, mapper PortMapper, idleTimeout time.Duration) *OnDemandPort {
+	return newOwnedTestPort(fc, mapper, 8443, 8443, idleTimeout, DescriptionPrefix, "")
 }
 
 func waitFor(t *testing.T, cond func() bool) {
@@ -398,4 +439,100 @@ func TestOnDemandPort_OpenForFailureDuringCloseKeepsRetrying(t *testing.T) {
 	// not a one-off.
 	fc.advance(closeRetryDelay + time.Millisecond)
 	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d > after })
+}
+
+func TestOpenForFastPathRenewsOnlyWhenLeaseTooShort(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	rm := &recordingMapper{}
+	p := newTestPort(fc, rm, time.Minute)
+	defer p.Close()
+
+	if err := p.OpenFor("share-1", 60*time.Second); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	fc.advance(10 * time.Second) // 50s remaining on the router lease
+
+	// OpenFor(30s) fits within the remaining 50s → must NOT renew.
+	if err := p.OpenFor("share-2", 30*time.Second); err != nil {
+		t.Fatalf("OpenFor(30s): %v", err)
+	}
+	if o, _, _, _ := rm.snapshot(); o != 1 {
+		t.Fatalf("OpenFor(30s) within remaining lease must not renew: AddPortMapping called %d times, want 1", o)
+	}
+
+	// OpenFor(120s) exceeds the remaining 50s → MUST renew.
+	if err := p.OpenFor("share-3", 120*time.Second); err != nil {
+		t.Fatalf("OpenFor(120s): %v", err)
+	}
+	if o, _, _, _ := rm.snapshot(); o != 2 {
+		t.Fatalf("OpenFor(120s) must renew: AddPortMapping called %d times, want 2", o)
+	}
+}
+
+func TestColdOpenCleansLingeringMapping(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	// The first maxCloseAttempts deletes fail, so Close escalates to
+	// close-failed with the mapping still lingering on the router.
+	rm := &recordingMapper{delFails: maxCloseAttempts}
+	p := newTestPort(fc, rm, time.Minute)
+	defer p.Close()
+
+	if err := p.OpenFor("share-1", time.Minute); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	if err := p.Close(); !errors.Is(err, ErrDeleteRetry) {
+		t.Fatalf("Close: want ErrDeleteRetry, got %v", err)
+	}
+	// Drive the delete-retry timer to escalation (close-failed).
+	for i := 0; i < maxCloseAttempts; i++ {
+		fc.advance(closeRetryDelay + time.Millisecond)
+		waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= i+2 || d >= maxCloseAttempts })
+	}
+	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= maxCloseAttempts })
+	if got := p.State(); got != StateCloseFailed {
+		t.Fatalf("State = %v, want StateCloseFailed", got)
+	}
+
+	// A subsequent cold OpenFor must delete the lingering mapping BEFORE
+	// re-selecting and adding the new mapping.
+	if err := p.OpenFor("share-2", time.Minute); err != nil {
+		t.Fatalf("OpenFor after close-failed: %v", err)
+	}
+	ev := rm.eventsSnapshot()
+	if n := len(ev); n < 2 || ev[n-2] != "del:8443" || ev[n-1] != "add:8443" {
+		t.Fatalf("cold open must delete lingering mapping before re-adding; events = %v", ev)
+	}
+}
+
+func TestOwnershipTokenInDescription(t *testing.T) {
+	// Listing-supported mapper with an empty list, so ChooseExternalPort keeps
+	// 443 and the description records the per-agent token + port.
+	rm := &recordingMapper{listMappings: []PortMapping{}}
+	p := NewOnDemandPortOwned(rm, 443, 8443, 5*time.Minute, "sharebridge-abc", "192.168.1.2")
+	defer p.Close()
+
+	if err := p.OpenFor("share-1", time.Minute); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	if got := rm.lastDesc(); got != "sharebridge-abc-443" {
+		t.Fatalf("description = %q, want sharebridge-abc-443", got)
+	}
+
+	want := PortMapping{ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.2", Protocol: "TCP", Description: "sharebridge-abc-443"}
+
+	// DeleteOwnedMapping refuses a mapping whose description differs.
+	foreign := &fakeMapper{mappings: map[int]PortMapping{
+		443: {ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.2", Protocol: "TCP", Description: "someone-else-443"},
+	}}
+	if err := DeleteOwnedMapping(foreign, 443, want); err != ErrForeignMapping {
+		t.Fatalf("DeleteOwnedMapping (description mismatch) = %v, want ErrForeignMapping", err)
+	}
+
+	// ...and one whose internal client (per-agent identity) differs.
+	wrongClient := &fakeMapper{mappings: map[int]PortMapping{
+		443: {ExternalPort: 443, InternalPort: 8443, InternalClient: "192.168.1.99", Protocol: "TCP", Description: "sharebridge-abc-443"},
+	}}
+	if err := DeleteOwnedMapping(wrongClient, 443, want); err != ErrForeignMapping {
+		t.Fatalf("DeleteOwnedMapping (internal client mismatch) = %v, want ErrForeignMapping", err)
+	}
 }

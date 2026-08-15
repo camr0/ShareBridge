@@ -26,6 +26,16 @@ const (
 	maxCloseAttempts = 5
 )
 
+// PortState is the lifecycle state of the on-demand port mapping.
+type PortState int
+
+const (
+	StateClosed PortState = iota
+	StateOpen
+	StateClosing
+	StateCloseFailed
+)
+
 var (
 	ErrPortClosed  = errors.New("direct: port is closed")
 	ErrDeleteRetry = errors.New("direct: mapping deletion failed; retrying")
@@ -66,6 +76,8 @@ const (
 	opClose
 	opIsOpen
 	opGrantedPort
+	opState
+	opSetCallback
 )
 
 type portReply struct {
@@ -73,6 +85,8 @@ type portReply struct {
 	sessionID string
 	granted   int
 	err       error
+	wasOpen   bool
+	state     PortState
 }
 
 type portCommand struct {
@@ -80,6 +94,7 @@ type portCommand struct {
 	shareID   string
 	lease     time.Duration
 	sessionID string
+	callback  func(old, new PortState, grantedPort int)
 	reply     chan portReply
 }
 
@@ -94,6 +109,10 @@ type portCommand struct {
 // before the lease expires; when the last session ends, an inactivity timeout
 // (or the unrenewed lease) closes it. Close is idempotent, and deletion
 // failures are retried with backoff then surfaced via CloseError.
+//
+// Ownership is per-agent: the mapping's description is "<descPrefix>-<extPort>"
+// and its internal client is intClient, so DeleteOwnedMapping only ever removes
+// a mapping this exact agent created (see portmap.go).
 type OnDemandPort struct {
 	mapper      PortMapper
 	extPort     int
@@ -101,6 +120,14 @@ type OnDemandPort struct {
 	idleTimeout time.Duration
 	renewWindow time.Duration
 	clock       portClock
+
+	descPrefix string
+	intClient  string
+
+	// state and cb are only read/written on the loop goroutine (via setState
+	// and the opState/opSetCallback commands), so they need no separate lock.
+	state PortState
+	cb    func(old, new PortState, grantedPort int)
 
 	cmds chan portCommand
 	done chan struct{}
@@ -114,6 +141,10 @@ func NewOnDemandPort(mapper PortMapper, extPort int) *OnDemandPort {
 }
 
 func NewOnDemandPortOpts(mapper PortMapper, extPort, intPort int, idleTimeout time.Duration) *OnDemandPort {
+	return NewOnDemandPortOwned(mapper, extPort, intPort, idleTimeout, DescriptionPrefix, mapper.InternalIP())
+}
+
+func NewOnDemandPortOwned(mapper PortMapper, extPort, intPort int, idleTimeout time.Duration, descPrefix, intClient string) *OnDemandPort {
 	p := &OnDemandPort{
 		mapper:      mapper,
 		extPort:     extPort,
@@ -121,14 +152,17 @@ func NewOnDemandPortOpts(mapper PortMapper, extPort, intPort int, idleTimeout ti
 		idleTimeout: idleTimeout,
 		renewWindow: renewWindow,
 		clock:       wallClock{},
+		descPrefix:  descPrefix,
+		intClient:   intClient,
 		cmds:        make(chan portCommand),
 		done:        make(chan struct{}),
+		state:       StateClosed,
 	}
 	go p.loop()
 	return p
 }
 
-func (p *OnDemandPort) desc() string { return fmt.Sprintf("sharebridge-direct-%d", p.extPort) }
+func (p *OnDemandPort) desc() string { return fmt.Sprintf("%s-%d", p.descPrefix, p.extPort) }
 
 func (p *OnDemandPort) send(c portCommand) portReply {
 	select {
@@ -143,6 +177,21 @@ func (p *OnDemandPort) send(c portCommand) portReply {
 func (p *OnDemandPort) Open() bool {
 	ch := make(chan portReply, 1)
 	return p.send(portCommand{op: opIsOpen, reply: ch}).open
+}
+
+// State returns the current lifecycle state of the port mapping.
+func (p *OnDemandPort) State() PortState {
+	ch := make(chan portReply, 1)
+	return p.send(portCommand{op: opState, reply: ch}).state
+}
+
+// SetTransitionCallback registers a callback invoked synchronously on the
+// state loop whenever the port's state changes. It receives the old state, the
+// new state, and the granted external port in effect (zero once closed). A nil
+// callback clears any previously registered one.
+func (p *OnDemandPort) SetTransitionCallback(cb func(old, new PortState, grantedPort int)) {
+	ch := make(chan portReply, 1)
+	p.send(portCommand{op: opSetCallback, callback: cb, reply: ch})
 }
 
 // OpenFor maps (or re-maps/renews) the port for shareID with the given lease.
@@ -202,6 +251,15 @@ func (p *OnDemandPort) setCloseErr(err error) {
 	p.closeMu.Lock()
 	p.closeErr = err
 	p.closeMu.Unlock()
+}
+
+// setState runs on the loop goroutine. It fires the transition callback (if
+// any) only on an actual state change, then records the new state.
+func (p *OnDemandPort) setState(next PortState, grantedPort int) {
+	if p.cb != nil && p.state != next {
+		p.cb(p.state, next, grantedPort)
+	}
+	p.state = next
 }
 
 func (p *OnDemandPort) loop() {
@@ -272,16 +330,26 @@ func (p *OnDemandPort) loop() {
 			port = grantedPort
 		}
 		// DeleteOwnedMapping refuses to delete a mapping this agent didn't
-		// create (spec §6), rather than deleting blindly.
-		if err := DeleteOwnedMapping(p.mapper, port); err != nil {
+		// create (spec §6), rather than deleting blindly. The want identity is
+		// exact: same description, internal port, internal client, protocol.
+		want := PortMapping{
+			ExternalPort:   port,
+			InternalPort:   p.intPort,
+			InternalClient: p.intClient,
+			Protocol:       "TCP",
+			Description:    p.desc(),
+		}
+		if err := DeleteOwnedMapping(p.mapper, port, want); err != nil {
 			closeFail++
 			p.setCloseErr(err)
+			p.setState(StateClosing, port)
 			return false
 		}
 		closing = false
 		closeFail = 0
 		grantedPort = 0
 		p.setCloseErr(nil)
+		p.setState(StateClosed, 0)
 		return true
 	}
 	startClose := func() {
@@ -290,6 +358,7 @@ func (p *OnDemandPort) loop() {
 		closeFail = 0
 		sessions = map[string]time.Time{} // drop stale sessions so a reopen can't renew from them
 		idleAt = time.Time{}
+		p.setState(StateClosing, grantedPort)
 		rearm() // first DeletePortMapping happens on the next tick
 	}
 
@@ -302,34 +371,67 @@ func (p *OnDemandPort) loop() {
 				if l < minValidLease {
 					l = minValidLease
 				}
-				port := p.extPort
-				if grantedPort != 0 {
-					port = grantedPort
-				}
-				granted, err := p.mapper.AddPortMapping(port, p.intPort, p.desc(), int(l.Seconds()))
-				if err != nil {
-					// Leave closing intact on failure: the old mapping may still
-					// exist on the router, so the armed delete-retry timer must
-					// keep firing rather than being silently abandoned.
-					c.reply <- portReply{err: err}
-					continue
-				}
-				if closing {
+				now := p.clock.Now()
+
+				if !open {
+					// Cold open. If a mapping from a prior open lingers
+					// (closing or close-failed), delete it before re-selecting
+					// — never two mappings on the router at once.
+					if grantedPort != 0 {
+						if !tryDelete() {
+							c.reply <- portReply{err: ErrDeleteRetry}
+							continue
+						}
+					}
+					requested, err := ChooseExternalPort(p.mapper, p.extPort)
+					if err != nil {
+						c.reply <- portReply{err: err}
+						continue
+					}
+					p.extPort = requested
+					granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(l.Seconds()))
+					if err != nil {
+						c.reply <- portReply{err: err}
+						continue
+					}
+					grantedPort = granted
+					open = true
 					closing = false
 					closeFail = 0
+					renewFailed = false
+					lease = l
+					deadline = now.Add(l)
+					renewAt = deadline.Add(-p.renewWindow)
+					if !renewAt.After(now) {
+						renewAt = now.Add(p.renewWindow)
+					}
+					idleAt = time.Time{}
+					p.setState(StateOpen, grantedPort)
+					rearm()
+					c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: false}
+					continue
 				}
-				grantedPort = granted
-				renewFailed = false
-				open = true
-				now := p.clock.Now()
-				lease = l
-				deadline = now.Add(l)
-				renewAt = deadline.Add(-p.renewWindow)
-				if !renewAt.After(now) {
-					renewAt = now.Add(p.renewWindow)
+
+				// Fast path: already open. A fresh signal means a fresh
+				// recipient, so clear the inactivity-close deadline; renew the
+				// router lease only when the requested lease extends beyond the
+				// current lease expiry.
+				wasOpen := true
+				idleAt = time.Time{}
+				if now.Add(l).After(deadline) {
+					granted, err := p.mapper.AddPortMapping(grantedPort, p.intPort, p.desc(), int(l.Seconds()))
+					if err != nil {
+						renewFailed = true
+						renewAt = deadline
+						c.reply <- portReply{err: err}
+						continue
+					}
+					grantedPort = granted
+					deadline = now.Add(l)
+					renewAt = deadline.Add(-p.renewWindow)
 				}
 				rearm()
-				c.reply <- portReply{err: nil}
+				c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: wasOpen}
 
 			case opBeginSession:
 				if !open {
@@ -387,6 +489,13 @@ func (p *OnDemandPort) loop() {
 
 			case opGrantedPort:
 				c.reply <- portReply{granted: grantedPort}
+
+			case opState:
+				c.reply <- portReply{state: p.state}
+
+			case opSetCallback:
+				p.cb = c.callback
+				c.reply <- portReply{}
 			}
 
 		case <-timerC:
@@ -399,6 +508,7 @@ func (p *OnDemandPort) loop() {
 					rearm()
 				} else if closeFail >= maxCloseAttempts {
 					closing = false
+					p.setState(StateCloseFailed, grantedPort)
 					rearm() // mapping remains; failure surfaced via CloseError
 				} else {
 					rearm()

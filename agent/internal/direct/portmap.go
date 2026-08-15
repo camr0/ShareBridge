@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 
 	"github.com/huin/goupnp/dcps/internetgateway1"
@@ -44,6 +43,7 @@ type PortMapper interface {
 	DeletePortMapping(externalPort int) error
 	ExternalIP() (string, error)
 	ListPortMappings() ([]PortMapping, error)
+	InternalIP() string
 }
 
 // upnpConnection abstracts WANIPConnection1 and WANPPPConnection1, which have
@@ -100,6 +100,8 @@ func (m *UPnPMapper) DeletePortMapping(ext int) error {
 func (m *UPnPMapper) ExternalIP() (string, error) {
 	return m.client.GetExternalIPAddress()
 }
+
+func (m *UPnPMapper) InternalIP() string { return m.internalIP }
 
 func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
 	var out []PortMapping
@@ -198,6 +200,10 @@ func (m *NATPMPMapper) ExternalIP() (string, error) {
 	return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]), nil
 }
 
+// InternalIP is empty for NAT-PMP: the protocol has no notion of an internal
+// client address (the router forwards to the requesting host by construction).
+func (m *NATPMPMapper) InternalIP() string { return "" }
+
 func (m *NATPMPMapper) ListPortMappings() ([]PortMapping, error) {
 	return nil, ErrListingUnsupported
 }
@@ -242,10 +248,14 @@ func ChooseExternalPort(mapper PortMapper, preferred int) (int, error) {
 	return preferred, nil
 }
 
-// DeleteOwnedMapping removes a mapping only if this agent created it. Mappers
-// without listing support (NAT-PMP) are deleted best-effort: their mappings
-// expire on their own and we tracked the granted port ourselves.
-func DeleteOwnedMapping(mapper PortMapper, externalPort int) error {
+// DeleteOwnedMapping removes the mapping at externalPort only if it EXACTLY
+// matches want (description, internal port, internal client, protocol). A
+// mapping that differs in any of those fields belongs to another service or
+// agent, so deletion is refused with ErrForeignMapping rather than clobbering
+// it. If there is no mapping at externalPort, the call is a no-op (idempotent).
+// Mappers without listing support (NAT-PMP) are deleted best-effort: their
+// mappings expire on their own and we tracked the granted port ourselves.
+func DeleteOwnedMapping(mapper PortMapper, externalPort int, want PortMapping) error {
 	mappings, err := mapper.ListPortMappings()
 	switch {
 	case errors.Is(err, ErrListingUnsupported):
@@ -254,11 +264,16 @@ func DeleteOwnedMapping(mapper PortMapper, externalPort int) error {
 		return fmt.Errorf("list port mappings: %w", err)
 	}
 	for _, m := range mappings {
-		if m.ExternalPort == externalPort && !strings.HasPrefix(m.Description, DescriptionPrefix) {
+		if m.ExternalPort != externalPort {
+			continue
+		}
+		if m.Description != want.Description || m.InternalPort != want.InternalPort ||
+			m.InternalClient != want.InternalClient || m.Protocol != want.Protocol {
 			return ErrForeignMapping
 		}
+		return mapper.DeletePortMapping(externalPort)
 	}
-	return mapper.DeletePortMapping(externalPort)
+	return nil // no mapping at that port (idempotent)
 }
 
 // lanAddressTowardsGateway returns this host's IP on the interface that routes

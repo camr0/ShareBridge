@@ -69,7 +69,14 @@ func main() {
 	// Remove the mapping on SIGINT/SIGTERM as well as on normal return, and
 	// only if this agent created it (§6).
 	defer func() {
-		if err := direct.DeleteOwnedMapping(mapper, granted); err != nil {
+		want := direct.PortMapping{
+			ExternalPort:   granted,
+			InternalPort:   *internalPort,
+			InternalClient: mapper.InternalIP(),
+			Protocol:       "TCP",
+			Description:    "sharebridge-spike",
+		}
+		if err := direct.DeleteOwnedMapping(mapper, granted, want); err != nil {
 			log.Printf("DeleteOwnedMapping(%d): %v", granted, err)
 		}
 	}()
