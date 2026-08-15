@@ -405,10 +405,12 @@ Expected: PASS.
 - [ ] **Step 5: Write the ACME DNS-01 spike program**
 
 `signaling-server/cmd/spike-cert/main.go`:
-1. Read `DNS_PROVIDER` + provider credentials from env (lego abstracts the provider — see https://go-acme.github.io/lego/dns/).
+1. Read `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ZONE` from env (lego's built-in `cloudflare` DNS provider).
 2. Call `GenerateWildcardCSR(namespace)`.
-3. Use `github.com/go-acme/lego/v4` to run an ACME DNS-01 order for `*.<namespace>.sharebridgeusercontent.com`, placing and removing the `_acme-challenge` TXT record via the configured DNS provider.
+3. Use `github.com/go-acme/lego/v4` with the `cloudflare` provider to run an ACME DNS-01 order for `*.<namespace>.sharebridgeusercontent.com` (lego places and removes the `_acme-challenge` TXT record).
 4. Write the returned chain to `cert.pem`, then call `ValidateSAN` on it.
+
+Note: lego handles ACME TXT records only. DDNS A-record updates are a separate Phase 2 component using `github.com/cloudflare/cloudflare-go`, not lego.
 
 - [ ] **Step 6: Run the spike against a real domain + CA**
 

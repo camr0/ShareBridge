@@ -207,14 +207,16 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - The public port is closed by default and opened on demand by the control plane for an active share access; the open/close switch is the UPnP mapping.
 - Sequencing: build the agent HTTPS server + direct wiring first (the custom Secure Relay remains the fallback), then migrate the relay to FRP L4 passthrough and delete Noise/WebRTC. There is no legacy-compatibility constraint (pre-release, no external users), so this is a clean v2 rewrite.
 - The direct transport (UPnP + on-demand + endpoint reporting) is packaged as a reusable internal library behind a narrow transport interface (sibling to the FRP tunnel); DDNS and the HTTP/reverse-proxy layer are separate concerns.
+- UPnP: `huin/goupnp` (IGD, primary) + `jackpal/go-nat-pmp` (NAT-PMP, fallback); PCP later if needed.
+- DNS: Cloudflare (registrar Porkbun, DNS managed on Cloudflare). ACME DNS-01 via lego's built-in Cloudflare provider; DDNS A-record updates via `github.com/cloudflare/cloudflare-go`; TTL 60s.
+- Service naming: relay path is `sharebridge-relay` (components `sharebridge-relay-gateway` for L4 SNI routing + `sharebridge-relay-frps` for the tunnel); control plane is `sharebridge-control` (accounts + direct-mode negotiation + share lifecycle).
 
 ## 15. Open Questions
 
-1. Select the concrete UPnP/NAT-PMP library and its self-probe method.
-2. Decide the DDNS provider and TTL policy.
-3. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
-4. Whether to publish the "WebTCP"-style transport library publicly (internal packaging is decided in §14).
-5. Frontend model: (a) custom ShareBridge frontend — lean (Immich Public Proxy-style: server-side fetch of the share's assets + minimal gallery, ~one API call) or rich (current full connector); vs (b) transparent route-proxy to the source's own share page (11notes/immich-share-proxy style — least code, non-unified UX, route-filter maintenance). The agent HTTPS server is frontend-agnostic, so this is decoupled from the transport and can be decided later.
+1. Select and register the content domain (`sharebridgeusercontent.com` is the working name but not yet purchased — FRP §27.1); add it to Cloudflare once bought.
+2. Define the lockdown-mode UX (where the button lives, whether it also forces all active shares to relay).
+3. Whether to publish the "WebTCP"-style transport library publicly (internal packaging is decided in §14).
+4. Frontend model: (a) custom ShareBridge frontend — lean (Immich Public Proxy-style: server-side fetch of the share's assets + minimal gallery, ~one API call) or rich (current full connector); vs (b) transparent route-proxy to the source's own share page (11notes/immich-share-proxy style — least code, non-unified UX, route-filter maintenance). The agent HTTPS server is frontend-agnostic, so this is decoupled from the transport and can be decided later.
 
 ## 16. References
 
