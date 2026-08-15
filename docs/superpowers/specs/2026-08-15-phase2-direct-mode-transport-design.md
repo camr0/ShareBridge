@@ -1,9 +1,9 @@
 # Phase 2 — Direct-Mode Transport (Agent HTTPS Server + Control Wiring)
 
 **Date:** 2026-08-15
-**Status:** Approved (design) — pending implementation plan
+**Status:** Approved (design) — revision 2 (incorporates design review findings)
 **Companion to:** `docs/superpowers/specs/2026-08-14-direct-tcp-mode-design.md` (the "v2 direct-TCP" spec this phase implements)
-**Implements:** the transport core of the v2 direct data plane — the agent HTTPS server, cert lifecycle, enrollment, endpoint reporting, and the control-plane open-signal/redirect loop.
+**Implements:** the transport core of the v2 direct data plane — the agent HTTPS server, cert lifecycle, enrollment, endpoint reporting, and the control-plane open-signal/redirect flow.
 
 ## 1. Summary
 
@@ -11,16 +11,17 @@ Phase 1 proved the building blocks and settled the throughput model. Phase 2 is 
 **transport-first milestone**: wire the validated primitives into a real, end-to-end
 direct path — a browser reaches the agent over native HTTPS, with a real Let's
 Encrypt certificate and an on-demand UPnP/NAT-PMP port, and downloads a file — with
-the control plane coordinating enrollment, certificate issuance, DDNS, and the
-open-signal/redirect flow. Content is a **placeholder** (a synthetic file); the real
-content-serving rewrite and the recipient UI are the next phase (item 2).
+the control plane coordinating enrollment, certificate issuance, DDNS, reachability
+probing, and the open-signal/redirect flow. Content is a **placeholder** (a synthetic
+file); the real content-serving rewrite and the recipient UI are the next phase
+(item 2).
 
 **In scope:**
 - Agent cert lifecycle (key custody → CSR → control-plane ACME → validate → install → renew).
 - Agent direct HTTPS server (`direct.Binder` + `direct.OnDemandPort` + installed cert).
 - Agent endpoint reporting (public IP:port).
 - Control-plane enrollment (namespace assignment) + `agents` schema.
-- Control-plane open-signal emission → `open_ack` → 302 redirect.
+- Control-plane open-signal emission → `open_ack` → reachability probe → 302 redirect.
 - Control-plane DDNS trigger on IP change.
 - Placeholder content served over the direct path.
 
@@ -29,10 +30,12 @@ content-serving rewrite and the recipient UI are the next phase (item 2).
 - Measure-and-prefer per recipient (item 4).
 - Relay fallback / FRP tunnel (Phase 3); this milestone is **direct-only**.
 - `signaling-server/` → `control/` rename + `relay/` layout (Phase 3).
+- STUN cross-check of the agent's reported public IP (the *independent* observation
+  half of the v2 self-probe) — see §6.
 
 ## 2. Architecture & Components
 
-Two new pieces on the agent, four on the control plane, one schema change, all
+Two new pieces on the agent, five on the control plane, one schema change, all
 speaking over the existing authenticated agent WebSocket. The Phase-1 libraries
 (`agent/internal/direct`, `agent/internal/cert`, `certcoordinator`, `ddns`) are
 wrapped, not rewritten.
@@ -53,24 +56,35 @@ wrapped, not rewritten.
 6. **Cert coordinator (WS-integrated)** — on `csr_submit`: validate the CSR, run ACME
    DNS-01 (lego), push `cert_issue`/`cert_error`.
 7. **Open-signal emitter + redirect** — on `/s/<code>`: resolve agent + origin, send
-   `open_signal`, wait `open_ack`, 302 to the direct hostname.
+   `open_signal`, wait `open_ack`, probe reachability (cold opens), 302 to the direct
+   hostname.
 8. **DDNS trigger** — on endpoint report with a changed IP, update the wildcard A record.
 
 ### WebSocket protocol (extend the existing `/ws/agent`)
 
+Wire types are normative: `lease_seconds` is an integer (seconds, not Go
+`time.Duration`); timestamps are RFC3339 strings; `seq` is a `uint64`; `fingerprint`
+is a lowercase SHA-256 hex digest of the DER leaf. Unknown fields are ignored;
+unexpected values are a protocol error.
+
 | Direction | Message | Payload |
 |---|---|---|
-| agent → control | `csr_submit` | `{ csr_pem }` |
-| agent → control | `report_endpoint` | `{ ip, port }` (`port: 0` = closed) |
-| agent → control | `open_ack` | `{ share_id, granted_port, public_ip }` |
-| agent → control | `register_share` | *(existing) + `origin` field* |
+| agent → control | `csr_submit` | `{ csr_pem: string }` |
+| agent → control | `report_endpoint` | `{ ip: string, port: int, status?: "closed" \| "close_failed" }` (`port: 0` = closed) |
+| agent → control | `open_ack` | `{ share_id, nonce, seq, granted_port, public_ip, was_already_open: bool, status: "ok" \| "error", error?: code }` |
+| agent → control | `tls_ready` | `{ fingerprint, not_after: RFC3339 }` |
+| agent → control | `tls_error` | `{ reason }` |
+| agent → control | `register_share` | *(existing)* |
 | control → agent | `enrolled` | `{ namespace }` |
+| control → agent | `enrollment_ready` | `{}` |
 | control → agent | `cert_issue` | `{ chain_pem }` |
 | control → agent | `cert_error` | `{ reason }` |
-| control → agent | `open_signal` | `{ version, agent_id, share_id, route, nonce, seq, expires_at, lease }` |
+| control → agent | `open_signal` | `{ version, agent_id, share_id, route, nonce, seq, lease_seconds, expires_at: RFC3339 }` |
+| control → agent | `share_registered` | *(existing)* `+ { origin }` |
 
-`share_id` is the share code; the agent maps it to its registered origin via the
-`Binder`/`shareAuthorizer`.
+The origin is **control-allocated** and returned in `share_registered` (§5). The
+`open_ack` echoes `nonce` + `seq` so the control can correlate it to a specific
+in-flight open request (§5). `share_id` is the share code.
 
 ## 3. Schema
 
@@ -85,102 +99,158 @@ self-reported `agent_id`.
 | `endpoint_ip` | text | last reported public IP |
 | `endpoint_port` | number | last reported port; **0 = closed**; informational only |
 | `cert_status` | text | `pending` / `ready` |
+| `cert_fingerprint` | text | SHA-256 of the latest issued leaf (generation tracking) |
 | `cert_expires_at` | date | leaf NotAfter |
 | `last_report_at` | date | last endpoint report |
 
-`sessions` gains `origin` (text) — the random per-share origin hostname
-(`<random>.<ns>.sharebridgeusercontent.com`), assigned by the agent at `register_share`.
+`sessions` gains `origin` (text, **unique**) — the random per-share origin hostname,
+**allocated by the control plane** at `register_share` (§5). Origins are permanent and
+never reused (tombstoned): allocation is globally-unique via the unique index +
+collision retry, and a deleted session's origin is not re-issued.
+
+**API-key rotation preserves the agent.** `agents` is keyed by `api_key_id`, but
+rotation must transactionally **re-point** `agents.api_key_id` to the new key record
+(and re-key any in-flight hub state) *before* the old key is revoked/deleted, so the
+namespace + cert survive a key rotation. Revocation without a replacement key
+cascade-deletes the agent (fresh namespace on re-enroll — acceptable).
+
+**Migration:** a **new forward migration** adds `agents` and `sessions.origin` with
+unique indexes (`agents.api_key_id`, `agents.namespace`, `sessions.origin`). Do not
+edit `1_create_collections.go`, which early-returns on existing databases.
 
 **DNS carries the IP, the redirect URL carries the port, the DB carries the origin and
-namespace bookkeeping.** There are exactly two wildcard A records per namespace
-(`*.<ns>` and `*.relay.<ns>`); no per-share DNS. `endpoint_port` is informational
-only — the redirect always uses the live `open_ack` granted port (§5).
+namespace bookkeeping.** There are exactly two wildcard SANs per namespace on one
+certificate; only the direct `*.<ns>` A record is provisioned this phase — the
+`*.relay.<ns>` A record is deferred with the Phase 3 gateway (the cert still includes
+the relay SAN so the namespace is relay-ready). `endpoint_port` is informational only
+— the redirect always uses the live `open_ack` granted port (§5).
 
 ## 4. Enrollment & Cert Lifecycle
 
 Enrollment is a **startup gate**: the agent cannot register direct shares until it is
-enrolled and cert-ready.
+enrolled and cert-ready. Readiness is an explicit handshake, not inferred from ACME
+returning a chain.
 
 **First connect:**
 1. `hello { agent_id }` (API-key authenticated). Control loads `agents` by
-   `api_key_id`; missing → create with a fresh random namespace, `cert_status =
-   "pending"`.
+   `api_key_id`; missing → create with a fresh random namespace, `cert_status = "pending"`.
 2. Control → `enrolled { namespace }`. Agent persists the namespace.
 3. Agent reports its public IP (`report_endpoint { ip, 0 }`) → control runs DDNS to
    create/update the wildcard A record. *(Parallel with cert issuance — the A record
    serves the browser; ACME uses TXT records, independent.)*
 4. Agent generates an ECDSA P-256 key (never leaves the agent) + a 2-SAN wildcard CSR
    (`*.ns` + `*.relay.ns`) → `csr_submit`.
-5. Control validates the CSR (§6) and runs ACME DNS-01 (lego) in a background
-   goroutine (10–60s) → `cert_issue { chain }` or `cert_error { reason }`.
+5. Control validates the CSR (§6) and runs ACME DNS-01 (lego) in a bounded worker
+   (§6) → `cert_issue { chain }` or `cert_error { reason }`.
 6. Agent validates the chain (`cert.ValidateChain`: public-key equality, exact SANs,
    serverAuth EKU), installs it, persists key+chain to its data dir, atomically
-   reloads the TLS config (no listener restart).
-7. When **both** DDNS and cert are complete → `cert_status = "ready"`. The agent may
-   now register direct shares.
+   reloads the TLS config (no listener restart), then sends
+   **`tls_ready { fingerprint, not_after }`** (or `tls_error`).
+7. Control marks `cert_status = "ready"` only after **both** DDNS is provisioned **and**
+   `tls_ready` is received; it then sends **`enrollment_ready`**. The agent may now
+   register direct shares.
 
-**Restart/reconnect:** namespace + key + chain are persisted; a reconnect re-sends
-`enrolled` and the agent skips the CSR if its chain is still valid.
+**Reconnect reconciliation:** on reconnect, `enrolled` is re-sent; the agent re-sends
+`tls_ready` if its persisted chain is still valid (not expiring), else submits a fresh
+CSR. The control re-evaluates readiness from the agent's `tls_ready` + current DDNS
+state — a reconnecting agent is never left permanently `pending`.
 
 **Renewal (agent-driven):** when the leaf `NotAfter` is < ~30 days out, the agent
 submits a fresh CSR (reusing the same key); control re-issues; agent installs +
-reloads. No control-side push.
+reloads + re-sends `tls_ready`. `cert_fingerprint` lets the control ignore stale or
+out-of-order generation acks.
 
-**Control-side requirement:** the ACME account key must be **persisted** (the Phase-1
-spike generated an ephemeral one each call — see the `acmeAccount` comment). This is
-required for correct renewals.
+**Issuance controls (shared CA quota is a shared resource):** the cert coordinator
+must (a) persist the ACME account key (the Phase-1 spike generated an ephemeral one
+each call), (b) singleflight per agent (one in-flight issuance), (c) bound global
+concurrency, (d) enforce an issuance cooldown per agent, (e) dedupe by CSR fingerprint,
+and (f) cap CSR/chain payload sizes. `ACMEConfig.Namespace` is bound exclusively from
+the authenticated `agents` row, never from message data.
 
 ## 5. Endpoint Reporting, DDNS, and the Runtime Share Flow
 
 ### Endpoint reporting & DDNS
-The agent reports `{ ip, port }` whenever its endpoint changes. On **port open** the
-`open_ack` itself carries the fresh `public_ip` + `granted_port` (serving as the
-open report); `report_endpoint` covers the remaining transitions — enrollment
-(port 0), IP change (periodic external-IP check via UPnP `GetExternalIPAddress`,
-STUN fallback), and port close (port 0). Control stores the values; on IP change it
-runs DDNS to update the wildcard A record (TTL 60s).
+The agent reports `{ ip, port, status? }` whenever its endpoint changes. On **cold
+open** the `open_ack` carries the fresh `public_ip` + `granted_port` (serving as the
+open report); `report_endpoint` covers enrollment (port 0), IP change (periodic
+external-IP check via UPnP `GetExternalIPAddress`, STUN fallback), and close. Control
+stores the values; on IP change it runs DDNS to update the wildcard A record (TTL 60s).
+A redirect issued immediately after an IP change may briefly resolve the stale A
+record for up to the TTL; the recipient re-opens the link to recover.
+
+### Port state machine & reporter coupling
+`OnDemandPort` states: `closed`, `open` (possibly with sessions), `closing`, and
+`close-failed`. The endpoint reporter must observe timer-driven transitions, so
+`OnDemandPort` gains an **optional transition callback** (invoked from its single
+state loop). The reporter never reports `port: 0` unless deletion **succeeded** (or
+the lease is known to have expired); a `close-failed` state reports
+`{ ip, port, status: "close_failed" }` — the mapping may still exist, so claiming
+"closed" would be a false security statement.
 
 ### Share creation & origin
-At `register_share`, the agent generates a random **origin**
-(`<random>.<ns>.sharebridgeusercontent.com`), registers
-`binder.Allow(origin, direct, code)` locally, and reports `origin` in the message.
-The agent stays authoritative over its bindings.
+At `register_share`, the agent sends the share metadata (as today). The **control
+plane allocates** a random, globally-unique, never-reused origin under the agent's
+namespace and returns it in `share_registered { …, origin }`. On receipt the agent
+registers `binder.Allow(origin, direct, code)` locally. The agent is authoritative
+over its bindings (the open-signal only *activates*, never *creates*, a route), but
+the control plane owns origin allocation — so an agent-supplied origin (an open-
+redirect vector) is never trusted.
 
 ### Runtime flow (canonical link → direct HTTPS)
 ```
 recipient → GET https://sharebridge.app/s/<code>
-  1. control resolves session → api_key_id (agent) + origin
-  2. guard: agent enrolled + cert ready + connected, else "direct unavailable"
-  3. control builds OpenSignal { agent, share=code, route=direct, nonce, seq, lease, expiry }
+  1. control resolves session: live expiry/revocation check → api_key_id (agent) + origin
+  2. guard: agent enrolled (cert ready) + connected, else "direct unavailable"
+  3. control builds OpenSignal { agent, share=code, route=direct, nonce, seq, lease_seconds, expiry }
      (lease short, e.g. 120s — v2 spec §5; SignalGate bounds it ≤15 min)
   4. control sends open_signal over WS; waits for open_ack (timeout ~2–3s)
   5. agent: SignalGate.Admit (version/agent/expiry/nonce/seq/lockdown/local-authz/rate-limit)
           → OnDemandPort.OpenFor(code, lease)
-  6. agent → open_ack { share_id, granted_port, public_ip }   ← live port from THIS open
-  7. control 302 → https://<origin>[:granted_port]/s/<code>   (port omitted if 443)
-  8. browser → agent; Binder admits SNI, authorizes Host + code; serves placeholder
+  6. agent → open_ack { share_id, nonce, seq, granted_port, public_ip, was_already_open, status }
+  7. if cold open (was_already_open=false): control probes reachability (§below)
+  8. control 302 → https://<origin>[:granted_port]/s/<code>   (port omitted if 443)
+      with Cache-Control: no-store (a cached 302 can pin an obsolete port)
+  9. browser → agent; Binder admits SNI, authorizes Host + code; serves placeholder
 ```
 
 **The port is dynamic** (NAT-PMP may remap; the preferred port may be occupied on a
 later open). The redirect is built **only** from the live `open_ack` granted port —
 never from `agents.endpoint_port`, which is informational.
 
-**The control plane is stateless w.r.t. port-open state.** It **always** sends the
+**Open-ack correlation:** `open_ack` echoes `nonce` + `seq` and carries an explicit
+`status` (+ bounded `error` code). The control matches acks to in-flight waiters by
+nonce; late acks after timeout are discarded; an HTTP waiter that disconnects is
+cleaned up (its open still succeeds harmlessly). A negative ack (`status: "error"`)
+maps to "direct unavailable".
+
+**Sequence authority:** `SignalGate`'s high-water mark is scoped to the **authenticated
+WS connection epoch** — the agent resets it when its control connection (re)establishes,
+so a control-plane restart (which resets its own counter) does not brick subsequent
+signals. Within one epoch the control's counter is monotonic.
+
+**Control plane is stateless w.r.t. port-open state:** it **always** sends the
 open-signal and waits for the ack; it never "skips because the DB says the port is
-open" (a stale-DB trap). Latency is recovered on the agent side (below), not by
-skipping.
+open" (a stale-DB trap).
 
-### Concurrency & the `OpenFor` fast-path
-One external port multiplexes all of the agent's shares; `OnDemandPort` tracks each
-TLS connection as a session (`BeginSession`/`Activity`/`EndSession`) and keeps the
-mapping open while any session is active, closing on idle timeout after the last.
+### Concurrency & the `OpenFor` fast path
+One external port multiplexes all of the agent's shares. The HTTPS server drives
+`OnDemandPort` session tracking **explicitly** — `BeginSession` on TLS admission
+(via `ConnContext`/connection wrapper), `Activity` per request, `EndSession` on
+disconnect — the primitive itself does not observe connections. The mapping stays
+open while any session is active, closing on idle timeout after the last.
 
-**Phase-2 change to `OnDemandPort.OpenFor`:** today it re-runs `AddPortMapping` on
-every call. Change it to a **no-op fast-path when the port is already open** — ack
-immediately without touching the router (the renewal loop already keeps the router
-lease fresh). This makes repeat open-signals cheap idempotent acks and removes the
-~1–3s UPnP latency for everyone after the first recipient (warm opens ≈ one WS
-round-trip).
+**`OpenFor` behavior change:** today it re-runs `AddPortMapping` on every call. Change
+it to a **fast path when already open**: no router call, but *extend the local
+unused-open deadline* to at least the requested lease so a signal arriving near the
+close deadline cannot ack "open" and then immediately lapse. If the remaining router
+lease is too short to cover the requested lease, perform a guarded renewal instead.
+This makes repeat open-signals cheap idempotent acks (warm opens ≈ one WS round-trip)
+while remaining correct at the deadline boundary.
+
+**Cold open re-selects a safe port:** every cold open re-enumerates the router's
+mappings and re-selects a safe external port (`ChooseExternalPort`), so a port that
+became occupied while closed is never clobbered (v2 §6 "never clobber"). `OnDemandPort`
+must therefore allow its requested/granted port to change across cold opens.
 
 **Rate limit:** `SignalGate` currently caps 3 signals/share/min, which would reject
 concurrent recipients of a hot share. Drop the tight per-share cap in favor of a
@@ -188,19 +258,37 @@ generous global ceiling (e.g., ~60/min) so legitimate bursts pass; the limit's r
 job is bounding cold-opens/abuse, and a no-op ack is cheap. Exact numbers land in
 the plan.
 
+### Reachability probe (core only)
+After a **cold** open, the control verifies the mapping before redirecting:
+1. Reject non-public IPs (private / reserved / link-local / multicast) before probing.
+2. Issue one HTTPS request to `https://<public_ip>:<granted_port>/s/<code>/probe?nonce=<nonce>`
+   (SNI = origin; cert verification relaxed — the probe authenticates via the nonce,
+   not the chain).
+3. The agent echoes the nonce **iff** it matches a recently-admitted open-signal for
+   that share (SignalGate tracks seen nonces); anything else gets 404/403.
+4. A correct echo proves the mapping reaches *this* agent; the control then redirects.
+
+The **STUN cross-check** of the reported IP (the "independent observation" half of the
+v2 self-probe) is **deferred** — an agent-reported STUN result is not genuinely
+independent of a malicious agent, and the nonce echo already prevents redirecting to
+the wrong host. Warm opens skip the probe (the mapping was verified at the cold open
+and is unchanged).
+
 ### Placeholder content
 The agent serves a minimal HTML page (showing the share is being served P2P over
-direct HTTPS, with the origin and granted port) plus a synthetic byte stream (size
-as a query parameter, so throughput can be eyeballed). The handler strips the
-`/s/<code>` prefix and routes the remainder — deliberately decoupled from the real
-gallery UI (item 2).
+direct HTTPS, with the origin and granted port) plus a synthetic byte stream (size as
+a query parameter, capped by a small configurable maximum). GET/HEAD only; stream
+without buffering; honor request cancellation; Range is not required this phase. The
+handler strips the `/s/<code>` prefix and routes the remainder — deliberately
+decoupled from the real gallery UI (item 2).
 
 ## 6. Security Properties
 
 ### Key custody & cert issuance
 The agent holds its TLS private key locally; only the CSR (public material) crosses
-the wire. The control plane proves domain ownership via DNS-01 and signs the agent's
-public key. The agent verifies the returned chain matches its key and exact SANs.
+the wire. The control plane proves domain ownership via DNS-01 and causes the CA to
+issue a certificate for the agent's public key. The agent verifies the returned chain
+matches its key and exact SANs.
 
 **CSR authorization (cross-tenant boundary):** `CompleteCSR` enforces, before
 issuance, that the CSR (a) is self-signed (proves key possession), (b) requests
@@ -209,21 +297,29 @@ and (c) has a CommonName that is empty or one of the two authorized names (block
 CN-smuggling). This is what stops a malicious agent from obtaining a cert for another
 agent's namespace, the parent zone, or the control-plane domain.
 
+**Mapping ownership (cross-instance):** UPnP mapping descriptions carry a **per-agent
+ownership token** (e.g. `sharebridge-<agent-token>`), and deletion verifies the exact
+description *plus* internal client/port/protocol before removing — the Phase-1
+`"sharebridge"` prefix is shared across agents/stale installs and lets one agent
+delete another's mapping. NAT-PMP cannot enumerate mappings, so its ownership
+guarantee is best-effort (documented).
+
 ### Threat model — malicious agent
 A malicious (or compromised) agent is confined to its own namespace:
-- **Cert:** can only obtain certs for its own two wildcard SANs (§6 CSR authorization).
+- **Cert:** can only obtain certs for its own two wildcard SANs (§6 CSR authorization);
+  issuance is additionally singleflight/rate-limited so it cannot burn shared CA quota.
 - **DNS:** DDNS is keyed off the authenticated namespace, so it can only move its own
   A record.
-- **Content:** `Binder` admits only origins it has registered, so it can only serve
-  its own shares.
-- **SSRF:** the control-plane self-probe is bounded (public-IP-only, nonce echo, STUN
-  cross-check).
+- **Content:** `Binder` admits only origins the control allocated for it and it
+  registered, so it can only serve its own shares.
+- **Probe SSRF:** the control probes only the agent's own reported public IP, rejects
+  non-public ranges, and rate-limits probes.
 
 Residual (accepted): a malicious agent can serve malicious content to its *own*
 recipients (inherent — the agent is the content source), and can spam the control
 plane (bounded by rate limits). The asymmetry is intentional: a malicious control
-plane can MITM everyone (it is the TLS root of trust, spec §11.3 of the v2 design);
-a malicious agent can only hurt itself.
+plane can MITM everyone (it is the TLS root of trust, v2 spec §11.3); a malicious
+agent can only hurt itself and, transiently, the shared CA quota (mitigated above).
 
 ## 7. Error Handling
 
@@ -231,8 +327,8 @@ a malicious agent can only hurt itself.
   (already implemented).
 - **SignalGate:** expired / replayed / nonce-reused / not-authorised / rate-limited
   signals dropped.
-- **Open-ack timeout or agent rejection** → control serves "direct unavailable" (no
-  relay fallback this milestone).
+- **Open-ack timeout, negative ack, or probe failure** → control serves "direct
+  unavailable" (no relay fallback this milestone).
 - **Not enrolled / cert not ready / offline** → control does not emit a direct
   redirect; "direct unavailable".
 - **Direct connection failure after redirect** (TLS timeout, stale DNS, path
@@ -240,32 +336,54 @@ a malicious agent can only hurt itself.
   interstitial yet — item 2).
 - **Cert issuance failure** → agent retries with bounded backoff; direct shares not
   registered while `cert_status != "ready"`.
+- **Close-failed** → reported truthfully (`status: "close_failed"`), escalated via
+  `OnDemandPort.CloseError`; never reported as closed.
 
 ## 8. Testing
 
-- **Unit:** cert lifecycle manager (CSR → validate → install → renew), endpoint
-  reporter, each new WS handler (`enrolled`, `csr_submit`, `open_signal`,
-  `report_endpoint`), the redirect handler, the DDNS trigger, the `OpenFor` fast-path.
-  Phase-1 `direct/` + `cert/` tests already cover the primitives.
+- **Unit:** cert lifecycle manager (CSR → validate → install → renew → `tls_ready`),
+  endpoint reporter (incl. close-failed + transition callback), each new WS handler,
+  the redirect handler (live expiry check, no-store), the DDNS trigger, the probe
+  (nonce echo + IP filtering), `OpenFor` fast-path (deadline-boundary + short-lease
+  renewal), cold-port reselection. Phase-1 `direct/` + `cert/` tests cover primitives.
+- **High-risk cases (required):** origin cross-tenant validation (control-allocated,
+  never agent-supplied), API-key rotation preserving the agent, open-ack correlation
+  (concurrent + late ack), sequence reset on control reconnect, replacement WS
+  disconnect (compare-and-delete unregister), IP-change/DNS propagation, cold port
+  reselection when 443 becomes occupied, deletion failure → close-failed, fast-path
+  near expiry, duplicate CSR renewal races, CSR quota abuse bounds.
 - **Integration:** promote `spike-e2e` into a real test — enroll → cert (staging CA +
-  test DNS zone) → register share → open-signal → redirect → download. No production
-  certs or live UPnP in CI.
+  test DNS zone) → register share → open-signal → probe → redirect → download. No
+  production certs or live UPnP in CI.
 - **Regression:** existing agent + signaling-server suites stay green.
 
 ## 9. Decisions Recorded
 
-- Transport-first: placeholder content + full cert/enrollment/redirect loop; content
-  serving + UI + measure-and-prefer + relay deferred.
+- Transport-first: placeholder content + full cert/enrollment/probe/redirect loop;
+  content serving + UI + measure-and-prefer + relay deferred.
 - Direct-only (no relay fallback) this milestone.
-- New `agents` collection, 1:1 with `api_keys` via unique `api_key_id`; `sessions.origin`.
+- New `agents` collection, 1:1 with `api_keys` via unique `api_key_id`; key rotation
+  transactionally re-points the agent record (namespace + cert survive).
+- `sessions.origin` is **control-allocated** (unique, permanent, tombstoned), returned
+  in `share_registered`; the agent registers the binding locally and stays
+  authoritative over its bindings (the signal activates, never creates, a route).
 - All new control messages ride the existing agent WebSocket (no new HTTP surface).
-- Origin is agent-generated at `register_share`; the agent is authoritative over its
-  bindings (the signal activates, never creates, a route).
+- Readiness is an explicit handshake: `tls_ready`/`enrollment_ready`, with reconnect
+  reconciliation; never inferred from ACME returning a chain.
+- `open_ack` echoes `nonce` + `seq` + explicit status, so the control correlates acks
+  to in-flight requests.
+- `SignalGate` sequence is scoped to the authenticated WS connection epoch (reset on
+  reconnect), so control restarts don't brick signals.
 - Control plane is stateless w.r.t. port state — always signals, always uses the live
   `open_ack` granted port for the redirect (never the DB port).
-- `OnDemandPort.OpenFor` gains a no-op fast-path when already open; rate limit raised.
+- `OnDemandPort.OpenFor` gains a fast path (extend local deadline, guarded renewal if
+  the remaining lease is short); cold opens re-select a safe port; per-agent UPnP
+  ownership token; transition callback for the reporter; rate limit raised.
+- Reachability probe (nonce echo + public-IP filtering) is in scope on cold opens;
+  the STUN cross-check is deferred.
 - Cert renewal is agent-driven (30-day threshold, key reuse); ACME account key
-  persisted control-side.
+  persisted control-side; issuance singleflight + cooldown + CSR-fingerprint
+  idempotency.
 - Enrollment is an automatic startup gate (API-key possession is the approval).
 
 ## 10. References
