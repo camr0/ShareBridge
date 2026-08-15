@@ -130,6 +130,57 @@ func TestCoordinatorIdempotencyAndLeafIndex(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRejectsExpiredLeaf(t *testing.T) {
+	ctx := context.Background()
+	c := newTestCoordinator()
+	csr := []byte("csr-expired")
+	chain := makeChain("leaf-expired", time.Now().Add(-time.Hour))
+	c.issueFn = func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error) { return chain, nil }
+
+	if _, err := c.Issue(ctx, csr, "sbdeadbeef", "key-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	leafFP := hex.EncodeToString(leafFingerprintBytes(chain))
+	if c.HasLeafFingerprint("key-1", leafFP) {
+		t.Fatalf("expired leaf must not verify")
+	}
+	if _, _, ok := c.ChainByLeaf("key-1", leafFP); ok {
+		t.Fatalf("expired leaf must not be returned by ChainByLeaf")
+	}
+}
+
+func TestCoordinatorLatestChain(t *testing.T) {
+	ctx := context.Background()
+	c := newTestCoordinator()
+	csr := []byte("csr-latest")
+	chain := makeChain("leaf-latest", time.Now().Add(90*24*time.Hour))
+	c.issueFn = func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error) { return chain, nil }
+
+	if _, err := c.Issue(ctx, csr, "sbdeadbeef", "key-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	leafFP := hex.EncodeToString(leafFingerprintBytes(chain))
+	gotChain, gotLeafFP, notAfter, ok := c.LatestChain("key-1")
+	if !ok {
+		t.Fatalf("LatestChain ok = false for known apiKeyID")
+	}
+	if string(gotChain) != string(chain) {
+		t.Fatalf("LatestChain returned wrong chain")
+	}
+	if gotLeafFP != leafFP {
+		t.Fatalf("LatestChain leaf fingerprint mismatch: got %s want %s", gotLeafFP, leafFP)
+	}
+	if notAfter.IsZero() {
+		t.Fatalf("LatestChain notAfter is zero")
+	}
+
+	if _, _, _, ok := c.LatestChain("key-unknown"); ok {
+		t.Fatalf("LatestChain ok = true for unknown apiKeyID")
+	}
+}
+
 func TestCoordinatorGlobalSemaphore(t *testing.T) {
 	c := newTestCoordinator()
 	c.sem = make(chan struct{}, 1) // bound 1: issues must serialize

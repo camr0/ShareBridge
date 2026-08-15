@@ -58,6 +58,14 @@ func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error) {
 	return c, nil
 }
 
+// SetIssueFn replaces the issuance function. It is a test-only stub used by
+// downstream packages (e.g. directctl) to inject a fake issuer.
+func (c *Coordinator) SetIssueFn(fn func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.issueFn = fn
+}
+
 func (c *Coordinator) completeCSR(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error) {
 	return CompleteCSR(ctx, csrPEM, ACMEConfig{
 		CA: c.cfg.CA, Email: c.cfg.Email, CloudflareToken: c.cfg.CloudflareToken,
