@@ -25,6 +25,7 @@ type ACMEConfig struct {
 	CloudflareToken string // Cloudflare API token: single zone, DNS-edit only
 	Namespace       string // the enrolling agent's namespace (authorized identity)
 	BaseDomain      string // content domain, e.g. sharebridgeusercontent.com
+	AccountKey      *ecdsa.PrivateKey // persisted ACME account key; nil → generate (spike path)
 }
 
 // acmeAccount implements lego's registration.User. The spike uses an ephemeral
@@ -77,9 +78,13 @@ func CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) ([]byte, er
 		return nil, fmt.Errorf("CSR CommonName = %q, want empty or one of %v", csr.Subject.CommonName, want)
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
+	key := cfg.AccountKey
+	if key == nil {
+		var err error
+		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, err
+		}
 	}
 	acct := &acmeAccount{email: cfg.Email, key: key}
 
