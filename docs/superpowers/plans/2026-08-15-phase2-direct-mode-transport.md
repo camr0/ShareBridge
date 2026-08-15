@@ -1679,13 +1679,7 @@ func AllocateOrigin(app core.App, namespace, baseDomain string, session *core.Re
 }
 ```
 
-Declare the coordinator hook (implemented in Task 9):
-
-```go
-// agentstore.go (append)
-var chainCacheHasFn func(apiKeyID, leafFP string) bool
-func SetChainCacheHas(fn func(apiKeyID, leafFP string) bool) { chainCacheHasFn = fn }
-```
+> The coordinator is passed directly into `NewController(..., coord, ...)` (Task 10), so `AcceptableTLSReady` is replaced by `coord.HasLeafFingerprint` — no package-level hook is needed.
 
 - [ ] **Step 4: Run tests + build, verify pass**
 
@@ -3389,7 +3383,7 @@ ACMEEmail       string // ACME_EMAIL
 ACMECADir       string // ACME_CA_DIR (default lego production)
 ```
 
-`main.go`: build the coordinator + controller, `directctl.SetChainCacheHas(coord.HasLeafFingerprint)`, replace `/s/{code}` with `ctrl.Redirect`, and thread `ctrl` into `handler.AgentWS`. In `agent_ws.go`, route `csr_submit`/`tls_ready`/`tls_error`/`report_endpoint`/`open_ack` to the controller and call `ctrl.AgentDisconnected(apiKeyID, conn)` on disconnect (with the `conn` for compare-and-delete).
+`main.go`: build the coordinator + controller, replace `/s/{code}` with `ctrl.Redirect`, and thread `ctrl` into `handler.AgentWS`. In `agent_ws.go`, route `csr_submit`/`tls_ready`/`tls_error`/`report_endpoint`/`open_ack` to the controller and call `ctrl.AgentDisconnected(apiKeyID, conn)` on disconnect (with the `conn` for compare-and-delete).
 
 - [ ] **Step 4: Run tests + build, verify pass**
 
