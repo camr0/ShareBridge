@@ -105,14 +105,16 @@ self-reported `agent_id`.
 
 `sessions` gains `origin` (text, **unique**) — the random per-share origin hostname,
 **allocated by the control plane** at `register_share` (§5). Origins are permanent and
-never reused (tombstoned): allocation is globally-unique via the unique index +
-collision retry, and a deleted session's origin is not re-issued.
+never reused: sessions are **soft-deleted** (marked inactive) rather than hard-deleted,
+so the unique `origin` value is never released for reuse (or, equivalently, expired
+origins move to a tombstone table).
 
-**API-key rotation preserves the agent.** `agents` is keyed by `api_key_id`, but
-rotation must transactionally **re-point** `agents.api_key_id` to the new key record
-(and re-key any in-flight hub state) *before* the old key is revoked/deleted, so the
-namespace + cert survive a key rotation. Revocation without a replacement key
-cascade-deletes the agent (fresh namespace on re-enroll — acceptable).
+**API-key rotation preserves the agent.** `agents` is keyed by `api_key_id`; rotation
+is **ordered**: (1) create the new key record, (2) re-point `agents.api_key_id` to it,
+(3) fence/disconnect the old key's socket (hub unregister uses compare-and-delete, so a
+stale old-socket disconnect cannot unregister the replacement), (4) revoke the old key.
+The namespace + cert survive. Revocation without a replacement cascade-deletes the
+agent (fresh namespace on re-enroll — acceptable).
 
 **Migration:** a **new forward migration** adds `agents` and `sessions.origin` with
 unique indexes (`agents.api_key_id`, `agents.namespace`, `sessions.origin`). Do not
@@ -152,8 +154,13 @@ returning a chain.
 
 **Reconnect reconciliation:** on reconnect, `enrolled` is re-sent; the agent re-sends
 `tls_ready` if its persisted chain is still valid (not expiring), else submits a fresh
-CSR. The control re-evaluates readiness from the agent's `tls_ready` + current DDNS
-state — a reconnecting agent is never left permanently `pending`.
+CSR. The control **accepts `tls_ready` for any still-valid fingerprint it has issued
+for this agent** — it does not gate on the latest generation (a lost `cert_issue`
+that never reached the agent would otherwise stall reconciliation). If the agent's
+reported fingerprint is behind the latest issued chain, the control re-delivers the
+latest cached chain. Readiness is **connection-epoch-local**: a persisted
+`cert_status = "ready"` does not by itself authorize redirects — the *current*
+connection must have completed `enrolled` → `tls_ready` → `enrollment_ready`.
 
 **Renewal (agent-driven):** when the leaf `NotAfter` is < ~30 days out, the agent
 submits a fresh CSR (reusing the same key); control re-issues; agent installs +
@@ -164,7 +171,10 @@ out-of-order generation acks.
 must (a) persist the ACME account key (the Phase-1 spike generated an ephemeral one
 each call), (b) singleflight per agent (one in-flight issuance), (c) bound global
 concurrency, (d) enforce an issuance cooldown per agent, (e) dedupe by CSR fingerprint,
-and (f) cap CSR/chain payload sizes. `ACMEConfig.Namespace` is bound exclusively from
+and (f) cap CSR/chain payload sizes. The CSR fingerprint is the SHA-256 of the DER CSR;
+an idempotent retry of the same fingerprint returns the cached issued chain without
+re-issuing or counting against the cooldown (chains are cached, persistently or in
+memory, keyed by fingerprint). `ACMEConfig.Namespace` is bound exclusively from
 the authenticated `agents` row, never from message data.
 
 ## 5. Endpoint Reporting, DDNS, and the Runtime Share Flow
@@ -180,12 +190,17 @@ record for up to the TTL; the recipient re-opens the link to recover.
 
 ### Port state machine & reporter coupling
 `OnDemandPort` states: `closed`, `open` (possibly with sessions), `closing`, and
-`close-failed`. The endpoint reporter must observe timer-driven transitions, so
-`OnDemandPort` gains an **optional transition callback** (invoked from its single
-state loop). The reporter never reports `port: 0` unless deletion **succeeded** (or
-the lease is known to have expired); a `close-failed` state reports
-`{ ip, port, status: "close_failed" }` — the mapping may still exist, so claiming
-"closed" would be a false security statement.
+`close-failed`. A cold open from `close-failed` first re-attempts deletion of the
+previous mapping (bounded), and only re-selects a safe port once the old mapping is
+confirmed removed — it never leaves two mappings behind. The endpoint reporter must
+observe timer-driven transitions, so `OnDemandPort` gains an **optional transition
+callback** `func(old, new state, grantedPort int)` invoked synchronously from the
+single state loop (non-blocking; must not call back into `OnDemandPort`; the initial
+state is not emitted). The reporter never reports `port: 0` unless deletion
+**succeeded** (or the lease is known to have expired); a `close-failed` state reports
+`{ ip, port, status: "close_failed" }` with a nonzero port — the mapping may still
+exist, so claiming "closed" would be a false security statement. Wire invariant:
+`port: 0` ⇔ `status: "closed"`; `close_failed` requires a nonzero port.
 
 ### Share creation & origin
 At `register_share`, the agent sends the share metadata (as today). The **control
@@ -224,9 +239,11 @@ cleaned up (its open still succeeds harmlessly). A negative ack (`status: "error
 maps to "direct unavailable".
 
 **Sequence authority:** `SignalGate`'s high-water mark is scoped to the **authenticated
-WS connection epoch** — the agent resets it when its control connection (re)establishes,
-so a control-plane restart (which resets its own counter) does not brick subsequent
-signals. Within one epoch the control's counter is monotonic.
+WS connection epoch** — a fresh (or reset) gate is instantiated per connection, and the
+old connection's reader is fenced (its in-flight messages are dropped), so a control-
+plane restart (which resets its own counter) does not brick subsequent signals and a
+replacement socket cannot inject stale signals into a new epoch. Within one epoch the
+control's counter is monotonic.
 
 **Control plane is stateless w.r.t. port-open state:** it **always** sends the
 open-signal and waits for the ack; it never "skips because the DB says the port is
@@ -238,6 +255,12 @@ One external port multiplexes all of the agent's shares. The HTTPS server drives
 (via `ConnContext`/connection wrapper), `Activity` per request, `EndSession` on
 disconnect — the primitive itself does not observe connections. The mapping stays
 open while any session is active, closing on idle timeout after the last.
+
+The TLS config is a single `tls.Config.GetConfigForClient` that (a) runs
+`Binder.AdmitSNI(hello.ServerName)` and (b) returns a config whose `Certificates` is
+the cert manager's *current* certificate; installing/renewing swaps that certificate
+in memory, so there is no listener restart and the Binder admission path is never
+bypassed.
 
 **`OpenFor` behavior change:** today it re-runs `AddPortMapping` on every call. Change
 it to a **fast path when already open**: no router call, but *extend the local
@@ -259,20 +282,26 @@ job is bounding cold-opens/abuse, and a no-op ack is cheap. Exact numbers land i
 the plan.
 
 ### Reachability probe (core only)
-After a **cold** open, the control verifies the mapping before redirecting:
+The control verifies the mapping before redirecting whenever the endpoint may have
+changed — i.e. when the `open_ack` reports a `(public_ip, granted_port)` tuple that
+differs from the last **successfully verified** tuple (tracked per agent). A probe is
+skipped only when the current tuple was already verified; this avoids both the
+stale-state trap and the "failed cold probe, then warm skip" hole.
 1. Reject non-public IPs (private / reserved / link-local / multicast) before probing.
 2. Issue one HTTPS request to `https://<public_ip>:<granted_port>/s/<code>/probe?nonce=<nonce>`
-   (SNI = origin; cert verification relaxed — the probe authenticates via the nonce,
-   not the chain).
+   with **both** TLS SNI **and** the HTTP `Host` header set to the **origin** (not the
+   IP — otherwise `Binder` rejects the `Host` mismatch). Cert verification is relaxed —
+   the probe authenticates via the nonce, not the chain. The client does **not** follow
+   redirects (preserves the public-IP SSRF boundary).
 3. The agent echoes the nonce **iff** it matches a recently-admitted open-signal for
    that share (SignalGate tracks seen nonces); anything else gets 404/403.
-4. A correct echo proves the mapping reaches *this* agent; the control then redirects.
+4. A correct echo proves the mapping reaches *this* agent; the control records the
+   verified tuple and then redirects.
 
 The **STUN cross-check** of the reported IP (the "independent observation" half of the
 v2 self-probe) is **deferred** — an agent-reported STUN result is not genuinely
 independent of a malicious agent, and the nonce echo already prevents redirecting to
-the wrong host. Warm opens skip the probe (the mapping was verified at the cold open
-and is unchanged).
+the wrong host.
 
 ### Placeholder content
 The agent serves a minimal HTML page (showing the share is being served P2P over
