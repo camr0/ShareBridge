@@ -4,13 +4,14 @@
 **Status:** Proposed — pending review
 **Companion to:** `docs/superpowers/specs/2026-07-25-native-https-tls-passthrough-design.md` (the "FRP spec")
 **Supersedes for direct shares:** WebRTC DataChannel transport (the slow SCTP path)
-**Reuses from the FRP spec:** certificate architecture (§9), DNS/hostname model (§8), identifiers/namespaces (§7), origin→share binding (§11), share-origin lifecycle (§12), agent HTTPS server (§15)
+**Reuses from the FRP spec:** certificate architecture (§9), origin→share binding (§11), share-origin lifecycle (§12), agent HTTPS server (§15)
+**Amends the FRP spec:** identifiers/namespaces (§7) and DNS/hostname model (§8) — the namespace is split into a direct namespace (clean) and a relay namespace (`.relay.`); see §7.
 
 ## 1. Summary
 
 Direct mode currently uses WebRTC DataChannels (SCTP), which collapse to ~8 MB/s at high latency due to userspace congestion control (see `agent/cmd/benchdirect/BENCH_RESULTS.md`). The relay path uses kernel TCP and reaches 20–30 MB/s — but it burns VPS bandwidth, which is the exact cost direct mode exists to avoid.
 
-This spec makes direct mode run over **ordinary browser HTTPS against the agent's own hostname**, terminating TLS at the agent, so the file data flows **peer-to-peer with no relay in the data path**. It reuses the FRP spec's certificate and DNS architecture unchanged — only the data plane (§13 of that spec) changes: instead of an SNI gateway + FRP tunnel, the agent makes itself directly reachable via **UPnP/NAT-PMP/PCP automatic port mapping** (opened on demand, closed by default — see §5.1) and the content hostname resolves straight to the agent's public IP.
+This spec makes direct mode run over **ordinary browser HTTPS against the agent's own hostname**, terminating TLS at the agent, so the file data flows **peer-to-peer with no relay in the data path**. It reuses the FRP spec's certificate architecture and origin→share binding, but splits the DNS namespace (§7): instead of an SNI gateway + FRP tunnel for the data plane, the agent makes itself directly reachable via **UPnP/NAT-PMP/PCP automatic port mapping** (opened on demand, closed by default — see §5.1) and the direct content hostname resolves straight to the agent's public IP, while the relay path keeps the gateway under a `relay.` sub-namespace.
 
 The relay (today the custom Secure Relay) remains as the automatic fallback and as the "hide my IP" mode. The FRP L4-passthrough design is a candidate relay transport that would share the agent HTTPS server (§3.1).
 
@@ -54,10 +55,10 @@ The data plane has no intermediary server. The control plane's only runtime role
 - **Control plane** = the hosted ShareBridge backend (the signaling server: database, redirects, certificate coordinator, route signals).
 - **Agent** = the software on the owner's home device. It terminates TLS, serves the recipient page and content, and enforces origin→share binding. The agent independently re-validates source authorization; the control plane's signal only activates a route the agent already knows.
 
-Direct and relay share **one agent HTTPS server** (TLS termination, page, content, binding). The two modes differ only in how the browser's connection reaches that server:
+Direct and relay share **one agent HTTPS server** (TLS termination, page, content, binding). The two modes differ only in how the browser's connection reaches that server, which is selected by the hostname (DNS) rather than any server-side switch:
 
-- **Direct**: browser → agent public IP:port (UPnP-mapped, on demand).
-- **Relay**: browser → hosted L4 gateway → outbound tunnel → the same agent server (the FRP design).
+- **Direct** (default): `<origin>.<namespace>.sharebridgeusercontent.com` resolves to the agent's public IP (DDNS); browser → agent public IP:port (UPnP-mapped, on demand).
+- **Relay**: `<origin>.relay.<namespace>.sharebridgeusercontent.com` resolves to the hosted L4 gateway; browser → gateway → outbound tunnel → the same agent server (the FRP design).
 
 This unified model is the point of the FRP spec and is what lets the custom Noise layer be deleted: both paths are browser↔agent TLS end-to-end, so TLS is the single encryption layer and the Noise/browser-framing protocol is retired (FRP §19.4).
 
@@ -71,7 +72,7 @@ Share resolution produces, in order:
 2. **Relay** — fallback when the agent has no reachable endpoint (CGNAT, UPnP disabled/unavailable, no usable port). This is the existing custom Secure Relay today; the FRP L4-passthrough design is a candidate replacement that would share the agent HTTPS server (§3.1).
 3. **`relayOnly`** — the existing user flag forces relay regardless of direct availability, to hide the home IP.
 
-Selection is made by the control plane at redirect time from the agent's latest endpoint report. A share that falls back to relay does not "fail" — it simply routes through the VPS. The user never configures a router in any path.
+Selection is made by the control plane at redirect time from the agent's latest endpoint report. The redirect target's hostname encodes the choice — the clean namespace for direct, the `relay.` namespace for relay (§7, §10). A share that falls back to relay does not "fail" — it simply routes through the VPS. The user never configures a router in any path.
 
 ## 5. Reachability — NAT Traversal
 
@@ -109,7 +110,7 @@ What this buys:
 - A browser cannot set a custom `User-Agent`, so there is no literal "ShareBridge user-agent" check. The effective markers a legitimate browser presents are: the **random origin hostname** (SNI, unguessable, rejected-before-serving per §11 binding) and **presence in the short-lived open window** (timed to a real user action). Post-handshake, the native share code + binding authorize content.
 - For public shares, "approved" = "possesses the link" (per-user identity is a separate future feature, FRP §7.6). On-demand opening therefore defends against *untargeted* scanning, not against someone who already holds the link.
 
-**Strict open-signal validation:** the agent never opens a port merely because the control plane asked. The open signal only activates a route for a share the agent has independently registered and source-verified; it cannot create arbitrary listeners or reach arbitrary local services (the HTTPS server is never a generic proxy). A hijacked control plane is therefore bounded to toggling routes for shares that already exist, and the agent rate-limits open signals per unit time.
+**Strict open-signal validation:** the agent never opens a port merely because the control plane asked. The open signal only activates a route for a share the agent has independently registered and source-verified; it cannot create arbitrary listeners or reach arbitrary local services (the HTTPS server is never a generic proxy). A hijacked control plane is therefore bounded to toggling routes for shares that already exist, and the agent rate-limits open signals per unit time. (This bounds *port-opening* abuse only; a control plane that also holds DNS/ACME authority has a wider capability — see §11.3.)
 
 Tradeoffs:
 
@@ -129,16 +130,22 @@ A port is not required to be static across agent restarts: the control plane sto
 
 ## 7. DNS and DDNS
 
-`<agent-namespace>.sharebridgeusercontent.com` and its wildcard child `*.<agent-namespace>.sharebridgeusercontent.com` resolve to the agent's public IP via A records owned by the control plane.
+Because direct and relay resolve to **different IP targets** (the agent's public IP vs the hosted gateway), a single wildcard A record cannot serve both. The namespace is therefore split into two, both under the same registered domain (`sharebridgeusercontent.com`, preserving browser site isolation):
 
-- The control plane updates the A record when the agent reports a changed public IP (dynamic DNS).
+| Namespace | Wildcard A record → | Used by |
+|---|---|---|
+| `*.<agent-namespace>.sharebridgeusercontent.com` | **agent public IP** (DDNS) | direct (the default) |
+| `*.relay.<agent-namespace>.sharebridgeusercontent.com` | **gateway** (static) | relay (FRP path) |
+
+- The clean `<agent-namespace>` namespace belongs to **direct** because direct is the default mode; the relay (FRP) path is the labeled `.relay.` exception. This **amends FRP §7/§8**, which assigned the clean namespace to the relay-only gateway model.
+- The control plane updates the direct A record when the agent reports a changed public IP (dynamic DNS). The relay A record is static (the gateway IP changes rarely).
 - DNS readiness is part of agent enrollment (as in FRP §8), not share creation.
-- Short TTL (e.g. 60s) bounds the propagation window after an IP change. A stale A record is harmless: the agent's origin→share binding rejects unrelated hostnames, and a wrong IP simply fails to connect (then falls back to relay for new sessions).
-- The agent namespace is a random, replaceable value (privacy: not linked to identity — FRP §7.3). **One wildcard certificate per agent namespace covers unlimited share origins** — creating a share requires no certificate; it is just a DNS entry + route already covered by the wildcard. Per-share origins are permanent and tombstoned (FRP §7.4). The Let's Encrypt default of 50 certificates/registered-domain/week bounds *agent enrollment* rate (one cert per new agent namespace), not share creation; Google Public CA (100 orders/hour) and ZeroSSL (unlimited) are the scale candidates (FRP §9.5). Namespace rotation is possible but infrequent for the same reason.
+- Short TTL (e.g. 60s) bounds the propagation window after an IP change. A stale direct A record is harmless: the agent's origin→share binding rejects unrelated hostnames, and a wrong IP simply fails to connect (then falls back to relay for new sessions).
+- The agent namespace is a random, replaceable value (privacy: not linked to identity — FRP §7.3). **One certificate per agent namespace — with two wildcard SANs — covers unlimited share origins in both namespaces.** Creating a share requires no certificate and no DNS mutation; it is just a route already covered by the wildcards. Per-share origins are permanent and tombstoned (FRP §7.4). The Let's Encrypt default of 50 certificates/registered-domain/week bounds *agent enrollment* rate (one cert — regardless of SAN count — per new agent namespace), not share creation; Google Public CA (100 orders/hour) and ZeroSSL (unlimited) are the scale candidates (FRP §9.5). Namespace rotation is possible but infrequent for the same reason.
 
 ## 8. Certificate Architecture (reused from FRP §9)
 
-Unchanged: the agent generates and holds its TLS private key locally (it never leaves the agent), submits a wildcard CSR for `*.<agent-namespace>.sharebridgeusercontent.com`, and the control plane's certificate coordinator completes DNS-01 ACME issuance and returns only the public chain. Renewal, atomic reload, CA abstraction, and CT handling are identical to the FRP spec. TLS is the end-to-end encryption; the custom Noise layer is not used for the new data plane. The certificate coordinator and DDNS updater remain OSS code behind provider-neutral interfaces (FRP §9.4); DNS-provider and CA credentials are operator-supplied secrets (env/config), never committed to the repo — self-hosters bring their own domain, DNS provider, and CA credentials (FRP §18.3).
+The agent generates and holds its TLS private key locally (it never leaves the agent), submits a CSR for **both wildcard SANs** — `*.<agent-namespace>.sharebridgeusercontent.com` and `*.relay.<agent-namespace>.sharebridgeusercontent.com` — and the control plane's certificate coordinator completes DNS-01 ACME issuance and returns only the public chain. This is **one certificate order with two SANs**, so the per-agent certificate count and CA rate-limit cost are unchanged. Renewal, atomic reload, CA abstraction, and CT handling are identical to the FRP spec. TLS is the end-to-end encryption; the custom Noise layer is not used for the new data plane. The certificate coordinator and DDNS updater remain OSS code behind provider-neutral interfaces (FRP §9.4); DNS-provider and CA credentials are operator-supplied secrets (env/config), never committed to the repo — self-hosters bring their own domain, DNS provider, and CA credentials (FRP §18.3).
 
 ## 9. Agent HTTPS Server (reused from FRP §15)
 
@@ -148,10 +155,11 @@ The agent is the authoritative recipient web server: TLS termination, `Host`/ori
 
 ```text
 Recipient → GET https://sharebridge.app/s/<token>
-  → control plane resolves active share + agent endpoint
-  → control plane signals agent to open the port on demand; waits for ack
-  → 302 to https://<origin>.<namespace>.sharebridgeusercontent.com[:port]/s/<token>
-  → browser connects directly to the agent's public IP:port
+  → control plane resolves active share + agent endpoint + mode
+  → direct: control plane signals agent to open the port on demand; waits for ack
+  → 302 to https://<origin>.<namespace>.sharebridgeusercontent.com[:port]/s/<token>      (direct)
+     or https://<origin>.relay.<namespace>.sharebridgeusercontent.com/s/<token>          (relay)
+  → browser connects to the agent's public IP:port (direct) or the hosted gateway (relay)
   → agent terminates TLS, validates (Host, route kind, native code), serves content
 ```
 
@@ -161,7 +169,7 @@ The native share code remains the bearer capability. No redundant bootstrap toke
 
 ### 11.1 Provided
 
-- File data encrypted end-to-end (browser↔agent) with the agent-owned TLS key; the control plane cannot read it.
+- File data encrypted end-to-end (browser↔agent) with the agent-owned TLS key; the control plane cannot read it under normal operation (see the trust boundary in §11.3).
 - No server bandwidth in the data path; transfer survives relay-VPS outage.
 - Strict agent-side origin→share binding (FRP §11) is the enforcement point.
 - Content served from a separate registered domain (`sharebridgeusercontent.com`), so a compromised agent is browser-isolated from control-plane cookies, storage, and service workers.
@@ -173,6 +181,10 @@ The native share code remains the bearer capability. No redundant bootstrap toke
 - **Home IP exposure** — direct mode publishes the agent's public IP (in DNS and the TCP connection). This is already disclosed in the UI; `relayOnly` remains the "hide my IP" option.
 - **No edge gateway** — abuse/DoS limits move from a hosted gateway to the agent and the control plane. A recipient who already knows an origin can still complete a TLS handshake toward the agent after revocation until the DNS record is removed or lockdown closes the listener; the agent rejects the actual requests via binding, and the control plane stops emitting the origin for new recipients.
 - **Volumetric DoS** saturates the home link rather than a hosted edge. Lockdown mode mitigates but does not eliminate this.
+
+### 11.3 Trust Boundary (carried from FRP §9.7)
+
+The confidentiality guarantee ("control plane cannot read file data") holds **under normal operation**, not against a compromised control plane. Because ShareBridge controls the parent DNS domain and the ACME credentials, a compromised certificate coordinator or DNS worker can complete domain validation with an attacker-controlled key, obtain a replacement certificate for an agent namespace, repoint DNS, and intercept browser↔agent traffic. The design mitigates this with credential isolation, least-privilege DNS tokens, CAA records, append-only issuance logs, Certificate Transparency monitoring, and agent-side alerts — but the property is "confidential against passive and network adversaries," not against a fully compromised control plane.
 
 ## 12. Failure Handling
 
@@ -199,7 +211,7 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 ## 14. Decisions Recorded
 
 - Direct mode becomes P2P native HTTPS, terminating TLS at the agent.
-- Reuse the FRP spec's certificate and DNS architecture unchanged.
+- Reuse the FRP spec's certificate architecture and origin→share binding; the DNS namespace model is amended (split into direct + relay namespaces — §7).
 - Direct and relay share one agent HTTPS server; the relay migrates to FRP-style L4 passthrough so TLS is the single e2e encryption layer and the Noise/browser-framing protocol is deleted.
 - The open signal only activates agent-registered, source-verified shares; the agent never opens arbitrary ports or reach arbitrary local services.
 - Reachability via UPnP/NAT-PMP/PCP automatic port mapping — no manual router configuration, ever.
@@ -207,6 +219,7 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - Direct is the default mode with relay as automatic fallback; `relayOnly` forces relay (hide IP). Speed parity (≥ relay throughput) is validated by the benchdirect spike before direct becomes the default.
 - IP exposure is an accepted, already-disclosed property of direct mode.
 - Content remains on `sharebridgeusercontent.com` for browser site isolation.
+- Two DNS namespaces per agent under one domain: the clean `<namespace>` resolves to the agent IP (direct, the default) and `relay.<namespace>` resolves to the gateway (relay). One certificate with two wildcard SANs covers both — no additional certificate or rate-limit cost.
 - The custom Noise/browser-framing layer is retired for migrated shares.
 - The public port is closed by default and opened on demand by the control plane for an active share access; the open/close switch is the UPnP mapping.
 - Lockdown mode is a prominent red button in the agent dashboard: it immediately removes the UPnP mapping, revokes all active origins, and notifies the control plane to deactivate shares — reversible via an explicit unlock. A separate, less prominent action stops the agent process entirely.

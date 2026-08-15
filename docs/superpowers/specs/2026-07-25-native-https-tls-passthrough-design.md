@@ -232,11 +232,14 @@ It contains:
 - no internal agent ID
 - no hardware identifier
 
-The namespace exists primarily so one agent-owned wildcard certificate can cover unlimited per-share origins:
+The namespace exists primarily so one agent-owned certificate can cover unlimited per-share origins:
 
 ```text
 *.v7q4km2x9pz6dn3w.sharebridgeusercontent.com
+*.relay.v7q4km2x9pz6dn3w.sharebridgeusercontent.com
 ```
+
+> **Amendment (direct-TCP mode):** the certificate carries two wildcard SANs. The clean `<namespace>` serves direct mode (resolving to the agent IP); the `.relay.` sub-namespace serves the FRP relay path (resolving to the gateway). See the direct-TCP spec §7.
 
 The namespace is public metadata, not a secret. It appears in DNS, browser connections, and Certificate Transparency.
 
@@ -332,6 +335,8 @@ The DNS design must allow arbitrary children beneath an enrolled agent namespace
 - an authoritative wildcard-routing DNS design proven to resolve the required nested names
 
 DNS readiness is part of agent enrollment, not share creation.
+
+> **Amendment (direct-TCP mode):** the direct-TCP spec (`docs/superpowers/specs/2026-08-14-direct-tcp-mode-design.md`, §7) splits this model. The clean `<agent-namespace>` namespace now resolves to the **agent's public IP** (direct mode, the default, via DDNS), and the FRP relay path moves to `<share-origin>.relay.<agent-namespace>.sharebridgeusercontent.com` resolving to the **gateway**. Both namespaces remain under `sharebridgeusercontent.com`, and one certificate carries both wildcard SANs — so the per-agent certificate count is unchanged.
 
 ## 9. Certificate Architecture
 
