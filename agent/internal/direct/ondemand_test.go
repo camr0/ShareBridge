@@ -82,6 +82,8 @@ type recordingMapper struct {
 	lastLease      int
 	delFails       int // the first N DeletePortMapping calls fail
 	alwaysFailDel  bool
+	remap          int   // if non-zero, AddPortMapping returns this instead of ext
+	addPorts       []int // ext argument of every AddPortMapping call
 }
 
 func (r *recordingMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
@@ -89,6 +91,10 @@ func (r *recordingMapper) AddPortMapping(ext, internal int, desc string, lease i
 	defer r.mu.Unlock()
 	r.opened++
 	r.lastLease = lease
+	r.addPorts = append(r.addPorts, ext)
+	if r.remap != 0 {
+		return r.remap, nil
+	}
 	return ext, nil
 }
 func (r *recordingMapper) DeletePortMapping(ext int) error {
@@ -111,6 +117,15 @@ func (r *recordingMapper) snapshot() (opened, closed, delCalls, lastLease int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.opened, r.closed, r.delCalls, r.lastLease
+}
+
+// ports returns a copy of every ext argument passed to AddPortMapping, in call order.
+func (r *recordingMapper) ports() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]int, len(r.addPorts))
+	copy(out, r.addPorts)
+	return out
 }
 
 // --- helpers ---
@@ -178,6 +193,32 @@ func TestOnDemandPort_LeaseExpiresUnusedCloses(t *testing.T) {
 	waitFor(t, func() bool { return !p.Open() })
 	fc.advance(closeRetryDelay + time.Millisecond) // first delete attempt
 	waitFor(t, func() bool { _, c, _, _ := rm.snapshot(); return c >= 1 })
+}
+
+func TestOnDemandPort_RenewalUsesGrantedPort(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	rm := &recordingMapper{remap: 52000}
+	p := newTestPort(fc, rm, time.Minute)
+	defer p.Close()
+
+	if err := p.OpenFor("share-1", 30*time.Second); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	if got := p.GrantedPort(); got != 52000 {
+		t.Fatalf("GrantedPort = %d, want 52000", got)
+	}
+	if _, err := p.BeginSession("share-1"); err != nil {
+		t.Fatalf("BeginSession: %v", err)
+	}
+
+	// Past renewAt with an active session → the mapping is renewed.
+	fc.advance(30*time.Second - 2*time.Second + time.Millisecond)
+	waitFor(t, func() bool { return len(rm.ports()) >= 2 })
+
+	ports := rm.ports()
+	if last := ports[len(ports)-1]; last != 52000 {
+		t.Fatalf("last AddPortMapping ext = %d, want 52000 (granted), not 8443", last)
+	}
 }
 
 func TestOnDemandPort_ConcurrentSessionsKeepOpenAndRenew(t *testing.T) {

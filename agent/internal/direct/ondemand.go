@@ -306,7 +306,11 @@ func (p *OnDemandPort) loop() {
 					closing = false
 					closeFail = 0
 				}
-				granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(l.Seconds()))
+				port := p.extPort
+				if grantedPort != 0 {
+					port = grantedPort
+				}
+				granted, err := p.mapper.AddPortMapping(port, p.intPort, p.desc(), int(l.Seconds()))
 				if err != nil {
 					c.reply <- portReply{err: err}
 					continue
@@ -409,7 +413,11 @@ func (p *OnDemandPort) loop() {
 						rearm()
 					}
 				case !now.Before(renewAt):
-					granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(lease.Seconds()))
+					port := p.extPort
+					if grantedPort != 0 {
+						port = grantedPort
+					}
+					granted, err := p.mapper.AddPortMapping(port, p.intPort, p.desc(), int(lease.Seconds()))
 					if err != nil {
 						renewFailed = true
 						renewAt = deadline // stop renewing; close at lease expiry
