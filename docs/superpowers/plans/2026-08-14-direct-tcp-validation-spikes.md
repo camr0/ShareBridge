@@ -323,10 +323,15 @@ func (m *UPnPMapper) ExternalIP() (string, error) {
 
 func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
 	var out []PortMapping
-	for i := 0; ; i++ {
+	for i := 0; i < 256; i++ {
 		_, ext, proto, internal, client, _, desc, _, err := m.client.GetGenericPortMappingEntry(uint16(i))
 		if err != nil {
-			break // index past the last entry
+			if isEndOfList(err) {
+				break // index past the last entry
+			}
+			// A real enumeration error must NOT be treated as an empty list —
+			// otherwise an occupied 443 could look free (fail closed).
+			return nil, fmt.Errorf("enumerate port mapping %d: %w", i, err)
 		}
 		out = append(out, PortMapping{
 			ExternalPort:   int(ext),
@@ -337,6 +342,17 @@ func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
 		})
 	}
 	return out, nil
+}
+
+// isEndOfList recognizes the IGD fault for "no entry at this index"
+// (SpecifiedArrayIndexInvalid / Invalid Args). Any other error is a real
+// enumeration failure and must not be mistaken for end-of-list.
+func isEndOfList(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "713") ||
+		strings.Contains(s, "SpecifiedArrayIndexInvalid") ||
+		strings.Contains(s, "Invalid Args") ||
+		strings.Contains(s, "InvalidArgs")
 }
 
 // NATPMPMapper maps ports using NAT-PMP (Apple/older routers).
@@ -717,7 +733,7 @@ git commit -m "spike: prove UPnP/NAT-PMP reachability for direct mode"
   - `cert.GenerateWildcardCSR(namespace, baseDomain string) (keyPEM, csrPEM []byte, err error)` — generates the key **locally** and requests **both** wildcard SANs (`*.<namespace>.<baseDomain>` and `*.relay.<namespace>.<baseDomain>`); the key never leaves the agent.
   - `cert.ValidateChain(certChainPEM, keyPEM []byte, namespace, baseDomain string, roots *x509.CertPool) error` — full-chain validation (trust root, public-key equality with the locally-held key, exact SAN set, validity window, EKU/key usage).
 - Produces (control-plane side, reused by Phase 2):
-  - `certcoordinator.CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) (chainPEM []byte, err error)` — accepts the agent's CSR and returns **only** the leaf-first chain. It never sees the agent's private key.
+  - `certcoordinator.CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) (chainPEM []byte, err error)` — verifies the CSR authorizes ONLY the enrolling agent's two wildcard SANs (signature + exact SAN set), then returns **only** the leaf-first chain. It never sees the agent's private key.
   - `ddns.Cloudflare` with `UpsertA` / `DeleteA` — direct-namespace wildcard A-record create/update/delete via `cloudflare-go`. (The relay namespace `*.relay.<namespace>.<baseDomain>` → static gateway IP is set once at enrollment and is **out of scope** for the DDNS test; only the direct A record is exercised here.)
 
 - [ ] **Step 1: Write the failing tests for CSR generation and chain validation**
@@ -1146,12 +1162,15 @@ import (
 	"github.com/go-acme/lego/v4/registration"
 )
 
-// ACMEConfig carries operator-supplied ACME/DNS credentials. All values come
-// from env/config at runtime and are NEVER committed to the repo.
+// ACMEConfig carries operator-supplied ACME/DNS credentials and the
+// enrollment's authorized identity. All values come from env/config at runtime
+// and are NEVER committed to the repo.
 type ACMEConfig struct {
 	CA              string // lego.LEDirectoryStaging or lego.LEDirectoryProduction
 	Email           string // ACME account contact
 	CloudflareToken string // Cloudflare API token: single zone, DNS-edit only
+	Namespace       string // the enrolling agent's namespace (authorized identity)
+	BaseDomain      string // content domain, e.g. sharebridgeusercontent.com
 }
 
 // acmeAccount implements lego's registration.User. The spike uses an ephemeral
@@ -1166,12 +1185,12 @@ func (a *acmeAccount) GetEmail() string                        { return a.email 
 func (a *acmeAccount) GetRegistration() *registration.Resource { return nil }
 func (a *acmeAccount) GetPrivateKey() crypto.PrivateKey        { return a.key }
 
-// CompleteCSR takes an agent-submitted CSR PEM, runs an ACME DNS-01 order via
-// lego's Cloudflare provider, and returns ONLY the issued leaf-first chain.
-// It never sees the agent's private key: lego finalizes the pre-made CSR via
-// ObtainForCSR (the external-CSR API) instead of generating a key. lego
-// derives the order's domains from the CSR's SANs, so a single call covers
-// BOTH wildcards in one order.
+// CompleteCSR takes an agent-submitted CSR PEM, verifies it authorizes ONLY the
+// enrolling agent's two wildcard SANs, then runs an ACME DNS-01 order via lego's
+// Cloudflare provider and returns ONLY the issued leaf-first chain. It never
+// sees the agent's private key: lego finalizes the pre-made CSR via ObtainForCSR
+// (the external-CSR API) instead of generating a key. lego derives the order's
+// domains from the CSR's SANs, so a single call covers BOTH wildcards in one order.
 func CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) ([]byte, error) {
 	block, _ := pem.Decode(csrPEM)
 	if block == nil || block.Type != "CERTIFICATE REQUEST" {
@@ -1180,6 +1199,21 @@ func CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) ([]byte, er
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse CSR: %w", err)
+	}
+
+	// Authorization: the CSR must be self-signed (proves the agent holds the
+	// key) and request EXACTLY the enrolling agent's two wildcard SANs. This is
+	// what stops an enrolled agent from obtaining a certificate for another
+	// namespace or any other name in the zone.
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("CSR signature check: %w", err)
+	}
+	want := []string{
+		fmt.Sprintf("*.%s.%s", cfg.Namespace, cfg.BaseDomain),
+		fmt.Sprintf("*.relay.%s.%s", cfg.Namespace, cfg.BaseDomain),
+	}
+	if !exactDNSNames(csr, want) {
+		return nil, fmt.Errorf("CSR SANs = %v, want exactly %v", csr.DNSNames, want)
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -1228,6 +1262,27 @@ func CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) ([]byte, er
 	chain := append([]byte(nil), resource.Certificate...)
 	chain = append(chain, resource.IssuerCertificate...)
 	return chain, nil
+}
+
+// exactDNSNames reports whether the CSR requests exactly the wanted DNS SANs
+// and nothing else: no IP, email, or URI SANs, and the DNSNames set equals want.
+func exactDNSNames(csr *x509.CertificateRequest, want []string) bool {
+	if len(csr.IPAddresses) != 0 || len(csr.EmailAddresses) != 0 || len(csr.URIs) != 0 {
+		return false
+	}
+	if len(csr.DNSNames) != len(want) {
+		return false
+	}
+	wantSet := make(map[string]bool, len(want))
+	for _, w := range want {
+		wantSet[w] = true
+	}
+	for _, n := range csr.DNSNames {
+		if !wantSet[n] {
+			return false
+		}
+	}
+	return true
 }
 ```
 
@@ -1365,12 +1420,26 @@ func main() {
 		log.Printf("recursive after update: %v", waitRecursive(probe, ip2, 5*time.Minute))
 	}
 
-	// 5. Delete and confirm removal.
+	// 5. Delete and confirm removal (recursive + authoritative NXDOMAIN/no-data).
 	if err := c.DeleteA(ctx, name); err != nil {
 		log.Fatalf("DeleteA: %v", err)
 	}
-	log.Printf("A record %s deleted; cleanup verified", name)
+	if err := waitGone(probe, 2*time.Minute); err != nil {
+		log.Fatalf("post-delete: %v", err)
+	}
+	log.Printf("A record %s deleted; removal confirmed (NXDOMAIN/no-data)", name)
 }
+
+// waitGone polls until name no longer resolves to any A record.
+func waitGone(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ips, err := net.LookupHost(name); err != nil || len(ips) == 0 {
+			return nil
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("record %s still resolves after %s", name, timeout)
 
 // resolveAuthoritative discovers the zone's NS records via a recursive
 // resolver, then queries each authoritative server directly for the A record.
@@ -1437,8 +1506,9 @@ import (
 	"sharebridge/server/internal/certcoordinator"
 )
 
-// Control-plane half: read the agent's CSR, complete DNS-01 ACME issuance,
-// write the chain. It never sees the agent's private key.
+// Control-plane half: read the agent's CSR, verify it authorizes the enrolling
+// namespace, complete DNS-01 ACME issuance, write the chain. It never sees the
+// agent's private key.
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -1449,8 +1519,10 @@ func main() {
 	}
 	token := os.Getenv("CLOUDFLARE_API_TOKEN")
 	email := os.Getenv("ACME_EMAIL")
-	if token == "" || email == "" {
-		log.Fatal("set CLOUDFLARE_API_TOKEN and ACME_EMAIL")
+	ns := os.Getenv("SPIKE_NS")
+	base := os.Getenv("SPIKE_BASE")
+	if token == "" || email == "" || ns == "" || base == "" {
+		log.Fatal("set CLOUDFLARE_API_TOKEN, ACME_EMAIL, SPIKE_NS, SPIKE_BASE")
 	}
 	// STAGING first: run the whole flow against the ACME staging CA before
 	// touching production. Set ACME_CA to the production directory URL only
@@ -1459,19 +1531,25 @@ func main() {
 	if ca == "" {
 		ca = lego.LEDirectoryStaging
 	}
+	outPath := os.Getenv("CHAIN_FILE")
+	if outPath == "" {
+		outPath = "chain.pem"
+	}
 
 	chain, err := certcoordinator.CompleteCSR(ctx, csrPEM, certcoordinator.ACMEConfig{
 		CA:              ca,
 		Email:           email,
 		CloudflareToken: token,
+		Namespace:       ns,
+		BaseDomain:      base,
 	})
 	if err != nil {
 		log.Fatalf("CompleteCSR: %v", err)
 	}
-	if err := os.WriteFile("chain.pem", chain, 0o644); err != nil {
+	if err := os.WriteFile(outPath, chain, 0o644); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("chain written to chain.pem (%d bytes) via %s", len(chain), ca)
+	log.Printf("chain written to %s (%d bytes) via %s", outPath, len(chain), ca)
 }
 ```
 
@@ -1481,20 +1559,40 @@ package main
 
 import (
 	"crypto/x509"
+	"flag"
 	"log"
 	"os"
 
 	"sharebridge/agent/internal/cert"
 )
 
-// Agent half: generate the key+CSR locally (key never leaves), and, when a
-// chain is present, validate it against the locally-held key and the
-// configured trust root.
+// Agent half: two modes.
+//   (default) generate the key+CSR locally (key never leaves) and write them.
+//   -validate: validate chain.pem against the EXISTING key (never regenerates,
+//              so the chain is checked against the key it was issued for).
 func main() {
 	ns := os.Getenv("SPIKE_NS")     // agent namespace, e.g. v7q4km2x9pz6dn3w
 	base := os.Getenv("SPIKE_BASE") // base domain, e.g. sbx.example.com
+	validateOnly := flag.Bool("validate", false, "validate chain.pem against the existing key")
+	flag.Parse()
 	if ns == "" || base == "" {
 		log.Fatal("set SPIKE_NS and SPIKE_BASE")
+	}
+
+	if *validateOnly {
+		keyPEM, err := os.ReadFile("key.pem")
+		if err != nil {
+			log.Fatalf("read key.pem: %v (run without -validate first to generate)", err)
+		}
+		chain, err := os.ReadFile("chain.pem")
+		if err != nil {
+			log.Fatalf("read chain.pem: %v", err)
+		}
+		if err := cert.ValidateChain(chain, keyPEM, ns, base, loadRoots()); err != nil {
+			log.Fatalf("ValidateChain rejected returned chain: %v", err)
+		}
+		log.Printf("returned chain validated: exact SANs, key matches, chain verifies")
+		return
 	}
 
 	keyPEM, csrPEM, err := cert.GenerateWildcardCSR(ns, base)
@@ -1508,15 +1606,6 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("agent key + CSR written: key.pem (0600), csr.pem")
-
-	chain, err := os.ReadFile("chain.pem")
-	if err != nil {
-		return // chain not yet returned; the control-plane half runs next
-	}
-	if err := cert.ValidateChain(chain, keyPEM, ns, base, loadRoots()); err != nil {
-		log.Fatalf("ValidateChain rejected returned chain: %v", err)
-	}
-	log.Printf("returned chain validated: exact SANs, key matches, chain verifies")
 }
 
 // loadRoots returns the trust root the agent validates against. For the spike,
@@ -1544,11 +1633,11 @@ func loadRoots() *x509.CertPool {
 - [ ] **Step 8: Run the spike end-to-end — ACME staging first, then DDNS, then production**
 
 1. Set env (never committed): `CLOUDFLARE_API_TOKEN` (single zone, DNS-edit only), `CLOUDFLARE_ZONE`, `ACME_EMAIL`, `SPIKE_NS`, `SPIKE_BASE`.
-2. Agent: `cd agent && go run ./cmd/spike-certagent` → writes `key.pem` (0600) + `csr.pem` (two wildcard SANs).
-3. Control plane (staging): `cd signaling-server && export ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory CSR_FILE=../agent/csr.pem && go run ./cmd/spike-cert`. Verify `chain.pem` has the leaf + issuer, and that no `_acme-challenge` TXT records remain in the zone afterward (challenge cleanup check via the Cloudflare dashboard/API).
-4. Agent validates: `cd agent && SPIKE_CA_ROOT=<staging-root.pem> go run ./cmd/spike-certagent` → `ValidateChain` passes against the staging root (download the LE staging root from https://letsencrypt.org/certs/staging/).
+2. Agent (generate): `cd agent && go run ./cmd/spike-certagent` → writes `key.pem` (0600) + `csr.pem` (two wildcard SANs).
+3. Control plane (staging): `cd signaling-server && export ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory CSR_FILE=../agent/csr.pem CHAIN_FILE=../agent/chain.pem && go run ./cmd/spike-cert`. The coordinator verifies the CSR's signature and exact two SANs before ordering. Verify `chain.pem` has the leaf + issuer, and that no `_acme-challenge` TXT records remain in the zone afterward (challenge cleanup check via the Cloudflare dashboard/API).
+4. Agent (validate): `cd agent && SPIKE_CA_ROOT=<staging-root.pem> go run ./cmd/spike-certagent -validate` → `ValidateChain` passes against the staging root using the **existing** key (the `-validate` flag never regenerates the key; download the LE staging root from https://letsencrypt.org/certs/staging/).
 5. DDNS: `cd signaling-server && SPIKE_DDNS_NAME='*.v7q4km2x9pz6dn3w.sbx.example.com' SPIKE_PROBE_NAME='probe.v7q4km2x9pz6dn3w.sbx.example.com' SPIKE_DDNS_IP=<agent-ip> SPIKE_DDNS_IP2=<second-ip> go run ./cmd/spike-ddns`. Record authoritative + recursive propagation times at TTL 60 for create and update, and confirm delete.
-6. Repeat steps 2–4 against production (`ACME_CA=https://acme-v02.api.letsencrypt.org/directory`) only after staging succeeds, with `SPIKE_CA_ROOT` pointing at the production ISRG root.
+6. Repeat steps 2–4 against production (`ACME_CA=https://acme-v02.api.letsencrypt.org/directory`) only after staging succeeds, with `SPIKE_CA_ROOT` pointing at the production ISRG root (still using `-validate` in step 4).
 
 Expected: a valid two-SAN wildcard certificate issued (staging then production), `ValidateChain` passes with the exact two SANs, and DDNS create/update/delete + propagation is measured. Record the CA used, issuance latency, propagation latency, and any rate-limit/terms surprises.
 
@@ -1568,225 +1657,45 @@ git commit -m "spike: prove 2-SAN wildcard cert (agent-held key) + DDNS for dire
 ### Task 3: Direct-TCP throughput spike
 
 **Files:**
-- Modify: `agent/cmd/benchdirect/main.go` (new `--mode` values `https|fetch|tcpproxy`, new `--url/--target/--reps` flags, validation + dispatch)
-- Create: `agent/cmd/benchdirect/tcpshim.go` (net.Conn-wrapping TCP impairment proxy)
-- Create: `agent/cmd/benchdirect/tcpshim_test.go`
+- Modify: `agent/cmd/benchdirect/main.go` (new `--mode` values `https|fetch`, new `--url/--reps` flags, validation + dispatch)
 - Create: `agent/cmd/benchdirect/httpsbench.go` (`--mode https` file server + `--mode fetch` client + result types/summary)
 - Create: `agent/cmd/benchdirect/httpsbench_test.go`
 - Create: `docs/superpowers/spikes/2026-08-14-direct-tcp-throughput.md`
 
-`server.go` and `rawbench.go` (and the WebRTC/`raw`/`prod` path) are left untouched. The HTTPS server is a new, separate listener — `server.go`'s `benchServer` is the browser-signaling path, not the data plane.
+`server.go` and `rawbench.go` (and the WebRTC/`raw`/`prod` path) are left untouched. The HTTPS server is a new, separate listener — `server.go`'s `benchServer` is the browser-signaling path, not the data plane. **Impairment is applied by the operating system at the packet layer, not by Go code** — see Step 1.
 
 **Interfaces:**
-- Consumes: the existing `--rtt/--jitter/--bandwidth/--loss` flags (now applied by the new TCP proxy, **not** the UDP shim), `parseByteSize` from `main.go`, and the `rateLimiter` type from `shim.go` (reused by the TCP proxy).
-- Produces: `tcpProxy` (a TCP listener that dials a target and shapes each conn) and `runHTTPServer`/`runFetch`, plus the written finding. No production code; no WebRTC/SCTP path is modified.
+- Consumes: `parseByteSize` from `main.go`; `--rtt` (labels the run; the actual delay is applied by the OS shaper).
+- Produces: `serveFile`/`fetch` (plus thin `main.go` dispatch wrappers), and the written finding. No production code; no WebRTC/SCTP path is modified.
 
-**Corrections this task fixes (from code review, verified against the real source):**
+**Why packet-level shaping (not a Go TCP proxy):** a net.Conn-wrapping proxy that "drops" bytes by returning success without forwarding silently loses them — the proxy terminates TCP at both ends, so there is no retransmission — and sleeping per `Write` serializes the stream, capping throughput far below the target. The benchmark must shape at the packet layer so the kernel TCP stack performs its real retransmit/backoff. Use Linux `tc netem` or macOS `dnctl`/`pfctl`.
 
-1. `--size 1024` is **1024 bytes**, not 1 GiB. `parseByteSize` accepts unit-suffixed values and falls through to `strconv.ParseInt(s, 10, 64)` for bare numbers, which is bytes. Use `--size 1GiB` / `--size 100MiB` / `--size 8MiB`. Note `--bandwidth 25MB` = 25×10⁶ bytes/s (~200 Mbps) because `MB` is a decimal multiplier.
-2. `--mode` today is `raw|prod` only (both WebRTC/SCTP). There is **no** relay mode and **no** HTTPS mode. The two new data-plane modes are specified below; do not assume they exist.
-3. `shim.go` is `net.UDPConn`-only (`ReadFromUDP`/`WriteToUDP`) — it cannot shape a TCP/HTTPS connection. A net.Conn-wrapping TCP proxy is specified below, with TCP loss modeled as drop→retransmit (not UDP drop-and-continue).
-4. The comparison measures the same payload over the real transport paths at RTT ≥ 50 ms, with TLS, warm-up, ≥12 reps, median + range + percentile, and an explicit pass/fail criterion.
+- [ ] **Step 1: Configure OS packet shaping (RTT 100 ms, 25 MB/s cap, optional loss)**
 
-- [ ] **Step 1: Write the failing test for the TCP impairment proxy**
+Shaping is applied between the server and client. Loopback shaping is unreliable on macOS, so prefer either (a) server and client on separate hosts with real RTT, or (b) Linux `tc netem` (the relay VPS is Linux) to add the target RTT/loss/bandwidth on a real interface.
 
-```go
-// agent/cmd/benchdirect/tcpshim_test.go
-package main
+Linux (`tc netem`, on the machine hosting the server or a router hop):
 
-import (
-	"io"
-	"net"
-	"testing"
-	"time"
-)
-
-// TestTCPProxyForwardsIntact: a large transfer through the proxy arrives
-// complete and in order even with loss enabled — TCP retransmits the dropped
-// bytes (the receiver never ACKs them, the sender re-sends). This is the
-// drop→retransmit semantic the UDP shim cannot model.
-func TestTCPProxyForwardsIntact(t *testing.T) {
-	backend, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		c, err := backend.Accept()
-		if err != nil {
-			return
-		}
-		_, _ = io.Copy(c, c) // echo
-		c.Close()
-	}()
-
-	p, err := newTCPProxy(backend.Addr().String(), 5*time.Millisecond, 2*time.Millisecond, 0.05, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	go p.Serve()
-	defer p.Close()
-
-	c, err := net.Dial("tcp", p.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
-	payload := make([]byte, 1<<20) // 1 MiB
-	if _, err := c.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(c, got); err != nil {
-		t.Fatalf("read back: %v (loss broke the stream)", err)
-	}
-	for i := range got {
-		if got[i] != payload[i] {
-			t.Fatalf("byte %d corrupted", i)
-		}
-	}
-}
+```bash
+# eth0 = the interface carrying the benchmark traffic. delay is ONE-WAY (RTT=2×delay).
+sudo tc qdisc add dev eth0 root netem delay 50ms loss 0.01% rate 200mbit
+# ... run the benchmark ...
+sudo tc qdisc del dev eth0 root
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+macOS (`dnctl` + `pfctl`):
 
-Run: `cd agent && go test ./cmd/benchdirect/ -run TestTCPProxyForwardsIntact -v`
-Expected: FAIL — `undefined: newTCPProxy`.
-
-- [ ] **Step 3: Implement the TCP impairment proxy**
-
-```go
-// agent/cmd/benchdirect/tcpshim.go
-package main
-
-import (
-	"errors"
-	"io"
-	"math/rand"
-	"net"
-	"sync"
-	"time"
-)
-
-// shapingConn wraps a net.Conn and applies one-way latency, jitter, packet
-// loss, and a bandwidth cap to the byte stream it writes.
-//
-// Loss is modeled by DROPPING whole write buffers (reporting success without
-// forwarding), so the receiving TCP never ACKs the bytes and the sender's TCP
-// retransmits with backoff — the same drop→retransmit behavior as a real link.
-// This is deliberately different from the UDP Shim, where a dropped datagram
-// simply never arrives and nothing retransmits.
-type shapingConn struct {
-	conn      net.Conn
-	delay     time.Duration // one-way latency (RTT/2)
-	jitter    time.Duration
-	loss      float64
-	limiter   *rateLimiter // nil = unlimited
-	onClose   func()
-	closeOnce sync.Once
-}
-
-func (c *shapingConn) Read(p []byte) (int, error) { return c.conn.Read(p) }
-
-func (c *shapingConn) Write(p []byte) (int, error) {
-	if c.loss > 0 && rand.Float64() < c.loss {
-		return len(p), nil // drop: never forwarded; peer TCP retransmits
-	}
-	if c.delay > 0 || c.jitter > 0 {
-		d := c.delay
-		if c.jitter > 0 {
-			d += time.Duration((rand.Float64()*2 - 1) * float64(c.jitter))
-		}
-		if d > 0 {
-			time.Sleep(d)
-		}
-	}
-	if c.limiter != nil {
-		c.limiter.take(len(p))
-	}
-	return c.conn.Write(p)
-}
-
-func (c *shapingConn) Close() error {
-	var err error
-	c.closeOnce.Do(func() {
-		err = c.conn.Close()
-		if c.onClose != nil {
-			c.onClose()
-		}
-	})
-	return err
-}
-
-func (c *shapingConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
-func (c *shapingConn) RemoteAddr() net.Addr               { return c.conn.RemoteAddr() }
-func (c *shapingConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
-func (c *shapingConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
-func (c *shapingConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
-
-// tcpProxy accepts a connection, dials target, and wires the two sides through
-// shapingConns, each direction shaped independently. It is the TCP analog of
-// the UDP Shim and is the ONLY way the benchmark shapes a TCP/HTTPS link.
-type tcpProxy struct {
-	ln        net.Listener
-	target    string
-	delay     time.Duration
-	jitter    time.Duration
-	loss      float64
-	bandwidth int64
-}
-
-func newTCPProxy(target string, delay, jitter time.Duration, loss float64, bandwidth int64) (*tcpProxy, error) {
-	if loss < 0 || loss > 1 {
-		return nil, errors.New("loss must be between 0 and 1")
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
-	return &tcpProxy{ln: ln, target: target, delay: delay, jitter: jitter, loss: loss, bandwidth: bandwidth}, nil
-}
-
-func (p *tcpProxy) Addr() net.Addr { return p.ln.Addr() }
-
-func (p *tcpProxy) Serve() {
-	for {
-		down, err := p.ln.Accept()
-		if err != nil {
-			return
-		}
-		go p.pipe(down)
-	}
-}
-
-func (p *tcpProxy) pipe(down net.Conn) {
-	up, err := net.Dial("tcp", p.target)
-	if err != nil {
-		down.Close()
-		return
-	}
-	var limiter *rateLimiter
-	if p.bandwidth > 0 {
-		limiter = newRateLimiter(float64(p.bandwidth))
-	}
-	a := &shapingConn{conn: down, delay: p.delay, jitter: p.jitter, loss: p.loss, limiter: limiter}
-	b := &shapingConn{conn: up, delay: p.delay, jitter: p.jitter, loss: p.loss, limiter: limiter}
-	a.onClose = func() { b.Close() }
-	b.onClose = func() { a.Close() }
-	go func() { _, _ = io.Copy(b, a); b.Close() }()
-	_, _ = io.Copy(a, b)
-	a.Close()
-}
-
-func (p *tcpProxy) Close() error { return p.ln.Close() }
+```bash
+sudo dnctl pipe 1 config delay 50ms plr 0.01 bw 200Mbit/s
+# enable the pipe with a pf rule on the test interface (see pfctl(8)); then:
+sudo pfctl -f /etc/pf.conf   # or a dedicated rules file
+# ... run the benchmark ...
+sudo dnctl -q flush
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+Note the `--size` gotcha: `parseByteSize` treats a bare number as **bytes**, so always pass a unit-suffixed value (`200MiB`).
 
-Run: `cd agent && go test ./cmd/benchdirect/ -run TestTCPProxyForwardsIntact -v`
-Expected: PASS (the full 1 MiB round-trips despite 5% per-direction loss).
-
-- [ ] **Step 5: Write the failing test for the HTTPS server + fetch client**
+- [ ] **Step 2: Write the failing test for the HTTPS server + fetch client**
 
 ```go
 // agent/cmd/benchdirect/httpsbench_test.go
@@ -1797,7 +1706,6 @@ import (
 	"io"
 	"net/http"
 	"testing"
-	"time"
 )
 
 func TestHTTPSRangeAndFullFetch(t *testing.T) {
@@ -1808,7 +1716,7 @@ func TestHTTPSRangeAndFullFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &http.Client{Transport: &http.Transport{
-		TLSClientConfig:  insecureTLSConfig(),
+		TLSClientConfig:   insecureTLSConfig(),
 		DisableKeepAlives: true,
 	}}
 
@@ -1837,16 +1745,15 @@ func TestHTTPSRangeAndFullFetch(t *testing.T) {
 			t.Fatalf("received = %d, want %d", r.Received, int64(1<<20))
 		}
 	}
-	_ = time.Now()
 }
 ```
 
-- [ ] **Step 6: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `cd agent && go test ./cmd/benchdirect/ -run TestHTTPSRangeAndFullFetch -v`
 Expected: FAIL — `undefined: serveFile` / `undefined: fetch`.
 
-- [ ] **Step 7: Implement the HTTPS server + fetch client**
+- [ ] **Step 4: Implement the HTTPS server + fetch client**
 
 ```go
 // agent/cmd/benchdirect/httpsbench.go
@@ -2062,56 +1969,45 @@ func summarize(rs []fetchResult) (median, min, max, p95 float64) {
 }
 ```
 
-- [ ] **Step 8: Run test to verify it passes**
+- [ ] **Step 5: Run test to verify it passes**
 
-Run: `cd agent && go test ./cmd/benchdirect/ -run 'TestHTTPSRangeAndFullFetch|TestTCPProxyForwardsIntact' -v`
+Run: `cd agent && go test ./cmd/benchdirect/ -run TestHTTPSRangeAndFullFetch -v`
 Expected: PASS.
 
-- [ ] **Step 9: Wire the new modes into `main.go`**
+- [ ] **Step 6: Wire the new modes into `main.go`**
 
 Only `main.go` changes (leave `server.go`, `rawbench.go`, `shim.go` untouched):
 
-1. `--mode` help string becomes `"raw|prod|https|fetch|tcpproxy"`.
-2. Add flags: `--url` (string, fetch target), `--target` (string, tcpproxy backend `host:port`), `--reps` (int, default **12**), optional `--cert`/`--key` (string, default `""` = generate self-signed).
-3. `validateRunConfig` (and the dispatch switch) accept the three new modes with these rules: `https` requires `--size > 0`; `fetch` requires `--url != ""` and `--reps >= 1`; `tcpproxy` requires `--target != ""`. The existing `raw|prod` validation is unchanged.
+1. `--mode` help string becomes `"raw|prod|https|fetch"`.
+2. Add flags: `--url` (string, fetch target), `--reps` (int, default **12**).
+3. `validateRunConfig` (and the dispatch switch) accept the new modes: `https` requires `--size > 0`; `fetch` requires `--url != ""` and `--reps >= 1`. The existing `raw|prod` validation is unchanged.
 4. The dispatch switch gains:
    - `case "https":` call `runHTTPServer(ctx, cfg)` → runs `serveFile(ctx, cfg.size)`, prints the listen URL to stderr, and blocks until signal.
-   - `case "tcpproxy":` build `newTCPProxy(cfg.target, rtt/2, jitter, loss, bandwidth)`, `Serve()`, block until signal.
    - `case "fetch":` call `fetch(ctx, cfg.url, cfg.size, cfg.rttMs, cfg.reps)`, then print `summarize(...)` (median/min/max/p95) to stderr and write the `[]fetchResult` array as JSON to `--out` (a new writer beside the existing `rawResult` path; the `raw`/`prod` JSON shape is unchanged).
 
-- [ ] **Step 10: Run direct-TCP vs relay at RTT ≥ 50 ms (same payload, same shaping)**
+- [ ] **Step 7: Run direct-TCP vs relay at RTT ≥ 50 ms (same payload, same shaping)**
 
-The relay data plane is also kernel TCP + TLS (browser → VPS → agent); its throughput is bounded by the same kernel-TCP physics as direct plus an extra hop (higher RTT, shared VPS bandwidth). The spike therefore measures the kernel-TCP/HTTPS data plane with one harness and treats the relay's documented **20–30 MB/s ≈ 160–240 Mbps** (BENCH_RESULTS.md, spec §2) as the baseline to meet — re-derived at the **same** payload, RTT, and bandwidth so the comparison is apples-to-apples. (If the real relay/VPS endpoint is reachable, `--url` can target it directly; the equal-RTT in-harness comparison is the deterministic gate.)
-
-Primary run — RTT 100 ms, owner's real upstream (25 MB/s ≈ 200 Mbps), 100 MiB payload, no loss, 12 reps:
+Primary run: RTT 100 ms, 25 MB/s cap, 200 MiB payload, no loss, 12 reps. Apply Step 1's shaper, then:
 
 ```bash
 cd agent
-# (1) HTTPS file server: 100 MiB, Range-capable.  NOTE: --size takes unit-suffixed
-#     values; a bare number is BYTES, so --size 1024 would be 1024 bytes, not 1 GiB.
-go run ./cmd/benchdirect -mode https -size 100MiB &
-SRV=$!
-
-# (2) TCP impairment proxy in front of the server: RTT=100ms (50ms each way),
-#     jitter 10ms, 25 MB/s cap, 0 loss.
-go run ./cmd/benchdirect -mode tcpproxy -target 127.0.0.1:<server-port> -rtt 100 -jitter 10 -bandwidth 25MB -loss 0 &
-PROXY=$!
-
-# (3) Fetch client: 1 warm-up + 12 measured reps (median/min/max/p95 reported).
-go run ./cmd/benchdirect -mode fetch -url https://127.0.0.1:<proxy-port>/bench.bin -size 100MiB -rtt 100 -reps 12
+go run ./cmd/benchdirect -mode https -size 200MiB &   # server, prints its URL
+go run ./cmd/benchdirect -mode fetch -url https://<server-host>/bench.bin -size 200MiB -rtt 100 -reps 12
 ```
 
-Secondary runs (same server/proxy pattern):
-- **RTT 50 ms** (`-rtt 50`) to cover the spec's "≥ 50 ms" lower bound.
-- **1% loss** (`-loss 0.01`, RTT 100) to confirm kernel TCP survives the loss level at which SCTP collapsed ~120× (BENCH_RESULTS.md).
+Secondary runs (same shaper pattern):
+- **RTT 50 ms** (shaper `delay 25ms`) to cover the spec's "≥ 50 ms" lower bound.
+- **1% loss** (shaper `loss 1%`, RTT 100) to confirm kernel TCP survives the loss level at which SCTP collapsed ~120× (BENCH_RESULTS.md).
 
-Expected: direct-TCP median ≈ the 25 MB/s cap (~200 Mbps) — i.e. **≥ relay** (160–240 Mbps) — with `stalls == 0` in every rep. This is the pass condition.
+**Relay comparison must be contemporaneous, not a historical floor:** measure the relay path (browser → VPS → agent, kernel TCP) at the same payload/RTT/bandwidth in the same session. If the real relay endpoint is reachable, point `--url` at it; otherwise record the relay's live 20–30 MB/s (≈160–240 Mbps) measurement and explicitly flag that a direct result merely beating a stale 160 Mbps floor does NOT prove "≥ relay" if the live relay achieves 240 Mbps.
 
-- [ ] **Step 11: Write findings and commit**
+Expected: direct-TCP median ≈ the 25 MB/s cap (~200 Mbps) with `stalls == 0` in every rep.
 
-Write `docs/superpowers/spikes/2026-08-14-direct-tcp-throughput.md` with: TLS setup (in-memory self-signed ECDSA P-256, TLS 1.2+), warm-up policy (first rep discarded), the per-rep `median / min / max / p95` Mbps table, the per-100ms sample trace (to eyeball the absence of stalls), the stall count per rep, and the explicit verdict:
+- [ ] **Step 8: Write findings and commit**
 
-> **Pass/fail:** PASS iff (a) direct-TCP median Mbps ≥ relay baseline (≥ 160 Mbps at RTT=100, 25 MB/s cap) at the same payload/RTT/bandwidth, **and** (b) every rep has `stalls == 0` (no SCTP-collapse signature — the SCTP path shows multi-second zero-throughput stalls at these settings). Fail on either condition means direct does not become the default (relay remains), per spec §13.4.
+Write `docs/superpowers/spikes/2026-08-14-direct-tcp-throughput.md` with: the shaper used (`tc netem` vs `dnctl`, and the interface/topology), TLS setup (in-memory self-signed ECDSA P-256, TLS 1.2+), warm-up policy (first rep discarded), the per-rep `median / min / max / p95` Mbps table for **both** direct and the contemporaneous relay measurement, the per-100ms sample trace (to eyeball the absence of stalls), the stall count per rep, and the explicit verdict:
+
+> **Pass/fail:** PASS iff (a) direct-TCP median Mbps ≥ the **contemporaneously measured** relay median at the same payload/RTT/bandwidth, **and** (b) every rep has `stalls == 0` (no SCTP-collapse signature). Fail on either condition means direct does not become the default (relay remains), per spec §13.4.
 
 Then:
 
@@ -2126,7 +2022,7 @@ git commit -m "spike: measure direct-TCP (HTTPS) vs relay throughput at RTT>=50m
 
 This task also folds in the strict open-signal protocol from spec §5.1: a versioned, expiring, idempotent signal bound to `(agent, share, route, nonce)`, verified and rate-limited at the agent.
 
-> **Spike simplification (granted port):** `OnDemandPort` tracks a single external port and assumes `AddPortMapping` grants the requested port (true for UPnP). NAT-PMP may remap the external port — Task 1 proves granted-port reporting; Phase 2's production `OnDemandPort` will store and use the granted port. The spike's `recordingMapper` echoes the requested port.
+> **Granted port:** `OnDemandPort` stores the external port the router actually granted (`AddPortMapping`'s return value — NAT-PMP may remap) and exposes it via `GrantedPort()` for endpoint reporting; deletion and renewal use the granted port.
 
 **Files:**
 - Create: `agent/internal/direct/ondemand.go`
@@ -2527,11 +2423,13 @@ const (
 	opEndSession
 	opClose
 	opIsOpen
+	opGrantedPort
 )
 
 type portReply struct {
 	open      bool
 	sessionID string
+	granted   int
 	err       error
 }
 
@@ -2643,6 +2541,13 @@ func (p *OnDemandPort) Close() error {
 	return p.send(portCommand{op: opClose, reply: ch}).err
 }
 
+// GrantedPort returns the external port the router actually granted (NAT-PMP
+// may remap), for endpoint reporting. Zero until the port is mapped.
+func (p *OnDemandPort) GrantedPort() int {
+	ch := make(chan portReply, 1)
+	return p.send(portCommand{op: opGrantedPort, reply: ch}).granted
+}
+
 // CloseError returns the last mapping-deletion failure (nil once deletion
 // succeeds), for alerting/escalation.
 func (p *OnDemandPort) CloseError() error {
@@ -2661,17 +2566,19 @@ func (p *OnDemandPort) loop() {
 	defer close(p.done)
 
 	var (
-		open      bool
-		closing   bool
-		lease     time.Duration
-		deadline  time.Time // lease expiry if never renewed
-		renewAt   time.Time // when to renew (while sessions are active)
-		idleAt    time.Time // inactivity close (zero until a session exists)
-		sessions  = map[string]time.Time{}
-		seq       uint64
-		timer     portTimer
-		timerC    <-chan time.Time
-		closeFail int
+		open        bool
+		closing     bool
+		renewFailed bool
+		lease       time.Duration
+		grantedPort int       // external port the router actually granted (NAT-PMP may remap)
+		deadline    time.Time // lease expiry if never renewed
+		renewAt     time.Time // when to renew (while sessions are active)
+		idleAt      time.Time // inactivity close (zero until a session exists)
+		sessions    = map[string]time.Time{}
+		seq         uint64
+		timer       portTimer
+		timerC      <-chan time.Time
+		closeFail   int
 	)
 
 	clearTimer := func() {
@@ -2715,7 +2622,13 @@ func (p *OnDemandPort) loop() {
 		}
 	}
 	tryDelete := func() bool {
-		if err := p.mapper.DeletePortMapping(p.extPort); err != nil {
+		port := p.extPort
+		if grantedPort != 0 {
+			port = grantedPort
+		}
+		// DeleteOwnedMapping refuses to delete a mapping this agent didn't
+		// create (spec §6), rather than deleting blindly.
+		if err := DeleteOwnedMapping(p.mapper, port); err != nil {
 			closeFail++
 			p.setCloseErr(err)
 			return false
@@ -2729,6 +2642,8 @@ func (p *OnDemandPort) loop() {
 		open = false
 		closing = true
 		closeFail = 0
+		sessions = map[string]time.Time{} // drop stale sessions so a reopen can't renew from them
+		idleAt = time.Time{}
 		rearm() // first DeletePortMapping happens on the next tick
 	}
 
@@ -2745,10 +2660,13 @@ func (p *OnDemandPort) loop() {
 					closing = false
 					closeFail = 0
 				}
-				if _, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(l.Seconds())); err != nil {
+				granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(l.Seconds()))
+				if err != nil {
 					c.reply <- portReply{err: err}
 					continue
 				}
+				grantedPort = granted
+				renewFailed = false
 				open = true
 				now := p.clock.Now()
 				lease = l
@@ -2797,6 +2715,8 @@ func (p *OnDemandPort) loop() {
 					open = false
 					closing = true
 					closeFail = 0
+					sessions = map[string]time.Time{}
+					idleAt = time.Time{}
 					if tryDelete() {
 						c.reply <- portReply{}
 					} else {
@@ -2811,6 +2731,9 @@ func (p *OnDemandPort) loop() {
 
 			case opIsOpen:
 				c.reply <- portReply{open: open}
+
+			case opGrantedPort:
+				c.reply <- portReply{granted: grantedPort}
 			}
 
 		case <-timerC:
@@ -2829,17 +2752,29 @@ func (p *OnDemandPort) loop() {
 				}
 			case open && len(sessions) > 0:
 				now := p.clock.Now()
-				if !now.Before(idleAt) {
+				switch {
+				case !now.Before(idleAt):
 					startClose()
-				} else if !now.Before(renewAt) {
-					if _, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(lease.Seconds())); err != nil {
-						renewAt = deadline // stop renewing; close at lease expiry
+				case renewFailed:
+					// a prior renewal failed; wait for lease expiry, then close
+					if !now.Before(deadline) {
+						startClose()
 					} else {
+						rearm()
+					}
+				case !now.Before(renewAt):
+					granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(lease.Seconds()))
+					if err != nil {
+						renewFailed = true
+						renewAt = deadline // stop renewing; close at lease expiry
+						rearm()
+					} else {
+						grantedPort = granted
 						deadline = now.Add(lease)
 						renewAt = deadline - p.renewWindow
+						rearm()
 					}
-					rearm()
-				} else {
+				default:
 					rearm()
 				}
 			case open:
@@ -3513,6 +3448,8 @@ var (
 	ErrSignalLockdown = errors.New("direct: open signals refused during lockdown")
 	ErrSignalNotAuth  = errors.New("direct: share not registered/source-authorized locally")
 	ErrSignalRate     = errors.New("direct: open-signal rate limit exceeded")
+	ErrBadLease       = errors.New("direct: open-signal lease out of bounds")
+	ErrBadLifetime    = errors.New("direct: open-signal expiry out of bounds")
 )
 
 // shareAuthorizer reports whether the agent has independently registered and
@@ -3548,6 +3485,10 @@ const (
 	signalWindow      = time.Minute
 	maxSignalsPerWin  = 10
 	maxPerSharePerWin = 3
+
+	maxLease          = 15 * time.Minute // per-share open lease ceiling
+	maxSignalLifetime = 5 * time.Minute  // how far in the future ExpiresAt may be
+	nonceRetention    = maxSignalLifetime + time.Minute // nonce remembered through validity + skew
 )
 
 func NewSignalGate(agentID string, authz shareAuthorizer) *SignalGate {
@@ -3585,6 +3526,15 @@ func (g *SignalGate) Admit(sig OpenSignal) error {
 	if !sig.ExpiresAt.After(now) {
 		return ErrExpiredSignal
 	}
+	if sig.ExpiresAt.After(now.Add(maxSignalLifetime)) {
+		return fmt.Errorf("%w: expiry too far in the future", ErrBadLifetime)
+	}
+	if sig.Lease <= 0 || sig.Lease > maxLease {
+		return fmt.Errorf("%w: lease %s (max %s)", ErrBadLease, sig.Lease, maxLease)
+	}
+	if sig.RouteKind != RouteDirect {
+		return fmt.Errorf("%w: route %q cannot open the direct public port", ErrWrongRouteKind, sig.RouteKind)
+	}
 	if u, ok := g.seen[sig.Nonce]; ok {
 		if u.shareID != sig.ShareID || u.kind != sig.RouteKind {
 			return ErrNonceReuse
@@ -3604,9 +3554,11 @@ func (g *SignalGate) Admit(sig OpenSignal) error {
 	g.seen[sig.Nonce] = nonceUse{shareID: sig.ShareID, kind: sig.RouteKind, seenAt: now}
 	g.applied[sig.ShareID+":"+string(sig.RouteKind)] = now
 
-	// Best-effort prune of expired nonce entries to bound memory.
+	// Best-effort prune of expired nonce entries to bound memory. Retention is
+	// maxSignalLifetime + skew so a valid signal's nonce is remembered through
+	// its full validity window (and a little past, to absorb clock skew).
 	for nonce, u := range g.seen {
-		if now.Sub(u.seenAt) > signalWindow*4 {
+		if now.Sub(u.seenAt) > nonceRetention {
 			delete(g.seen, nonce)
 		}
 	}

@@ -95,7 +95,7 @@ Requirements for direct mode: the home router exposes a public IP (no CGNAT) and
 2. Includes a control-plane-generated nonce in the probe request; the agent's HTTPS server answers the nonce only for the share being opened, so a correct echo proves the mapping reaches *this* agent and not some other host on the IP.
 3. Rate-limits probes per agent.
 
-The agent never asks the control plane to probe arbitrary hosts, and the control plane never probes an address the agent did not just claim as its own.
+The agent never asks the control plane to probe arbitrary hosts, and the control plane never probes an address the agent did not just claim as its own. Because both the reported IP and `GetExternalIPAddress` are agent-supplied, the control plane additionally cross-checks the claimed public IP against an independently observed source address (STUN) and treats any mismatch as relay-only, so a compromised agent cannot induce probes toward arbitrary public targets.
 
 ## 5.1 On-Demand Port Opening (Closed by Default)
 

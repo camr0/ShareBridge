@@ -5,6 +5,8 @@
 **Supersedes for migrated shares:** WebRTC transfer channels, Secure Relay/Noise browser channels, multilane transfer framing, and service-worker-simulated HTTP media delivery
 **Preserves:** Native-share discovery, source connectors, share lifecycle, gallery construction, passwords, source authorization, account/control-plane functionality, and the recipient-facing ShareBridge product
 
+> **Amendment (2026-08-14 — direct-TCP mode):** the direct-TCP spec (`docs/superpowers/specs/2026-08-14-direct-tcp-mode-design.md`) splits the namespace. The clean `<agent-namespace>` now serves **direct mode** (resolving to the agent's public IP via DDNS), and this spec's FRP relay path moves to `<share-origin>.relay.<agent-namespace>.sharebridgeusercontent.com` (resolving to the gateway). The certificate carries **two** wildcard SANs (`*.<agent-namespace>.sharebridgeusercontent.com` + `*.relay.<agent-namespace>.sharebridgeusercontent.com`). Throughout this spec, read the relay/gateway hostname `<share-origin>.<agent-namespace>.sharebridgeusercontent.com` as `<share-origin>.relay.<agent-namespace>.sharebridgeusercontent.com`; §7.3 and §8 carry the detailed amendment.
+
 ## 1. Summary
 
 ShareBridge will migrate its bulk data plane from a custom browser transfer protocol to ordinary browser HTTPS.
@@ -16,24 +18,25 @@ https://sharebridge.app/share/<immich-key>
 https://sharebridge.app/s/<nextcloud-or-opencloud-token>
 ```
 
-The ShareBridge control plane will resolve that native share to a one-time, share-specific content origin:
+The ShareBridge control plane will resolve that native share to a one-time, share-specific content origin (relay path shown; the direct-TCP spec adds the clean `<share-origin>.<agent-namespace>.sharebridgeusercontent.com` direct path):
 
 ```text
-https://<share-origin>.<agent-namespace>.sharebridgeusercontent.com/<native-route>
+https://<share-origin>.relay.<agent-namespace>.sharebridgeusercontent.com/<native-route>
 ```
 
 The browser will establish normal HTTPS directly with a web server running inside the local ShareBridge agent. A public Layer 4 gateway will inspect only the TLS ClientHello/SNI hostname and forward the raw encrypted TCP stream through an authenticated FRP tunnel. The gateway will not terminate browser TLS and will not be able to read HTTP, passwords, files, photos, videos, document contents, cookies, or editor traffic.
 
-Each agent will own a wildcard certificate for a random, replaceable public certificate namespace:
+Each agent will own one certificate (two wildcard SANs) for a random, replaceable public certificate namespace:
 
 ```text
 *.<agent-namespace>.sharebridgeusercontent.com
+*.relay.<agent-namespace>.sharebridgeusercontent.com
 ```
 
-Each native share will receive one random child hostname under that namespace:
+Each native share will receive one random child hostname under the relay namespace (and, under direct-TCP, under the clean namespace):
 
 ```text
-<share-origin>.<agent-namespace>.sharebridgeusercontent.com
+<share-origin>.relay.<agent-namespace>.sharebridgeusercontent.com
 ```
 
 The gateway will route only exact, active share hostnames. It will not route the bare agent namespace or arbitrary wildcard children. When a native share is deleted, revoked, or expired, its exact mapping will be removed and active streams will be terminated. The hostname will be permanently tombstoned and never reused.
