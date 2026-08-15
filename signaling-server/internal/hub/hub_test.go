@@ -70,7 +70,7 @@ func TestRegisterAndUnregisterAgent(t *testing.T) {
 	assert.True(t, h.AgentConnected(apiKey))
 
 	// Unregister agent
-	h.UnregisterAgent(apiKey)
+	h.UnregisterAgent(apiKey, agentConn)
 	assert.False(t, h.AgentConnected(apiKey))
 
 	// Cleanup
@@ -136,7 +136,7 @@ func TestGetAgentConn_AgentDisconnected(t *testing.T) {
 	assert.NotNil(t, conn)
 
 	// Unregister agent (simulates disconnect)
-	h.UnregisterAgent(apiKey)
+	h.UnregisterAgent(apiKey, agentConn)
 
 	// GetAgentConn should now fail even though code is still registered
 	conn, ok = h.GetAgentConn(code)

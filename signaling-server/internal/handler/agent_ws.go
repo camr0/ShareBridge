@@ -81,7 +81,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 			if err != nil {
 				if agentID != "" {
 					log.Printf("agent disconnected: %s (agent_id: %s)", apiKeyID, agentID)
-					h.UnregisterAgent(apiKeyID)
+					h.UnregisterAgent(apiKeyID, conn)
 				}
 				return
 			}

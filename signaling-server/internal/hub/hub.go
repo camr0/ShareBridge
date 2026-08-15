@@ -38,20 +38,30 @@ func New() *Hub {
 	}
 }
 
+// RegisterAgent stores conn for apiKey, closing any prior conn for that key
+// (fencing the old reader) so a stale disconnect cannot unregister the new one.
 func (h *Hub) RegisterAgent(apiKey string, conn *websocket.Conn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	if old, ok := h.agents[apiKey]; ok && old != conn {
+		h.mu.Unlock()
+		old.Close(websocket.StatusPolicyViolation, "superseded")
+		h.mu.Lock()
+	}
 	h.agents[apiKey] = conn
 	h.ensureWriteMuLocked(conn)
+	h.mu.Unlock()
 }
 
-func (h *Hub) UnregisterAgent(apiKey string) {
+// UnregisterAgent removes the mapping only if conn is still the registered one.
+func (h *Hub) UnregisterAgent(apiKey string, conn *websocket.Conn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if conn, ok := h.agents[apiKey]; ok {
-		delete(h.connWrites, conn)
+	if cur, ok := h.agents[apiKey]; ok && cur == conn {
+		delete(h.agents, apiKey)
+		if _, ok := h.connWrites[conn]; ok {
+			delete(h.connWrites, conn)
+		}
 	}
-	delete(h.agents, apiKey)
+	h.mu.Unlock()
 }
 
 func (h *Hub) AgentConnected(apiKey string) bool {
