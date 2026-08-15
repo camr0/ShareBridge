@@ -168,30 +168,55 @@ func fetch(ctx context.Context, url string, size int64, rttMs int, reps int) ([]
 
 func measureCopy(r io.Reader) ([]float64, int64, error) {
 	buf := make([]byte, 128*1024)
+	type readResult struct {
+		n   int
+		err error
+	}
+	reads := make(chan readResult, 1)
+	go func() {
+		for {
+			n, err := r.Read(buf)
+			reads <- readResult{n, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	var total int64
+	var winBytes int64
 	winStart := time.Now()
-	var winBytes, total int64
 	var samples []float64
+
 	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			total += int64(n)
-			winBytes += int64(n)
-		}
-		if el := time.Since(winStart); el >= 100*time.Millisecond {
+		select {
+		case rr := <-reads:
+			total += int64(rr.n)
+			winBytes += int64(rr.n)
+			if rr.err != nil {
+				// Finalize the in-flight window (only if it carried bytes, to
+				// avoid a spurious trailing zero).
+				if el := time.Since(winStart); el > 0 && winBytes > 0 {
+					samples = append(samples, float64(winBytes)*8/el.Seconds()/1e6)
+				}
+				if rr.err == io.EOF {
+					return samples, total, nil
+				}
+				return samples, total, rr.err
+			}
+		case <-ticker.C:
+			// Emit a sample every 100ms regardless of whether bytes arrived,
+			// so a full stall (Read blocked, zero bytes) yields consecutive
+			// zero-throughput windows that countStalls can detect.
+			el := time.Since(winStart)
 			samples = append(samples, float64(winBytes)*8/el.Seconds()/1e6)
-			winStart, winBytes = time.Now(), 0
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return samples, total, err
+			winStart = time.Now()
+			winBytes = 0
 		}
 	}
-	if winBytes > 0 {
-		samples = append(samples, float64(winBytes)*8/time.Since(winStart).Seconds()/1e6)
-	}
-	return samples, total, nil
 }
 
 // countStalls counts ≥2s runs where every 100ms window is <1 Mbps (the SCTP
