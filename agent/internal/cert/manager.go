@@ -47,7 +47,7 @@ func (m *Manager) SetNamespace(namespace string) error {
 	m.mu.Lock()
 	m.namespace = namespace
 	m.mu.Unlock()
-	return m.persistNamespace()
+	return m.persistNamespace(namespace)
 }
 
 func (m *Manager) Namespace() string {
@@ -57,10 +57,10 @@ func (m *Manager) Namespace() string {
 }
 
 func (m *Manager) Load() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if b, err := os.ReadFile(m.nsPath()); err == nil {
-		m.mu.Lock()
 		m.namespace = string(b)
-		m.mu.Unlock()
 	}
 	keyPEM, err1 := os.ReadFile(m.keyPath())
 	chainPEM, err2 := os.ReadFile(m.chainPath())
@@ -179,11 +179,11 @@ func (m *Manager) NeedsRenewal() bool {
 	return time.Until(na) < renewalWindow
 }
 
-func (m *Manager) persistNamespace() error {
+func (m *Manager) persistNamespace(ns string) error {
 	if err := os.MkdirAll(m.dir(), 0700); err != nil {
 		return err
 	}
-	return os.WriteFile(m.nsPath(), []byte(m.namespace), 0600)
+	return os.WriteFile(m.nsPath(), []byte(ns), 0600)
 }
 func (m *Manager) persistKey() error {
 	if err := os.MkdirAll(m.dir(), 0700); err != nil {
