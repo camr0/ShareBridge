@@ -149,12 +149,6 @@ type OpenAck struct {
 	PublicIP string; WasAlreadyOpen bool; Status, Error string
 }
 type openWaiter struct{ apiKeyID string; shareID string; seq uint64; ch chan OpenAck }
-
-// signaling-server/internal/directctl — OpenAck (control side)
-type OpenAck struct {
-	ShareID string; Nonce string; Seq uint64; GrantedPort int
-	PublicIP string; WasAlreadyOpen bool; Status, Error string
-}
 ```
 
 ---
@@ -1484,12 +1478,6 @@ type Reporter struct {
 	mu   sync.Mutex
 	ip   string
 	send func(ip string, port int, status string)
-}
-
-type Reporter struct {
-	mu   sync.Mutex
-	ip   string
-	send func(ip string, port int, status string)
 	ch   chan endpointEvent // queued sends: never blocks the state loop
 }
 
@@ -1551,6 +1539,8 @@ git commit -m "feat(agent): endpoint reporter (transition callback, fresh IP)"
 - Test: `signaling-server/internal/directctl/agentstore_test.go`
 
 **Interfaces:** `GenerateNamespace`, `LoadOrCreateAgent`, `SaveCertReady`, `AllocateOrigin` (transactional). `AcceptableTLSReady` is replaced by a callback to the coordinator (Task 9) — declare the hook here.
+
+> **Execution-order note (pre-flight fix):** the shared fixture `newTestController` constructs a real `certcoordinator.Coordinator` via `NewCoordinator` + `SetIssueFn`, which only exist after **Task 9**. Dispatch **Task 9 before Task 8** (the coordinator has no dependency on this task's code). The controller will already be available when this task's fixtures compile.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2459,6 +2449,8 @@ git commit -m "feat(control): endpoint report + DDNS (provisioned-IP tracking, i
 
 **Interfaces:** `share_registered { …, origin }`; `AllocateOriginFor`; sessions soft-deleted (`is_active=false`) on unregister/expiry; every active-session lookup filters `is_active = true`.
 
+> **Threading (pre-flight fix):** `handleRegisterShare` needs the controller for `AllocateOriginFor`. Thread `ctrl *directctl.Controller` through `AgentWS` as a new **nil-able 5th parameter** (same pattern as the existing nil-able `reg *relay.Registry`): `func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, ctrl *directctl.Controller) http.HandlerFunc`. Update ALL existing `AgentWS(...)` call sites — `agent_ws_test.go`, `browser_ws_test.go`, and `main.go` (line ~54) — to pass `nil` (tests that don't exercise origin allocation); only Task 12's new `origin_test.go` passes a real controller. `handleRegisterShare` gains a `ctrl *directctl.Controller` param. This keeps `go build ./...` green here; Task 19 wires the real controller into `main.go`.
+
 - [ ] **Step 1: Write the failing test**
 
 ```go
@@ -2489,6 +2481,8 @@ Expected: FAIL.
 - [ ] **Step 3: Implement**
 
 In `createSession` + `claimSessionCode`, set `record.Set("is_active", true)`.
+
+Thread the controller: change `AgentWS` to accept `ctrl *directctl.Controller` (5th nil-able param), pass it into `handleRegisterShare`, and update every `AgentWS(app, h, reg, cfg)` call site to `AgentWS(app, h, reg, cfg, nil)` (see Interfaces note above).
 
 In `handleRegisterShare`, allocate the origin (control-allocated) and include it in the response:
 
@@ -3336,6 +3330,8 @@ git commit -m "feat(agent): open_signal handler with fresh-IP reporting"
 - Test: `signaling-server/internal/handler/apikeys_test.go` (extend)
 
 **Interfaces:** rotation re-points `agents.api_key_id` (in the same transaction, before revoking the old key); standalone revocation deletes the agent; controller wired in `main.go`.
+
+> **Note:** `ctrl` is already threaded into `AgentWS` (Task 12, pre-flight fix). Task 19 only constructs the real `coord`/`ctrl` in `main.go` and passes them in — it does NOT re-change the `AgentWS` signature.
 
 - [ ] **Step 1: Write the failing test**
 
