@@ -83,6 +83,7 @@ type recordingMapper struct {
 	delFails       int // the first N DeletePortMapping calls fail
 	alwaysFailDel  bool
 	remap          int   // if non-zero, AddPortMapping returns this instead of ext
+	addErr         error // if set, AddPortMapping returns this error
 	addPorts       []int // ext argument of every AddPortMapping call
 }
 
@@ -92,6 +93,9 @@ func (r *recordingMapper) AddPortMapping(ext, internal int, desc string, lease i
 	r.opened++
 	r.lastLease = lease
 	r.addPorts = append(r.addPorts, ext)
+	if r.addErr != nil {
+		return 0, r.addErr
+	}
 	if r.remap != 0 {
 		return r.remap, nil
 	}
@@ -349,4 +353,49 @@ func TestOnDemandPort_CloseEscalatesAfterMaxAttempts(t *testing.T) {
 	if p.CloseError() == nil {
 		t.Fatalf("CloseError must be non-nil after escalation")
 	}
+}
+
+func TestOnDemandPort_OpenForFailureDuringCloseKeepsRetrying(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	rm := &recordingMapper{alwaysFailDel: true}
+	p := newTestPort(fc, rm, time.Minute)
+	defer p.Close()
+
+	if err := p.OpenFor("share-1", time.Minute); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	// First delete fails → the port enters closing with an armed delete-retry
+	// timer (closing=true, open=false).
+	if err := p.Close(); !errors.Is(err, ErrDeleteRetry) {
+		t.Fatalf("want ErrDeleteRetry, got %v", err)
+	}
+	fc.advance(closeRetryDelay + time.Millisecond)
+	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= 2 })
+
+	// Now a reopen fails to add the mapping. The buggy code cleared `closing`
+	// BEFORE AddPortMapping, so on failure the armed delete-retry timer was
+	// abandoned (closing=false/open=false, and no case matches anymore). The
+	// fix leaves `closing` intact so the retry keeps firing.
+	rm.mu.Lock()
+	rm.addErr = errors.New("add failed")
+	rm.mu.Unlock()
+	if err := p.OpenFor("share-2", time.Minute); err == nil {
+		t.Fatalf("OpenFor with addErr must fail")
+	}
+	if p.Open() {
+		t.Fatalf("port must stay closed after a failed OpenFor during close")
+	}
+
+	_, _, base, _ := rm.snapshot()
+	fc.advance(closeRetryDelay + time.Millisecond)
+	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d > base })
+	_, _, after, _ := rm.snapshot()
+	if after <= base {
+		t.Fatalf("delete retry did not fire after failed OpenFor: delCalls %d -> %d", base, after)
+	}
+
+	// And it keeps firing on the next tick, proving the retry is re-armed and
+	// not a one-off.
+	fc.advance(closeRetryDelay + time.Millisecond)
+	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d > after })
 }

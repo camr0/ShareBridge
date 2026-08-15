@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -119,5 +122,72 @@ func TestMeasureCopy_EmitsSamplesDuringStall(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("no sample < 1.0 Mbps during stall, samples=%v", samples)
+	}
+}
+
+func TestFetch_RejectsNon200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	if _, err := fetch(context.Background(), srv.URL, 1<<20, 0, 1); err == nil {
+		t.Fatalf("fetch accepted a non-200 response")
+	}
+}
+
+func TestFetch_RejectsTruncatedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 100)) // far fewer than the requested size
+	}))
+	defer srv.Close()
+
+	if _, err := fetch(context.Background(), srv.URL, 1<<20, 0, 1); err == nil {
+		t.Fatalf("fetch accepted a truncated body")
+	}
+}
+
+func TestServeFileConcurrentFullFetches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	url, err := serveFile(ctx, 1<<20, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig:   insecureTLSConfig(),
+		DisableKeepAlives: true,
+	}}
+
+	// The shared, immutable payload buffer must be served correctly to many
+	// concurrent requests, each with its own offset (per-request sizeReader).
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := client.Get(url + "/bench.bin")
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if int64(len(b)) != 1<<20 {
+				errs <- fmt.Errorf("got %d bytes, want %d", len(b), 1<<20)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }

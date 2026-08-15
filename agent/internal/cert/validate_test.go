@@ -8,6 +8,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -144,5 +146,42 @@ func TestValidateChain_RejectsMissingSAN(t *testing.T) {
 	chain := signLeaf(t, ca, caKey, leafKey, tmpl)
 	if err := ValidateChain(chain, keyPEMFor(t, leafKey), "v7q4km2x9pz6dn3w", testBase, roots); err == nil {
 		t.Fatalf("ValidateChain accepted a leaf missing the relay SAN")
+	}
+}
+
+func TestValidateChain_RejectsExtraIPSAN(t *testing.T) {
+	ca, caKey, roots := makeTestCA(t)
+	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	now := time.Now()
+	tmpl := leafTemplate("v7q4km2x9pz6dn3w", testBase, now.Add(-time.Hour), now.Add(time.Hour))
+	tmpl.IPAddresses = []net.IP{net.ParseIP("192.0.2.1")}
+	chain := signLeaf(t, ca, caKey, leafKey, tmpl)
+	if err := ValidateChain(chain, keyPEMFor(t, leafKey), "v7q4km2x9pz6dn3w", testBase, roots); err == nil {
+		t.Fatalf("ValidateChain accepted a leaf with an extra IP SAN")
+	}
+}
+
+func TestValidateChain_RejectsExtraEmailSAN(t *testing.T) {
+	ca, caKey, roots := makeTestCA(t)
+	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	now := time.Now()
+	tmpl := leafTemplate("v7q4km2x9pz6dn3w", testBase, now.Add(-time.Hour), now.Add(time.Hour))
+	tmpl.EmailAddresses = []string{"attacker@example.com"}
+	chain := signLeaf(t, ca, caKey, leafKey, tmpl)
+	if err := ValidateChain(chain, keyPEMFor(t, leafKey), "v7q4km2x9pz6dn3w", testBase, roots); err == nil {
+		t.Fatalf("ValidateChain accepted a leaf with an extra email SAN")
+	}
+}
+
+func TestValidateChain_RejectsExtraURISAN(t *testing.T) {
+	ca, caKey, roots := makeTestCA(t)
+	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	now := time.Now()
+	u, _ := url.Parse("spiffe://example.com/attacker")
+	tmpl := leafTemplate("v7q4km2x9pz6dn3w", testBase, now.Add(-time.Hour), now.Add(time.Hour))
+	tmpl.URIs = []*url.URL{u}
+	chain := signLeaf(t, ca, caKey, leafKey, tmpl)
+	if err := ValidateChain(chain, keyPEMFor(t, leafKey), "v7q4km2x9pz6dn3w", testBase, roots); err == nil {
+		t.Fatalf("ValidateChain accepted a leaf with an extra URI SAN")
 	}
 }

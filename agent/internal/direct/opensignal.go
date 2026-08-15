@@ -10,13 +10,16 @@ import (
 
 // OpenSignal is a short-lived, versioned, idempotent request to open the public
 // port for one share. It is bound to (agent, share, route, nonce) and carries
-// an expiration and a per-share open lease (spec §5.1).
+// an expiration, a monotonically increasing sequence number, and a per-share
+// open lease (spec §5.1). The sequence number is what lets the gate reject a
+// distinct-nonce signal that is older than one already admitted (reorder).
 type OpenSignal struct {
 	Version   int
 	AgentID   string
 	ShareID   string
 	RouteKind RouteKind
 	Nonce     string
+	Seq       uint64
 	ExpiresAt time.Time
 	Lease     time.Duration
 }
@@ -53,6 +56,7 @@ type SignalGate struct {
 
 	seen    map[string]nonceUse
 	applied map[string]time.Time // "share:route" -> appliedAt
+	highest uint64               // highest sequence number admitted so far
 
 	winStart time.Time
 	winCount int
@@ -119,6 +123,12 @@ func (g *SignalGate) Admit(sig OpenSignal) error {
 	if sig.RouteKind != RouteDirect {
 		return fmt.Errorf("%w: route %q cannot open the direct public port", ErrWrongRouteKind, sig.RouteKind)
 	}
+	// Reject replayed or out-of-order signals. The wire protocol has no
+	// explicit ordering field beyond Seq, so an older, previously-unseen,
+	// unexpired signal must not stay admissible after a newer one.
+	if sig.Seq <= g.highest {
+		return ErrReplaySignal
+	}
 	if u, ok := g.seen[sig.Nonce]; ok {
 		if u.shareID != sig.ShareID || u.kind != sig.RouteKind {
 			return ErrNonceReuse
@@ -137,6 +147,7 @@ func (g *SignalGate) Admit(sig OpenSignal) error {
 
 	g.seen[sig.Nonce] = nonceUse{shareID: sig.ShareID, kind: sig.RouteKind, seenAt: now}
 	g.applied[sig.ShareID+":"+string(sig.RouteKind)] = now
+	g.highest = sig.Seq
 
 	// Best-effort prune of expired nonce entries to bound memory. Retention is
 	// maxSignalLifetime + skew so a valid signal's nonce is remembered through

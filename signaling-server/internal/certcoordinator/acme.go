@@ -69,6 +69,13 @@ func CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) ([]byte, er
 	if !exactDNSNames(csr, want) {
 		return nil, fmt.Errorf("CSR SANs = %v, want exactly %v", csr.DNSNames, want)
 	}
+	// lego's ObtainForCSR folds csr.Subject.CommonName into the order's domains
+	// alongside the SANs, so an authorized SAN set plus an unauthorized CN would
+	// still order a certificate for the extra name. Reject unless the CN is
+	// empty or one of the two authorized names.
+	if !validCommonName(csr.Subject.CommonName, want) {
+		return nil, fmt.Errorf("CSR CommonName = %q, want empty or one of %v", csr.Subject.CommonName, want)
+	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -116,6 +123,21 @@ func CompleteCSR(ctx context.Context, csrPEM []byte, cfg ACMEConfig) ([]byte, er
 	chain := append([]byte(nil), resource.Certificate...)
 	chain = append(chain, resource.IssuerCertificate...)
 	return chain, nil
+}
+
+// validCommonName reports whether a CSR's Subject.CommonName is acceptable:
+// it must be empty or equal to one of the authorized names, so a CSR cannot
+// smuggle an extra order domain through the CN while its SANs pass exactDNSNames.
+func validCommonName(cn string, want []string) bool {
+	if cn == "" {
+		return true
+	}
+	for _, w := range want {
+		if cn == w {
+			return true
+		}
+	}
+	return false
 }
 
 // exactDNSNames reports whether the CSR requests exactly the wanted DNS SANs

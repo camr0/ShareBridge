@@ -76,6 +76,9 @@ func ValidateChain(certChainPEM, keyPEM []byte, namespace, baseDomain string, ro
 
 	// 4. Exact SAN set (both wildcards, no extras).
 	want := wildcardSANs(namespace, baseDomain)
+	if len(leaf.IPAddresses) != 0 || len(leaf.EmailAddresses) != 0 || len(leaf.URIs) != 0 {
+		return fmt.Errorf("SAN set has non-DNS entries: IPs=%v emails=%v URIs=%v", leaf.IPAddresses, leaf.EmailAddresses, leaf.URIs)
+	}
 	if !stringSetsEqual(leaf.DNSNames, want) {
 		return fmt.Errorf("SAN set = %v, want exactly %v", leaf.DNSNames, want)
 	}

@@ -91,8 +91,13 @@ func serveFile(ctx context.Context, size int64, host string) (string, error) {
 		return "", err
 	}
 	mux := http.NewServeMux()
+	// Allocate the payload ONCE and share it across requests. The buffer is
+	// immutable (never written); each request gets its own sizeReader with its
+	// own offset, preserving http.ServeContent Range behavior without a fresh
+	// size-byte zeroed allocation per request.
+	data := make([]byte, size)
 	mux.HandleFunc("/bench.bin", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeContent(w, r, "bench.bin", time.Time{}, &sizeReader{b: make([]byte, size)})
+		http.ServeContent(w, r, "bench.bin", time.Time{}, &sizeReader{b: data})
 	})
 	srv := &http.Server{
 		Handler:   mux,
@@ -137,14 +142,25 @@ func fetch(ctx context.Context, url string, size int64, rttMs int, reps int) ([]
 	}}
 	run := func() (fetchResult, error) {
 		start := time.Now()
-		resp, err := client.Get(url)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return fetchResult{}, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fetchResult{}, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return fetchResult{}, fmt.Errorf("GET %s: unexpected status %d", url, resp.StatusCode)
 		}
 		samples, received, err := measureCopy(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			return fetchResult{}, err
+		}
+		if received != size {
+			return fetchResult{}, fmt.Errorf("GET %s: received %d bytes, want %d", url, received, size)
 		}
 		return fetchResult{
 			Mode: "https", RTT: rttMs, Requested: size, Received: received,

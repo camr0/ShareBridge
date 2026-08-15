@@ -15,10 +15,12 @@ func TestSignalGate_ReplayReorderReuse(t *testing.T) {
 	})
 	gate.now = func() time.Time { return now }
 
+	var seq uint64
 	mk := func(shareID, nonce string) OpenSignal {
+		seq++
 		return OpenSignal{
 			Version: signalVersion, AgentID: "agent-1",
-			ShareID: shareID, RouteKind: RouteDirect, Nonce: nonce,
+			ShareID: shareID, RouteKind: RouteDirect, Nonce: nonce, Seq: seq,
 			ExpiresAt: now.Add(time.Minute), Lease: 30 * time.Second,
 		}
 	}
@@ -41,6 +43,14 @@ func TestSignalGate_ReplayReorderReuse(t *testing.T) {
 	if err := gate.Admit(mk("share-a", "n1")); !errors.Is(err, ErrReplaySignal) {
 		t.Fatalf("reorder: want ErrReplaySignal, got %v", err)
 	}
+	// Reorder with a DISTINCT nonce but an OLDER (lower) sequence number: the
+	// nonce was never seen, but Seq alone must reject the out-of-order signal
+	// (the protocol has no other ordering field).
+	old := mk("share-a", "n3")
+	old.Seq = 1 // older than the highest admitted sequence
+	if err := gate.Admit(old); !errors.Is(err, ErrReplaySignal) {
+		t.Fatalf("distinct nonce with older seq: want ErrReplaySignal, got %v", err)
+	}
 }
 
 func TestSignalGate_ExpiryLockdownSourceAuthRateLimit(t *testing.T) {
@@ -50,10 +60,12 @@ func TestSignalGate_ExpiryLockdownSourceAuthRateLimit(t *testing.T) {
 	})
 	gate.now = func() time.Time { return now }
 
+	var seq uint64
 	mk := func() OpenSignal {
+		seq++
 		return OpenSignal{
 			Version: signalVersion, AgentID: "agent-1", ShareID: "share-a",
-			RouteKind: RouteDirect, Nonce: "n", ExpiresAt: now.Add(time.Minute),
+			RouteKind: RouteDirect, Nonce: "n", Seq: seq, ExpiresAt: now.Add(time.Minute),
 			Lease: 30 * time.Second,
 		}
 	}

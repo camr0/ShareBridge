@@ -302,18 +302,21 @@ func (p *OnDemandPort) loop() {
 				if l < minValidLease {
 					l = minValidLease
 				}
-				if closing {
-					closing = false
-					closeFail = 0
-				}
 				port := p.extPort
 				if grantedPort != 0 {
 					port = grantedPort
 				}
 				granted, err := p.mapper.AddPortMapping(port, p.intPort, p.desc(), int(l.Seconds()))
 				if err != nil {
+					// Leave closing intact on failure: the old mapping may still
+					// exist on the router, so the armed delete-retry timer must
+					// keep firing rather than being silently abandoned.
 					c.reply <- portReply{err: err}
 					continue
+				}
+				if closing {
+					closing = false
+					closeFail = 0
 				}
 				grantedPort = granted
 				renewFailed = false
