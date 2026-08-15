@@ -70,7 +70,7 @@ unexpected values are a protocol error.
 | Direction | Message | Payload |
 |---|---|---|
 | agent → control | `csr_submit` | `{ csr_pem: string }` |
-| agent → control | `report_endpoint` | `{ ip: string, port: int, status?: "closed" \| "close_failed" }` (`port: 0` = closed) |
+| agent → control | `report_endpoint` | `{ ip: string, port: int, status?: "close_failed" }` — status present only for `close_failed`; `port: 0` = closed, `port > 0` = open |
 | agent → control | `open_ack` | `{ share_id, nonce, seq, granted_port, public_ip, was_already_open: bool, status: "ok" \| "error", error?: code }` |
 | agent → control | `tls_ready` | `{ fingerprint, not_after: RFC3339 }` |
 | agent → control | `tls_error` | `{ reason }` |
@@ -200,7 +200,7 @@ state is not emitted). The reporter never reports `port: 0` unless deletion
 **succeeded** (or the lease is known to have expired); a `close-failed` state reports
 `{ ip, port, status: "close_failed" }` with a nonzero port — the mapping may still
 exist, so claiming "closed" would be a false security statement. Wire invariant:
-`port: 0` ⇔ `status: "closed"`; `close_failed` requires a nonzero port.
+`port: 0` ⇒ closed (status omitted); `status: "close_failed"` requires a nonzero port; any other status value is a protocol error.
 
 ### Share creation & origin
 At `register_share`, the agent sends the share metadata (as today). The **control
@@ -222,7 +222,7 @@ recipient → GET https://sharebridge.app/s/<code>
   5. agent: SignalGate.Admit (version/agent/expiry/nonce/seq/lockdown/local-authz/rate-limit)
           → OnDemandPort.OpenFor(code, lease)
   6. agent → open_ack { share_id, nonce, seq, granted_port, public_ip, was_already_open, status }
-  7. if cold open (was_already_open=false): control probes reachability (§below)
+  7. control probes reachability when the (public_ip, granted_port) tuple changed (§below)
   8. control 302 → https://<origin>[:granted_port]/s/<code>   (port omitted if 443)
       with Cache-Control: no-store (a cached 302 can pin an obsolete port)
   9. browser → agent; Binder admits SNI, authorizes Host + code; serves placeholder
