@@ -76,12 +76,12 @@ func (f *fakeClock) advance(d time.Duration) {
 // --- recording mapper ---
 
 type recordingMapper struct {
-	mu            sync.Mutex
+	mu             sync.Mutex
 	opened, closed int
-	delCalls      int
-	lastLease     int
-	delFails      int  // the first N DeletePortMapping calls fail
-	alwaysFailDel bool
+	delCalls       int
+	lastLease      int
+	delFails       int // the first N DeletePortMapping calls fail
+	alwaysFailDel  bool
 }
 
 func (r *recordingMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {

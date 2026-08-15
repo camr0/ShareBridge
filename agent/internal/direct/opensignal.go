@@ -70,8 +70,8 @@ const (
 	maxSignalsPerWin  = 10
 	maxPerSharePerWin = 3
 
-	maxLease          = 15 * time.Minute // per-share open lease ceiling
-	maxSignalLifetime = 5 * time.Minute  // how far in the future ExpiresAt may be
+	maxLease          = 15 * time.Minute                // per-share open lease ceiling
+	maxSignalLifetime = 5 * time.Minute                 // how far in the future ExpiresAt may be
 	nonceRetention    = maxSignalLifetime + time.Minute // nonce remembered through validity + skew
 )
 
