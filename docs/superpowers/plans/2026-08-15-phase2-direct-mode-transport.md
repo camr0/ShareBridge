@@ -2616,23 +2616,8 @@ import (
 	"time"
 )
 
-type OpenAck struct {
-	ShareID        string
-	Nonce          string
-	Seq            uint64
-	GrantedPort    int
-	PublicIP       string
-	WasAlreadyOpen bool
-	Status         string
-	Error          string
-}
-
-type openWaiter struct {
-	apiKeyID string
-	shareID  string
-	seq      uint64
-	ch       chan OpenAck
-}
+// NOTE: `OpenAck` and `openWaiter` are ALREADY defined in controller.go (Task 10,
+// from the Contracts section). Do NOT re-declare them here — import and use them.
 
 func (c *Controller) EmitOpen(ctx context.Context, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error) {
 	nonce := newNonce()
