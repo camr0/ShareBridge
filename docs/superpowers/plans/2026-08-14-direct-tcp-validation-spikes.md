@@ -21,6 +21,19 @@
 
 ---
 
+## Phase 0 — Manual Smoke Test (optional, no LE/CF/domain)
+
+Before investing in certificates, DNS, or the control plane, prove the core transport with a throwaway self-signed cert on your own machine. This answers "does the agent even become reachable over HTTPS via UPnP?" in an afternoon.
+
+- [ ] **Step 1:** Run the Task 1 spike to obtain a mapped external port (`go run ./cmd/spike-upnp`).
+- [ ] **Step 2:** Stand up a throwaway HTTPS server on that port with a self-signed cert (for your own testing only — never served to real users).
+- [ ] **Step 3:** From a phone on cellular (off the LAN), browse to `https://<your-public-ip>:<port>` — accept the self-signed warning — and download a file.
+- [ ] **Step 4:** Record the result. Success proves UPnP reachability + direct TCP + TLS-at-agent end-to-end with zero external infrastructure. Failure (port unreachable, ISP blocks inbound) means direct mode leans on relay, and we learn that before building anything else.
+
+This is deliberately crude: self-signed TLS, no control plane, no cert automation. Its only job is to confirm the transport works before we spend anything on LE/CF/domain.
+
+---
+
 ### Task 1: UPnP/NAT-PMP reachability spike
 
 **Files:**
