@@ -42,6 +42,25 @@ func GenerateWildcardCSR(namespace, baseDomain string) (keyPEM, csrPEM []byte, e
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
 }
 
+// CSRFromKey builds the two-SAN wildcard CSR from an existing ECDSA P-256 key PEM.
+func CSRFromKey(keyPEM []byte, namespace, baseDomain string) ([]byte, error) {
+	block, _ := pem.Decode(keyPEM)
+	if block == nil || block.Type != "EC PRIVATE KEY" {
+		return nil, fmt.Errorf("invalid key PEM block")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse key: %w", err)
+	}
+	sans := wildcardSANs(namespace, baseDomain)
+	tmpl := &x509.CertificateRequest{Subject: pkix.Name{CommonName: sans[0]}, DNSNames: sans}
+	der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil
+}
+
 // wildcardSANs returns the two wildcard SANs for a namespace, in a fixed,
 // canonical order.
 func wildcardSANs(namespace, baseDomain string) []string {
