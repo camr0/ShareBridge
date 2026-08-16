@@ -49,7 +49,9 @@ func main() {
 
 	var dnsClient *ddns.Cloudflare
 	if cfg.CloudflareToken != "" && cfg.BaseDomain != "" {
-		dnsClient, err = ddns.New(context.Background(), cfg.CloudflareToken, cfg.BaseDomain)
+		ddnsCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		dnsClient, err = ddns.New(ddnsCtx, cfg.CloudflareToken, cfg.BaseDomain)
 		if err != nil {
 			log.Printf("warning: ddns unavailable, direct mode disabled: %v", err)
 			dnsClient = nil
