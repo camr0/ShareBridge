@@ -61,8 +61,34 @@ func TestReportEndpointRejectsBadStatus(t *testing.T) {
 	if called {
 		t.Fatalf("ddns must not run for unknown status")
 	}
+	rec, _, _ = LoadOrCreateAgent(app, apiKeyID)
 	if rec.GetString("endpoint_ip") != "" {
 		t.Fatalf("endpoint_ip must not be saved for unknown status")
+	}
+}
+
+func TestReportEndpointEmptyIPNoop(t *testing.T) {
+	app, ctrl := newTestController(t)
+	apiKeyID := mustAPIKey(t, app, "empty-ip").Id
+	ctrl.HandleHello(context.Background(), nil, apiKeyID, "acct-1", "agent-1")
+
+	called := false
+	ctrl.ddnsFn = func(ctx context.Context, name, ip string, ttl int) (string, error) {
+		called = true
+		return "", nil
+	}
+
+	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "", 0, "")
+
+	if called {
+		t.Fatalf("ddns must not run for empty IP")
+	}
+	rec, _, _ := LoadOrCreateAgent(app, apiKeyID)
+	if rec.GetString("endpoint_ip") != "" {
+		t.Fatalf("endpoint_ip must not be saved for empty IP")
+	}
+	if ctrl.epochReady(apiKeyID) {
+		t.Fatalf("epoch must not be ready for empty IP")
 	}
 }
 
