@@ -1,7 +1,7 @@
 # Phase 3 — Content Serving (Direct HTTP) + `control/` Rename
 
 **Date:** 2026-08-16
-**Status:** Draft — revision 6 (incorporates design review round 5)
+**Status:** Draft — revision 7 (incorporates design review round 6)
 **Companion to:** `docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md` (the transport this phase builds on)
 **Forks off:** `v2`
 
@@ -215,7 +215,7 @@ random token, TTL — default 1h) and returns:
   `Content-Disposition: attachment` (filename from the manifest, sanitized). The token
   binds the part to its transaction. Missing part index → `404`; duplicate part fetch →
   idempotent (re-stream, no double-count).
-- **Transaction state machine** (atomic, under the ledger lock): a transaction is
+- **Transaction state machine** (atomic, under the per-share state lock): a transaction is
   `open` (holds its reservation) → `committed` (all parts done → one download) or
   `released` (no count). **TTL expiry targets only idle transactions** — an in-flight
   part **pins** its transaction (renews the TTL), and the pin is taken/released under
@@ -238,8 +238,10 @@ records activity only at request start. Change: each streaming response takes a
 **begin/end active-transfer hold** on the port (a per-share in-flight counter). The
 idle deadline is **not evaluated while any hold is active** — a large
 asset/archive/video lasting past the idle timeout does not get its mapping closed. Each
-HTTP/2 stream holds independently; client disconnect releases the hold. An integration
-test transfers longer than the idle timeout (§12.1).
+HTTP/2 stream holds independently; client disconnect releases the hold. The hold is a
+new `OnDemandPort`/`SessionTracker` operation (or a pause flag on the close loop — the
+current loop evaluates `idleAt` even while sessions are active). An integration test
+transfers longer than the idle timeout (§12.1).
 
 ### 4.8 Headers & CSP
 
@@ -274,8 +276,8 @@ daemon lock, containing: the resolved `ContentBackend` (the §3 client subset bo
 the share's Immich key), the **complete gallery snapshot** (DTO + membership index +
 generation/timestamp, §5.2), the download **limit** (immutable), and lifecycle state
 (active, not revoked, type=gallery). The mutable download **count + active reservations
-live in a separate, locked per-session accounting ledger** (§11.1) — not in this
-immutable snapshot. The snapshot is a value the request holds for its lifetime — no
+live in a per-session accounting ledger** (§11.1), guarded by the **same per-share state
+lock** — not in this immutable snapshot. The snapshot is a value the request holds for its lifetime — no
 shared mutable client state (`ValidatePassword`'s mutation of the client is not used in
 Phase 3; see §7.2).
 
@@ -423,6 +425,7 @@ plan); no `relay-old`/`relay-v1` copies.
 | control | `internal/relay`, `internal/handler/relay_ws.go`, `internal/handler/browser_ws.go`, TURN/ICE wiring, `/ws/client` + `/ws/relay` + `/i/{key}` + `/join` + `/sessions/{code}` + web-asset routes, relay *runtime* config fields |
 | repo | `extensions/`, `scripts/update_streamsaver_vendor.sh` |
 | client JS | §6 "Delete" list |
+| client UI source | `web/index.html`, `web/app.js`, `web/src/gallery.js`, `web/src/videoBufferWarning.js`, `web/src/vendor/lightgallery/*`, `web/sw.js` (moved to agent in 3a; source deleted here) |
 
 The deletion is not a simple tree removal — `cmd/server/main.go`, `agent_ws.go`, and
 `daemon.go` deeply wire the v1 packages (peer/multilane/relay/TURN). The plan must
@@ -443,6 +446,15 @@ revocation writes `revoked`; unsupported migration writes `unsupported`. A missi
 unrecognized `inactive_reason` on an inactive row **fails safe as `404`**. Backfill
 ordering: mark `unsupported` (relay-only/WebDAV/protected) first, then assign `expired`
 (past `expires_at`) / `revoked` (remaining) to the rest.
+
+**Mutation sites** (enumerated, not implied): control `handleUnregisterShare`
+(revocation), control `deleteExpiredSessions` (expiry cron), control
+`claimSessionCodeTx` (reactivation → clear), agent `RevokeSession` and
+`pruneExpiredSessions`. Note: the agent's `RevokeSession`/`pruneExpiredSessions`
+currently send an **unhandled `deregister`** message — `agent_ws.go` only handles
+`unregister_share` — so those paths never mark the control-side row inactive today. Add
+control-side `deregister` handling (or route agent revocation/expiry through
+`UnregisterShare`) so every path writes the discriminator.
 
 Only the relay *runtime* (sockets, handler, TURN) is deleted.
 
@@ -474,9 +486,9 @@ Only the relay *runtime* (sockets, handler, TURN) is deleted.
   (`/asset/{id}`) and a completed **album archive transaction** (all parts, once).
   Thumbnails, previews, and video playback do **not** count.
 - **Model**: `MaxDownloads` is an **immutable per-share limit**; `Downloads` is the
-  **persisted committed count** (`store.IncrementDownloads`, as in v1). A **locked
-  per-session accounting ledger** (separate from the immutable gallery snapshot) tracks
-  `Downloads` + active reservations.
+  **persisted committed count** (`store.IncrementDownloads`, as in v1). A **per-session
+  accounting ledger** (guarded by the per-share state lock; separate from the immutable
+  gallery snapshot) tracks `Downloads` + active reservations.
 - **Concurrency-safe**: an atomic `TryReserve` on the ledger enforces
   `Downloads + activeReservations < MaxDownloads` **when `MaxDownloads > 0`**.
   `MaxDownloads <= 0` means **unlimited** — admission is always granted, but the ledger
