@@ -1,7 +1,7 @@
 # Phase 3 — Content Serving (Direct HTTP) + `control/` Rename
 
 **Date:** 2026-08-16
-**Status:** Draft — revision 3 (incorporates design review round 2)
+**Status:** Draft — revision 4 (incorporates design review round 3)
 **Companion to:** `docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md` (the transport this phase builds on)
 **Forks off:** `v2`
 
@@ -34,7 +34,7 @@ is intentional and asserted by the parity gate (§12.2).
 **Out of scope (deferred):**
 - WebDAV / file shares (drops in later on the same serving layer; the file-browser half of the UI stays as reference).
 - **Password-protected Immich shares** (§7.2) and **private/authenticated shares** (GitHub OAuth). The auth seam (§5) is designed so both slot in later without rework.
-- **Large-album pagination** (§4.3): the frozen `ListGallery` eagerly loads all pages; Phase 3 keeps v1 parity and documents the limit.
+- **Large-album pagination** (§4.3): `ListGallery` eagerly loads all pages; Phase 3 serves from a snapshot and documents the limit.
 - Relay fallback / FRP tunnel + measure-and-prefer → **Phase 4**.
 - Any UI framework rewrite — the vanilla-JS lightGallery UI is kept (lean, no build step).
 
@@ -57,8 +57,8 @@ share→content binding is **frozen** at the wire level (§7).
 ### Control plane (3a–3b)
 
 4. **Canonical-route cutover** (§8): `/share/{code}` resolves Immich gallery shares to
-   the direct path; the v1 `/i/{key}`, `/join`, `/ws/client`, `/ws/relay`, and web-asset
-   routes are retired (in 3c). `DefaultRelayOnly` flips to `false`.
+   the direct path; the v1 `/i/{key}`, `/join`, `/ws/client`, `/ws/relay`, `/sessions/{code}`,
+   and web-asset routes are retired (in 3c). `DefaultRelayOnly` flips to `false`.
 5. **Rename** (3b): mechanical, no functional change (§9).
 
 ### Deleted (3c, gated)
@@ -85,7 +85,10 @@ The `transfer.GalleryBackend` names (`GetAsset`, `GetAssetRange`, `GetAlbumDownl
 | `HeadVideoPlayback(ctx, id)` | transcoded video `Content-Length` (may be unknown/non-positive) |
 | `GetAlbumDownloadInfo(ctx)` | `AlbumDownload` (may hold **multiple** `Archives`) |
 | `DownloadArchive(ctx, assetIDs, w)` | stream one archive (ZIP) |
-| `PollShares`, `ValidatePassword`, `IsPasswordProtected` | discovery / password |
+| `PollShares(ctx)` | discover shared links |
+
+Package-level discovery helpers on the `SharedLink` value (not `Client` methods):
+`SharedLink.IsPasswordProtected()`, and `Client.ValidatePassword(ctx, password)`.
 
 **Consequences:**
 - **Range is supported only for transcoded video** (`GetVideoPlaybackRange` +
@@ -101,51 +104,53 @@ The **request/response shapes and endpoints to Immich are unchanged**; the Go cl
 gains two additive capabilities the serving layer needs (no behavior change to existing
 methods):
 
-1. **Typed error classification** — `getAsset`/`doJSON` currently flatten HTTP status
-   into a formatted string. Add typed errors (e.g. `NotFoundError`, `AuthError`,
-   `UpstreamError{Status}`) so the serving layer can map `404` vs `403` vs `5xx` vs
-   transport failure (§4.5). Exposed via `errors.As`.
-2. **Metadata access before streaming** — helpers that return an asset kind's
+1. **Typed error classification** — applied to **every** client HTTP path that currently
+   flattens status into a string (`getAsset`, `doJSON`, `doJSONStatus`,
+   `HeadVideoPlayback`, `GetAlbumDownloadInfo`, `DownloadArchive`, thumbnail/preview
+   fetches): `NotFoundError`, `AuthError`, `UpstreamError{Status}`. Exposed via
+   `errors.As`/`errors.Is`.
+2. **Metadata access before streaming** — helpers returning an asset kind's
    `Content-Type` and authoritative `Content-Length` **when the upstream provides it**
-   (via a HEAD request or response headers), e.g. `ThumbnailInfo(id)` / `PreviewInfo(id)`
-   / `PlaybackInfo(id)`. Where Immich omits the length (thumbnails/previews/archive
-   estimates), the helper reports `ok=false` rather than fabricating a length.
+   (HEAD request or response headers), e.g. `ThumbnailInfo(id)` / `PreviewInfo(id)` /
+   `PlaybackInfo(id)`. Where Immich omits the length, the helper reports `ok=false`.
 
 ## 4. HTTP serving layer
 
 ### 4.1 Endpoints (all under `https://<origin>/s/{code}/…`)
 
-| Method | Path | Serves | Backing call |
+| Method | Path | Serves | Backing |
 |---|---|---|---|
 | GET/HEAD | `/s/{code}` | gallery HTML (embedded UI) | — |
-| GET/HEAD | `/s/{code}/items` | album + item metadata (JSON, §4.3) | `ListGallery` |
+| GET/HEAD | `/s/{code}/items` | album + items (JSON, §4.3) | snapshot (§5.2) |
 | GET/HEAD | `/s/{code}/thumb/{id}` | thumbnail | `GetThumbnail` |
 | GET/HEAD | `/s/{code}/preview/{id}` | lightbox preview | `GetPreview` |
 | GET/HEAD | `/s/{code}/asset/{id}` | original asset (download) | `GetFile` |
-| GET/HEAD | `/s/{code}/asset/{id}/playback` | transcoded video (Range), `video/mp4` | `GetVideoPlayback` / `GetVideoPlaybackRange` + `HeadVideoPlayback` |
-| GET/HEAD | `/s/{code}/archive` | archive manifest (JSON, §4.6) | `GetAlbumDownloadInfo` |
-| GET/HEAD | `/s/{code}/archive/{part}` | one archive ZIP (attachment) | `DownloadArchive` |
+| GET/HEAD | `/s/{code}/asset/{id}/playback` | transcoded video (Range), `video/mp4` | `GetVideoPlayback`/`GetVideoPlaybackRange` + `HeadVideoPlayback` |
+| GET/HEAD | `/s/{code}/archive` | archive manifest + transaction token (JSON, §4.6) | `GetAlbumDownloadInfo` |
+| GET/HEAD | `/s/{code}/archive/{token}/{part}` | one archive ZIP (attachment) | `DownloadArchive` |
 
 ### 4.2 Range (transcoded video only)
 
 - Parse a **single** `bytes=start-end` / `bytes=start-` range (case/whitespace-tolerant).
   Suffix ranges (`bytes=-N`), multiple ranges, non-numeric, or `start ≥ total` → `416
   Range Not Satisfiable` with `Content-Range: bytes */<total>`.
-- **Unknown/non-positive total** (`HeadVideoPlayback` ≤ 0): serve `200` + full body via
-  `GetVideoPlayback` (no `Accept-Ranges` advertised). Do not fabricate a `206`.
+- **Unknown/non-positive total** (`HeadVideoPlayback` ≤ 0): **ignore all `Range`
+  headers** and serve `200` + full body via `GetVideoPlayback` (no `Accept-Ranges`
+  advertised) — never fabricate a `206`, and never emit a `416` whose `*/<total>` can't
+  be populated.
 - Valid range → `206 Partial Content`, `Content-Range: bytes start-end/total`,
   `Accept-Ranges: bytes`. `end` is clamped to `total-1`; `start > end` after clamping and
   integer-overflow inputs → `416`. Zero-length total → `416`.
 - `start-end` reads use `GetVideoPlaybackRange` with a **bounded writer** that stops the
-  upstream read at `end` (the "did we hit the bound" sentinel must not surface as an
-  error). `start=0` sends no upstream Range header (client behavior) — a downstream
-  `206` is synthesized deliberately.
+  upstream read at `end` (the "hit the bound" sentinel must not surface as an error).
+  `start=0` sends no upstream Range header (client behavior) — a downstream `206` is
+  synthesized deliberately.
 - **Original assets and all non-video resources do not advertise `Accept-Ranges`.**
 
 ### 4.3 `items` JSON
 
-`/items` returns a **normative lowerCamel wire schema** (the agent marshals
-`immich.Gallery` — whose raw struct lacks JSON tags — into an explicit DTO):
+`/items` returns the **snapshot's** gallery as a **normative lowerCamel wire schema**
+(the agent marshals into an explicit DTO — `immich.Gallery`'s raw struct lacks JSON tags):
 
 ```json
 {
@@ -158,9 +163,9 @@ methods):
 }
 ```
 
-Empty album → `200` with `items: []`. `duration` is a float seconds or `null`. **Large-
+Empty album → `200` with `items: []`. `duration` is float seconds or `null`. **Large-
 album pagination is deferred**; the plan documents the eager-load memory/latency
-behavior and the UI's existing 120-item "load-more" windowing.
+behavior and the UI's 120-item "load-more" windowing.
 
 ### 4.4 HEAD
 
@@ -175,27 +180,42 @@ headers to GET for streaming endpoints. Upstream failure during metadata lookup 
 
 - **Preflight before streaming**: resolve + membership-check + metadata lookup first;
   only then stream. Unknown asset → `404` before any bytes are written.
-- **Typed error mapping** (§3.1): `NotFoundError` → `404`; `AuthError` → `403`
-  (invalid/revoked share); other `UpstreamError` / transport failure → `502`/`503`.
-- **Mid-stream upstream failure** (after `200` is committed): log + close the
-  connection. **Truncation is only detectable where `Content-Length` was authoritative**
-  (transcoded video via `HeadVideoPlayback`); thumbnails/previews/archives may have no
-  authoritative length, so their truncation is not guaranteed-detectable — document
-  this, don't promise it.
+- **Delayed status commit**: handlers buffer the status until the **first body write**.
+  An error returned before any bytes are written (e.g. an upstream `404` on the actual
+  fetch, discovered only after metadata) still sets the correct status — no
+  already-committed `200`.
+- **Typed error mapping** (§3.1), exact and deterministic: upstream `401`/`403` → `403`;
+  `404` → `404`; any other upstream HTTP status → `502`; timeout / unreachable → `503`.
+- **Mid-stream failure** (after the first body byte): log + close the connection.
+  Truncation is only detectable where `Content-Length` was authoritative (transcoded
+  video via `HeadVideoPlayback`); thumbnails/previews/archives may have no authoritative
+  length, so their truncation is not guaranteed-detectable — documented, not promised.
 - Fallback MIME: `application/octet-stream` when metadata has no usable type.
 
-### 4.6 Album archive (multi-part)
+### 4.6 Album archive (multi-part, transactional)
 
-- `GET /s/{code}/archive` → manifest:
-  ```json
-  { "parts": [ { "index": 0, "name": "Summer-2025-part-1.zip",
-                 "estimatedSize": 500000000, "assetIds": ["…"] } ] }
-  ```
-  Zero archives → `404`. `assetIds` come from the **same authorized snapshot** as §5.
-- `GET /s/{code}/archive/{part}` → stream that part via `DownloadArchive(assetIDs, w)`,
-  `Content-Disposition: attachment` (filename from the manifest, sanitized).
+`GET /s/{code}/archive` creates an in-memory **album-download transaction** (opaque
+random token, TTL — default 1h) and returns:
+
+```json
+{ "token": "<opaque>",
+  "parts": [ { "index": 0, "name": "Summer-2025-part-1.zip",
+               "estimatedSize": 500000000, "assetIds": ["…"] } ] }
+```
+
+- Zero archives → `404`. The archive info is **deep-copied** from `GetAlbumDownloadInfo`
+  and **every `assetIds` element is verified against the membership snapshot** (§5.2);
+  any mismatch → `403` (reject the whole manifest). Duplicate IDs → `403`.
+- `GET /s/{code}/archive/{token}/{part}` → stream that part via `DownloadArchive` with
+  `Content-Disposition: attachment` (filename from the manifest, sanitized). The token
+  binds the part to its transaction. Missing part index → `404`; duplicate part fetch →
+  idempotent (re-stream, no double-count).
+- **Completion accounting** (§11.1): completed parts are recorded per transaction;
+  when **all** parts of a transaction complete, the album counts as **one** download.
+  Abandoned transactions (TTL elapsed before all parts) expire with **no** count.
+  Transactions are in-memory — an agent restart drops uncommitted transactions (no count).
 - Multiple parts are **not** concatenated; the UI presents each part as its own
-  download. Archive streaming is exclusive per share (one at a time, §11).
+  download. Archive streaming is exclusive per transaction (§11).
 
 ### 4.7 Idle vs. long transfers
 
@@ -214,13 +234,17 @@ test transfers longer than the idle timeout (§12.1).
   behavior consistent with revocation.
 - `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
 - **CSP**: `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
-  media-src 'self'; connect-src 'self'`. The moved page's **inline `<style>`, inline
-  service-worker script, and inline `onclick` must be extracted into static files** so
-  no `unsafe-inline` is required.
-- `Content-Disposition: attachment` on `/asset/{id}` and `/archive/{part}`; filename via
-  `mime.FormatMediaType` with an ASCII-safe fallback and path separators stripped.
+  media-src 'self'; connect-src 'self'`. To satisfy it without `unsafe-inline`, the moved
+  page must have **no** inline `<style>`, inline scripts, inline `onclick`, and
+  `gallery.js` must **stop emitting inline `style="…"` attributes** (e.g. the progress
+  `style="width: 0%"`) — move to classes — and must **replace the `data:image/gif`
+  placeholder** with a code-prefixed embedded static asset. A browser test asserts zero
+  CSP violations.
+- `Content-Disposition: attachment` on `/asset/{id}` and `/archive/{token}/{part}`;
+  filename via `mime.FormatMediaType` with an ASCII-safe fallback and path separators
+  stripped.
 
-## 5. Auth, resolver, and membership
+## 5. Auth, resolver, membership, and snapshot
 
 ### 5.1 Resolver seam
 
@@ -228,30 +252,35 @@ test transfers longer than the idle timeout (§12.1).
 resolve(code) → (ContentSession, error)   // error → 404 (unknown) / 403 (revoked/unsupported)
 ```
 
-`ContentSession` is an **immutable per-share snapshot** constructed under the daemon
-lock, containing: the resolved `ContentBackend` (the §3 client subset, bound to the
-share's Immich key), the share's **membership index** (§5.2), download limits
-(§11.2), and lifecycle state (active, not revoked, type=gallery). It is a value the
-daemon builds atomically and the request holds for its lifetime — no shared mutable
-client state (`ValidatePassword`'s mutation of the client is not used in Phase 3; see
-§7.2).
+`ContentSession` is an **immutable per-share snapshot** constructed atomically under the
+daemon lock, containing: the resolved `ContentBackend` (the §3 client subset bound to
+the share's Immich key), the **complete gallery snapshot** (DTO + membership index +
+generation/timestamp, §5.2), the download limit/count (§11.1), and lifecycle state
+(active, not revoked, type=gallery). It is a value the request holds for its lifetime —
+no shared mutable client state (`ValidatePassword`'s mutation of the client is not used
+in Phase 3; see §7.2).
 
-### 5.2 Membership index
+### 5.2 Snapshot & membership (single source of truth)
 
-`{id}` authorization must not re-run `ListGallery` per thumbnail. Each `ContentSession`
-carries an **immutable membership snapshot** — the set of asset IDs in the resolved
-gallery — with a refresh TTL (or rebuilt on poll). Atomic replacement on rebuild;
-requests hold their snapshot for the request lifetime (an asset removed from the share
-mid-request may still complete its in-flight stream, but new requests see the new set).
-Archive `assetIds` are taken from the same snapshot, so archive and membership are
-consistent.
+- The snapshot contains the **complete gallery DTO + membership index** (the set of asset
+  IDs) **+ a generation/timestamp**. `/items`, membership checks, and archive manifests
+  all read the **same snapshot** — never a live, separate `ListGallery` re-run — so they
+  are mutually consistent.
+- **Refresh** is driven by the existing Immich poll cycle: rebuild the snapshot by
+  fetching **outside** the daemon lock (network I/O), then **atomically swap** it under
+  the lock. Concurrent rebuilds are **singleflight**-deduplicated.
+- **Stale / fail-closed policy**: on poll failure, keep serving the last snapshot; but if
+  refresh fails for longer than a bound (2× the poll interval), **fail closed** — reject
+  new content requests (`503`) rather than indefinitely authorizing a stale membership.
+  Requests already holding a snapshot finish their in-flight streams.
 
 ### 5.3 Path constraints
 
 `{code}` matches the control plane's contract: external codes `[A-Za-z0-9_-]{8,128}`,
-generated codes `[a-z0-9]{8}`. `{id}` is an Immich asset UUID, validated by strict
-regex + length cap; reject encoded slashes, dot segments, and multi-segment paths.
-Verify `{id}` ∈ the membership snapshot before streaming.
+generated codes `[a-z0-9]{8}`. `{id}` is an Immich asset UUID, validated by strict regex
++ length cap; reject encoded slashes, dot segments, and multi-segment paths. Verify
+`{id}` ∈ the membership snapshot before streaming. The archive `{token}` is opaque
+random, validated by length/charset.
 
 ## 6. Recipient UI — move, reuse, rewrite, delete
 
@@ -269,7 +298,7 @@ code-prefixed namespace (the Phase-2 `Binder` rejects any path without the bound
 - **Rewrite:** `app.js` (fetch the §4.1 endpoints) and `gallery.js`'s data layer. The
   revised gallery API receives **URL factories directly**: `thumbUrl(id)`,
   `previewUrl(id)`, `assetUrl(id)`, `playbackUrl(id)`, `archiveManifestUrl()`,
-  `archivePartUrl(index)` — replacing binary-frame thumbnail batches, `/media/{id}`
+  `archivePartUrl(token, index)` — replacing binary-frame thumbnail batches, `/media/{id}`
   video, and binary preview payloads. Thumbnails become `<img src="…/thumb/{id}"
   loading="lazy">`. Inline style/handlers are moved to static files (§4.8 CSP).
 - **Delete (transport):** `directChannel.js`, `secureRelayChannel.js`,
@@ -290,8 +319,7 @@ and registers a matching ShareBridge share with the control plane (`RegisterShar
 code + control-allocated origin). The `code → Immich shareKey` mapping stays
 agent-local, maintained by the daemon's polling/registration flow. **Untouched wire
 protocol:** `agent/internal/immich/client.go` and `agent/internal/cloudwebdav/client.go`
-make the same HTTP requests to Immich/WebDAV as today (§3.1 is additive Go helpers
-only).
+make the same HTTP requests to Immich/WebDAV as today (§3.1 is additive Go helpers only).
 
 ### 7.2 Password-protected shares — deferred (explicit, all entry points)
 
@@ -307,22 +335,25 @@ per-auth-session backend credentials) reuses the §5 seam; it is **not** impleme
 
 Today the control plane routes Immich links through the v1 path: `/share/{code}` →
 `serveShareRedirect` → `/i/{code}` (Immich) or `/s/{code}` (other); `/i/{key}` serves
-`web/index.html`; `/join` serves it too; `/ws/client` + `/ws/relay` are the v1 sockets.
+`web/index.html`; `/join` serves it too; `/ws/client` + `/ws/relay` are the v1 sockets;
+`/sessions/{code}` exposes session info.
 
 Phase 3a changes this so **gallery shares reach the agent's direct server**:
 
-- `/share/{code}` → resolve the session → `302` to canonical `/s/{code}` (direct) for
-  **active gallery shares**. Non-gallery (WebDAV/file), relay-only, expired, revoked, or
-  protected sessions → a **clean explicit response** (not a silent redirect into a
-  resolver that rejects them): relay-only/protected/WebDAV → `410 Gone` (unsupported);
-  expired → `410`; revoked/unknown → `404`. The Phase 2 runtime-flow error handling
-  (`docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md` §5) still
-  governs the open-signal/redirect for the direct case.
+- `/share/{code}` → resolve the session **including inactive tombstones** (to recover the
+  share's type) → `302` to canonical `/s/{code}` (direct) for **active gallery shares**.
+  All other cases return a **clean explicit status**: relay-only / WebDAV/file /
+  protected / expired → `410 Gone`; unknown / revoked → `404`. The Phase 2 runtime-flow
+  error handling (`docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md`
+  §5) still governs the open-signal/redirect for the direct case.
+- The **direct-origin resolver** uses its own statuses: unknown → `404`, revoked or
+  unsupported-type (relay-only/WebDAV/protected) → `403`. Canonical (`410`) and direct
+  (`403`) are documented separately — they are not required to match.
 - `DefaultRelayOnly` flips to `false` so new registrations are direct by default.
-- `/i/{key}`, `/join`, `/ws/client`, `/ws/relay`, `/sw.js`, `/app.js`, `/src/{…}`,
-  `/noise-p256/{…}` are retired in 3c.
-- Route tests cover: active gallery (→ direct), relay-only (→ 410), WebDAV/file (→ 410),
-  protected (→ 410), expired (→ 410), revoked (→ 404).
+- `/i/{key}`, `/join`, `/ws/client`, `/ws/relay`, `/sessions/{code}`, `/sw.js`,
+  `/app.js`, `/src/{…}`, `/noise-p256/{…}` are retired in 3c.
+- Route tests cover: active gallery (→ direct), relay-only (→ `410`), WebDAV/file
+  (→ `410`), protected (→ `410`), expired (→ `410`), revoked (→ `404`).
 
 ## 9. `control/` rename (3b)
 
@@ -347,7 +378,7 @@ plan); no `relay-old`/`relay-v1` copies.
 | Tree | Delete |
 |---|---|
 | agent | `internal/transfer`, `internal/multilane`, `internal/relaychannel`, `internal/peer`, `internal/noise` |
-| control | `internal/relay`, `internal/handler/relay_ws.go`, `internal/handler/browser_ws.go`, TURN/ICE wiring, `/ws/client` + `/ws/relay` + `/i/{key}` + `/join` + web-asset routes, relay config/registration fields |
+| control | `internal/relay`, `internal/handler/relay_ws.go`, `internal/handler/browser_ws.go`, TURN/ICE wiring, `/ws/client` + `/ws/relay` + `/i/{key}` + `/join` + `/sessions/{code}` + web-asset routes, relay *runtime* config fields |
 | repo | `extensions/`, `scripts/update_streamsaver_vendor.sh` |
 | client JS | §6 "Delete" list |
 
@@ -357,6 +388,11 @@ enumerate every route, handler, config field, WS message type, daemon field/func
 and test to remove, so each step keeps `go build ./...` + `go test ./...` green. Remove
 transport message handling from the kept `agent/internal/signaling` client.
 
+**Discriminator fields survive 3c.** The session fields that classify a share as
+relay-only / WebDAV / protected / expired (`relay_only`, share type, `is_active`) are
+**kept** through 3c so the canonical route keeps returning `410` for retired share
+types. Only the relay *runtime* (sockets, handler, TURN) is deleted.
+
 **Kept (frozen):** `internal/immich`, `internal/cloudwebdav`, `internal/signaling`,
 `internal/direct`, `internal/cert`, `internal/daemon` (minus the v1 wiring),
 `internal/store`, `internal/web` (agent admin UI), `internal/config`.
@@ -364,49 +400,60 @@ transport message handling from the kept `agent/internal/signaling` client.
 ## 11. Resource limits, concurrency, and download accounting
 
 - `http.Server`: explicit `ReadHeaderTimeout`, `IdleTimeout`, `MaxHeaderBytes`.
-- Per-share concurrency: a semaphore limiting simultaneous streaming responses (assets,
-  video, archives) per share; global cap across shares. Over limit → `429` (transient)
-  or `503` with a bounded-retry hint. Archive streaming is **exclusive** per share.
+- **Streaming responses** (assets, video, archive parts) are semaphore-limited per share
+  + globally; over limit → `429` (transient) / `503` with a bounded-retry hint.
+- **Non-streaming upstream work is bounded separately**: `/items` is served **from the
+  snapshot** (no per-request upstream call); HEAD metadata probes and `/archive`
+  manifest creation run behind per-share/global semaphores and are singleflight'd.
 - Cancellation: propagate request `ctx` into every immich call; abort upstream on client
   disconnect (releases the §4.7 hold).
 
 ### 11.1 Download accounting (defined)
 
-- **What counts:** a completed **original-asset download** (`/asset/{id}`) and a
-  completed **album archive** (the whole multi-part album, once). Thumbnails, previews,
-  and video playback do **not** count.
-- **Multi-part album = one download**, counted only when the **last** part completes.
-  The agent tracks per-share part-completion state (which parts of the current archive
-  have been fetched) to infer "all parts done"; a manifest refetch or share re-open
-  resets the window.
-- **Concurrency-safe:** atomic reserve at request start, commit on successful
-  completion, rollback on failure/cancel. A check-then-stream must not let two
-  concurrent requests both pass the limit — reserve the slot before streaming.
-- **Persistence:** mirror v1 (`MaxDownloads` decremented, `DownloadComplete` byte
-  report). When the limit reaches zero, further downloads → `403`/`410`.
-- **Source of the limit:** discovered Immich shares must get an **explicit default
-  `MaxDownloads` at registration** (today polled sessions leave it unset); manual
-  creation keeps its existing `maxDownloads` parameter.
+- **What counts** (committed downloads): a completed **original-asset download**
+  (`/asset/{id}`) and a completed **album archive transaction** (all parts, once).
+  Thumbnails, previews, and video playback do **not** count.
+- **Model**: `MaxDownloads` is an **immutable per-share limit**; `Downloads` is the
+  **persisted committed count** (`store.IncrementDownloads`, as in v1). The limit is
+  checked against the committed count at resolve time.
+- **Concurrency-safe** for assets: reserve a slot before streaming, commit (increment
+  `Downloads`) on successful completion, rollback on failure/cancel. For albums, the
+  transaction token (§4.6) is the reservation identity — the increment happens once,
+  only when the transaction's last part completes; duplicate parts and abandoned
+  transactions never double-count.
+- **Persistence**: the committed increment is durable; a persistence failure is logged
+  and the in-memory count still enforces the limit for the session's lifetime
+  (documented gap). **Byte-level reporting is out of scope** — v1's
+  `DownloadComplete` byte report is already a no-op at the control plane (no handler);
+  Phase 3 does not reintroduce it.
+- **Source of the limit**: discovered Immich shares get an **explicit default
+  `MaxDownloads` from config at registration** (today polled shares leave it unset);
+  manual Immich creation must **plumb** its `maxDownloads` + expiry through the Immich
+  path (today they are discarded — fix that).
 
 ## 12. Testing
 
 ### 12.1 Matrix
 
 - **Unit** — Range parsing (single/suffix/multiple/invalid/`start≥total`/unknown-total/
-  zero-length/overflow → `206`/`416`/`200`), HEAD (no body, omitted length), typed-error
-  mapping (`404`/`403`/`502`/`503`), path-traversal/encoded-separator rejection,
-  `Content-Disposition` sanitization, headers (no-store/nosniff/CSP/Referrer-Policy),
-  resolver/membership lifecycle (snapshot immutability, TTL rebuild, concurrent
-  polling), download accounting (reserve/commit/rollback, multi-part-once).
+  zero-length/overflow → `206`/`416`/`200`-ignore), HEAD (no body, omitted length),
+  typed-error mapping (exact `403`/`404`/`502`/`503`), delayed status commit
+  (pre-first-byte error sets the right status), path-traversal/encoded-separator
+  rejection, `Content-Disposition` sanitization, headers (no-store/nosniff/CSP/
+  Referrer-Policy), snapshot/membership lifecycle (immutability, atomic swap,
+  singleflight, fail-closed after refresh failure), download accounting
+  (reserve/commit/rollback, album-transaction once, duplicate-part idempotency,
+  abandoned-transaction expiry).
 - **Integration** — real agent stack (cert.Manager + Binder + DirectServer +
   OnDemandPort + a fake `ContentBackend`, mirroring `6233e10`): SNI admission → gallery
-  HTML → items → thumb → preview → asset → playback (206) → archive manifest → part.
-  Plus: transfer-longer-than-idle-timeout does **not** close the mapping; concurrent
-  recipients; cancellation; overload → `429`/`503`.
+  HTML → items (from snapshot) → thumb → preview → asset → playback (206) → archive
+  manifest (token) → part. Plus: transfer-longer-than-idle-timeout does **not** close
+  the mapping; concurrent recipients; cancellation; overload → `429`/`503`.
 - **UI** — port `gallery.test.js` to the URL-factory data layer (item render, lightbox,
-  download/album-download against a stubbed `fetch`, archive manifest + part wiring).
+  download/album-download against a stubbed `fetch`, archive manifest + `archivePartUrl`),
+  plus a browser test asserting **zero CSP violations**.
 - **Route cutover** — `/share/{code}`: active gallery → direct; relay-only/WebDAV/
-  protected/expired → `410`; revoked → `404`.
+  protected/expired → `410`; revoked → `404` (including inactive-tombstone lookup).
 - **Protected-share enforcement** — all three entry points (poller, manual, restore).
 
 ### 12.2 Parity gate (blocks 3c)
@@ -421,7 +468,9 @@ original asset, and enumerates/downloads **every** archive part — and asserts 
 
 ## 13. Migration / rollout
 
-- No schema migration (content serving is agent-local; no new collections).
+- No schema migration (content serving is agent-local; no new collections). Manual
+  Immich creation must start plumbing `maxDownloads`/expiry (a code fix, not a schema
+  change).
 - 3a is additive to Phase 2's transport; the v1 transport stays wired (unused) until the
   gated 3c cleanup, so every plan step keeps `go build ./...` green in isolation.
 - Live e2e (optional, manual): `control/deploy-testing.sh --bootstrap` on a Hetzner box
