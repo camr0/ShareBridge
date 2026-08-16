@@ -53,9 +53,17 @@ type DirectServer struct {
 }
 
 func NewDirectServer(namespace, baseDomain string, port SessionTracker, certs CertProvider, gate *SignalGate, maxContentBytes int64) *DirectServer {
+	return NewDirectServerWithBinder(namespace, baseDomain, port, certs, gate, maxContentBytes, NewBinder(namespace, baseDomain))
+}
+
+// NewDirectServerWithBinder is NewDirectServer with an explicit, SHARED binder.
+// The daemon uses it so the binder it populates via bindOrigin is the same
+// binder the server consults for SNI admission and HTTP authorization; a
+// split-binder would reject every direct handshake as an unknown origin.
+func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker, certs CertProvider, gate *SignalGate, maxContentBytes int64, binder *Binder) *DirectServer {
 	return &DirectServer{
 		namespace: namespace, baseDomain: baseDomain, port: port, certs: certs, gate: gate,
-		maxContentBytes: maxContentBytes, binder: NewBinder(namespace, baseDomain),
+		maxContentBytes: maxContentBytes, binder: binder,
 	}
 }
 
@@ -97,10 +105,15 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/s/"+code)
 	switch {
 	case rest == "/probe" || strings.HasPrefix(rest, "/probe?"):
+		// The reachability probe is a control-plane liveness check, not a
+		// recipient session, so it must not participate in activity tracking.
 		s.handleProbe(w, r, code)
+		return
 	case rest == "/" || rest == "":
+		s.activity(w, r, code)
 		s.handlePage(w, r, code)
-	case strings.HasPrefix(rest, "/download"):
+	case rest == "/download":
+		s.activity(w, r, code)
 		s.handleDownload(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
@@ -120,7 +133,6 @@ func (s *DirectServer) handleProbe(w http.ResponseWriter, r *http.Request, code 
 }
 
 func (s *DirectServer) handlePage(w http.ResponseWriter, r *http.Request, code string) {
-	s.activity(w, r, code)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<html><body><h1>ShareBridge direct</h1><p>serving %s P2P over direct HTTPS</p></body></html>", code)
 }

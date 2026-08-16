@@ -290,3 +290,64 @@ func TestServerConnSessionTracking(t *testing.T) {
 		t.Fatalf("ends = %v, want exactly one EndSession", ends)
 	}
 }
+
+// TestServerDownloadTracksActivityAndExactPath verifies the /download route
+// participates in session activity tracking (I5) and that only the exact
+// /download path matches (no prefix routing).
+func TestServerDownloadTracksActivityAndExactPath(t *testing.T) {
+	ns, base := "sbdeadbeef", "example.com"
+	cert := testServerCert(t, ns, base)
+	gate := NewSignalGate("a", func(string, RouteKind) bool { return true })
+	tr := &recordingTracker{}
+	srv := NewDirectServer(ns, base, tr, &rotatableCerts{cert}, gate, 1<<20)
+	_ = srv.Binder().Allow("demo."+ns+"."+base, RouteDirect, "abc")
+
+	hs := srv.newHTTPServer()
+	hs.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go hs.ServeTLS(ln, "", "")
+	defer hs.Close()
+
+	origin := "demo." + ns + "." + base
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName:         origin,
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"http/1.1"},
+		},
+		ForceAttemptHTTP2: false,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, ln.Addr().String())
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	download := func(path string) int {
+		req, _ := http.NewRequest("GET", "https://"+origin+path, nil)
+		req.Host = origin
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := download("/s/abc/download"); got != http.StatusOK {
+		t.Fatalf("download status = %d, want 200", got)
+	}
+	if got := download("/s/abc/downloadX"); got != http.StatusNotFound {
+		t.Fatalf("downloadX status = %d, want 404 (prefix routing must not match)", got)
+	}
+
+	// The download request must have begun a session (activity tracked); the
+	// 404 request must not add a second begin.
+	begins, _, _ := tr.snapshot()
+	if len(begins) != 1 || begins[0] != "abc" {
+		t.Fatalf("begins = %v, want exactly [abc]", begins)
+	}
+}

@@ -56,6 +56,7 @@ type Message struct {
 	Namespace      string          `json:"namespace,omitempty"`
 	ChainPEM       string          `json:"chain_pem,omitempty"`
 	Reason         string          `json:"reason,omitempty"`
+	AgentID        string          `json:"agent_id,omitempty"`
 }
 
 // OpenAck is the agent-side acknowledgement of an open_signal. Its json tags

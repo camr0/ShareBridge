@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -288,6 +289,7 @@ func newOpenSignalTestDaemon(t *testing.T, authz func(string, direct.RouteKind) 
 func openSignalMessage() signaling.Message {
 	return signaling.Message{
 		Type:         "open_signal",
+		AgentID:      "test-agent-id",
 		Version:      1,
 		ShareID:      "SHARE123",
 		Nonce:        "nonce-123",
@@ -491,4 +493,159 @@ func TestStartDirectServerGuardedAndStopsOnDisconnect(t *testing.T) {
 	if ds.cancel != nil {
 		t.Fatalf("onSignalingDisconnect should clear cancel")
 	}
+}
+
+// TestDirectServerSharesDaemonBinder proves the daemon's bindOrigin and the
+// DirectServer consult the SAME binder. This is the split-Binder regression
+// (C1): before the fix the server used its own private binder and rejected
+// every direct handshake as an unknown origin.
+func TestDirectServerSharesDaemonBinder(t *testing.T) {
+	ds := &directState{
+		namespace:  testDirectNS,
+		baseDomain: testDirectBase,
+		origin:     map[string]string{},
+		gate:       direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true }),
+	}
+	d := &Daemon{direct: ds}
+	d.syncDirectServe()
+
+	if ds.binder != ds.server.Binder() {
+		t.Fatalf("daemon and server must share one binder instance")
+	}
+
+	const code = "SHARE123"
+	origin := testOriginFor("sbabc123")
+	d.bindOrigin(code, origin)
+
+	// The server's binder (the one consulted for TLS admission) must admit the
+	// origin the daemon just bound.
+	if _, err := ds.server.Binder().AdmitSNI(origin); err != nil {
+		t.Fatalf("server binder did not admit daemon-bound origin: %v", err)
+	}
+}
+
+// TestDirectRegistrationWaitsForEnrollmentReady verifies waitForDirectReady
+// blocks until enrollment_ready is received (the I1 startup gate).
+func TestDirectRegistrationWaitsForEnrollmentReady(t *testing.T) {
+	d := &Daemon{direct: &directState{}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ready := make(chan error, 1)
+	go func() { ready <- d.waitForDirectReady(ctx) }()
+
+	// Not ready yet: must still block.
+	select {
+	case err := <-ready:
+		t.Fatalf("waitForDirectReady returned before enrollment_ready: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	d.handleEnrollmentReady(signaling.Message{})
+
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("waitForDirectReady: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForDirectReady did not unblock after enrollment_ready")
+	}
+}
+
+// TestDirectRegistrationBlockedAfterDisconnect verifies a disconnect clears
+// readiness, so a subsequent wait blocks until the NEXT enrollment_ready.
+func TestDirectRegistrationBlockedAfterDisconnect(t *testing.T) {
+	d := &Daemon{direct: &directState{ready: true}}
+
+	d.onSignalingDisconnect() // ready flips to false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ready := make(chan error, 1)
+	go func() { ready <- d.waitForDirectReady(ctx) }()
+
+	select {
+	case err := <-ready:
+		t.Fatalf("waitForDirectReady returned after disconnect: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	d.handleEnrollmentReady(signaling.Message{})
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("waitForDirectReady: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForDirectReady did not unblock after re-enrollment")
+	}
+}
+
+// TestStartDirectServerResetsOnBindFailureAndRetries drives a REAL bind
+// failure (occupied port) and asserts the started guard resets, then a retry
+// after the port is freed actually binds (I6).
+func TestStartDirectServerResetsOnBindFailureAndRetries(t *testing.T) {
+	gate := direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	ds := &directState{
+		server:     direct.NewDirectServer(testDirectNS, testDirectBase, nil, nil, gate, 1<<20),
+		listenAddr: addr,
+	}
+	d := &Daemon{direct: ds}
+
+	d.startDirectServer()
+
+	// Wait for the bind failure to reset started/cancel.
+	waitForCond(t, func() bool {
+		ds.mu.Lock()
+		defer ds.mu.Unlock()
+		return !ds.started && ds.cancel == nil
+	})
+
+	// Free the port and retry; the server must actually bind.
+	ln.Close()
+	d.startDirectServer()
+
+	// Prove a real re-bind by dialing the listener.
+	deadline := time.Now().Add(2 * time.Second)
+	dialed := false
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			c.Close()
+			dialed = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !dialed {
+		t.Fatalf("retry did not bind the freed port %s", addr)
+	}
+
+	ds.mu.Lock()
+	started, cancelSet := ds.started, ds.cancel != nil
+	ds.mu.Unlock()
+	if !started || !cancelSet {
+		t.Fatalf("retry must leave server started (started=%v cancel=%v)", started, cancelSet)
+	}
+	d.onSignalingDisconnect()
+}
+
+// waitForCond polls cond until true or fails after a deadline.
+func waitForCond(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met within deadline")
 }

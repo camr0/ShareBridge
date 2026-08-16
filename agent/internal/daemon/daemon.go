@@ -300,8 +300,11 @@ type directState struct {
 	origin     map[string]string
 
 	started    bool               // DirectServer.Start guard (under mu)
+	startGen   uint64             // increments per start attempt (under mu)
 	cancel     context.CancelFunc // cancels the direct server ctx on disconnect
 	listenAddr string             // override for tests; empty => :directIntPort
+
+	cond *sync.Cond // readiness signal (lazily created; guarded by mu)
 }
 
 // canRegisterDirect reports whether direct shares may be registered: the direct
@@ -313,6 +316,44 @@ func (d *Daemon) canRegisterDirect() bool {
 	d.direct.mu.Lock()
 	defer d.direct.mu.Unlock()
 	return d.direct.ready
+}
+
+// condLocked returns the readiness condition variable, creating it on first
+// use. Caller must hold ds.mu.
+func (ds *directState) condLocked() *sync.Cond {
+	if ds.cond == nil {
+		ds.cond = sync.NewCond(&ds.mu)
+	}
+	return ds.cond
+}
+
+// waitForDirectReady blocks until the CURRENT connection epoch has reached
+// enrollment_ready (or ctx is cancelled). It is a no-op when direct transport
+// is not configured. The condition is reset on disconnect, so a waiter sleeps
+// through reconnects and only proceeds once a live epoch signals readiness.
+func (d *Daemon) waitForDirectReady(ctx context.Context) error {
+	ds := d.direct
+	if ds == nil {
+		return nil
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	cond := ds.condLocked()
+	stop := context.AfterFunc(ctx, func() {
+		ds.mu.Lock()
+		if ds.cond != nil {
+			ds.cond.Broadcast()
+		}
+		ds.mu.Unlock()
+	})
+	defer stop()
+	for !ds.ready {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		cond.Wait()
+	}
+	return nil
 }
 
 // directShareAuthorized is the SignalGate source-authorization check: a share is
@@ -394,7 +435,19 @@ func (d *Daemon) syncDirectServe() {
 		return
 	}
 	ds.binder = direct.NewBinder(ds.namespace, ds.baseDomain)
-	ds.server = direct.NewDirectServer(ds.namespace, ds.baseDomain, ds.port, ds.cert, ds.gate, directMaxContentBytes)
+	// Share ONE binder between the daemon (which records control-allocated
+	// origins via bindOrigin) and the DirectServer (which consults it for SNI
+	// admission + per-request authorization). A private server binder would
+	// reject every direct handshake as an unknown origin.
+	ds.server = direct.NewDirectServerWithBinder(ds.namespace, ds.baseDomain, ds.port, ds.cert, ds.gate, directMaxContentBytes, ds.binder)
+	// Re-Allow currently-bound origins into the fresh binder (atomic under
+	// ds.mu). Origins from a previous namespace are rejected by Allow and are
+	// re-bound once the control re-allocates them for the new namespace.
+	for code, origin := range ds.origin {
+		if err := ds.binder.Allow(origin, direct.RouteDirect, code); err != nil {
+			log.Printf("re-allow origin %q for share %s after binder rebuild: %v", origin, code, err)
+		}
+	}
 	ds.serveNS = ds.namespace
 }
 
@@ -708,6 +761,16 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 
 	if shareType == "immich" {
 		return d.createManualImmichSession(ctx, shareURL)
+	}
+
+	// Direct (non-relay) registrations must wait for the current epoch's
+	// enrollment_ready: a direct share needs a live origin + certificate, and
+	// registering before readiness would allocate an origin the agent cannot
+	// yet serve. Relay-only shares need no direct transport.
+	if !relayOnly {
+		if err := d.waitForDirectReady(ctx); err != nil {
+			return "", fmt.Errorf("direct transport not ready: %w", err)
+		}
 	}
 
 	allowedHosts := []string{cfg.AllowedHost, cfg.NCAllowedHost}
@@ -1027,6 +1090,9 @@ func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
 	}
 	ds.mu.Lock()
 	ds.ready = true
+	if ds.cond != nil {
+		ds.cond.Broadcast()
+	}
 	ds.mu.Unlock()
 
 	// Learn/report the public IP and start the direct HTTPS server. Both are
@@ -1094,6 +1160,8 @@ func (d *Daemon) startDirectServer() {
 		return
 	}
 	ds.started = true
+	ds.startGen++
+	gen := ds.startGen
 	ctx, cancel := context.WithCancel(context.Background())
 	ds.cancel = cancel
 	listenAddr := ds.listenAddr
@@ -1105,6 +1173,17 @@ func (d *Daemon) startDirectServer() {
 	go func() {
 		if err := ds.server.Start(ctx, listenAddr); err != nil {
 			log.Printf("direct server: %v", err)
+			cancel() // release the epoch ctx
+			// A bind/start failure must not latch the epoch as started: reset
+			// the guard so a later enrollment_ready retries. The generation
+			// check ensures a stale failure cannot clobber a newer start
+			// attempt (or a disconnect that already reset the epoch).
+			ds.mu.Lock()
+			if ds.startGen == gen {
+				ds.cancel = nil
+				ds.started = false
+			}
+			ds.mu.Unlock()
 		}
 	}()
 }
@@ -1133,7 +1212,7 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	}
 	sig := direct.OpenSignal{
 		Version:   msg.Version,
-		AgentID:   d.store.GetAgentID(),
+		AgentID:   msg.AgentID,
 		ShareID:   msg.ShareID,
 		RouteKind: direct.RouteDirect,
 		Nonce:     msg.Nonce,
@@ -1730,6 +1809,17 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		if entry.ShareType == "" {
 			log.Printf("warning: skipping legacy session %s: missing share_type", entry.Code)
 			continue
+		}
+
+		// Direct (non-relay) sessions must wait for the current epoch's
+		// enrollment_ready before re-registration; relay-only sessions proceed
+		// immediately. Without this gate a reconnect would register a direct
+		// session (and allocate an origin) before the certificate is usable.
+		if !entry.RelayOnly {
+			if err := d.waitForDirectReady(ctx); err != nil {
+				log.Printf("warning: direct transport not ready, deferring session %s: %v", entry.Code, err)
+				continue
+			}
 		}
 
 		if entry.ShareType == "immich" {
