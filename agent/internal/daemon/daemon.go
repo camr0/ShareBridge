@@ -2043,6 +2043,18 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 	shareURL := "immich://" + link.Key
 	passwordProtected := link.IsPasswordProtected()
 	relayOnly := d.GetConfig().DefaultRelayOnly
+
+	// Direct (non-relay) Immich shares must wait for the current epoch's
+	// enrollment_ready before registration, matching CreateSession and
+	// persisted-session restoration: a direct share needs a live origin +
+	// certificate, and registering before readiness would allocate an origin the
+	// agent cannot yet serve. Relay-only shares need no direct transport.
+	if !relayOnly {
+		if err := d.waitForDirectReady(ctx); err != nil {
+			return nil, fmt.Errorf("direct transport not ready: %w", err)
+		}
+	}
+
 	log.Printf("registering Immich share %s (relay_only=%v, password_protected=%v)", link.Key, relayOnly, passwordProtected)
 	opts := signaling.RegisterShareOptions{
 		ShareURL:            shareURL,

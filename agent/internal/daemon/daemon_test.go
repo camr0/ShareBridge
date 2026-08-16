@@ -1728,6 +1728,69 @@ func TestSyncImmichSharesWiresClientForNewSession(t *testing.T) {
 	require.True(t, stored.IsPasswordProtected)
 }
 
+// TestRegisterImmichShareWaitsForDirectReady covers the I1-gap for Immich
+// polling: a direct (relay_only=false) Immich share must wait for the current
+// epoch's enrollment_ready before registering, while a relay-only share must
+// register immediately without waiting.
+func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
+	setup := func(t *testing.T, relayOnly bool) (*Daemon, *mockSignalingClient) {
+		t.Helper()
+		d, sig := newTestDaemon(t)
+		d.config.ImmichURL = "http://immich.lan:2283"
+		d.config.ImmichAllowedHost = "immich.lan:2283"
+		d.config.ImmichAPIKey = "api"
+		d.config.DefaultRelayOnly = relayOnly
+		// Give the daemon a real (not-ready) direct state so waitForDirectReady
+		// actually gates direct registrations.
+		d.direct = &directState{}
+		return d, sig
+	}
+
+	link := immich.SharedLink{Key: "IMMICHDIRECT1", Type: "ALBUM"}
+
+	t.Run("direct waits for readiness", func(t *testing.T) {
+		d, sig := setup(t, false)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := d.registerImmichShare(ctx, link, "04abcd")
+			done <- err
+		}()
+
+		// Not ready: registration must not have happened yet.
+		select {
+		case err := <-done:
+			t.Fatalf("registerImmichShare returned before enrollment_ready: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		require.False(t, sig.registeredCode("IMMICHDIRECT1"))
+
+		d.handleEnrollmentReady(signaling.Message{})
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("registerImmichShare did not unblock after enrollment_ready")
+		}
+		require.True(t, sig.registeredCode("IMMICHDIRECT1"))
+	})
+
+	t.Run("relay-only does not wait", func(t *testing.T) {
+		d, sig := setup(t, true)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		_, err := d.registerImmichShare(ctx, link, "04abcd")
+		require.NoError(t, err)
+		require.True(t, sig.registeredCode("IMMICHDIRECT1"))
+	})
+}
+
 func TestLoadSessionsFromStoreWiresPersistedImmichSession(t *testing.T) {
 	cfg := &config.Config{
 		SignalingURL:      "ws://localhost:8080",
