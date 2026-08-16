@@ -65,6 +65,8 @@ type Controller struct {
 	sendFn        func(ctx context.Context, conn *websocket.Conn, msg any) error
 	ddnsFn        func(ctx context.Context, name, ip string, ttl int) (string, error)
 	sendToAgentFn func(ctx context.Context, apiKeyID string, msg any) error
+	emitOpenFn    func(ctx context.Context, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error)
+	probeFn       func(ctx context.Context, origin, code, apiKeyID string, ack OpenAck) error
 
 	epochMu sync.Mutex
 	epochs  map[string]*epochState // apiKeyID -> current connection epoch
@@ -107,6 +109,8 @@ func NewController(app core.App, h *hub.Hub, coord *certcoordinator.Coordinator,
 	c.sendToAgentFn = func(ctx context.Context, apiKeyID string, msg any) error {
 		return h.SendToAgent(ctx, apiKeyID, msg)
 	}
+	c.emitOpenFn = c.EmitOpen
+	c.probeFn = c.Probe
 	return c
 }
 
