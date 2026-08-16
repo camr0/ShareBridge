@@ -6,6 +6,25 @@ import (
 	"time"
 )
 
+func TestHandleTLSReadyUnknownFingerprint(t *testing.T) {
+	app, ctrl := newTestController(t)
+	apiKeyID := mustAPIKey(t, app, "key-unknown-fp").Id
+
+	// No chain has been issued for this key, so any fingerprint is unknown.
+	sent := ctrl.captureSend(func() {
+		ctrl.HandleTLSReady(context.Background(), nil, apiKeyID, "deadbeef", time.Now().Add(90*24*time.Hour).Format(time.RFC3339))
+	})
+	if sent == nil || sent["type"] != "cert_error" {
+		t.Fatalf("expected cert_error, got %v", sent)
+	}
+	if sent["reason"] != "unknown fingerprint" {
+		t.Fatalf("expected reason 'unknown fingerprint', got %v", sent["reason"])
+	}
+	if ctrl.epochReady(apiKeyID) {
+		t.Fatalf("must not be ready on unknown fingerprint")
+	}
+}
+
 func TestEpochReadinessGatedOnDDNSAndTLS(t *testing.T) {
 	app, ctrl := newTestController(t)
 	// agents.api_key_id is a required relation, so the enrollment path needs a

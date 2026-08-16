@@ -12,16 +12,17 @@ import (
 // persistence, the port/status invariant validation, last_report_at, and
 // "same-IP already provisioned" short-circuiting.
 func (c *Controller) HandleReportEndpoint(ctx context.Context, apiKeyID, ip string, port int, status string) {
+	if ip == "" {
+		return
+	}
 	rec, _, err := LoadOrCreateAgent(c.app, apiKeyID)
 	if err != nil {
 		return
 	}
-	if ip != "" {
-		ns := rec.GetString("namespace")
-		if _, err := c.ddnsFn(ctx, "*."+ns+"."+c.cfg.BaseDomain, ip, 60); err != nil {
-			// DDNS failed -> leave the epoch's ddnsReady false; the next report retries.
-			return
-		}
+	ns := rec.GetString("namespace")
+	if _, err := c.ddnsFn(ctx, "*."+ns+"."+c.cfg.BaseDomain, ip, 60); err != nil {
+		// DDNS failed -> leave the epoch's ddnsReady false; the next report retries.
+		return
 	}
 	c.epochMu.Lock()
 	if e := c.epochs[apiKeyID]; e != nil {

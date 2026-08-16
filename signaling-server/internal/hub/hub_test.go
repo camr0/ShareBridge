@@ -3,6 +3,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -75,6 +76,37 @@ func TestRegisterAndUnregisterAgent(t *testing.T) {
 
 	// Cleanup
 	_ = agentConn.Close(websocket.StatusNormalClosure, "test complete")
+}
+
+func TestRegisterAgentFencesPriorConn(t *testing.T) {
+	h := New()
+	apiKey := "api-key-fence"
+
+	oldClient, oldServer := newTestWebSocketPair(t)
+	defer oldClient.CloseNow()
+	newClient, newServer := newTestWebSocketPair(t)
+	defer newClient.CloseNow()
+	defer newServer.CloseNow()
+
+	h.RegisterAgent(apiKey, oldServer)
+	h.RegisterAgent(apiKey, newServer)
+
+	// The new conn is the registered one; the old conn is fenced.
+	require.True(t, h.AgentConnected(apiKey))
+	h.mu.RLock()
+	require.Equal(t, newServer, h.agents[apiKey])
+	_, leaked := h.connWrites[oldServer]
+	h.mu.RUnlock()
+	require.False(t, leaked, "fenced conn's write mutex must be removed")
+
+	// The old client observes the fence close with StatusPolicyViolation.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _, err := oldClient.Read(ctx)
+	require.Error(t, err)
+	var ce websocket.CloseError
+	require.True(t, errors.As(err, &ce))
+	require.Equal(t, websocket.StatusPolicyViolation, ce.Code)
 }
 
 func TestRegisterCodeAndGetAgentConn(t *testing.T) {

@@ -46,6 +46,7 @@ func (h *Hub) RegisterAgent(apiKey string, conn *websocket.Conn) {
 		h.mu.Unlock()
 		old.Close(websocket.StatusPolicyViolation, "superseded")
 		h.mu.Lock()
+		delete(h.connWrites, old)
 	}
 	h.agents[apiKey] = conn
 	h.ensureWriteMuLocked(conn)
