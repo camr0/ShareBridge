@@ -327,35 +327,47 @@ func (d *Daemon) directShareAuthorized(shareID string, kind direct.RouteKind) bo
 // bindOrigin records the control-allocated origin for a share code and admits it
 // in the binder. It is a no-op until the binder exists (namespace known).
 func (d *Daemon) bindOrigin(code, origin string) {
-	if d.direct == nil || d.direct.binder == nil || origin == "" {
+	ds := d.direct
+	if ds == nil || origin == "" {
 		return
 	}
-	if err := d.direct.binder.Allow(origin, direct.RouteDirect, code); err != nil {
+	// Snapshot the binder under the state lock: syncDirectServe swaps the
+	// binder under ds.mu, so an unlocked read here would race a namespace
+	// change/reconnect.
+	ds.mu.Lock()
+	binder := ds.binder
+	ds.mu.Unlock()
+	if binder == nil {
+		return
+	}
+	if err := binder.Allow(origin, direct.RouteDirect, code); err != nil {
 		log.Printf("bind origin %q for share %s: %v", origin, code, err)
 		return
 	}
-	d.direct.mu.Lock()
-	if d.direct.origin == nil {
-		d.direct.origin = make(map[string]string)
+	ds.mu.Lock()
+	if ds.origin == nil {
+		ds.origin = make(map[string]string)
 	}
-	d.direct.origin[code] = origin
-	d.direct.mu.Unlock()
+	ds.origin[code] = origin
+	ds.mu.Unlock()
 }
 
 // revokeOrigin drops the origin binding for a share code and revokes it in the
 // binder. It is a no-op if no origin was recorded.
 func (d *Daemon) revokeOrigin(code string) {
-	if d.direct == nil || d.direct.binder == nil {
+	ds := d.direct
+	if ds == nil {
 		return
 	}
-	d.direct.mu.Lock()
-	origin, ok := d.direct.origin[code]
+	ds.mu.Lock()
+	origin, ok := ds.origin[code]
 	if ok {
-		delete(d.direct.origin, code)
+		delete(ds.origin, code)
 	}
-	d.direct.mu.Unlock()
-	if ok {
-		d.direct.binder.Revoke(origin)
+	binder := ds.binder
+	ds.mu.Unlock()
+	if ok && binder != nil {
+		binder.Revoke(origin)
 	}
 }
 
@@ -1023,6 +1035,14 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "not_ready"})
 		return
 	}
+	// readiness can be true even when the port mapper was unavailable at
+	// construction (ds.mapper/ds.port stay nil), so guard every dereference.
+	ds := d.direct
+	if ds == nil || ds.gate == nil || ds.port == nil || ds.mapper == nil {
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "direct_unavailable"})
+		return
+	}
 	exp, err := time.Parse(time.RFC3339, msg.ExpiresAt)
 	if err != nil {
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
@@ -1039,18 +1059,18 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 		ExpiresAt: exp,
 		Lease:     time.Duration(msg.LeaseSeconds) * time.Second,
 	}
-	if err := d.direct.gate.Admit(sig); err != nil {
+	if err := ds.gate.Admit(sig); err != nil {
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "rejected"})
 		return
 	}
-	wasOpen := d.direct.port.Open()
-	if err := d.direct.port.OpenFor(msg.ShareID, sig.Lease); err != nil {
+	wasOpen := ds.port.Open()
+	if err := ds.port.OpenFor(msg.ShareID, sig.Lease); err != nil {
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
 		return
 	}
-	ip, err := d.direct.mapper.ExternalIP() // FRESH on every ack
+	ip, err := ds.mapper.ExternalIP() // FRESH on every ack
 	if err != nil || ip == "" {
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "no_public_ip"})
@@ -1058,7 +1078,7 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	}
 	_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
-		GrantedPort: d.direct.port.GrantedPort(), PublicIP: ip,
+		GrantedPort: ds.port.GrantedPort(), PublicIP: ip,
 		WasAlreadyOpen: wasOpen, Status: "ok"})
 }
 
@@ -1644,6 +1664,9 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			if err != nil {
 				log.Printf("warning: could not re-register Immich session %s: %v", entry.Code, err)
 				continue
+			}
+			if origin == "" {
+				origin = entry.Origin
 			}
 			d.bindOrigin(code, origin)
 
