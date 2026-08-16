@@ -1146,12 +1146,11 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "rejected"})
 		return
 	}
-	wasOpen := ds.port.Open()
-	if err := ds.port.OpenFor(msg.ShareID, sig.Lease); err != nil {
-		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
-			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
-		return
-	}
+	// Fetch the fresh public IP and record it on the reporter BEFORE opening
+	// the port: OpenFor synchronously fires the open transition on the state
+	// loop, which snapshots the reporter's IP. Doing this first keeps the open
+	// report_endpoint consistent with open_ack even when the public IP changed
+	// mid-epoch.
 	ip, err := ds.mapper.ExternalIP() // FRESH on every ack
 	if err != nil || ip == "" {
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
@@ -1160,6 +1159,12 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	}
 	if ds.reporter != nil {
 		ds.reporter.SetIP(ip) // keep subsequent transition reports fresh
+	}
+	wasOpen := ds.port.Open()
+	if err := ds.port.OpenFor(msg.ShareID, sig.Lease); err != nil {
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
+		return
 	}
 	_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,

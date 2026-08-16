@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -335,6 +336,101 @@ func TestHandleOpenSignalRejectsUnauthorized(t *testing.T) {
 		"error":  "rejected",
 	}) {
 		t.Fatalf("expected rejected open_ack, got %#v", sig.messagesSnapshot())
+	}
+}
+
+// reportedEndpoint is one (ip, port, status) triple delivered to a Reporter's
+// send func.
+type reportedEndpoint struct {
+	ip     string
+	port   int
+	status string
+}
+
+// endpointRecorder captures the Reporter send func invocations so the
+// transition → ReportEndpoint path can be asserted.
+type endpointRecorder struct {
+	mu     sync.Mutex
+	events []reportedEndpoint
+}
+
+func (r *endpointRecorder) record(ip string, port int, status string) {
+	r.mu.Lock()
+	r.events = append(r.events, reportedEndpoint{ip: ip, port: port, status: status})
+	r.mu.Unlock()
+}
+
+func (r *endpointRecorder) snapshot() []reportedEndpoint {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]reportedEndpoint(nil), r.events...)
+}
+
+// waitForEndpoints polls until n reports have been delivered (the Reporter
+// drains its queue on a background goroutine) or fails after a deadline.
+func waitForEndpoints(t *testing.T, r *endpointRecorder, n int) []reportedEndpoint {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := r.snapshot(); len(got) >= n {
+			return got
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	got := r.snapshot()
+	t.Fatalf("timed out waiting for %d endpoint reports, got %d: %#v", n, len(got), got)
+	return nil
+}
+
+// TestHandleOpenSignalReportsFreshIPOnTransition verifies the open/close
+// transitions drive ReportEndpoint with the fresh public IP and correct port
+// (open → granted port, close → 0). The reporter is seeded with a STALE IP to
+// prove SetIP happens before OpenFor (the open transition snapshots the
+// reporter's IP synchronously on the state loop).
+func TestHandleOpenSignalReportsFreshIPOnTransition(t *testing.T) {
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	const (
+		staleIP = "203.0.113.7" // enrollment-time IP the reporter currently holds
+		freshIP = "203.0.113.9" // IP the mapper now returns
+	)
+	mapper := &fakeDirectMapper{ip: freshIP}
+	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+
+	rec := &endpointRecorder{}
+	reporter := direct.NewReporter(rec.record)
+	reporter.SetIP(staleIP)
+	port.SetTransitionCallback(reporter.OnTransition)
+
+	d := &Daemon{
+		store:     st,
+		signaling: sig,
+		direct: &directState{
+			ready:    true,
+			gate:     direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+			port:     port,
+			mapper:   mapper,
+			reporter: reporter,
+		},
+	}
+
+	// admit → OpenFor fires the open transition.
+	d.handleOpenSignal(openSignalMessage())
+
+	// close fires the closed transition.
+	if err := port.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reports := waitForEndpoints(t, rec, 2)
+
+	if reports[0].ip != freshIP || reports[0].port != 443 || reports[0].status != "" {
+		t.Fatalf("open report = %#v, want {ip:%s, port:443, status:\"\"}", reports[0], freshIP)
+	}
+	if reports[1].ip != freshIP || reports[1].port != 0 || reports[1].status != "" {
+		t.Fatalf("close report = %#v, want {ip:%s, port:0, status:\"\"}", reports[1], freshIP)
 	}
 }
 
