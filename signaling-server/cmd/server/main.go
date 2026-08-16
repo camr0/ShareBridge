@@ -106,10 +106,17 @@ func main() {
 		// and redirects to /i/{key} for Immich or /s/{code} for regular shares.
 		router.GET("/share/{code}", serveShareRedirect(app))
 
-		// Direct link route - redirects to the agent's direct HTTPS origin when
-		// enrolled + ready, otherwise 503 (controller gate).
+		// Direct link route. Dispatch on the live session's relay_only value:
+		// direct shares (relay_only false/absent) redirect to the agent's direct
+		// HTTPS origin via the controller gate; relay-only shares keep the
+		// existing web-client/serve path ("no relay fallback" applies to direct
+		// shares only, never to shares explicitly configured relay-only).
 		router.GET("/s/{code}", func(e *core.RequestEvent) error {
-			return ctrl.Redirect(e.Response, e.Request, e.Request.PathValue("code"))
+			code := e.Request.PathValue("code")
+			if isRelayOnlySession(app, code) {
+				return handler.ServeFileNoCache("./web/index.html")(e)
+			}
+			return ctrl.Redirect(e.Response, e.Request, code)
 		})
 		router.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
 
@@ -221,6 +228,28 @@ func deleteExpiredSessions(app core.App) error {
 	}
 
 	return nil
+}
+
+// isRelayOnlySession reports whether the live session identified by code is
+// explicitly relay-only. A missing/inactive/expired session is treated as
+// direct (so the controller gate can 503 it), preserving the direct path's
+// behavior for unknown codes.
+func isRelayOnlySession(app core.App, code string) bool {
+	if code == "" {
+		return false
+	}
+	records, err := app.FindRecordsByFilter(
+		"sessions", "code = {:code} && is_active = true", "", 1, 0,
+		map[string]any{"code": code},
+	)
+	if err != nil || len(records) == 0 {
+		return false
+	}
+	rec := records[0]
+	if exp := rec.GetDateTime("expires_at"); !exp.IsZero() && exp.Time().Before(time.Now()) {
+		return false
+	}
+	return rec.GetBool("relay_only")
 }
 
 // serveShareRedirect looks up a share code and redirects to the canonical

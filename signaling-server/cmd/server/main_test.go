@@ -11,7 +11,9 @@ import (
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"github.com/stretchr/testify/require"
+	"sharebridge/server/internal/directctl"
 	"sharebridge/server/internal/handler"
+	"sharebridge/server/internal/hub"
 	"sharebridge/server/migrations"
 )
 
@@ -24,6 +26,7 @@ func setupServerTestApp(t *testing.T) (core.App, func()) {
 	require.NoError(t, testApp.Bootstrap())
 	require.NoError(t, testApp.RunSystemMigrations())
 	require.NoError(t, migrations.CreateCollections(testApp))
+	require.NoError(t, migrations.AddRelayOnly(testApp))
 	require.NoError(t, migrations.CreateAgents(testApp))
 
 	return testApp, func() { testApp.Cleanup() }
@@ -120,8 +123,20 @@ func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
 	pbRouter, err := apis.NewRouter(app)
 	require.NoError(t, err)
 
-	// Direct link route - serves file client; JS reads code from window.location
-	pbRouter.GET("/s/{code}", handler.ServeFileNoCache("./web/index.html"))
+	// Direct-mode controller for the /s/{code} dispatch. Coordinator and DDNS
+	// are nil: Redirect's gates only need the hub + epoch state, which the
+	// route-level tests exercise independently.
+	ctrl := directctl.NewController(app, hub.New(), nil, nil, directctl.Config{BaseDomain: "example.com"})
+
+	// Direct link route - dispatch on relay_only: relay-only sessions serve the
+	// web client; direct sessions redirect through the controller gate.
+	pbRouter.GET("/s/{code}", func(e *core.RequestEvent) error {
+		code := e.Request.PathValue("code")
+		if isRelayOnlySession(app, code) {
+			return handler.ServeFileNoCache("./web/index.html")(e)
+		}
+		return ctrl.Redirect(e.Response, e.Request, code)
+	})
 	pbRouter.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
 
 	// Homepage (marketing)
@@ -156,6 +171,41 @@ func TestServerRoutesImmichLinks404ForUnknownSession(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// TestServerRoutesRelayOnlySessionServesWebClient is the backward-compat check
+// for /s/{code}: an explicitly relay-only session must keep the existing
+// web-client serve path (200), not be 503'd by the direct controller gate.
+func TestServerRoutesRelayOnlySessionServesWebClient(t *testing.T) {
+	app, router := setupRouterForTest(t)
+	user := createServerTestUser(t, app, "relayonly-route@example.com")
+	apiKey := createServerTestAPIKey(t, app, user.Id)
+	session := createServerTestSession(t, app, apiKey.Id, "RELAYONLYROUTE1", nil)
+	session.Set("relay_only", true)
+	require.NoError(t, app.Save(session))
+
+	req := httptest.NewRequest(http.MethodGet, "/s/RELAYONLYROUTE1", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), "ShareBridge")
+}
+
+// TestServerRoutesDirectSessionRedirectsNotWebClient asserts a direct
+// (relay_only false/absent) session still dispatches to the controller gate
+// (503 when the epoch is not ready) rather than the web-client serve path.
+func TestServerRoutesDirectSessionRedirectsNotWebClient(t *testing.T) {
+	app, router := setupRouterForTest(t)
+	user := createServerTestUser(t, app, "direct-route@example.com")
+	apiKey := createServerTestAPIKey(t, app, user.Id)
+	// relay_only defaults to false/absent → direct.
+	createServerTestSession(t, app, apiKey.Id, "DIRECTROUTE1", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/s/DIRECTROUTE1", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Contains(t, rec.Body.String(), "direct unavailable")
 }
 
 func TestDeleteExpiredSessions_PreservesSessionsWithoutExpiry(t *testing.T) {
