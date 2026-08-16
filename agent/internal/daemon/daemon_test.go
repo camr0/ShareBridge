@@ -178,6 +178,7 @@ type mockSignalingClient struct {
 	onMessage     func(signaling.Message)
 	iceServers    []webrtc.ICEServer
 	registerShare func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error)
+	shareOrigin   func(code, shareURL string) string
 	sendMessages  []map[string]any
 	codeCounter   int // Counter for generating unique codes
 	registered    []signaling.RegisterShareOptions
@@ -201,26 +202,32 @@ func (m *mockSignalingClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
+func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var code string
+	var reconnected bool
+	var err error
 	if m.registerShare != nil {
-		return m.registerShare(ctx, shareURL, preferredCode, relayOnly, relayStaticPub)
+		code, reconnected, err = m.registerShare(ctx, shareURL, preferredCode, relayOnly, relayStaticPub)
+	} else if preferredCode != "" {
+		code, reconnected = preferredCode, true
+	} else {
+		m.codeCounter++
+		code = fmt.Sprintf("test-code-%d", m.codeCounter)
 	}
-	// Default: generate a unique code
-	if preferredCode != "" {
-		return preferredCode, true, nil
+	origin := ""
+	if m.shareOrigin != nil {
+		origin = m.shareOrigin(code, shareURL)
 	}
-	m.codeCounter++
-	return fmt.Sprintf("test-code-%d", m.codeCounter), false, nil
+	return code, origin, reconnected, err
 }
 
 func (m *mockSignalingClient) RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, string, bool, error) {
 	m.mu.Lock()
 	m.registered = append(m.registered, opts)
 	m.mu.Unlock()
-	code, reconnected, err := m.RegisterShare(ctx, opts.ShareURL, opts.PreferredCode, opts.RelayOnly, opts.RelayStaticPub)
-	return code, "", reconnected, err
+	return m.RegisterShare(ctx, opts.ShareURL, opts.PreferredCode, opts.RelayOnly, opts.RelayStaticPub)
 }
 
 func (m *mockSignalingClient) UnregisterShare(ctx context.Context, code string) error {
@@ -249,6 +256,26 @@ func (m *mockSignalingClient) Send(ctx context.Context, msg any) error {
 		m.sendMessages = append(m.sendMessages, converted)
 	}
 	return nil
+}
+
+func (m *mockSignalingClient) SubmitCSR(ctx context.Context, csrPEM string) error {
+	return m.Send(ctx, map[string]any{"type": "csr_submit", "csr_pem": csrPEM})
+}
+
+func (m *mockSignalingClient) OpenAck(ctx context.Context, ack signaling.OpenAck) error {
+	return m.Send(ctx, map[string]any{
+		"type": "open_ack", "share_id": ack.ShareID, "nonce": ack.Nonce, "seq": ack.Seq,
+		"granted_port": ack.GrantedPort, "public_ip": ack.PublicIP,
+		"was_already_open": ack.WasAlreadyOpen, "status": ack.Status,
+	})
+}
+
+func (m *mockSignalingClient) TLSReady(ctx context.Context, fingerprint, notAfter string) error {
+	return m.Send(ctx, map[string]any{"type": "tls_ready", "fingerprint": fingerprint, "not_after": notAfter})
+}
+
+func (m *mockSignalingClient) TLSError(ctx context.Context, reason string) error {
+	return m.Send(ctx, map[string]any{"type": "tls_error", "reason": reason})
 }
 
 func (m *mockSignalingClient) GetICEServers() []webrtc.ICEServer {

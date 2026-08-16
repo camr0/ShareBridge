@@ -53,6 +53,9 @@ type Message struct {
 	PublicIP       string          `json:"public_ip,omitempty"`
 	WasAlreadyOpen bool            `json:"was_already_open,omitempty"`
 	Error          string          `json:"error,omitempty"`
+	Namespace      string          `json:"namespace,omitempty"`
+	ChainPEM       string          `json:"chain_pem,omitempty"`
+	Reason         string          `json:"reason,omitempty"`
 }
 
 // OpenAck is the agent-side acknowledgement of an open_signal. Its json tags
@@ -133,17 +136,17 @@ func (c *Client) Connect(ctx context.Context) error {
 // It must not call conn.Read directly — all reads go through Listen.
 // The response is delivered via pendingReg, which Listen feeds.
 // relayStaticPub is the hex-encoded P-256 public key for relay identity.
-func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
-	code, _, reconnected, err := c.RegisterShareWithOptions(ctx, RegisterShareOptions{
+func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, string, bool, error) {
+	code, origin, reconnected, err := c.RegisterShareWithOptions(ctx, RegisterShareOptions{
 		ShareURL:       shareURL,
 		PreferredCode:  preferredCode,
 		RelayOnly:      relayOnly,
 		RelayStaticPub: relayStaticPub,
 	})
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
-	return code, reconnected, nil
+	return code, origin, reconnected, nil
 }
 
 func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShareOptions) (string, string, bool, error) {

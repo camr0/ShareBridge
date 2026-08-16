@@ -30,6 +30,7 @@ type SessionEntry struct {
 	Downloads           int       `json:"downloads"`
 	RelayOnly           bool      `json:"relay_only"`
 	CreatedAt           time.Time `json:"created_at"`
+	Origin              string    `json:"origin,omitempty"`
 }
 
 type storeData struct {

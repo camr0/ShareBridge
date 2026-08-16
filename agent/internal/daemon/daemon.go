@@ -6,19 +6,24 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"sharebridge/agent/internal/cert"
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
+	"sharebridge/agent/internal/direct"
 	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/multilane"
 	"sharebridge/agent/internal/peer"
@@ -203,12 +208,16 @@ type StoreInterface interface {
 // SignalingClientInterface defines the interface for signaling client.
 type SignalingClientInterface interface {
 	Connect(ctx context.Context) error
-	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error)
+	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, string, bool, error)
 	DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error
 	Send(ctx context.Context, msg any) error
 	GetICEServers() []webrtc.ICEServer
 	Listen(ctx context.Context) error
 	SetOnMessage(handler func(signaling.Message))
+	SubmitCSR(ctx context.Context, csrPEM string) error
+	OpenAck(ctx context.Context, ack signaling.OpenAck) error
+	TLSReady(ctx context.Context, fingerprint, notAfter string) error
+	TLSError(ctx context.Context, reason string) error
 }
 
 // Session represents an active share session with WebRTC peers.
@@ -240,6 +249,7 @@ type Daemon struct {
 	configMgr ConfigManagerInterface
 	store     StoreInterface
 	signaling SignalingClientInterface
+	direct    *directState
 	sessions  map[string]*Session // code -> Session
 	mu        sync.RWMutex
 
@@ -263,6 +273,182 @@ type Daemon struct {
 	OnSessionRemoved func(code string)
 }
 
+const (
+	defaultBaseDomain     = "sharebridgeusercontent.com"
+	directMaxContentBytes = int64(1 << 20) // placeholder download ceiling
+	directIntPort         = 8443
+	directExtPort         = 443
+	directPortIdle        = 5 * time.Minute
+)
+
+// directState is the daemon's direct-TCP transport state. It is nil when direct
+// transport is not configured (e.g. in tests using NewWithSignaling).
+type directState struct {
+	mu         sync.Mutex
+	namespace  string
+	ready      bool
+	cert       *cert.Manager
+	binder     *direct.Binder
+	gate       *direct.SignalGate
+	port       *direct.OnDemandPort
+	mapper     direct.PortMapper
+	server     *direct.DirectServer
+	baseDomain string
+	serveNS    string // namespace the binder/server were built for
+	origin     map[string]string
+}
+
+// canRegisterDirect reports whether direct shares may be registered: the direct
+// transport must be configured and the agent must have completed enrollment.
+func (d *Daemon) canRegisterDirect() bool {
+	if d.direct == nil {
+		return false
+	}
+	d.direct.mu.Lock()
+	defer d.direct.mu.Unlock()
+	return d.direct.ready
+}
+
+// directShareAuthorized is the SignalGate source-authorization check: a share is
+// only openable over direct once its origin is locally bound.
+func (d *Daemon) directShareAuthorized(shareID string, kind direct.RouteKind) bool {
+	if kind != direct.RouteDirect {
+		return false
+	}
+	if d.direct == nil {
+		return false
+	}
+	d.direct.mu.Lock()
+	defer d.direct.mu.Unlock()
+	_, ok := d.direct.origin[shareID]
+	return ok
+}
+
+// bindOrigin records the control-allocated origin for a share code and admits it
+// in the binder. It is a no-op until the binder exists (namespace known).
+func (d *Daemon) bindOrigin(code, origin string) {
+	if d.direct == nil || d.direct.binder == nil || origin == "" {
+		return
+	}
+	if err := d.direct.binder.Allow(origin, direct.RouteDirect, code); err != nil {
+		log.Printf("bind origin %q for share %s: %v", origin, code, err)
+		return
+	}
+	d.direct.mu.Lock()
+	if d.direct.origin == nil {
+		d.direct.origin = make(map[string]string)
+	}
+	d.direct.origin[code] = origin
+	d.direct.mu.Unlock()
+}
+
+// revokeOrigin drops the origin binding for a share code and revokes it in the
+// binder. It is a no-op if no origin was recorded.
+func (d *Daemon) revokeOrigin(code string) {
+	if d.direct == nil || d.direct.binder == nil {
+		return
+	}
+	d.direct.mu.Lock()
+	origin, ok := d.direct.origin[code]
+	if ok {
+		delete(d.direct.origin, code)
+	}
+	d.direct.mu.Unlock()
+	if ok {
+		d.direct.binder.Revoke(origin)
+	}
+}
+
+// syncDirectServe (re)builds the binder and direct server once the namespace is
+// known. It is idempotent for an unchanged namespace so reconnect does not drop
+// live origin bindings.
+func (d *Daemon) syncDirectServe() {
+	ds := d.direct
+	if ds == nil {
+		return
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if ds.namespace == "" {
+		return
+	}
+	if ds.binder != nil && ds.serveNS == ds.namespace {
+		return
+	}
+	ds.binder = direct.NewBinder(ds.namespace, ds.baseDomain)
+	ds.server = direct.NewDirectServer(ds.namespace, ds.baseDomain, ds.port, ds.cert, ds.gate, directMaxContentBytes)
+	ds.serveNS = ds.namespace
+}
+
+// buildDirectState constructs the daemon's direct-transport state. When withNetwork
+// is false (tests) the port mapper and on-demand port are left nil.
+func (d *Daemon) buildDirectState(withNetwork bool) {
+	cfg := d.GetConfig()
+	agentID := d.store.GetAgentID()
+
+	baseDomain := cfg.BaseDomain
+	if baseDomain == "" {
+		baseDomain = defaultBaseDomain
+	}
+
+	ds := &directState{
+		baseDomain: baseDomain,
+		origin:     make(map[string]string),
+	}
+	d.direct = ds
+
+	ds.cert = cert.NewManager(resolveDataDir(), baseDomain, systemRoots())
+	if err := ds.cert.Load(); err != nil {
+		log.Printf("load direct cert state: %v", err)
+	}
+	ds.namespace = ds.cert.Namespace()
+
+	ds.gate = direct.NewSignalGate(agentID, d.directShareAuthorized)
+
+	if withNetwork {
+		mapperCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		mapper, err := direct.MapperForRouter(mapperCtx)
+		cancel()
+		if err != nil {
+			log.Printf("direct port mapper unavailable: %v", err)
+		} else {
+			ds.mapper = mapper
+			token := "sharebridge-" + shortHash(agentID)
+			ds.port = direct.NewOnDemandPortOwned(mapper, directExtPort, directIntPort, directPortIdle, token, mapper.InternalIP())
+		}
+	}
+
+	d.syncDirectServe()
+}
+
+// shortHash returns a short stable hex digest of s, used to derive a per-agent
+// port-mapping ownership token.
+func shortHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:8])
+}
+
+// resolveDataDir resolves the agent data directory, matching store.New.
+func resolveDataDir() string {
+	if env := os.Getenv("SHAREBRIDGE_DATA_DIR"); env != "" {
+		return env
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".sharebridge"
+	}
+	return filepath.Join(home, ".sharebridge")
+}
+
+// systemRoots returns the system trust root pool the agent validates the issued
+// chain against (Let's Encrypt roots live in the system trust store).
+func systemRoots() *x509.CertPool {
+	if sys, err := x509.SystemCertPool(); err == nil {
+		return sys
+	}
+	return x509.NewCertPool()
+}
+
 // New creates a new Daemon with the given config manager and store.
 func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 	cfg := cfgMgr.Get()
@@ -270,7 +456,7 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 
 	sig := signaling.New(cfg.SignalingURL, cfg.APIKey, agentID)
 
-	return &Daemon{
+	d := &Daemon{
 		config:    cfg,
 		configMgr: cfgMgr,
 		store:     st,
@@ -278,7 +464,9 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 		sessions:  make(map[string]*Session),
 		nonces:    make(map[string]nonceEntry),
 		startTime: time.Now(),
-	}, nil
+	}
+	d.buildDirectState(true)
+	return d, nil
 }
 
 // NewWithSignaling creates a new Daemon with a custom signaling client.
@@ -302,36 +490,20 @@ func (d *Daemon) SetWebServer(ws WebServer) {
 	d.webServer = ws
 }
 
-// Start connects to signaling server, loads sessions from store, starts the
-// web server, and begins the expiry pruner. Returns an error channel that
-// emits errors from background goroutines.
+// Start connects to signaling server (with reconnect), loads sessions from
+// store, starts the web server, and begins the expiry pruner + cert renewal.
+// Returns an error channel that emits errors from background goroutines.
 func (d *Daemon) Start(ctx context.Context) <-chan error {
 	errChan := make(chan error, 10)
 
-	// Connect to signaling server
-	if err := d.signaling.Connect(ctx); err != nil {
-		errChan <- fmt.Errorf("connect to signaling server: %w", err)
-		return errChan
-	}
-	log.Printf("connected to signaling server at %s", d.GetConfig().SignalingURL)
-
-	// Set up message handler before starting listener
+	// Set up message handler before the reconnect loop starts the listener.
 	d.signaling.SetOnMessage(d.handleSignalingMessage)
 
-	// Start signaling listener before loading sessions — Listen is the sole
-	// WebSocket reader, and RegisterShare (called during loadSessionsFromStore)
-	// waits on a channel that Listen feeds. Starting it first avoids a
-	// concurrent-read race that corrupts WebSocket frame boundaries.
-	go func() {
-		if err := d.signaling.Listen(ctx); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				errChan <- fmt.Errorf("signaling listener: %w", err)
-			}
-		}
-	}()
+	// Signaling connect + listen run in a reconnect loop (bounded backoff).
+	go d.runSignalingLoop(ctx, errChan)
 
-	// Load persisted sessions and re-register them
-	d.loadSessionsFromStore(ctx)
+	// Renewal scheduler re-issues the cert at the 30-day threshold.
+	go d.runRenewalScheduler(ctx)
 
 	if d.config.ImmichURL != "" && d.config.ImmichAPIKey != "" {
 		go d.runImmichPoller(ctx)
@@ -352,6 +524,120 @@ func (d *Daemon) Start(ctx context.Context) <-chan error {
 	}
 
 	return errChan
+}
+
+// runSignalingLoop drives connect + listen with bounded exponential backoff.
+// Each successful connect re-registers persisted sessions; each disconnect
+// resets direct-transport readiness and the open-signal gate for the new epoch.
+func (d *Daemon) runSignalingLoop(ctx context.Context, errChan chan<- error) {
+	backoff := signaling.NewBackoff()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := d.signaling.Connect(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			errChan <- fmt.Errorf("connect to signaling server: %w", err)
+			if !sleepCtx(ctx, backoff.Next()) {
+				return
+			}
+			continue
+		}
+		backoff.Reset()
+		log.Printf("connected to signaling server at %s", d.GetConfig().SignalingURL)
+
+		// Listen is the sole WebSocket reader and must run before re-enrollment
+		// / re-registration (RegisterShare waits on a channel Listen feeds).
+		listenDone := make(chan error, 1)
+		go func() { listenDone <- d.signaling.Listen(ctx) }()
+
+		// Re-enrollment (hello → enrolled → cert → enrollment_ready) is driven
+		// by the message handler asynchronously; here we re-register sessions.
+		d.loadSessionsFromStore(ctx)
+
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-listenDone:
+			if ctx.Err() != nil {
+				return
+			}
+			d.onSignalingDisconnect()
+			if !errors.Is(err, context.Canceled) {
+				errChan <- fmt.Errorf("signaling listener: %w", err)
+			}
+			if !sleepCtx(ctx, backoff.Next()) {
+				return
+			}
+		}
+	}
+}
+
+// onSignalingDisconnect resets the direct-transport epoch: readiness is
+// connection-local, and the gate forgets nonces/sequence numbers so signals
+// from the previous connection cannot replay.
+func (d *Daemon) onSignalingDisconnect() {
+	if d.direct == nil {
+		return
+	}
+	d.direct.mu.Lock()
+	d.direct.ready = false
+	d.direct.mu.Unlock()
+	if d.direct.gate != nil {
+		d.direct.gate.Reset()
+	}
+}
+
+// runRenewalScheduler periodically checks the cert and re-issues it at the
+// 30-day renewal threshold (key reuse via cert.Manager.GenerateCSR).
+func (d *Daemon) runRenewalScheduler(ctx context.Context) {
+	if d.direct == nil || d.direct.cert == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.renewCertIfNeeded(ctx)
+		}
+	}
+}
+
+func (d *Daemon) renewCertIfNeeded(ctx context.Context) {
+	ds := d.direct
+	if ds == nil || ds.cert == nil || !ds.cert.Installed() {
+		return // initial enrollment handles the first CSR
+	}
+	if !ds.cert.NeedsRenewal() {
+		return
+	}
+	csr, err := ds.cert.GenerateCSR()
+	if err != nil {
+		log.Printf("renewal: generate CSR: %v", err)
+		return
+	}
+	if err := d.signaling.SubmitCSR(ctx, string(csr)); err != nil {
+		log.Printf("renewal: submit CSR: %v", err)
+		return
+	}
+	log.Printf("renewal: submitted CSR (cert within 30-day window)")
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled, returning false on cancel.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // Stop gracefully shuts down the daemon.
@@ -425,10 +711,11 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 	}
 
 	// Register with signaling server (no preferred code for new sessions)
-	code, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly, relayStaticPub)
+	code, origin, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly, relayStaticPub)
 	if err != nil {
 		return "", fmt.Errorf("register share: %w", err)
 	}
+	d.bindOrigin(code, origin)
 
 	now := time.Now()
 	session := &Session{
@@ -463,6 +750,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 		Downloads:    0,
 		RelayOnly:    relayOnly,
 		CreatedAt:    now,
+		Origin:       origin,
 	}); err != nil {
 		log.Printf("warning: could not persist session: %v", err)
 	}
@@ -554,6 +842,7 @@ func (d *Daemon) RevokeSession(code string) error {
 	if err := d.store.DeleteSession(code); err != nil {
 		log.Printf("warning: could not delete session from store: %v", err)
 	}
+	d.revokeOrigin(code)
 
 	// Notify server of deregistration (send deregister message)
 	d.signaling.Send(context.Background(), map[string]string{
@@ -618,9 +907,159 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	case "relay_prepare":
 		go d.handleRelayPrepare(msg)
 
+	case "enrolled":
+		d.handleEnrolled(msg)
+
+	case "cert_issue":
+		d.handleCertIssue(msg)
+
+	case "cert_error":
+		d.handleCertError(msg)
+
+	case "enrollment_ready":
+		d.handleEnrollmentReady(msg)
+
+	case "open_signal":
+		d.handleOpenSignal(msg)
+
 	case "error":
 		log.Printf("signaling error: %s", msg.Err)
 	}
+}
+
+// handleEnrolled persists the control-assigned namespace, rebuilds the binder
+// (if the namespace changed), and initiates or re-affirms certificate issuance.
+func (d *Daemon) handleEnrolled(msg signaling.Message) {
+	ds := d.direct
+	if ds == nil || msg.Namespace == "" {
+		return
+	}
+
+	ds.mu.Lock()
+	nsChanged := ds.namespace != msg.Namespace
+	ds.namespace = msg.Namespace
+	ds.mu.Unlock()
+
+	if err := ds.cert.SetNamespace(msg.Namespace); err != nil {
+		log.Printf("persist namespace: %v", err)
+	}
+	d.syncDirectServe()
+
+	if nsChanged || !ds.cert.Installed() || ds.cert.NeedsRenewal() {
+		csr, err := ds.cert.GenerateCSR()
+		if err != nil {
+			log.Printf("generate CSR: %v", err)
+			return
+		}
+		if err := d.signaling.SubmitCSR(context.Background(), string(csr)); err != nil {
+			log.Printf("submit CSR: %v", err)
+		}
+		return
+	}
+
+	// Reconnect reconciliation: cert already installed and not expiring —
+	// re-affirm tls_ready so the control marks the current epoch ready.
+	d.sendTLSReady()
+}
+
+// handleCertIssue validates and installs the issued chain, then reports the
+// installed leaf to the control (or a tls_error on validation failure).
+func (d *Daemon) handleCertIssue(msg signaling.Message) {
+	ds := d.direct
+	if ds == nil || msg.ChainPEM == "" {
+		return
+	}
+	if err := ds.cert.Install([]byte(msg.ChainPEM)); err != nil {
+		log.Printf("install issued chain: %v", err)
+		_ = d.signaling.TLSError(context.Background(), err.Error())
+		return
+	}
+	d.sendTLSReady()
+}
+
+func (d *Daemon) handleCertError(msg signaling.Message) {
+	log.Printf("cert issuance error: %s", msg.Reason)
+}
+
+// handleEnrollmentReady marks the current connection epoch ready: direct shares
+// may now be registered and opened.
+func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
+	ds := d.direct
+	if ds == nil {
+		return
+	}
+	ds.mu.Lock()
+	ds.ready = true
+	ds.mu.Unlock()
+	log.Printf("direct enrollment ready")
+}
+
+// sendTLSReady reports the installed leaf fingerprint + not_after to the control.
+func (d *Daemon) sendTLSReady() {
+	ds := d.direct
+	if ds == nil || ds.cert == nil {
+		return
+	}
+	fp, err := ds.cert.LeafFingerprint()
+	if err != nil {
+		log.Printf("leaf fingerprint: %v", err)
+		return
+	}
+	notAfter, err := ds.cert.NotAfter()
+	if err != nil {
+		log.Printf("leaf not_after: %v", err)
+		return
+	}
+	if err := d.signaling.TLSReady(context.Background(), fp, notAfter.Format(time.RFC3339)); err != nil {
+		log.Printf("send tls_ready: %v", err)
+	}
+}
+
+// handleOpenSignal admits a control-plane open-signal, opens the on-demand
+// port, and acknowledges with the fresh public IP + granted port.
+func (d *Daemon) handleOpenSignal(msg signaling.Message) {
+	if !d.canRegisterDirect() {
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "not_ready"})
+		return
+	}
+	exp, err := time.Parse(time.RFC3339, msg.ExpiresAt)
+	if err != nil {
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "bad_expiry"})
+		return
+	}
+	sig := direct.OpenSignal{
+		Version:   msg.Version,
+		AgentID:   d.store.GetAgentID(),
+		ShareID:   msg.ShareID,
+		RouteKind: direct.RouteDirect,
+		Nonce:     msg.Nonce,
+		Seq:       msg.Seq,
+		ExpiresAt: exp,
+		Lease:     time.Duration(msg.LeaseSeconds) * time.Second,
+	}
+	if err := d.direct.gate.Admit(sig); err != nil {
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "rejected"})
+		return
+	}
+	wasOpen := d.direct.port.Open()
+	if err := d.direct.port.OpenFor(msg.ShareID, sig.Lease); err != nil {
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
+		return
+	}
+	ip, err := d.direct.mapper.ExternalIP() // FRESH on every ack
+	if err != nil || ip == "" {
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "no_public_ip"})
+		return
+	}
+	_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
+		GrantedPort: d.direct.port.GrantedPort(), PublicIP: ip,
+		WasAlreadyOpen: wasOpen, Status: "ok"})
 }
 
 // handleKnock handles a knock from a browser (via signaling server).
@@ -1194,7 +1633,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 				log.Printf("warning: signaling client does not support Immich registration options for %s", entry.Code)
 				continue
 			}
-			code, _, reconnected, err := reg.RegisterShareWithOptions(ctx, signaling.RegisterShareOptions{
+			code, origin, reconnected, err := reg.RegisterShareWithOptions(ctx, signaling.RegisterShareOptions{
 				ShareURL:            entry.ShareURL,
 				PreferredCode:       entry.Code,
 				ShareType:           "immich",
@@ -1206,6 +1645,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 				log.Printf("warning: could not re-register Immich session %s: %v", entry.Code, err)
 				continue
 			}
+			d.bindOrigin(code, origin)
 
 			session := &Session{
 				Code:                code,
@@ -1241,11 +1681,15 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		}
 
 		// Re-register with signaling server
-		code, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly, relayStaticPub)
+		code, origin, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly, relayStaticPub)
 		if err != nil {
 			log.Printf("warning: could not re-register session %s: %v", entry.Code, err)
 			continue
 		}
+		if origin == "" {
+			origin = entry.Origin
+		}
+		d.bindOrigin(code, origin)
 
 		// Use the returned code (might be different if reconnection failed)
 		session := &Session{
@@ -1362,6 +1806,7 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 		if err := d.store.DeleteSession(session.Code); err != nil {
 			return err
 		}
+		d.revokeOrigin(session.Code)
 		d.mu.Lock()
 		if d.sessions[session.Code] == session {
 			delete(d.sessions, session.Code)
@@ -1404,10 +1849,11 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		RelayOnly:           relayOnly,
 		RelayStaticPub:      relayStaticPub,
 	}
-	code, _, _, err := reg.RegisterShareWithOptions(ctx, opts)
+	code, origin, _, err := reg.RegisterShareWithOptions(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
+	d.bindOrigin(code, origin)
 	client, err := d.newImmichClient(code)
 	if err != nil {
 		_ = d.unregisterShare(ctx, code)
@@ -1433,6 +1879,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		IsPasswordProtected: passwordProtected,
 		RelayOnly:           relayOnly,
 		CreatedAt:           now,
+		Origin:              origin,
 	}); err != nil {
 		_ = d.unregisterShare(ctx, code)
 		return nil, err
@@ -1570,6 +2017,7 @@ func (d *Daemon) pruneExpiredSessions() {
 		if err := d.store.DeleteSession(item.code); err != nil {
 			log.Printf("warning: could not delete expired session: %v", err)
 		}
+		d.revokeOrigin(item.code)
 		_ = d.signaling.Send(context.Background(), map[string]string{
 			"type": "deregister",
 			"code": item.code,

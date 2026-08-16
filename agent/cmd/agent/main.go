@@ -369,7 +369,7 @@ func runSession(ctx context.Context, cfg *config.Config, webdavClient *cloudwebd
 	}
 
 	// Use new RegisterShare instead of CreateSession
-	code, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode, relayOnly, relayStaticPub)
+	code, _, reconnected, err := sig.RegisterShare(ctx, shareURL, preferredCode, relayOnly, relayStaticPub)
 	if err != nil {
 		return "", fmt.Errorf("register share: %w", err)
 	}

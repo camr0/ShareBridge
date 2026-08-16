@@ -281,7 +281,7 @@ func TestRegisterShare_IncludesRelayStaticPub(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- client.Listen(ctx) }()
 
-	_, _, err := client.RegisterShare(ctx, "https://example.com/s/abc", "", false, "04abcd")
+	_, _, _, err := client.RegisterShare(ctx, "https://example.com/s/abc", "", false, "04abcd")
 	if err != nil {
 		t.Fatalf("RegisterShare: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestRegisterShare_OmitsEmptyRelayStaticPub(t *testing.T) {
 	go func() { done <- client.Listen(ctx) }()
 
 	// Call with empty relayStaticPub
-	_, _, err := client.RegisterShare(ctx, "https://example.com/s/xyz", "", false, "")
+	_, _, _, err := client.RegisterShare(ctx, "https://example.com/s/xyz", "", false, "")
 	if err != nil {
 		t.Fatalf("RegisterShare: %v", err)
 	}

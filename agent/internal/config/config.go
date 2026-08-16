@@ -32,6 +32,7 @@ type Config struct {
 	UIPort              int    `json:"ui_port"`           // default: 7878
 	UIAddr              string `json:"ui_addr,omitempty"` // default: 0.0.0.0
 	UIPassword          string `json:"ui_password,omitempty"`
+	BaseDomain          string `json:"base_domain,omitempty"` // content base domain for direct/relay origins
 
 	// Legacy fields for backward compatibility
 	SignalingServer string `json:"-"` // Deprecated: use SignalingURL
@@ -184,9 +185,15 @@ func (m *Manager) load() (*Config, error) {
 	if v := os.Getenv("UI_ADDR"); v != "" {
 		cfg.UIAddr = v
 	}
+	if v := os.Getenv("CONTENT_BASE_DOMAIN"); v != "" {
+		cfg.BaseDomain = v
+	}
 
 	if cfg.SignalingURL == "" {
 		cfg.SignalingURL = "wss://sharebridge.app"
+	}
+	if cfg.BaseDomain == "" {
+		cfg.BaseDomain = "sharebridgeusercontent.com"
 	}
 	if cfg.UIPort == 0 {
 		cfg.UIPort = 7878
