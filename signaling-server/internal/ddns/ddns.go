@@ -3,6 +3,8 @@ package ddns
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/cloudflare/cloudflare-go"
 )
@@ -15,15 +17,20 @@ type Cloudflare struct {
 }
 
 func New(ctx context.Context, apiToken, zoneName string) (*Cloudflare, error) {
-	api, err := cloudflare.NewWithAPIToken(apiToken)
+	api, err := cloudflare.NewWithAPIToken(apiToken, cloudflare.HTTPClient(&http.Client{Timeout: 10 * time.Second}))
 	if err != nil {
 		return nil, fmt.Errorf("cloudflare client: %w", err)
 	}
-	zoneID, err := api.ZoneIDByName(zoneName)
+	resp, err := api.ListZonesContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolve zone %q: %w", zoneName, err)
 	}
-	return &Cloudflare{api: api, zoneID: zoneID}, nil
+	for _, zone := range resp.Result {
+		if zone.Name == zoneName {
+			return &Cloudflare{api: api, zoneID: zone.ID}, nil
+		}
+	}
+	return nil, fmt.Errorf("resolve zone %q: not found", zoneName)
 }
 
 // UpsertA creates or updates the direct wildcard A record to point at ip with
