@@ -114,6 +114,21 @@ func NewController(app core.App, h *hub.Hub, coord *certcoordinator.Coordinator,
 	return c
 }
 
+// SetDDNSFunc overrides the DDNS provisioning function used by
+// HandleReportEndpoint. It is a test-only injection point (mirrors
+// certcoordinator.SetIssueFn) so an out-of-package integration test can succeed
+// DDNS without a live Cloudflare zone.
+func (c *Controller) SetDDNSFunc(fn func(ctx context.Context, name, ip string, ttl int) (string, error)) {
+	c.ddnsFn = fn
+}
+
+// AllowPrivateProbes disables the SSRF guard that rejects non-globally-routable
+// probe targets, so loopback test servers can be probed. Test-only; production
+// must never call this.
+func (c *Controller) AllowPrivateProbes() {
+	c.allowPrivate = true
+}
+
 // epochReady reports whether the CURRENT connection epoch for apiKeyID has
 // reached readiness. Used by tests to assert readiness is not inherited across
 // epochs.
