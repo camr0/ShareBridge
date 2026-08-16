@@ -18,7 +18,7 @@ func TestEmitOpenUsesHelloAgentID(t *testing.T) {
 		emitted = msg.(map[string]any)
 		go func() {
 			time.Sleep(5 * time.Millisecond)
-			ctrl.HandleOpenAck(apiKeyID, OpenAck{
+			ctrl.HandleOpenAck(nil, apiKeyID, OpenAck{
 				ShareID: "abc", Nonce: emitted["nonce"].(string), Seq: emitted["seq"].(uint64),
 				GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok",
 			})
@@ -66,11 +66,11 @@ func TestOpenAckValidatesFullTuple(t *testing.T) {
 	seq := emitted["seq"].(uint64)
 
 	// Wrong seq — discarded.
-	ctrl.HandleOpenAck(apiKeyID, OpenAck{ShareID: "abc", Nonce: nonce, Seq: seq + 1, GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok"})
+	ctrl.HandleOpenAck(nil, apiKeyID, OpenAck{ShareID: "abc", Nonce: nonce, Seq: seq + 1, GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok"})
 	// Wrong share_id — discarded.
-	ctrl.HandleOpenAck(apiKeyID, OpenAck{ShareID: "wrong", Nonce: nonce, Seq: seq, GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok"})
+	ctrl.HandleOpenAck(nil, apiKeyID, OpenAck{ShareID: "wrong", Nonce: nonce, Seq: seq, GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok"})
 	// Wrong apiKeyID — discarded.
-	ctrl.HandleOpenAck("key-other", OpenAck{ShareID: "abc", Nonce: nonce, Seq: seq, GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok"})
+	ctrl.HandleOpenAck(nil, "key-other", OpenAck{ShareID: "abc", Nonce: nonce, Seq: seq, GrantedPort: 443, PublicIP: "1.2.3.4", Status: "ok"})
 
 	// No completion yet — the mismatched acks must not have satisfied the waiter.
 	select {
@@ -82,7 +82,7 @@ func TestOpenAckValidatesFullTuple(t *testing.T) {
 	}
 
 	// Correct full tuple — completes.
-	ctrl.HandleOpenAck(apiKeyID, OpenAck{ShareID: "abc", Nonce: nonce, Seq: seq, GrantedPort: 8080, PublicIP: "1.2.3.4", Status: "ok"})
+	ctrl.HandleOpenAck(nil, apiKeyID, OpenAck{ShareID: "abc", Nonce: nonce, Seq: seq, GrantedPort: 8080, PublicIP: "1.2.3.4", Status: "ok"})
 
 	select {
 	case ack := <-ackCh:

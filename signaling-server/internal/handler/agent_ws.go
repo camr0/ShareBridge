@@ -147,6 +147,12 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, 
 
 			switch msg.Type {
 			case "hello":
+				if msg.AgentID == "" {
+					// Reject an empty hello: emit an error and do NOT enroll the
+					// agent (the epoch identity must never be empty).
+					handleHello(ctx, conn, h, apiKeyID, accountID, "", cfg)
+					continue
+				}
 				handleHello(ctx, conn, h, apiKeyID, accountID, msg.AgentID, cfg)
 				if ctrl != nil {
 					ctrl.HandleHello(ctx, conn, apiKeyID, accountID, msg.AgentID)
@@ -154,30 +160,49 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, 
 				agentID = msg.AgentID
 
 			case "csr_submit":
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before csr_submit"})
+					continue
+				}
 				if ctrl == nil {
 					continue
 				}
 				ctrl.HandleCSRSubmit(ctx, conn, apiKeyID, msg.CSRPEM)
 
 			case "tls_ready":
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before tls_ready"})
+					continue
+				}
 				if ctrl == nil {
 					continue
 				}
 				ctrl.HandleTLSReady(ctx, conn, apiKeyID, msg.Fingerprint, msg.NotAfter)
 
 			case "tls_error":
+				if agentID == "" {
+					continue
+				}
 				if ctrl == nil {
 					continue
 				}
 				ctrl.HandleTLSError(ctx, apiKeyID, msg.Reason)
 
 			case "report_endpoint":
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before report_endpoint"})
+					continue
+				}
 				if ctrl == nil {
 					continue
 				}
-				ctrl.HandleReportEndpoint(ctx, apiKeyID, msg.IP, msg.Port, msg.Status)
+				ctrl.HandleReportEndpoint(ctx, conn, apiKeyID, msg.IP, msg.Port, msg.Status)
 
 			case "open_ack":
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before open_ack"})
+					continue
+				}
 				if ctrl == nil {
 					continue
 				}
@@ -187,7 +212,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, 
 				if msg.Nonce == "" || msg.Seq == 0 {
 					continue
 				}
-				ctrl.HandleOpenAck(apiKeyID, directctl.OpenAck{
+				ctrl.HandleOpenAck(conn, apiKeyID, directctl.OpenAck{
 					ShareID:        msg.ShareID,
 					Nonce:          msg.Nonce,
 					Seq:            msg.Seq,
@@ -405,7 +430,10 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	})
 }
 
-// handleRegisterShare processes share registration (new or reconnect)
+// handleRegisterShare processes share registration (new or reconnect). Session
+// creation/claim AND origin allocation run in ONE transaction, and the hub is
+// only updated after the transaction commits, so an allocation failure cannot
+// orphan an active originless session + hub entry (I7).
 func handleRegisterShare(
 	ctx context.Context,
 	conn *websocket.Conn,
@@ -417,142 +445,150 @@ func handleRegisterShare(
 	msg agentMsg,
 	ctrl *directctl.Controller,
 ) {
-	// Determine the code to use
-	code := msg.Code
-	reconnected := false
-
-	if code == "" {
-		// Generate a new random code
-		var err error
-		code, err = generateRandomCode()
-		if err != nil {
-			log.Printf("failed to generate random code: %v", err)
-			hub.SendDirect(ctx, conn, map[string]string{
-				"type":    "error",
-				"message": "failed to generate code",
-			})
-			return
-		}
-
-		// Try to create with collision retry (5 attempts)
+	if msg.Code == "" {
+		// Generated code: create + allocate origin atomically, retrying on a
+		// unique-constraint collision (code or origin) with a fresh code.
+		var code string
+		var session *core.Record
+		var origin string
 		created := false
 		for i := 0; i < 5; i++ {
-			relayOnly := false
-			if msg.RelayOnly != nil {
-				relayOnly = *msg.RelayOnly
+			var err error
+			code, err = generateRandomCode()
+			if err != nil {
+				log.Printf("failed to generate random code: %v", err)
+				hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "failed to generate code"})
+				return
 			}
-			err = createSession(app, code, apiKeyID, agentID, msg.ExpiresAt, relayOnly, msg.RelayStaticPub, "", false)
+			session, origin, err = createSessionAndOrigin(app, code, apiKeyID, agentID, msg, ctrl)
 			if err == nil {
 				created = true
 				break
 			}
-
-			// Collision, generate new code
-			code, err = generateRandomCode()
-			if err != nil {
-				log.Printf("failed to generate random code: %v", err)
-				hub.SendDirect(ctx, conn, map[string]string{
-					"type":    "error",
-					"message": "failed to generate code",
-				})
+			if !directctl.IsUniqueViolation(err) {
+				log.Printf("db error creating session: %v", err)
+				hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "database error"})
 				return
 			}
 		}
-
 		if !created {
-			hub.SendDirect(ctx, conn, map[string]string{
-				"type":    "error",
-				"message": "code collision, try again",
-			})
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "code collision, try again"})
 			return
 		}
-	} else {
-		// Validate custom code format
-		if !externalCodeRegex.MatchString(code) {
-			hub.SendDirect(ctx, conn, map[string]string{
-				"type":    "error",
-				"message": "invalid external code format (8-128 chars, alphanumeric + hyphen + underscore)",
-			})
-			return
+		h.RegisterCode(code, apiKeyID)
+		response := map[string]any{"type": "share_registered", "code": code, "reconnected": false}
+		if ctrl != nil {
+			response["origin"] = origin
 		}
-
-		session, reclaimed, err := claimSessionCode(app, code, apiKeyID, accountID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub, msg.ShareType, msg.IsPasswordProtected)
-		if err != nil {
-			if errors.Is(err, errCodeAlreadyInUse) {
-				hub.SendDirect(ctx, conn, map[string]string{
-					"type":    "error",
-					"message": "code already in use",
-				})
-				return
-			}
-			if err.Error() == "session owned by different agent" {
-				hub.SendDirect(ctx, conn, map[string]string{
-					"type":    "error",
-					"message": "session owned by different agent",
-				})
-				return
-			}
-			log.Printf("db error checking code availability: %v", err)
-			hub.SendDirect(ctx, conn, map[string]string{
-				"type":    "error",
-				"message": "database error",
-			})
-			return
+		if exp := session.GetDateTime("expires_at"); !exp.IsZero() {
+			response["expires_at"] = exp.Time().Format(time.RFC3339)
 		}
-		if session == nil {
-			hub.SendDirect(ctx, conn, map[string]string{
-				"type":    "error",
-				"message": "failed to retrieve session",
-			})
-			return
-		}
-		reconnected = reclaimed
-	}
-
-	// Register code with hub
-	h.RegisterCode(code, apiKeyID)
-
-	// Get session for response
-	session, err := getSessionByCode(app, code)
-	if err != nil || session == nil {
-		log.Printf("db error getting session after creation: %v", err)
-		hub.SendDirect(ctx, conn, map[string]string{
-			"type":    "error",
-			"message": "failed to retrieve session",
-		})
+		hub.SendDirect(ctx, conn, response)
+		log.Printf("share registered: code=%s api_key_id=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, false)
 		return
 	}
 
-	// Send success response
-	response := map[string]any{
-		"type":        "share_registered",
-		"code":        code,
-		"reconnected": reconnected,
+	// Custom code: validate, then claim + allocate origin in one transaction.
+	if !externalCodeRegex.MatchString(msg.Code) {
+		hub.SendDirect(ctx, conn, map[string]string{
+			"type":    "error",
+			"message": "invalid external code format (8-128 chars, alphanumeric + hyphen + underscore)",
+		})
+		return
 	}
-
-	// Control-allocated origin for the direct path. Nil-safe: when no
-	// controller is configured, origin allocation is skipped and "origin" is
-	// omitted from the response.
-	if ctrl != nil {
-		var origin string
-		origin, err = ctrl.AllocateOriginFor(app, apiKeyID, session)
-		if err != nil {
-			log.Printf("origin allocation failed for code %s: %v", code, err)
-			hub.SendDirect(ctx, conn, map[string]string{
-				"type":    "error",
-				"message": "origin allocation failed",
-			})
+	session, reconnected, origin, err := claimSessionAndOrigin(app, msg.Code, apiKeyID, accountID, agentID, msg, ctrl)
+	if err != nil {
+		if errors.Is(err, errCodeAlreadyInUse) {
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "code already in use"})
 			return
 		}
+		if err.Error() == "session owned by different agent" {
+			hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "session owned by different agent"})
+			return
+		}
+		log.Printf("db error checking code availability: %v", err)
+		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "database error"})
+		return
+	}
+	if session == nil {
+		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "failed to retrieve session"})
+		return
+	}
+
+	h.RegisterCode(msg.Code, apiKeyID)
+
+	response := map[string]any{"type": "share_registered", "code": msg.Code, "reconnected": reconnected}
+	if ctrl != nil {
 		response["origin"] = origin
 	}
-
-	if expiresAt := session.GetDateTime("expires_at"); !expiresAt.IsZero() {
-		response["expires_at"] = expiresAt.Time().Format(time.RFC3339)
+	if exp := session.GetDateTime("expires_at"); !exp.IsZero() {
+		response["expires_at"] = exp.Time().Format(time.RFC3339)
 	}
-
 	hub.SendDirect(ctx, conn, response)
-	log.Printf("share registered: code=%s api_key_id=%s agent_id=%s reconnected=%v", code, apiKeyID, agentID, reconnected)
+	log.Printf("share registered: code=%s api_key_id=%s agent_id=%s reconnected=%v", msg.Code, apiKeyID, agentID, reconnected)
+}
+
+// createSessionAndOrigin creates a session and (when a controller is present)
+// allocates its control-managed origin in a single transaction.
+func createSessionAndOrigin(app core.App, code, apiKeyID, agentID string, msg agentMsg, ctrl *directctl.Controller) (*core.Record, string, error) {
+	var session *core.Record
+	var origin string
+	err := app.RunInTransaction(func(txApp core.App) error {
+		relayOnly := false
+		if msg.RelayOnly != nil {
+			relayOnly = *msg.RelayOnly
+		}
+		if err := createSession(txApp, code, apiKeyID, agentID, msg.ExpiresAt, relayOnly, msg.RelayStaticPub, "", false); err != nil {
+			return err
+		}
+		s, err := getSessionByCode(txApp, code)
+		if err != nil {
+			return err
+		}
+		if s == nil {
+			return errors.New("failed to retrieve session")
+		}
+		session = s
+		if ctrl != nil {
+			o, err := ctrl.AllocateOriginForTx(txApp, apiKeyID, session)
+			if err != nil {
+				return err
+			}
+			origin = o
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return session, origin, nil
+}
+
+// claimSessionAndOrigin claims (or creates) a custom-coded session and
+// allocates its origin in a single transaction.
+func claimSessionAndOrigin(app core.App, code, apiKeyID, accountID, agentID string, msg agentMsg, ctrl *directctl.Controller) (*core.Record, bool, string, error) {
+	var session *core.Record
+	var reconnected bool
+	var origin string
+	err := app.RunInTransaction(func(txApp core.App) error {
+		s, rec, err := claimSessionCodeTx(txApp, code, apiKeyID, accountID, agentID, msg.ExpiresAt, msg.RelayOnly, msg.RelayStaticPub, msg.ShareType, msg.IsPasswordProtected)
+		if err != nil {
+			return err
+		}
+		if s == nil {
+			return errors.New("failed to retrieve session")
+		}
+		session, reconnected = s, rec
+		if ctrl != nil {
+			o, err := ctrl.AllocateOriginForTx(txApp, apiKeyID, session)
+			if err != nil {
+				return err
+			}
+			origin = o
+		}
+		return nil
+	})
+	return session, reconnected, origin, err
 }
 
 func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app core.App, apiKeyID, code string) {
@@ -634,82 +670,72 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 	return records[0], nil
 }
 
-// claimSessionCode atomically creates or reassigns a custom code.
-func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly *bool, relayStaticPub, shareType string, isPasswordProtected bool) (*core.Record, bool, error) {
-	var claimed *core.Record
-	reconnected := false
+// claimSessionCodeTx creates or reassigns a custom code within an already-open
+// transaction (txApp). It is the transactional body of the former
+// claimSessionCode; the caller owns the transaction so origin allocation can
+// commit atomically with the claim (I7).
+func claimSessionCodeTx(txApp core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly *bool, relayStaticPub, shareType string, isPasswordProtected bool) (*core.Record, bool, error) {
+	var existing struct {
+		SessionID string `db:"session_id"`
+		AccountID string `db:"account_id"`
+		AgentID   string `db:"agent_id"`
+	}
 
-	err := app.RunInTransaction(func(txApp core.App) error {
-		var existing struct {
-			SessionID string `db:"session_id"`
-			AccountID string `db:"account_id"`
-			AgentID   string `db:"agent_id"`
-		}
+	err := txApp.DB().
+		NewQuery(`SELECT s.id AS session_id, ak.account_id, s.agent_id
+			FROM sessions s
+			JOIN api_keys ak ON ak.id = s.api_key_id
+			WHERE s.code = {:code}
+			LIMIT 1`).
+		Bind(dbx.Params{"code": code}).
+		One(&existing)
 
-		err := txApp.DB().
-			NewQuery(`SELECT s.id AS session_id, ak.account_id, s.agent_id
-				FROM sessions s
-				JOIN api_keys ak ON ak.id = s.api_key_id
-				WHERE s.code = {:code}
-				LIMIT 1`).
-			Bind(dbx.Params{"code": code}).
-			One(&existing)
-
-		if err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			createRelayOnly := false
-			if relayOnly != nil {
-				createRelayOnly = *relayOnly
-			}
-			if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, createRelayOnly, relayStaticPub, shareType, isPasswordProtected); err != nil {
-				return err
-			}
-			record, getErr := getSessionByCode(txApp, code)
-			if getErr != nil {
-				return getErr
-			}
-			claimed = record
-			return nil
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, false, err
 		}
-
-		if existing.AccountID != accountID {
-			return errCodeAlreadyInUse
-		}
-		if existing.AgentID != "" && existing.AgentID != agentID {
-			return errors.New("session owned by different agent")
-		}
-
-		record, err := txApp.FindRecordById("sessions", existing.SessionID)
-		if err != nil {
-			return err
-		}
-		record.Set("api_key_id", apiKeyID)
-		record.Set("agent_id", agentID)
+		createRelayOnly := false
 		if relayOnly != nil {
-			record.Set("relay_only", *relayOnly)
+			createRelayOnly = *relayOnly
 		}
-		record.Set("relay_static_pub", relayStaticPub)
-		record.Set("share_type", shareType)
-		record.Set("is_password_protected", isPasswordProtected)
-		record.Set("is_active", true)
-		if expiresAt != nil {
-			dt, _ := types.ParseDateTime(*expiresAt)
-			record.Set("expires_at", dt)
+		if err := createSession(txApp, code, apiKeyID, agentID, expiresAt, createRelayOnly, relayStaticPub, shareType, isPasswordProtected); err != nil {
+			return nil, false, err
 		}
-		if err := txApp.Save(record); err != nil {
-			return err
+		record, getErr := getSessionByCode(txApp, code)
+		if getErr != nil {
+			return nil, false, getErr
 		}
+		return record, false, nil
+	}
 
-		claimed = record
-		reconnected = true
-		return nil
-	})
+	if existing.AccountID != accountID {
+		return nil, false, errCodeAlreadyInUse
+	}
+	if existing.AgentID != "" && existing.AgentID != agentID {
+		return nil, false, errors.New("session owned by different agent")
+	}
+
+	record, err := txApp.FindRecordById("sessions", existing.SessionID)
 	if err != nil {
 		return nil, false, err
 	}
-	return claimed, reconnected, nil
+	record.Set("api_key_id", apiKeyID)
+	record.Set("agent_id", agentID)
+	if relayOnly != nil {
+		record.Set("relay_only", *relayOnly)
+	}
+	record.Set("relay_static_pub", relayStaticPub)
+	record.Set("share_type", shareType)
+	record.Set("is_password_protected", isPasswordProtected)
+	record.Set("is_active", true)
+	if expiresAt != nil {
+		dt, _ := types.ParseDateTime(*expiresAt)
+		record.Set("expires_at", dt)
+	}
+	if err := txApp.Save(record); err != nil {
+		return nil, false, err
+	}
+	return record, true, nil
 }
 
 // generateRandomCode generates a random 8-character code

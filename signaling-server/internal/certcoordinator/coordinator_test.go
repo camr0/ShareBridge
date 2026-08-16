@@ -12,6 +12,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -231,5 +234,54 @@ func TestCoordinatorGlobalSemaphore(t *testing.T) {
 
 	if got := atomic.LoadInt32(&maxActive); got != 1 {
 		t.Fatalf("max concurrent issues = %d, want 1", got)
+	}
+}
+
+// TestLoadOrCreateAccountKeyRejectsMalformedExistingKey verifies a malformed
+// existing key file fails with a clear error instead of being silently
+// regenerated (I9).
+func TestLoadOrCreateAccountKeyRejectsMalformedExistingKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "acct.pem")
+	if err := os.WriteFile(path, []byte("this is not a pem"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewCoordinator(CoordinatorConfig{AccountKeyPath: path})
+	if err == nil {
+		t.Fatal("expected error for malformed existing key")
+	}
+	if !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("error should mention malformed key, got %v", err)
+	}
+}
+
+// TestLoadOrCreateAccountKeyWritesAtomically verifies a generated key is
+// persisted as a single valid PEM file (no leftover temp files) and re-loads
+// identically (I9).
+func TestLoadOrCreateAccountKeyWritesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "acct.pem")
+
+	c, err := NewCoordinator(CoordinatorConfig{AccountKeyPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.acct == nil || c.acct.key == nil {
+		t.Fatal("account key not loaded")
+	}
+
+	c2, err := NewCoordinator(CoordinatorConfig{AccountKeyPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.acct.key.Equal(c2.acct.key) {
+		t.Fatal("persisted key does not match the generated key")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 file (the key) after atomic write, got %d", len(entries))
 	}
 }

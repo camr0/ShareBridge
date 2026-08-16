@@ -3,12 +3,19 @@ package directctl
 import (
 	"context"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // HandleReportEndpoint tracks the agent's public endpoint (IP + port) and
 // provisions the wildcard DNS record when the IP changes. endpoint_ip is saved
 // ONLY after DDNS succeeds, so a failed update is retried on the next report.
-func (c *Controller) HandleReportEndpoint(ctx context.Context, apiKeyID, ip string, port int, status string) {
+// conn is verified against the current epoch so a fenced socket cannot drive
+// DDNS/readiness.
+func (c *Controller) HandleReportEndpoint(ctx context.Context, conn *websocket.Conn, apiKeyID, ip string, port int, status string) {
+	if !c.isCurrentEpoch(apiKeyID, conn) {
+		return
+	}
 	// Wire invariant: status "close_failed" requires a nonzero port.
 	if status == "close_failed" && port == 0 {
 		return
@@ -41,11 +48,16 @@ func (c *Controller) HandleReportEndpoint(ctx context.Context, apiKeyID, ip stri
 	// provisioned in a prior epoch (same non-empty IP) — a replacement socket
 	// must reach readiness without re-provisioning.
 	c.epochMu.Lock()
-	if e := c.epochs[apiKeyID]; e != nil {
+	e := c.epochs[apiKeyID]
+	var shouldSend bool
+	if e != nil {
 		e.ddnsReady = true
-		c.maybeReadyLocked(e.conn, apiKeyID, e)
+		shouldSend = c.markReadyLocked(e)
 	}
 	c.epochMu.Unlock()
+	if shouldSend {
+		c.sendEnrollmentReady(apiKeyID, conn, e)
+	}
 
 	rec.Set("endpoint_ip", ip)
 	rec.Set("endpoint_port", port)

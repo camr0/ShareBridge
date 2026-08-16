@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,6 +108,47 @@ func TestRegisterAgentFencesPriorConn(t *testing.T) {
 	var ce websocket.CloseError
 	require.True(t, errors.As(err, &ce))
 	require.Equal(t, websocket.StatusPolicyViolation, ce.Code)
+}
+
+// TestRegisterAgentConcurrentInstallUnderLock exercises the I3 fix: the new
+// conn is installed under the hub lock BEFORE the old one is closed (outside
+// the lock). After a storm of concurrent same-key registers, exactly one conn
+// wins and no superseded conn leaks a write mutex.
+func TestRegisterAgentConcurrentInstallUnderLock(t *testing.T) {
+	h := New()
+	apiKey := "api-key-concurrent"
+
+	const n = 8
+	type pair struct{ client, server *websocket.Conn }
+	pairs := make([]pair, n)
+	for i := range pairs {
+		c, s := newTestWebSocketPair(t)
+		pairs[i] = pair{client: c, server: s}
+		defer c.CloseNow()
+		defer s.CloseNow()
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			h.RegisterAgent(apiKey, pairs[i].server)
+		}(i)
+	}
+	wg.Wait()
+
+	h.mu.RLock()
+	winner := h.agents[apiKey]
+	nWrites := len(h.connWrites)
+	h.mu.RUnlock()
+
+	if winner == nil {
+		t.Fatal("no agent registered after concurrent registers")
+	}
+	if nWrites != 1 {
+		t.Fatalf("connWrites has %d entries, want exactly 1 (only the winning conn)", nWrites)
+	}
 }
 
 func TestRegisterCodeAndGetAgentConn(t *testing.T) {

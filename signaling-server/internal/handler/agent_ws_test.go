@@ -939,3 +939,35 @@ func TestAgentWS_AuthOK_RelayPrepareIncludesSessionCode(t *testing.T) {
 	assert.NotEmpty(t, relayPrepare["sid"])
 	assert.NotEmpty(t, relayPrepare["relay_jwt"])
 }
+
+// TestAgentWSRejectsEmptyHelloAndPreHelloDirectControl verifies C2(b) (empty
+// agent_id hello is rejected and does not enroll) and I2 (direct-control
+// messages require a successful hello first).
+func TestAgentWSRejectsEmptyHelloAndPreHelloDirectControl(t *testing.T) {
+	app, serverURL, cleanup := setupAgentWSWithController(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, app)
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverURL, "http")+"/ws/agent?api_key="+apiKey, nil)
+	require.NoError(t, err)
+	defer conn.CloseNow()
+
+	// Direct-control before hello must be rejected.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"csr_submit","csr_pem":"dummy"}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "hello required before csr_submit")
+
+	// Empty agent_id hello must be rejected and NOT enroll the agent.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":""}`)))
+	_, raw, err = conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "agent_id required")
+
+	// Still not enrolled: a subsequent direct-control message is still gated.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"report_endpoint","ip":"1.2.3.4","port":0}`)))
+	_, raw, err = conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "hello required before report_endpoint")
+}

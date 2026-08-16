@@ -21,14 +21,14 @@ func TestReportEndpointRetriesFailedDDNS(t *testing.T) {
 		}
 		return "", nil
 	}
-	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "1.2.3.4", 0, "")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, "1.2.3.4", 0, "")
 	rec, _, _ := LoadOrCreateAgent(app, apiKeyID)
 	if rec.GetString("endpoint_ip") == "1.2.3.4" {
 		t.Fatalf("endpoint_ip must not be saved before DDNS succeeds")
 	}
 
 	fail = false
-	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "1.2.3.4", 0, "")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, "1.2.3.4", 0, "")
 	rec, _, _ = LoadOrCreateAgent(app, apiKeyID)
 	if rec.GetString("endpoint_ip") != "1.2.3.4" {
 		t.Fatalf("endpoint_ip saved after DDNS success")
@@ -47,7 +47,7 @@ func TestReportEndpointRejectsBadStatus(t *testing.T) {
 	}
 
 	// status "close_failed" with port 0 is invalid → ignored (no DDNS, no save).
-	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "1.2.3.4", 0, "close_failed")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, "1.2.3.4", 0, "close_failed")
 	if called {
 		t.Fatalf("ddns must not run for invalid close_failed + port 0")
 	}
@@ -57,7 +57,7 @@ func TestReportEndpointRejectsBadStatus(t *testing.T) {
 	}
 
 	// Unknown status → also rejected (no DDNS, no save).
-	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "1.2.3.4", 9000, "bogus")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, "1.2.3.4", 9000, "bogus")
 	if called {
 		t.Fatalf("ddns must not run for unknown status")
 	}
@@ -78,7 +78,7 @@ func TestReportEndpointEmptyIPNoop(t *testing.T) {
 		return "", nil
 	}
 
-	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "", 0, "")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, "", 0, "")
 
 	if called {
 		t.Fatalf("ddns must not run for empty IP")
@@ -98,14 +98,14 @@ func TestReportEndpointSameIPSkipsDDNS(t *testing.T) {
 	ctrl.HandleHello(context.Background(), nil, apiKeyID, "acct-1", "agent-1")
 
 	ctrl.ddnsFn = func(ctx context.Context, name, ip string, ttl int) (string, error) { return "", nil }
-	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "1.2.3.4", 0, "")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, "1.2.3.4", 0, "")
 
 	calls := 0
 	ctrl.ddnsFn = func(ctx context.Context, name, ip string, ttl int) (string, error) {
 		calls++
 		return "", errors.New("should not be re-provisioned")
 	}
-	ctrl.HandleReportEndpoint(context.Background(), apiKeyID, "1.2.3.4", 0, "")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, "1.2.3.4", 0, "")
 	if calls != 0 {
 		t.Fatalf("ddns must not be re-provisioned for unchanged IP")
 	}

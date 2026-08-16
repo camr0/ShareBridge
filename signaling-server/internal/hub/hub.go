@@ -40,17 +40,24 @@ func New() *Hub {
 
 // RegisterAgent stores conn for apiKey, closing any prior conn for that key
 // (fencing the old reader) so a stale disconnect cannot unregister the new one.
+// The new conn is installed UNDER the lock before the old one is closed (which
+// happens outside the lock), closing the unlock/re-lock TOCTOU window where a
+// concurrent same-key register could be overwritten.
 func (h *Hub) RegisterAgent(apiKey string, conn *websocket.Conn) {
 	h.mu.Lock()
-	if old, ok := h.agents[apiKey]; ok && old != conn {
-		h.mu.Unlock()
-		old.Close(websocket.StatusPolicyViolation, "superseded")
-		h.mu.Lock()
-		delete(h.connWrites, old)
-	}
+	old := h.agents[apiKey]
 	h.agents[apiKey] = conn
 	h.ensureWriteMuLocked(conn)
+	if old != nil && old != conn {
+		// Compare-and-delete: only remove the write mutex for the conn we just
+		// replaced (still the previous value as of this lock hold).
+		delete(h.connWrites, old)
+	}
 	h.mu.Unlock()
+
+	if old != nil && old != conn {
+		old.Close(websocket.StatusPolicyViolation, "superseded")
+	}
 }
 
 // UnregisterAgent removes the mapping only if conn is still the registered one.

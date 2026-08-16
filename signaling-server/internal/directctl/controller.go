@@ -133,6 +133,16 @@ func (c *Controller) epochReady(apiKeyID string) bool {
 	return e != nil && e.ready
 }
 
+// isCurrentEpoch reports whether conn is the connection that owns the current
+// epoch for apiKeyID. A fenced (superseded) socket must not drive any
+// epoch-sensitive state transition (CSR issuance, TLS ready, DDNS, open_ack).
+func (c *Controller) isCurrentEpoch(apiKeyID string, conn *websocket.Conn) bool {
+	c.epochMu.Lock()
+	defer c.epochMu.Unlock()
+	e := c.epochs[apiKeyID]
+	return e != nil && e.conn == conn
+}
+
 // AgentDisconnected drops the epoch for apiKeyID only if conn is still the
 // connection that owns it (a stale old-socket disconnect must not disrupt a
 // replacement socket). It also drops that epoch's waiters WITHOUT closing

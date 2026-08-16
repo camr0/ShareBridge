@@ -150,3 +150,66 @@ func TestGetSessionInfoFiltersInactive(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
+
+// setupAgentWSWithControllerAndHub is setupAgentWSWithController but also
+// returns the hub so tests can assert hub state (e.g. no orphaned code entry).
+func setupAgentWSWithControllerAndHub(t *testing.T) (core.App, string, *hub.Hub, func()) {
+	t.Helper()
+
+	app, appCleanup := setupAgentTestApp(t)
+	h := hub.New()
+	cfg := config.Load()
+	reg := relay.NewRegistry(2 * time.Second)
+	ctrl := directctl.NewController(app, h, nil, nil, directctl.Config{BaseDomain: "example.com"})
+
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, reg, cfg, ctrl)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+
+	server := httptest.NewServer(mux)
+	cleanup := func() {
+		server.Close()
+		appCleanup()
+	}
+	return app, server.URL, h, cleanup
+}
+
+// TestRegisterShareOriginAllocationFailureRollsBack verifies I7: when origin
+// allocation fails, the session created in the same transaction is rolled back
+// AND the hub is never told about the code (no orphaned active session + hub
+// entry).
+func TestRegisterShareOriginAllocationFailureRollsBack(t *testing.T) {
+	app, serverURL, h, cleanup := setupAgentWSWithControllerAndHub(t)
+	defer cleanup()
+
+	// Force origin-label collisions: every allocation tries the same label, so
+	// the second registration exhausts its retries and fails.
+	directctl.SetGenerateOriginLabel(func() string { return "000000000000" })
+	t.Cleanup(func() { directctl.SetGenerateOriginLabel(nil) })
+
+	apiKey := createTestAgentAPIKey(t, app)
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-rollback")
+	defer conn.CloseNow()
+	ctx := context.Background()
+
+	// First registration allocates the fixed label successfully.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ROLLBACKOK1"}`)))
+	_, _, err := conn.Read(ctx)
+	require.NoError(t, err)
+
+	// Second registration collides on the fixed label → allocation fails → the
+	// session must be rolled back and no hub entry created.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ROLLBACKFAIL"}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"error"`)
+
+	records, err := app.FindRecordsByFilter("sessions", "code = {:code}", "", 1, 0, map[string]any{"code": "ROLLBACKFAIL"})
+	require.NoError(t, err)
+	require.Len(t, records, 0, "session must be rolled back on origin allocation failure")
+
+	if _, ok := h.GetAgentConn("ROLLBACKFAIL"); ok {
+		t.Fatalf("hub must not have a code entry for the rolled-back session")
+	}
+}

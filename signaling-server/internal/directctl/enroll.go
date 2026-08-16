@@ -2,6 +2,7 @@ package directctl
 
 import (
 	"context"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -25,6 +26,9 @@ func (c *Controller) HandleHello(ctx context.Context, conn *websocket.Conn, apiK
 // HandleCSRSubmit issues a certificate for the agent's namespace and returns
 // the chain as cert_issue.
 func (c *Controller) HandleCSRSubmit(ctx context.Context, conn *websocket.Conn, apiKeyID, csrPEM string) {
+	if !c.isCurrentEpoch(apiKeyID, conn) {
+		return
+	}
 	rec, _, err := LoadOrCreateAgent(c.app, apiKeyID)
 	if err != nil {
 		c.sendFn(ctx, conn, map[string]string{"type": "cert_error", "reason": "lookup failed"})
@@ -47,16 +51,32 @@ func (c *Controller) HandleCSRSubmit(ctx context.Context, conn *websocket.Conn, 
 // HandleTLSReady records a successfully installed leaf certificate. It only
 // advances readiness for the CURRENT connection epoch; a stale TLS report from
 // an old socket is ignored. notAfter is derived from OUR cached chain, never
-// the agent's string.
+// the agent's string. When the in-memory leaf index is empty (control restart
+// or API-key rotation) the persisted agents.cert_fingerprint + cert_expires_at
+// row authorizes the report instead.
 func (c *Controller) HandleTLSReady(ctx context.Context, conn *websocket.Conn, apiKeyID, fingerprint, notAfter string) {
-	chain, na, ok := c.coord.ChainByLeaf(apiKeyID, fingerprint)
-	if !ok {
-		c.sendFn(ctx, conn, map[string]string{"type": "cert_error", "reason": "unknown fingerprint"})
+	if !c.isCurrentEpoch(apiKeyID, conn) {
 		return
 	}
 	rec, _, err := LoadOrCreateAgent(c.app, apiKeyID)
 	if err != nil {
 		return
+	}
+	chain, na, ok := c.coord.ChainByLeaf(apiKeyID, fingerprint)
+	if !ok {
+		// Fall back to the persisted cert row: the agent record survives a
+		// control restart and API-key rotation, so a valid installed cert is
+		// still authoritative when the in-memory index is empty.
+		persistedFP := rec.GetString("cert_fingerprint")
+		persistedExp := rec.GetDateTime("cert_expires_at")
+		if fingerprint == "" || fingerprint != persistedFP || persistedExp.IsZero() || !persistedExp.Time().After(time.Now()) {
+			c.sendFn(ctx, conn, map[string]string{"type": "cert_error", "reason": "unknown fingerprint"})
+			return
+		}
+		na = persistedExp.Time()
+		// Re-seed the leaf index so this fingerprint is accepted for the rest
+		// of the epoch without further fallback.
+		c.coord.SeedLeaf(apiKeyID, fingerprint, nil, na)
 	}
 	if err := SaveCertReady(c.app, rec, fingerprint, na); err != nil {
 		c.sendFn(ctx, conn, map[string]string{"type": "cert_error", "reason": "persist failed"})
@@ -71,11 +91,15 @@ func (c *Controller) HandleTLSReady(ctx context.Context, conn *websocket.Conn, a
 
 	c.epochMu.Lock()
 	e := c.epochs[apiKeyID]
+	var shouldSend bool
 	if e != nil && e.conn == conn {
 		e.tlsReady = true
-		c.maybeReadyLocked(conn, apiKeyID, e)
+		shouldSend = c.markReadyLocked(e)
 	}
 	c.epochMu.Unlock()
+	if shouldSend {
+		c.sendEnrollmentReady(apiKeyID, conn, e)
+	}
 }
 
 // HandleTLSError is a no-op beyond logging at this layer; the agent retries
@@ -84,11 +108,28 @@ func (c *Controller) HandleTLSError(ctx context.Context, apiKeyID, reason string
 	// No-op beyond logging at this layer; the agent retries with backoff.
 }
 
-// maybeReadyLocked emits enrollment_ready once both TLS and DDNS succeeded in
-// the CURRENT epoch. Caller holds epochMu.
-func (c *Controller) maybeReadyLocked(conn *websocket.Conn, apiKeyID string, e *epochState) {
+// markReadyLocked flips e.ready to true when both TLS and DDNS succeeded and
+// returns whether the epoch JUST became ready. Caller holds epochMu. The
+// enrollment_ready message must be sent AFTER releasing epochMu (see
+// sendEnrollmentReady); sending under the lock would hold it across a
+// WebSocket write.
+func (c *Controller) markReadyLocked(e *epochState) bool {
 	if e.tlsReady && e.ddnsReady && !e.ready {
 		e.ready = true
-		c.sendFn(context.Background(), conn, map[string]string{"type": "enrollment_ready"})
+		return true
+	}
+	return false
+}
+
+// sendEnrollmentReady sends the enrollment_ready message outside epochMu. On a
+// send failure it clears readiness only if the SAME epoch still owns the conn
+// (a newer epoch must not have its readiness clobbered by a stale failure).
+func (c *Controller) sendEnrollmentReady(apiKeyID string, conn *websocket.Conn, e *epochState) {
+	if err := c.sendFn(context.Background(), conn, map[string]string{"type": "enrollment_ready"}); err != nil {
+		c.epochMu.Lock()
+		if cur := c.epochs[apiKeyID]; cur == e && cur.conn == conn {
+			cur.ready = false
+		}
+		c.epochMu.Unlock()
 	}
 }

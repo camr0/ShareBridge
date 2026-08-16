@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // NOTE: `OpenAck` and `openWaiter` are ALREADY defined in controller.go (Task 10,
@@ -64,8 +66,12 @@ func (c *Controller) EmitOpen(ctx context.Context, apiKeyID, shareID, origin str
 // accepted when the FULL tuple (apiKeyID + nonce + share_id + seq) matches the
 // waiter; any mismatch discards the ack without completing the waiter. On a
 // match the waiter is removed from the map (deferred cleanup in EmitOpen makes
-// a late ack after timeout a no-op).
-func (c *Controller) HandleOpenAck(apiKeyID string, ack OpenAck) {
+// a late ack after timeout a no-op). conn must be the current epoch connection,
+// so a fenced socket cannot complete an open-signal waiter.
+func (c *Controller) HandleOpenAck(conn *websocket.Conn, apiKeyID string, ack OpenAck) {
+	if !c.isCurrentEpoch(apiKeyID, conn) {
+		return
+	}
 	c.waiterMu.Lock()
 	w, ok := c.waiters[ack.Nonce]
 	if ok && (w.apiKeyID != apiKeyID || w.shareID != ack.ShareID || w.seq != ack.Seq) {

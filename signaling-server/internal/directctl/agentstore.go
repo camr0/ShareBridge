@@ -52,13 +52,25 @@ func LoadOrCreateAgent(app core.App, apiKeyID string) (*core.Record, bool, error
 	return nil, false, fmt.Errorf("agent create failed after retries")
 }
 
-// generateOriginLabel returns a fresh 48-bit random origin label as a
-// lowercase-hex string (12 chars). It is a package-level variable so tests can
-// stub it to force the unique-constraint collision path in AllocateOrigin.
-var generateOriginLabel = func() string {
+var defaultOriginLabel = func() string {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// generateOriginLabel returns a fresh 48-bit random origin label as a
+// lowercase-hex string (12 chars). It is a package-level variable so tests can
+// stub it to force the unique-constraint collision path in AllocateOrigin.
+var generateOriginLabel = defaultOriginLabel
+
+// SetGenerateOriginLabel overrides the origin-label generator (test-only). A
+// nil fn restores the default random generator.
+func SetGenerateOriginLabel(fn func() string) {
+	if fn == nil {
+		generateOriginLabel = defaultOriginLabel
+		return
+	}
+	generateOriginLabel = fn
 }
 
 // SaveCertReady marks an agent record as having a successfully installed
@@ -76,37 +88,71 @@ func SaveCertReady(app core.App, rec *core.Record, fingerprint string, notAfter 
 func AllocateOrigin(app core.App, namespace, baseDomain string, session *core.Record) (string, error) {
 	var origin string
 	err := app.RunInTransaction(func(txApp core.App) error {
-		for i := 0; i < 8; i++ {
-			candidate := generateOriginLabel() + "." + namespace + "." + baseDomain
-			session.Set("origin", candidate)
-			session.Set("is_active", true)
-			if err := txApp.Save(session); err != nil {
-				if isUniqueViolation(err) {
-					continue // collision -> retry with a new label
-				}
-				return err // real validation/DB error - do not mask it
-			}
-			origin = candidate
-			return nil
+		o, err := allocateOriginTx(txApp, namespace, baseDomain, session)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("could not allocate a free origin")
+		origin = o
+		return nil
 	})
 	return origin, err
+}
+
+// allocateOriginTx allocates a free origin within an already-open transaction.
+func allocateOriginTx(txApp core.App, namespace, baseDomain string, session *core.Record) (string, error) {
+	for i := 0; i < 8; i++ {
+		candidate := generateOriginLabel() + "." + namespace + "." + baseDomain
+		session.Set("origin", candidate)
+		session.Set("is_active", true)
+		if err := txApp.Save(session); err != nil {
+			if isUniqueViolation(err) {
+				continue // collision -> retry with a new label
+			}
+			return "", err // real validation/DB error - do not mask it
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("could not allocate a free origin")
 }
 
 // AllocateOriginFor returns the session's already-allocated origin (re-activating
 // the session), or allocates a fresh control-managed origin via the agent's
 // namespace. The origin is never agent-supplied.
 func (c *Controller) AllocateOriginFor(app core.App, apiKeyID string, session *core.Record) (string, error) {
+	var origin string
+	err := app.RunInTransaction(func(txApp core.App) error {
+		o, err := c.AllocateOriginForTx(txApp, apiKeyID, session)
+		if err != nil {
+			return err
+		}
+		origin = o
+		return nil
+	})
+	return origin, err
+}
+
+// AllocateOriginForTx is AllocateOriginFor but runs inside an already-open
+// transaction (txApp), so session creation/claim and origin allocation commit
+// atomically (I7).
+func (c *Controller) AllocateOriginForTx(txApp core.App, apiKeyID string, session *core.Record) (string, error) {
 	if origin := session.GetString("origin"); origin != "" {
 		session.Set("is_active", true)
-		return origin, app.Save(session)
+		if err := txApp.Save(session); err != nil {
+			return "", err
+		}
+		return origin, nil
 	}
-	rec, _, err := LoadOrCreateAgent(app, apiKeyID)
+	rec, _, err := LoadOrCreateAgent(txApp, apiKeyID)
 	if err != nil {
 		return "", err
 	}
-	return AllocateOrigin(app, rec.GetString("namespace"), c.cfg.BaseDomain, session)
+	return allocateOriginTx(txApp, rec.GetString("namespace"), c.cfg.BaseDomain, session)
+}
+
+// IsUniqueViolation reports whether err is a SQLite UNIQUE constraint failure
+// (exported for the handler package's collision-retry path).
+func IsUniqueViolation(err error) bool {
+	return isUniqueViolation(err)
 }
 
 // isUniqueViolation reports whether err is a SQLite UNIQUE constraint failure.

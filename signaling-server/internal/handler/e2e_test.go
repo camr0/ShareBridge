@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -14,11 +15,13 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,17 +80,17 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	// Loopback TLS probe server: echoes the nonce back verbatim, exactly what
-	// directctl.Probe asserts (status 200 + body == nonce).
-	probe := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, r.URL.Query().Get("nonce"))
-	}))
-	probe.StartTLS()
-	defer probe.Close()
-	probeURL, err := url.Parse(probe.URL)
-	require.NoError(t, err)
-	probePort := mustE2EAtoi(t, probeURL.Port())
+	// In-process replica of the agent's direct data plane: SNI admission
+	// (unknown SNI fails the handshake), Host authorization, a nonce-echo
+	// probe, and a synthetic download. The agent module's real
+	// Binder/DirectServer/cert.Manager/OnDemandPort cannot be imported across
+	// the module boundary (Go internal-package rule), so this replica mirrors
+	// their admission semantics; the agent module additionally has an
+	// in-module test (TestDirectServerSharesDaemonBinder) that fails on the
+	// split-Binder regression directly.
+	as := startDirectAdmissionServer(t)
+	defer as.Close()
+	asPort := as.Port()
 
 	// Agent identity + API key, then dial the real agent WS.
 	user, err := createTestUser(app, "e2e-agent@example.com")
@@ -131,7 +134,7 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	require.NoError(t, conn.Write(context.Background(), websocket.MessageText,
 		[]byte(fmt.Sprintf(`{"type":"tls_ready","fingerprint":%q}`, leafFP))))
 	require.NoError(t, conn.Write(context.Background(), websocket.MessageText,
-		[]byte(fmt.Sprintf(`{"type":"report_endpoint","ip":"127.0.0.1","port":%d,"status":""}`, probePort))))
+		[]byte(fmt.Sprintf(`{"type":"report_endpoint","ip":"127.0.0.1","port":%d,"status":""}`, asPort))))
 	require.Contains(t, string(readE2E(t, conn)), `"type":"enrollment_ready"`)
 
 	// 4. register_share → share_registered {origin}.
@@ -147,6 +150,7 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	require.Equal(t, "share_registered", shareReg.Type)
 	require.Equal(t, code, shareReg.Code)
 	require.NotEmpty(t, shareReg.Origin)
+	as.SetOrigin(shareReg.Origin)
 
 	// 5. GET /s/<code> blocks on open_ack; drive it from a goroutine. The
 	//    default http.Get would follow the 302 to the loopback server, so use a
@@ -179,7 +183,7 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	require.NotZero(t, openSignal.Seq)
 
 	ack := fmt.Sprintf(`{"type":"open_ack","share_id":%q,"nonce":%q,"seq":%d,"granted_port":%d,"public_ip":"127.0.0.1","status":"ok"}`,
-		openSignal.ShareID, openSignal.Nonce, openSignal.Seq, probePort)
+		openSignal.ShareID, openSignal.Nonce, openSignal.Seq, asPort)
 	require.NoError(t, conn.Write(context.Background(), websocket.MessageText, []byte(ack)))
 
 	// Control probes the loopback nonce echo and 302s to the direct origin.
@@ -194,6 +198,47 @@ func TestEndToEndDirectFlow(t *testing.T) {
 		require.Contains(t, loc, "/s/"+code)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for redirect response")
+	}
+
+	// Follow the redirect through REAL SNI/Host admission and download the
+	// synthetic content (I8). The Location points at https://<origin>:<port>/s/<code>;
+	// we dial the in-process admission server directly and present SNI + Host =
+	// origin, exactly like a browser would after DNS resolution.
+	downloadTransport := &http.Transport{
+		TLSClientConfig:    &tls.Config{ServerName: shareReg.Origin, InsecureSkipVerify: true},
+		ForceAttemptHTTP2:  false,
+		DisableCompression: true,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, "127.0.0.1:"+strconv.Itoa(as.Port()))
+		},
+	}
+	dlClient := &http.Client{Transport: downloadTransport}
+	dlReq, err := http.NewRequest(http.MethodGet, "https://"+shareReg.Origin+"/s/"+code+"/download", nil)
+	require.NoError(t, err)
+	dlReq.Host = shareReg.Origin
+	dlResp, err := dlClient.Do(dlReq)
+	require.NoError(t, err)
+	defer dlResp.Body.Close()
+	require.Equal(t, http.StatusOK, dlResp.StatusCode)
+	body, err := io.ReadAll(dlResp.Body)
+	require.NoError(t, err)
+	require.Equal(t, e2eDownloadBody, string(body))
+
+	// A wrong SNI must fail the TLS handshake (unknown origin), proving the
+	// admission is real rather than a permissive echo server.
+	badTransport := &http.Transport{
+		TLSClientConfig:   &tls.Config{ServerName: "wrong." + shareReg.Origin, InsecureSkipVerify: true},
+		ForceAttemptHTTP2: false,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, "127.0.0.1:"+strconv.Itoa(as.Port()))
+		},
+	}
+	badClient := &http.Client{Transport: badTransport}
+	badReq, err := http.NewRequest(http.MethodGet, "https://"+shareReg.Origin+"/s/"+code+"/download", nil)
+	require.NoError(t, err)
+	badReq.Host = shareReg.Origin
+	if _, err := badClient.Do(badReq); err == nil {
+		t.Fatal("unknown SNI must fail the TLS handshake")
 	}
 }
 
@@ -253,4 +298,109 @@ func mustE2EAtoi(t *testing.T, s string) int {
 	n, err := strconv.Atoi(s)
 	require.NoError(t, err)
 	return n
+}
+
+const e2eDownloadBody = "SHAREBRIDGE-SYNTHETIC-DOWNLOAD-CONTENT"
+
+// directAdmissionServer is a faithful in-process replica of the agent's direct
+// data plane: SNI admission (unknown SNI fails the handshake), Host
+// authorization, share-code path checks, a nonce-echo probe, and a synthetic
+// download. The origin is set after register_share; until then every request
+// is rejected.
+type directAdmissionServer struct {
+	mu     sync.Mutex
+	origin string
+	port   int
+	cert   tls.Certificate
+	srv    *httptest.Server
+}
+
+func (s *directAdmissionServer) SetOrigin(origin string) {
+	s.mu.Lock()
+	s.origin = origin
+	s.mu.Unlock()
+}
+
+func (s *directAdmissionServer) originNow() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.origin
+}
+
+func (s *directAdmissionServer) Port() int { return s.port }
+
+func (s *directAdmissionServer) Close() { s.srv.Close() }
+
+func startDirectAdmissionServer(t *testing.T) *directAdmissionServer {
+	t.Helper()
+	s := &directAdmissionServer{cert: mustE2ESelfSigned(t)}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := s.originNow()
+		if origin == "" || !strings.EqualFold(r.Host, origin) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		code, ok := e2eShareCode(r.URL.Path)
+		if !ok || code == "" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/s/"+code)
+		switch {
+		case rest == "/probe" || strings.HasPrefix(rest, "/probe?"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, r.URL.Query().Get("nonce"))
+		case rest == "" || rest == "/":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "synthetic page")
+		case rest == "/download":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, e2eDownloadBody)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	})
+
+	ts := httptest.NewUnstartedServer(handler)
+	ts.TLS = &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			origin := s.originNow()
+			if origin == "" || hello.ServerName != origin {
+				return nil, fmt.Errorf("unknown origin %q", hello.ServerName)
+			}
+			return &tls.Config{Certificates: []tls.Certificate{s.cert}}, nil
+		},
+	}
+	ts.StartTLS()
+	s.srv = ts
+
+	u, err := url.Parse(ts.URL)
+	require.NoError(t, err)
+	s.port = mustE2EAtoi(t, u.Port())
+	return s
+}
+
+func mustE2ESelfSigned(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// e2eShareCode extracts a native share code from a /s/<code> path.
+func e2eShareCode(path string) (string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) >= 2 && parts[0] == "s" && parts[1] != "" {
+		return parts[1], true
+	}
+	return "", false
 }

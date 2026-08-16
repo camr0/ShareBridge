@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -143,6 +144,24 @@ func (c *Coordinator) ChainByLeaf(apiKeyID, leafFP string) ([]byte, time.Time, b
 	return append([]byte(nil), ch.chain...), ch.notAfter, true
 }
 
+// SeedLeaf re-seeds the in-memory leaf index from persisted state. After a
+// control restart or API-key rotation the in-memory index is empty while the
+// agent record still holds the installed cert fingerprint + expiry, so a
+// tls_ready carrying that fingerprint must still be accepted without re-issuing.
+// chain may be nil when the original chain bytes are not available (restart);
+// notAfter is the persisted expiry.
+func (c *Coordinator) SeedLeaf(apiKeyID, leafFP string, chain []byte, notAfter time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if chain == nil {
+		chain = []byte{}
+	}
+	c.leafIdx[apiKeyID+":"+leafFP] = cachedChain{chain: chain, notAfter: notAfter}
+	if _, ok := c.latest[apiKeyID]; !ok {
+		c.latest[apiKeyID] = leafFP
+	}
+}
+
 // LatestChain returns the most recently issued chain for an agent (for
 // re-delivery when the agent reports an older, still-valid fingerprint).
 func (c *Coordinator) LatestChain(apiKeyID string) ([]byte, string, time.Time, bool) {
@@ -170,13 +189,24 @@ func (c *Coordinator) loadOrCreateAccountKey() (*ecdsa.PrivateKey, error) {
 	if c.cfg.AccountKeyPath == "" {
 		return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	}
-	if b, err := os.ReadFile(c.cfg.AccountKeyPath); err == nil {
-		if block, _ := pem.Decode(b); block != nil && block.Type == "EC PRIVATE KEY" {
-			if k, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
-				return k, nil
-			}
+	b, err := os.ReadFile(c.cfg.AccountKeyPath)
+	switch {
+	case err == nil:
+		block, _ := pem.Decode(b)
+		if block == nil || block.Type != "EC PRIVATE KEY" {
+			return nil, fmt.Errorf("ACME account key %s is malformed (not an EC PRIVATE KEY PEM block); refusing to silently regenerate — delete the file to recover", c.cfg.AccountKeyPath)
 		}
+		k, err := x509.ParseECPrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("ACME account key %s is malformed (%v); refusing to silently regenerate — delete the file to recover", c.cfg.AccountKeyPath, err)
+		}
+		return k, nil
+	case errors.Is(err, os.ErrNotExist):
+		// fall through to generate
+	default:
+		return nil, fmt.Errorf("read ACME account key %s: %w", c.cfg.AccountKeyPath, err)
 	}
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -188,10 +218,37 @@ func (c *Coordinator) loadOrCreateAccountKey() (*ecdsa.PrivateKey, error) {
 	if err := os.MkdirAll(filepath.Dir(c.cfg.AccountKeyPath), 0700); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(c.cfg.AccountKeyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0600); err != nil {
+	if err := writeFileAtomic(c.cfg.AccountKeyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0600); err != nil {
 		return nil, err
 	}
 	return key, nil
+}
+
+// writeFileAtomic writes data to a temp file in the same directory, fsyncs it,
+// and renames it over target so a crash cannot leave a truncated/partial key.
+func writeFileAtomic(target string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".acct-key-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, target)
 }
 
 func fingerprint(csrPEM []byte) string {
