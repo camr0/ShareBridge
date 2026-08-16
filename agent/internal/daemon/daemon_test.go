@@ -263,11 +263,23 @@ func (m *mockSignalingClient) SubmitCSR(ctx context.Context, csrPEM string) erro
 }
 
 func (m *mockSignalingClient) OpenAck(ctx context.Context, ack signaling.OpenAck) error {
-	return m.Send(ctx, map[string]any{
+	msg := map[string]any{
 		"type": "open_ack", "share_id": ack.ShareID, "nonce": ack.Nonce, "seq": ack.Seq,
 		"granted_port": ack.GrantedPort, "public_ip": ack.PublicIP,
 		"was_already_open": ack.WasAlreadyOpen, "status": ack.Status,
-	})
+	}
+	if ack.Error != "" {
+		msg["error"] = ack.Error
+	}
+	return m.Send(ctx, msg)
+}
+
+func (m *mockSignalingClient) ReportEndpoint(ctx context.Context, ip string, port int, status string) error {
+	msg := map[string]any{"type": "report_endpoint", "ip": ip, "port": port}
+	if status != "" {
+		msg["status"] = status
+	}
+	return m.Send(ctx, msg)
 }
 
 func (m *mockSignalingClient) TLSReady(ctx context.Context, fingerprint, notAfter string) error {

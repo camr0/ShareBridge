@@ -17,6 +17,7 @@ import (
 	"sharebridge/agent/internal/cert"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/direct"
+	"sharebridge/agent/internal/signaling"
 )
 
 const (
@@ -236,5 +237,162 @@ func TestRenewalSchedulerGeneratesAndSubmitsCSR(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("csr_submit did not carry a CSR body: %#v", sig.messagesSnapshot())
+	}
+}
+
+// fakeDirectMapper implements direct.PortMapper without any network, so the
+// daemon's open-signal handler can drive a real OnDemandPort in-process.
+type fakeDirectMapper struct {
+	ip    string
+	added []int
+}
+
+func (f *fakeDirectMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
+	f.added = append(f.added, ext)
+	return ext, nil
+}
+
+func (f *fakeDirectMapper) DeletePortMapping(ext int) error { return nil }
+
+func (f *fakeDirectMapper) ExternalIP() (string, error) { return f.ip, nil }
+
+func (f *fakeDirectMapper) InternalIP() string { return "192.168.1.20" }
+
+func (f *fakeDirectMapper) ListPortMappings() ([]direct.PortMapping, error) { return nil, nil }
+
+// newOpenSignalTestDaemon builds a Daemon whose direct state is ready and fully
+// wired (real SignalGate + real OnDemandPort over a fake mapper) but whose
+// signaling client is the in-memory mock, so handleOpenSignal can be exercised
+// end-to-end without a router or WebSocket.
+func newOpenSignalTestDaemon(t *testing.T, authz func(string, direct.RouteKind) bool) (*Daemon, *fakeDirectMapper, *mockSignalingClient) {
+	t.Helper()
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	mapper := &fakeDirectMapper{ip: "203.0.113.7"}
+	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	d := &Daemon{
+		store:     st,
+		signaling: sig,
+		direct: &directState{
+			ready:  true,
+			gate:   direct.NewSignalGate(st.GetAgentID(), authz),
+			port:   port,
+			mapper: mapper,
+		},
+	}
+	return d, mapper, sig
+}
+
+func openSignalMessage() signaling.Message {
+	return signaling.Message{
+		Type:         "open_signal",
+		Version:      1,
+		ShareID:      "SHARE123",
+		Nonce:        "nonce-123",
+		Seq:          1,
+		ExpiresAt:    time.Now().Add(time.Minute).Format(time.RFC3339),
+		LeaseSeconds: 30,
+	}
+}
+
+// TestHandleOpenSignalAdmitsOpensAcks drives the full happy path: an admitted
+// open_signal opens the on-demand port (AddPortMapping) and is acked with the
+// echoed nonce + seq, the granted port, a fresh public IP, and status ok.
+func TestHandleOpenSignalAdmitsOpensAcks(t *testing.T) {
+	d, mapper, sig := newOpenSignalTestDaemon(t, func(string, direct.RouteKind) bool { return true })
+
+	d.handleOpenSignal(openSignalMessage())
+
+	if len(mapper.added) == 0 {
+		t.Fatalf("OpenFor was not called: no AddPortMapping recorded")
+	}
+	if !sig.hasSentMessage("open_ack", map[string]any{
+		"share_id":         "SHARE123",
+		"nonce":            "nonce-123",
+		"seq":              uint64(1),
+		"granted_port":     443,
+		"public_ip":        "203.0.113.7",
+		"was_already_open": false,
+		"status":           "ok",
+	}) {
+		t.Fatalf("expected ok open_ack, got %#v", sig.messagesSnapshot())
+	}
+}
+
+// TestHandleOpenSignalRejectsUnauthorized asserts a gate rejection yields an
+// open_ack with status error (and no port is opened).
+func TestHandleOpenSignalRejectsUnauthorized(t *testing.T) {
+	d, mapper, sig := newOpenSignalTestDaemon(t, func(string, direct.RouteKind) bool { return false })
+
+	d.handleOpenSignal(openSignalMessage())
+
+	if len(mapper.added) != 0 {
+		t.Fatalf("OpenFor must not run on rejection, but AddPortMapping recorded %v", mapper.added)
+	}
+	if !sig.hasSentMessage("open_ack", map[string]any{
+		"status": "error",
+		"error":  "rejected",
+	}) {
+		t.Fatalf("expected rejected open_ack, got %#v", sig.messagesSnapshot())
+	}
+}
+
+// TestLearnAndReportPublicIPReportsClosedEndpoint asserts the initial
+// report_endpoint {ip, 0} is sent once the public IP is learned, unblocking
+// the control's DDNS → enrollment_ready step.
+func TestLearnAndReportPublicIPReportsClosedEndpoint(t *testing.T) {
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	d := &Daemon{
+		store:     st,
+		signaling: sig,
+		direct:    &directState{mapper: &fakeDirectMapper{ip: "203.0.113.7"}},
+	}
+
+	d.learnAndReportPublicIP()
+
+	if !sig.hasSentMessage("report_endpoint", map[string]any{
+		"ip":   "203.0.113.7",
+		"port": 0,
+	}) {
+		t.Fatalf("expected initial report_endpoint {ip,0}, got %#v", sig.messagesSnapshot())
+	}
+}
+
+// TestStartDirectServerGuardedAndStopsOnDisconnect asserts the double-start
+// guard holds and that onSignalingDisconnect cancels the server context and
+// clears the started flag.
+func TestStartDirectServerGuardedAndStopsOnDisconnect(t *testing.T) {
+	gate := direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true })
+	ds := &directState{
+		server:     direct.NewDirectServer(testDirectNS, testDirectBase, nil, nil, gate, 1<<20),
+		listenAddr: "127.0.0.1:0",
+	}
+	d := &Daemon{direct: ds}
+
+	d.startDirectServer()
+	if !ds.started {
+		t.Fatalf("startDirectServer should set started=true")
+	}
+	if ds.cancel == nil {
+		t.Fatalf("startDirectServer should install a cancel func")
+	}
+
+	// Double-start guard: a second call must be a no-op (started stays true and
+	// no replacement cancel is installed).
+	d.startDirectServer()
+	if !ds.started {
+		t.Fatalf("double start must leave started=true")
+	}
+
+	d.onSignalingDisconnect()
+	if ds.started {
+		t.Fatalf("onSignalingDisconnect should reset started=false")
+	}
+	if ds.cancel != nil {
+		t.Fatalf("onSignalingDisconnect should clear cancel")
 	}
 }

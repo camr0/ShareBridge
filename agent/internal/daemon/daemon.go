@@ -216,6 +216,7 @@ type SignalingClientInterface interface {
 	SetOnMessage(handler func(signaling.Message))
 	SubmitCSR(ctx context.Context, csrPEM string) error
 	OpenAck(ctx context.Context, ack signaling.OpenAck) error
+	ReportEndpoint(ctx context.Context, ip string, port int, status string) error
 	TLSReady(ctx context.Context, fingerprint, notAfter string) error
 	TLSError(ctx context.Context, reason string) error
 }
@@ -293,9 +294,14 @@ type directState struct {
 	port       *direct.OnDemandPort
 	mapper     direct.PortMapper
 	server     *direct.DirectServer
+	reporter   *direct.Reporter
 	baseDomain string
 	serveNS    string // namespace the binder/server were built for
 	origin     map[string]string
+
+	started    bool               // DirectServer.Start guard (under mu)
+	cancel     context.CancelFunc // cancels the direct server ctx on disconnect
+	listenAddr string             // override for tests; empty => :directIntPort
 }
 
 // canRegisterDirect reports whether direct shares may be registered: the direct
@@ -427,6 +433,10 @@ func (d *Daemon) buildDirectState(withNetwork bool) {
 			ds.mapper = mapper
 			token := "sharebridge-" + shortHash(agentID)
 			ds.port = direct.NewOnDemandPortOwned(mapper, directExtPort, directIntPort, directPortIdle, token, mapper.InternalIP())
+			ds.reporter = direct.NewReporter(func(ip string, port int, status string) {
+				_ = d.signaling.ReportEndpoint(context.Background(), ip, port, status)
+			})
+			ds.port.SetTransitionCallback(ds.reporter.OnTransition)
 		}
 	}
 
@@ -594,11 +604,18 @@ func (d *Daemon) onSignalingDisconnect() {
 	if d.direct == nil {
 		return
 	}
-	d.direct.mu.Lock()
-	d.direct.ready = false
-	d.direct.mu.Unlock()
-	if d.direct.gate != nil {
-		d.direct.gate.Reset()
+	ds := d.direct
+	ds.mu.Lock()
+	ds.ready = false
+	cancel := ds.cancel
+	ds.cancel = nil
+	ds.started = false
+	ds.mu.Unlock()
+	if cancel != nil {
+		cancel() // close the direct HTTPS server for this epoch
+	}
+	if ds.gate != nil {
+		ds.gate.Reset()
 	}
 }
 
@@ -664,6 +681,10 @@ func (d *Daemon) Stop() error {
 	for _, session := range sessions {
 		d.closeSessionResources(session)
 	}
+
+	// Tear down the direct-transport epoch: cancel the direct HTTPS server and
+	// reset readiness/gate for a clean shutdown.
+	d.onSignalingDisconnect()
 
 	// Stop web server
 	if d.webServer != nil {
@@ -972,6 +993,7 @@ func (d *Daemon) handleEnrolled(msg signaling.Message) {
 	// Reconnect reconciliation: cert already installed and not expiring —
 	// re-affirm tls_ready so the control marks the current epoch ready.
 	d.sendTLSReady()
+	d.learnAndReportPublicIP()
 }
 
 // handleCertIssue validates and installs the issued chain, then reports the
@@ -987,6 +1009,9 @@ func (d *Daemon) handleCertIssue(msg signaling.Message) {
 		return
 	}
 	d.sendTLSReady()
+	// TLS is now ready; learn and report the public IP so the control can run
+	// DDNS and complete enrollment (enrollment_ready).
+	d.learnAndReportPublicIP()
 }
 
 func (d *Daemon) handleCertError(msg signaling.Message) {
@@ -1003,6 +1028,11 @@ func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
 	ds.mu.Lock()
 	ds.ready = true
 	ds.mu.Unlock()
+
+	// Learn/report the public IP and start the direct HTTPS server. Both are
+	// idempotent and re-run safely on every reconnect.
+	d.learnAndReportPublicIP()
+	d.startDirectServer()
 	log.Printf("direct enrollment ready")
 }
 
@@ -1025,6 +1055,58 @@ func (d *Daemon) sendTLSReady() {
 	if err := d.signaling.TLSReady(context.Background(), fp, notAfter.Format(time.RFC3339)); err != nil {
 		log.Printf("send tls_ready: %v", err)
 	}
+}
+
+// learnAndReportPublicIP fetches the agent's public IP from the port mapper and
+// (a) records it on the endpoint reporter so subsequent open/close transitions
+// carry a fresh IP, and (b) sends an initial report_endpoint {ip, 0} so the
+// control provisions DDNS and can emit enrollment_ready. It is idempotent and a
+// no-op when the mapper is unavailable or the IP is empty.
+func (d *Daemon) learnAndReportPublicIP() {
+	ds := d.direct
+	if ds == nil || ds.mapper == nil {
+		return
+	}
+	ip, err := ds.mapper.ExternalIP()
+	if err != nil || ip == "" {
+		log.Printf("direct public IP unavailable: %v", err)
+		return
+	}
+	if ds.reporter != nil {
+		ds.reporter.SetIP(ip)
+	}
+	if err := d.signaling.ReportEndpoint(context.Background(), ip, 0, ""); err != nil {
+		log.Printf("report endpoint: %v", err)
+	}
+}
+
+// startDirectServer starts the direct HTTPS server on the internal listen
+// address. It is idempotent (guarded by ds.started under ds.mu); the server is
+// closed when the context is cancelled on disconnect (onSignalingDisconnect).
+func (d *Daemon) startDirectServer() {
+	ds := d.direct
+	if ds == nil || ds.server == nil {
+		return
+	}
+	ds.mu.Lock()
+	if ds.started {
+		ds.mu.Unlock()
+		return
+	}
+	ds.started = true
+	ctx, cancel := context.WithCancel(context.Background())
+	ds.cancel = cancel
+	listenAddr := ds.listenAddr
+	ds.mu.Unlock()
+	if listenAddr == "" {
+		listenAddr = fmt.Sprintf(":%d", directIntPort)
+	}
+
+	go func() {
+		if err := ds.server.Start(ctx, listenAddr); err != nil {
+			log.Printf("direct server: %v", err)
+		}
+	}()
 }
 
 // handleOpenSignal admits a control-plane open-signal, opens the on-demand
@@ -1075,6 +1157,9 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "no_public_ip"})
 		return
+	}
+	if ds.reporter != nil {
+		ds.reporter.SetIP(ip) // keep subsequent transition reports fresh
 	}
 	_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
