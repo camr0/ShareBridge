@@ -26,3 +26,7 @@ signaling-server/server
 agent/opencloudshare
 agent/agent
 agent/benchdirect
+
+# macOS + editor/agent tooling artifacts
+.DS_Store
+.pi/

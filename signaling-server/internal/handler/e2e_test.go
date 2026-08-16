@@ -56,10 +56,12 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	h := hub.New()
 	cfg := config.Load()
 	reg := relay.NewRegistry(2 * time.Second)
-	ctrl := directctl.NewController(app, h, coord, nil, directctl.Config{BaseDomain: "example.com"})
-	ctrl.AllowPrivateProbes() // loopback probe target in this test
-	ctrl.SetDDNSFunc(func(ctx context.Context, name, ip string, ttl int) (string, error) {
-		return "", nil // succeed DDNS without a live Cloudflare zone
+	ctrl := directctl.NewController(app, h, coord, nil, directctl.Config{
+		BaseDomain:         "example.com",
+		AllowPrivateProbes: true, // loopback probe target in this test
+		DDNSFunc: func(ctx context.Context, name, ip string, ttl int) (string, error) {
+			return "", nil // succeed DDNS without a live Cloudflare zone
+		},
 	})
 
 	// Wire the real HTTP + WS stack: /ws/agent (auth + AgentWS) and /s/{code}
