@@ -1,7 +1,7 @@
 # Phase 3 — Content Serving (Direct HTTP) + `control/` Rename
 
 **Date:** 2026-08-16
-**Status:** Draft — revision 4 (incorporates design review round 3)
+**Status:** Draft — revision 6 (incorporates design review round 5)
 **Companion to:** `docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md` (the transport this phase builds on)
 **Forks off:** `v2`
 
@@ -27,9 +27,9 @@ transport.
 **Compatibility policy (explicit breaking change):** v2 has no legacy compatibility
 (pre-release, zero users). Removing the v1 transport **retires** relay-only shares,
 WebDAV/file shares, and password-protected shares — they are **not migrated**; they are
-rejected at registration and return a clean "unsupported" response when served. The
-default `DefaultRelayOnly` flips to `false` in 3a so new registrations are direct. This
-is intentional and asserted by the parity gate (§12.2).
+rejected at registration and return a clean "unsupported" response when served.
+`DefaultRelayOnly` is **forced to `false`** in 3a (persisted `true` overridden). This is
+intentional and asserted by the parity gate (§12.2).
 
 **Out of scope (deferred):**
 - WebDAV / file shares (drops in later on the same serving layer; the file-browser half of the UI stays as reference).
@@ -215,14 +215,19 @@ random token, TTL — default 1h) and returns:
   `Content-Disposition: attachment` (filename from the manifest, sanitized). The token
   binds the part to its transaction. Missing part index → `404`; duplicate part fetch →
   idempotent (re-stream, no double-count).
-- **Completion accounting** (§11.1): completed parts are recorded per transaction;
-  when **all** parts of a transaction complete, the album counts as **one** download.
-  Abandoned transactions (TTL elapsed before all parts) expire with **no** count.
-  Transactions are in-memory — an agent restart drops uncommitted transactions (no count).
+- **Transaction state machine** (atomic, under the ledger lock): a transaction is
+  `open` (holds its reservation) → `committed` (all parts done → one download) or
+  `released` (no count). **TTL expiry targets only idle transactions** — an in-flight
+  part **pins** its transaction (renews the TTL), and the pin is taken/released under
+  the lock so expiry and streaming are mutually exclusive. A released reservation can
+  never commit: if a transaction is released (expiry/invalidation) while a part is still
+  streaming, that stream is aborted and its commit is a no-op. Transactions are
+  in-memory — an agent restart drops uncommitted transactions (no count).
 - **Generation binding**: each transaction is bound to its snapshot generation. Before
   streaming a part, revalidate the part's copied `assetIds` against the **current**
   snapshot; on a membership change (new generation), invalidate incomplete transactions —
-  roll back their reservation and `403` any further part fetch.
+  atomically cancel any active stream, release the reservation, and `403` further part
+  fetches.
 - Multiple parts are **not** concatenated; the UI presents each part as its own
   download. Archive streaming is exclusive per transaction (§11).
 
@@ -261,7 +266,7 @@ test transfers longer than the idle timeout (§12.1).
 ### 5.1 Resolver seam
 
 ```
-resolve(code) → (ContentSession, error)   // error → 404 (unknown) / 403 (revoked/unsupported)
+resolve(code) → (ContentSession, error)   // error → 404 (unknown) / 403 (membership/limit/type) / 503 (not yet hydrated)
 ```
 
 `ContentSession` is an **immutable per-share snapshot** constructed atomically under the
@@ -287,6 +292,11 @@ Phase 3; see §7.2).
   refresh fails for longer than a bound (2× the poll interval), **fail closed** — reject
   new content requests (`503`) rather than indefinitely authorizing a stale membership.
   Requests already holding a snapshot finish their in-flight streams.
+- **Initial hydration**: snapshots are in-memory, not persisted. On new-share or restart,
+  a share is **not content-ready** until its first snapshot succeeds; until then
+  `resolve()` returns `503` (unready). The origin binding may exist first, but content
+  requests fail `503` until hydration. The 2×poll stale timer starts at the first
+  successful hydration. Cover new-registration, restart, and initial-fetch failure.
 
 ### 5.3 Path constraints
 
@@ -354,17 +364,25 @@ Today the control plane routes Immich links through the v1 path: `/share/{code}`
 
 Phase 3a changes this so **gallery shares reach the agent's direct server**:
 
-- `/share/{code}` → resolve the session **including inactive tombstones** (to recover the
-  share's type) → `302` to canonical `/s/{code}` (direct) for **active gallery shares**.
-  All other cases return a **clean explicit status**, with `404` taking precedence over
-  `410`: unknown or **revoked** → `404`; then (known, not revoked) relay-only /
-  WebDAV/file / protected / **expired** → `410 Gone`. The Phase 2 runtime-flow error
-  handling (`docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md`
-  §5) still governs the open-signal/redirect for the direct case.
-- The **direct-origin resolver** uses its own statuses: unknown → `404`; revoked,
-  **expired**, or unsupported-type (relay-only/WebDAV/protected) → `403`. Canonical
-  (`410`) and direct (`403`) are documented separately — they are not required to match.
-- `DefaultRelayOnly` flips to `false` so new registrations are direct by default.
+- `/share/{code}` → resolve the session **including inactive tombstones** → `302` to
+  canonical `/s/{code}` (direct) for **active gallery shares**. All other cases return a
+  clean explicit status driven by a single lifecycle discriminator
+  **`inactive_reason ∈ {expired, revoked, unsupported}`** (§10): `revoked` → `404`;
+  `expired` → `410`; `unsupported` (relay-only / WebDAV/file / protected) → `410`;
+  unknown code → `404`. The discriminator makes revoked-vs-expired unambiguous (both set
+  `is_active=false` today). The Phase 2 runtime-flow error handling
+  (`docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md` §5) still
+  governs the open-signal/redirect for the direct case.
+- The **direct-origin** path is TLS-gated: only **active gallery shares** have a live
+  origin binding + snapshot. Revoked/expired/unsupported bindings are removed, so those
+  requests **fail at TLS admission** and never reach HTTP. The HTTP resolver's statuses
+  (`404` unknown code / `403` membership-or-limit failure) therefore apply only to
+  requests that *reach* the resolver.
+- **Unsupported registration is rejected at every entry point** (poller, manual
+  creation, persisted-session restoration, and control `register_share`): relay-only,
+  WebDAV/file, and protected shares are all rejected. **Config migration** forces
+  `DefaultRelayOnly` to `false` on upgrade (persisted `true` overridden); existing v1
+  sessions of unsupported types become `inactive_reason=unsupported` tombstones.
 - `/i/{key}`, `/join`, `/ws/client`, `/ws/relay`, `/sessions/{code}`, `/sw.js`,
   `/app.js`, `/src/{…}`, `/noise-p256/{…}` are retired in 3c.
 - Route tests cover: active gallery (→ direct), relay-only (→ `410`), WebDAV/file
@@ -403,11 +421,14 @@ enumerate every route, handler, config field, WS message type, daemon field/func
 and test to remove, so each step keeps `go build ./...` + `go test ./...` green. Remove
 transport message handling from the kept `agent/internal/signaling` client.
 
-**Discriminator fields survive 3c.** The session fields that classify a share as
-relay-only / WebDAV / protected / expired / revoked (`relay_only`, `share_type`,
-`is_password_protected`, `expires_at`, `is_active`) are **kept** through 3c so the
-canonical route keeps returning the correct `404`/`410` for retired share types. Only
-the relay *runtime* (sockets, handler, TURN) is deleted.
+**Discriminator fields survive 3c.** The session lifecycle adds an **`inactive_reason`
+field** (`expired | revoked | unsupported`) so the canonical route can distinguish
+revoked (`404`) from expired/unsupported (`410`) — today both just set `is_active=false`.
+The classifier fields (`relay_only`, `share_type`, `is_password_protected`, `expires_at`,
+`is_active`) are **kept** through 3c for diagnostics; `inactive_reason` is authoritative
+for the status. Migration backfills `inactive_reason` for existing inactive rows
+(`expired` if `expires_at` is past, else `revoked` — best-effort, acceptable pre-release).
+Only the relay *runtime* (sockets, handler, TURN) is deleted.
 
 **Kept (frozen):** `internal/immich`, `internal/cloudwebdav`, `internal/signaling`,
 `internal/direct`, `internal/cert`, `internal/daemon` (minus the v1 wiring),
@@ -423,8 +444,10 @@ the relay *runtime* (sockets, handler, TURN) is deleted.
   per-share/global semaphores. `/archive` singleflights **only** the upstream
   `GetAlbumDownloadInfo` fetch + validation into a shared immutable manifest template
   (keyed by share + snapshot generation); each GET then creates its own **fresh token +
-  transaction + reservation** from that template (HEAD creates neither token nor
-  reservation).
+  transaction + reservation** from that template (HEAD creates neither). **After the
+  shared fetch returns, re-check the template's generation against the current snapshot
+  under the ledger lock; if it advanced, discard and retry against the new generation**
+  (test: refresh during an in-flight manifest fetch).
 - Cancellation: propagate request `ctx` into every immich call; abort upstream on client
   disconnect (releases the §4.7 hold).
 
@@ -438,12 +461,15 @@ the relay *runtime* (sockets, handler, TURN) is deleted.
   per-session accounting ledger** (separate from the immutable gallery snapshot) tracks
   `Downloads` + active reservations.
 - **Concurrency-safe**: an atomic `TryReserve` on the ledger enforces
-  `Downloads + activeReservations < MaxDownloads`. Assets reserve immediately before
-  streaming; albums reserve after manifest validation but **before the token is
-  returned**. Commit (increment `Downloads`) on successful completion; release on
-  failure / cancel / TTL-expiry / invalidation. Commit is idempotent. Two concurrent
-  requests resolving at `Downloads == MaxDownloads-1` cannot both pass. Add a mixed
-  concurrent asset/album test starting at `MaxDownloads-1`.
+  `Downloads + activeReservations < MaxDownloads` **when `MaxDownloads > 0`**.
+  `MaxDownloads <= 0` means **unlimited** — admission is always granted, but the ledger
+  still tracks reservations + idempotent commit for consistency. A finite limit
+  exhausted by reservation → `403`. Assets reserve immediately before streaming; albums
+  reserve after manifest validation but **before the token is returned**. Commit
+  (increment `Downloads`) on successful completion; release on failure / cancel /
+  TTL-expiry / invalidation. Commit is idempotent. Two concurrent requests resolving at
+  `Downloads == MaxDownloads-1` cannot both pass. Tests: zero/unlimited, reservation
+  denial, mixed concurrent asset/album at `MaxDownloads-1`.
 - **Persistence**: the committed increment is durable; a persistence failure is logged
   and the in-memory count still enforces the limit for the session's lifetime
   (documented gap). **Byte-level reporting is out of scope** — v1's
@@ -464,10 +490,11 @@ the relay *runtime* (sockets, handler, TURN) is deleted.
   (pre-first-byte error sets the right status), path-traversal/encoded-separator
   rejection, `Content-Disposition` sanitization, headers (no-store/nosniff/CSP/
   Referrer-Policy), snapshot/membership lifecycle (immutability, atomic swap,
-  singleflight, fail-closed after refresh failure), download accounting
-  (reserve/commit/rollback, album-transaction once, duplicate-part idempotency,
-  abandoned-transaction expiry, mixed concurrent asset/album at `MaxDownloads-1`),
-  HEAD+Range (ignored).
+  singleflight, fail-closed after refresh failure, initial-hydration `503`), download
+  accounting (reserve/commit/rollback, album-transaction once, duplicate-part
+  idempotency, abandoned-transaction expiry, mixed concurrent asset/album at
+  `MaxDownloads-1`, zero/unlimited limit, **TTL firing during an active part stream**),
+  HEAD+Range (ignored), **manifest generation changing during the singleflight fetch**.
 - **Integration** — real agent stack (cert.Manager + Binder + DirectServer +
   OnDemandPort + a fake `ContentBackend`, mirroring `6233e10`): SNI admission → gallery
   HTML → items (from snapshot) → thumb → preview → asset → playback (206) → archive
@@ -479,7 +506,9 @@ the relay *runtime* (sockets, handler, TURN) is deleted.
   open, video slide, zoom, and navigation.
 - **Route cutover** — `/share/{code}`: active gallery → direct; relay-only/WebDAV/
   protected/expired → `410`; revoked → `404` (including inactive-tombstone lookup).
-- **Protected-share enforcement** — all three entry points (poller, manual, restore).
+- **Unsupported-share enforcement** — protected, relay-only, and WebDAV shares rejected
+  at all entry points (poller, manual, restore, control registration) + config migration
+  forcing `DefaultRelayOnly=false`.
 
 ### 12.2 Parity gate (blocks 3c)
 
