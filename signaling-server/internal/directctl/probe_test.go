@@ -23,18 +23,49 @@ func mustPort(t *testing.T, s string) int {
 func TestProbeRejectsPrivateAndSpecialUse(t *testing.T) {
 	_, ctrl := newTestController(t)
 	ctrl.allowPrivate = false
-	for _, ip := range []string{"10.0.0.1", "100.64.0.1", "192.168.1.1", "169.254.1.1", "198.18.0.1", "240.0.0.1"} {
-		if err := ctrl.Probe(context.Background(), "o", "abc", "key-1", OpenAck{PublicIP: ip, GrantedPort: 443}); err == nil {
-			t.Fatalf("expected rejection for %s", ip)
-		}
+
+	// One representative IP from each of the 18 CIDRs in ssrfDeny.
+	cases := []struct {
+		cidr string
+		ip   string
+	}{
+		{"0.0.0.0/8", "0.0.0.1"},
+		{"10.0.0.0/8", "10.0.0.1"},
+		{"100.64.0.0/10", "100.64.0.1"},
+		{"127.0.0.0/8", "127.0.0.1"},
+		{"169.254.0.0/16", "169.254.1.1"},
+		{"172.16.0.0/12", "172.16.0.1"},
+		{"192.0.0.0/24", "192.0.0.1"},
+		{"192.0.2.0/24", "192.0.2.1"},
+		{"192.88.99.0/24", "192.88.99.1"},
+		{"192.168.0.0/16", "192.168.1.1"},
+		{"198.18.0.0/15", "198.18.0.1"},
+		{"198.51.100.0/24", "198.51.100.1"},
+		{"203.0.113.0/24", "203.0.113.1"},
+		{"224.0.0.0/4", "224.0.0.1"},
+		{"240.0.0.0/4", "240.0.0.1"},
+		{"192.31.196.0/24", "192.31.196.1"},
+		{"192.52.193.0/24", "192.52.193.1"},
+		{"192.175.48.0/24", "192.175.48.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.cidr, func(t *testing.T) {
+			if err := ctrl.Probe(context.Background(), "o", "abc", "key-1", OpenAck{PublicIP: tc.ip, GrantedPort: 443}); err == nil {
+				t.Fatalf("expected rejection for %s (%s)", tc.ip, tc.cidr)
+			}
+		})
 	}
 }
 
-func TestProbeRejectsZeroPort(t *testing.T) {
+func TestProbeRejectsInvalidPort(t *testing.T) {
 	_, ctrl := newTestController(t)
 	ctrl.allowPrivate = true
-	if err := ctrl.Probe(context.Background(), "o", "abc", "key-1", OpenAck{PublicIP: "127.0.0.1", GrantedPort: 0}); err == nil {
-		t.Fatalf("expected zero-port rejection")
+	for _, port := range []int{0, 65536} {
+		t.Run(strconv.Itoa(port), func(t *testing.T) {
+			if err := ctrl.Probe(context.Background(), "o", "abc", "key-1", OpenAck{PublicIP: "127.0.0.1", GrantedPort: port}); err == nil {
+				t.Fatalf("expected rejection for port %d", port)
+			}
+		})
 	}
 }
 
