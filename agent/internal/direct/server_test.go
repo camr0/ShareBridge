@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -349,5 +350,60 @@ func TestServerDownloadTracksActivityAndExactPath(t *testing.T) {
 	begins, _, _ := tr.snapshot()
 	if len(begins) != 1 || begins[0] != "abc" {
 		t.Fatalf("begins = %v, want exactly [abc]", begins)
+	}
+}
+
+func TestServerPageHasDownloadLinksAndContentLength(t *testing.T) {
+	ns, base := "sbdeadbeef", "example.com"
+	cert := testServerCert(t, ns, base)
+	gate := NewSignalGate("a", func(string, RouteKind) bool { return true })
+	srv := NewDirectServer(ns, base, &recordingTracker{}, &rotatableCerts{cert}, gate, 1<<30)
+	_ = srv.Binder().Allow("demo."+ns+"."+base, RouteDirect, "abc")
+
+	hs := srv.newHTTPServer()
+	hs.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go hs.ServeTLS(ln, "", "")
+	defer hs.Close()
+
+	origin := "demo." + ns + "." + base
+	transport := &http.Transport{
+		TLSClientConfig:     &tls.Config{ServerName: origin, InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}},
+		ForceAttemptHTTP2:   false,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, ln.Addr().String())
+		},
+	}
+	client := &http.Client{Transport: transport}
+	get := func(path string) *http.Response {
+		req, _ := http.NewRequest("GET", "https://"+origin+path, nil)
+		req.Host = origin
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		return resp
+	}
+
+	// Page must advertise a 100 MB download link.
+	page := get("/s/abc")
+	body, _ := io.ReadAll(page.Body)
+	page.Body.Close()
+	if !strings.Contains(string(body), "/s/abc/download?size=104857600") {
+		t.Fatalf("page missing 100 MB download link:\n%s", body)
+	}
+
+	// Download must set Content-Length to the exact requested size.
+	dl := get("/s/abc/download?size=104857600")
+	n, _ := io.Copy(io.Discard, dl.Body)
+	dl.Body.Close()
+	if n != 104857600 {
+		t.Fatalf("downloaded %d bytes, want 104857600", n)
+	}
+	if cl := dl.Header.Get("Content-Length"); cl != "104857600" {
+		t.Fatalf("Content-Length = %q, want 104857600", cl)
 	}
 }

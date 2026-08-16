@@ -276,7 +276,7 @@ type Daemon struct {
 
 const (
 	defaultBaseDomain     = "sharebridgeusercontent.com"
-	directMaxContentBytes = int64(1 << 20) // placeholder download ceiling
+	directMaxContentBytes = int64(2 << 30) // placeholder download ceiling (2 GiB)
 	directIntPort         = 8443
 	directExtPort         = 443
 	directPortIdle        = 5 * time.Minute

@@ -134,7 +134,13 @@ func (s *DirectServer) handleProbe(w http.ResponseWriter, r *http.Request, code 
 
 func (s *DirectServer) handlePage(w http.ResponseWriter, r *http.Request, code string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, "<html><body><h1>ShareBridge direct</h1><p>serving %s P2P over direct HTTPS</p></body></html>", code)
+	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>ShareBridge direct</title></head>
+<body><h1>ShareBridge direct</h1><p>serving %[1]s P2P over direct HTTPS</p>
+<ul>
+<li><a href="/s/%[1]s/download?size=10485760">Download 10 MB test file</a></li>
+<li><a href="/s/%[1]s/download?size=104857600">Download 100 MB test file</a></li>
+<li><a href="/s/%[1]s/download?size=1073741824">Download 1 GB test file</a></li>
+</ul></body></html>`, code)
 }
 
 func (s *DirectServer) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +152,7 @@ func (s *DirectServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="sharebridge.bin"`)
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	io.CopyN(w, zeroReader{}, size)
 }
 
