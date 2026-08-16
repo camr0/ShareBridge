@@ -110,9 +110,11 @@ methods):
    fetches): `NotFoundError`, `AuthError`, `UpstreamError{Status}`. Exposed via
    `errors.As`/`errors.Is`.
 2. **Metadata access before streaming** — helpers returning an asset kind's
-   `Content-Type` and authoritative `Content-Length` **when the upstream provides it**
-   (HEAD request or response headers), e.g. `ThumbnailInfo(id)` / `PreviewInfo(id)` /
-   `PlaybackInfo(id)`. Where Immich omits the length, the helper reports `ok=false`.
+   `Content-Type` and authoritative length **when the upstream provides it** (HEAD
+   request or response headers), e.g. `ThumbnailInfo(id)` / `PreviewInfo(id)` /
+   `PlaybackInfo(id)`. Playback metadata returns `(length int64, known bool)` so
+   "unknown" is distinguishable from an authoritative zero. Where Immich omits the
+   length, `known=false` (never fabricate a length).
 
 ## 4. HTTP serving layer
 
@@ -134,13 +136,13 @@ methods):
 - Parse a **single** `bytes=start-end` / `bytes=start-` range (case/whitespace-tolerant).
   Suffix ranges (`bytes=-N`), multiple ranges, non-numeric, or `start ≥ total` → `416
   Range Not Satisfiable` with `Content-Range: bytes */<total>`.
-- **Unknown/non-positive total** (`HeadVideoPlayback` ≤ 0): **ignore all `Range`
-  headers** and serve `200` + full body via `GetVideoPlayback` (no `Accept-Ranges`
-  advertised) — never fabricate a `206`, and never emit a `416` whose `*/<total>` can't
-  be populated.
+- **Unknown total** (`PlaybackInfo` → `known=false`): **ignore all `Range` headers** and
+  serve `200` + full body via `GetVideoPlayback` (no `Accept-Ranges` advertised) — never
+  fabricate a `206`, and never emit a `416` whose `*/<total>` can't be populated.
+- **Authoritative zero** (`known=true, length=0`): `416`.
 - Valid range → `206 Partial Content`, `Content-Range: bytes start-end/total`,
   `Accept-Ranges: bytes`. `end` is clamped to `total-1`; `start > end` after clamping and
-  integer-overflow inputs → `416`. Zero-length total → `416`.
+  integer-overflow inputs → `416`.
 - `start-end` reads use `GetVideoPlaybackRange` with a **bounded writer** that stops the
   upstream read at `end` (the "hit the bound" sentinel must not surface as an error).
   `start=0` sends no upstream Range header (client behavior) — a downstream `206` is
@@ -173,8 +175,9 @@ HEAD returns **status + headers only, no body**, derived from metadata (§3.1) a
 membership (§5) — **not** by invoking the streaming GET path. Where metadata is
 unavailable (thumbnails/previews/archives), `Content-Length` is **omitted** and the
 handler reports existence via `200`/`404` only. HEAD does **not** promise byte-identical
-headers to GET for streaming endpoints. Upstream failure during metadata lookup →
-`502`/`503` (§4.5).
+headers to GET for streaming endpoints, and **ignores `Range`** (returns `200` +
+resource headers; no `206`/`Content-Range` even for playback). Upstream failure during
+metadata lookup → `502`/`503` (§4.5).
 
 ### 4.5 Errors and response commitment
 
@@ -186,10 +189,12 @@ headers to GET for streaming endpoints. Upstream failure during metadata lookup 
   already-committed `200`.
 - **Typed error mapping** (§3.1), exact and deterministic: upstream `401`/`403` → `403`;
   `404` → `404`; any other upstream HTTP status → `502`; timeout / unreachable → `503`.
-- **Mid-stream failure** (after the first body byte): log + close the connection.
-  Truncation is only detectable where `Content-Length` was authoritative (transcoded
-  video via `HeadVideoPlayback`); thumbnails/previews/archives may have no authoritative
-  length, so their truncation is not guaranteed-detectable — documented, not promised.
+- **Mid-stream failure** (after the first body byte): log + abort via
+  `panic(http.ErrAbortHandler)` — aborts the HTTP/2 stream and terminates the HTTP/1.1
+  response (no hijacking). Truncation is only detectable where `Content-Length` was
+  authoritative (transcoded video); thumbnails/previews/archives may have no
+  authoritative length, so their truncation is not guaranteed-detectable — documented,
+  not promised.
 - Fallback MIME: `application/octet-stream` when metadata has no usable type.
 
 ### 4.6 Album archive (multi-part, transactional)
@@ -214,6 +219,10 @@ random token, TTL — default 1h) and returns:
   when **all** parts of a transaction complete, the album counts as **one** download.
   Abandoned transactions (TTL elapsed before all parts) expire with **no** count.
   Transactions are in-memory — an agent restart drops uncommitted transactions (no count).
+- **Generation binding**: each transaction is bound to its snapshot generation. Before
+  streaming a part, revalidate the part's copied `assetIds` against the **current**
+  snapshot; on a membership change (new generation), invalidate incomplete transactions —
+  roll back their reservation and `403` any further part fetch.
 - Multiple parts are **not** concatenated; the UI presents each part as its own
   download. Archive streaming is exclusive per transaction (§11).
 
@@ -233,13 +242,16 @@ test transfers longer than the idle timeout (§12.1).
   playback, archive). The share is ephemeral and revocable; no caching is the only
   behavior consistent with revocation.
 - `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
-- **CSP**: `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self';
-  media-src 'self'; connect-src 'self'`. To satisfy it without `unsafe-inline`, the moved
-  page must have **no** inline `<style>`, inline scripts, inline `onclick`, and
-  `gallery.js` must **stop emitting inline `style="…"` attributes** (e.g. the progress
-  `style="width: 0%"`) — move to classes — and must **replace the `data:image/gif`
-  placeholder** with a code-prefixed embedded static asset. A browser test asserts zero
-  CSP violations.
+- **CSP**: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+  img-src 'self'; media-src 'self'; connect-src 'self'`. `script-src` stays strict (no
+  inline scripts — move the inline service-worker script and `onclick` handlers into
+  static files), but `style-src` allows inline style *attributes* because the reused
+  lightGallery runtime and `gallery.js`'s progress bar set `style`/`style.cssText` at
+  runtime (CSS cannot execute script; the residual CSS-injection risk requires a separate
+  injection vulnerability and is accepted this phase). The page's large inline `<style>`
+  block is still moved to a static file, and the `data:image/gif` placeholder is replaced
+  with a code-prefixed embedded static asset. A browser test asserts zero CSP violations
+  across gallery load, lightbox open, video slide, zoom, and navigation.
 - `Content-Disposition: attachment` on `/asset/{id}` and `/archive/{token}/{part}`;
   filename via `mime.FormatMediaType` with an ASCII-safe fallback and path separators
   stripped.
@@ -255,10 +267,12 @@ resolve(code) → (ContentSession, error)   // error → 404 (unknown) / 403 (re
 `ContentSession` is an **immutable per-share snapshot** constructed atomically under the
 daemon lock, containing: the resolved `ContentBackend` (the §3 client subset bound to
 the share's Immich key), the **complete gallery snapshot** (DTO + membership index +
-generation/timestamp, §5.2), the download limit/count (§11.1), and lifecycle state
-(active, not revoked, type=gallery). It is a value the request holds for its lifetime —
-no shared mutable client state (`ValidatePassword`'s mutation of the client is not used
-in Phase 3; see §7.2).
+generation/timestamp, §5.2), the download **limit** (immutable), and lifecycle state
+(active, not revoked, type=gallery). The mutable download **count + active reservations
+live in a separate, locked per-session accounting ledger** (§11.1) — not in this
+immutable snapshot. The snapshot is a value the request holds for its lifetime — no
+shared mutable client state (`ValidatePassword`'s mutation of the client is not used in
+Phase 3; see §7.2).
 
 ### 5.2 Snapshot & membership (single source of truth)
 
@@ -342,13 +356,14 @@ Phase 3a changes this so **gallery shares reach the agent's direct server**:
 
 - `/share/{code}` → resolve the session **including inactive tombstones** (to recover the
   share's type) → `302` to canonical `/s/{code}` (direct) for **active gallery shares**.
-  All other cases return a **clean explicit status**: relay-only / WebDAV/file /
-  protected / expired → `410 Gone`; unknown / revoked → `404`. The Phase 2 runtime-flow
-  error handling (`docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md`
+  All other cases return a **clean explicit status**, with `404` taking precedence over
+  `410`: unknown or **revoked** → `404`; then (known, not revoked) relay-only /
+  WebDAV/file / protected / **expired** → `410 Gone`. The Phase 2 runtime-flow error
+  handling (`docs/superpowers/specs/2026-08-15-phase2-direct-mode-transport-design.md`
   §5) still governs the open-signal/redirect for the direct case.
-- The **direct-origin resolver** uses its own statuses: unknown → `404`, revoked or
-  unsupported-type (relay-only/WebDAV/protected) → `403`. Canonical (`410`) and direct
-  (`403`) are documented separately — they are not required to match.
+- The **direct-origin resolver** uses its own statuses: unknown → `404`; revoked,
+  **expired**, or unsupported-type (relay-only/WebDAV/protected) → `403`. Canonical
+  (`410`) and direct (`403`) are documented separately — they are not required to match.
 - `DefaultRelayOnly` flips to `false` so new registrations are direct by default.
 - `/i/{key}`, `/join`, `/ws/client`, `/ws/relay`, `/sessions/{code}`, `/sw.js`,
   `/app.js`, `/src/{…}`, `/noise-p256/{…}` are retired in 3c.
@@ -389,9 +404,10 @@ and test to remove, so each step keeps `go build ./...` + `go test ./...` green.
 transport message handling from the kept `agent/internal/signaling` client.
 
 **Discriminator fields survive 3c.** The session fields that classify a share as
-relay-only / WebDAV / protected / expired (`relay_only`, share type, `is_active`) are
-**kept** through 3c so the canonical route keeps returning `410` for retired share
-types. Only the relay *runtime* (sockets, handler, TURN) is deleted.
+relay-only / WebDAV / protected / expired / revoked (`relay_only`, `share_type`,
+`is_password_protected`, `expires_at`, `is_active`) are **kept** through 3c so the
+canonical route keeps returning the correct `404`/`410` for retired share types. Only
+the relay *runtime* (sockets, handler, TURN) is deleted.
 
 **Kept (frozen):** `internal/immich`, `internal/cloudwebdav`, `internal/signaling`,
 `internal/direct`, `internal/cert`, `internal/daemon` (minus the v1 wiring),
@@ -403,8 +419,12 @@ types. Only the relay *runtime* (sockets, handler, TURN) is deleted.
 - **Streaming responses** (assets, video, archive parts) are semaphore-limited per share
   + globally; over limit → `429` (transient) / `503` with a bounded-retry hint.
 - **Non-streaming upstream work is bounded separately**: `/items` is served **from the
-  snapshot** (no per-request upstream call); HEAD metadata probes and `/archive`
-  manifest creation run behind per-share/global semaphores and are singleflight'd.
+  snapshot** (no per-request upstream call); HEAD metadata probes run behind
+  per-share/global semaphores. `/archive` singleflights **only** the upstream
+  `GetAlbumDownloadInfo` fetch + validation into a shared immutable manifest template
+  (keyed by share + snapshot generation); each GET then creates its own **fresh token +
+  transaction + reservation** from that template (HEAD creates neither token nor
+  reservation).
 - Cancellation: propagate request `ctx` into every immich call; abort upstream on client
   disconnect (releases the §4.7 hold).
 
@@ -414,13 +434,16 @@ types. Only the relay *runtime* (sockets, handler, TURN) is deleted.
   (`/asset/{id}`) and a completed **album archive transaction** (all parts, once).
   Thumbnails, previews, and video playback do **not** count.
 - **Model**: `MaxDownloads` is an **immutable per-share limit**; `Downloads` is the
-  **persisted committed count** (`store.IncrementDownloads`, as in v1). The limit is
-  checked against the committed count at resolve time.
-- **Concurrency-safe** for assets: reserve a slot before streaming, commit (increment
-  `Downloads`) on successful completion, rollback on failure/cancel. For albums, the
-  transaction token (§4.6) is the reservation identity — the increment happens once,
-  only when the transaction's last part completes; duplicate parts and abandoned
-  transactions never double-count.
+  **persisted committed count** (`store.IncrementDownloads`, as in v1). A **locked
+  per-session accounting ledger** (separate from the immutable gallery snapshot) tracks
+  `Downloads` + active reservations.
+- **Concurrency-safe**: an atomic `TryReserve` on the ledger enforces
+  `Downloads + activeReservations < MaxDownloads`. Assets reserve immediately before
+  streaming; albums reserve after manifest validation but **before the token is
+  returned**. Commit (increment `Downloads`) on successful completion; release on
+  failure / cancel / TTL-expiry / invalidation. Commit is idempotent. Two concurrent
+  requests resolving at `Downloads == MaxDownloads-1` cannot both pass. Add a mixed
+  concurrent asset/album test starting at `MaxDownloads-1`.
 - **Persistence**: the committed increment is durable; a persistence failure is logged
   and the in-memory count still enforces the limit for the session's lifetime
   (documented gap). **Byte-level reporting is out of scope** — v1's
@@ -443,7 +466,8 @@ types. Only the relay *runtime* (sockets, handler, TURN) is deleted.
   Referrer-Policy), snapshot/membership lifecycle (immutability, atomic swap,
   singleflight, fail-closed after refresh failure), download accounting
   (reserve/commit/rollback, album-transaction once, duplicate-part idempotency,
-  abandoned-transaction expiry).
+  abandoned-transaction expiry, mixed concurrent asset/album at `MaxDownloads-1`),
+  HEAD+Range (ignored).
 - **Integration** — real agent stack (cert.Manager + Binder + DirectServer +
   OnDemandPort + a fake `ContentBackend`, mirroring `6233e10`): SNI admission → gallery
   HTML → items (from snapshot) → thumb → preview → asset → playback (206) → archive
@@ -451,7 +475,8 @@ types. Only the relay *runtime* (sockets, handler, TURN) is deleted.
   the mapping; concurrent recipients; cancellation; overload → `429`/`503`.
 - **UI** — port `gallery.test.js` to the URL-factory data layer (item render, lightbox,
   download/album-download against a stubbed `fetch`, archive manifest + `archivePartUrl`),
-  plus a browser test asserting **zero CSP violations**.
+  plus a browser test asserting **zero CSP violations** across gallery load, lightbox
+  open, video slide, zoom, and navigation.
 - **Route cutover** — `/share/{code}`: active gallery → direct; relay-only/WebDAV/
   protected/expired → `410`; revoked → `404` (including inactive-tombstone lookup).
 - **Protected-share enforcement** — all three entry points (poller, manual, restore).
