@@ -286,8 +286,15 @@ Phase 3; see §7.2).
   all read the **same snapshot** — never a live, separate `ListGallery` re-run — so they
   are mutually consistent.
 - **Refresh** is driven by the existing Immich poll cycle: rebuild the snapshot by
-  fetching **outside** the daemon lock (network I/O), then **atomically swap** it under
-  the lock. Concurrent rebuilds are **singleflight**-deduplicated.
+  fetching **outside** the lock (network I/O), then **atomically swap** it. Concurrent
+  rebuilds are **singleflight**-deduplicated. **One per-share state lock** guards the
+  snapshot generation, membership, manifest validation/recheck, transaction insertion,
+  and refresh-driven invalidation — so the §11 singleflight recheck and refresh-driven
+  invalidation are atomic with the swap (no split daemon/ledger locks).
+- **Generation semantics**: a **refresh timestamp** advances every successful poll, but a
+  **content/membership generation** advances only when the gallery DTO/membership
+  actually changes. Archive transactions and the §11 singleflight cache invalidate on the
+  **membership generation** only — a no-op refresh does not cancel long-running archives.
 - **Stale / fail-closed policy**: on poll failure, keep serving the last snapshot; but if
   refresh fails for longer than a bound (2× the poll interval), **fail closed** — reject
   new content requests (`503`) rather than indefinitely authorizing a stale membership.
@@ -364,8 +371,9 @@ Today the control plane routes Immich links through the v1 path: `/share/{code}`
 
 Phase 3a changes this so **gallery shares reach the agent's direct server**:
 
-- `/share/{code}` → resolve the session **including inactive tombstones** → `302` to
-  canonical `/s/{code}` (direct) for **active gallery shares**. All other cases return a
+- `/share/{code}` **and control-hosted `/s/{code}`** → resolve the session **including
+  inactive tombstones** → `302` to canonical `/s/{code}` (direct) for **active gallery
+  shares**. All other cases return a
   clean explicit status driven by a single lifecycle discriminator
   **`inactive_reason ∈ {expired, revoked, unsupported}`** (§10): `revoked` → `404`;
   `expired` → `410`; `unsupported` (relay-only / WebDAV/file / protected) → `410`;
@@ -397,7 +405,8 @@ Mechanical, no functional change:
   **reduced, not removed**: the control server still serves the **four retained
   control-hosted pages** (`home.html`, `login.html`, `register.html`, `account.html`)
   from `./web/` at runtime, so the script keeps copying **those pages only** (the
-  recipient UI + transport assets left the tree in 3a).
+  recipient UI was **copied/adapted into the agent** in 3a; its control-tree source is
+  deleted in 3c).
 - Update: `deploy.sh` (image/install paths), `signaling-server/docs/testing-server.md`
   (moves to `control/docs/`), CI workflows, README, `scripts/update_streamsaver_vendor.sh`
   (deleted with StreamSaver in 3c).
@@ -426,8 +435,15 @@ field** (`expired | revoked | unsupported`) so the canonical route can distingui
 revoked (`404`) from expired/unsupported (`410`) — today both just set `is_active=false`.
 The classifier fields (`relay_only`, `share_type`, `is_password_protected`, `expires_at`,
 `is_active`) are **kept** through 3c for diagnostics; `inactive_reason` is authoritative
-for the status. Migration backfills `inactive_reason` for existing inactive rows
-(`expired` if `expires_at` is past, else `revoked` — best-effort, acceptable pre-release).
+for the status.
+
+**Transitions** (every mutation site writes the discriminator): a new or reactivated
+session **clears** `inactive_reason`; expiry writes `expired`; explicit removal/
+revocation writes `revoked`; unsupported migration writes `unsupported`. A missing or
+unrecognized `inactive_reason` on an inactive row **fails safe as `404`**. Backfill
+ordering: mark `unsupported` (relay-only/WebDAV/protected) first, then assign `expired`
+(past `expires_at`) / `revoked` (remaining) to the rest.
+
 Only the relay *runtime* (sockets, handler, TURN) is deleted.
 
 **Kept (frozen):** `internal/immich`, `internal/cloudwebdav`, `internal/signaling`,
@@ -445,9 +461,10 @@ Only the relay *runtime* (sockets, handler, TURN) is deleted.
   `GetAlbumDownloadInfo` fetch + validation into a shared immutable manifest template
   (keyed by share + snapshot generation); each GET then creates its own **fresh token +
   transaction + reservation** from that template (HEAD creates neither). **After the
-  shared fetch returns, re-check the template's generation against the current snapshot
-  under the ledger lock; if it advanced, discard and retry against the new generation**
-  (test: refresh during an in-flight manifest fetch).
+  shared fetch returns, re-check the template's membership generation against the
+  current snapshot under the per-share state lock; if it advanced, discard and retry
+  against the new generation** (test: force a swap between comparison and transaction
+  creation).
 - Cancellation: propagate request `ctx` into every immich call; abort upstream on client
   disconnect (releases the §4.7 hold).
 
@@ -504,8 +521,10 @@ Only the relay *runtime* (sockets, handler, TURN) is deleted.
   download/album-download against a stubbed `fetch`, archive manifest + `archivePartUrl`),
   plus a browser test asserting **zero CSP violations** across gallery load, lightbox
   open, video slide, zoom, and navigation.
-- **Route cutover** — `/share/{code}`: active gallery → direct; relay-only/WebDAV/
-  protected/expired → `410`; revoked → `404` (including inactive-tombstone lookup).
+- **Route cutover** — `/share/{code}` **and** control `/s/{code}` (same resolver):
+  active gallery → direct; relay-only/WebDAV/protected/expired → `410`; revoked → `404`
+  (including inactive-tombstone lookup); lifecycle transitions (new→clear, expire,
+  revoke, unsupported-migrate) and invalid/missing `inactive_reason` → `404`.
 - **Unsupported-share enforcement** — protected, relay-only, and WebDAV shares rejected
   at all entry points (poller, manual, restore, control registration) + config migration
   forcing `DefaultRelayOnly=false`.
@@ -522,7 +541,8 @@ original asset, and enumerates/downloads **every** archive part — and asserts 
 
 ## 13. Migration / rollout
 
-- No schema migration (content serving is agent-local; no new collections). Manual
+- One forward migration in 3a: add `sessions.inactive_reason`
+  (`expired|revoked|unsupported`) + backfill (§10). No other schema change. Manual
   Immich creation must start plumbing `maxDownloads`/expiry (a code fix, not a schema
   change).
 - 3a is additive to Phase 2's transport; the v1 transport stays wired (unused) until the
