@@ -147,3 +147,39 @@ func TestManagerGenerateInstallRenewal(t *testing.T) {
 		t.Fatal("NeedsRenewal() = false for a short-lived cert")
 	}
 }
+
+func TestManagerLoadReusesPersistedKeyWithoutChain(t *testing.T) {
+	const ns = "v7q4km2x9pz6dn3w"
+	dir := t.TempDir()
+	m := NewManager(dir, testBase, nil)
+	if err := m.SetNamespace(ns); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.GenerateCSR(); err != nil {
+		t.Fatal(err)
+	}
+	keyOnDisk, err := os.ReadFile(filepath.Join(dir, "direct", "key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh manager over the same dir, Load()ed BEFORE any chain is
+	// installed, must restore the persisted key (not mint a new one on the
+	// next GenerateCSR) — otherwise a restart between CSR and install changes
+	// the CSR fingerprint and stalls re-enrollment under the control plane's
+	// issuance cooldown.
+	m2 := NewManager(dir, testBase, nil)
+	if err := m2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m2.GenerateCSR(); err != nil {
+		t.Fatal(err)
+	}
+	keyOnDisk2, err := os.ReadFile(filepath.Join(dir, "direct", "key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(keyOnDisk2) != string(keyOnDisk) {
+		t.Fatal("Load() did not restore the persisted key; GenerateCSR regenerated it")
+	}
+}

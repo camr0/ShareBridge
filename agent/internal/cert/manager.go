@@ -63,9 +63,17 @@ func (m *Manager) Load() error {
 		m.namespace = string(b)
 	}
 	keyPEM, err1 := os.ReadFile(m.keyPath())
+	if err1 != nil {
+		return nil // no persisted key — fresh enrollment
+	}
+	// Restore the key even when no chain is persisted yet: a restart between
+	// CSR submission and cert install must REUSE the same key, or the CSR
+	// fingerprint changes and the control plane sees a brand-new CSR (which,
+	// under the issuance cooldown, stalls re-enrollment).
+	m.keyPEM = keyPEM
 	chainPEM, err2 := os.ReadFile(m.chainPath())
-	if err1 != nil || err2 != nil {
-		return nil
+	if err2 != nil {
+		return nil // key restored; CSR will reuse it
 	}
 	return m.installLocked(chainPEM, keyPEM)
 }
