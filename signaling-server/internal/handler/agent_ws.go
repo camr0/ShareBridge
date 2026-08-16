@@ -673,7 +673,10 @@ func getSessionByCode(app core.App, code string) (*core.Record, error) {
 // claimSessionCodeTx creates or reassigns a custom code within an already-open
 // transaction (txApp). It is the transactional body of the former
 // claimSessionCode; the caller owns the transaction so origin allocation can
-// commit atomically with the claim (I7).
+// commit atomically with the claim (I7). Soft-deleted (inactive) sessions are
+// still reclaimed — the sessions.code unique index means a fresh row for the
+// same code is impossible — but AllocateOriginForTx then refreshes a stale
+// origin whose namespace no longer matches the agent's.
 func claimSessionCodeTx(txApp core.App, code, apiKeyID, accountID, agentID string, expiresAt *time.Time, relayOnly *bool, relayStaticPub, shareType string, isPasswordProtected bool) (*core.Record, bool, error) {
 	var existing struct {
 		SessionID string `db:"session_id"`

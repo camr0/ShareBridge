@@ -233,17 +233,46 @@ func RevokeAPIKey(app core.App, h *hub.Hub) func(*core.RequestEvent) error {
 			return e.JSON(http.StatusForbidden, map[string]string{"error": "access denied"})
 		}
 
-		// Mark key as inactive
-		record.Set("is_active", false)
-		if err := app.Save(record); err != nil {
-			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke key"})
-		}
+		// Mark the key inactive, soft-delete the agent's active sessions, and
+		// delete the agent row in ONE transaction. Soft-deleting the sessions
+		// (rather than leaving them reclaimable) means a later re-enroll with a
+		// fresh key gets a fresh namespace AND fresh origins — the stale origin
+		// (bound under the deleted agent's namespace) can never be reclaimed.
+		err = app.RunInTransaction(func(txApp core.App) error {
+			keyRecord, findErr := txApp.FindRecordById("api_keys", keyID)
+			if findErr != nil {
+				return findErr
+			}
+			keyRecord.Set("is_active", false)
+			if saveErr := txApp.Save(keyRecord); saveErr != nil {
+				return saveErr
+			}
 
-		// Standalone revocation deletes the agent row, so a later re-enroll with
-		// a fresh key gets a fresh namespace (spec §3).
-		agentRecs, _ := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": keyID})
-		for _, rec := range agentRecs {
-			_ = app.Delete(rec)
+			// Soft-delete active sessions so their stale origins cannot be
+			// reclaimed under a fresh namespace.
+			_, updateErr := txApp.DB().
+				NewQuery(`UPDATE sessions SET is_active = false WHERE api_key_id = {:keyID} AND is_active = true`).
+				Bind(dbx.Params{"keyID": keyID}).
+				Execute()
+			if updateErr != nil {
+				return updateErr
+			}
+
+			// Standalone revocation deletes the agent row, so a later re-enroll
+			// with a fresh key gets a fresh namespace (spec §3).
+			agentRecs, agentErr := txApp.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": keyID})
+			if agentErr != nil {
+				return agentErr
+			}
+			for _, rec := range agentRecs {
+				if delErr := txApp.Delete(rec); delErr != nil {
+					return delErr
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke key"})
 		}
 
 		// Immediately disconnect any agent using this API key

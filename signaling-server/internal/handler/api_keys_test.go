@@ -2,11 +2,13 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/coder/websocket"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -193,4 +195,79 @@ func TestRevokeDeletesAgent(t *testing.T) {
 	agents, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": key.Id})
 	require.NoError(t, err)
 	assert.Len(t, agents, 0)
+}
+
+// TestRevokeAPIKeySoftDeletesSessionsAndReenrollGetsFreshOrigin covers the
+// standalone-revocation recovery end-to-end: revoke soft-deletes the agent's
+// active sessions (same transaction as the key+agent), so a re-enroll with a
+// fresh key gets a fresh namespace AND a fresh origin — the stale origin bound
+// under the deleted agent's namespace is never reclaimed.
+func TestRevokeAPIKeySoftDeletesSessionsAndReenrollGetsFreshOrigin(t *testing.T) {
+	app, serverURL, h, cleanup := setupAgentWSWithControllerAndHub(t)
+	defer cleanup()
+
+	user, err := createTestUser(app, "revoke-origin@example.com")
+	require.NoError(t, err)
+
+	// Old key + enroll → agent row with namespace N1.
+	oldKey, err := createTestAPIKey(app, user.Id, "revoke-origin-secret")
+	require.NoError(t, err)
+	oldFullKey := oldKey.Id + ".revoke-origin-secret"
+
+	oldConn := dialAgentAndEnroll(t, serverURL, oldFullKey, "agent-revoke-origin")
+	defer oldConn.CloseNow()
+	ctx := context.Background()
+
+	// Register a share → control allocates an origin under N1.
+	require.NoError(t, oldConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"REVOKERECLAIM1"}`)))
+	_, raw, err := oldConn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"share_registered"`)
+	var first struct{ Origin string `json:"origin"` }
+	require.NoError(t, json.Unmarshal(raw, &first))
+	require.NotEmpty(t, first.Origin)
+
+	// Standalone revoke: key inactive + session soft-deleted + agent deleted.
+	revokeReq := httptest.NewRequest(http.MethodDelete, "/api/keys/"+oldKey.Id, nil)
+	revokeReq.SetPathValue("id", oldKey.Id)
+	revokeRec := httptest.NewRecorder()
+	revokeEvent := new(core.RequestEvent)
+	revokeEvent.App = app
+	revokeEvent.Request = revokeReq
+	revokeEvent.Response = revokeRec
+	revokeEvent.Auth = user
+	require.NoError(t, RevokeAPIKey(app, h)(revokeEvent))
+	require.Equal(t, http.StatusOK, revokeRec.Code, revokeRec.Body.String())
+
+	records, err := app.FindRecordsByFilter("sessions", "code = {:code}", "", 1, 0, map[string]any{"code": "REVOKERECLAIM1"})
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	require.False(t, records[0].GetBool("is_active"))
+
+	oldAgents, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": oldKey.Id})
+	require.NoError(t, err)
+	require.Len(t, oldAgents, 0)
+
+	// Re-enroll with a fresh key → fresh namespace N2.
+	newKey, err := createTestAPIKey(app, user.Id, "revoke-origin-new")
+	require.NoError(t, err)
+	newFullKey := newKey.Id + ".revoke-origin-new"
+
+	newConn := dialAgentAndEnroll(t, serverURL, newFullKey, "agent-revoke-origin")
+	defer newConn.CloseNow()
+
+	// Re-register the same code → a FRESH origin under N2, never the stale N1 origin.
+	require.NoError(t, newConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"REVOKERECLAIM1"}`)))
+	_, raw2, err := newConn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw2), `"type":"share_registered"`)
+	var second struct{ Origin string `json:"origin"` }
+	require.NoError(t, json.Unmarshal(raw2, &second))
+	require.NotEmpty(t, second.Origin)
+	require.NotEqual(t, first.Origin, second.Origin)
+
+	session := findSessionByCode(t, app, "REVOKERECLAIM1")
+	require.NotNil(t, session)
+	require.Equal(t, newKey.Id, session.GetString("api_key_id"))
+	require.Equal(t, second.Origin, session.GetString("origin"))
 }

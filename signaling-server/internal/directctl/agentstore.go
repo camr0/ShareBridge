@@ -134,19 +134,40 @@ func (c *Controller) AllocateOriginFor(app core.App, apiKeyID string, session *c
 // AllocateOriginForTx is AllocateOriginFor but runs inside an already-open
 // transaction (txApp), so session creation/claim and origin allocation commit
 // atomically (I7).
+//
+// A pre-existing origin is reused only when its namespace still matches the
+// agent's current namespace. After standalone key revocation deletes the agent
+// row, a re-enroll gets a FRESH namespace; reclaiming the session would
+// otherwise reuse the stale origin (bound under the deleted namespace) and the
+// new cert/Binder would reject it. On mismatch we allocate a fresh origin under
+// the current namespace, leaving the stale origin behind (never reused).
 func (c *Controller) AllocateOriginForTx(txApp core.App, apiKeyID string, session *core.Record) (string, error) {
-	if origin := session.GetString("origin"); origin != "" {
+	rec, _, err := LoadOrCreateAgent(txApp, apiKeyID)
+	if err != nil {
+		return "", err
+	}
+	namespace := rec.GetString("namespace")
+
+	if origin := session.GetString("origin"); origin != "" && originNamespace(origin) == namespace {
 		session.Set("is_active", true)
 		if err := txApp.Save(session); err != nil {
 			return "", err
 		}
 		return origin, nil
 	}
-	rec, _, err := LoadOrCreateAgent(txApp, apiKeyID)
-	if err != nil {
-		return "", err
+	return allocateOriginTx(txApp, namespace, c.cfg.BaseDomain, session)
+}
+
+// originNamespace extracts the namespace component from a direct-mode origin of
+// the form "<label>.<namespace>.<base-domain>". The label is lowercase hex (no
+// dots) and the namespace is "sb"+hex (no dots), so the namespace is always the
+// second dot-separated component.
+func originNamespace(origin string) string {
+	parts := strings.Split(origin, ".")
+	if len(parts) < 2 {
+		return ""
 	}
-	return allocateOriginTx(txApp, rec.GetString("namespace"), c.cfg.BaseDomain, session)
+	return parts[1]
 }
 
 // IsUniqueViolation reports whether err is a SQLite UNIQUE constraint failure
