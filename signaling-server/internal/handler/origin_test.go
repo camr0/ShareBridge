@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,19 +49,31 @@ func setupAgentWSWithController(t *testing.T) (core.App, string, func()) {
 	return app, server.URL, cleanup
 }
 
+// dialAgentAndEnroll dials the agent WS, sends hello, and consumes BOTH hello
+// responses (welcome + enrolled). The controller sends welcome (ICE config)
+// and enrolled (namespace) back-to-back, so callers must drain both before the
+// next request/response pair or they will misread the queued enrolled frame.
+func dialAgentAndEnroll(t *testing.T, serverURL, apiKey, agentID string) *websocket.Conn {
+	t.Helper()
+	ctx := context.Background()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverURL, "http")+"/ws/agent?api_key="+apiKey, nil)
+	require.NoError(t, err)
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(fmt.Sprintf(`{"type":"hello","agent_id":%q}`, agentID))))
+	_, _, err = conn.Read(ctx) // welcome
+	require.NoError(t, err)
+	_, _, err = conn.Read(ctx) // enrolled
+	require.NoError(t, err)
+	return conn
+}
+
 func TestRegisterShareReturnsOrigin(t *testing.T) {
 	app, serverURL, cleanup := setupAgentWSWithController(t)
 	defer cleanup()
 
 	apiKey := createTestAgentAPIKey(t, app)
-	ctx := context.Background()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverURL, "http")+"/ws/agent?api_key="+apiKey, nil)
-	require.NoError(t, err)
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-origin")
 	defer conn.CloseNow()
-
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-origin"}`)))
-	_, _, err = conn.Read(ctx)
-	require.NoError(t, err)
+	ctx := context.Background()
 
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ORIGIN01"}`)))
 	_, raw, err := conn.Read(ctx)
@@ -89,7 +102,7 @@ func TestUnregisterSoftDeletes(t *testing.T) {
 	defer cleanup()
 
 	apiKey := createTestAgentAPIKey(t, app)
-	conn := dialAgentAndHello(t, serverURL, apiKey, "agent-softdelete")
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-softdelete")
 	defer conn.CloseNow()
 
 	ctx := context.Background()

@@ -4,6 +4,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/go-acme/lego/v4/lego"
 )
 
 type Config struct {
@@ -23,6 +25,12 @@ type Config struct {
 
 	// Bandwidth quota — tracked server-side for future tier enforcement
 	DefaultQuotaGB float64
+
+	// Direct-mode control plane (operator-supplied; empty disables direct mode)
+	CloudflareToken string // CLOUDFLARE_TOKEN (single zone, DNS-edit only)
+	BaseDomain      string // CONTENT_BASE_DOMAIN
+	ACMEEmail       string // ACME_EMAIL
+	ACMECADir       string // ACME_CA_DIR (lego production by default)
 }
 
 func Load() *Config {
@@ -40,6 +48,11 @@ func Load() *Config {
 		SMTPPassword: getEnv("SMTP_PASSWORD", ""),
 
 		DefaultQuotaGB: getEnvFloat("DEFAULT_QUOTA_GB", 50.0),
+
+		CloudflareToken: getEnv("CLOUDFLARE_TOKEN", ""),
+		BaseDomain:      getEnv("CONTENT_BASE_DOMAIN", "sharebridgeusercontent.com"),
+		ACMEEmail:       getEnv("ACME_EMAIL", ""),
+		ACMECADir:       getEnv("ACME_CA_DIR", lego.LEDirectoryProduction),
 	}
 }
 

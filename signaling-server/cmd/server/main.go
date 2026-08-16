@@ -1,17 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
+	"sharebridge/server/internal/certcoordinator"
 	"sharebridge/server/internal/config"
+	"sharebridge/server/internal/ddns"
+	"sharebridge/server/internal/directctl"
 	"sharebridge/server/internal/handler"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/middleware"
@@ -27,6 +32,31 @@ func main() {
 	app := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir: cfg.DataDir,
 	})
+
+	// Build the direct-mode control plane. A missing Cloudflare token simply
+	// leaves the DDNS client nil, so the controller degrades gracefully and the
+	// legacy relay path keeps working unconfigured.
+	coord, err := certcoordinator.NewCoordinator(certcoordinator.CoordinatorConfig{
+		CA:              cfg.ACMECADir,
+		Email:           cfg.ACMEEmail,
+		CloudflareToken: cfg.CloudflareToken,
+		BaseDomain:      cfg.BaseDomain,
+		AccountKeyPath:  filepath.Join(cfg.DataDir, "acme_account.pem"),
+	})
+	if err != nil {
+		log.Fatalf("cert coordinator: %v", err)
+	}
+
+	var dnsClient *ddns.Cloudflare
+	if cfg.CloudflareToken != "" && cfg.BaseDomain != "" {
+		dnsClient, err = ddns.New(context.Background(), cfg.CloudflareToken, cfg.BaseDomain)
+		if err != nil {
+			log.Printf("warning: ddns unavailable, direct mode disabled: %v", err)
+			dnsClient = nil
+		}
+	}
+
+	ctrl := directctl.NewController(app, h, coord, dnsClient, directctl.Config{BaseDomain: cfg.BaseDomain})
 
 	// IMPORTANT: wire PocketBase to cfg.DataDir and cfg.Port explicitly.
 
@@ -51,7 +81,7 @@ func main() {
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
 			authMiddleware := middleware.APIKeyAuth(app)
-			handlerFunc := handler.AgentWS(app, h, reg, cfg, nil)
+			handlerFunc := handler.AgentWS(app, h, reg, cfg, ctrl)
 			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
 			return nil
 		})
@@ -74,8 +104,11 @@ func main() {
 		// and redirects to /i/{key} for Immich or /s/{code} for regular shares.
 		router.GET("/share/{code}", serveShareRedirect(app))
 
-		// Direct link route - serves file client; JS reads code from window.location
-		router.GET("/s/{code}", handler.ServeFileNoCache("./web/index.html"))
+		// Direct link route - redirects to the agent's direct HTTPS origin when
+		// enrolled + ready, otherwise 503 (controller gate).
+		router.GET("/s/{code}", func(e *core.RequestEvent) error {
+			return ctrl.Redirect(e.Response, e.Request, e.Request.PathValue("code"))
+		})
 		router.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
 
 		// Homepage (marketing)

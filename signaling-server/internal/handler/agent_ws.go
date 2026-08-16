@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/coder/websocket"
@@ -24,6 +25,33 @@ import (
 	"sharebridge/server/internal/relay"
 	"sharebridge/server/internal/turn"
 )
+
+// flexInt decodes a JSON number or a numeric string. The agent's hello message
+// sends `"version":"1.0"` as a string while open_signal.version is a JSON
+// number, so a plain int field would reject the hello and drop the message.
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		if s == "" {
+			*f = 0
+			return nil
+		}
+		n, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return err
+		}
+		*f = flexInt(n)
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(data, &n); err != nil {
+		return err
+	}
+	*f = flexInt(n)
+	return nil
+}
 
 // Agent message types from agent to server
 type agentMsg struct {
@@ -43,6 +71,27 @@ type agentMsg struct {
 	RelayStaticPub      string          `json:"relay_static_pub,omitempty"`
 	ShareType           string          `json:"share_type,omitempty"`
 	IsPasswordProtected bool            `json:"is_password_protected,omitempty"`
+
+	// Direct-mode control-plane fields. Json tags mirror the agent's
+	// signaling.Message so a single struct decodes both legacy and control
+	// message shapes.
+	CSRPEM         string  `json:"csr_pem,omitempty"`
+	Fingerprint    string  `json:"fingerprint,omitempty"`
+	NotAfter       string  `json:"not_after,omitempty"`
+	IP             string  `json:"ip,omitempty"`
+	Port           int     `json:"port,omitempty"`
+	Status         string  `json:"status,omitempty"`
+	Nonce          string  `json:"nonce,omitempty"`
+	Seq            uint64  `json:"seq,omitempty"`
+	ShareID        string  `json:"share_id,omitempty"`
+	Route          string  `json:"route,omitempty"`
+	LeaseSeconds   int     `json:"lease_seconds,omitempty"`
+	Version        flexInt `json:"version,omitempty"`
+	GrantedPort    int     `json:"granted_port,omitempty"`
+	PublicIP       string  `json:"public_ip,omitempty"`
+	WasAlreadyOpen bool    `json:"was_already_open,omitempty"`
+	Error          string  `json:"error,omitempty"`
+	Reason         string  `json:"reason,omitempty"`
 }
 
 var generatedCodeRegex = regexp.MustCompile(`^[a-z0-9]{8}$`)
@@ -85,6 +134,9 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, 
 					log.Printf("agent disconnected: %s (agent_id: %s)", apiKeyID, agentID)
 					h.UnregisterAgent(apiKeyID, conn)
 				}
+				if ctrl != nil {
+					ctrl.AgentDisconnected(apiKeyID, conn)
+				}
 				return
 			}
 
@@ -96,7 +148,55 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, 
 			switch msg.Type {
 			case "hello":
 				handleHello(ctx, conn, h, apiKeyID, accountID, msg.AgentID, cfg)
+				if ctrl != nil {
+					ctrl.HandleHello(ctx, conn, apiKeyID, accountID, msg.AgentID)
+				}
 				agentID = msg.AgentID
+
+			case "csr_submit":
+				if ctrl == nil {
+					continue
+				}
+				ctrl.HandleCSRSubmit(ctx, conn, apiKeyID, msg.CSRPEM)
+
+			case "tls_ready":
+				if ctrl == nil {
+					continue
+				}
+				ctrl.HandleTLSReady(ctx, conn, apiKeyID, msg.Fingerprint, msg.NotAfter)
+
+			case "tls_error":
+				if ctrl == nil {
+					continue
+				}
+				ctrl.HandleTLSError(ctx, apiKeyID, msg.Reason)
+
+			case "report_endpoint":
+				if ctrl == nil {
+					continue
+				}
+				ctrl.HandleReportEndpoint(ctx, apiKeyID, msg.IP, msg.Port, msg.Status)
+
+			case "open_ack":
+				if ctrl == nil {
+					continue
+				}
+				if msg.Status != "ok" && msg.Status != "error" {
+					continue
+				}
+				if msg.Nonce == "" || msg.Seq == 0 {
+					continue
+				}
+				ctrl.HandleOpenAck(apiKeyID, directctl.OpenAck{
+					ShareID:        msg.ShareID,
+					Nonce:          msg.Nonce,
+					Seq:            msg.Seq,
+					GrantedPort:    msg.GrantedPort,
+					PublicIP:       msg.PublicIP,
+					WasAlreadyOpen: msg.WasAlreadyOpen,
+					Status:         msg.Status,
+					Error:          msg.Error,
+				})
 
 			case "register_share":
 				if agentID == "" {

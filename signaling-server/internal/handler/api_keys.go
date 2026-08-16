@@ -115,6 +115,19 @@ func RotateAPIKey(app core.App, sessionHub *hub.Hub) func(*core.RequestEvent) er
 				return updateErr
 			}
 
+			// Re-point the agent to the new key (namespace + cert survive), so
+			// rotation does not force a fresh namespace/re-enrollment.
+			agentRecs, agentErr := txApp.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": oldKeyID})
+			if agentErr != nil {
+				return agentErr
+			}
+			if len(agentRecs) > 0 {
+				agentRecs[0].Set("api_key_id", newRecord.Id)
+				if err := txApp.Save(agentRecs[0]); err != nil {
+					return err
+				}
+			}
+
 			oldKeyTxRecord, findErr := txApp.FindRecordById("api_keys", oldKeyID)
 			if findErr != nil {
 				return findErr
@@ -224,6 +237,13 @@ func RevokeAPIKey(app core.App, h *hub.Hub) func(*core.RequestEvent) error {
 		record.Set("is_active", false)
 		if err := app.Save(record); err != nil {
 			return e.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke key"})
+		}
+
+		// Standalone revocation deletes the agent row, so a later re-enroll with
+		// a fresh key gets a fresh namespace (spec §3).
+		agentRecs, _ := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": keyID})
+		for _, rec := range agentRecs {
+			_ = app.Delete(rec)
 		}
 
 		// Immediately disconnect any agent using this API key

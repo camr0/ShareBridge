@@ -97,3 +97,100 @@ func TestRotateAPIKey_TransfersSessionsAndRevokesOldKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, response.ID, sessionRecord.GetString("api_key_id"))
 }
+
+// createTestAgent inserts an agent record bound to apiKeyID with the given
+// namespace and cert status. It exercises the real agents schema (required
+// api_key_id relation + namespace) exactly as the directctl enrollment path does.
+func createTestAgent(t *testing.T, app core.App, apiKeyID, namespace, certStatus string) *core.Record {
+	t.Helper()
+	agentsCol, err := app.FindCollectionByNameOrId("agents")
+	require.NoError(t, err)
+	rec := core.NewRecord(agentsCol)
+	rec.Set("api_key_id", apiKeyID)
+	rec.Set("namespace", namespace)
+	rec.Set("cert_status", certStatus)
+	require.NoError(t, app.Save(rec))
+	return rec
+}
+
+func TestRotatePreservesAgent(t *testing.T) {
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
+
+	alice, err := createTestUser(app, "alice-rotate-agent@example.com")
+	require.NoError(t, err)
+
+	oldKey, err := createTestAPIKey(app, alice.Id, "old-secret")
+	require.NoError(t, err)
+
+	agent := createTestAgent(t, app, oldKey.Id, "sbdeadbeef", "ready")
+	agent.Set("cert_fingerprint", "abc123")
+	require.NoError(t, app.Save(agent))
+
+	request := httptest.NewRequest(http.MethodPost, "/api/keys/"+oldKey.Id+"/rotate", bytes.NewBufferString(`{}`))
+	request.SetPathValue("id", oldKey.Id)
+	recorder := httptest.NewRecorder()
+
+	requestEvent := new(core.RequestEvent)
+	requestEvent.App = app
+	requestEvent.Request = request
+	requestEvent.Response = recorder
+	requestEvent.Auth = alice
+
+	err = RotateAPIKey(app, hub.New())(requestEvent)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, recorder.Code, recorder.Body.String())
+
+	var response CreateAPIKeyResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+
+	// Old key is revoked.
+	oldKeyRecord, err := app.FindRecordById("api_keys", oldKey.Id)
+	require.NoError(t, err)
+	assert.False(t, oldKeyRecord.GetBool("is_active"))
+
+	// No agent still points at the old key.
+	oldAgents, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": oldKey.Id})
+	require.NoError(t, err)
+	assert.Len(t, oldAgents, 0)
+
+	// The same agent row now points at the new key, preserving namespace + cert.
+	newAgents, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": response.ID})
+	require.NoError(t, err)
+	require.Len(t, newAgents, 1)
+	assert.Equal(t, "sbdeadbeef", newAgents[0].GetString("namespace"))
+	assert.Equal(t, "ready", newAgents[0].GetString("cert_status"))
+	assert.Equal(t, "abc123", newAgents[0].GetString("cert_fingerprint"))
+}
+
+func TestRevokeDeletesAgent(t *testing.T) {
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
+
+	alice, err := createTestUser(app, "alice-revoke-agent@example.com")
+	require.NoError(t, err)
+
+	key, err := createTestAPIKey(app, alice.Id, "revoke-secret")
+	require.NoError(t, err)
+
+	createTestAgent(t, app, key.Id, "sbrevoke01", "pending")
+
+	request := httptest.NewRequest(http.MethodDelete, "/api/keys/"+key.Id, nil)
+	request.SetPathValue("id", key.Id)
+	recorder := httptest.NewRecorder()
+
+	requestEvent := new(core.RequestEvent)
+	requestEvent.App = app
+	requestEvent.Request = request
+	requestEvent.Response = recorder
+	requestEvent.Auth = alice
+
+	err = RevokeAPIKey(app, hub.New())(requestEvent)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+
+	// The agent row is deleted so a fresh namespace is issued on re-enroll.
+	agents, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": key.Id})
+	require.NoError(t, err)
+	assert.Len(t, agents, 0)
+}
