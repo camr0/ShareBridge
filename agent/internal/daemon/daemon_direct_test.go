@@ -5,12 +5,16 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -648,4 +652,167 @@ func waitForCond(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("condition not met within deadline")
+}
+
+// TestDirectServerEndToEndSNIAdmissionAndDownload runs the REAL agent stack —
+// cert.Manager (with a test CA), the daemon-shared Binder, DirectServer, and an
+// OnDemandPort over a fake mapper — and drives a real TLS handshake + download
+// with SNI/Host admission and real trust verification. This fails if the
+// split-Binder bug (C1) regresses: bindOrigin would populate a binder the
+// server does not consult, so even the KNOWN origin would be rejected during
+// the handshake.
+func TestDirectServerEndToEndSNIAdmissionAndDownload(t *testing.T) {
+	const ns = testDirectNS
+	const base = testDirectBase
+	dir := t.TempDir()
+
+	// Mint a test CA root.
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "e2e-root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+
+	cm := cert.NewManager(dir, base, roots)
+	if err := cm.SetNamespace(ns); err != nil {
+		t.Fatal(err)
+	}
+	csrPEM, err := cm.GenerateCSR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrBlock, _ := pem.Decode(csrPEM)
+	csr, err := x509.ParseCertificateRequest(csrBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, ok := csr.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("CSR public key is %T", csr.PublicKey)
+	}
+
+	sans := []string{
+		fmt.Sprintf("*.%s.%s", ns, base),
+		fmt.Sprintf("*.relay.%s.%s", ns, base),
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: sans[0]},
+		DNSNames:     sans,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, root, pub, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	chain = append(chain, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})...)
+	if err := cm.Install(chain); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wire the real agent stack: daemon-shared Binder + DirectServer over an
+	// OnDemandPort backed by a fake mapper.
+	mapper := &fakeDirectMapper{ip: "203.0.113.7"}
+	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	gate := direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true })
+	ds := &directState{
+		namespace:  ns,
+		baseDomain: base,
+		cert:       cm,
+		gate:       gate,
+		port:       port,
+		mapper:     mapper,
+		origin:     map[string]string{},
+	}
+	d := &Daemon{direct: ds}
+	d.syncDirectServe()
+
+	const code = "SHARE123"
+	origin := testOriginFor("sbabc123")
+	d.bindOrigin(code, origin)
+	if err := ds.port.OpenFor(code, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewUnstartedServer(ds.server.Handler())
+	ts.TLS = ds.server.TLSConfig()
+	ts.StartTLS()
+	defer ts.Close()
+	addr := ts.Listener.Addr().String()
+
+	// Real trust: verify against the test CA, with SNI = origin, Host = origin.
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName: origin,
+			RootCAs:    roots,
+			NextProtos: []string{"http/1.1"},
+		},
+		ForceAttemptHTTP2: false,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	req, _ := http.NewRequest("GET", "https://"+origin+"/s/"+code+"/download?size=32", nil)
+	req.Host = origin
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("download status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if len(body) != 32 {
+		t.Fatalf("download body = %d bytes, want 32", len(body))
+	}
+	for _, b := range body {
+		if b != 0 {
+			t.Fatalf("download body not synthetic zeros: %v", body)
+		}
+	}
+
+	// An unknown SNI must fail the handshake (the same code path that would
+	// reject the KNOWN origin if the daemon and server used different binders).
+	badTransport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName: "other." + ns + "." + base,
+			RootCAs:    roots,
+			NextProtos: []string{"http/1.1"},
+		},
+		ForceAttemptHTTP2: false,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
+	badClient := &http.Client{Transport: badTransport}
+	badReq, _ := http.NewRequest("GET", "https://"+origin+"/s/"+code, nil)
+	badReq.Host = origin
+	if _, err := badClient.Do(badReq); err == nil {
+		t.Fatalf("unknown SNI must fail the TLS handshake")
+	}
 }
