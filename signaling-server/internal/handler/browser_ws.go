@@ -39,7 +39,7 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 
 		records, err := app.FindRecordsByFilter(
 			"sessions",
-			"code = {:code}",
+			"code = {:code} && is_active = true",
 			"",
 			1,
 			0,

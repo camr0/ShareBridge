@@ -51,7 +51,7 @@ func main() {
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
 			authMiddleware := middleware.APIKeyAuth(app)
-			handlerFunc := handler.AgentWS(app, h, reg, cfg)
+			handlerFunc := handler.AgentWS(app, h, reg, cfg, nil)
 			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
 			return nil
 		})
@@ -85,8 +85,7 @@ func main() {
 		router.GET("/join", handler.ServeFileNoCache("./web/index.html"))
 
 		// Static assets for file client
-			router.GET("/sw.js", handler.ServeFileNoCache("./web/sw.js"))
-
+		router.GET("/sw.js", handler.ServeFileNoCache("./web/sw.js"))
 
 		router.GET("/app.js", handler.ServeFileNoCache("./web/app.js"))
 		router.GET("/src/{path...}", handler.ServeDirNoCache("./web/src"))
@@ -180,8 +179,9 @@ func deleteExpiredSessions(app core.App) error {
 		if expiresAt.IsZero() || expiresAt.Time().After(now) {
 			continue
 		}
-		if err := app.Delete(record); err != nil {
-			return fmt.Errorf("delete expired session %s: %w", record.Id, err)
+		record.Set("is_active", false)
+		if err := app.Save(record); err != nil {
+			return fmt.Errorf("soft-delete expired session %s: %w", record.Id, err)
 		}
 	}
 
@@ -197,7 +197,7 @@ func serveShareRedirect(app core.App) func(*core.RequestEvent) error {
 			return e.NotFoundError("session not found", nil)
 		}
 		records, err := app.FindRecordsByFilter(
-			"sessions", "code = {:code}", "", 1, 0,
+			"sessions", "code = {:code} && is_active = true", "", 1, 0,
 			map[string]any{"code": code},
 		)
 		if err != nil || len(records) == 0 {

@@ -18,6 +18,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
 	"sharebridge/server/internal/config"
+	"sharebridge/server/internal/directctl"
 	"sharebridge/server/internal/hub"
 	"sharebridge/server/internal/middleware"
 	"sharebridge/server/internal/relay"
@@ -52,7 +53,8 @@ var errCodeAlreadyInUse = errors.New("code already in use")
 // AgentWS handles WebSocket connections from agents.
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
 // The registry parameter is optional - if nil, relay functionality is disabled.
-func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) http.HandlerFunc {
+// The controller parameter is optional - if nil, origin allocation is disabled.
+func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, ctrl *directctl.Controller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
 		apiKeyID := middleware.GetAPIKeyID(r.Context())
@@ -104,7 +106,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					})
 					continue
 				}
-				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg)
+				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg, ctrl)
 
 			case "unregister_share":
 				if agentID == "" {
@@ -313,6 +315,7 @@ func handleRegisterShare(
 	accountID string,
 	agentID string,
 	msg agentMsg,
+	ctrl *directctl.Controller,
 ) {
 	// Determine the code to use
 	code := msg.Code
@@ -426,6 +429,24 @@ func handleRegisterShare(
 		"code":        code,
 		"reconnected": reconnected,
 	}
+
+	// Control-allocated origin for the direct path. Nil-safe: when no
+	// controller is configured, origin allocation is skipped and "origin" is
+	// omitted from the response.
+	if ctrl != nil {
+		var origin string
+		origin, err = ctrl.AllocateOriginFor(app, apiKeyID, session)
+		if err != nil {
+			log.Printf("origin allocation failed for code %s: %v", code, err)
+			hub.SendDirect(ctx, conn, map[string]string{
+				"type":    "error",
+				"message": "origin allocation failed",
+			})
+			return
+		}
+		response["origin"] = origin
+	}
+
 	if expiresAt := session.GetDateTime("expires_at"); !expiresAt.IsZero() {
 		response["expires_at"] = expiresAt.Time().Format(time.RFC3339)
 	}
@@ -459,7 +480,8 @@ func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub
 		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "session not owned by this api key"})
 		return
 	}
-	if err := app.Delete(session); err != nil {
+	session.Set("is_active", false)
+	if err := app.Save(session); err != nil {
 		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "database error"})
 		return
 	}
@@ -483,6 +505,7 @@ func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time
 	record.Set("relay_static_pub", relayStaticPub)
 	record.Set("share_type", shareType)
 	record.Set("is_password_protected", isPasswordProtected)
+	record.Set("is_active", true)
 
 	if expiresAt != nil {
 		dt, _ := types.ParseDateTime(*expiresAt)
@@ -496,7 +519,7 @@ func createSession(app core.App, code, apiKeyID, agentID string, expiresAt *time
 func getSessionByCode(app core.App, code string) (*core.Record, error) {
 	records, err := app.FindRecordsByFilter(
 		"sessions",
-		"code = {:code}",
+		"code = {:code} && is_active = true",
 		"",
 		1,
 		0,
@@ -570,6 +593,7 @@ func claimSessionCode(app core.App, code, apiKeyID, accountID, agentID string, e
 		record.Set("relay_static_pub", relayStaticPub)
 		record.Set("share_type", shareType)
 		record.Set("is_password_protected", isPasswordProtected)
+		record.Set("is_active", true)
 		if expiresAt != nil {
 			dt, _ := types.ParseDateTime(*expiresAt)
 			record.Set("expires_at", dt)

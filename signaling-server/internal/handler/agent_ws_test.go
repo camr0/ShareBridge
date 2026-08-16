@@ -44,6 +44,8 @@ func setupAgentTestApp(t *testing.T) (core.App, func()) {
 	require.NoError(t, err)
 	err = migrations.AddImmichSessionFields(testApp)
 	require.NoError(t, err)
+	err = migrations.CreateAgents(testApp)
+	require.NoError(t, err)
 
 	cleanup := func() { testApp.Cleanup() }
 	return testApp, cleanup
@@ -58,7 +60,7 @@ func setupAgentWSTest(t *testing.T) (core.App, string, func()) {
 	reg := relay.NewRegistry(2 * time.Second)
 
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 
@@ -150,6 +152,7 @@ func createTestSession(app core.App, apiKeyID, agentID, code string) (*core.Reco
 	record.Set("code", code)
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", agentID)
+	record.Set("is_active", true)
 
 	if err := app.Save(record); err != nil {
 		return nil, err
@@ -183,7 +186,7 @@ func TestAgentWS_HelloFlow(t *testing.T) {
 
 	// Create HTTP test server with the AgentWS handler wrapped in auth middleware
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 
@@ -217,7 +220,7 @@ func TestAgentWS_InvalidAPIKey(t *testing.T) {
 	reg := relay.NewRegistry(2 * time.Second)
 
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 
@@ -258,7 +261,7 @@ func TestAgentWS_CodeOwnership(t *testing.T) {
 	reg := relay.NewRegistry(2 * time.Second)
 
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 
@@ -303,7 +306,7 @@ func TestAgentWS_RegisterShare_PersistsRelayStaticPub(t *testing.T) {
 	reg := relay.NewRegistry(2 * time.Second)
 
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 
@@ -523,7 +526,7 @@ func TestAgentWS_AuthOK_SendsRelayPrepareToAgentAndRelayPolicyToBrowser(t *testi
 
 	fullKey := apiKey.Id + ".sigsecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	browserHandler := BrowserWS(app, h, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
@@ -629,7 +632,7 @@ func TestAgentWS_AuthOK_WithoutRegistryDoesNotSendRelayMessages(t *testing.T) {
 
 	fullKey := apiKey.Id + ".norelaysecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, nil, cfg) // nil registry - relay disabled
+	agentHandler := AgentWS(app, h, nil, cfg, nil) // nil registry - relay disabled
 	browserHandler := BrowserWS(app, h, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
@@ -708,7 +711,7 @@ func TestAgentWS_AuthOK_QuotaExceeded_DisablesRelayFallback(t *testing.T) {
 
 	fullKey := apiKey.Id + ".quotasecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	browserHandler := BrowserWS(app, h, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
@@ -786,7 +789,7 @@ func TestAgentWS_AuthOK_MissingRelayStaticPubDisablesRelayFallback(t *testing.T)
 
 	fullKey := apiKey.Id + ".nostaticsecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	browserHandler := BrowserWS(app, h, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
@@ -865,7 +868,7 @@ func TestAgentWS_AuthOK_RelayPrepareIncludesSessionCode(t *testing.T) {
 
 	fullKey := apiKey.Id + ".codechecksecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	browserHandler := BrowserWS(app, h, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))

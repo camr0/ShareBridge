@@ -44,6 +44,8 @@ func setupBrowserTestApp(t *testing.T) (core.App, func()) {
 	// Run our custom migrations
 	err = migrations.CreateCollections(testApp)
 	require.NoError(t, err)
+	err = migrations.CreateAgents(testApp)
+	require.NoError(t, err)
 
 	cleanup := func() { testApp.Cleanup() }
 	return testApp, cleanup
@@ -58,7 +60,7 @@ func setupBrowserWSTest(t *testing.T) (core.App, string, func()) {
 	reg := relay.NewRegistry(2 * time.Second)
 
 	authMiddleware := middleware.APIKeyAuth(testApp)
-	agentHandler := AgentWS(testApp, h, reg, cfg)
+	agentHandler := AgentWS(testApp, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(testApp, h, cfg)))
@@ -139,6 +141,7 @@ func createTestSessionWithAPIKey(app core.App, apiKeyID, agentID, code string) (
 	record.Set("code", code)
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", agentID)
+	record.Set("is_active", true)
 
 	if err := app.Save(record); err != nil {
 		return nil, err
@@ -213,7 +216,7 @@ func TestBrowserWS_QuotaExceeded_SendsSTUNOnly(t *testing.T) {
 	// First connect an agent to the hub
 	fullKey := apiKey.Id + ".quotasecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
@@ -279,7 +282,7 @@ func TestBrowserWS_QuotaNotExceeded_SendsSTUNOnlyICE(t *testing.T) {
 	// First connect an agent to the hub
 	fullKey := apiKey.Id + ".normalsecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
@@ -346,7 +349,7 @@ func TestBrowserWS_DirectFlowStillSendsICEConfigFirst(t *testing.T) {
 
 	fullKey := apiKey.Id + ".directsecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
@@ -395,7 +398,7 @@ func TestBrowserWS_RelayOnlyAnnotatesIceConfig(t *testing.T) {
 
 	fullKey := apiKey.Id + ".relayonlysecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
@@ -455,7 +458,7 @@ func TestBrowserWS_IceConfigIsStunOnlyWithoutTurnFields(t *testing.T) {
 
 	fullKey := apiKey.Id + ".stunonlysecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))
@@ -512,7 +515,7 @@ func TestBrowserWS_KnockSurvivesRequestContextCancellation(t *testing.T) {
 
 	fullKey := apiKey.Id + ".ctxcancelsecret"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	browserHandler := BrowserWS(app, h, cfg)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
@@ -580,7 +583,7 @@ func TestBrowserWS_RelayOnlyStillEmitsIceConfigAndInitiatesNonceChallenge(t *tes
 
 	fullKey := apiKey.Id + ".relayonlychallenge"
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg)
+	agentHandler := AgentWS(app, h, reg, cfg, nil)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.Handle("/ws/client", http.HandlerFunc(BrowserWS(app, h, cfg)))

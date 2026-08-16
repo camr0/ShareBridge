@@ -94,6 +94,21 @@ func AllocateOrigin(app core.App, namespace, baseDomain string, session *core.Re
 	return origin, err
 }
 
+// AllocateOriginFor returns the session's already-allocated origin (re-activating
+// the session), or allocates a fresh control-managed origin via the agent's
+// namespace. The origin is never agent-supplied.
+func (c *Controller) AllocateOriginFor(app core.App, apiKeyID string, session *core.Record) (string, error) {
+	if origin := session.GetString("origin"); origin != "" {
+		session.Set("is_active", true)
+		return origin, app.Save(session)
+	}
+	rec, _, err := LoadOrCreateAgent(app, apiKeyID)
+	if err != nil {
+		return "", err
+	}
+	return AllocateOrigin(app, rec.GetString("namespace"), c.cfg.BaseDomain, session)
+}
+
 // isUniqueViolation reports whether err is a SQLite UNIQUE constraint failure.
 //
 // It matches both forms the error can reach this code in:

@@ -38,7 +38,7 @@ func ServeSessionFileNoCache(app core.App, path, routeParam, shareType string) f
 			return requestEvent.NotFoundError("session not found", nil)
 		}
 
-		filter := "code = {:code}"
+		filter := "code = {:code} && is_active = true"
 		params := map[string]any{"code": code}
 		if shareType != "" {
 			filter += " && share_type = {:share_type}"
@@ -107,7 +107,7 @@ func GetSessionInfo(app core.App, sessionHub *hub.Hub) func(*core.RequestEvent) 
 
 		records, err := app.FindRecordsByFilter(
 			"sessions",
-			"code = {:code}",
+			"code = {:code} && is_active = true",
 			"",
 			1,
 			0,

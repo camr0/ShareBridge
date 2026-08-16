@@ -24,6 +24,7 @@ func setupServerTestApp(t *testing.T) (core.App, func()) {
 	require.NoError(t, testApp.Bootstrap())
 	require.NoError(t, testApp.RunSystemMigrations())
 	require.NoError(t, migrations.CreateCollections(testApp))
+	require.NoError(t, migrations.CreateAgents(testApp))
 
 	return testApp, func() { testApp.Cleanup() }
 }
@@ -67,6 +68,7 @@ func createServerTestSession(t *testing.T, app core.App, apiKeyID, code string, 
 	record.Set("code", code)
 	record.Set("api_key_id", apiKeyID)
 	record.Set("agent_id", "test-agent")
+	record.Set("is_active", true)
 	if expiresAt != nil {
 		dt, err := types.ParseDateTime(*expiresAt)
 		require.NoError(t, err)
@@ -90,6 +92,22 @@ func testSessionExists(t *testing.T, app core.App, code string) bool {
 	)
 	require.NoError(t, err)
 	return len(records) == 1
+}
+
+func sessionIsActive(t *testing.T, app core.App, code string) bool {
+	t.Helper()
+
+	records, err := app.FindRecordsByFilter(
+		"sessions",
+		"code = {:code}",
+		"",
+		1,
+		0,
+		map[string]any{"code": code},
+	)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	return records[0].GetBool("is_active")
 }
 
 func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
@@ -166,6 +184,10 @@ func TestDeleteExpiredSessions_DeletesOnlyExpiredSessions(t *testing.T) {
 	createServerTestSession(t, app, apiKey.Id, "FUTURE01", &futureAt)
 
 	require.NoError(t, deleteExpiredSessions(app))
-	require.False(t, testSessionExists(t, app, "EXPIRED1"))
+	// Soft-delete: the expired row still exists (so its origin is never reused)
+	// but is marked inactive.
+	require.True(t, testSessionExists(t, app, "EXPIRED1"))
+	require.False(t, sessionIsActive(t, app, "EXPIRED1"))
 	require.True(t, testSessionExists(t, app, "FUTURE01"))
+	require.True(t, sessionIsActive(t, app, "FUTURE01"))
 }
