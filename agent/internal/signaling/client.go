@@ -21,21 +21,51 @@ type ICEServer struct {
 
 // Message is any message received from the signaling server.
 type Message struct {
-	Type        string          `json:"type"`
-	SessionID   string          `json:"session_id,omitempty"` // Share code
-	PeerID      string          `json:"peer_id,omitempty"`    // Unique peer connection ID
-	SDP         string          `json:"sdp,omitempty"`
-	Candidate   json.RawMessage `json:"candidate,omitempty"`
-	Err         string          `json:"message,omitempty"`
-	Code        string          `json:"code,omitempty"`
-	ConnID      string          `json:"conn_id,omitempty"`
-	HMAC        string          `json:"hmac,omitempty"`
-	Password    string          `json:"password,omitempty"`
-	Reconnected bool            `json:"reconnected,omitempty"`
-	ICEServers  []ICEServer     `json:"ice_servers,omitempty"`
-	SID         string          `json:"sid,omitempty"`
-	RelayJWT    string          `json:"relay_jwt,omitempty"`
-	ExpiresAt   string          `json:"expires_at,omitempty"`
+	Type           string          `json:"type"`
+	SessionID      string          `json:"session_id,omitempty"` // Share code
+	PeerID         string          `json:"peer_id,omitempty"`    // Unique peer connection ID
+	SDP            string          `json:"sdp,omitempty"`
+	Candidate      json.RawMessage `json:"candidate,omitempty"`
+	Err            string          `json:"message,omitempty"`
+	Code           string          `json:"code,omitempty"`
+	ConnID         string          `json:"conn_id,omitempty"`
+	HMAC           string          `json:"hmac,omitempty"`
+	Password       string          `json:"password,omitempty"`
+	Reconnected    bool            `json:"reconnected,omitempty"`
+	ICEServers     []ICEServer     `json:"ice_servers,omitempty"`
+	SID            string          `json:"sid,omitempty"`
+	RelayJWT       string          `json:"relay_jwt,omitempty"`
+	ExpiresAt      string          `json:"expires_at,omitempty"`
+	Origin         string          `json:"origin,omitempty"`
+	CSRPEM         string          `json:"csr_pem,omitempty"`
+	Fingerprint    string          `json:"fingerprint,omitempty"`
+	NotAfter       string          `json:"not_after,omitempty"`
+	IP             string          `json:"ip,omitempty"`
+	Port           int             `json:"port,omitempty"`
+	Status         string          `json:"status,omitempty"`
+	Nonce          string          `json:"nonce,omitempty"`
+	Seq            uint64          `json:"seq,omitempty"`
+	ShareID        string          `json:"share_id,omitempty"`
+	Route          string          `json:"route,omitempty"`
+	LeaseSeconds   int             `json:"lease_seconds,omitempty"`
+	Version        int             `json:"version,omitempty"`
+	GrantedPort    int             `json:"granted_port,omitempty"`
+	PublicIP       string          `json:"public_ip,omitempty"`
+	WasAlreadyOpen bool            `json:"was_already_open,omitempty"`
+	Error          string          `json:"error,omitempty"`
+}
+
+// OpenAck is the agent-side acknowledgement of an open_signal. Its json tags
+// mirror the control-side directctl.OpenAck fields exactly.
+type OpenAck struct {
+	ShareID        string `json:"share_id"`
+	Nonce          string `json:"nonce"`
+	Seq            uint64 `json:"seq"`
+	GrantedPort    int    `json:"granted_port"`
+	PublicIP       string `json:"public_ip"`
+	WasAlreadyOpen bool   `json:"was_already_open"`
+	Status         string `json:"status"`
+	Error          string `json:"error,omitempty"`
 }
 
 type RegisterShareOptions struct {
@@ -104,20 +134,24 @@ func (c *Client) Connect(ctx context.Context) error {
 // The response is delivered via pendingReg, which Listen feeds.
 // relayStaticPub is the hex-encoded P-256 public key for relay identity.
 func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
-	return c.RegisterShareWithOptions(ctx, RegisterShareOptions{
+	code, _, reconnected, err := c.RegisterShareWithOptions(ctx, RegisterShareOptions{
 		ShareURL:       shareURL,
 		PreferredCode:  preferredCode,
 		RelayOnly:      relayOnly,
 		RelayStaticPub: relayStaticPub,
 	})
+	if err != nil {
+		return "", false, err
+	}
+	return code, reconnected, nil
 }
 
-func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShareOptions) (string, bool, error) {
+func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShareOptions) (string, string, bool, error) {
 	responseCh := make(chan Message, 1)
 	c.pendingRegMu.Lock()
 	if c.pendingReg != nil {
 		c.pendingRegMu.Unlock()
-		return "", false, fmt.Errorf("registration already in progress")
+		return "", "", false, fmt.Errorf("registration already in progress")
 	}
 	c.pendingReg = responseCh
 	c.pendingRegMu.Unlock()
@@ -145,17 +179,17 @@ func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShar
 		msg["relay_static_pub"] = opts.RelayStaticPub
 	}
 	if err := c.Send(ctx, msg); err != nil {
-		return "", false, fmt.Errorf("send register_share: %w", err)
+		return "", "", false, fmt.Errorf("send register_share: %w", err)
 	}
 
 	select {
 	case resp := <-responseCh:
 		if resp.Type == "error" {
-			return "", false, fmt.Errorf("server error: %s", resp.Err)
+			return "", "", false, fmt.Errorf("server error: %s", resp.Err)
 		}
-		return resp.Code, resp.Reconnected, nil
+		return resp.Code, resp.Origin, resp.Reconnected, nil
 	case <-ctx.Done():
-		return "", false, ctx.Err()
+		return "", "", false, ctx.Err()
 	}
 }
 
@@ -169,6 +203,64 @@ func (c *Client) DownloadComplete(ctx context.Context, code string, bytesTransfe
 		"type":              "download_complete",
 		"code":              code,
 		"bytes_transferred": bytesTransferred,
+	})
+}
+
+// SubmitCSR submits a certificate signing request for the agent's namespace.
+func (c *Client) SubmitCSR(ctx context.Context, csrPEM string) error {
+	return c.Send(ctx, map[string]any{
+		"type":    "csr_submit",
+		"csr_pem": csrPEM,
+	})
+}
+
+// ReportEndpoint reports the agent's public endpoint (IP + port). status is
+// only present for "close_failed"; port 0 means closed, port > 0 means open.
+func (c *Client) ReportEndpoint(ctx context.Context, ip string, port int, status string) error {
+	msg := map[string]any{
+		"type": "report_endpoint",
+		"ip":   ip,
+		"port": port,
+	}
+	if status != "" {
+		msg["status"] = status
+	}
+	return c.Send(ctx, msg)
+}
+
+// OpenAck acknowledges an open_signal with the granted port and public IP.
+func (c *Client) OpenAck(ctx context.Context, ack OpenAck) error {
+	msg := map[string]any{
+		"type":             "open_ack",
+		"share_id":         ack.ShareID,
+		"nonce":            ack.Nonce,
+		"seq":              ack.Seq,
+		"granted_port":     ack.GrantedPort,
+		"public_ip":        ack.PublicIP,
+		"was_already_open": ack.WasAlreadyOpen,
+		"status":           ack.Status,
+	}
+	if ack.Error != "" {
+		msg["error"] = ack.Error
+	}
+	return c.Send(ctx, msg)
+}
+
+// TLSReady reports a successfully installed leaf certificate.
+func (c *Client) TLSReady(ctx context.Context, fingerprint, notAfter string) error {
+	return c.Send(ctx, map[string]any{
+		"type":        "tls_ready",
+		"fingerprint": fingerprint,
+		"not_after":   notAfter,
+	})
+}
+
+// TLSError reports a certificate installation failure. The agent retries with
+// backoff; the control plane treats this as a no-op beyond logging.
+func (c *Client) TLSError(ctx context.Context, reason string) error {
+	return c.Send(ctx, map[string]any{
+		"type":   "tls_error",
+		"reason": reason,
 	})
 }
 

@@ -156,7 +156,7 @@ type immichPoller interface {
 }
 
 type shareOptionRegistrar interface {
-	RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, bool, error)
+	RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, string, bool, error)
 }
 
 type shareUnregistrar interface {
@@ -1194,7 +1194,7 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 				log.Printf("warning: signaling client does not support Immich registration options for %s", entry.Code)
 				continue
 			}
-			code, reconnected, err := reg.RegisterShareWithOptions(ctx, signaling.RegisterShareOptions{
+			code, _, reconnected, err := reg.RegisterShareWithOptions(ctx, signaling.RegisterShareOptions{
 				ShareURL:            entry.ShareURL,
 				PreferredCode:       entry.Code,
 				ShareType:           "immich",
@@ -1404,7 +1404,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		RelayOnly:           relayOnly,
 		RelayStaticPub:      relayStaticPub,
 	}
-	code, _, err := reg.RegisterShareWithOptions(ctx, opts)
+	code, _, _, err := reg.RegisterShareWithOptions(ctx, opts)
 	if err != nil {
 		return nil, err
 	}

@@ -215,11 +215,12 @@ func (m *mockSignalingClient) RegisterShare(ctx context.Context, shareURL, prefe
 	return fmt.Sprintf("test-code-%d", m.codeCounter), false, nil
 }
 
-func (m *mockSignalingClient) RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, bool, error) {
+func (m *mockSignalingClient) RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, string, bool, error) {
 	m.mu.Lock()
 	m.registered = append(m.registered, opts)
 	m.mu.Unlock()
-	return m.RegisterShare(ctx, opts.ShareURL, opts.PreferredCode, opts.RelayOnly, opts.RelayStaticPub)
+	code, reconnected, err := m.RegisterShare(ctx, opts.ShareURL, opts.PreferredCode, opts.RelayOnly, opts.RelayStaticPub)
+	return code, "", reconnected, err
 }
 
 func (m *mockSignalingClient) UnregisterShare(ctx context.Context, code string) error {
@@ -337,9 +338,9 @@ func (m *mockSignalingClient) unregisteredCode(code string) bool {
 func newTestDaemon(t *testing.T) (*Daemon, *mockSignalingClient) {
 	t.Helper()
 	cfg := &config.Config{
-		SignalingURL:      "ws://localhost:8080",
-		APIKey:            "test-key",
-		DefaultRelayOnly:  true,
+		SignalingURL:     "ws://localhost:8080",
+		APIKey:           "test-key",
+		DefaultRelayOnly: true,
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
