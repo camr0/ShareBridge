@@ -4,6 +4,7 @@ package direct
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"mime"
@@ -254,6 +255,114 @@ func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code,
 	}
 	s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
 		_, err := session.Backend.GetFile(r.Context(), id, dst)
+		return err
+	})
+}
+
+// errBoundReached is the sentinel a boundedWriter returns once it has forwarded
+// its full bound of bytes. It is not an error: it is how the writer halts the
+// upstream read exactly at the range bound. Callers translate it back to nil.
+var errBoundReached = errors.New("direct: playback range bound reached")
+
+// boundedWriter forwards at most limit bytes to w, then returns errBoundReached
+// to stop the upstream reader at the bound. It never reports the bound sentinel
+// as a failure of the bytes it actually forwarded.
+type boundedWriter struct {
+	w     io.Writer
+	limit int64
+}
+
+func (bw *boundedWriter) Write(p []byte) (int, error) {
+	if bw.limit <= 0 {
+		return 0, errBoundReached
+	}
+	if int64(len(p)) > bw.limit {
+		p = p[:bw.limit]
+	}
+	n, err := bw.w.Write(p)
+	bw.limit -= int64(n)
+	if err == nil && bw.limit <= 0 {
+		return n, errBoundReached
+	}
+	return n, err
+}
+
+// writeRangeNotSatisfiable commits a 416 with the `bytes */<total>` form.
+// http.Error supplies the status, text body, and Content-Type.
+func writeRangeNotSatisfiable(w http.ResponseWriter, total int64) {
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", total))
+	http.Error(w, http.StatusText(http.StatusRequestedRangeNotSatisfiable), http.StatusRequestedRangeNotSatisfiable)
+}
+
+// handlePlayback serves the transcoded video stream at /asset/{id}/playback
+// (§4.2). It honors a single satisfiable byte range when the transcoded length
+// is authoritatively known; otherwise it serves the full body (200) or, for an
+// authoritative zero length or an unsatisfiable range, a 416.
+func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, code, id string) {
+	session, ok := s.resolveAndMember(w, code, id)
+	if !ok {
+		return
+	}
+	length, known, err := session.Backend.PlaybackInfo(r.Context(), id)
+	if err != nil {
+		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
+		return
+	}
+
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "video/mp4")
+
+	if r.Method == http.MethodHead {
+		// HEAD ignores Range (§4.4): status + headers, no body, no 206.
+		if known {
+			w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if !known {
+		// Unknown total: ignore Range, serve 200 full body, no Accept-Ranges.
+		s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+			_, err := session.Backend.GetVideoPlayback(r.Context(), id, dst)
+			return err
+		})
+		return
+	}
+
+	if length <= 0 {
+		// Authoritative zero length → 416 with the */0 form.
+		writeRangeNotSatisfiable(w, 0)
+		return
+	}
+
+	if r.Header.Get("Range") == "" {
+		// No Range header: serve the full body.
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+			_, err := session.Backend.GetVideoPlayback(r.Context(), id, dst)
+			return err
+		})
+		return
+	}
+
+	start, end, _, ok := ParseRange(r.Header.Get("Range"), length, true)
+	if !ok {
+		// Suffix / multiple / malformed / start>=total / start>end → 416.
+		writeRangeNotSatisfiable(w, length)
+		return
+	}
+
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, length))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	limit := end - start + 1
+	s.streamBody(w, http.StatusPartialContent, func(dst io.Writer) error {
+		bw := &boundedWriter{w: dst, limit: limit}
+		_, err := session.Backend.GetVideoPlaybackRange(r.Context(), id, start, bw)
+		if errors.Is(err, errBoundReached) {
+			return nil
+		}
 		return err
 	})
 }

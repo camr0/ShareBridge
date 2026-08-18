@@ -150,7 +150,16 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	case strings.HasPrefix(rest, "/asset/"):
-		if id, ok := contentID(rest, "/asset/"); ok {
+		assetRest := strings.TrimPrefix(rest, "/asset/")
+		if id, found := strings.CutSuffix(assetRest, "/playback"); found {
+			if id == "" || id == "." || id == ".." || strings.Contains(id, "/") {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			s.handlePlayback(w, r, code, id)
+			return
+		}
+		if id, ok := contentID(assetRest, ""); ok {
 			s.handleAsset(w, r, code, id)
 		} else {
 			http.Error(w, "not found", http.StatusNotFound)
