@@ -127,6 +127,57 @@ func (s *DirectServer) streamBody(w http.ResponseWriter, status int, stream func
 	}
 }
 
+// acquireStreams admits a streaming response under the per-share and global
+// semaphores (§11). On success it returns a release func and ok=true. On
+// saturation it returns the overload status — 429 (per-share, transient) or
+// 503 (global) — and ok=false; the caller must write that response and not
+// stream.
+func (s *DirectServer) acquireStreams(session *ContentSession) (release func(), status int, ok bool) {
+	var perShare *streamGate
+	if session != nil {
+		perShare = session.Streams
+	}
+	if !perShare.tryAcquire() {
+		return nil, http.StatusTooManyRequests, false
+	}
+	if !s.globalStreams.tryAcquire() {
+		perShare.release()
+		return nil, http.StatusServiceUnavailable, false
+	}
+	return func() {
+		s.globalStreams.release()
+		perShare.release()
+	}, 0, true
+}
+
+// writeOverloaded writes the overload response with a bounded-retry hint
+// (§11). It clears streaming headers that a handler may have staged before the
+// admission check so the short error body is not contradicted by a stale
+// Content-Length.
+func writeOverloaded(w http.ResponseWriter, status int) {
+	h := w.Header()
+	h.Del("Content-Length")
+	h.Del("Content-Range")
+	h.Del("Accept-Ranges")
+	h.Del("Content-Disposition")
+	h.Set("Retry-After", "1")
+	http.Error(w, http.StatusText(status), status)
+}
+
+// streamBodyLimited is streamBody gated by the per-share + global streaming
+// semaphores. When saturated it writes the overload response (429/503) and
+// returns without streaming; otherwise the release is deferred so the slot is
+// freed on success, pre-first-byte error, and the mid-stream abort panic alike.
+func (s *DirectServer) streamBodyLimited(session *ContentSession, w http.ResponseWriter, status int, stream func(dst io.Writer) error) {
+	release, overload, ok := s.acquireStreams(session)
+	if !ok {
+		writeOverloaded(w, overload)
+		return
+	}
+	defer release()
+	s.streamBody(w, status, stream)
+}
+
 // resolveAndMember resolves the share and verifies {id} ∈ the snapshot
 // membership. It writes the mapped response (404/403/503) and returns ok=false
 // when the request must not proceed.
@@ -259,7 +310,7 @@ func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code,
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+	s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
 		_, err := session.Backend.GetFile(r.Context(), id, dst)
 		return err
 	})
@@ -330,7 +381,7 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 
 	if !known {
 		// Unknown total: ignore Range, serve 200 full body, no Accept-Ranges.
-		s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+		s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
 			_, err := session.Backend.GetVideoPlayback(r.Context(), id, dst)
 			return err
 		})
@@ -346,7 +397,7 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 	if r.Header.Get("Range") == "" {
 		// No Range header: serve the full body.
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+		s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
 			_, err := session.Backend.GetVideoPlayback(r.Context(), id, dst)
 			return err
 		})
@@ -364,7 +415,7 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, length))
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	limit := end - start + 1
-	s.streamBody(w, http.StatusPartialContent, func(dst io.Writer) error {
+	s.streamBodyLimited(session, w, http.StatusPartialContent, func(dst io.Writer) error {
 		bw := &boundedWriter{w: dst, limit: limit}
 		_, err := session.Backend.GetVideoPlaybackRange(r.Context(), id, start, bw)
 		if errors.Is(err, errBoundReached) {
@@ -553,7 +604,7 @@ func (s *DirectServer) handleArchivePart(w http.ResponseWriter, r *http.Request,
 	defer func() {
 		session.Archives.endPart(txn, part, completed)
 	}()
-	s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+	s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
 		_, err := session.Backend.DownloadArchive(streamCtx, p.AssetIDs, dst)
 		if err == nil {
 			completed = true

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // CertProvider supplies the current serving certificate. The cert Manager
@@ -59,6 +60,11 @@ type DirectServer struct {
 	binder          *Binder
 	resolver        Resolver
 
+	// globalStreams bounds the total number of simultaneous streaming
+	// responses (asset/video/archive parts) across all shares (§11). A nil
+	// gate means unlimited.
+	globalStreams *streamGate
+
 	// connStates maps each raw net.Conn to its per-connection *connState.
 	// The key is the exact conn handed to ConnContext and later to ConnState
 	// on StateClosed — the same object for the connection's entire lifetime
@@ -80,6 +86,7 @@ func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker
 	return &DirectServer{
 		namespace: namespace, baseDomain: baseDomain, port: port, certs: certs, gate: gate,
 		maxContentBytes: maxContentBytes, binder: binder,
+		globalStreams: newStreamGate(globalStreamLimit),
 	}
 }
 
@@ -350,6 +357,64 @@ type connState struct {
 
 type connStateKey struct{}
 
+// Server resource limits (§11): explicit header/keep-alive timeouts and the
+// streaming semaphore capacities.
+const (
+	// readHeaderTimeout bounds how long a client may take to send request
+	// headers (slowloris protection).
+	readHeaderTimeout = 10 * time.Second
+	// idleTimeout bounds keep-alive connections between requests. The
+	// on-demand port's own idle close (§4.7 hold) governs the mapping; this
+	// only bounds the HTTP keep-alive.
+	idleTimeout = 120 * time.Second
+	// maxHeaderBytes bounds the total size of request headers.
+	maxHeaderBytes = 1 << 20
+
+	// perShareStreamLimit bounds simultaneous streaming responses per share.
+	perShareStreamLimit = 4
+	// globalStreamLimit bounds simultaneous streaming responses across shares.
+	globalStreamLimit = 32
+)
+
+// streamGate is a counting semaphore that admits at most n simultaneous
+// streaming responses and fails fast (rather than blocking) when saturated. A
+// nil gate (or one built with a non-positive limit) is unlimited: tryAcquire
+// always succeeds and release is a no-op.
+type streamGate struct {
+	slots chan struct{}
+}
+
+// newStreamGate returns a gate with capacity n. A non-positive n yields a nil
+// (unlimited) gate.
+func newStreamGate(n int) *streamGate {
+	if n <= 0 {
+		return nil
+	}
+	return &streamGate{slots: make(chan struct{}, n)}
+}
+
+// tryAcquire attempts to take a slot without blocking. A nil receiver is
+// unlimited and always succeeds.
+func (g *streamGate) tryAcquire() bool {
+	if g == nil {
+		return true
+	}
+	select {
+	case g.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// release returns a slot. It is a no-op on a nil receiver.
+func (g *streamGate) release() {
+	if g == nil {
+		return
+	}
+	<-g.slots
+}
+
 // newHTTPServer builds the fully-wired http.Server: Handler and TLSConfig, plus
 // ConnContext/ConnState that connect each net.Conn to its *connState.
 //
@@ -361,8 +426,11 @@ type connStateKey struct{}
 // and ends the session.
 func (s *DirectServer) newHTTPServer() *http.Server {
 	return &http.Server{
-		Handler:   s.Handler(),
-		TLSConfig: s.TLSConfig(),
+		Handler:           s.Handler(),
+		TLSConfig:         s.TLSConfig(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			cs := &connState{}
 			s.connStates.Store(c, cs)

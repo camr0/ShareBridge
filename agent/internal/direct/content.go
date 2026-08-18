@@ -48,6 +48,11 @@ type ContentSession struct {
 	MaxDownloads int
 	Ledger       *Ledger
 	Archives     *ArchiveRegistry
+
+	// Streams is the per-share streaming semaphore (§11), stable across the
+	// session's lifetime (like Ledger and Archives). A nil gate means
+	// unlimited streaming admission.
+	Streams *streamGate
 }
 
 // Ledger is the per-session download-accounting ledger. It tracks the committed
@@ -141,6 +146,7 @@ type SnapshotManager struct {
 	maxDownloads int
 	ledger       *Ledger
 	archives     *ArchiveRegistry
+	streams      *streamGate
 	now          func() time.Time
 	building     bool
 	done         chan struct{}
@@ -158,6 +164,7 @@ func NewSnapshotManager(backend ContentBackend, maxDownloads int, poll time.Dura
 		maxDownloads: maxDownloads,
 		ledger:       ledger,
 		archives:     archives,
+		streams:      newStreamGate(perShareStreamLimit),
 		poll:         poll,
 		now:          time.Now,
 	}
@@ -231,6 +238,7 @@ func (m *SnapshotManager) doBuild(ctx context.Context) error {
 		MaxDownloads: m.maxDownloads,
 		Ledger:       m.ledger,
 		Archives:     m.archives,
+		Streams:      m.streams,
 	}
 	// Membership changed: roll back any open archive transactions (release their
 	// reservations) atomically with the swap (§4.6/§5.2).
