@@ -45,14 +45,21 @@ func contentID(rest, prefix string) (string, bool) {
 	return id, true
 }
 
+// contentSecurityPolicy is the §4.8 CSP: script-src stays strict (no inline
+// scripts, no onclick handlers); style-src allows inline style attributes
+// because the lightGallery runtime and gallery.js set style/style.cssText at
+// runtime; img/media/connect are same-origin only.
+const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; media-src 'self'; connect-src 'self'"
+
 // setSecurityHeaders applies the shared security headers for content responses
 // (§4.8): no sniffing, no caching (the share is ephemeral and revocable), no
-// referrer.
+// referrer, and the CSP.
 func setSecurityHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Cache-Control", "no-store")
 	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Content-Security-Policy", contentSecurityPolicy)
 }
 
 // sanitizeFilename strips path separators and control characters from a

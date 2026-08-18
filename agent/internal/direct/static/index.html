@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShareBridge</title>
+  <base href="/s/__CODE__/">
+  <link rel="stylesheet" href="static/lightgallery/lightgallery.css">
+  <link rel="stylesheet" href="static/gallery.css">
+</head>
+<body>
+  <h2>ShareBridge</h2>
+  <div id="status" aria-live="polite"></div>
+  <div id="download-warning" class="download-warning hidden" role="status" aria-live="polite"></div>
+
+  <!-- The gallery is the Phase-3 recipient UI. The join/password/file-browser
+       sections below are retained as reference markup for the WebDAV phase and
+       are not wired to any handler here (their inline onclick handlers were
+       removed to satisfy the script-src 'self' CSP). -->
+  <div id="password-section" class="hidden">
+    <p>This share is password protected.</p>
+    <input id="password-input" type="password" placeholder="Enter password" />
+    <button type="button" id="unlock-button">Unlock</button>
+    <div id="password-error"></div>
+  </div>
+  <div id="connection-status" class="hidden">
+    <span id="connection-type" class="connection-badge">● Connected</span>
+  </div>
+  <section id="gallery-section">
+    <div id="gallery-root"></div>
+  </section>
+  <div id="breadcrumb" class="hidden"></div>
+  <div id="file-list" class="hidden"></div>
+  <div id="join-section" class="hidden">
+    <input id="code" placeholder="Enter session code" autocomplete="off" />
+    <br>
+    <button type="button" id="join-button">Join</button>
+  </div>
+  <script src="static/lightgallery/lightgallery.es5.min.js"></script>
+  <script type="module" src="static/app.js"></script>
+</body>
+</html>

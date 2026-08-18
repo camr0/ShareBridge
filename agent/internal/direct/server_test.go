@@ -356,7 +356,7 @@ func TestServerDownloadTracksActivityAndExactPath(t *testing.T) {
 	}
 }
 
-func TestServerPageHasDownloadLinksAndContentLength(t *testing.T) {
+func TestServerPageServesGalleryHTMLAndDownloadContentLength(t *testing.T) {
 	ns, base := "sbdeadbeef", "example.com"
 	cert := testServerCert(t, ns, base)
 	gate := NewSignalGate("a", func(string, RouteKind) bool { return true })
@@ -392,12 +392,25 @@ func TestServerPageHasDownloadLinksAndContentLength(t *testing.T) {
 		return resp
 	}
 
-	// Page must advertise a 100 MB download link.
+	// The page must be the embedded recipient gallery: code-substituted <base>,
+	// the gallery root container, the §4.8 CSP, and no inline handlers.
 	page := get("/s/abc")
 	body, _ := io.ReadAll(page.Body)
 	page.Body.Close()
-	if !strings.Contains(string(body), "/s/abc/download?size=104857600") {
-		t.Fatalf("page missing 100 MB download link:\n%s", body)
+	if ct := page.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("page Content-Type = %q, want text/html", ct)
+	}
+	if got := page.Header.Get("Content-Security-Policy"); !strings.Contains(got, "script-src 'self'") {
+		t.Fatalf("page CSP = %q, want script-src 'self'", got)
+	}
+	if !strings.Contains(string(body), `id="gallery-root"`) {
+		t.Fatalf("page missing gallery root:\n%s", body)
+	}
+	if !strings.Contains(string(body), `<base href="/s/abc/">`) {
+		t.Fatalf("page missing code-substituted base:\n%s", body)
+	}
+	if strings.Contains(string(body), "onclick=") {
+		t.Fatalf("page contains inline onclick (forbidden by CSP):\n%s", body)
 	}
 
 	// Download must set Content-Length to the exact requested size.

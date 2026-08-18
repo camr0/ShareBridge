@@ -2,6 +2,7 @@
 package direct
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -135,6 +136,12 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/s/"+code)
 	switch {
+	case rest == "/static/" || strings.HasPrefix(rest, "/static/"):
+		// Code-scoped static UI assets. These are the same for every share and
+		// do not require content resolution (the Binder has already authorized
+		// the code against the admitted origin).
+		s.handleStatic(w, r, rest)
+		return
 	case rest == "/probe" || strings.HasPrefix(rest, "/probe?"):
 		// The reachability probe is a control-plane liveness check, not a
 		// recipient session, so it must not participate in activity tracking
@@ -251,14 +258,51 @@ func (s *DirectServer) handleProbe(w http.ResponseWriter, r *http.Request, code 
 }
 
 func (s *DirectServer) handlePage(w http.ResponseWriter, r *http.Request, code string) {
+	page, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>ShareBridge direct</title></head>
-<body><h1>ShareBridge direct</h1><p>serving %[1]s P2P over direct HTTPS</p>
-<ul>
-<li><a href="/s/%[1]s/download?size=10485760">Download 10 MB test file</a></li>
-<li><a href="/s/%[1]s/download?size=104857600">Download 100 MB test file</a></li>
-<li><a href="/s/%[1]s/download?size=1073741824">Download 1 GB test file</a></li>
-</ul></body></html>`, code)
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// The embedded page uses a <base href="/s/__CODE__/"> placeholder so its
+	// relative asset references resolve under the code-prefixed namespace.
+	_, _ = w.Write(bytes.ReplaceAll(page, []byte("__CODE__"), []byte(code)))
+}
+
+// handleStatic serves one embedded static UI asset under /s/{code}/static/….
+// The name is strictly a single relative path under the embedded static/ tree;
+// dot segments and absolute paths are rejected so a traversal never escapes
+// the embed.FS.
+func (s *DirectServer) handleStatic(w http.ResponseWriter, r *http.Request, rest string) {
+	name := strings.TrimPrefix(rest, "/static/")
+	if name == "" || name == "." || name == ".." || strings.Contains(name, "..") ||
+		strings.HasPrefix(name, "/") || strings.Contains(name, "\\") {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	f, err := staticFS.Open("static/" + name)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	rs, ok := f.(io.ReadSeeker)
+	if !ok {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	setSecurityHeaders(w)
+	http.ServeContent(w, r, name, info.ModTime(), rs)
 }
 
 func (s *DirectServer) handleDownload(w http.ResponseWriter, r *http.Request) {
