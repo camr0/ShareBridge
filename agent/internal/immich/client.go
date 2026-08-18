@@ -605,9 +605,59 @@ func (c *Client) HeadVideoPlayback(ctx context.Context, id string) (int64, error
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HEAD /video/playback returned %s", resp.Status)
+		return 0, responseStatusError(req, resp)
 	}
 	return resp.ContentLength, nil
+}
+
+// ThumbnailInfo returns the Content-Type and authoritative Content-Length of an
+// asset's thumbnail via a HEAD request, without consuming the body. known is
+// false when the upstream omits Content-Length.
+func (c *Client) ThumbnailInfo(ctx context.Context, id string) (string, int64, bool, error) {
+	return c.headMetadata(ctx, c.assetURL(id, "/thumbnail"))
+}
+
+// PreviewInfo returns the Content-Type and authoritative Content-Length of an
+// asset's lightbox preview (the ?size=preview thumbnail) via a HEAD request.
+// known is false when the upstream omits Content-Length.
+func (c *Client) PreviewInfo(ctx context.Context, id string) (string, int64, bool, error) {
+	u, _ := url.Parse(c.assetURL(id, "/thumbnail"))
+	q := u.Query()
+	q.Set("size", "preview")
+	u.RawQuery = q.Encode()
+	return c.headMetadata(ctx, u.String())
+}
+
+// PlaybackInfo returns the authoritative Content-Length of the transcoded video
+// stream via a HEAD request. known is false when the upstream omits the length
+// (e.g. chunked transfer encoding); in that case length is 0.
+func (c *Client) PlaybackInfo(ctx context.Context, id string) (int64, bool, error) {
+	_, length, known, err := c.headMetadata(ctx, c.assetURL(id, "/video/playback"))
+	return length, known, err
+}
+
+// headMetadata performs a HEAD request and reports the upstream Content-Type and
+// Content-Length without consuming the response body. known is false when the
+// upstream omits Content-Length (resp.ContentLength == -1); in that case length
+// is normalized to 0.
+func (c *Client) headMetadata(ctx context.Context, rawURL string) (contentType string, length int64, known bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
+	if err != nil {
+		return "", 0, false, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", 0, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, false, responseStatusError(req, resp)
+	}
+	length = resp.ContentLength
+	if length < 0 {
+		return resp.Header.Get("Content-Type"), 0, false, nil
+	}
+	return resp.Header.Get("Content-Type"), length, true, nil
 }
 
 func (c *Client) getAsset(ctx context.Context, rawURL string, startOffset int64, w io.Writer) (int64, error) {
@@ -626,7 +676,7 @@ func (c *Client) getAsset(ctx context.Context, rawURL string, startOffset int64,
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		return 0, fmt.Errorf("range not satisfiable: start_offset=%d", startOffset)
+		return 0, &UpstreamError{Status: resp.StatusCode, Detail: fmt.Sprintf("range not satisfiable: start_offset=%d", startOffset)}
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return 0, responseStatusError(req, resp)
@@ -667,7 +717,20 @@ func (c *Client) doJSONStatus(req *http.Request, status int, out any) error {
 
 func responseStatusError(req *http.Request, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPErrorBody))
-	return fmt.Errorf("%s %s returned %s: %s", req.Method, req.URL.Path, resp.Status, strings.TrimSpace(string(body)))
+	detail := strings.TrimSpace(string(body))
+	if detail == "" {
+		detail = fmt.Sprintf("%s %s returned %s", req.Method, req.URL.Path, resp.Status)
+	} else {
+		detail = fmt.Sprintf("%s %s returned %s: %s", req.Method, req.URL.Path, resp.Status, detail)
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return &AuthError{Status: resp.StatusCode, Detail: detail}
+	case http.StatusNotFound:
+		return &NotFoundError{Detail: detail}
+	default:
+		return &UpstreamError{Status: resp.StatusCode, Detail: detail}
+	}
 }
 
 func (c *Client) buildSharedLinkURL() *url.URL {
