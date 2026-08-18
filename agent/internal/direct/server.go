@@ -4,6 +4,7 @@ package direct
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -42,6 +43,7 @@ type DirectServer struct {
 	gate            *SignalGate
 	maxContentBytes int64
 	binder          *Binder
+	resolver        Resolver
 
 	// connStates maps each raw net.Conn to its per-connection *connState.
 	// The key is the exact conn handed to ConnContext and later to ConnState
@@ -68,6 +70,14 @@ func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker
 }
 
 func (s *DirectServer) Binder() *Binder { return s.binder }
+
+// SetResolver installs the share-code resolver consulted for content routes.
+// It is a setter (not a constructor argument) so the daemon can wire the
+// registry after the server is built. When no resolver is set, content routes
+// fail closed with 404.
+func (s *DirectServer) SetResolver(r Resolver) {
+	s.resolver = r
+}
 
 // TLSConfig returns a tls.Config whose GetConfigForClient performs SNI
 // admission and, on success, returns the current serving certificate. An
@@ -106,18 +116,55 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case rest == "/probe" || strings.HasPrefix(rest, "/probe?"):
 		// The reachability probe is a control-plane liveness check, not a
-		// recipient session, so it must not participate in activity tracking.
+		// recipient session, so it must not participate in activity tracking
+		// or content resolution.
 		s.handleProbe(w, r, code)
 		return
 	case rest == "/" || rest == "":
+		if _, ok := s.resolveContent(w, code); !ok {
+			return
+		}
 		s.activity(w, r, code)
 		s.handlePage(w, r, code)
 	case rest == "/download":
+		if _, ok := s.resolveContent(w, code); !ok {
+			return
+		}
 		s.activity(w, r, code)
 		s.handleDownload(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// resolveContent resolves the share code to its content session, writing the
+// mapped error response (404 unknown / 403 forbidden / 503 unready) and
+// returning ok=false when the request must not proceed. A nil resolver fails
+// closed with 404.
+func (s *DirectServer) resolveContent(w http.ResponseWriter, code string) (*ContentSession, bool) {
+	if s.resolver == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return nil, false
+	}
+	session, err := s.resolver.Resolve(code)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrUnknown):
+			http.Error(w, "not found", http.StatusNotFound)
+		case errors.Is(err, ErrForbidden):
+			http.Error(w, "forbidden", http.StatusForbidden)
+		case errors.Is(err, ErrUnready):
+			http.Error(w, "content not ready", http.StatusServiceUnavailable)
+		default:
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+		}
+		return nil, false
+	}
+	if session == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return nil, false
+	}
+	return session, true
 }
 
 // handleProbe serves the reachability probe. It verifies the nonce was

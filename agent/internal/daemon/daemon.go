@@ -236,6 +236,7 @@ type Session struct {
 
 	IsPasswordProtected bool
 	immichClient        immichGalleryBackend
+	immich              *immich.Client // concrete client for the content layer
 	webdavClient        *cloudwebdav.Client
 	peers               map[string]*peer.Peer           // peerID -> Peer
 	relayChannels       map[string]relayTransferChannel // sid -> relay channel
@@ -251,7 +252,8 @@ type Daemon struct {
 	store     StoreInterface
 	signaling SignalingClientInterface
 	direct    *directState
-	sessions  map[string]*Session // code -> Session
+	resolver  *direct.ResolverRegistry // share code -> SnapshotManager
+	sessions  map[string]*Session      // code -> Session
 	mu        sync.RWMutex
 
 	webServer          WebServer
@@ -440,6 +442,9 @@ func (d *Daemon) syncDirectServe() {
 	// admission + per-request authorization). A private server binder would
 	// reject every direct handshake as an unknown origin.
 	ds.server = direct.NewDirectServerWithBinder(ds.namespace, ds.baseDomain, ds.port, ds.cert, ds.gate, directMaxContentBytes, ds.binder)
+	if d.resolver != nil {
+		ds.server.SetResolver(d.resolver)
+	}
 	// Re-Allow currently-bound origins into the fresh binder (atomic under
 	// ds.mu). Origins from a previous namespace are rejected by Allow and are
 	// re-bound once the control re-allocates them for the new namespace.
@@ -536,6 +541,7 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 		configMgr: cfgMgr,
 		store:     st,
 		signaling: sig,
+		resolver:  direct.NewResolverRegistry(),
 		sessions:  make(map[string]*Session),
 		nonces:    make(map[string]nonceEntry),
 		startTime: time.Now(),
@@ -554,6 +560,7 @@ func NewWithSignaling(cfgMgr ConfigManagerInterface, st StoreInterface, sig Sign
 		configMgr: cfgMgr,
 		store:     st,
 		signaling: sig,
+		resolver:  direct.NewResolverRegistry(),
 		sessions:  make(map[string]*Session),
 		nonces:    make(map[string]nonceEntry),
 	}, nil
@@ -1860,13 +1867,15 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 				Downloads:           entry.Downloads,
 				RelayOnly:           entry.RelayOnly,
 				CreatedAt:           entry.CreatedAt,
-				immichClient:        client,
+				immichClient:        immichTransferAdapter{client: client},
+				immich:              client,
 				peers:               make(map[string]*peer.Peer),
 				relayChannels:       make(map[string]relayTransferChannel),
 			}
 			d.mu.Lock()
 			d.sessions[code] = session
 			d.mu.Unlock()
+			d.hydrateContentSession(session)
 
 			if reconnected {
 				log.Printf("Immich session reconnected - code: %s", code)
@@ -1972,9 +1981,12 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 		seen[link.Key] = link
 
 		d.mu.RLock()
-		_, exists := d.sessions[link.Key]
+		existing, exists := d.sessions[link.Key]
 		d.mu.RUnlock()
 		if exists {
+			// Keep already-registered shares fresh: re-drive their snapshot
+			// Build so the fail-closed refresh clock stays ahead of 2×poll.
+			d.hydrateContentSession(existing)
 			continue
 		}
 
@@ -2083,7 +2095,8 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		IsPasswordProtected: passwordProtected,
 		RelayOnly:           relayOnly,
 		CreatedAt:           now,
-		immichClient:        client,
+		immichClient:        immichTransferAdapter{client: client},
+		immich:              client,
 		peers:               make(map[string]*peer.Peer),
 		relayChannels:       make(map[string]relayTransferChannel),
 	}
@@ -2099,6 +2112,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		_ = d.unregisterShare(ctx, code)
 		return nil, err
 	}
+	d.hydrateContentSession(session)
 	return session, nil
 }
 
@@ -2109,17 +2123,42 @@ func (d *Daemon) unregisterShare(ctx context.Context, code string) error {
 	return d.signaling.Send(ctx, map[string]string{"type": "unregister_share", "code": code})
 }
 
-func (d *Daemon) newImmichClient(code string) (immichGalleryBackend, error) {
-	client, err := immich.New(immich.Config{
+func (d *Daemon) newImmichClient(code string) (*immich.Client, error) {
+	return immich.New(immich.Config{
 		BaseURL:     d.config.ImmichURL,
 		AllowedHost: d.config.ImmichAllowedHost,
 		APIKey:      d.config.ImmichAPIKey,
 		ShareKey:    code,
 	})
-	if err != nil {
-		return nil, err
+}
+
+// hydrateContentSession ensures a SnapshotManager exists in the registry for
+// the session's share and drives a snapshot Build. Build runs from a
+// daemon/background context, never the HTTP request context: a request-scoped
+// context cancelled during ListGallery would wrongly advance the fail-closed
+// clock.
+func (d *Daemon) hydrateContentSession(session *Session) {
+	if session == nil || session.immich == nil || d.resolver == nil {
+		return
 	}
-	return immichTransferAdapter{client: client}, nil
+	mgr := d.resolver.Get(session.Code)
+	if mgr == nil {
+		mgr = direct.NewSnapshotManager(session.immich, session.MaxDownloads, d.immichPollInterval())
+		d.resolver.Put(session.Code, mgr)
+	}
+	if err := mgr.Build(context.Background()); err != nil {
+		log.Printf("hydrate content snapshot for %s: %v", session.Code, err)
+	}
+}
+
+// immichPollInterval returns the configured Immich poll interval (default 30s),
+// used as the SnapshotManager's fail-closed refresh bound.
+func (d *Daemon) immichPollInterval() time.Duration {
+	interval := time.Duration(d.config.ImmichPollInterval) * time.Second
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	return interval
 }
 
 func (d *Daemon) relayStaticPubHex() (string, error) {

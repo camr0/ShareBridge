@@ -65,6 +65,7 @@ func TestServerServesAdmittedSNI(t *testing.T) {
 	gate := NewSignalGate("a", func(string, RouteKind) bool { return true })
 	srv := NewDirectServer(ns, base, nil, &rotatableCerts{cert}, gate, 1<<20)
 	_ = srv.Binder().Allow("demo."+ns+"."+base, RouteDirect, "abc")
+	srv.SetResolver(stubResolver{})
 
 	ts := httptest.NewUnstartedServer(srv.Handler())
 	ts.TLS = srv.TLSConfig()
@@ -226,6 +227,7 @@ func TestServerConnSessionTracking(t *testing.T) {
 	tr := &recordingTracker{}
 	srv := NewDirectServer(ns, base, tr, &rotatableCerts{cert}, gate, 1<<20)
 	_ = srv.Binder().Allow("demo."+ns+"."+base, RouteDirect, "abc")
+	srv.SetResolver(stubResolver{})
 
 	hs := srv.newHTTPServer()
 	// Force HTTP/1.1 so the two requests deterministically share one conn.
@@ -302,6 +304,7 @@ func TestServerDownloadTracksActivityAndExactPath(t *testing.T) {
 	tr := &recordingTracker{}
 	srv := NewDirectServer(ns, base, tr, &rotatableCerts{cert}, gate, 1<<20)
 	_ = srv.Binder().Allow("demo."+ns+"."+base, RouteDirect, "abc")
+	srv.SetResolver(stubResolver{})
 
 	hs := srv.newHTTPServer()
 	hs.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
@@ -359,6 +362,7 @@ func TestServerPageHasDownloadLinksAndContentLength(t *testing.T) {
 	gate := NewSignalGate("a", func(string, RouteKind) bool { return true })
 	srv := NewDirectServer(ns, base, &recordingTracker{}, &rotatableCerts{cert}, gate, 1<<30)
 	_ = srv.Binder().Allow("demo."+ns+"."+base, RouteDirect, "abc")
+	srv.SetResolver(stubResolver{})
 
 	hs := srv.newHTTPServer()
 	hs.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}

@@ -748,6 +748,7 @@ func TestDirectServerEndToEndSNIAdmissionAndDownload(t *testing.T) {
 	}
 	d := &Daemon{direct: ds}
 	d.syncDirectServe()
+	ds.server.SetResolver(stubResolver{})
 
 	const code = "SHARE123"
 	origin := testOriginFor("sbabc123")
