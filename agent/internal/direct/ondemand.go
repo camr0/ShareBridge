@@ -86,6 +86,7 @@ type portReply struct {
 	open      bool
 	sessionID string
 	granted   int
+	token     uint64
 	err       error
 	wasOpen   bool
 	state     PortState
@@ -96,6 +97,7 @@ type portCommand struct {
 	shareID   string
 	lease     time.Duration
 	sessionID string
+	token     uint64
 	callback  func(old, new PortState, grantedPort int)
 	reply     chan portReply
 }
@@ -227,19 +229,25 @@ func (p *OnDemandPort) EndSession(sessionID string) {
 }
 
 // Begin records an in-flight hold — a long streaming response in progress — so
-// the idle close is paused while at least one hold is active. It is a no-op
-// while the port is closed (there is nothing to hold open).
-func (p *OnDemandPort) Begin() {
+// the idle close is paused while at least one hold is active. It returns an
+// opaque hold token bound to the current open epoch; End(token) ignores a token
+// from a prior epoch (e.g. a deferred release that runs after a force-close and
+// reopen). It is a no-op, returning the zero token, while the port is closed
+// (there is nothing to hold open).
+func (p *OnDemandPort) Begin() uint64 {
 	ch := make(chan portReply, 1)
-	p.send(portCommand{op: opBeginHold, reply: ch})
+	return p.send(portCommand{op: opBeginHold, reply: ch}).token
 }
 
-// End releases one hold previously taken with Begin. When the last hold is
-// released after the idle deadline has already passed, the port closes
-// immediately. It is a no-op if no hold is active (e.g. after a forced Close).
-func (p *OnDemandPort) End() {
+// End releases the hold identified by token, as returned by Begin. A stale
+// token from a prior open epoch — a deferred release that runs after the port
+// was force-closed and reopened for a different stream — is ignored so it can
+// never decrement the new epoch's in-flight count. The zero token is likewise a
+// no-op. When the last hold of the current epoch is released after the idle
+// deadline has already passed, the port closes immediately.
+func (p *OnDemandPort) End(token uint64) {
 	ch := make(chan portReply, 1)
-	p.send(portCommand{op: opEndHold, reply: ch})
+	p.send(portCommand{op: opEndHold, token: token, reply: ch})
 }
 
 // Close removes the mapping immediately and idempotently (lockdown or expiry).
@@ -293,7 +301,8 @@ func (p *OnDemandPort) loop() {
 		renewAt     time.Time // when to renew (while sessions are active)
 		idleAt      time.Time // inactivity close (zero until a session exists)
 		sessions    = map[string]time.Time{}
-		inFlight    int // active streaming holds; pause the idle close while > 0
+		inFlight    int    // active streaming holds; pause the idle close while > 0
+		epoch       uint64 // bumped on each open; hold tokens bind to this epoch
 		seq         uint64
 		timer       portTimer
 		timerC      <-chan time.Time
@@ -416,6 +425,7 @@ func (p *OnDemandPort) loop() {
 					}
 					grantedPort = granted
 					open = true
+					epoch++ // new open epoch: hold tokens from a prior open can no longer match
 					closing = false
 					closeFail = 0
 					renewFailed = false
@@ -493,10 +503,20 @@ func (p *OnDemandPort) loop() {
 				if open {
 					inFlight++
 					rearm()
+					c.reply <- portReply{token: epoch}
+				} else {
+					c.reply <- portReply{}
 				}
-				c.reply <- portReply{}
 
 			case opEndHold:
+				// A stale token from a prior open epoch must not touch the
+				// current epoch's in-flight count: after a force-close and
+				// reopen the epoch has advanced, so the old stream's deferred
+				// release is ignored here.
+				if c.token == 0 || c.token != epoch {
+					c.reply <- portReply{}
+					continue
+				}
 				released := inFlight > 0
 				if released {
 					inFlight--

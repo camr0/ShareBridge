@@ -25,7 +25,7 @@ func TestOnDemandPort_HoldPausesIdleClose(t *testing.T) {
 		t.Fatalf("BeginSession: %v", err)
 	}
 
-	p.Begin() // take the in-flight hold
+	tok := p.Begin() // take the in-flight hold
 
 	// Sleep past the idle deadline: the hold must keep the mapping open.
 	fc.advance(21 * time.Second)
@@ -34,7 +34,7 @@ func TestOnDemandPort_HoldPausesIdleClose(t *testing.T) {
 	}
 
 	// Release the hold: the idle deadline has passed, so the port closes.
-	p.End()
+	p.End(tok)
 	waitFor(t, func() bool { return !p.Open() })
 	fc.advance(closeRetryDelay + time.Millisecond)
 	waitFor(t, func() bool { _, c, _, _ := rm.snapshot(); return c >= 1 })
@@ -55,7 +55,7 @@ func TestOnDemandPort_HoldDoesNotPreventRenewal(t *testing.T) {
 	if _, err := p.BeginSession("share-1"); err != nil {
 		t.Fatalf("BeginSession: %v", err)
 	}
-	p.Begin()
+	_ = p.Begin()
 
 	// The lease (30s) is longer than the idle timeout (20s). Advance past the
 	// idle timeout but before the renewal point: the hold keeps it open.
@@ -72,6 +72,59 @@ func TestOnDemandPort_HoldDoesNotPreventRenewal(t *testing.T) {
 	if !p.Open() {
 		t.Fatalf("port must stay open and renew while held with an active session")
 	}
+}
+
+// TestOnDemandPort_StaleEndAfterReopenIsIgnored reproduces the
+// cross-generation corruption: a stream is force-closed mid-flight (Close), the
+// port is reopened for a different stream, and then the old stream's deferred
+// release runs. The stale End token must not decrement the new epoch's
+// in-flight count, or it would re-enable the idle close this hold exists to
+// prevent.
+func TestOnDemandPort_StaleEndAfterReopenIsIgnored(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	rm := &recordingMapper{}
+	p := newTestPort(fc, rm, 20*time.Second)
+	defer p.Close()
+
+	if err := p.OpenFor("share-1", time.Minute); err != nil {
+		t.Fatalf("OpenFor share-1: %v", err)
+	}
+	if _, err := p.BeginSession("share-1"); err != nil {
+		t.Fatalf("BeginSession share-1: %v", err)
+	}
+	stale := p.Begin() // hold bound to the first open epoch
+
+	// Force-close mid-flight (lockdown / lease-expiry), resetting the hold.
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitFor(t, func() bool { return !p.Open() })
+
+	// Reopen for a different stream; this bumps the open epoch.
+	if err := p.OpenFor("share-2", time.Minute); err != nil {
+		t.Fatalf("OpenFor share-2: %v", err)
+	}
+	if _, err := p.BeginSession("share-2"); err != nil {
+		t.Fatalf("BeginSession share-2: %v", err)
+	}
+	fresh := p.Begin() // hold bound to the new epoch
+	if fresh == stale {
+		t.Fatalf("reopen must issue a fresh epoch token: got %d == stale %d", fresh, stale)
+	}
+
+	// The old stream's deferred release runs now, after the reopen. It must be
+	// ignored, leaving the new hold (inFlight == 1) intact.
+	p.End(stale)
+
+	// Sleep past the idle deadline: the new hold must keep the mapping open.
+	fc.advance(21 * time.Second)
+	if !p.Open() {
+		t.Fatalf("stale End must not release the new hold")
+	}
+
+	// Releasing the new hold with its own token closes the port.
+	p.End(fresh)
+	waitFor(t, func() bool { return !p.Open() })
 }
 
 // TestContentRoutesRecordActivity verifies the carried requirement: the content

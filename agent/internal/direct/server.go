@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // CertProvider supplies the current serving certificate. The cert Manager
@@ -32,13 +33,15 @@ type SessionTracker interface {
 
 // HoldTracker optionally extends SessionTracker with an in-flight hold that
 // pauses the on-demand port's idle close for the lifetime of a long streaming
-// response. Begin is taken on the first body write; End is released when the
-// stream completes or the client disconnects. A SessionTracker that does not
-// implement HoldTracker simply never pauses (the streaming wrapper is skipped).
-// OnDemandPort implements both.
+// response. Begin is taken on the first body write and returns a token bound to
+// the current open epoch; End(token) is released when the stream completes or
+// the client disconnects, and is ignored if the token is stale (from a prior
+// open epoch). A SessionTracker that does not implement HoldTracker simply
+// never pauses (the streaming wrapper is skipped). OnDemandPort implements
+// both.
 type HoldTracker interface {
-	Begin()
-	End()
+	Begin() uint64
+	End(token uint64)
 }
 
 // DirectServer serves the native-HTTPS "direct" data path (placeholder content
@@ -283,21 +286,23 @@ func (s *DirectServer) holdStream(dst io.Writer) (io.Writer, func()) {
 
 // holdWriter wraps a streaming response body so a long transfer holds the
 // on-demand port open from the first byte until it is closed. Begin and End
-// are each applied at most once regardless of the write/close pattern.
+// are each applied at most once regardless of the write/close pattern, and the
+// Begin token is captured so a deferred End after a port reopen is ignored.
 type holdWriter struct {
 	io.Writer
 	beginOnce sync.Once
 	endOnce   sync.Once
+	token     atomic.Uint64
 	h         HoldTracker
 }
 
 func (hw *holdWriter) Write(p []byte) (int, error) {
-	hw.beginOnce.Do(hw.h.Begin)
+	hw.beginOnce.Do(func() { hw.token.Store(hw.h.Begin()) })
 	return hw.Writer.Write(p)
 }
 
 func (hw *holdWriter) Close() error {
-	hw.endOnce.Do(hw.h.End)
+	hw.endOnce.Do(func() { hw.h.End(hw.token.Load()) })
 	return nil
 }
 
