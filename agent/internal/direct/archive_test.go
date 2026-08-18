@@ -4,6 +4,7 @@ package direct
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -386,6 +387,103 @@ func TestArchiveContentGenChangeInvalidates(t *testing.T) {
 	}
 	if got := ledger.Downloads(); got != 0 {
 		t.Fatalf("downloads after gen-change part: want 0, got %d", got)
+	}
+}
+
+func TestArchiveInvalidateTombstoneReturnsForbidden(t *testing.T) {
+	backend := &archiveBackend{
+		handlerBackend: &handlerBackend{},
+		info: func(context.Context) (immich.AlbumDownload, error) {
+			return immich.AlbumDownload{
+				AlbumName: "A",
+				Archives:  []immich.DownloadArchive{{AssetIDs: []string{"a1"}, Size: 1}},
+			}, nil
+		},
+	}
+	ledger := NewLedger(5)
+	handler, res := newArchiveHandler(t, backend, map[string]struct{}{"a1": {}}, ledger, 1, time.Hour, time.Now)
+
+	resp := getManifest(t, handler)
+	if got := ledger.Reservations(); got != 1 {
+		t.Fatalf("reservations after manifest: want 1, got %d", got)
+	}
+
+	// Drive the real invalidate() path (as SnapshotManager.doBuild does on a
+	// membership change), not a manual session swap.
+	res.session.Archives.invalidate()
+
+	if got := ledger.Reservations(); got != 0 {
+		t.Fatalf("reservations after invalidate: want 0, got %d", got)
+	}
+
+	// A part fetch for an invalidated token must be 403 (not 404).
+	rr := doRequest(handler, http.MethodGet, "/s/abc/archive/"+resp.Token+"/0")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("part after invalidate: status = %d, want 403", rr.Code)
+	}
+	if got := ledger.Downloads(); got != 0 {
+		t.Fatalf("downloads after invalidate: want 0, got %d", got)
+	}
+}
+
+func TestArchiveInvalidateCancelsInFlightStream(t *testing.T) {
+	started := make(chan struct{})
+	streamErr := make(chan error, 1)
+	backend := &archiveBackend{
+		handlerBackend: &handlerBackend{},
+		info: func(context.Context) (immich.AlbumDownload, error) {
+			return immich.AlbumDownload{
+				AlbumName: "A",
+				Archives:  []immich.DownloadArchive{{AssetIDs: []string{"a1"}, Size: 1}},
+			}, nil
+		},
+		stream: func(ctx context.Context, _ []string, _ io.Writer) (int64, error) {
+			close(started)
+			select {
+			case <-ctx.Done():
+				streamErr <- ctx.Err()
+				return 0, ctx.Err()
+			case <-time.After(5 * time.Second):
+				streamErr <- nil
+				return 0, nil
+			}
+		},
+	}
+	ledger := NewLedger(5)
+	handler, res := newArchiveHandler(t, backend, map[string]struct{}{"a1": {}}, ledger, 1, time.Hour, time.Now)
+
+	resp := getManifest(t, handler)
+	if got := ledger.Reservations(); got != 1 {
+		t.Fatalf("reservations after manifest: want 1, got %d", got)
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- doRequest(handler, http.MethodGet, "/s/abc/archive/"+resp.Token+"/0")
+	}()
+	<-started // the part stream is in flight
+
+	// invalidate() must atomically cancel the in-flight stream.
+	res.session.Archives.invalidate()
+
+	select {
+	case err := <-streamErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("stream error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("invalidate() did not cancel the in-flight stream")
+	}
+
+	rr := <-done
+	if rr.Code == http.StatusOK {
+		t.Fatalf("part status = 200, want non-200 after invalidate")
+	}
+	if got := ledger.Reservations(); got != 0 {
+		t.Fatalf("reservations after invalidate: want 0, got %d", got)
+	}
+	if got := ledger.Downloads(); got != 0 {
+		t.Fatalf("downloads after invalidate: want 0, got %d", got)
 	}
 }
 

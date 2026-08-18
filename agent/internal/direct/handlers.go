@@ -443,19 +443,20 @@ func (s *DirectServer) handleArchiveManifest(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
-		// Re-check the generation under the per-share state lock (§11): if the
-		// membership advanced while the upstream fetch was in flight, discard
-		// the template and retry against the new generation.
-		if re, err := s.resolver.Resolve(code); err == nil && re != nil && re.ContentGen != session.ContentGen {
-			if attempts >= maxArchiveManifestRetries {
-				http.Error(w, "content changed, retry", http.StatusServiceUnavailable)
-				return
-			}
-			continue
-		}
-
-		token, err := session.Archives.mint(session, parts)
+		// Re-check the generation and mint atomically under the per-share state
+		// lock (§11): if the membership advanced while the upstream fetch was
+		// in flight, discard the template and retry against the new generation;
+		// otherwise mint a transaction bound to the generation that was current
+		// at check time — a generation advance cannot interleave the two.
+		token, err := mintArchiveTransaction(s.resolver, code, session, parts)
 		if err != nil {
+			if errors.Is(err, errArchiveGenChanged) {
+				if attempts >= maxArchiveManifestRetries {
+					http.Error(w, "content changed, retry", http.StatusServiceUnavailable)
+					return
+				}
+				continue
+			}
 			http.Error(w, http.StatusText(archiveStatus(err)), archiveStatus(err))
 			return
 		}
@@ -465,6 +466,38 @@ func (s *DirectServer) handleArchiveManifest(w http.ResponseWriter, r *http.Requ
 		})
 		return
 	}
+}
+
+// archiveMinter is an optional Resolver capability: it mints an archive
+// transaction atomically under the per-share state lock. ResolverRegistry
+// implements it; test doubles that do not fall back to a re-resolve + mint in
+// mintArchiveTransaction.
+type archiveMinter interface {
+	MintArchive(code string, expectedGen uint64, parts []ArchivePart) (string, error)
+}
+
+// mintArchiveTransaction atomically re-checks the content generation and mints
+// the transaction. A resolver implementing archiveMinter does both under the
+// per-share state lock; otherwise it falls back to a re-resolve + mint (the
+// test double path, which is not concurrent with a real SnapshotManager).
+func mintArchiveTransaction(r Resolver, code string, session *ContentSession, parts []ArchivePart) (string, error) {
+	if m, ok := r.(archiveMinter); ok {
+		return m.MintArchive(code, session.ContentGen, parts)
+	}
+	re, err := r.Resolve(code)
+	if err != nil {
+		return "", err
+	}
+	if re == nil {
+		return "", ErrUnknown
+	}
+	if re.Archives == nil {
+		return "", errArchiveNotFound
+	}
+	if re.ContentGen != session.ContentGen {
+		return "", errArchiveGenChanged
+	}
+	return re.Archives.mint(re, parts)
 }
 
 // handleArchivePart serves GET/HEAD /s/{code}/archive/{token}/{part} (§4.6): it
@@ -482,7 +515,7 @@ func (s *DirectServer) handleArchivePart(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	p, txn, err := session.Archives.beginPart(session, token, part)
+	p, txn, streamCtx, err := session.Archives.beginPart(r.Context(), session, token, part)
 	if err != nil {
 		http.Error(w, http.StatusText(archiveStatus(err)), archiveStatus(err))
 		return
@@ -499,14 +532,15 @@ func (s *DirectServer) handleArchivePart(w http.ResponseWriter, r *http.Request,
 	}
 
 	// completed is set by the stream closure and read by the deferred endPart,
-	// which runs on every exit path — success, pre-first-byte error, and the
-	// mid-stream abort panic — so the pin is always released exactly once.
+	// which runs on every exit path — success, pre-first-byte error, the
+	// mid-stream abort panic, and the invalidate()-triggered cancellation — so
+	// the pin is always released exactly once.
 	completed := false
 	defer func() {
 		session.Archives.endPart(txn, part, completed)
 	}()
 	s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
-		_, err := session.Backend.DownloadArchive(r.Context(), p.AssetIDs, dst)
+		_, err := session.Backend.DownloadArchive(streamCtx, p.AssetIDs, dst)
 		if err == nil {
 			completed = true
 		}

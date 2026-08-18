@@ -333,6 +333,44 @@ func (r *ResolverRegistry) Resolve(code string) (*ContentSession, error) {
 	return m.Resolve()
 }
 
+// MintArchive mints an archive transaction for code atomically under the
+// per-share state lock: it re-resolves the current session and, only if its
+// generation still equals expectedGen, mints a fresh token + reservation bound
+// to that session. A generation advance between the re-check and the mint is
+// thus impossible (§4.6/§11). It implements the archiveMinter capability used
+// by handleArchiveManifest.
+func (r *ResolverRegistry) MintArchive(code string, expectedGen uint64, parts []ArchivePart) (string, error) {
+	r.mu.Lock()
+	m := r.byCode[code]
+	r.mu.Unlock()
+	if m == nil {
+		return "", ErrUnknown
+	}
+	return m.mintArchive(expectedGen, parts)
+}
+
+// mintArchive holds the per-share state lock across the session re-resolution
+// and the mint, closing the TOCTOU window that a separate re-check + mint would
+// leave open.
+func (m *SnapshotManager) mintArchive(expectedGen uint64, parts []ArchivePart) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.session == nil {
+		return "", ErrUnready
+	}
+	if !m.lastErrAt.IsZero() && m.now().Sub(m.refreshAt) > 2*m.poll {
+		return "", ErrUnready
+	}
+	s := m.session
+	if s.ContentGen != expectedGen {
+		return "", errArchiveGenChanged
+	}
+	if s.Archives == nil {
+		return "", errArchiveNotFound
+	}
+	return s.Archives.mint(s, parts)
+}
+
 var _ Resolver = (*ResolverRegistry)(nil)
 
 // itemsResponse is the lowerCamel wire DTO for /items. immich.Gallery has no
@@ -380,7 +418,8 @@ type ArchiveTransaction struct {
 	done      map[int]bool
 	state     string // open|committed|released
 	expiresAt time.Time
-	pinned    bool // an in-flight part holds the pin
+	pinned    bool               // an in-flight part holds the pin
+	cancel    context.CancelFunc // aborts the in-flight part stream (guarded by mu)
 }
 
 const (
@@ -399,6 +438,9 @@ var (
 	// errArchiveForbidden reports a membership/duplicate/generation failure or
 	// an exhausted download limit (→ 403).
 	errArchiveForbidden = errors.New("direct: archive forbidden")
+	// errArchiveGenChanged reports that the content generation advanced between
+	// a manifest fetch and its mint, so the caller must discard and retry.
+	errArchiveGenChanged = errors.New("direct: archive generation changed")
 )
 
 // templateInflight is the singleflight slot for the upstream
@@ -591,44 +633,46 @@ func (a *ArchiveRegistry) mint(s *ContentSession, parts []ArchivePart) (string, 
 	return token, nil
 }
 
-// beginPart validates a part fetch: the token must exist and be open, the
-// transaction must still be bound to the current generation, the part index must
-// be in range, and every asset ID must still be in the membership. On success it
-// pins the transaction (renewing its TTL) so the reaper cannot expire it
-// mid-stream. The returned part is a deep copy.
-func (a *ArchiveRegistry) beginPart(s *ContentSession, token string, part int) (ArchivePart, *ArchiveTransaction, error) {
+// beginPart validates a part fetch and pins the transaction. It derives a
+// cancelable stream context from ctx and registers its CancelFunc on the
+// transaction (under txn.mu) so invalidate() can atomically abort an in-flight
+// part stream. On success it returns the deep-copied part, the pinned
+// transaction, and the stream context to use for DownloadArchive.
+func (a *ArchiveRegistry) beginPart(ctx context.Context, s *ContentSession, token string, part int) (ArchivePart, *ArchiveTransaction, context.Context, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.reapLocked()
 
 	txn, ok := a.txns[token]
 	if !ok {
-		return ArchivePart{}, nil, errArchiveNotFound
+		return ArchivePart{}, nil, nil, errArchiveNotFound
 	}
 
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
 	if txn.state == txnReleased {
-		return ArchivePart{}, nil, errArchiveForbidden
+		return ArchivePart{}, nil, nil, errArchiveForbidden
 	}
 	if part < 0 || part >= len(txn.Parts) {
-		return ArchivePart{}, nil, errArchiveNotFound
+		return ArchivePart{}, nil, nil, errArchiveNotFound
 	}
 	if txn.ContentGen != s.ContentGen {
 		a.releaseLocked(txn)
-		return ArchivePart{}, nil, errArchiveForbidden
+		return ArchivePart{}, nil, nil, errArchiveForbidden
 	}
 	for _, id := range txn.Parts[part].AssetIDs {
 		if _, ok := s.Membership[id]; !ok {
 			a.releaseLocked(txn)
-			return ArchivePart{}, nil, errArchiveForbidden
+			return ArchivePart{}, nil, nil, errArchiveForbidden
 		}
 	}
 
+	streamCtx, cancel := context.WithCancel(ctx)
+	txn.cancel = cancel
 	txn.pinned = true
 	txn.expiresAt = a.now().Add(a.ttl)
-	return clonePart(txn.Parts[part]), txn, nil
+	return clonePart(txn.Parts[part]), txn, streamCtx, nil
 }
 
 // endPart releases the pin taken by beginPart and, when the stream completed
@@ -641,6 +685,7 @@ func (a *ArchiveRegistry) endPart(txn *ArchiveTransaction, part int, completed b
 	defer txn.mu.Unlock()
 
 	txn.pinned = false
+	txn.cancel = nil
 	txn.expiresAt = a.now().Add(a.ttl)
 
 	if completed && txn.state == txnOpen {
@@ -673,41 +718,75 @@ func (a *ArchiveRegistry) reapLocked() {
 		txn.mu.Lock()
 		if txn.state == txnOpen && !txn.pinned && !now.Before(txn.expiresAt) {
 			a.releaseLocked(txn)
+		} else if txn.state == txnReleased && !now.Before(txn.expiresAt) {
+			// Remove an expired invalidate() tombstone: it has 403'd long
+			// enough; further fetches of the token are now 404.
+			delete(a.txns, txn.Token)
 		}
 		txn.mu.Unlock()
 	}
 }
 
-// invalidate releases every open transaction (no commit) — used when a
-// membership change advances the generation and existing reservations must be
-// rolled back. In-flight streams are not aborted; their endPart commit is a
-// no-op because the transaction is already released. The stale generation-keyed
-// template is discarded.
+// invalidate releases every open transaction (no commit) and aborts any
+// in-flight part stream — used when a membership change advances the generation
+// and existing reservations must be rolled back (§4.6: "atomically cancel any
+// active stream"). Each transaction is kept as a released tombstone so a
+// subsequent part fetch returns 403 (not 404); the reaper removes the tombstone
+// once its TTL expires. The stale generation-keyed template is discarded.
 func (a *ArchiveRegistry) invalidate() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	var cancels []context.CancelFunc
 	for _, txn := range a.txns {
 		txn.mu.Lock()
-		a.releaseLocked(txn)
+		if txn.cancel != nil {
+			cancels = append(cancels, txn.cancel)
+		}
+		a.invalidateLocked(txn)
 		txn.mu.Unlock()
 	}
 	a.templateParts = nil
 	a.templateGen = 0
+	a.mu.Unlock()
+
+	// Abort the in-flight streams after releasing the registry lock: cancel is
+	// non-blocking and idempotent, and the aborted stream's endPart must be able
+	// to re-acquire a.mu.
+	for _, c := range cancels {
+		c()
+	}
 }
 
 // releaseLocked transitions an open transaction to released and releases its
-// reservation (no download count). It is idempotent. The caller must hold both
-// a.mu and txn.mu.
+// reservation (no download count), removing it from the map so subsequent
+// fetches return 404. It is idempotent. The caller must hold both a.mu and
+// txn.mu.
 func (a *ArchiveRegistry) releaseLocked(txn *ArchiveTransaction) {
 	if txn.state != txnOpen {
 		return
 	}
 	txn.state = txnReleased
 	txn.pinned = false
+	txn.cancel = nil
 	if a.ledger != nil {
 		a.ledger.Release()
 	}
 	delete(a.txns, txn.Token)
+}
+
+// invalidateLocked transitions an open transaction to released and releases its
+// reservation, but KEEPS it in the map as a tombstone so a subsequent part
+// fetch for the invalidated token returns 403 (§4.6). It is idempotent. The
+// caller must hold both a.mu and txn.mu.
+func (a *ArchiveRegistry) invalidateLocked(txn *ArchiveTransaction) {
+	if txn.state != txnOpen {
+		return
+	}
+	txn.state = txnReleased
+	txn.pinned = false
+	txn.cancel = nil
+	if a.ledger != nil {
+		a.ledger.Release()
+	}
 }
 
 func cloneParts(parts []ArchivePart) []ArchivePart {
