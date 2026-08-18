@@ -2,6 +2,7 @@
 package direct
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -191,6 +192,40 @@ func (s *DirectServer) handlePreview(w http.ResponseWriter, r *http.Request, cod
 		_, err := session.Backend.GetPreview(r.Context(), id, dst)
 		return err
 	})
+}
+
+// handleItems serves the gallery metadata as the lowerCamel wire DTO. The
+// snapshot's immich.Gallery has no JSON tags (it would marshal PascalCase
+// keys), so it is mapped through itemsResponse/itemDTO explicitly.
+func (s *DirectServer) handleItems(w http.ResponseWriter, r *http.Request, code string) {
+	session, ok := s.resolveContent(w, code)
+	if !ok {
+		return
+	}
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	resp := itemsResponse{
+		AlbumName:        session.Gallery.AlbumName,
+		AlbumDescription: session.Gallery.AlbumDescription,
+		Items:            make([]itemDTO, 0, len(session.Gallery.Items)),
+	}
+	for _, it := range session.Gallery.Items {
+		resp.Items = append(resp.Items, itemDTO{
+			ID:       it.ID,
+			Name:     it.Name,
+			MimeType: it.MimeType,
+			Width:    it.Width,
+			Height:   it.Height,
+			Size:     it.Size,
+			Duration: it.Duration,
+			SHA1:     it.SHA1,
+		})
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code, id string) {

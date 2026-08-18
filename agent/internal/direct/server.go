@@ -126,6 +126,9 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 		}
 		s.activity(w, r, code)
 		s.handlePage(w, r, code)
+	case rest == "/items":
+		s.handleItems(w, r, code)
+		return
 	case rest == "/download":
 		if _, ok := s.resolveContent(w, code); !ok {
 			return
