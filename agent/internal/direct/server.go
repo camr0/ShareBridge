@@ -132,6 +132,27 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 		}
 		s.activity(w, r, code)
 		s.handleDownload(w, r)
+	case strings.HasPrefix(rest, "/thumb/"):
+		if id, ok := contentID(rest, "/thumb/"); ok {
+			s.handleThumb(w, r, code, id)
+		} else {
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+		return
+	case strings.HasPrefix(rest, "/preview/"):
+		if id, ok := contentID(rest, "/preview/"); ok {
+			s.handlePreview(w, r, code, id)
+		} else {
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+		return
+	case strings.HasPrefix(rest, "/asset/"):
+		if id, ok := contentID(rest, "/asset/"); ok {
+			s.handleAsset(w, r, code, id)
+		} else {
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+		return
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
