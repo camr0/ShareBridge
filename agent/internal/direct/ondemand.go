@@ -73,6 +73,8 @@ const (
 	opBeginSession
 	opActivity
 	opEndSession
+	opBeginHold
+	opEndHold
 	opClose
 	opIsOpen
 	opGrantedPort
@@ -224,6 +226,22 @@ func (p *OnDemandPort) EndSession(sessionID string) {
 	p.send(portCommand{op: opEndSession, sessionID: sessionID, reply: ch})
 }
 
+// Begin records an in-flight hold — a long streaming response in progress — so
+// the idle close is paused while at least one hold is active. It is a no-op
+// while the port is closed (there is nothing to hold open).
+func (p *OnDemandPort) Begin() {
+	ch := make(chan portReply, 1)
+	p.send(portCommand{op: opBeginHold, reply: ch})
+}
+
+// End releases one hold previously taken with Begin. When the last hold is
+// released after the idle deadline has already passed, the port closes
+// immediately. It is a no-op if no hold is active (e.g. after a forced Close).
+func (p *OnDemandPort) End() {
+	ch := make(chan portReply, 1)
+	p.send(portCommand{op: opEndHold, reply: ch})
+}
+
 // Close removes the mapping immediately and idempotently (lockdown or expiry).
 // On deletion failure it returns ErrDeleteRetry and retries with backoff; after
 // maxCloseAttempts the failure is escalated and stays visible via CloseError.
@@ -275,6 +293,7 @@ func (p *OnDemandPort) loop() {
 		renewAt     time.Time // when to renew (while sessions are active)
 		idleAt      time.Time // inactivity close (zero until a session exists)
 		sessions    = map[string]time.Time{}
+		inFlight    int // active streaming holds; pause the idle close while > 0
 		seq         uint64
 		timer       portTimer
 		timerC      <-chan time.Time
@@ -312,13 +331,13 @@ func (p *OnDemandPort) loop() {
 			arm(closeRetryDelay)
 		case open && len(sessions) > 0:
 			next := renewAt
-			if !idleAt.IsZero() && idleAt.Before(next) {
+			if inFlight == 0 && !idleAt.IsZero() && idleAt.Before(next) {
 				next = idleAt
 			}
 			arm(until(now, next))
 		case open:
 			next := deadline
-			if !idleAt.IsZero() && idleAt.Before(next) {
+			if inFlight == 0 && !idleAt.IsZero() && idleAt.Before(next) {
 				next = idleAt
 			}
 			arm(until(now, next))
@@ -358,6 +377,7 @@ func (p *OnDemandPort) loop() {
 		closeFail = 0
 		sessions = map[string]time.Time{} // drop stale sessions so a reopen can't renew from them
 		idleAt = time.Time{}
+		inFlight = 0 // drop stale holds so a reopen can't stay held open forever
 		p.setState(StateClosing, grantedPort)
 		rearm() // first DeletePortMapping happens on the next tick
 	}
@@ -469,6 +489,28 @@ func (p *OnDemandPort) loop() {
 				}
 				c.reply <- portReply{}
 
+			case opBeginHold:
+				if open {
+					inFlight++
+					rearm()
+				}
+				c.reply <- portReply{}
+
+			case opEndHold:
+				released := inFlight > 0
+				if released {
+					inFlight--
+				}
+				if open && released && inFlight == 0 {
+					now := p.clock.Now()
+					if !idleAt.IsZero() && !now.Before(idleAt) {
+						startClose()
+					} else {
+						rearm()
+					}
+				}
+				c.reply <- portReply{}
+
 			case opClose:
 				switch {
 				case open:
@@ -477,6 +519,7 @@ func (p *OnDemandPort) loop() {
 					closeFail = 0
 					sessions = map[string]time.Time{}
 					idleAt = time.Time{}
+					inFlight = 0
 					p.setState(StateClosing, grantedPort)
 					if tryDelete() {
 						c.reply <- portReply{}
@@ -522,7 +565,7 @@ func (p *OnDemandPort) loop() {
 			case open && len(sessions) > 0:
 				now := p.clock.Now()
 				switch {
-				case !idleAt.IsZero() && !now.Before(idleAt):
+				case inFlight == 0 && !idleAt.IsZero() && !now.Before(idleAt):
 					startClose()
 				case renewFailed:
 					// a prior renewal failed; wait for lease expiry, then close
@@ -553,7 +596,7 @@ func (p *OnDemandPort) loop() {
 				}
 			case open:
 				now := p.clock.Now()
-				if !idleAt.IsZero() && !now.Before(idleAt) {
+				if inFlight == 0 && !idleAt.IsZero() && !now.Before(idleAt) {
 					startClose()
 				} else if !now.Before(deadline) {
 					startClose()

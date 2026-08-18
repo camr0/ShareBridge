@@ -109,7 +109,9 @@ func (sw *statusWriter) Write(p []byte) (int, error) {
 // stream via panic(http.ErrAbortHandler) (§4.5).
 func (s *DirectServer) streamBody(w http.ResponseWriter, status int, stream func(dst io.Writer) error) {
 	sw := &statusWriter{ResponseWriter: w, status: status}
-	if err := stream(sw); err != nil {
+	dst, release := s.holdStream(sw)
+	defer release()
+	if err := stream(dst); err != nil {
 		if !sw.committed {
 			// The failure surfaced before the first body byte, so the success
 			// status was never committed; map and commit the correct status.
@@ -158,6 +160,7 @@ func (s *DirectServer) handleThumb(w http.ResponseWriter, r *http.Request, code,
 	if !ok {
 		return
 	}
+	s.activity(w, r, code)
 	contentType, length, known, err := session.Backend.ThumbnailInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -179,6 +182,7 @@ func (s *DirectServer) handlePreview(w http.ResponseWriter, r *http.Request, cod
 	if !ok {
 		return
 	}
+	s.activity(w, r, code)
 	contentType, length, known, err := session.Backend.PreviewInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -203,6 +207,7 @@ func (s *DirectServer) handleItems(w http.ResponseWriter, r *http.Request, code 
 	if !ok {
 		return
 	}
+	s.activity(w, r, code)
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method == http.MethodHead {
@@ -234,6 +239,7 @@ func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code,
 	if !ok {
 		return
 	}
+	s.activity(w, r, code)
 	asset, err := session.Backend.GetAssetInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -303,6 +309,7 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 	if !ok {
 		return
 	}
+	s.activity(w, r, code)
 	length, known, err := session.Backend.PlaybackInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -423,14 +430,20 @@ func (s *DirectServer) handleArchiveManifest(w http.ResponseWriter, r *http.Requ
 		if _, ok := s.resolveContent(w, code); !ok {
 			return
 		}
+		s.activity(w, r, code)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
+	recorded := false
 	for attempts := 0; ; attempts++ {
 		session, ok := s.resolveContent(w, code)
 		if !ok {
 			return
+		}
+		if !recorded {
+			s.activity(w, r, code)
+			recorded = true
 		}
 		if session.Archives == nil {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -510,6 +523,7 @@ func (s *DirectServer) handleArchivePart(w http.ResponseWriter, r *http.Request,
 	if !ok {
 		return
 	}
+	s.activity(w, r, code)
 	if session.Archives == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return

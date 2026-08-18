@@ -30,6 +30,17 @@ type SessionTracker interface {
 	EndSession(sessionID string)
 }
 
+// HoldTracker optionally extends SessionTracker with an in-flight hold that
+// pauses the on-demand port's idle close for the lifetime of a long streaming
+// response. Begin is taken on the first body write; End is released when the
+// stream completes or the client disconnects. A SessionTracker that does not
+// implement HoldTracker simply never pauses (the streaming wrapper is skipped).
+// OnDemandPort implements both.
+type HoldTracker interface {
+	Begin()
+	End()
+}
+
 // DirectServer serves the native-HTTPS "direct" data path (placeholder content
 // plus a reachability probe) on an on-demand port. It composes the Binder (SNI
 // admission + per-request authorization), a CertProvider (the current serving
@@ -250,7 +261,44 @@ func (s *DirectServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="sharebridge.bin"`)
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	io.CopyN(w, zeroReader{}, size)
+	dst, release := s.holdStream(w)
+	defer release()
+	io.CopyN(dst, zeroReader{}, size)
+}
+
+// holdStream wraps dst so the on-demand port pauses its idle close for the
+// duration of a long streaming response: Begin fires on the first write and
+// End (via the returned release func, which the caller must defer) releases it
+// on completion, error, or the panic that aborts a mid-stream failure —
+// including a client disconnect, which surfaces as a write error and unwinds
+// the same defer. When the port does not support holds, dst is returned
+// unchanged and release is a no-op.
+func (s *DirectServer) holdStream(dst io.Writer) (io.Writer, func()) {
+	if h, ok := s.port.(HoldTracker); ok {
+		hw := &holdWriter{Writer: dst, h: h}
+		return hw, func() { _ = hw.Close() }
+	}
+	return dst, func() {}
+}
+
+// holdWriter wraps a streaming response body so a long transfer holds the
+// on-demand port open from the first byte until it is closed. Begin and End
+// are each applied at most once regardless of the write/close pattern.
+type holdWriter struct {
+	io.Writer
+	beginOnce sync.Once
+	endOnce   sync.Once
+	h         HoldTracker
+}
+
+func (hw *holdWriter) Write(p []byte) (int, error) {
+	hw.beginOnce.Do(hw.h.Begin)
+	return hw.Writer.Write(p)
+}
+
+func (hw *holdWriter) Close() error {
+	hw.endOnce.Do(hw.h.End)
+	return nil
 }
 
 type zeroReader struct{}
