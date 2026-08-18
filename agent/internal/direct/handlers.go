@@ -366,3 +366,150 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 		return err
 	})
 }
+
+// archiveManifestResponse is the lowerCamel wire DTO for the archive manifest
+// (§4.6): the opaque transaction token plus its parts.
+type archiveManifestResponse struct {
+	Token string           `json:"token"`
+	Parts []archivePartDTO `json:"parts"`
+}
+
+type archivePartDTO struct {
+	Index         int      `json:"index"`
+	Name          string   `json:"name"`
+	EstimatedSize int64    `json:"estimatedSize"`
+	AssetIDs      []string `json:"assetIds"`
+}
+
+func archivePartDTOs(parts []ArchivePart) []archivePartDTO {
+	out := make([]archivePartDTO, len(parts))
+	for i, p := range parts {
+		out[i] = archivePartDTO{
+			Index:         p.Index,
+			Name:          p.Name,
+			EstimatedSize: p.EstimatedSize,
+			AssetIDs:      p.AssetIDs,
+		}
+	}
+	return out
+}
+
+// archiveStatus maps an archive error to an HTTP status: missing
+// archive/part/token → 404, membership/duplicate/generation/limit failure →
+// 403, upstream errors via classifyErr.
+func archiveStatus(err error) int {
+	switch {
+	case errors.Is(err, errArchiveNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, errArchiveForbidden), errors.Is(err, ErrForbidden):
+		return http.StatusForbidden
+	default:
+		return classifyErr(err)
+	}
+}
+
+// maxArchiveManifestRetries bounds the generation-recheck retry loop (§11).
+const maxArchiveManifestRetries = 5
+
+// handleArchiveManifest serves GET /s/{code}/archive (§4.6): it singleflights
+// the upstream GetAlbumDownloadInfo into a template keyed by the content
+// generation, re-checks the generation after the fetch (discard+retry if it
+// advanced), then mints a fresh token + transaction + reservation. HEAD
+// validates the share but mints nothing.
+func (s *DirectServer) handleArchiveManifest(w http.ResponseWriter, r *http.Request, code string) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodHead {
+		if _, ok := s.resolveContent(w, code); !ok {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	for attempts := 0; ; attempts++ {
+		session, ok := s.resolveContent(w, code)
+		if !ok {
+			return
+		}
+		if session.Archives == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		parts, err := session.Archives.template(r.Context(), session)
+		if err != nil {
+			http.Error(w, http.StatusText(archiveStatus(err)), archiveStatus(err))
+			return
+		}
+
+		// Re-check the generation under the per-share state lock (§11): if the
+		// membership advanced while the upstream fetch was in flight, discard
+		// the template and retry against the new generation.
+		if re, err := s.resolver.Resolve(code); err == nil && re != nil && re.ContentGen != session.ContentGen {
+			if attempts >= maxArchiveManifestRetries {
+				http.Error(w, "content changed, retry", http.StatusServiceUnavailable)
+				return
+			}
+			continue
+		}
+
+		token, err := session.Archives.mint(session, parts)
+		if err != nil {
+			http.Error(w, http.StatusText(archiveStatus(err)), archiveStatus(err))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(archiveManifestResponse{
+			Token: token,
+			Parts: archivePartDTOs(parts),
+		})
+		return
+	}
+}
+
+// handleArchivePart serves GET/HEAD /s/{code}/archive/{token}/{part} (§4.6): it
+// revalidates the part's asset IDs against the current generation before
+// streaming, pins the transaction for the stream's duration, and commits exactly
+// one download once the last part completes. Duplicate part fetches are
+// idempotent (re-stream, no double count).
+func (s *DirectServer) handleArchivePart(w http.ResponseWriter, r *http.Request, code, token string, part int) {
+	session, ok := s.resolveContent(w, code)
+	if !ok {
+		return
+	}
+	if session.Archives == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	p, txn, err := session.Archives.beginPart(session, token, part)
+	if err != nil {
+		http.Error(w, http.StatusText(archiveStatus(err)), archiveStatus(err))
+		return
+	}
+
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", contentDisposition(sanitizeFilename(p.Name)))
+
+	if r.Method == http.MethodHead {
+		session.Archives.endPart(txn, part, false)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// completed is set by the stream closure and read by the deferred endPart,
+	// which runs on every exit path — success, pre-first-byte error, and the
+	// mid-stream abort panic — so the pin is always released exactly once.
+	completed := false
+	defer func() {
+		session.Archives.endPart(txn, part, completed)
+	}()
+	s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+		_, err := session.Backend.DownloadArchive(r.Context(), p.AssetIDs, dst)
+		if err == nil {
+			completed = true
+		}
+		return err
+	})
+}

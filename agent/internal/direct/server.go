@@ -165,6 +165,23 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 		}
 		return
+	case rest == "/archive":
+		s.handleArchiveManifest(w, r, code)
+		return
+	case strings.HasPrefix(rest, "/archive/"):
+		seg := strings.TrimPrefix(rest, "/archive/")
+		token, partStr, found := strings.Cut(seg, "/")
+		if !found || token == "" || partStr == "" || len(token) > 128 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		part, err := strconv.Atoi(partStr)
+		if err != nil || part < 0 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		s.handleArchivePart(w, r, code, token, part)
+		return
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}

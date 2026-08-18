@@ -3,7 +3,10 @@ package direct
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -44,6 +47,7 @@ type ContentSession struct {
 	ContentGen   uint64
 	MaxDownloads int
 	Ledger       *Ledger
+	Archives     *ArchiveRegistry
 }
 
 // Ledger is the per-session download-accounting ledger. It tracks the committed
@@ -136,6 +140,7 @@ type SnapshotManager struct {
 	poll         time.Duration
 	maxDownloads int
 	ledger       *Ledger
+	archives     *ArchiveRegistry
 	now          func() time.Time
 	building     bool
 	done         chan struct{}
@@ -146,10 +151,13 @@ type SnapshotManager struct {
 // download limit is immutable per share; poll is the refresh interval used for
 // the 2×poll fail-closed bound.
 func NewSnapshotManager(backend ContentBackend, maxDownloads int, poll time.Duration) *SnapshotManager {
+	ledger := NewLedger(maxDownloads)
+	archives := newArchiveRegistry(ledger, defaultArchiveTTL, time.Now)
 	return &SnapshotManager{
 		backend:      backend,
 		maxDownloads: maxDownloads,
-		ledger:       NewLedger(maxDownloads),
+		ledger:       ledger,
+		archives:     archives,
 		poll:         poll,
 		now:          time.Now,
 	}
@@ -222,6 +230,12 @@ func (m *SnapshotManager) doBuild(ctx context.Context) error {
 		ContentGen:   m.contentGen,
 		MaxDownloads: m.maxDownloads,
 		Ledger:       m.ledger,
+		Archives:     m.archives,
+	}
+	// Membership changed: roll back any open archive transactions (release their
+	// reservations) atomically with the swap (§4.6/§5.2).
+	if m.archives != nil {
+		m.archives.invalidate()
 	}
 	return nil
 }
@@ -338,4 +352,391 @@ type itemDTO struct {
 	Size     int64    `json:"size"`
 	Duration *float64 `json:"duration"`
 	SHA1     string   `json:"sha1"`
+}
+
+// ---- Album archive (multi-part, transactional) ----
+
+// ArchivePart is one immutable part of an album-download archive: its index, a
+// display name, the asset IDs it packages (already validated against the
+// snapshot membership), and its estimated size in bytes.
+type ArchivePart struct {
+	Index         int
+	Name          string
+	AssetIDs      []string
+	EstimatedSize int64
+}
+
+// ArchiveTransaction is the in-memory state of one album-download transaction.
+// It holds a reservation in the session ledger until it is committed (all parts
+// fetched → one committed download) or released (abandoned/invalidated → no
+// count). done/state/expiresAt/pinned are guarded by mu; the registry's lock
+// guards map membership and the TTL reaper's scan.
+type ArchiveTransaction struct {
+	Token      string
+	Parts      []ArchivePart
+	ContentGen uint64
+
+	mu        sync.Mutex
+	done      map[int]bool
+	state     string // open|committed|released
+	expiresAt time.Time
+	pinned    bool // an in-flight part holds the pin
+}
+
+const (
+	txnOpen      = "open"
+	txnCommitted = "committed"
+	txnReleased  = "released"
+)
+
+// defaultArchiveTTL is the idle-transaction TTL (§4.6): an abandoned
+// transaction (no in-flight part) is released after this duration.
+const defaultArchiveTTL = time.Hour
+
+var (
+	// errArchiveNotFound reports a missing archive/part/token (→ 404).
+	errArchiveNotFound = errors.New("direct: archive not found")
+	// errArchiveForbidden reports a membership/duplicate/generation failure or
+	// an exhausted download limit (→ 403).
+	errArchiveForbidden = errors.New("direct: archive forbidden")
+)
+
+// templateInflight is the singleflight slot for the upstream
+// GetAlbumDownloadInfo fetch. The leader closes done after publishing its
+// result (or error) into the registry; waiters re-enter template and observe
+// the cache or become the leader themselves.
+type templateInflight struct {
+	done chan struct{}
+}
+
+// ArchiveRegistry owns the per-share album-archive state: the transaction map,
+// the singleflight manifest-template cache keyed by content generation, and the
+// idle-transaction reaper. It is guarded by mu; the ledger it accounts against
+// is the same per-session ledger the asset handler uses.
+type ArchiveRegistry struct {
+	mu            sync.Mutex
+	ledger        *Ledger
+	txns          map[string]*ArchiveTransaction
+	templateParts []ArchivePart
+	templateGen   uint64
+	inflight      *templateInflight
+	ttl           time.Duration
+	now           func() time.Time
+	stop          chan struct{}
+}
+
+func newArchiveRegistry(ledger *Ledger, ttl time.Duration, now func() time.Time) *ArchiveRegistry {
+	if now == nil {
+		now = time.Now
+	}
+	return &ArchiveRegistry{
+		ledger: ledger,
+		txns:   make(map[string]*ArchiveTransaction),
+		ttl:    ttl,
+		now:    now,
+	}
+}
+
+// Start launches the idle-transaction reaper. It is idempotent; Close stops it.
+// mint calls Start lazily once the first transaction exists, so shares with no
+// archive activity never spawn a reaper goroutine.
+func (a *ArchiveRegistry) Start() {
+	a.mu.Lock()
+	if a.stop != nil {
+		a.mu.Unlock()
+		return
+	}
+	a.stop = make(chan struct{})
+	stop := a.stop
+	a.mu.Unlock()
+	go a.reapLoop(stop)
+}
+
+// Close stops the reaper (if started). Safe to call on a never-started registry.
+func (a *ArchiveRegistry) Close() {
+	a.mu.Lock()
+	stop := a.stop
+	a.stop = nil
+	a.mu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+}
+
+func (a *ArchiveRegistry) reapLoop(stop chan struct{}) {
+	if a.ttl <= 0 {
+		return
+	}
+	interval := a.ttl / 4
+	if interval < time.Second {
+		interval = time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			a.reap()
+		case <-stop:
+			return
+		}
+	}
+}
+
+// template returns the validated manifest parts for the session's generation,
+// singleflighting the upstream GetAlbumDownloadInfo fetch into a shared template
+// keyed by the generation. The caller MUST re-resolve the session after this
+// returns and retry if the generation advanced during the fetch (§11).
+func (a *ArchiveRegistry) template(ctx context.Context, s *ContentSession) ([]ArchivePart, error) {
+	for {
+		a.mu.Lock()
+		a.reapLocked()
+
+		if a.templateParts != nil && a.templateGen == s.ContentGen {
+			parts := cloneParts(a.templateParts)
+			a.mu.Unlock()
+			return parts, nil
+		}
+
+		if a.inflight != nil {
+			f := a.inflight
+			a.mu.Unlock()
+			select {
+			case <-f.done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		f := &templateInflight{done: make(chan struct{})}
+		a.inflight = f
+		gen := s.ContentGen
+		a.mu.Unlock()
+
+		parts, err := a.fetchAndValidate(ctx, s.Backend, s.Membership)
+
+		a.mu.Lock()
+		a.inflight = nil
+		if err == nil {
+			a.templateParts = parts
+			a.templateGen = gen
+		}
+		a.mu.Unlock()
+		close(f.done)
+
+		if err != nil {
+			return nil, err
+		}
+		return cloneParts(parts), nil
+	}
+}
+
+// fetchAndValidate fetches the album download info outside the registry lock
+// and validates it: every asset ID must be in the membership snapshot, duplicate
+// IDs are rejected (→ 403 the whole manifest), and zero archives → 404.
+func (a *ArchiveRegistry) fetchAndValidate(ctx context.Context, backend ContentBackend, membership map[string]struct{}) ([]ArchivePart, error) {
+	info, err := backend.GetAlbumDownloadInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]ArchivePart, 0, len(info.Archives))
+	seen := make(map[string]struct{})
+	for i, arch := range info.Archives {
+		for _, id := range arch.AssetIDs {
+			if _, ok := membership[id]; !ok {
+				return nil, errArchiveForbidden
+			}
+			if _, dup := seen[id]; dup {
+				return nil, errArchiveForbidden
+			}
+			seen[id] = struct{}{}
+		}
+		parts = append(parts, ArchivePart{
+			Index:         i,
+			Name:          archivePartName(info.AlbumName, i),
+			AssetIDs:      append([]string(nil), arch.AssetIDs...),
+			EstimatedSize: arch.Size,
+		})
+	}
+	if len(parts) == 0 {
+		return nil, errArchiveNotFound
+	}
+	return parts, nil
+}
+
+// mint reserves a download slot and creates a fresh transaction bound to the
+// session's generation, returning the opaque token. It returns ErrForbidden when
+// the download limit is exhausted.
+func (a *ArchiveRegistry) mint(s *ContentSession, parts []ArchivePart) (string, error) {
+	if a.ledger != nil && !a.ledger.TryReserve() {
+		return "", ErrForbidden
+	}
+	token := newArchiveToken()
+	txn := &ArchiveTransaction{
+		Token:      token,
+		Parts:      cloneParts(parts),
+		ContentGen: s.ContentGen,
+		done:       make(map[int]bool, len(parts)),
+		state:      txnOpen,
+		expiresAt:  a.now().Add(a.ttl),
+	}
+	a.mu.Lock()
+	a.reapLocked()
+	a.txns[token] = txn
+	a.mu.Unlock()
+	// Lazily ensure the idle-transaction reaper is running now that there is
+	// at least one live transaction.
+	a.Start()
+	return token, nil
+}
+
+// beginPart validates a part fetch: the token must exist and be open, the
+// transaction must still be bound to the current generation, the part index must
+// be in range, and every asset ID must still be in the membership. On success it
+// pins the transaction (renewing its TTL) so the reaper cannot expire it
+// mid-stream. The returned part is a deep copy.
+func (a *ArchiveRegistry) beginPart(s *ContentSession, token string, part int) (ArchivePart, *ArchiveTransaction, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reapLocked()
+
+	txn, ok := a.txns[token]
+	if !ok {
+		return ArchivePart{}, nil, errArchiveNotFound
+	}
+
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+
+	if txn.state == txnReleased {
+		return ArchivePart{}, nil, errArchiveForbidden
+	}
+	if part < 0 || part >= len(txn.Parts) {
+		return ArchivePart{}, nil, errArchiveNotFound
+	}
+	if txn.ContentGen != s.ContentGen {
+		a.releaseLocked(txn)
+		return ArchivePart{}, nil, errArchiveForbidden
+	}
+	for _, id := range txn.Parts[part].AssetIDs {
+		if _, ok := s.Membership[id]; !ok {
+			a.releaseLocked(txn)
+			return ArchivePart{}, nil, errArchiveForbidden
+		}
+	}
+
+	txn.pinned = true
+	txn.expiresAt = a.now().Add(a.ttl)
+	return clonePart(txn.Parts[part]), txn, nil
+}
+
+// endPart releases the pin taken by beginPart and, when the stream completed
+// successfully, marks the part done; once every part is done the transaction
+// commits exactly one download.
+func (a *ArchiveRegistry) endPart(txn *ArchiveTransaction, part int, completed bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+
+	txn.pinned = false
+	txn.expiresAt = a.now().Add(a.ttl)
+
+	if completed && txn.state == txnOpen {
+		txn.done[part] = true
+		if len(txn.done) == len(txn.Parts) {
+			txn.state = txnCommitted
+			if a.ledger != nil {
+				a.ledger.Commit()
+			}
+			delete(a.txns, txn.Token)
+		}
+	}
+}
+
+// reap releases idle (unpinned) transactions whose TTL has expired. It is
+// invoked by the background reaper and opportunistically on every registry
+// operation.
+func (a *ArchiveRegistry) reap() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reapLocked()
+}
+
+func (a *ArchiveRegistry) reapLocked() {
+	if a.ttl <= 0 {
+		return
+	}
+	now := a.now()
+	for _, txn := range a.txns {
+		txn.mu.Lock()
+		if txn.state == txnOpen && !txn.pinned && !now.Before(txn.expiresAt) {
+			a.releaseLocked(txn)
+		}
+		txn.mu.Unlock()
+	}
+}
+
+// invalidate releases every open transaction (no commit) — used when a
+// membership change advances the generation and existing reservations must be
+// rolled back. In-flight streams are not aborted; their endPart commit is a
+// no-op because the transaction is already released. The stale generation-keyed
+// template is discarded.
+func (a *ArchiveRegistry) invalidate() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, txn := range a.txns {
+		txn.mu.Lock()
+		a.releaseLocked(txn)
+		txn.mu.Unlock()
+	}
+	a.templateParts = nil
+	a.templateGen = 0
+}
+
+// releaseLocked transitions an open transaction to released and releases its
+// reservation (no download count). It is idempotent. The caller must hold both
+// a.mu and txn.mu.
+func (a *ArchiveRegistry) releaseLocked(txn *ArchiveTransaction) {
+	if txn.state != txnOpen {
+		return
+	}
+	txn.state = txnReleased
+	txn.pinned = false
+	if a.ledger != nil {
+		a.ledger.Release()
+	}
+	delete(a.txns, txn.Token)
+}
+
+func cloneParts(parts []ArchivePart) []ArchivePart {
+	out := make([]ArchivePart, len(parts))
+	for i, p := range parts {
+		out[i] = clonePart(p)
+	}
+	return out
+}
+
+func clonePart(p ArchivePart) ArchivePart {
+	p.AssetIDs = append([]string(nil), p.AssetIDs...)
+	return p
+}
+
+func archivePartName(albumName string, index int) string {
+	base := albumName
+	if base == "" {
+		base = "album"
+	}
+	return fmt.Sprintf("%s-part-%d.zip", base, index+1)
+}
+
+func newArchiveToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand is documented not to fail; fall back to a time-based token
+		// so a request never fails on token generation.
+		return fmt.Sprintf("archive-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
