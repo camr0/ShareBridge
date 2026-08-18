@@ -239,6 +239,15 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, 
 				}
 				handleUnregisterShare(ctx, conn, h, app, apiKeyID, msg.Code)
 
+			case "deregister":
+				// Agent-initiated lifecycle transition (RevokeSession or
+				// pruneExpiredSessions). Marks the control-side row inactive and
+				// writes the discriminator (§10).
+				if agentID == "" {
+					continue
+				}
+				handleDeregister(ctx, conn, h, app, apiKeyID, msg.Code, msg.Reason)
+
 			case "offer":
 				if agentID == "" {
 					continue
@@ -617,12 +626,40 @@ func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub
 		return
 	}
 	session.Set("is_active", false)
+	session.Set("inactive_reason", "revoked")
 	if err := app.Save(session); err != nil {
 		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "database error"})
 		return
 	}
 	h.UnregisterCode(ctx, code, apiKeyID, "share has been removed")
 	hub.SendDirect(ctx, conn, map[string]string{"type": "share_unregistered", "code": code})
+}
+
+// handleDeregister applies an agent-initiated lifecycle transition
+// (RevokeSession → "revoked", pruneExpiredSessions → "expired"). Unlike
+// unregister_share it is fire-and-forget: the agent does not wait for an ack.
+func handleDeregister(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app core.App, apiKeyID, code, reason string) {
+	if code == "" || !externalCodeRegex.MatchString(code) {
+		return
+	}
+	session, err := getSessionByCode(app, code)
+	if err != nil || session == nil {
+		return
+	}
+	if session.GetString("api_key_id") != apiKeyID {
+		return
+	}
+	inactiveReason := reason
+	if inactiveReason != "expired" && inactiveReason != "revoked" && inactiveReason != "unsupported" {
+		inactiveReason = "revoked"
+	}
+	session.Set("is_active", false)
+	session.Set("inactive_reason", inactiveReason)
+	if err := app.Save(session); err != nil {
+		log.Printf("deregister: save session %s: %v", code, err)
+		return
+	}
+	h.UnregisterCode(ctx, code, apiKeyID, "share deregistered")
 }
 
 // createSession creates a new session record in PocketBase.
@@ -731,6 +768,7 @@ func claimSessionCodeTx(txApp core.App, code, apiKeyID, accountID, agentID strin
 	record.Set("share_type", shareType)
 	record.Set("is_password_protected", isPasswordProtected)
 	record.Set("is_active", true)
+	record.Set("inactive_reason", "")
 	if expiresAt != nil {
 		dt, _ := types.ParseDateTime(*expiresAt)
 		record.Set("expires_at", dt)

@@ -75,7 +75,7 @@ func TestWiringLoadSessionsFromStoreHydratesRestoredSessions(t *testing.T) {
 		ShareURL:            "immich://IMMICHPERSIST2",
 		ShareType:           "immich",
 		IsPasswordProtected: false,
-		RelayOnly:           true,
+		RelayOnly:           false,
 		MaxDownloads:        3,
 		CreatedAt:           time.Now().Add(-time.Hour),
 		ExpiresAt:           time.Now().Add(time.Hour),
@@ -87,7 +87,7 @@ func TestWiringLoadSessionsFromStoreHydratesRestoredSessions(t *testing.T) {
 		ImmichURL:         baseURL,
 		ImmichAllowedHost: host,
 		ImmichAPIKey:      "api",
-		DefaultRelayOnly:  true,
+		DefaultRelayOnly:  false,
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())

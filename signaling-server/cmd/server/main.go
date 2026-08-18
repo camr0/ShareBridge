@@ -101,22 +101,22 @@ func main() {
 		// Public session info endpoint
 		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
 
-		// Redirect /share/{code} to the canonical path based on share type.
-		// Immich creates share links with /share/ prefix — this catches those
-		// and redirects to /i/{key} for Immich or /s/{code} for regular shares.
-		router.GET("/share/{code}", serveShareRedirect(app))
+		// Redirect /share/{code} and /s/{code} through the single tombstone-aware
+		// resolver. Active gallery shares 302 to the agent's direct origin;
+		// expired/unsupported return 410 and revoked/unknown return 404 (§8).
+		router.GET("/share/{code}", serveShareRedirect(ctrl))
 
-		// Direct link route. Dispatch on the live session's relay_only value:
-		// direct shares (relay_only false/absent) redirect to the agent's direct
-		// HTTPS origin via the controller gate; relay-only shares keep the
-		// existing web-client/serve path ("no relay fallback" applies to direct
-		// shares only, never to shares explicitly configured relay-only).
 		router.GET("/s/{code}", func(e *core.RequestEvent) error {
 			code := e.Request.PathValue("code")
-			if isRelayOnlySession(app, code) {
-				return handler.ServeFileNoCache("./web/index.html")(e)
+			_, status := ctrl.ResolveForRedirect(code)
+			switch status {
+			case http.StatusFound:
+				return ctrl.Redirect(e.Response, e.Request, code)
+			case http.StatusGone:
+				return e.Error(http.StatusGone, "share expired or unsupported", nil)
+			default:
+				return e.NotFoundError("session not found", nil)
 			}
-			return ctrl.Redirect(e.Response, e.Request, code)
 		})
 		router.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
 
@@ -217,11 +217,19 @@ func deleteExpiredSessions(app core.App) error {
 
 	now := time.Now().UTC()
 	for _, record := range records {
+		// Only transition still-active rows: an already-inactive row's
+		// inactive_reason is authoritative and must not be overwritten (a
+		// revoked or unsupported session stays revoked/unsupported even after
+		// its original lease lapses).
+		if !record.GetBool("is_active") {
+			continue
+		}
 		expiresAt := record.GetDateTime("expires_at")
 		if expiresAt.IsZero() || expiresAt.Time().After(now) {
 			continue
 		}
 		record.Set("is_active", false)
+		record.Set("inactive_reason", "expired")
 		if err := app.Save(record); err != nil {
 			return fmt.Errorf("soft-delete expired session %s: %w", record.Id, err)
 		}
@@ -230,47 +238,20 @@ func deleteExpiredSessions(app core.App) error {
 	return nil
 }
 
-// isRelayOnlySession reports whether the live session identified by code is
-// explicitly relay-only. A missing/inactive/expired session is treated as
-// direct (so the controller gate can 503 it), preserving the direct path's
-// behavior for unknown codes.
-func isRelayOnlySession(app core.App, code string) bool {
-	if code == "" {
-		return false
-	}
-	records, err := app.FindRecordsByFilter(
-		"sessions", "code = {:code} && is_active = true", "", 1, 0,
-		map[string]any{"code": code},
-	)
-	if err != nil || len(records) == 0 {
-		return false
-	}
-	rec := records[0]
-	if exp := rec.GetDateTime("expires_at"); !exp.IsZero() && exp.Time().Before(time.Now()) {
-		return false
-	}
-	return rec.GetBool("relay_only")
-}
-
-// serveShareRedirect looks up a share code and redirects to the canonical
-// path: /i/{key} for Immich album shares, /s/{code} for everything else.
-func serveShareRedirect(app core.App) func(*core.RequestEvent) error {
+// serveShareRedirect resolves a /share/{code} code through the tombstone-aware
+// resolver and 302s active gallery shares to the agent's direct origin.
+// Expired/unsupported return 410; revoked/unknown return 404 (§8).
+func serveShareRedirect(ctrl *directctl.Controller) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		code := e.Request.PathValue("code")
-		if code == "" {
+		_, status := ctrl.ResolveForRedirect(code)
+		switch status {
+		case http.StatusFound:
+			return ctrl.Redirect(e.Response, e.Request, code)
+		case http.StatusGone:
+			return e.Error(http.StatusGone, "share expired or unsupported", nil)
+		default:
 			return e.NotFoundError("session not found", nil)
 		}
-		records, err := app.FindRecordsByFilter(
-			"sessions", "code = {:code} && is_active = true", "", 1, 0,
-			map[string]any{"code": code},
-		)
-		if err != nil || len(records) == 0 {
-			return e.NotFoundError("session not found", nil)
-		}
-		shareType := records[0].GetString("share_type")
-		if shareType == "immich" {
-			return e.Redirect(http.StatusFound, "/i/"+code)
-		}
-		return e.Redirect(http.StatusFound, "/s/"+code)
 	}
 }

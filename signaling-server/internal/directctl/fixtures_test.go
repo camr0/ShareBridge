@@ -36,8 +36,19 @@ func newTestController(t *testing.T) (core.App, *Controller) {
 	if err := mig.CreateCollections(app); err != nil {
 		t.Fatalf("base schema: %v", err)
 	}
-	if err := mig.CreateAgents(app); err != nil {
-		t.Fatalf("agents schema: %v", err)
+	// Apply the full session-field migration chain so the sessions collection
+	// carries relay_only/share_type/is_password_protected/inactive_reason for
+	// the tombstone-aware resolver tests.
+	for _, fn := range []func(core.App) error{
+		mig.AddRelayOnly,
+		mig.AddSessionRelayStaticPub,
+		mig.AddImmichSessionFields,
+		mig.CreateAgents,
+		mig.AddSessionsInactiveReason,
+	} {
+		if err := fn(app); err != nil {
+			t.Fatalf("session schema: %v", err)
+		}
 	}
 
 	// A coordinator with a stub issuer returning a fixed chain, so tests can

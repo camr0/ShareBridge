@@ -11,7 +11,7 @@ import (
 	"strconv"
 )
 
-const currentConfigVersion = 1
+const currentConfigVersion = 2
 
 // Config holds all agent configuration settings.
 // JSON tags use snake_case for file persistence.
@@ -116,7 +116,7 @@ func (m *Manager) load() (*Config, error) {
 		ConfigVersion:       currentConfigVersion,
 		DefaultExpiry:       24,
 		DefaultMaxDownloads: 10,
-		DefaultRelayOnly:    true,
+		DefaultRelayOnly:    false,
 		// UIPort: leave as 0, use env fallback with default
 	}
 
@@ -140,7 +140,7 @@ func (m *Manager) load() (*Config, error) {
 		}
 		if metadata.ConfigVersion < currentConfigVersion {
 			cfg.ConfigVersion = currentConfigVersion
-			cfg.DefaultRelayOnly = true
+			cfg.DefaultRelayOnly = false
 			m.configNeedsSave = true
 		}
 	}

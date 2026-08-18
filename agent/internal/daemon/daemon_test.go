@@ -379,7 +379,7 @@ func newTestDaemon(t *testing.T) (*Daemon, *mockSignalingClient) {
 	cfg := &config.Config{
 		SignalingURL:     "ws://localhost:8080",
 		APIKey:           "test-key",
-		DefaultRelayOnly: true,
+		DefaultRelayOnly: false,
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
@@ -480,7 +480,8 @@ func TestNewWithSignaling(t *testing.T) {
 	}
 }
 
-// TestCreateSession tests session creation.
+// TestCreateSession verifies that WebDAV/file share creation is rejected in
+// Phase 3 (only direct gallery shares are supported).
 func TestCreateSession(t *testing.T) {
 	cfg := &config.Config{
 		SignalingURL: "ws://localhost:8080",
@@ -497,46 +498,24 @@ func TestCreateSession(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
-	if err != nil {
-		t.Fatalf("CreateSession() error: %v", err)
+	_, err = d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
+	if err == nil {
+		t.Fatalf("expected error for WebDAV share type")
 	}
-
-	if code == "" {
-		t.Errorf("expected non-empty code")
-	}
-
-	// Verify session was added to in-memory map
-	session := d.GetSession(code)
-	if session == nil {
-		t.Fatalf("session not found in daemon")
-	}
-
-	if session.ShareURL != "https://opencloud.example.com/s/abc123" {
-		t.Errorf("ShareURL mismatch")
-	}
-	if session.MaxDownloads != 10 {
-		t.Errorf("MaxDownloads mismatch")
-	}
-	if session.RelayOnly != false {
-		t.Errorf("RelayOnly should be false")
-	}
-
-	// Verify session was persisted to store
-	storeSession := st.GetSession(code)
-	if storeSession == nil {
-		t.Errorf("session not persisted to store")
+	var verr validationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("expected a validation error, got %v", err)
 	}
 }
 
-func TestCreateSessionManualImmichRegistersRelayOnlyShare(t *testing.T) {
+func TestCreateSessionManualImmichPlumbsMaxDownloadsAndExpiry(t *testing.T) {
 	d, sig := newTestDaemon(t)
 	d.config.ImmichURL = "http://immich.lan:2283"
 	d.config.ImmichAllowedHost = "immich.lan:2283"
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
-			{Key: "IMMICHMANUAL1", Type: "ALBUM", Password: "********"},
+			{Key: "IMMICHMANUAL1", Type: "ALBUM"},
 		}}, nil
 	}
 
@@ -549,16 +528,20 @@ func TestCreateSessionManualImmichRegistersRelayOnlyShare(t *testing.T) {
 	require.NotNil(t, session)
 	require.Equal(t, "immich://IMMICHMANUAL1", session.ShareURL)
 	require.Equal(t, "immich", session.ShareType)
-	require.True(t, session.RelayOnly)
-	require.True(t, session.IsPasswordProtected)
+	require.False(t, session.RelayOnly)
+	require.False(t, session.IsPasswordProtected)
+	require.Equal(t, 10, session.MaxDownloads)
+	require.False(t, session.ExpiresAt.IsZero())
 	require.NotNil(t, session.immichClient)
 
 	stored := d.store.GetSession("IMMICHMANUAL1")
 	require.NotNil(t, stored)
 	require.Equal(t, "immich://IMMICHMANUAL1", stored.ShareURL)
 	require.Equal(t, "immich", stored.ShareType)
-	require.True(t, stored.RelayOnly)
-	require.True(t, stored.IsPasswordProtected)
+	require.False(t, stored.RelayOnly)
+	require.False(t, stored.IsPasswordProtected)
+	require.Equal(t, 10, stored.MaxDownloads)
+	require.False(t, stored.ExpiresAt.IsZero())
 
 	registered := sig.registeredSnapshot()
 	require.Len(t, registered, 1)
@@ -566,8 +549,8 @@ func TestCreateSessionManualImmichRegistersRelayOnlyShare(t *testing.T) {
 		ShareURL:            "immich://IMMICHMANUAL1",
 		PreferredCode:       "IMMICHMANUAL1",
 		ShareType:           "immich",
-		IsPasswordProtected: true,
-		RelayOnly:           true,
+		IsPasswordProtected: false,
+		RelayOnly:           false,
 		RelayStaticPub:      registered[0].RelayStaticPub,
 	}, registered[0])
 }
@@ -633,7 +616,6 @@ func TestRevokeSession(t *testing.T) {
 	cfg := &config.Config{
 		SignalingURL: "ws://localhost:8080",
 		APIKey:       "test-api-key",
-		AllowedHost:  "opencloud.example.com",
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
@@ -644,11 +626,16 @@ func TestRevokeSession(t *testing.T) {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
 
-	ctx := context.Background()
-	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
-	if err != nil {
-		t.Fatalf("CreateSession() error: %v", err)
+	code := "revoke-code"
+	d.mu.Lock()
+	d.sessions[code] = &Session{
+		Code:          code,
+		ShareType:     "immich",
+		peers:         make(map[string]*peer.Peer),
+		relayChannels: make(map[string]relayTransferChannel),
 	}
+	d.mu.Unlock()
+	st.SaveSession(store.SessionEntry{Code: code, ShareType: "immich"})
 
 	// Verify session exists
 	if d.GetSession(code) == nil {
@@ -698,7 +685,6 @@ func TestListSessions(t *testing.T) {
 	cfg := &config.Config{
 		SignalingURL: "ws://localhost:8080",
 		APIKey:       "test-api-key",
-		AllowedHost:  "opencloud.example.com",
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
@@ -709,34 +695,14 @@ func TestListSessions(t *testing.T) {
 		t.Fatalf("NewWithSignaling() error: %v", err)
 	}
 
-	ctx := context.Background()
-	code1, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
-	if err != nil {
-		t.Fatalf("CreateSession() error: %v", err)
-	}
-	code2, err := d.CreateSession(ctx, "https://opencloud.example.com/s/def456", "opencloud", "", 24*time.Hour, 5, true)
-	if err != nil {
-		t.Fatalf("CreateSession() error: %v", err)
-	}
+	d.mu.Lock()
+	d.sessions["code-1"] = &Session{Code: "code-1", ShareType: "immich", peers: make(map[string]*peer.Peer)}
+	d.sessions["code-2"] = &Session{Code: "code-2", ShareType: "immich", peers: make(map[string]*peer.Peer)}
+	d.mu.Unlock()
 
 	sessions := d.ListSessions()
 	if len(sessions) != 2 {
 		t.Errorf("expected 2 sessions, got %d", len(sessions))
-	}
-
-	// Check that both sessions are in the list
-	foundCode1 := false
-	foundCode2 := false
-	for _, session := range sessions {
-		if session.Code == code1 {
-			foundCode1 = true
-		}
-		if session.Code == code2 {
-			foundCode2 = true
-		}
-	}
-	if !foundCode1 || !foundCode2 {
-		t.Errorf("expected both sessions in list")
 	}
 }
 
@@ -888,18 +854,12 @@ func TestHandleSignalingMessage(t *testing.T) {
 
 // TestOnSessionCallbacks tests that callbacks are called.
 func TestOnSessionCallbacks(t *testing.T) {
-	cfg := &config.Config{
-		SignalingURL: "ws://localhost:8080",
-		APIKey:       "test-api-key",
-		AllowedHost:  "opencloud.example.com",
-	}
-	cfgMgr := &mockConfigManager{cfg: cfg}
-	st := newMockStore()
-	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
-	if err != nil {
-		t.Fatalf("NewWithSignaling() error: %v", err)
+	d, _ := newTestDaemon(t)
+	d.config.ImmichURL = "http://immich.lan:2283"
+	d.config.ImmichAllowedHost = "immich.lan:2283"
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{{Key: "IMMICHCB1", Type: "ALBUM"}}}, nil
 	}
 
 	var addedSession *Session
@@ -913,7 +873,7 @@ func TestOnSessionCallbacks(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
+	code, err := d.CreateSession(ctx, "immich://IMMICHCB1", "immich", "", 24*time.Hour, 10, false)
 	if err != nil {
 		t.Fatalf("CreateSession() error: %v", err)
 	}
@@ -957,9 +917,11 @@ func TestSessionDownloads(t *testing.T) {
 // TestLoadSessionsFromStore tests loading persisted sessions.
 func TestLoadSessionsFromStore(t *testing.T) {
 	cfg := &config.Config{
-		SignalingURL: "ws://localhost:8080",
-		APIKey:       "test-api-key",
-		AllowedHost:  "opencloud.example.com",
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-api-key",
+		ImmichURL:         "http://immich.lan:2283",
+		ImmichAllowedHost: "immich.lan:2283",
+		ImmichAPIKey:      "api",
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
@@ -967,8 +929,8 @@ func TestLoadSessionsFromStore(t *testing.T) {
 	// Pre-populate store with a session
 	st.SaveSession(store.SessionEntry{
 		Code:         "persisted-code",
-		ShareURL:     "https://opencloud.example.com/s/persisted",
-		ShareType:    "opencloud",
+		ShareURL:     "immich://persisted-code",
+		ShareType:    "immich",
 		ExpiresAt:    time.Now().Add(24 * time.Hour),
 		MaxDownloads: 10,
 		Downloads:    3,
@@ -977,9 +939,6 @@ func TestLoadSessionsFromStore(t *testing.T) {
 	})
 
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
-		return preferredCode, true, nil
-	}
 
 	d, err := NewWithSignaling(cfgMgr, st, sigClient)
 	if err != nil {
@@ -1035,30 +994,26 @@ func TestLoadSessionsFromStoreFiltersExpired(t *testing.T) {
 	}
 }
 
-// TestLoadSessionsFromStore_PreservesFileID tests that FileID is loaded from store.
-func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
+// TestLoadSessionsFromStoreRejectsWebDAV verifies that a persisted WebDAV/file
+// session is removed (and its control registration unregistered) at restore.
+func TestLoadSessionsFromStoreRejectsWebDAV(t *testing.T) {
 	cfg := &config.Config{
 		SignalingURL: "ws://localhost:8080",
 		APIKey:       "test-api-key",
-		AllowedHost:  "opencloud.example.com",
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 
 	st.SaveSession(store.SessionEntry{
-		Code:         "file-code",
-		ShareURL:     "https://opencloud.example.com/s/abc123",
-		ShareType:    "opencloud",
-		FileID:       "storage-1$foo!bar",
-		ExpiresAt:    time.Now().Add(24 * time.Hour),
-		MaxDownloads: 10,
-		CreatedAt:    time.Now().Add(-1 * time.Hour),
+		Code:      "file-code",
+		ShareURL:  "https://opencloud.example.com/s/abc123",
+		ShareType: "opencloud",
+		FileID:    "storage-1$foo!bar",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+		CreatedAt: time.Now().Add(-1 * time.Hour),
 	})
 
 	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
-		return preferredCode, true, nil
-	}
 
 	d, err := NewWithSignaling(cfgMgr, st, sigClient)
 	if err != nil {
@@ -1067,12 +1022,14 @@ func TestLoadSessionsFromStore_PreservesFileID(t *testing.T) {
 
 	d.loadSessionsFromStore(context.Background())
 
-	session := d.GetSession("file-code")
-	if session == nil {
-		t.Fatal("session not found after loadSessionsFromStore")
+	if d.GetSession("file-code") != nil {
+		t.Fatal("WebDAV session should not be restored")
 	}
-	if session.FileID != "storage-1$foo!bar" {
-		t.Errorf("FileID = %q, want storage-1$foo!bar", session.FileID)
+	if st.GetSession("file-code") != nil {
+		t.Fatal("WebDAV session should be deleted from the store")
+	}
+	if !sigClient.unregisteredCode("file-code") {
+		t.Fatal("WebDAV session should be unregistered from the control plane")
 	}
 }
 
@@ -1175,12 +1132,6 @@ func TestHasTURN(t *testing.T) {
 // TestDaemonGetsRelayStaticKey tests that the daemon correctly retrieves
 // the relay static private key and derives the public key.
 func TestDaemonGetsRelayStaticKey(t *testing.T) {
-	cfg := &config.Config{
-		SignalingURL: "ws://localhost:8080",
-		APIKey:       "test-api-key",
-		AllowedHost:  "opencloud.example.com",
-	}
-	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
 
 	// Get relay static private key from mock store
@@ -1201,33 +1152,6 @@ func TestDaemonGetsRelayStaticKey(t *testing.T) {
 	}
 	if pubHex[:2] != "04" {
 		t.Errorf("relay static public key should start with 04 (uncompressed point), got %s", pubHex[:2])
-	}
-
-	// Verify the mock signaling client receives the relay_static_pub
-	sigClient := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
-	var receivedRelayPub string
-	sigClient.registerShare = func(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, bool, error) {
-		receivedRelayPub = relayStaticPub
-		return "test-code", false, nil
-	}
-
-	d, err := NewWithSignaling(cfgMgr, st, sigClient)
-	if err != nil {
-		t.Fatalf("NewWithSignaling() error: %v", err)
-	}
-
-	ctx := context.Background()
-	code, err := d.CreateSession(ctx, "https://opencloud.example.com/s/abc123", "opencloud", "", 24*time.Hour, 10, false)
-	if err != nil {
-		t.Fatalf("CreateSession() error: %v", err)
-	}
-
-	if code != "test-code" {
-		t.Errorf("CreateSession() code = %s, expected test-code", code)
-	}
-
-	if receivedRelayPub != pubHex {
-		t.Errorf("RegisterShare received relay_static_pub = %s, expected %s", receivedRelayPub, pubHex)
 	}
 }
 
@@ -1529,7 +1453,7 @@ func TestSyncImmichSharesRegistersNewAndUnregistersRemoved(t *testing.T) {
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
-			{Key: "IMMICHNEW1", Type: "ALBUM", Password: "********"},
+			{Key: "IMMICHNEW1", Type: "ALBUM"},
 		}}, nil
 	}
 	d.sessions["IMMICHOLD1"] = &Session{Code: "IMMICHOLD1", ShareType: "immich", RelayOnly: true}
@@ -1712,7 +1636,7 @@ func TestSyncImmichSharesWiresClientForNewSession(t *testing.T) {
 	d.config.ImmichAPIKey = "api"
 	d.newImmichPoller = func() (immichPoller, error) {
 		return &fakeImmichPoller{shares: []immich.SharedLink{
-			{Key: "IMMICHCLIENT1", Type: "ALBUM", Password: "********"},
+			{Key: "IMMICHCLIENT1", Type: "ALBUM"},
 		}}, nil
 	}
 
@@ -1721,17 +1645,17 @@ func TestSyncImmichSharesWiresClientForNewSession(t *testing.T) {
 	session := d.GetSession("IMMICHCLIENT1")
 	require.NotNil(t, session)
 	require.NotNil(t, session.immichClient)
-	require.True(t, session.IsPasswordProtected)
+	require.False(t, session.IsPasswordProtected)
 
 	stored := d.store.GetSession("IMMICHCLIENT1")
 	require.NotNil(t, stored)
-	require.True(t, stored.IsPasswordProtected)
+	require.False(t, stored.IsPasswordProtected)
 }
 
 // TestRegisterImmichShareWaitsForDirectReady covers the I1-gap for Immich
 // polling: a direct (relay_only=false) Immich share must wait for the current
-// epoch's enrollment_ready before registering, while a relay-only share must
-// register immediately without waiting.
+// epoch's enrollment_ready before registering. Phase 3 rejects relay-only
+// registrations outright.
 func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
 	setup := func(t *testing.T, relayOnly bool) (*Daemon, *mockSignalingClient) {
 		t.Helper()
@@ -1756,7 +1680,7 @@ func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, err := d.registerImmichShare(ctx, link, "04abcd")
+			_, err := d.registerImmichShare(ctx, link, "04abcd", 0, time.Time{})
 			done <- err
 		}()
 
@@ -1779,15 +1703,12 @@ func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
 		require.True(t, sig.registeredCode("IMMICHDIRECT1"))
 	})
 
-	t.Run("relay-only does not wait", func(t *testing.T) {
+	t.Run("relay-only rejected", func(t *testing.T) {
 		d, sig := setup(t, true)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		_, err := d.registerImmichShare(ctx, link, "04abcd")
-		require.NoError(t, err)
-		require.True(t, sig.registeredCode("IMMICHDIRECT1"))
+		_, err := d.registerImmichShare(context.Background(), link, "04abcd", 0, time.Time{})
+		require.ErrorContains(t, err, "relay-only")
+		require.False(t, sig.registeredCode("IMMICHDIRECT1"))
 	})
 }
 
@@ -1798,7 +1719,7 @@ func TestLoadSessionsFromStoreWiresPersistedImmichSession(t *testing.T) {
 		ImmichURL:         "http://immich.lan:2283",
 		ImmichAllowedHost: "immich.lan:2283",
 		ImmichAPIKey:      "api",
-		DefaultRelayOnly:  true,
+		DefaultRelayOnly:  false,
 	}
 	cfgMgr := &mockConfigManager{cfg: cfg}
 	st := newMockStore()
@@ -1806,8 +1727,8 @@ func TestLoadSessionsFromStoreWiresPersistedImmichSession(t *testing.T) {
 		Code:                "IMMICHPERSIST1",
 		ShareURL:            "immich://IMMICHPERSIST1",
 		ShareType:           "immich",
-		IsPasswordProtected: true,
-		RelayOnly:           true,
+		IsPasswordProtected: false,
+		RelayOnly:           false,
 		CreatedAt:           time.Now().Add(-time.Hour),
 	}))
 	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
@@ -1819,8 +1740,8 @@ func TestLoadSessionsFromStoreWiresPersistedImmichSession(t *testing.T) {
 	session := d.GetSession("IMMICHPERSIST1")
 	require.NotNil(t, session)
 	require.Equal(t, "immich", session.ShareType)
-	require.True(t, session.RelayOnly)
-	require.True(t, session.IsPasswordProtected)
+	require.False(t, session.RelayOnly)
+	require.False(t, session.IsPasswordProtected)
 	require.NotNil(t, session.immichClient)
 	require.True(t, sig.registeredCode("IMMICHPERSIST1"))
 }

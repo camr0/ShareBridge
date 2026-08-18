@@ -113,6 +113,77 @@ func TestRedirectUnavailableLiveSessionAgentDisconnected(t *testing.T) {
 	}
 }
 
+// seedResolveSession seeds a session with code and the given mutation applied on
+// top of a default active, direct, gallery (immich) session. The mutation may
+// flip is_active/share_type/relay_only/is_password_protected/expires_at or set
+// inactive_reason. This is the ResolveForRedirect test harness, so it does NOT
+// install an epoch or a connected hub agent (status logic must not depend on
+// live transport readiness).
+func seedResolveSession(t *testing.T, app core.App, code string, mutate func(*core.Record)) {
+	t.Helper()
+	apiKeyID := mustAPIKey(t, app, "key-"+code).Id
+
+	sessions, _ := app.FindCollectionByNameOrId("sessions")
+	sess := core.NewRecord(sessions)
+	sess.Set("code", code)
+	sess.Set("api_key_id", apiKeyID)
+	sess.Set("agent_id", "agent-1")
+	sess.Set("share_type", "immich")
+	sess.Set("is_active", true)
+	if mutate != nil {
+		mutate(sess)
+	}
+	if err := app.Save(sess); err != nil {
+		t.Fatalf("save session %s: %v", code, err)
+	}
+}
+
+// TestResolveForRedirect is the canonical-route status matrix (§8): active
+// gallery → 302; relay-only/WebDAV/protected/expired → 410; revoked/unknown →
+// 404; inactive rows with a missing/unrecognized inactive_reason fail safe as
+// 404.
+func TestResolveForRedirect(t *testing.T) {
+	app, ctrl := newTestController(t)
+
+	cases := []struct {
+		name   string
+		code   string
+		seed   bool
+		mutate func(*core.Record)
+		status int
+	}{
+		{name: "active gallery", code: "active", seed: true, status: http.StatusFound},
+		{name: "relay-only active", code: "relay", seed: true, mutate: func(r *core.Record) { r.Set("relay_only", true) }, status: http.StatusGone},
+		{name: "webdav active", code: "webdav", seed: true, mutate: func(r *core.Record) { r.Set("share_type", "opencloud") }, status: http.StatusGone},
+		{name: "protected active", code: "prot", seed: true, mutate: func(r *core.Record) { r.Set("is_password_protected", true) }, status: http.StatusGone},
+		{name: "expired active", code: "expactive", seed: true, mutate: func(r *core.Record) { r.Set("expires_at", time.Now().Add(-time.Hour)) }, status: http.StatusGone},
+		{name: "revoked tombstone", code: "revoked", seed: true, mutate: func(r *core.Record) { r.Set("is_active", false); r.Set("inactive_reason", "revoked") }, status: http.StatusNotFound},
+		{name: "expired tombstone", code: "exptomb", seed: true, mutate: func(r *core.Record) { r.Set("is_active", false); r.Set("inactive_reason", "expired") }, status: http.StatusGone},
+		{name: "unsupported tombstone", code: "unsup", seed: true, mutate: func(r *core.Record) { r.Set("is_active", false); r.Set("inactive_reason", "unsupported") }, status: http.StatusGone},
+		{name: "missing reason", code: "missing", seed: true, mutate: func(r *core.Record) { r.Set("is_active", false) }, status: http.StatusNotFound},
+		{name: "invalid reason", code: "invalid", seed: true, mutate: func(r *core.Record) { r.Set("is_active", false); r.Set("inactive_reason", "bogus") }, status: http.StatusNotFound},
+		{name: "unknown code", code: "unknown", status: http.StatusNotFound},
+	}
+
+	for _, tc := range cases {
+		if tc.seed {
+			seedResolveSession(t, app, tc.code, tc.mutate)
+		}
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, status := ctrl.ResolveForRedirect(tc.code)
+			if status != tc.status {
+				t.Fatalf("status = %d, want %d", status, tc.status)
+			}
+			if tc.status == http.StatusFound && rec == nil {
+				t.Fatalf("active gallery must return its session record")
+			}
+		})
+	}
+}
+
 // TestRedirectUnavailableGrantedPortZero seeds a fully-ready session/epoch/agent
 // but stubs emitOpenFn to return GrantedPort 0 with Status "ok", asserting the
 // port-range rejection (port 0 must never redirect).

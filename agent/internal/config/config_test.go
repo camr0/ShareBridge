@@ -51,8 +51,8 @@ func TestNewManager_CreatesConfigDir(t *testing.T) {
 	if cfg.DefaultMaxDownloads != 10 {
 		t.Errorf("DefaultMaxDownloads = %d, want 10", cfg.DefaultMaxDownloads)
 	}
-	if !cfg.DefaultRelayOnly {
-		t.Error("DefaultRelayOnly = false, want true")
+	if cfg.DefaultRelayOnly {
+		t.Error("DefaultRelayOnly = true, want false")
 	}
 	if cfg.UIPort != 7878 {
 		t.Errorf("UIPort = %d, want 7878", cfg.UIPort)
@@ -280,7 +280,7 @@ func TestLoad_PartialFileWithEnvFill(t *testing.T) {
 	}
 }
 
-func TestNewManager_MigratesLegacyDirectDefaultToRelay(t *testing.T) {
+func TestNewManager_MigratesLegacyRelayDefaultToDirect(t *testing.T) {
 	tmpDir := t.TempDir()
 	homeDir := filepath.Join(tmpDir, "home")
 	configDir := filepath.Join(homeDir, ".sharebridge")
@@ -292,7 +292,7 @@ func TestNewManager_MigratesLegacyDirectDefaultToRelay(t *testing.T) {
 	configPath := filepath.Join(configDir, "config.json")
 	legacyConfig := []byte(`{
   "agent_api_key": "sb_agent_existing",
-  "default_relay_only": false
+  "default_relay_only": true
 }`)
 	if err := os.WriteFile(configPath, legacyConfig, 0600); err != nil {
 		t.Fatal(err)
@@ -302,8 +302,8 @@ func TestNewManager_MigratesLegacyDirectDefaultToRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
-	if !mgr.Get().DefaultRelayOnly {
-		t.Fatal("DefaultRelayOnly = false after legacy config migration, want true")
+	if mgr.Get().DefaultRelayOnly {
+		t.Fatal("DefaultRelayOnly = true after relay-default migration, want false")
 	}
 
 	data, err := os.ReadFile(configPath)
@@ -317,8 +317,8 @@ func TestNewManager_MigratesLegacyDirectDefaultToRelay(t *testing.T) {
 	if persisted["config_version"] != float64(currentConfigVersion) {
 		t.Fatalf("config_version = %v, want %d", persisted["config_version"], currentConfigVersion)
 	}
-	if relayOnly, ok := persisted["default_relay_only"].(bool); !ok || !relayOnly {
-		t.Fatalf("persisted default_relay_only = %v, want true", persisted["default_relay_only"])
+	if relayOnly, ok := persisted["default_relay_only"].(bool); !ok || relayOnly {
+		t.Fatalf("persisted default_relay_only = %v, want false", persisted["default_relay_only"])
 	}
 }
 

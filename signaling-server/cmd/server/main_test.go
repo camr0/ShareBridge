@@ -27,7 +27,10 @@ func setupServerTestApp(t *testing.T) (core.App, func()) {
 	require.NoError(t, testApp.RunSystemMigrations())
 	require.NoError(t, migrations.CreateCollections(testApp))
 	require.NoError(t, migrations.AddRelayOnly(testApp))
+	require.NoError(t, migrations.AddSessionRelayStaticPub(testApp))
+	require.NoError(t, migrations.AddImmichSessionFields(testApp))
 	require.NoError(t, migrations.CreateAgents(testApp))
+	require.NoError(t, migrations.AddSessionsInactiveReason(testApp))
 
 	return testApp, func() { testApp.Cleanup() }
 }
@@ -128,14 +131,21 @@ func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
 	// route-level tests exercise independently.
 	ctrl := directctl.NewController(app, hub.New(), nil, nil, directctl.Config{BaseDomain: "example.com"})
 
-	// Direct link route - dispatch on relay_only: relay-only sessions serve the
-	// web client; direct sessions redirect through the controller gate.
+	// Canonical routes: /share/{code} and /s/{code} both resolve through the
+	// tombstone-aware resolver (§8). Active gallery shares 302 to the direct
+	// origin; expired/unsupported return 410 and revoked/unknown return 404.
+	pbRouter.GET("/share/{code}", serveShareRedirect(ctrl))
 	pbRouter.GET("/s/{code}", func(e *core.RequestEvent) error {
 		code := e.Request.PathValue("code")
-		if isRelayOnlySession(app, code) {
-			return handler.ServeFileNoCache("./web/index.html")(e)
+		_, status := ctrl.ResolveForRedirect(code)
+		switch status {
+		case http.StatusFound:
+			return ctrl.Redirect(e.Response, e.Request, code)
+		case http.StatusGone:
+			return e.Error(http.StatusGone, "share expired or unsupported", nil)
+		default:
+			return e.NotFoundError("session not found", nil)
 		}
-		return ctrl.Redirect(e.Response, e.Request, code)
 	})
 	pbRouter.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
 
@@ -173,10 +183,10 @@ func TestServerRoutesImmichLinks404ForUnknownSession(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestServerRoutesRelayOnlySessionServesWebClient is the backward-compat check
-// for /s/{code}: an explicitly relay-only session must keep the existing
-// web-client serve path (200), not be 503'd by the direct controller gate.
-func TestServerRoutesRelayOnlySessionServesWebClient(t *testing.T) {
+// TestServerRoutesRelayOnlySessionGone asserts a relay-only session returns 410
+// (unsupported) from the canonical /s/{code} route rather than serving the v1
+// web client.
+func TestServerRoutesRelayOnlySessionGone(t *testing.T) {
 	app, router := setupRouterForTest(t)
 	user := createServerTestUser(t, app, "relayonly-route@example.com")
 	apiKey := createServerTestAPIKey(t, app, user.Id)
@@ -187,19 +197,19 @@ func TestServerRoutesRelayOnlySessionServesWebClient(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/s/RELAYONLYROUTE1", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Contains(t, rec.Body.String(), "ShareBridge")
+	require.Equal(t, http.StatusGone, rec.Code)
 }
 
-// TestServerRoutesDirectSessionRedirectsNotWebClient asserts a direct
-// (relay_only false/absent) session still dispatches to the controller gate
-// (503 when the epoch is not ready) rather than the web-client serve path.
-func TestServerRoutesDirectSessionRedirectsNotWebClient(t *testing.T) {
+// TestServerRoutesGallerySessionRedirectsNotWebClient asserts an active gallery
+// (immich) session dispatches to the controller gate (503 when the epoch is not
+// ready) rather than serving a static page.
+func TestServerRoutesGallerySessionRedirectsNotWebClient(t *testing.T) {
 	app, router := setupRouterForTest(t)
 	user := createServerTestUser(t, app, "direct-route@example.com")
 	apiKey := createServerTestAPIKey(t, app, user.Id)
-	// relay_only defaults to false/absent → direct.
-	createServerTestSession(t, app, apiKey.Id, "DIRECTROUTE1", nil)
+	session := createServerTestSession(t, app, apiKey.Id, "DIRECTROUTE1", nil)
+	session.Set("share_type", "immich")
+	require.NoError(t, app.Save(session))
 
 	req := httptest.NewRequest(http.MethodGet, "/s/DIRECTROUTE1", nil)
 	rec := httptest.NewRecorder()

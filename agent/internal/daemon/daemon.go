@@ -761,118 +761,24 @@ func (d *Daemon) Stop() error {
 }
 
 // CreateSession creates a new share session and registers it with the
-// signaling server. The shareType must be explicitly provided by the caller
-// ("opencloud" or "nextcloud") - it is not derived from the URL.
+// signaling server. Phase 3 only supports direct (non-relay) gallery shares:
+// relay-only and WebDAV/file (opencloud/nextcloud) shares are rejected.
 func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
-	cfg := d.GetConfig()
-
-	if shareType == "immich" {
-		return d.createManualImmichSession(ctx, shareURL)
+	// Phase 3 enforcement: relay-only and WebDAV/file shares are unsupported.
+	if relayOnly {
+		return "", validationError{message: "relay-only shares are not supported"}
 	}
-
-	// Direct (non-relay) registrations must wait for the current epoch's
-	// enrollment_ready: a direct share needs a live origin + certificate, and
-	// registering before readiness would allocate an origin the agent cannot
-	// yet serve. Relay-only shares need no direct transport.
-	if !relayOnly {
-		if err := d.waitForDirectReady(ctx); err != nil {
-			return "", fmt.Errorf("direct transport not ready: %w", err)
-		}
+	switch shareType {
+	case "immich":
+		return d.createManualImmichSession(ctx, shareURL, expiryDuration, maxDownloads)
+	case "opencloud", "nextcloud":
+		return "", validationError{message: fmt.Sprintf("share type %q is not supported", shareType)}
+	default:
+		return "", validationError{message: fmt.Sprintf("share type %q is not supported", shareType)}
 	}
-
-	allowedHosts := []string{cfg.AllowedHost, cfg.NCAllowedHost}
-
-	// Validate share URL against allowed hosts
-	if cfg.AllowedHost != "" || cfg.NCAllowedHost != "" {
-		_, err := cloudwebdav.New(shareType, shareURL, allowedHosts, password)
-		if err != nil {
-			return "", fmt.Errorf("validate share URL: %w", err)
-		}
-	}
-
-	// Create WebDAV client
-	webdavClient, err := cloudwebdav.New(shareType, shareURL, allowedHosts, password)
-	if err != nil {
-		return "", fmt.Errorf("create WebDAV client: %w", err)
-	}
-
-	// Extract oc:fileid from share root — best-effort; empty string on failure.
-	fileID, err := webdavClient.GetRootFileID()
-	if err != nil {
-		log.Printf("warning: could not extract fileID for %s: %v", shareURL, err)
-		fileID = ""
-	}
-
-	// Get relay static private key and derive public key
-	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
-	if err != nil {
-		return "", fmt.Errorf("get relay static key: %w", err)
-	}
-	relayStaticPub, err := RelayStaticPubHex(relayStaticPriv)
-	if err != nil {
-		return "", fmt.Errorf("derive relay static public key: %w", err)
-	}
-
-	// Register with signaling server (no preferred code for new sessions)
-	code, origin, reconnected, err := d.signaling.RegisterShare(ctx, shareURL, "", relayOnly, relayStaticPub)
-	if err != nil {
-		return "", fmt.Errorf("register share: %w", err)
-	}
-	d.bindOrigin(code, origin)
-
-	now := time.Now()
-	session := &Session{
-		Code:         code,
-		ShareURL:     shareURL,
-		ShareType:    shareType,
-		FileID:       fileID,
-		Password:     password,
-		ExpiresAt:    now.Add(expiryDuration),
-		MaxDownloads: maxDownloads,
-		Downloads:    0,
-		RelayOnly:    relayOnly,
-		CreatedAt:    now,
-		webdavClient: webdavClient,
-		peers:        make(map[string]*peer.Peer),
-	}
-
-	// Add to in-memory map
-	d.mu.Lock()
-	d.sessions[code] = session
-	d.mu.Unlock()
-
-	// Persist to store
-	if err := d.store.SaveSession(store.SessionEntry{
-		Code:         code,
-		ShareURL:     shareURL,
-		ShareType:    session.ShareType,
-		FileID:       fileID,
-		Password:     password,
-		ExpiresAt:    session.ExpiresAt,
-		MaxDownloads: maxDownloads,
-		Downloads:    0,
-		RelayOnly:    relayOnly,
-		CreatedAt:    now,
-		Origin:       origin,
-	}); err != nil {
-		log.Printf("warning: could not persist session: %v", err)
-	}
-
-	if reconnected {
-		log.Printf("session reclaimed - code: %s", code)
-	} else {
-		log.Printf("session created - code: %s", code)
-	}
-
-	// Notify callback
-	if d.OnSessionAdded != nil {
-		d.OnSessionAdded(session)
-	}
-
-	return code, nil
 }
 
-func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string) (string, error) {
+func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string, expiryDuration time.Duration, maxDownloads int) (string, error) {
 	const prefix = "immich://"
 	if !strings.HasPrefix(shareURL, prefix) || strings.TrimPrefix(shareURL, prefix) == "" {
 		return "", validationError{message: "share_url must be immich://KEY for manual Immich shares"}
@@ -907,12 +813,16 @@ func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string)
 	if !found {
 		return "", fmt.Errorf("immich share %q not found", key)
 	}
+	// Phase 3: password-protected shares are deferred.
+	if link.IsPasswordProtected() {
+		return "", validationError{message: "password-protected Immich shares are not supported"}
+	}
 
 	relayStaticPub, err := d.relayStaticPubHex()
 	if err != nil {
 		return "", err
 	}
-	session, err := d.registerImmichShare(ctx, link, relayStaticPub)
+	session, err := d.registerImmichShare(ctx, link, relayStaticPub, maxDownloads, time.Now().Add(expiryDuration))
 	if err != nil {
 		return "", err
 	}
@@ -947,10 +857,11 @@ func (d *Daemon) RevokeSession(code string) error {
 	}
 	d.revokeOrigin(code)
 
-	// Notify server of deregistration (send deregister message)
+	// Notify server of deregistration (send deregister message).
 	d.signaling.Send(context.Background(), map[string]string{
-		"type": "deregister",
-		"code": code,
+		"type":   "deregister",
+		"code":   code,
+		"reason": "revoked",
 	})
 
 	log.Printf("session revoked: %s", code)
@@ -1818,6 +1729,14 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			continue
 		}
 
+		// Phase 3 enforcement: protected, relay-only, and WebDAV/file sessions
+		// are unsupported. Remove them and their control registrations.
+		if entry.IsPasswordProtected || entry.RelayOnly || entry.ShareType != "immich" {
+			log.Printf("warning: removing unsupported persisted session %s (share_type=%s relay_only=%v protected=%v)", entry.Code, entry.ShareType, entry.RelayOnly, entry.IsPasswordProtected)
+			d.cleanupPersistedSession(ctx, entry)
+			continue
+		}
+
 		// Direct (non-relay) sessions must wait for the current epoch's
 		// enrollment_ready before re-registration; relay-only sessions proceed
 		// immediately. Without this gate a reconnect would register a direct
@@ -1978,6 +1897,12 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 		if !strings.EqualFold(link.Type, "ALBUM") {
 			continue
 		}
+		// Phase 3: password-protected shares are deferred. Skip before adding
+		// to `seen` so any previously-registered protected session is removed
+		// below (stale-registration clean-up).
+		if link.IsPasswordProtected() {
+			continue
+		}
 		seen[link.Key] = link
 
 		d.mu.RLock()
@@ -1990,7 +1915,7 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 			continue
 		}
 
-		session, err := d.registerImmichShare(ctx, link, relayStaticPub)
+		session, err := d.registerImmichShare(ctx, link, relayStaticPub, d.GetConfig().DefaultMaxDownloads, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -2046,7 +1971,7 @@ func (d *Daemon) getImmichPoller() (immichPoller, error) {
 	})
 }
 
-func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink, relayStaticPub string) (*Session, error) {
+func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink, relayStaticPub string, maxDownloads int, expiresAt time.Time) (*Session, error) {
 	reg, ok := d.signaling.(shareOptionRegistrar)
 	if !ok {
 		return nil, fmt.Errorf("signaling client does not support option registration")
@@ -2056,15 +1981,19 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 	passwordProtected := link.IsPasswordProtected()
 	relayOnly := d.GetConfig().DefaultRelayOnly
 
-	// Direct (non-relay) Immich shares must wait for the current epoch's
-	// enrollment_ready before registration, matching CreateSession and
-	// persisted-session restoration: a direct share needs a live origin +
-	// certificate, and registering before readiness would allocate an origin the
-	// agent cannot yet serve. Relay-only shares need no direct transport.
-	if !relayOnly {
-		if err := d.waitForDirectReady(ctx); err != nil {
-			return nil, fmt.Errorf("direct transport not ready: %w", err)
-		}
+	// Phase 3 enforcement: relay-only and protected Immich shares are
+	// unsupported at every entry point.
+	if relayOnly {
+		return nil, validationError{message: "relay-only shares are not supported"}
+	}
+	if passwordProtected {
+		return nil, validationError{message: "password-protected Immich shares are not supported"}
+	}
+
+	// Direct Immich shares must wait for the current epoch's enrollment_ready
+	// before registration: a direct share needs a live origin + certificate.
+	if err := d.waitForDirectReady(ctx); err != nil {
+		return nil, fmt.Errorf("direct transport not ready: %w", err)
 	}
 
 	log.Printf("registering Immich share %s (relay_only=%v, password_protected=%v)", link.Key, relayOnly, passwordProtected)
@@ -2094,6 +2023,8 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		ShareType:           "immich",
 		IsPasswordProtected: passwordProtected,
 		RelayOnly:           relayOnly,
+		MaxDownloads:        maxDownloads,
+		ExpiresAt:           expiresAt,
 		CreatedAt:           now,
 		immichClient:        immichTransferAdapter{client: client},
 		immich:              client,
@@ -2106,6 +2037,8 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		ShareType:           "immich",
 		IsPasswordProtected: passwordProtected,
 		RelayOnly:           relayOnly,
+		MaxDownloads:        maxDownloads,
+		ExpiresAt:           expiresAt,
 		CreatedAt:           now,
 		Origin:              origin,
 	}); err != nil {
@@ -2121,6 +2054,17 @@ func (d *Daemon) unregisterShare(ctx context.Context, code string) error {
 		return unreg.UnregisterShare(ctx, code)
 	}
 	return d.signaling.Send(ctx, map[string]string{"type": "unregister_share", "code": code})
+}
+
+// cleanupPersistedSession removes a persisted session that is unsupported in
+// Phase 3: it deregisters the control-side session and deletes the local entry.
+func (d *Daemon) cleanupPersistedSession(ctx context.Context, entry store.SessionEntry) {
+	if err := d.unregisterShare(ctx, entry.Code); err != nil {
+		log.Printf("warning: could not unregister unsupported session %s: %v", entry.Code, err)
+	}
+	if err := d.store.DeleteSession(entry.Code); err != nil {
+		log.Printf("warning: could not delete unsupported session %s: %v", entry.Code, err)
+	}
 }
 
 func (d *Daemon) newImmichClient(code string) (*immich.Client, error) {
@@ -2273,8 +2217,9 @@ func (d *Daemon) pruneExpiredSessions() {
 		}
 		d.revokeOrigin(item.code)
 		_ = d.signaling.Send(context.Background(), map[string]string{
-			"type": "deregister",
-			"code": item.code,
+			"type":   "deregister",
+			"code":   item.code,
+			"reason": "expired",
 		})
 		if d.OnSessionRemoved != nil {
 			d.OnSessionRemoved(item.code)
