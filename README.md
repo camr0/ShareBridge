@@ -30,11 +30,11 @@ Direct mode sends data peer-to-peer over WebRTC. Relay mode sends payloads throu
 ## Repository layout
 
 - `agent/` — private-network agent and backend integrations
-- `signaling-server/` — signaling, accounts, secure relay, and browser application
-- `signaling-server/web/` — browser client
+- `control/` — signaling, accounts, secure relay, and browser application
+- `control/web/` — browser client
 - `docs/` — architecture, design, operations, and release documentation
 
-The signaling server has additional setup and configuration guidance in [signaling-server/README.md](signaling-server/README.md).
+The control plane has additional setup and configuration guidance in [control/README.md](control/README.md).
 
 ## Development
 
@@ -45,7 +45,7 @@ cd agent
 go test ./...
 go vet ./...
 
-cd ../signaling-server
+cd ../control
 go test ./...
 
 cd web
