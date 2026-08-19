@@ -1,1 +1,0 @@
-// Vitest happy-dom setup — no additional globals needed for this extension

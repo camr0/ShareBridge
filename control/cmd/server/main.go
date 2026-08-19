@@ -20,14 +20,12 @@ import (
 	"sharebridge/control/internal/handler"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
-	"sharebridge/control/internal/relay"
 	_ "sharebridge/control/migrations"
 )
 
 func main() {
 	cfg := config.Load()
 	h := hub.New()
-	reg := relay.NewRegistry(cfg.RelayPendingWaitWindow)
 
 	app := pocketbase.NewWithConfig(pocketbase.Config{
 		DefaultDataDir: cfg.DataDir,
@@ -83,23 +81,10 @@ func main() {
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
 			authMiddleware := middleware.APIKeyAuth(app)
-			handlerFunc := handler.AgentWS(app, h, reg, cfg, ctrl)
+			handlerFunc := handler.AgentWS(app, h, cfg, ctrl)
 			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
 			return nil
 		})
-
-		router.GET("/ws/client", func(e *core.RequestEvent) error {
-			handler.BrowserWS(app, h, cfg)(e.Response, e.Request)
-			return nil
-		})
-
-		router.GET("/ws/relay", func(e *core.RequestEvent) error {
-			handler.RelayWS(app, reg, cfg)(e.Response, e.Request)
-			return nil
-		})
-
-		// Public session info endpoint
-		router.GET("/sessions/{code}", handler.GetSessionInfo(app, h))
 
 		// Redirect /share/{code} and /s/{code} through the single tombstone-aware
 		// resolver. Active gallery shares 302 to the agent's direct origin;
@@ -118,20 +103,8 @@ func main() {
 				return e.NotFoundError("session not found", nil)
 			}
 		})
-		router.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
-
 		// Homepage (marketing)
 		router.GET("/", handler.ServeFileNoCache("./web/home.html"))
-
-		// File transfer client (manual join)
-		router.GET("/join", handler.ServeFileNoCache("./web/index.html"))
-
-		// Static assets for file client
-		router.GET("/sw.js", handler.ServeFileNoCache("./web/sw.js"))
-
-		router.GET("/app.js", handler.ServeFileNoCache("./web/app.js"))
-		router.GET("/src/{path...}", handler.ServeDirNoCache("./web/src"))
-		router.GET("/noise-p256/{path...}", handler.ServeDirNoCache("./web/noise-p256"))
 
 		// User-facing pages (placeholders - full implementation in Task 10)
 		router.GET("/register", handler.ServeFileNoCache("./web/register.html"))
@@ -177,13 +150,6 @@ func main() {
 			}
 		})
 
-		// Relay registry entries are short-lived and in-memory only. Clean up
-		// expired pending sessions so direct-mode success does not leak them until
-		// process restart.
-		app.Cron().MustAdd("relay_registry_cleanup", "* * * * *", func() {
-			reg.CleanupExpired(time.Now().UTC())
-		})
-
 		// Initialize quota fields when a new user registers.
 		app.OnRecordCreate("users").BindFunc(func(e *core.RecordEvent) error {
 			now := time.Now().UTC()
@@ -191,11 +157,10 @@ func main() {
 			e.Record.Set("current_period_usage_gb", 0.0)
 			e.Record.Set("quota_period_start", now)
 			e.Record.Set("quota_period_end", now.Add(30*24*time.Hour))
-			e.Record.Set("turn_baseline_bytes", 0.0)
 			return e.Next()
 		})
 
-		log.Printf("signaling server listening on :%s", cfg.Port)
+		log.Printf("control server listening on :%s", cfg.Port)
 		log.Printf("pocketbase data dir: %s", cfg.DataDir)
 
 		return se.Next()

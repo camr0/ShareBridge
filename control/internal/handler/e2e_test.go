@@ -32,7 +32,6 @@ import (
 	"sharebridge/control/internal/directctl"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
-	"sharebridge/control/internal/relay"
 )
 
 // TestEndToEndDirectFlow drives the full direct-mode control flow through the
@@ -58,7 +57,6 @@ func TestEndToEndDirectFlow(t *testing.T) {
 
 	h := hub.New()
 	cfg := config.Load()
-	reg := relay.NewRegistry(2 * time.Second)
 	ctrl := directctl.NewController(app, h, coord, nil, directctl.Config{
 		BaseDomain:         "example.com",
 		AllowPrivateProbes: true, // loopback probe target in this test
@@ -70,7 +68,7 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	// Wire the real HTTP + WS stack: /ws/agent (auth + AgentWS) and /s/{code}
 	// (ctrl.Redirect), matching main.go's route shape.
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg, ctrl)
+	agentHandler := AgentWS(app, h, cfg, ctrl)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.HandleFunc("/s/", func(w http.ResponseWriter, r *http.Request) {

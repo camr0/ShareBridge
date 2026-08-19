@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -22,8 +21,6 @@ import (
 	"sharebridge/control/internal/directctl"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
-	"sharebridge/control/internal/relay"
-	"sharebridge/control/internal/turn"
 )
 
 // flexInt decodes a JSON number or a numeric string. The agent's hello message
@@ -55,22 +52,15 @@ func (f *flexInt) UnmarshalJSON(data []byte) error {
 
 // Agent message types from agent to server
 type agentMsg struct {
-	Type                string          `json:"type"`
-	AgentID             string          `json:"agent_id,omitempty"`
-	Code                string          `json:"code,omitempty"`
-	ShareURL            string          `json:"share_url,omitempty"` // received for protocol compat, not stored
-	ExpiresAt           *time.Time      `json:"expires_at,omitempty"`
-	SessionID           string          `json:"session_id,omitempty"`
-	SDP                 string          `json:"sdp,omitempty"`
-	Candidate           json.RawMessage `json:"candidate,omitempty"`
-	ConnID              string          `json:"conn_id,omitempty"`
-	Value               string          `json:"value,omitempty"`
-	Password            string          `json:"password,omitempty"`
-	HasPassword         bool            `json:"has_password,omitempty"`
-	RelayOnly           *bool           `json:"relay_only,omitempty"`
-	RelayStaticPub      string          `json:"relay_static_pub,omitempty"`
-	ShareType           string          `json:"share_type,omitempty"`
-	IsPasswordProtected bool            `json:"is_password_protected,omitempty"`
+	Type                string     `json:"type"`
+	AgentID             string     `json:"agent_id,omitempty"`
+	Code                string     `json:"code,omitempty"`
+	ShareURL            string     `json:"share_url,omitempty"` // received for protocol compat, not stored
+	ExpiresAt           *time.Time `json:"expires_at,omitempty"`
+	RelayOnly           *bool      `json:"relay_only,omitempty"`
+	RelayStaticPub      string     `json:"relay_static_pub,omitempty"`
+	ShareType           string     `json:"share_type,omitempty"`
+	IsPasswordProtected bool       `json:"is_password_protected,omitempty"`
 
 	// Direct-mode control-plane fields. Json tags mirror the agent's
 	// signaling.Message so a single struct decodes both legacy and control
@@ -101,9 +91,8 @@ var errCodeAlreadyInUse = errors.New("code already in use")
 
 // AgentWS handles WebSocket connections from agents.
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
-// The registry parameter is optional - if nil, relay functionality is disabled.
 // The controller parameter is optional - if nil, origin allocation is disabled.
-func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, ctrl *directctl.Controller) http.HandlerFunc {
+func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Controller) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
 		apiKeyID := middleware.GetAPIKeyID(r.Context())
@@ -247,168 +236,6 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config, 
 					continue
 				}
 				handleDeregister(ctx, conn, h, app, apiKeyID, msg.Code, msg.Reason)
-
-			case "offer":
-				if agentID == "" {
-					continue
-				}
-				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
-					"type": "offer",
-					"sdp":  msg.SDP,
-				})
-
-			case "ice_candidate":
-				if agentID == "" {
-					continue
-				}
-				// TURN removed - relay candidates now handled by secure relay
-				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
-					"type":      "ice_candidate",
-					"candidate": msg.Candidate,
-				})
-
-			case "nonce":
-				// Route nonce from agent to the specific browser identified by connID.
-				if agentID == "" {
-					continue
-				}
-				log.Printf("agent_ws: forwarding nonce to browser conn_id=%s has_password=%v", msg.ConnID, msg.HasPassword)
-				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-					"type":         "nonce",
-					"conn_id":      msg.ConnID,
-					"value":        msg.Value,
-					"has_password": msg.HasPassword,
-				})
-
-			case "auth_ok":
-				// Browser authentication succeeded - send relay_policy so browser can proceed.
-				if agentID == "" {
-					continue
-				}
-
-				session, err := getSessionByCode(app, msg.Code)
-				if err != nil {
-					log.Printf("agent_ws: auth_ok session lookup failed for code %s: %v", msg.Code, err)
-					continue
-				}
-				if session == nil {
-					log.Printf("agent_ws: auth_ok session not found for code %s", msg.Code)
-					continue
-				}
-
-				relayOnly := session.GetBool("relay_only")
-				expectedStaticPub := session.GetString("relay_static_pub")
-
-				// Determine relay availability: requires relay to be configured,
-				// a valid static pub key from the session, and (for relay-only sessions,
-				// relay is mandatory; for direct sessions, relay is optional fallback).
-				var relayAllowed bool
-				if reg != nil && cfg.RelayJWTSecret != "" && expectedStaticPub != "" {
-					accountRecord, err := app.FindRecordById("users", accountID)
-					if err != nil {
-						log.Printf("agent_ws: auth_ok account lookup failed for account %s: %v", accountID, err)
-						continue
-					}
-					quotaExceeded, _ := checkRelayQuota(accountRecord)
-					relayAllowed = !quotaExceeded
-				}
-
-				var browserJWT string
-				if relayAllowed {
-					sid := relay.NewSID()
-					now := time.Now().UTC()
-
-					browserClaims := relay.BrowserPolicyClaims{
-						SID:               sid,
-						SessionCode:       msg.Code,
-						RelayAllowed:      true,
-						RelayOnly:         relayOnly,
-						ExpectedStaticPub: expectedStaticPub,
-						RegisteredClaims:  jwt.RegisteredClaims{ID: relay.NewJTI()},
-					}
-					var err error
-					browserJWT, err = relay.SignBrowserPolicyJWT(cfg.RelayJWTSecret, browserClaims, now)
-					if err != nil {
-						log.Printf("agent_ws: failed to sign browser policy JWT: %v", err)
-						continue
-					}
-
-					agentJWT, err := relay.SignAgentRelayJWT(cfg.RelayJWTSecret, relay.AgentRelayClaims{SID: sid, AgentID: agentID}, now)
-					if err != nil {
-						log.Printf("agent_ws: failed to sign agent relay JWT: %v", err)
-						continue
-					}
-
-					err = reg.CreatePendingSession(relay.PendingSession{
-						SID:               sid,
-						AccountID:         accountID,
-						SessionCode:       msg.Code,
-						AgentID:           agentID,
-						RelayAllowed:      true,
-						RelayOnly:         relayOnly,
-						ExpectedStaticPub: expectedStaticPub,
-						JTI:               browserClaims.RegisteredClaims.ID,
-						ExpiresAt:         now.Add(relay.TokenLifetime),
-					}, now)
-					if err != nil {
-						log.Printf("agent_ws: failed to create pending relay session: %v", err)
-						continue
-					}
-
-					// Send relay_prepare to agent only when relay fallback is actually allowed.
-					hub.SendDirect(ctx, conn, map[string]any{
-						"type":       "relay_prepare",
-						"sid":        sid,
-						"code":       msg.Code,
-						"expires_at": now.Add(relay.TokenLifetime).Format(time.RFC3339),
-						"relay_jwt":  agentJWT,
-					})
-
-					log.Printf("agent_ws: relay session prepared: sid=%s code=%s agent_id=%s", sid, msg.Code, agentID)
-				}
-
-				// Send relay_policy to browser via hub (always, so browser can proceed)
-				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-					"type":          "relay_policy",
-					"token":         browserJWT,
-					"relay_allowed": relayAllowed,
-					"relay_only":    relayOnly,
-				})
-
-			case "auth_fail":
-				if agentID == "" {
-					continue
-				}
-				failures := h.IncrementImmichAuthFailure(msg.ConnID)
-				log.Printf("Immich auth failed: conn %s failure %d/5", msg.ConnID, failures)
-				if failures >= 5 {
-					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
-				} else {
-					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-						"type":               "auth_fail",
-						"attempts_remaining": 5 - failures,
-					})
-				}
-
-			case "auth_failed":
-				// Track failures per connID. After 3, close the browser WebSocket.
-				// Browser receives auth_failed with attempts_remaining so it can re-prompt.
-				if agentID == "" {
-					continue
-				}
-				failures := h.IncrementAuthFailure(msg.ConnID)
-				log.Printf("HMAC auth failed: conn %s failure %d/3", msg.ConnID, failures)
-				if failures >= 3 {
-					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
-				} else {
-					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
-						"type":               "auth_failed",
-						"attempts_remaining": 3 - failures,
-					})
-				}
-
-			case "session_expired":
-				log.Printf("session expired (max downloads): %s", msg.SessionID)
 			}
 		}
 	}
@@ -428,14 +255,8 @@ func handleHello(ctx context.Context, conn *websocket.Conn, h *hub.Hub, apiKeyID
 	h.RegisterAgent(apiKeyID, conn)
 	log.Printf("agent hello received: api_key_id=%s agent_id=%s", apiKeyID, agentID)
 
-	// Build ICE config for agent - STUN-only (no TURN)
-	iceServers := turn.BuildICEConfig(&turn.ICEConfigRequest{
-		STUNURL: cfg.STUNURL,
-	})
-
 	hub.SendDirect(ctx, conn, map[string]any{
-		"type":        "welcome",
-		"ice_servers": iceServers,
+		"type": "welcome",
 	})
 }
 

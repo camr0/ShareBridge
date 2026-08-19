@@ -2,16 +2,11 @@ package daemon
 
 import (
 	"context"
-	"crypto/ecdh"
-	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,142 +14,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/webrtc/v4"
 	"sharebridge/agent/internal/cert"
-	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/direct"
 	"sharebridge/agent/internal/immich"
-	"sharebridge/agent/internal/multilane"
-	"sharebridge/agent/internal/peer"
-	"sharebridge/agent/internal/relaychannel"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
-	"sharebridge/agent/internal/transfer"
 )
-
-// nonceEntry holds a per-connection nonce for HMAC pre-challenge.
-type nonceEntry struct {
-	nonce     string
-	expiresAt time.Time
-}
-
-// relayTransferChannel is a multi-lane transfer session with a startable relay
-// lifecycle. Application handlers are installed only after transport v2 is
-// ready.
-type relayTransferChannel interface {
-	multilane.ChannelSet
-	Start(ctx context.Context) error
-}
-
-// relayChannelConfig holds configuration for creating a relay channel.
-type relayChannelConfig struct {
-	RelayURL      string
-	RelayJWT      string
-	StaticPrivate []byte
-}
-
-type immichAuthenticator interface {
-	ValidatePassword(ctx context.Context, password string) (bool, error)
-}
-
-type immichGalleryBackend interface {
-	immichAuthenticator
-}
-
-type immichTransferAdapter struct {
-	client *immich.Client
-}
-
-func (a immichTransferAdapter) ValidatePassword(ctx context.Context, password string) (bool, error) {
-	return a.client.ValidatePassword(ctx, password)
-}
-
-func (a immichTransferAdapter) ListGallery(ctx context.Context) (transfer.Gallery, error) {
-	g, err := a.client.ListGallery(ctx)
-	if err != nil {
-		return transfer.Gallery{}, err
-	}
-	items := make([]transfer.GalleryItem, len(g.Items))
-	for i, item := range g.Items {
-		items[i] = transfer.GalleryItem{
-			ID:       item.ID,
-			Name:     item.Name,
-			MimeType: item.MimeType,
-			Width:    item.Width,
-			Height:   item.Height,
-			Size:     item.Size,
-			Duration: item.Duration,
-			SHA1:     item.SHA1,
-		}
-	}
-	return transfer.Gallery{
-		AlbumName:        g.AlbumName,
-		AlbumDescription: g.AlbumDescription,
-		Items:            items,
-	}, nil
-}
-
-func (a immichTransferAdapter) GetThumbnail(ctx context.Context, id string, w io.Writer) (int64, error) {
-	return a.client.GetThumbnail(ctx, id, w)
-}
-
-func (a immichTransferAdapter) GetAssetInfo(ctx context.Context, id string) (string, int64, string, error) {
-	asset, err := a.client.GetAssetInfo(ctx, id)
-	if err != nil {
-		return "", 0, "", err
-	}
-	return asset.OriginalFileName, asset.FileSize(), asset.OriginalMimeType, nil
-}
-
-func (a immichTransferAdapter) GetAsset(ctx context.Context, id string, quality string, w io.Writer) (int64, error) {
-	switch quality {
-	case "", "original":
-		return a.client.GetFile(ctx, id, w)
-	case "preview":
-		return a.client.GetPreview(ctx, id, w)
-	case "thumbnail":
-		return a.client.GetThumbnail(ctx, id, w)
-	case "video":
-		return a.client.GetVideoPlayback(ctx, id, w)
-	default:
-		return 0, fmt.Errorf("unsupported asset quality: %s", quality)
-	}
-}
-
-func (a immichTransferAdapter) HeadVideoPlayback(ctx context.Context, id string) (int64, error) {
-	return a.client.HeadVideoPlayback(ctx, id)
-}
-
-func (a immichTransferAdapter) GetAssetRange(ctx context.Context, id string, quality string, startOffset int64, w io.Writer) (int64, error) {
-	if quality == "video" {
-		return a.client.GetVideoPlaybackRange(ctx, id, startOffset, w)
-	}
-	return a.GetAsset(ctx, id, quality, w)
-}
-
-func (a immichTransferAdapter) GetAlbumDownload(ctx context.Context) (transfer.AlbumDownload, error) {
-	download, err := a.client.GetAlbumDownloadInfo(ctx)
-	if err != nil {
-		return transfer.AlbumDownload{}, err
-	}
-	archives := make([]transfer.AlbumArchive, len(download.Archives))
-	for i, archive := range download.Archives {
-		archives[i] = transfer.AlbumArchive{
-			AssetIDs:      append([]string(nil), archive.AssetIDs...),
-			EstimatedSize: archive.Size,
-		}
-	}
-	return transfer.AlbumDownload{
-		AlbumName: download.AlbumName,
-		TotalSize: download.TotalSize,
-		Archives:  archives,
-	}, nil
-}
-
-func (a immichTransferAdapter) StreamAlbumArchive(ctx context.Context, assetIDs []string, w io.Writer) (int64, error) {
-	return a.client.DownloadArchive(ctx, assetIDs, w)
-}
 
 type immichPoller interface {
 	PollShares(ctx context.Context) ([]immich.SharedLink, error)
@@ -196,7 +62,6 @@ type ConfigManagerInterface interface {
 // StoreInterface defines the interface for session storage.
 type StoreInterface interface {
 	GetAgentID() string
-	GetRelayStaticPrivateKey() ([]byte, error)
 	GetSession(code string) *store.SessionEntry
 	GetByShareURL(shareURL string) *store.SessionEntry
 	ListSessions(filterExpired bool) []store.SessionEntry
@@ -208,10 +73,8 @@ type StoreInterface interface {
 // SignalingClientInterface defines the interface for signaling client.
 type SignalingClientInterface interface {
 	Connect(ctx context.Context) error
-	RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, string, bool, error)
 	DownloadComplete(ctx context.Context, code string, bytesTransferred int64) error
 	Send(ctx context.Context, msg any) error
-	GetICEServers() []webrtc.ICEServer
 	Listen(ctx context.Context) error
 	SetOnMessage(handler func(signaling.Message))
 	SubmitCSR(ctx context.Context, csrPEM string) error
@@ -221,7 +84,7 @@ type SignalingClientInterface interface {
 	TLSError(ctx context.Context, reason string) error
 }
 
-// Session represents an active share session with WebRTC peers.
+// Session represents an active share session.
 type Session struct {
 	Code         string
 	ShareURL     string
@@ -235,11 +98,7 @@ type Session struct {
 	CreatedAt    time.Time
 
 	IsPasswordProtected bool
-	immichClient        immichGalleryBackend
 	immich              *immich.Client // concrete client for the content layer
-	webdavClient        *cloudwebdav.Client
-	peers               map[string]*peer.Peer           // peerID -> Peer
-	relayChannels       map[string]relayTransferChannel // sid -> relay channel
 	closing             bool
 	mu                  sync.Mutex
 }
@@ -259,15 +118,6 @@ type Daemon struct {
 	webServer          WebServer
 	startTime          time.Time
 	signalingConnected bool // true once welcome received
-	hasTURN            bool
-
-	// Nonce store for HMAC pre-challenge (connID -> nonce)
-	nonces   map[string]nonceEntry
-	noncesMu sync.Mutex
-
-	// Factory for creating relay channels (injected for testing)
-	newRelayChannel func(cfg relayChannelConfig) (relayTransferChannel, error)
-	newPeer         func(iceServers []webrtc.ICEServer, relayOnly bool) (*peer.Peer, error)
 
 	newImmichPoller func() (immichPoller, error)
 
@@ -543,7 +393,6 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 		signaling: sig,
 		resolver:  direct.NewResolverRegistry(),
 		sessions:  make(map[string]*Session),
-		nonces:    make(map[string]nonceEntry),
 		startTime: time.Now(),
 	}
 	d.buildDirectState(true)
@@ -562,7 +411,6 @@ func NewWithSignaling(cfgMgr ConfigManagerInterface, st StoreInterface, sig Sign
 		signaling: sig,
 		resolver:  direct.NewResolverRegistry(),
 		sessions:  make(map[string]*Session),
-		nonces:    make(map[string]nonceEntry),
 	}, nil
 }
 
@@ -818,11 +666,7 @@ func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string,
 		return "", validationError{message: "password-protected Immich shares are not supported"}
 	}
 
-	relayStaticPub, err := d.relayStaticPubHex()
-	if err != nil {
-		return "", err
-	}
-	session, err := d.registerImmichShare(ctx, link, relayStaticPub, maxDownloads, time.Now().Add(expiryDuration))
+	session, err := d.registerImmichShare(ctx, link, maxDownloads, time.Now().Add(expiryDuration))
 	if err != nil {
 		return "", err
 	}
@@ -896,26 +740,6 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 	case "welcome":
 		log.Println("agent authenticated with signaling server")
 		d.signalingConnected = true
-		iceServers := d.signaling.GetICEServers()
-		d.hasTURN = hasTURNServer(iceServers)
-
-	case "knock":
-		go d.handleKnock(msg.ConnID, msg.Code)
-
-	case "join":
-		go d.handleJoin(msg.ConnID, msg.Code, msg.HMAC)
-
-	case "password_submit":
-		go d.handlePasswordSubmit(msg.ConnID, msg.Code, msg.Password)
-
-	case "answer":
-		d.handleAnswer(msg.PeerID, msg.SDP)
-
-	case "ice_candidate":
-		d.handleICECandidate(msg.PeerID, msg.Candidate)
-
-	case "relay_prepare":
-		go d.handleRelayPrepare(msg)
 
 	case "enrolled":
 		d.handleEnrolled(msg)
@@ -1165,560 +989,11 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 		WasAlreadyOpen: wasOpen, Status: "ok"})
 }
 
-// handleKnock handles a knock from a browser (via signaling server).
-// It generates a per-connection nonce, stores it with a 60s TTL, and
-// sends it back so the browser can compute the HMAC proof.
-func (d *Daemon) handleKnock(connID, sessionCode string) {
-	d.mu.RLock()
-	session, ok := d.sessions[sessionCode]
-	d.mu.RUnlock()
-	if !ok {
-		log.Printf("knock for unknown session %s", sessionCode)
-		return
-	}
-
-	// Generate 32 random bytes → 64-char hex nonce
-	nonceBytes := make([]byte, 32)
-	if _, err := rand.Read(nonceBytes); err != nil {
-		log.Printf("generate nonce for session %s: %v", sessionCode, err)
-		return
-	}
-	nonce := hex.EncodeToString(nonceBytes)
-
-	// Sweep expired nonces and store new one (under same lock)
-	d.noncesMu.Lock()
-	now := time.Now()
-	for id, entry := range d.nonces {
-		if now.After(entry.expiresAt) {
-			delete(d.nonces, id)
-		}
-	}
-	d.nonces[connID] = nonceEntry{nonce: nonce, expiresAt: now.Add(60 * time.Second)}
-	d.noncesMu.Unlock()
-
-	// Send nonce back to browser (via signaling server)
-	d.signaling.Send(context.Background(), map[string]any{
-		"type":         "nonce",
-		"conn_id":      connID,
-		"value":        nonce,
-		"has_password": session.Password != "",
-	})
-
-	log.Printf("nonce sent for session %s conn %s", sessionCode, connID)
-}
-
-// handleJoin verifies the HMAC from the browser. If valid, creates a WebRTC
-// peer. If invalid, notifies the signaling server (which tracks failures and
-// closes the browser WS after 3 strikes).
-func (d *Daemon) handleJoin(connID, sessionCode, receivedHMAC string) {
-	d.mu.RLock()
-	session, ok := d.sessions[sessionCode]
-	d.mu.RUnlock()
-	if !ok {
-		log.Printf("join for unknown session %s", sessionCode)
-		return
-	}
-
-	// Atomically delete nonce entry before verifying — prevents race where
-	// two concurrent join messages both read the nonce before either deletes it.
-	d.noncesMu.Lock()
-	entry, found := d.nonces[connID]
-	delete(d.nonces, connID)
-	d.noncesMu.Unlock()
-
-	if !found || time.Now().After(entry.expiresAt) {
-		log.Printf("join with expired/missing nonce: session %s conn %s", sessionCode, connID)
-		d.signaling.Send(context.Background(), map[string]any{
-			"type":    "auth_failed",
-			"conn_id": connID,
-		})
-		return
-	}
-
-	if session.ShareType == "immich" && session.IsPasswordProtected {
-		log.Printf("protected Immich join requires password submit: session %s conn %s", sessionCode, connID)
-		d.signaling.Send(context.Background(), map[string]any{
-			"type":    "auth_failed",
-			"conn_id": connID,
-			"code":    sessionCode,
-		})
-		return
-	}
-
-	// Verify HMAC for password-protected shares. Password-less shares skip verification.
-	if session.Password != "" && session.ShareType != "immich" {
-		mac := hmac.New(sha256.New, []byte(session.Password))
-		mac.Write([]byte(entry.nonce))
-		expectedMAC := mac.Sum(nil)
-
-		receivedBytes, err := hex.DecodeString(receivedHMAC)
-		if err != nil || !hmac.Equal(expectedMAC, receivedBytes) {
-			log.Printf("HMAC mismatch for session %s conn %s", sessionCode, connID)
-			d.signaling.Send(context.Background(), map[string]any{
-				"type":    "auth_failed",
-				"conn_id": connID,
-			})
-			return
-		}
-	}
-
-	log.Printf("HMAC verified for session %s conn %s — creating peer", sessionCode, connID)
-
-	// Send auth_ok to signaling server after successful HMAC verification
-	d.signaling.Send(context.Background(), map[string]any{
-		"type":    "auth_ok",
-		"conn_id": connID,
-		"code":    sessionCode,
-	})
-
-	if session.RelayOnly {
-		log.Printf("relay-only session %s conn %s — skipping direct WebRTC peer", sessionCode, connID)
-		return
-	}
-
-	go d.createPeer(connID, sessionCode)
-}
-
-func (d *Daemon) handlePasswordSubmit(connID, sessionCode, password string) {
-	d.mu.RLock()
-	session := d.sessions[sessionCode]
-	d.mu.RUnlock()
-	if session == nil || session.ShareType != "immich" || session.immichClient == nil {
-		_ = d.signaling.Send(context.Background(), map[string]any{"type": "auth_fail", "conn_id": connID, "code": sessionCode})
-		return
-	}
-	ok, err := session.immichClient.ValidatePassword(context.Background(), password)
-	if err != nil || !ok {
-		_ = d.signaling.Send(context.Background(), map[string]any{"type": "auth_fail", "conn_id": connID, "code": sessionCode})
-		return
-	}
-	_ = d.signaling.Send(context.Background(), map[string]any{"type": "auth_ok", "conn_id": connID, "code": sessionCode})
-}
-
-// wireDirectTransferSession waits for Peer.SetOnOpen, which is fired only after
-// all three direct lanes are open and the transport v2 handshake has completed.
-func (d *Daemon) wireDirectTransferSession(session *Session, peerID string, channels multilane.ChannelSet, isCurrent func() bool) {
-	var activateOnce sync.Once
-	channels.SetOnOpen(func() {
-		activateOnce.Do(func() {
-			if isCurrent != nil && !isCurrent() {
-				return
-			}
-			log.Printf("DataChannel lanes ready for peer %s (session %s)", peerID, session.Code)
-			d.activateTransferSession(session, peerID, channels)
-		})
-	})
-}
-
-// wireRelayTransferSession installs the application-version responder over the
-// already Noise-authenticated relay transport. The transfer manager is not
-// created until transport_hello version 2 has been acknowledged.
-func (d *Daemon) wireRelayTransferSession(session *Session, sid string, channel relayTransferChannel) {
-	var activateOnce sync.Once
-	multilane.InstallHandshakeResponder(channel, func() {
-		activateOnce.Do(func() {
-			if !d.relayChannelCurrent(session, sid, channel) {
-				return
-			}
-			d.activateTransferSession(session, "", channel)
-		})
-	})
-}
-
-func (d *Daemon) relayChannelCurrent(session *Session, sid string, channel relayTransferChannel) bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.sessions[session.Code] != session {
-		return false
-	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	return !session.closing && session.relayChannels[sid] == channel
-}
-
-func (d *Daemon) directPeerCurrent(session *Session, peerID string, candidate *peer.Peer) bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.sessions[session.Code] != session {
-		return false
-	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	return !session.closing && session.peers[peerID] == candidate
-}
-
-func (d *Daemon) removeRelayChannelIfCurrent(session *Session, sid string, channel relayTransferChannel) bool {
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.relayChannels[sid] != channel {
-		return false
-	}
-	delete(session.relayChannels, sid)
-	return true
-}
-
-func (d *Daemon) activateTransferSession(session *Session, peerID string, channels multilane.ChannelSet) {
-	var tm *transfer.Manager
-	if session.ShareType == "immich" {
-		galleryBackend, ok := session.immichClient.(transfer.GalleryBackend)
-		if !ok {
-			log.Printf("Immich session %s has no gallery transfer backend", session.Code)
-			_ = channels.Close()
-			return
-		}
-		tm = transfer.NewGalleryManager(channels, galleryBackend, session.MaxDownloads)
-	} else {
-		tm = transfer.NewManager(channels, session.webdavClient, session.MaxDownloads)
-	}
-	session.mu.Lock()
-	downloads := session.Downloads
-	session.mu.Unlock()
-	tm.SetDownloadCount(downloads)
-
-	tm.OnSessionExpired = func() {
-		message := map[string]any{
-			"type":       "session_expired",
-			"session_id": session.Code,
-		}
-		if peerID != "" {
-			message["peer_id"] = peerID
-		}
-		_ = d.signaling.Send(context.Background(), message)
-	}
-	tm.OnDownloadComplete = func(bytesTransferred int64) {
-		session.mu.Lock()
-		session.Downloads++
-		newCount := session.Downloads
-		session.mu.Unlock()
-
-		if _, err := d.store.IncrementDownloads(session.Code); err != nil {
-			log.Printf("warning: could not persist download count: %v", err)
-		}
-		_ = d.signaling.DownloadComplete(context.Background(), session.Code, bytesTransferred)
-		log.Printf("download complete for session %s (count: %d)", session.Code, newCount)
-	}
-
-	tm.HandleOpen()
-}
-
-// createPeer creates a WebRTC peer connection for a browser joining a session.
-func (d *Daemon) createPeer(connID, sessionCode string) {
-	d.mu.RLock()
-	session, ok := d.sessions[sessionCode]
-	d.mu.RUnlock()
-
-	if !ok {
-		log.Printf("join for unknown session %s", sessionCode)
-		return
-	}
-
-	log.Printf("browser joined session %s (conn %s) - starting WebRTC handshake", sessionCode, connID)
-
-	// Get ICE servers from signaling client
-	iceServers := d.signaling.GetICEServers()
-	if len(iceServers) == 0 {
-		log.Printf("warning: no ICE servers received, using default STUN")
-		iceServers = []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.cloudflare.com:3478"}},
-		}
-	}
-
-	// Create new peer connection
-	newPeer := d.newPeer
-	if newPeer == nil {
-		newPeer = peer.New
-	}
-	p, err := newPeer(iceServers, session.RelayOnly)
-	if err != nil {
-		log.Printf("create peer for session %s: %v", sessionCode, err)
-		return
-	}
-
-	// Set up peer callbacks
-	p.SetOnClose(func() {
-		log.Printf("peer %s closed (session %s)", connID, sessionCode)
-		session.mu.Lock()
-		if session.peers[connID] == p {
-			delete(session.peers, connID)
-		}
-		session.mu.Unlock()
-	})
-
-	p.SetOnICECandidate(func(init webrtc.ICECandidateInit) {
-		if !d.directPeerCurrent(session, connID, p) {
-			return
-		}
-		d.signaling.Send(context.Background(), map[string]any{
-			"type":       "ice_candidate",
-			"session_id": sessionCode,
-			"peer_id":    connID,
-			"candidate":  init,
-		})
-	})
-
-	d.wireDirectTransferSession(session, connID, p, func() bool {
-		return d.directPeerCurrent(session, connID, p)
-	})
-
-	// Register only while the looked-up session is still current. Replacing a
-	// duplicate connection ID is identity-safe because the old close callback
-	// cannot delete the new entry.
-	d.mu.RLock()
-	if d.sessions[sessionCode] != session {
-		d.mu.RUnlock()
-		_ = p.Close()
-		return
-	}
-	session.mu.Lock()
-	if session.closing {
-		session.mu.Unlock()
-		d.mu.RUnlock()
-		_ = p.Close()
-		return
-	}
-	if session.peers == nil {
-		session.peers = make(map[string]*peer.Peer)
-	}
-	oldPeer := session.peers[connID]
-	session.peers[connID] = p
-	session.mu.Unlock()
-	d.mu.RUnlock()
-	if oldPeer != nil && oldPeer != p {
-		_ = oldPeer.Close()
-	}
-
-	// Create offer and send to signaling server
-	sdp, err := p.CreateOffer()
-	if err != nil {
-		log.Printf("create offer for session %s: %v", sessionCode, err)
-		session.mu.Lock()
-		if session.peers[connID] == p {
-			delete(session.peers, connID)
-		}
-		session.mu.Unlock()
-		_ = p.Close()
-		return
-	}
-	if !d.directPeerCurrent(session, connID, p) {
-		_ = p.Close()
-		return
-	}
-	d.signaling.Send(context.Background(), map[string]any{
-		"type":       "offer",
-		"session_id": sessionCode,
-		"peer_id":    connID,
-		"sdp":        sdp,
-	})
-}
-
-// handleAnswer applies the browser's SDP answer to the peer connection.
-func (d *Daemon) handleAnswer(peerID, sdp string) {
-	// Find the session containing this peer
-	d.mu.RLock()
-	var session *Session
-	for _, sess := range d.sessions {
-		sess.mu.Lock()
-		if _, ok := sess.peers[peerID]; ok {
-			session = sess
-			sess.mu.Unlock()
-			break
-		}
-		sess.mu.Unlock()
-	}
-	d.mu.RUnlock()
-
-	if session == nil {
-		log.Printf("answer for unknown peer %s", peerID)
-		return
-	}
-
-	session.mu.Lock()
-	p, ok := session.peers[peerID]
-	session.mu.Unlock()
-
-	if !ok {
-		log.Printf("peer %s not found in session", peerID)
-		return
-	}
-
-	if err := p.SetAnswer(sdp); err != nil {
-		log.Printf("set answer for peer %s: %v", peerID, err)
-	}
-}
-
-// handleICECandidate adds an ICE candidate to the peer connection.
-func (d *Daemon) handleICECandidate(peerID string, candidate json.RawMessage) {
-	// Find the session containing this peer
-	d.mu.RLock()
-	var session *Session
-	for _, sess := range d.sessions {
-		sess.mu.Lock()
-		if _, ok := sess.peers[peerID]; ok {
-			session = sess
-			sess.mu.Unlock()
-			break
-		}
-		sess.mu.Unlock()
-	}
-	d.mu.RUnlock()
-
-	if session == nil {
-		log.Printf("ICE candidate for unknown peer %s", peerID)
-		return
-	}
-
-	session.mu.Lock()
-	p, ok := session.peers[peerID]
-	session.mu.Unlock()
-
-	if !ok {
-		log.Printf("peer %s not found in session", peerID)
-		return
-	}
-
-	var init webrtc.ICECandidateInit
-	if err := json.Unmarshal(candidate, &init); err != nil {
-		log.Printf("parse ICE candidate for peer %s: %v", peerID, err)
-		return
-	}
-
-	if err := p.AddICECandidate(init); err != nil {
-		log.Printf("add ICE candidate for peer %s: %v", peerID, err)
-	}
-}
-
-// handleRelayPrepare handles a relay_prepare message from the signaling server.
-// It creates a SecureRelayChannel, wires it to a transfer manager, and starts it.
-func (d *Daemon) handleRelayPrepare(msg signaling.Message) {
-	log.Printf("relay_prepare received for session %s sid=%s", msg.Code, msg.SID)
-
-	d.mu.RLock()
-	session := d.sessions[msg.Code]
-	d.mu.RUnlock()
-	if session == nil {
-		log.Printf("relay_prepare for unknown session %s", msg.Code)
-		return
-	}
-
-	// Get relay static private key
-	rawPriv, err := d.store.GetRelayStaticPrivateKey()
-	if err != nil {
-		log.Printf("get relay static key: %v", err)
-		return
-	}
-	log.Printf("relay_prepare: got static key for session %s", msg.Code)
-
-	// Convert raw bytes to ecdh.PrivateKey
-	staticPriv, err := ecdh.P256().NewPrivateKey(rawPriv)
-	if err != nil {
-		log.Printf("import relay static key: %v", err)
-		return
-	}
-
-	// Create relay channel
-	relayURL := signaling.RelayWebSocketURL(d.config.SignalingURL)
-	log.Printf("relay_prepare: connecting to relay at %s for session %s", relayURL, msg.Code)
-
-	// Use factory function if set (for testing), otherwise create real channel
-	var channel relayTransferChannel
-	if d.newRelayChannel != nil {
-		channel, err = d.newRelayChannel(relayChannelConfig{
-			RelayURL:      relayURL,
-			RelayJWT:      msg.RelayJWT,
-			StaticPrivate: rawPriv,
-		})
-		if err != nil {
-			log.Printf("new relay channel: %v", err)
-			return
-		}
-	} else {
-		// Production: create SecureRelayChannel directly
-		rc, err := relaychannel.NewSecureRelayChannel(relaychannel.SecureRelayConfig{
-			RelayURL:      relayURL,
-			RelayJWT:      msg.RelayJWT,
-			StaticPrivate: staticPriv,
-		})
-		if err != nil {
-			log.Printf("new relay channel: %v", err)
-			return
-		}
-		channel = rc
-	}
-
-	d.wireRelayTransferSession(session, msg.SID, channel)
-
-	// Any required-lane closure is a terminal channel-set closure. Guard the
-	// daemon cleanup too so repeated transport notifications cannot tear down a
-	// replacement entry with the same SID.
-	var removeOnce sync.Once
-	channel.SetOnClose(func() {
-		removeOnce.Do(func() {
-			d.removeRelayChannelIfCurrent(session, msg.SID, channel)
-		})
-	})
-
-	// Add the channel only if the session from the initial lookup is still
-	// current. A duplicate SID replaces and closes the old channel outside all
-	// daemon/session locks.
-	d.mu.RLock()
-	if d.sessions[msg.Code] != session {
-		d.mu.RUnlock()
-		_ = channel.Close()
-		return
-	}
-	session.mu.Lock()
-	if session.closing {
-		session.mu.Unlock()
-		d.mu.RUnlock()
-		_ = channel.Close()
-		return
-	}
-	if session.relayChannels == nil {
-		session.relayChannels = make(map[string]relayTransferChannel)
-	}
-	oldChannel := session.relayChannels[msg.SID]
-	session.relayChannels[msg.SID] = channel
-	session.mu.Unlock()
-	d.mu.RUnlock()
-	if oldChannel != nil && oldChannel != channel {
-		_ = oldChannel.Close()
-	}
-
-	// Start relay channel (asynchronously handles handshake)
-	log.Printf("relay_prepare: starting relay channel for session %s sid=%s", msg.Code, msg.SID)
-	if err := channel.Start(context.Background()); err != nil {
-		log.Printf("start relay channel sid=%s: %v", msg.SID, err)
-		d.removeRelayChannelIfCurrent(session, msg.SID, channel)
-		return
-	}
-	if !d.relayChannelCurrent(session, msg.SID, channel) {
-		_ = channel.Close()
-		return
-	}
-	log.Printf("relay_prepare: relay channel started successfully for session %s sid=%s", msg.Code, msg.SID)
-}
-
 // loadSessionsFromStore loads persisted sessions from the store and
 // re-registers them with the signaling server.
 func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 	sessions := d.store.ListSessions(true) // Filter expired
 
-	// Get relay static key once for all sessions
-	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
-	if err != nil {
-		log.Printf("warning: could not get relay static key: %v", err)
-		relayStaticPriv = nil
-	}
-	var relayStaticPub string
-	if relayStaticPriv != nil {
-		relayStaticPub, err = RelayStaticPubHex(relayStaticPriv)
-		if err != nil {
-			log.Printf("warning: could not derive relay static public key: %v", err)
-			relayStaticPub = ""
-		}
-	}
-
-	cfg := d.GetConfig()
 	for _, entry := range sessions {
 		if entry.ShareType == "" {
 			log.Printf("warning: skipping legacy session %s: missing share_type", entry.Code)
@@ -1744,73 +1019,25 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			}
 		}
 
-		if entry.ShareType == "immich" {
-			client, err := d.newImmichClient(entry.Code)
-			if err != nil {
-				log.Printf("warning: could not create Immich client for %s: %v", entry.Code, err)
-				continue
-			}
-			reg, ok := d.signaling.(shareOptionRegistrar)
-			if !ok {
-				log.Printf("warning: signaling client does not support Immich registration options for %s", entry.Code)
-				continue
-			}
-			code, origin, reconnected, err := reg.RegisterShareWithOptions(ctx, signaling.RegisterShareOptions{
-				ShareURL:            entry.ShareURL,
-				PreferredCode:       entry.Code,
-				ShareType:           "immich",
-				IsPasswordProtected: entry.IsPasswordProtected,
-				RelayOnly:           entry.RelayOnly,
-				RelayStaticPub:      relayStaticPub,
-			})
-			if err != nil {
-				log.Printf("warning: could not re-register Immich session %s: %v", entry.Code, err)
-				continue
-			}
-			if origin == "" {
-				origin = entry.Origin
-			}
-			d.bindOrigin(code, origin)
-
-			session := &Session{
-				Code:                code,
-				ShareURL:            entry.ShareURL,
-				ShareType:           "immich",
-				IsPasswordProtected: entry.IsPasswordProtected,
-				ExpiresAt:           entry.ExpiresAt,
-				MaxDownloads:        entry.MaxDownloads,
-				Downloads:           entry.Downloads,
-				RelayOnly:           entry.RelayOnly,
-				CreatedAt:           entry.CreatedAt,
-				immichClient:        immichTransferAdapter{client: client},
-				immich:              client,
-				peers:               make(map[string]*peer.Peer),
-				relayChannels:       make(map[string]relayTransferChannel),
-			}
-			d.mu.Lock()
-			d.sessions[code] = session
-			d.mu.Unlock()
-			d.hydrateContentSession(session)
-
-			if reconnected {
-				log.Printf("Immich session reconnected - code: %s", code)
-			} else {
-				log.Printf("Immich session loaded - code: %s", code)
-			}
+		client, err := d.newImmichClient(entry.Code)
+		if err != nil {
+			log.Printf("warning: could not create Immich client for %s: %v", entry.Code, err)
 			continue
 		}
-
-		// Create WebDAV client
-		webdavClient, err := cloudwebdav.New(entry.ShareType, entry.ShareURL, []string{cfg.AllowedHost, cfg.NCAllowedHost}, entry.Password)
-		if err != nil {
-			log.Printf("warning: could not create WebDAV client for %s: %v", entry.Code, err)
+		reg, ok := d.signaling.(shareOptionRegistrar)
+		if !ok {
+			log.Printf("warning: signaling client does not support Immich registration options for %s", entry.Code)
 			continue
 		}
-
-		// Re-register with signaling server
-		code, origin, reconnected, err := d.signaling.RegisterShare(ctx, entry.ShareURL, entry.Code, entry.RelayOnly, relayStaticPub)
+		code, origin, reconnected, err := reg.RegisterShareWithOptions(ctx, signaling.RegisterShareOptions{
+			ShareURL:            entry.ShareURL,
+			PreferredCode:       entry.Code,
+			ShareType:           "immich",
+			IsPasswordProtected: entry.IsPasswordProtected,
+			RelayOnly:           entry.RelayOnly,
+		})
 		if err != nil {
-			log.Printf("warning: could not re-register session %s: %v", entry.Code, err)
+			log.Printf("warning: could not re-register Immich session %s: %v", entry.Code, err)
 			continue
 		}
 		if origin == "" {
@@ -1818,30 +1045,27 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		}
 		d.bindOrigin(code, origin)
 
-		// Use the returned code (might be different if reconnection failed)
 		session := &Session{
-			Code:         code,
-			ShareURL:     entry.ShareURL,
-			ShareType:    entry.ShareType,
-			FileID:       entry.FileID,
-			Password:     entry.Password,
-			ExpiresAt:    entry.ExpiresAt,
-			MaxDownloads: entry.MaxDownloads,
-			Downloads:    entry.Downloads,
-			RelayOnly:    entry.RelayOnly,
-			CreatedAt:    entry.CreatedAt,
-			webdavClient: webdavClient,
-			peers:        make(map[string]*peer.Peer),
+			Code:                code,
+			ShareURL:            entry.ShareURL,
+			ShareType:           "immich",
+			IsPasswordProtected: entry.IsPasswordProtected,
+			ExpiresAt:           entry.ExpiresAt,
+			MaxDownloads:        entry.MaxDownloads,
+			Downloads:           entry.Downloads,
+			RelayOnly:           entry.RelayOnly,
+			CreatedAt:           entry.CreatedAt,
+			immich:              client,
 		}
-
 		d.mu.Lock()
 		d.sessions[code] = session
 		d.mu.Unlock()
+		d.hydrateContentSession(session)
 
 		if reconnected {
-			log.Printf("session reconnected - code: %s", code)
+			log.Printf("Immich session reconnected - code: %s", code)
 		} else {
-			log.Printf("session loaded - code: %s", code)
+			log.Printf("Immich session loaded - code: %s", code)
 		}
 	}
 
@@ -1880,11 +1104,6 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 		return err
 	}
 
-	relayStaticPub, err := d.relayStaticPubHex()
-	if err != nil {
-		return err
-	}
-
 	// `present` tracks every non-empty Immich link key (including protected and
 	// non-ALBUM links that Phase 3 skips) so the removal pass can distinguish an
 	// unsupported share (still present but skipped → 410) from a revoked share
@@ -1917,7 +1136,7 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 			continue
 		}
 
-		session, err := d.registerImmichShare(ctx, link, relayStaticPub, d.GetConfig().DefaultMaxDownloads, time.Time{})
+		session, err := d.registerImmichShare(ctx, link, d.GetConfig().DefaultMaxDownloads, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -1980,7 +1199,7 @@ func (d *Daemon) getImmichPoller() (immichPoller, error) {
 	})
 }
 
-func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink, relayStaticPub string, maxDownloads int, expiresAt time.Time) (*Session, error) {
+func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink, maxDownloads int, expiresAt time.Time) (*Session, error) {
 	reg, ok := d.signaling.(shareOptionRegistrar)
 	if !ok {
 		return nil, fmt.Errorf("signaling client does not support option registration")
@@ -2012,7 +1231,6 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		ShareType:           "immich",
 		IsPasswordProtected: passwordProtected,
 		RelayOnly:           relayOnly,
-		RelayStaticPub:      relayStaticPub,
 	}
 	code, origin, _, err := reg.RegisterShareWithOptions(ctx, opts)
 	if err != nil {
@@ -2035,10 +1253,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		MaxDownloads:        maxDownloads,
 		ExpiresAt:           expiresAt,
 		CreatedAt:           now,
-		immichClient:        immichTransferAdapter{client: client},
 		immich:              client,
-		peers:               make(map[string]*peer.Peer),
-		relayChannels:       make(map[string]relayTransferChannel),
 	}
 	if err := d.store.SaveSession(store.SessionEntry{
 		Code:                code,
@@ -2128,76 +1343,14 @@ func (d *Daemon) immichPollInterval() time.Duration {
 	return interval
 }
 
-func (d *Daemon) relayStaticPubHex() (string, error) {
-	relayStaticPriv, err := d.store.GetRelayStaticPrivateKey()
-	if err != nil {
-		return "", fmt.Errorf("get relay static key: %w", err)
-	}
-	relayStaticPub, err := RelayStaticPubHex(relayStaticPriv)
-	if err != nil {
-		return "", fmt.Errorf("derive relay static public key: %w", err)
-	}
-	return relayStaticPub, nil
-}
-
 func (d *Daemon) closeSessionResources(session *Session) {
 	d.closeSessionResourcesWithError(session, "")
-}
-
-type namedPeer struct {
-	id   string
-	peer *peer.Peer
-}
-
-type namedRelayChannel struct {
-	sid     string
-	channel relayTransferChannel
 }
 
 func (d *Daemon) closeSessionResourcesWithError(session *Session, message string) {
 	session.mu.Lock()
 	session.closing = true
-	peers := make([]namedPeer, 0, len(session.peers))
-	for peerID, peerConn := range session.peers {
-		peers = append(peers, namedPeer{id: peerID, peer: peerConn})
-	}
-	relays := make([]namedRelayChannel, 0, len(session.relayChannels))
-	for sid, channel := range session.relayChannels {
-		relays = append(relays, namedRelayChannel{sid: sid, channel: channel})
-	}
-	// Detach first so synchronous close callbacks can safely reenter and stale
-	// callbacks cannot affect replacement resources.
-	session.peers = make(map[string]*peer.Peer)
-	session.relayChannels = make(map[string]relayTransferChannel)
 	session.mu.Unlock()
-
-	if message != "" {
-		msg, err := json.Marshal(map[string]string{"type": "error", "scope": "connection", "message": message})
-		if err != nil {
-			log.Printf("marshal session close error: %v", err)
-		} else {
-			for _, relay := range relays {
-				control := relay.channel.Endpoint(multilane.LaneControl)
-				if control == nil {
-					log.Printf("notify relay channel %s before close: missing control lane", relay.sid)
-					continue
-				}
-				if err := control.SendText(string(msg)); err != nil {
-					log.Printf("notify relay channel %s before close: %v", relay.sid, err)
-				}
-			}
-		}
-	}
-	for _, direct := range peers {
-		if err := direct.peer.Close(); err != nil {
-			log.Printf("close peer %s: %v", direct.id, err)
-		}
-	}
-	for _, relay := range relays {
-		if err := relay.channel.Close(); err != nil {
-			log.Printf("close relay channel %s: %v", relay.sid, err)
-		}
-	}
 }
 
 // runExpiryPruner periodically checks for and removes expired sessions.
@@ -2251,9 +1404,11 @@ func (d *Daemon) IsConnected() bool {
 	return d.signalingConnected
 }
 
-// HasTURN returns whether TURN servers are available.
+// HasTURN reports whether TURN servers are available. The v1 relay/TURN
+// transport is deleted, so this is always false; it remains for the admin web
+// UI's Daemon interface.
 func (d *Daemon) HasTURN() bool {
-	return d.hasTURN
+	return false
 }
 
 // GetConfig returns a copy of the current configuration.
@@ -2292,25 +1447,4 @@ func (d *Daemon) SaveConfig(cfg *config.Config) error {
 		}
 	}
 	return nil
-}
-
-// hasTURNServer checks if any ICE server is a TURN server.
-func hasTURNServer(servers []webrtc.ICEServer) bool {
-	for _, server := range servers {
-		for _, url := range server.URLs {
-			if strings.HasPrefix(url, "turn:") || strings.HasPrefix(url, "turns:") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// RelayStaticPubHex derives the hex-encoded P-256 public key from the raw private key bytes.
-func RelayStaticPubHex(rawPrivateKey []byte) (string, error) {
-	priv, err := ecdh.P256().NewPrivateKey(rawPrivateKey)
-	if err != nil {
-		return "", fmt.Errorf("import relay static key: %w", err)
-	}
-	return hex.EncodeToString(priv.PublicKey().Bytes()), nil
 }

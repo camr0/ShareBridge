@@ -12,7 +12,6 @@ import (
 	"github.com/pocketbase/pocketbase/tools/types"
 	"github.com/stretchr/testify/require"
 	"sharebridge/control/internal/directctl"
-	"sharebridge/control/internal/handler"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/migrations"
 )
@@ -118,7 +117,6 @@ func sessionIsActive(t *testing.T, app core.App, code string) bool {
 
 func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
 	t.Helper()
-	t.Chdir("../..")
 
 	app, cleanup := setupServerTestApp(t)
 	t.Cleanup(cleanup)
@@ -147,45 +145,12 @@ func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
 			return e.NotFoundError("session not found", nil)
 		}
 	})
-	pbRouter.GET("/i/{key}", handler.ServeSessionFileNoCache(app, "./web/index.html", "key", "immich"))
-
-	// Homepage (marketing)
-	pbRouter.GET("/", handler.ServeFileNoCache("./web/home.html"))
-
-	// File transfer client (manual join)
-	pbRouter.GET("/join", handler.ServeFileNoCache("./web/index.html"))
 
 	mux, err := pbRouter.BuildMux()
 	require.NoError(t, err)
 	return app, mux
 }
 
-func TestServerRoutesImmichLinksToBrowserApp(t *testing.T) {
-	app, router := setupRouterForTest(t)
-	user := createServerTestUser(t, app, "immich-route@example.com")
-	apiKey := createServerTestAPIKey(t, app, user.Id)
-	session := createServerTestSession(t, app, apiKey.Id, "ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", nil)
-	session.Set("share_type", "immich")
-	require.NoError(t, app.Save(session))
-
-	req := httptest.NewRequest(http.MethodGet, "/i/ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Contains(t, rec.Body.String(), "ShareBridge")
-}
-
-func TestServerRoutesImmichLinks404ForUnknownSession(t *testing.T) {
-	_, router := setupRouterForTest(t)
-	req := httptest.NewRequest(http.MethodGet, "/i/ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusNotFound, rec.Code)
-}
-
-// TestServerRoutesRelayOnlySessionGone asserts a relay-only session returns 410
-// (unsupported) from the canonical /s/{code} route rather than serving the v1
-// web client.
 func TestServerRoutesRelayOnlySessionGone(t *testing.T) {
 	app, router := setupRouterForTest(t)
 	user := createServerTestUser(t, app, "relayonly-route@example.com")

@@ -1,1 +1,0 @@
-// intentionally empty — personal settings are registered via PHP ISettings

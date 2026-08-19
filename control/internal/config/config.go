@@ -3,19 +3,13 @@ package config
 import (
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/go-acme/lego/v4/lego"
 )
 
 type Config struct {
 	Port    string
-	STUNURL string
 	DataDir string
-
-	// Relay configuration
-	RelayJWTSecret         string
-	RelayPendingWaitWindow time.Duration
 
 	// SMTP (optional - if absent, email verification is disabled and login is allowed immediately)
 	SMTPHost     string
@@ -36,11 +30,7 @@ type Config struct {
 func Load() *Config {
 	return &Config{
 		Port:    getEnv("PORT", "8080"),
-		STUNURL: getEnv("STUN_URL", "stun:stun.cloudflare.com:3478"),
 		DataDir: getEnv("DATA_DIR", "./pb_data"),
-
-		RelayJWTSecret:         getEnv("RELAY_JWT_SECRET", ""),
-		RelayPendingWaitWindow: getEnvDuration("RELAY_PENDING_WAIT_WINDOW", 7*time.Second),
 
 		SMTPHost:     getEnv("SMTP_HOST", ""),
 		SMTPPort:     getEnv("SMTP_PORT", "587"),
@@ -68,16 +58,6 @@ func getEnvFloat(key string, def float64) float64 {
 		f, err := strconv.ParseFloat(v, 64)
 		if err == nil {
 			return f
-		}
-	}
-	return def
-}
-
-func getEnvDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		d, err := time.ParseDuration(v)
-		if err == nil {
-			return d
 		}
 	}
 	return def

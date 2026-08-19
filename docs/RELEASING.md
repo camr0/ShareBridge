@@ -17,19 +17,15 @@ Run the complete gate from the repository root. Only run `gofmt` when changed Go
 cd agent
 gofmt -w $(git diff --name-only -- '*.go')
 go test ./... -count=1
-go test -race ./internal/transfer ./internal/peer ./internal/relaychannel ./internal/multilane -count=1
 go vet ./...
 go build ./cmd/agent
 
-cd ../signaling-server
+cd ../control
 go test ./... -count=1
 go vet ./...
 go build ./cmd/server
 
-cd web
-npm test
-
-cd ../..
+cd ..
 git diff --check
 git status --short
 ```
@@ -52,10 +48,10 @@ Confirm that the Agent Container workflow succeeds and that GHCR contains both `
 
 ## 4. Deploy and smoke-test production
 
-Redeploy the signaling server with its established operator script:
+Redeploy the control plane with its established operator script:
 
 ```bash
-cd signaling-server
+cd control
 ./redeploy.sh
 ```
 
@@ -67,8 +63,8 @@ Verify all of the following:
 - the private agent dashboard responds;
 - a representative OpenCloud share loads and downloads correctly;
 - a representative large Immich gallery initially renders 120 items and expands progressively;
-- bounded signaling-server and agent logs contain no new errors.
+- bounded control-plane and agent logs contain no new errors.
 
 ## 5. Roll back
 
-For the signaling server, check out the prior source tag and rerun the established server deployment procedure. For the agent, temporarily pin the prior immutable full-SHA GHCR tag and redeploy it through the established container platform. Repeat the production smoke tests after either rollback and document why it was required.
+For the control plane, check out the prior source tag and rerun the established server deployment procedure. For the agent, temporarily pin the prior immutable full-SHA GHCR tag and redeploy it through the established container platform. Repeat the production smoke tests after either rollback and document why it was required.

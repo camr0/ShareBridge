@@ -22,7 +22,7 @@ pb_data/
 # Common local build outputs
 bin/
 dist/
-signaling-server/server
+control/server
 agent/opencloudshare
 agent/agent
 agent/benchdirect

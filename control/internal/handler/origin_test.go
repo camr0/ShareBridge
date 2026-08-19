@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/coder/websocket"
 	"github.com/pocketbase/pocketbase/core"
@@ -18,7 +17,6 @@ import (
 	"sharebridge/control/internal/directctl"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
-	"sharebridge/control/internal/relay"
 )
 
 // setupAgentWSWithController boots an app (with agents + sessions.origin /
@@ -30,14 +28,13 @@ func setupAgentWSWithController(t *testing.T) (core.App, string, func()) {
 	app, appCleanup := setupAgentTestApp(t)
 	h := hub.New()
 	cfg := config.Load()
-	reg := relay.NewRegistry(2 * time.Second)
 
 	// coord/dnsClient are nil: origin allocation only needs LoadOrCreateAgent
 	// + AllocateOrigin, neither of which touch the coordinator or DDNS client.
 	ctrl := directctl.NewController(app, h, nil, nil, directctl.Config{BaseDomain: "example.com"})
 
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg, ctrl)
+	agentHandler := AgentWS(app, h, cfg, ctrl)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 
@@ -159,11 +156,10 @@ func setupAgentWSWithControllerAndHub(t *testing.T) (core.App, string, *hub.Hub,
 	app, appCleanup := setupAgentTestApp(t)
 	h := hub.New()
 	cfg := config.Load()
-	reg := relay.NewRegistry(2 * time.Second)
 	ctrl := directctl.NewController(app, h, nil, nil, directctl.Config{BaseDomain: "example.com"})
 
 	authMiddleware := middleware.APIKeyAuth(app)
-	agentHandler := AgentWS(app, h, reg, cfg, ctrl)
+	agentHandler := AgentWS(app, h, cfg, ctrl)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 

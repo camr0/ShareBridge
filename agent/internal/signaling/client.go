@@ -9,54 +9,36 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/pion/webrtc/v4"
 )
-
-// ICEServer represents an ICE server configuration from the signaling server.
-type ICEServer struct {
-	URLs       []string `json:"urls"`
-	Username   string   `json:"username,omitempty"`
-	Credential string   `json:"credential,omitempty"`
-}
 
 // Message is any message received from the signaling server.
 type Message struct {
-	Type           string          `json:"type"`
-	SessionID      string          `json:"session_id,omitempty"` // Share code
-	PeerID         string          `json:"peer_id,omitempty"`    // Unique peer connection ID
-	SDP            string          `json:"sdp,omitempty"`
-	Candidate      json.RawMessage `json:"candidate,omitempty"`
-	Err            string          `json:"message,omitempty"`
-	Code           string          `json:"code,omitempty"`
-	ConnID         string          `json:"conn_id,omitempty"`
-	HMAC           string          `json:"hmac,omitempty"`
-	Password       string          `json:"password,omitempty"`
-	Reconnected    bool            `json:"reconnected,omitempty"`
-	ICEServers     []ICEServer     `json:"ice_servers,omitempty"`
-	SID            string          `json:"sid,omitempty"`
-	RelayJWT       string          `json:"relay_jwt,omitempty"`
-	ExpiresAt      string          `json:"expires_at,omitempty"`
-	Origin         string          `json:"origin,omitempty"`
-	CSRPEM         string          `json:"csr_pem,omitempty"`
-	Fingerprint    string          `json:"fingerprint,omitempty"`
-	NotAfter       string          `json:"not_after,omitempty"`
-	IP             string          `json:"ip,omitempty"`
-	Port           int             `json:"port,omitempty"`
-	Status         string          `json:"status,omitempty"`
-	Nonce          string          `json:"nonce,omitempty"`
-	Seq            uint64          `json:"seq,omitempty"`
-	ShareID        string          `json:"share_id,omitempty"`
-	Route          string          `json:"route,omitempty"`
-	LeaseSeconds   int             `json:"lease_seconds,omitempty"`
-	Version        int             `json:"version,omitempty"`
-	GrantedPort    int             `json:"granted_port,omitempty"`
-	PublicIP       string          `json:"public_ip,omitempty"`
-	WasAlreadyOpen bool            `json:"was_already_open,omitempty"`
-	Error          string          `json:"error,omitempty"`
-	Namespace      string          `json:"namespace,omitempty"`
-	ChainPEM       string          `json:"chain_pem,omitempty"`
-	Reason         string          `json:"reason,omitempty"`
-	AgentID        string          `json:"agent_id,omitempty"`
+	Type           string `json:"type"`
+	Err            string `json:"message,omitempty"`
+	Code           string `json:"code,omitempty"`
+	Reconnected    bool   `json:"reconnected,omitempty"`
+	ExpiresAt      string `json:"expires_at,omitempty"`
+	Origin         string `json:"origin,omitempty"`
+	CSRPEM         string `json:"csr_pem,omitempty"`
+	Fingerprint    string `json:"fingerprint,omitempty"`
+	NotAfter       string `json:"not_after,omitempty"`
+	IP             string `json:"ip,omitempty"`
+	Port           int    `json:"port,omitempty"`
+	Status         string `json:"status,omitempty"`
+	Nonce          string `json:"nonce,omitempty"`
+	Seq            uint64 `json:"seq,omitempty"`
+	ShareID        string `json:"share_id,omitempty"`
+	Route          string `json:"route,omitempty"`
+	LeaseSeconds   int    `json:"lease_seconds,omitempty"`
+	Version        int    `json:"version,omitempty"`
+	GrantedPort    int    `json:"granted_port,omitempty"`
+	PublicIP       string `json:"public_ip,omitempty"`
+	WasAlreadyOpen bool   `json:"was_already_open,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Namespace      string `json:"namespace,omitempty"`
+	ChainPEM       string `json:"chain_pem,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	AgentID        string `json:"agent_id,omitempty"`
 }
 
 // OpenAck is the agent-side acknowledgement of an open_signal. Its json tags
@@ -78,18 +60,16 @@ type RegisterShareOptions struct {
 	ShareType           string
 	IsPasswordProtected bool
 	RelayOnly           bool
-	RelayStaticPub      string
 }
 
 // Client manages a WebSocket connection to the signaling server.
 type Client struct {
-	serverURL  string
-	apiKey     string
-	agentID    string
-	conn       *websocket.Conn
-	OnMessage  func(msg Message)
-	mu         sync.Mutex
-	iceServers []webrtc.ICEServer // Store ICE config from server
+	serverURL string
+	apiKey    string
+	agentID   string
+	conn      *websocket.Conn
+	OnMessage func(msg Message)
+	mu        sync.Mutex
 
 	// pendingReg receives the share_registered (or error) response for the
 	// RegisterShare call currently in flight. nil when no registration pending.
@@ -133,23 +113,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
-// RegisterShare sends register_share message and waits for the response.
-// It must not call conn.Read directly — all reads go through Listen.
+// RegisterShareWithOptions sends a register_share message and waits for the
+// response. It must not call conn.Read directly — all reads go through Listen.
 // The response is delivered via pendingReg, which Listen feeds.
-// relayStaticPub is the hex-encoded P-256 public key for relay identity.
-func (c *Client) RegisterShare(ctx context.Context, shareURL, preferredCode string, relayOnly bool, relayStaticPub string) (string, string, bool, error) {
-	code, origin, reconnected, err := c.RegisterShareWithOptions(ctx, RegisterShareOptions{
-		ShareURL:       shareURL,
-		PreferredCode:  preferredCode,
-		RelayOnly:      relayOnly,
-		RelayStaticPub: relayStaticPub,
-	})
-	if err != nil {
-		return "", "", false, err
-	}
-	return code, origin, reconnected, nil
-}
-
 func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShareOptions) (string, string, bool, error) {
 	responseCh := make(chan Message, 1)
 	c.pendingRegMu.Lock()
@@ -178,9 +144,6 @@ func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShar
 	}
 	if opts.IsPasswordProtected {
 		msg["is_password_protected"] = true
-	}
-	if opts.RelayStaticPub != "" {
-		msg["relay_static_pub"] = opts.RelayStaticPub
 	}
 	if err := c.Send(ctx, msg); err != nil {
 		return "", "", false, fmt.Errorf("send register_share: %w", err)
@@ -277,13 +240,6 @@ func (c *Client) Send(ctx context.Context, msg any) error {
 	return c.conn.Write(ctx, websocket.MessageText, data)
 }
 
-// GetICEServers returns the ICE servers received from the server's welcome message.
-func (c *Client) GetICEServers() []webrtc.ICEServer {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.iceServers
-}
-
 // Listen reads messages in a loop and dispatches them.
 // It is the sole reader of the WebSocket connection — RegisterShare and
 // other callers must not call conn.Read concurrently.
@@ -317,20 +273,6 @@ func (c *Client) Listen(ctx context.Context) error {
 			continue
 		}
 
-		// Update ICE servers whenever the server sends a welcome.
-		if msg.Type == "welcome" && len(msg.ICEServers) > 0 {
-			c.mu.Lock()
-			c.iceServers = make([]webrtc.ICEServer, len(msg.ICEServers))
-			for i, s := range msg.ICEServers {
-				c.iceServers[i] = webrtc.ICEServer{
-					URLs:       s.URLs,
-					Username:   s.Username,
-					Credential: s.Credential,
-				}
-			}
-			c.mu.Unlock()
-		}
-
 		// Route registration responses to RegisterShare if one is in flight.
 		if msg.Type == "share_registered" || msg.Type == "error" {
 			c.pendingRegMu.Lock()
@@ -353,23 +295,4 @@ func (c *Client) SetOnMessage(handler func(Message)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.OnMessage = handler
-}
-
-// RelayWebSocketURL derives the relay WebSocket URL from the signaling URL.
-// It converts http/https to ws/wss and appends "/ws/relay" path.
-func RelayWebSocketURL(signalingURL string) string {
-	u, err := url.Parse(signalingURL)
-	if err != nil {
-		return signalingURL + "/ws/relay"
-	}
-	switch u.Scheme {
-	case "https":
-		u.Scheme = "wss"
-	case "http":
-		u.Scheme = "ws"
-	}
-	u.Path = "/ws/relay"
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String()
 }

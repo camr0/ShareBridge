@@ -1,1 +1,0 @@
-export const t = (_app: string, text: string): string => text

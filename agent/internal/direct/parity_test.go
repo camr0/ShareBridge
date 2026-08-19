@@ -11,7 +11,7 @@
 //	(manifest) → every /archive/{token}/{part}.
 //
 // The control-plane "redirect" step (GET /s/{code} → 302 to the agent origin)
-// lives in the signaling-server directctl package and is covered by that
+// lives in the control directctl package and is covered by that
 // suite's redirect/probe tests, which this milestone's gate also runs.
 //
 // The headless-browser test asserts zero CSP violations (and zero uncaught JS
