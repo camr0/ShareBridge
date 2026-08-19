@@ -1328,6 +1328,15 @@ func (d *Daemon) hydrateContentSession(session *Session) {
 		mgr = direct.NewSnapshotManager(session.immich, session.MaxDownloads, d.immichPollInterval())
 		d.resolver.Put(session.Code, mgr)
 	}
+	// Wire download-accounting persistence (§11.1): every committed download
+	// (original-asset and album-archive alike) is durably recorded via
+	// store.IncrementDownloads. The closure captures the immutable share code;
+	// a persistence failure is logged inside the ledger and the in-memory count
+	// still enforces MaxDownloads.
+	mgr.SetPersistDownload(func(count int) error {
+		_, err := d.store.IncrementDownloads(session.Code)
+		return err
+	})
 	if err := mgr.Build(context.Background()); err != nil {
 		log.Printf("hydrate content snapshot for %s: %v", session.Code, err)
 	}

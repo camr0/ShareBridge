@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -58,11 +59,17 @@ type ContentSession struct {
 // Ledger is the per-session download-accounting ledger. It tracks the committed
 // download count plus active reservations, enforcing the immutable MaxDownloads
 // limit. It is guarded by its own mutex (l.mu).
+//
+// persist is an optional callback invoked on every Commit with the new
+// committed-download count, wired by the daemon to store.IncrementDownloads.
+// A persistence failure is logged and does not affect the in-memory count,
+// which still enforces the limit (§11.1).
 type Ledger struct {
 	mu           sync.Mutex
 	max          int
 	downloads    int
 	reservations int
+	persist      func(count int) error
 }
 
 // NewLedger returns a Ledger with the given immutable download limit. A limit
@@ -84,15 +91,25 @@ func (l *Ledger) TryReserve() bool {
 }
 
 // Commit consumes one reservation and records a completed download, returning
-// the new committed-download count.
+// the new committed-download count. If a persist callback is installed it is
+// invoked outside the lock with the new count; a persistence failure is logged
+// and the in-memory count still enforces the limit (§11.1).
 func (l *Ledger) Commit() int {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.reservations > 0 {
 		l.reservations--
 	}
 	l.downloads++
-	return l.downloads
+	count := l.downloads
+	persist := l.persist
+	l.mu.Unlock()
+
+	if persist != nil {
+		if err := persist(count); err != nil {
+			log.Printf("direct: persist download count: %v", err)
+		}
+	}
+	return count
 }
 
 // Release consumes one reservation without counting a download.
@@ -116,6 +133,15 @@ func (l *Ledger) Reservations() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.reservations
+}
+
+// SetPersist installs the optional persistence callback invoked on every
+// Commit with the new committed-download count. It is intended to be set once
+// by the daemon to store.IncrementDownloads; it may be re-set idempotently.
+func (l *Ledger) SetPersist(fn func(count int) error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.persist = fn
 }
 
 // Resolver maps a share code to an immutable content session.
@@ -167,6 +193,15 @@ func NewSnapshotManager(backend ContentBackend, maxDownloads int, poll time.Dura
 		streams:      newStreamGate(perShareStreamLimit),
 		poll:         poll,
 		now:          time.Now,
+	}
+}
+
+// SetPersistDownload installs the ledger's persistence callback, wired by the
+// daemon to store.IncrementDownloads so committed downloads (both original-
+// asset and album-archive) are durable (§11.1).
+func (m *SnapshotManager) SetPersistDownload(fn func(count int) error) {
+	if m.ledger != nil {
+		m.ledger.SetPersist(fn)
 	}
 }
 

@@ -317,8 +317,33 @@ func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code,
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+
+	// Reserve a download slot before streaming and commit on successful
+	// completion / release on failure or cancel — mirroring the album-archive
+	// path's reserve-before-stream atomicity (§11.1). A nil ledger (test
+	// doubles) means unlimited admission with no accounting.
+	ledger := session.Ledger
+	if ledger != nil && !ledger.TryReserve() {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	completed := false
+	defer func() {
+		if ledger == nil {
+			return
+		}
+		if completed {
+			ledger.Commit()
+		} else {
+			ledger.Release()
+		}
+	}()
+
 	s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
 		_, err := session.Backend.GetFile(r.Context(), id, dst)
+		if err == nil {
+			completed = true
+		}
 		return err
 	})
 }

@@ -105,3 +105,34 @@ func TestWiringLoadSessionsFromStoreHydratesRestoredSessions(t *testing.T) {
 	require.Equal(t, "Summer", cs.Gallery.AlbumName)
 	require.Equal(t, 3, cs.MaxDownloads)
 }
+
+func TestWiringHydrateContentSessionPersistsDownloads(t *testing.T) {
+	baseURL, host := newImmichTestServer(t)
+	d, sig := newTestDaemon(t)
+	d.config.ImmichURL = baseURL
+	d.config.ImmichAllowedHost = host
+	d.config.ImmichAPIKey = "api"
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{{Key: "IMMICHPERSIST3", Type: "ALBUM"}}}, nil
+	}
+
+	require.NoError(t, d.syncImmichShares(context.Background()))
+	require.True(t, sig.registeredCode("IMMICHPERSIST3"))
+
+	mgr := d.resolver.Get("IMMICHPERSIST3")
+	require.NotNil(t, mgr, "registering a share must create a SnapshotManager")
+	cs, err := mgr.Resolve()
+	require.NoError(t, err)
+	require.NotNil(t, cs.Ledger)
+
+	// A committed download must be durably recorded via store.IncrementDownloads
+	// (the persist callback hydrateContentSession wires into the ledger).
+	require.True(t, cs.Ledger.TryReserve())
+	cs.Ledger.Commit()
+
+	st := d.store.(*mockStore)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	require.Equal(t, 1, st.downloads["IMMICHPERSIST3"],
+		"committed download must be persisted via store.IncrementDownloads")
+}

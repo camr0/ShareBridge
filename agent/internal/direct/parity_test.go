@@ -601,13 +601,16 @@ func TestParityFullDirectPath(t *testing.T) {
 		}
 	}
 
-	// ---- download accounting: exactly one committed download across parts ----
+	// ---- download accounting: original assets + archive both count (§11.1) ----
+	// Two original assets (img-1, img-2) were downloaded above and the archive
+	// parts commit exactly once, so the ledger must show 3 committed downloads
+	// and no dangling reservations.
 	session, err := h.sm.Resolve()
 	if err != nil {
 		t.Fatalf("resolve after parts: %v", err)
 	}
-	if got := session.Ledger.Downloads(); got != 1 {
-		t.Fatalf("committed downloads = %d, want 1", got)
+	if got := session.Ledger.Downloads(); got != 3 {
+		t.Fatalf("committed downloads = %d, want 3 (2 assets + 1 archive)", got)
 	}
 	if got := session.Ledger.Reservations(); got != 0 {
 		t.Fatalf("reservations after commit = %d, want 0", got)
