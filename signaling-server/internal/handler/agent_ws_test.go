@@ -46,6 +46,8 @@ func setupAgentTestApp(t *testing.T) (core.App, func()) {
 	require.NoError(t, err)
 	err = migrations.CreateAgents(testApp)
 	require.NoError(t, err)
+	err = migrations.AddSessionsInactiveReason(testApp)
+	require.NoError(t, err)
 
 	cleanup := func() { testApp.Cleanup() }
 	return testApp, cleanup
@@ -498,6 +500,32 @@ func TestAgentWS_UnregisterShareRejectsDifferentAPIKeyOwner(t *testing.T) {
 
 	session := findSessionByCode(t, testApp, "IMMICHOWN1")
 	require.NotNil(t, session)
+}
+
+func TestAgentWS_DeregisterUnsupportedMarksInactiveReason(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSTest(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, testApp)
+	conn := dialAgentAndHello(t, serverURL, apiKey, "agent-deregister-unsupported")
+	defer conn.CloseNow()
+
+	ctx := context.Background()
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"IMMICHUNSUP1","share_type":"immich"}`)))
+	_, _, err := conn.Read(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"deregister","code":"IMMICHUNSUP1","reason":"unsupported"}`)))
+
+	// deregister is fire-and-forget (no ack), so poll until the row is
+	// tombstoned with the unsupported discriminator (→ 410, not revoked/404).
+	require.Eventually(t, func() bool {
+		records, err := testApp.FindRecordsByFilter("sessions", "code = {:code}", "", 1, 0, map[string]any{"code": "IMMICHUNSUP1"})
+		if err != nil || len(records) == 0 {
+			return false
+		}
+		return !records[0].GetBool("is_active") && records[0].GetString("inactive_reason") == "unsupported"
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 func TestAgentWS_AuthOK_SendsRelayPrepareToAgentAndRelayPolicyToBrowser(t *testing.T) {

@@ -87,8 +87,45 @@ func TestEnforceRestoreRejectsUnsupported(t *testing.T) {
 	for _, code := range []string{"prot", "relay", "wd"} {
 		require.Nil(t, d.GetSession(code), "session %q should not be restored", code)
 		require.Nil(t, d.store.GetSession(code), "session %q should be deleted from the store", code)
-		require.True(t, sig.unregisteredCode(code), "session %q should be unregistered from the control plane", code)
+		require.True(t, sig.hasSentMessage("deregister", map[string]any{"code": code, "reason": "unsupported"}),
+			"session %q should be deregistered as unsupported (410)", code)
+		require.False(t, sig.unregisteredCode(code),
+			"session %q must not be unregistered via unregister_share (revoked/404)", code)
 	}
+}
+
+func TestCleanupPersistedSessionSendsDeregisterUnsupported(t *testing.T) {
+	d, sig := newTestDaemon(t)
+
+	entry := store.SessionEntry{Code: "prot", ShareURL: "immich://prot", ShareType: "immich", IsPasswordProtected: true}
+	require.NoError(t, d.store.SaveSession(entry))
+
+	d.cleanupPersistedSession(context.Background(), entry)
+
+	require.Nil(t, d.store.GetSession("prot"), "persisted session should be deleted")
+	require.True(t, sig.hasSentMessage("deregister", map[string]any{"code": "prot", "reason": "unsupported"}),
+		"cleanupPersistedSession should deregister unsupported sessions as unsupported")
+	require.False(t, sig.unregisteredCode("prot"),
+		"cleanupPersistedSession must not use unregister_share (revoked/404)")
+}
+
+func TestSyncImmichSharesProtectedRemovalDeregistersUnsupported(t *testing.T) {
+	d, sig := newTestDaemon(t)
+	immichTestConfig(d)
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{
+			{Key: "IMMICHPROTOLD", Type: "ALBUM", Password: "secret"},
+		}}, nil
+	}
+	d.sessions["IMMICHPROTOLD"] = &Session{Code: "IMMICHPROTOLD", ShareType: "immich"}
+
+	require.NoError(t, d.syncImmichShares(context.Background()))
+
+	require.Nil(t, d.GetSession("IMMICHPROTOLD"))
+	require.True(t, sig.hasSentMessage("deregister", map[string]any{"code": "IMMICHPROTOLD", "reason": "unsupported"}),
+		"protected Immich share skipped by the poller should be deregistered as unsupported")
+	require.False(t, sig.unregisteredCode("IMMICHPROTOLD"),
+		"protected Immich share must not be unregistered as revoked (404)")
 }
 
 func TestEnforceManualImmichPlumbsMaxDownloadsAndExpiry(t *testing.T) {

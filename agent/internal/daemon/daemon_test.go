@@ -1028,8 +1028,11 @@ func TestLoadSessionsFromStoreRejectsWebDAV(t *testing.T) {
 	if st.GetSession("file-code") != nil {
 		t.Fatal("WebDAV session should be deleted from the store")
 	}
-	if !sigClient.unregisteredCode("file-code") {
-		t.Fatal("WebDAV session should be unregistered from the control plane")
+	if !sigClient.hasSentMessage("deregister", map[string]any{"code": "file-code", "reason": "unsupported"}) {
+		t.Fatal("WebDAV session should be deregistered as unsupported (410), not revoked (404)")
+	}
+	if sigClient.unregisteredCode("file-code") {
+		t.Fatal("WebDAV session must not be unregistered via unregister_share (revoked/404)")
 	}
 }
 

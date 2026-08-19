@@ -858,11 +858,7 @@ func (d *Daemon) RevokeSession(code string) error {
 	d.revokeOrigin(code)
 
 	// Notify server of deregistration (send deregister message).
-	d.signaling.Send(context.Background(), map[string]string{
-		"type":   "deregister",
-		"code":   code,
-		"reason": "revoked",
-	})
+	_ = d.deregisterShare(context.Background(), code, "revoked")
 
 	log.Printf("session revoked: %s", code)
 
@@ -1889,11 +1885,17 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 		return err
 	}
 
+	// `present` tracks every non-empty Immich link key (including protected and
+	// non-ALBUM links that Phase 3 skips) so the removal pass can distinguish an
+	// unsupported share (still present but skipped → 410) from a revoked share
+	// (deleted upstream → 404).
+	present := make(map[string]immich.SharedLink, len(links))
 	seen := make(map[string]immich.SharedLink, len(links))
 	for _, link := range links {
 		if link.Key == "" {
 			continue
 		}
+		present[link.Key] = link
 		if !strings.EqualFold(link.Type, "ALBUM") {
 			continue
 		}
@@ -1940,7 +1942,14 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 
 	for _, session := range removed {
 		d.closeSessionResourcesWithError(session, "share has been removed")
-		if err := d.unregisterShare(ctx, session.Code); err != nil {
+		// A removed session whose link is still present in Immich but skipped
+		// here (protected/non-ALBUM) is unsupported → tombstone 410; one that
+		// was deleted upstream is revoked → 404.
+		if _, unsupported := present[session.Code]; unsupported {
+			if err := d.deregisterShare(ctx, session.Code, "unsupported"); err != nil {
+				return err
+			}
+		} else if err := d.unregisterShare(ctx, session.Code); err != nil {
 			return err
 		}
 		if err := d.store.DeleteSession(session.Code); err != nil {
@@ -2056,11 +2065,25 @@ func (d *Daemon) unregisterShare(ctx context.Context, code string) error {
 	return d.signaling.Send(ctx, map[string]string{"type": "unregister_share", "code": code})
 }
 
+// deregisterShare notifies the control plane of an agent-initiated lifecycle
+// transition with an explicit inactive_reason discriminator (RevokeSession →
+// "revoked", pruneExpiredSessions → "expired", unsupported cleanup →
+// "unsupported").
+func (d *Daemon) deregisterShare(ctx context.Context, code, reason string) error {
+	return d.signaling.Send(ctx, map[string]string{
+		"type":   "deregister",
+		"code":   code,
+		"reason": reason,
+	})
+}
+
 // cleanupPersistedSession removes a persisted session that is unsupported in
-// Phase 3: it deregisters the control-side session and deletes the local entry.
+// Phase 3: it deregisters the control-side session as unsupported (410) and
+// deletes the local entry. It must NOT use unregister_share, which hardcodes
+// inactive_reason="revoked" (404).
 func (d *Daemon) cleanupPersistedSession(ctx context.Context, entry store.SessionEntry) {
-	if err := d.unregisterShare(ctx, entry.Code); err != nil {
-		log.Printf("warning: could not unregister unsupported session %s: %v", entry.Code, err)
+	if err := d.deregisterShare(ctx, entry.Code, "unsupported"); err != nil {
+		log.Printf("warning: could not deregister unsupported session %s: %v", entry.Code, err)
 	}
 	if err := d.store.DeleteSession(entry.Code); err != nil {
 		log.Printf("warning: could not delete unsupported session %s: %v", entry.Code, err)
@@ -2216,11 +2239,7 @@ func (d *Daemon) pruneExpiredSessions() {
 			log.Printf("warning: could not delete expired session: %v", err)
 		}
 		d.revokeOrigin(item.code)
-		_ = d.signaling.Send(context.Background(), map[string]string{
-			"type":   "deregister",
-			"code":   item.code,
-			"reason": "expired",
-		})
+		_ = d.deregisterShare(context.Background(), item.code, "expired")
 		if d.OnSessionRemoved != nil {
 			d.OnSessionRemoved(item.code)
 		}
