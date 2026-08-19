@@ -11,7 +11,6 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/tools/router"
 	"github.com/stretchr/testify/require"
 	"sharebridge/control/internal/config"
 	"sharebridge/control/internal/directctl"
@@ -120,32 +119,6 @@ func TestUnregisterSoftDeletes(t *testing.T) {
 	require.False(t, records[0].GetBool("is_active"))
 
 	require.Nil(t, findSessionByCode(t, app, "SOFTDEL01"))
-}
-
-func TestGetSessionInfoFiltersInactive(t *testing.T) {
-	app, cleanup := setupAgentTestApp(t)
-	defer cleanup()
-
-	user, err := createTestUser(app, "getinfo@example.com")
-	require.NoError(t, err)
-	apiKey, err := createTestAPIKey(app, user.Id, "getinfosecret")
-	require.NoError(t, err)
-
-	// Seed a session and explicitly mark it inactive (as a prior soft-delete
-	// would). The row exists but must be filtered out of GetSessionInfo.
-	session, err := createTestSession(app, apiKey.Id, "agent-inactive", "INACTIVE01")
-	require.NoError(t, err)
-	session.Set("is_active", false)
-	require.NoError(t, app.Save(session))
-
-	req := httptest.NewRequest(http.MethodGet, "/sessions/INACTIVE01", nil)
-	req.SetPathValue("code", "INACTIVE01")
-	rec := httptest.NewRecorder()
-	err = GetSessionInfo(app, hub.New())(&core.RequestEvent{
-		Event: router.Event{Request: req, Response: rec},
-	})
-	require.NoError(t, err)
-	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 // setupAgentWSWithControllerAndHub is setupAgentWSWithController but also

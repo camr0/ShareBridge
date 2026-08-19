@@ -6,7 +6,6 @@ require (
 	github.com/cloudflare/cloudflare-go v0.57.1
 	github.com/coder/websocket v1.8.14
 	github.com/go-acme/lego/v4 v4.35.2
-	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/miekg/dns v1.1.72
 	github.com/pocketbase/dbx v1.12.0
 	github.com/pocketbase/pocketbase v0.36.8
@@ -27,6 +26,7 @@ require (
 	github.com/ganigeorgiev/fexpr v0.5.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-ozzo/ozzo-validation/v4 v4.3.0 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect

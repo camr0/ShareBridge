@@ -4,10 +4,8 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/pocketbase/pocketbase/core"
-	"sharebridge/control/internal/hub"
 )
 
 // ServeFile returns a handler that serves a single static file.
@@ -29,35 +27,6 @@ func ServeFileNoCache(path string) func(*core.RequestEvent) error {
 	}
 }
 
-// ServeSessionFileNoCache serves a static shell only when the route code maps
-// to an existing session. If shareType is non-empty, the session must match it.
-func ServeSessionFileNoCache(app core.App, path, routeParam, shareType string) func(*core.RequestEvent) error {
-	return func(requestEvent *core.RequestEvent) error {
-		code := requestEvent.Request.PathValue(routeParam)
-		if code == "" {
-			return requestEvent.NotFoundError("session not found", nil)
-		}
-
-		filter := "code = {:code} && is_active = true"
-		params := map[string]any{"code": code}
-		if shareType != "" {
-			filter += " && share_type = {:share_type}"
-			params["share_type"] = shareType
-		}
-		records, err := app.FindRecordsByFilter("sessions", filter, "", 1, 0, params)
-		if err != nil {
-			return requestEvent.InternalServerError("failed to lookup session", err)
-		}
-		if len(records) == 0 {
-			return requestEvent.NotFoundError("session not found", nil)
-		}
-
-		requestEvent.Response.Header().Set("Cache-Control", "no-store")
-		http.ServeFile(requestEvent.Response, requestEvent.Request, path)
-		return nil
-	}
-}
-
 // ServeDir returns a handler that serves files under root using a "{path...}"
 // route wildcard. Requests attempting to escape the root are rejected.
 func ServeDir(root string) func(*core.RequestEvent) error {
@@ -71,76 +40,5 @@ func ServeDir(root string) func(*core.RequestEvent) error {
 		}
 		http.ServeFile(requestEvent.Response, requestEvent.Request, filepath.Join(root, relPath))
 		return nil
-	}
-}
-
-// ServeDirNoCache returns a handler that serves files under root with cache
-// disabled. Use this for module trees during development-style deployments.
-func ServeDirNoCache(root string) func(*core.RequestEvent) error {
-	return func(requestEvent *core.RequestEvent) error {
-		relPath := filepath.Clean(requestEvent.Request.PathValue("path"))
-		if relPath == "." || relPath == "" {
-			return requestEvent.NotFoundError("file not found", nil)
-		}
-		if strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || relPath == ".." {
-			return requestEvent.NotFoundError("file not found", nil)
-		}
-		requestEvent.Response.Header().Set("Cache-Control", "no-store")
-		http.ServeFile(requestEvent.Response, requestEvent.Request, filepath.Join(root, relPath))
-		return nil
-	}
-}
-
-type SessionInfoResponse struct {
-	Code      string     `json:"code"`
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	IsActive  bool       `json:"is_active"`
-}
-
-// GetSessionInfo returns basic public session info by code.
-func GetSessionInfo(app core.App, sessionHub *hub.Hub) func(*core.RequestEvent) error {
-	return func(requestEvent *core.RequestEvent) error {
-		code := requestEvent.Request.PathValue("code")
-		if code == "" {
-			return requestEvent.JSON(http.StatusBadRequest, map[string]string{"error": "code required"})
-		}
-
-		records, err := app.FindRecordsByFilter(
-			"sessions",
-			"code = {:code} && is_active = true",
-			"",
-			1,
-			0,
-			map[string]any{"code": code},
-		)
-		if err != nil {
-			return requestEvent.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to lookup session"})
-		}
-		if len(records) == 0 {
-			return requestEvent.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
-		}
-
-		sessionRecord := records[0]
-		var expiresAtPtr *time.Time
-		isActive := true
-
-		expiresAt := sessionRecord.GetDateTime("expires_at")
-		if !expiresAt.IsZero() {
-			expiresAtTime := expiresAt.Time()
-			expiresAtPtr = &expiresAtTime
-			if expiresAtTime.Before(time.Now()) {
-				isActive = false
-			}
-		}
-
-		if !sessionHub.AgentConnected(sessionRecord.GetString("api_key_id")) {
-			isActive = false
-		}
-
-		return requestEvent.JSON(http.StatusOK, SessionInfoResponse{
-			Code:      sessionRecord.GetString("code"),
-			ExpiresAt: expiresAtPtr,
-			IsActive:  isActive,
-		})
 	}
 }
