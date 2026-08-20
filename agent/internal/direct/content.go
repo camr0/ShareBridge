@@ -75,7 +75,16 @@ type Ledger struct {
 // NewLedger returns a Ledger with the given immutable download limit. A limit
 // <= 0 means unlimited admission (reservations are still tracked).
 func NewLedger(max int) *Ledger {
-	return &Ledger{max: max}
+	return newLedger(max, 0)
+}
+
+// newLedger initializes a ledger with an already-persisted committed count.
+// Negative persisted values are treated as zero.
+func newLedger(max, downloads int) *Ledger {
+	if downloads < 0 {
+		downloads = 0
+	}
+	return &Ledger{max: max, downloads: downloads}
 }
 
 // TryReserve atomically grants admission when downloads+reservations < max, or
@@ -183,7 +192,14 @@ type SnapshotManager struct {
 // download limit is immutable per share; poll is the refresh interval used for
 // the 2×poll fail-closed bound.
 func NewSnapshotManager(backend ContentBackend, maxDownloads int, poll time.Duration) *SnapshotManager {
-	ledger := NewLedger(maxDownloads)
+	return NewSnapshotManagerWithDownloads(backend, maxDownloads, 0, poll)
+}
+
+// NewSnapshotManagerWithDownloads constructs a manager whose ledger starts at
+// the persisted committed count. NewSnapshotManager remains the zero-default
+// constructor for callers without persisted session state.
+func NewSnapshotManagerWithDownloads(backend ContentBackend, maxDownloads, downloads int, poll time.Duration) *SnapshotManager {
+	ledger := newLedger(maxDownloads, downloads)
 	archives := newArchiveRegistry(ledger, defaultArchiveTTL, time.Now)
 	return &SnapshotManager{
 		backend:      backend,
@@ -695,6 +711,11 @@ func (a *ArchiveRegistry) beginPart(ctx context.Context, s *ContentSession, toke
 	defer txn.mu.Unlock()
 
 	if txn.state == txnReleased {
+		return ArchivePart{}, nil, nil, errArchiveForbidden
+	}
+	// Archive parts are exclusive per transaction: do not replace the active
+	// stream's cancellation function or pin while it is running.
+	if txn.pinned {
 		return ArchivePart{}, nil, nil, errArchiveForbidden
 	}
 	if part < 0 || part >= len(txn.Parts) {

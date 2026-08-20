@@ -1325,7 +1325,7 @@ func (d *Daemon) hydrateContentSession(session *Session) {
 	}
 	mgr := d.resolver.Get(session.Code)
 	if mgr == nil {
-		mgr = direct.NewSnapshotManager(session.immich, session.MaxDownloads, d.immichPollInterval())
+		mgr = direct.NewSnapshotManagerWithDownloads(session.immich, session.MaxDownloads, session.Downloads, d.immichPollInterval())
 		d.resolver.Put(session.Code, mgr)
 	}
 	// Wire download-accounting persistence (§11.1): every committed download

@@ -219,11 +219,13 @@ func TestRevokeAPIKeySoftDeletesSessionsAndReenrollGetsFreshOrigin(t *testing.T)
 	ctx := context.Background()
 
 	// Register a share → control allocates an origin under N1.
-	require.NoError(t, oldConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"REVOKERECLAIM1"}`)))
+	require.NoError(t, oldConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"REVOKERECLAIM1","share_type":"immich"}`)))
 	_, raw, err := oldConn.Read(ctx)
 	require.NoError(t, err)
 	require.Contains(t, string(raw), `"type":"share_registered"`)
-	var first struct{ Origin string `json:"origin"` }
+	var first struct {
+		Origin string `json:"origin"`
+	}
 	require.NoError(t, json.Unmarshal(raw, &first))
 	require.NotEmpty(t, first.Origin)
 
@@ -257,11 +259,13 @@ func TestRevokeAPIKeySoftDeletesSessionsAndReenrollGetsFreshOrigin(t *testing.T)
 	defer newConn.CloseNow()
 
 	// Re-register the same code → a FRESH origin under N2, never the stale N1 origin.
-	require.NoError(t, newConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"REVOKERECLAIM1"}`)))
+	require.NoError(t, newConn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"REVOKERECLAIM1","share_type":"immich"}`)))
 	_, raw2, err := newConn.Read(ctx)
 	require.NoError(t, err)
 	require.Contains(t, string(raw2), `"type":"share_registered"`)
-	var second struct{ Origin string `json:"origin"` }
+	var second struct {
+		Origin string `json:"origin"`
+	}
 	require.NoError(t, json.Unmarshal(raw2, &second))
 	require.NotEmpty(t, second.Origin)
 	require.NotEqual(t, first.Origin, second.Origin)

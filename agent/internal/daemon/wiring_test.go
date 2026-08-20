@@ -77,6 +77,7 @@ func TestWiringLoadSessionsFromStoreHydratesRestoredSessions(t *testing.T) {
 		IsPasswordProtected: false,
 		RelayOnly:           false,
 		MaxDownloads:        3,
+		Downloads:           3,
 		CreatedAt:           time.Now().Add(-time.Hour),
 		ExpiresAt:           time.Now().Add(time.Hour),
 	}))
@@ -104,6 +105,7 @@ func TestWiringLoadSessionsFromStoreHydratesRestoredSessions(t *testing.T) {
 	require.NoError(t, err, "restored session must be hydrated by Build")
 	require.Equal(t, "Summer", cs.Gallery.AlbumName)
 	require.Equal(t, 3, cs.MaxDownloads)
+	require.False(t, cs.Ledger.TryReserve(), "restored committed downloads must exhaust the configured limit")
 }
 
 func TestWiringHydrateContentSessionPersistsDownloads(t *testing.T) {

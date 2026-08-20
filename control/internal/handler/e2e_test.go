@@ -138,7 +138,7 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	// 4. register_share → share_registered {origin}.
 	const code = "e2e-code-1234"
 	require.NoError(t, conn.Write(context.Background(), websocket.MessageText,
-		[]byte(fmt.Sprintf(`{"type":"register_share","code":%q}`, code))))
+		[]byte(fmt.Sprintf(`{"type":"register_share","code":%q,"share_type":"immich"}`, code))))
 	var shareReg struct {
 		Type   string `json:"type"`
 		Code   string `json:"code"`

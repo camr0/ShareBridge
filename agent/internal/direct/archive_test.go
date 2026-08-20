@@ -426,6 +426,50 @@ func TestArchiveInvalidateTombstoneReturnsForbidden(t *testing.T) {
 	}
 }
 
+func TestArchiveRejectsConcurrentPartAndStillCancelsPermittedStream(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan error, 1)
+	var calls int
+	backend := &archiveBackend{
+		handlerBackend: &handlerBackend{},
+		info: func(context.Context) (immich.AlbumDownload, error) {
+			return immich.AlbumDownload{AlbumName: "A", Archives: []immich.DownloadArchive{{AssetIDs: []string{"a1"}, Size: 1}}}, nil
+		},
+		stream: func(ctx context.Context, _ []string, w io.Writer) (int64, error) {
+			calls++
+			if calls == 1 {
+				close(started)
+				<-ctx.Done()
+				cancelled <- ctx.Err()
+				return 0, ctx.Err()
+			}
+			n, err := io.WriteString(w, "unexpected")
+			return int64(n), err
+		},
+	}
+	ledger := NewLedger(5)
+	handler, res := newArchiveHandler(t, backend, map[string]struct{}{"a1": {}}, ledger, 1, time.Hour, time.Now)
+	resp := getManifest(t, handler)
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- doRequest(handler, http.MethodGet, "/s/abc/archive/"+resp.Token+"/0") }()
+	<-started
+
+	if rr := doRequest(handler, http.MethodGet, "/s/abc/archive/"+resp.Token+"/0"); rr.Code != http.StatusForbidden {
+		t.Fatalf("concurrent part status = %d, want 403", rr.Code)
+	}
+	res.session.Archives.invalidate()
+	select {
+	case err := <-cancelled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("permitted stream error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("invalidation did not cancel permitted stream")
+	}
+	<-firstDone
+}
+
 func TestArchiveInvalidateCancelsInFlightStream(t *testing.T) {
 	started := make(chan struct{})
 	streamErr := make(chan error, 1)

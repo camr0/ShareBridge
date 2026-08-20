@@ -55,6 +55,30 @@ func TestAssetDownloadReserveCommitOnSuccess(t *testing.T) {
 	}
 }
 
+func TestAssetDownloadCleanShortStreamDoesNotCommit(t *testing.T) {
+	ledger := NewLedger(1)
+	backend := &handlerBackend{
+		assetInfo: func(context.Context, string) (immich.Asset, error) {
+			return immich.Asset{OriginalFileName: "x.bin", OriginalMimeType: "application/octet-stream", ExifInfo: &immich.ExifInfo{FileSizeInByte: 4}}, nil
+		},
+		file: func(_ context.Context, _ string, w io.Writer) (int64, error) {
+			n, err := io.WriteString(w, "OK")
+			return int64(n), err
+		},
+	}
+	handler := assetLedgerServer(t, backend, ledger)
+
+	if rr := doRequest(handler, http.MethodGet, "/s/abc/asset/asset-1"); rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if got := ledger.Downloads(); got != 0 {
+		t.Fatalf("downloads = %d, want 0 after clean short stream", got)
+	}
+	if !ledger.TryReserve() {
+		t.Fatal("short stream must release its finite download reservation")
+	}
+}
+
 func TestAssetDownloadReleaseOnStreamFailure(t *testing.T) {
 	ledger := NewLedger(5)
 	backend := assetBackend(func(context.Context, string, io.Writer) (int64, error) {

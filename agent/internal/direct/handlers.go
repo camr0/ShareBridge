@@ -340,10 +340,10 @@ func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code,
 	}()
 
 	s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
-		_, err := session.Backend.GetFile(r.Context(), id, dst)
-		if err == nil {
-			completed = true
-		}
+		streamed, err := session.Backend.GetFile(r.Context(), id, dst)
+		// A positive asset metadata size is authoritative. A clean short
+		// upstream stream must release, rather than consume, the reservation.
+		completed = err == nil && (asset.FileSize() <= 0 || streamed == asset.FileSize())
 		return err
 	})
 }

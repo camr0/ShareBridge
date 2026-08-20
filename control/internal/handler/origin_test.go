@@ -71,7 +71,7 @@ func TestRegisterShareReturnsOrigin(t *testing.T) {
 	defer conn.CloseNow()
 	ctx := context.Background()
 
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ORIGIN01"}`)))
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ORIGIN01","share_type":"immich"}`)))
 	_, raw, err := conn.Read(ctx)
 	require.NoError(t, err)
 	require.Contains(t, string(raw), `"type":"share_registered"`)
@@ -102,7 +102,7 @@ func TestUnregisterSoftDeletes(t *testing.T) {
 	defer conn.CloseNow()
 
 	ctx := context.Background()
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"SOFTDEL01"}`)))
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"SOFTDEL01","share_type":"immich"}`)))
 	_, _, err := conn.Read(ctx)
 	require.NoError(t, err)
 
@@ -163,13 +163,13 @@ func TestRegisterShareOriginAllocationFailureRollsBack(t *testing.T) {
 	ctx := context.Background()
 
 	// First registration allocates the fixed label successfully.
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ROLLBACKOK1"}`)))
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ROLLBACKOK1","share_type":"immich"}`)))
 	_, _, err := conn.Read(ctx)
 	require.NoError(t, err)
 
 	// Second registration collides on the fixed label → allocation fails → the
 	// session must be rolled back and no hub entry created.
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ROLLBACKFAIL"}`)))
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ROLLBACKFAIL","share_type":"immich"}`)))
 	_, raw, err := conn.Read(ctx)
 	require.NoError(t, err)
 	require.Contains(t, string(raw), `"type":"error"`)

@@ -275,6 +275,13 @@ func handleRegisterShare(
 	msg agentMsg,
 	ctrl *directctl.Controller,
 ) {
+	// Phase 3 serves only direct, unprotected Immich gallery shares. Reject
+	// unsupported registrations before any session claim/create or origin
+	// allocation so they cannot become live control-plane state.
+	if msg.ShareType != "immich" || (msg.RelayOnly != nil && *msg.RelayOnly) || msg.IsPasswordProtected {
+		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "unsupported share type"})
+		return
+	}
 	if msg.Code == "" {
 		// Generated code: create + allocate origin atomically, retrying on a
 		// unique-constraint collision (code or origin) with a fresh code.

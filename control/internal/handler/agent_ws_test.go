@@ -277,7 +277,7 @@ func TestAgentWS_CodeOwnership(t *testing.T) {
 	require.NoError(t, err)
 
 	// Try to register same code
-	err = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"ocs://evil.com","code":"CUSTOM01"}`))
+	err = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","share_url":"immich://evil","code":"CUSTOM01","share_type":"immich"}`))
 	require.NoError(t, err)
 	_, data, err := conn.Read(ctx)
 	require.NoError(t, err)
@@ -317,7 +317,7 @@ func TestAgentWS_RegisterShare_PersistsRelayStaticPub(t *testing.T) {
 	_, _, err = conn.Read(ctx)
 	require.NoError(t, err)
 
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"RELAYKEY1","relay_static_pub":"04abcd"}`)))
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"RELAYKEY1","share_type":"immich","relay_static_pub":"04abcd"}`)))
 	_, _, err = conn.Read(ctx)
 	require.NoError(t, err)
 
@@ -326,37 +326,33 @@ func TestAgentWS_RegisterShare_PersistsRelayStaticPub(t *testing.T) {
 	require.Equal(t, "04abcd", session.GetString("relay_static_pub"))
 }
 
-func TestAgentWS_RegisterShare_AcceptsImmichExternalCodeMetadata(t *testing.T) {
-	testApp, serverURL, cleanup := setupAgentWSTest(t)
+func TestAgentWS_RegisterShare_RejectsUnsupportedPayloadBeforeSessionCreation(t *testing.T) {
+	testApp, serverURL, cleanup := setupAgentWSWithController(t)
 	defer cleanup()
 
 	apiKey := createTestAgentAPIKey(t, testApp)
-	wsURL := strings.Replace(serverURL, "http://", "ws://", 1) + "/ws/agent?api_key=" + apiKey
 	ctx := context.Background()
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
-	require.NoError(t, err)
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-immich")
 	defer conn.CloseNow()
 
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"hello","agent_id":"agent-immich"}`)))
-	_, _, err = conn.Read(ctx)
-	require.NoError(t, err)
-
-	code := "ffSw63qnIYMt_aBcDeFgHiJkLmNoPqRsTuVwXyZ-1234567890"
-	payload := fmt.Sprintf(`{"type":"register_share","code":%q,"share_type":"immich","is_password_protected":true,"relay_only":true,"relay_static_pub":"04abcd"}`, code)
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(payload)))
-
-	_, raw, err := conn.Read(ctx)
-	require.NoError(t, err)
-	require.Contains(t, string(raw), `"type":"share_registered"`)
-	require.Contains(t, string(raw), code)
-
-	session := findSessionByCode(t, testApp, code)
-	require.Equal(t, "immich", session.GetString("share_type"))
-	require.True(t, session.GetBool("is_password_protected"))
-	require.True(t, session.GetBool("relay_only"))
+	for _, tc := range []struct {
+		name, payload string
+	}{
+		{"wrong type", `{"share_type":"webdav"}`},
+		{"relay only", `{"share_type":"immich","relay_only":true}`},
+		{"protected", `{"share_type":"immich","is_password_protected":true}`},
+	} {
+		code := "UNSUPPORTED" + strings.ReplaceAll(strings.ToUpper(tc.name), " ", "")
+		payload := fmt.Sprintf(`{"type":"register_share","code":%q,%s}`, code, tc.payload[1:len(tc.payload)-1])
+		require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(payload)), tc.name)
+		_, raw, err := conn.Read(ctx)
+		require.NoError(t, err, tc.name)
+		require.Contains(t, string(raw), `"type":"error"`, tc.name)
+		require.Nil(t, findSessionByCode(t, testApp, code), "unsupported registration must not allocate a live session", tc.name)
+	}
 }
 
-func TestAgentWS_RegisterShare_ReclaimPreservesRelayOnlyWhenOmitted(t *testing.T) {
+func TestAgentWS_RegisterShare_ReclaimSupportedImmich(t *testing.T) {
 	testApp, serverURL, cleanup := setupAgentWSTest(t)
 	defer cleanup()
 
@@ -364,19 +360,19 @@ func TestAgentWS_RegisterShare_ReclaimPreservesRelayOnlyWhenOmitted(t *testing.T
 	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-reclaim-relay")
 	defer agentConn.CloseNow()
 
-	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMRELAY","relay_only":true,"relay_static_pub":"04abcd"}`)))
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMRELAY","share_type":"immich","relay_static_pub":"04abcd"}`)))
 	_, _, err := agentConn.Read(context.Background())
 	require.NoError(t, err)
 
-	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMRELAY","relay_static_pub":"04abcd"}`)))
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMRELAY","share_type":"immich","relay_static_pub":"04abcd"}`)))
 	_, _, err = agentConn.Read(context.Background())
 	require.NoError(t, err)
 
 	session := findSessionByCode(t, testApp, "RECLAIMRELAY")
-	require.True(t, session.GetBool("relay_only"))
+	require.False(t, session.GetBool("relay_only"))
 }
 
-func TestAgentWS_RegisterShare_ReclaimAllowsExplicitRelayOnlyFalse(t *testing.T) {
+func TestAgentWS_RegisterShare_ReclaimAllowsSupportedDirectPayload(t *testing.T) {
 	testApp, serverURL, cleanup := setupAgentWSTest(t)
 	defer cleanup()
 
@@ -384,11 +380,11 @@ func TestAgentWS_RegisterShare_ReclaimAllowsExplicitRelayOnlyFalse(t *testing.T)
 	agentConn := dialAgentAndHello(t, serverURL, apiKey, "agent-reclaim-relay-false")
 	defer agentConn.CloseNow()
 
-	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMFALSE","relay_only":true,"relay_static_pub":"04abcd"}`)))
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMFALSE","share_type":"immich","relay_only":false,"relay_static_pub":"04abcd"}`)))
 	_, _, err := agentConn.Read(context.Background())
 	require.NoError(t, err)
 
-	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMFALSE","relay_only":false,"relay_static_pub":"04abcd"}`)))
+	require.NoError(t, agentConn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"register_share","code":"RECLAIMFALSE","share_type":"immich","relay_only":false,"relay_static_pub":"04abcd"}`)))
 	_, _, err = agentConn.Read(context.Background())
 	require.NoError(t, err)
 
