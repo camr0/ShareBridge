@@ -805,6 +805,28 @@ func TestParityBrowserZeroCSPViolations(t *testing.T) {
 		t.Fatalf("video src = %q, want .../asset/vid-1/playback", videoSrc)
 	}
 
+	// video visibility: the injected <video> must render inside the viewport.
+	// Regression: a `position:relative` override on .lg-img-wrap downgraded
+	// lightGallery's `position:absolute` slide wrapper, pushing the video
+	// ~1359px off-screen while audio still played (the element existed and
+	// streamed, but had a non-visible bounding rect).
+	var videoRect struct {
+		Top    float64
+		Width  float64
+		Height float64
+	}
+	var viewportHeight float64
+	_ = chromedp.Run(ctx,
+		chromedp.Evaluate(`(function(){var v=document.querySelector('.lg-current video.lg-video');if(!v)return null;var r=v.getBoundingClientRect();return {Top:r.top,Width:r.width,Height:r.height};})()`, &videoRect),
+		chromedp.Evaluate(`window.innerHeight`, &viewportHeight),
+	)
+	if videoRect.Width <= 0 || videoRect.Height <= 0 {
+		t.Fatalf("video has zero rendered size: %+v", videoRect)
+	}
+	if videoRect.Top < 0 || videoRect.Top >= viewportHeight {
+		t.Fatalf("video rendered off-screen: top=%v viewportHeight=%v", videoRect.Top, viewportHeight)
+	}
+
 	// Let lightGallery finish its open animation (the first slide's busy flag
 	// resets ~500ms after open) before navigating.
 	time.Sleep(1500 * time.Millisecond)

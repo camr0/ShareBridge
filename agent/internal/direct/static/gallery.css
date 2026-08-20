@@ -337,9 +337,9 @@
       color: white;
       font-size: 0.75rem;
     }
-    .lg-current .lg-img-wrap {
-      position: relative;
-    }
+    /* NOTE: do NOT set .lg-current .lg-img-wrap to position:relative —
+       lightGallery sizes/centers it with position:absolute (top/bottom 0),
+       and downgrading it to relative pushes the slide content off-screen. */
     .sharebridge-video-buffer-warning {
       position: absolute;
       left: 50%;
