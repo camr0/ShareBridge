@@ -78,27 +78,59 @@ func TestRegisterShareReturnsOrigin(t *testing.T) {
 	require.Contains(t, string(raw), `"type":"share_registered"`)
 
 	var resp struct {
-		Type        string `json:"type"`
-		Code        string `json:"code"`
-		Origin      string `json:"origin"`
-		RelayOrigin string `json:"relay_origin"`
+		Type   string `json:"type"`
+		Code   string `json:"code"`
+		Origin string `json:"origin"`
 	}
 	require.NoError(t, json.Unmarshal(raw, &resp))
 	require.Equal(t, "share_registered", resp.Type)
 	require.Equal(t, "ORIGIN01", resp.Code)
 	require.Regexp(t, `^[0-9a-f]{12}\.sb[0-9a-f]{8}\.example\.com$`, resp.Origin)
 
-	// §6/§11.2: share_registered also returns the control-derived relay origin:
-	// the direct origin with ".relay." inserted before the namespace. The
-	// persisted origin stays the direct one.
+	// The control-allocated origin must be persisted on the session row.
+	session := findSessionByCode(t, app, "ORIGIN01")
+	require.NotNil(t, session)
+	require.Equal(t, resp.Origin, session.GetString("origin"))
+	require.True(t, session.GetBool("is_active"))
+}
+
+// TestShareRegisteredReturnsControlDerivedRelayOrigin is the plan-mandated
+// test (Task 6 Step 1, §6/§11.2): share_registered returns the control-derived
+// relay origin — the direct origin with ".relay." inserted before the
+// namespace — and the persisted session origin stays the direct one only. No
+// agent message may supply either origin.
+func TestShareRegisteredReturnsControlDerivedRelayOrigin(t *testing.T) {
+	app, serverURL, cleanup := setupAgentWSWithController(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, app)
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-relay-origin")
+	defer conn.CloseNow()
+	ctx := context.Background()
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"ORIGINRLY","share_type":"immich"}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"share_registered"`)
+
+	var resp struct {
+		Type        string `json:"type"`
+		Origin      string `json:"origin"`
+		RelayOrigin string `json:"relay_origin"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &resp))
+
+	// The relay origin is exactly the direct origin with ".relay." inserted
+	// before the namespace component.
 	require.Regexp(t, `^[0-9a-f]{12}\.relay\.sb[0-9a-f]{8}\.example\.com$`, resp.RelayOrigin)
 	expectedRelayOrigin, err := relayctl.RelayOriginFromDirect(resp.Origin)
 	require.NoError(t, err)
 	require.Equal(t, expectedRelayOrigin, resp.RelayOrigin)
 	require.NotEqual(t, resp.Origin, resp.RelayOrigin)
 
-	// The control-allocated origin must be persisted on the session row.
-	session := findSessionByCode(t, app, "ORIGIN01")
+	// The persisted origin remains the direct one: sessions never store the
+	// relay origin (it is deterministic from sessions.origin).
+	session := findSessionByCode(t, app, "ORIGINRLY")
 	require.NotNil(t, session)
 	require.Equal(t, resp.Origin, session.GetString("origin"))
 	require.NotEqual(t, resp.RelayOrigin, session.GetString("origin"), "sessions persist the direct origin only")
