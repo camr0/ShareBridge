@@ -21,6 +21,7 @@ import (
 	"sharebridge/control/internal/directctl"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
+	"sharebridge/control/internal/relayctl"
 )
 
 // flexInt decodes a JSON number or a numeric string. The agent's hello message
@@ -82,6 +83,12 @@ type agentMsg struct {
 	WasAlreadyOpen bool    `json:"was_already_open,omitempty"`
 	Error          string  `json:"error,omitempty"`
 	Reason         string  `json:"reason,omitempty"`
+
+	// Relay telemetry fields (§11.1). Additive with omitempty so existing
+	// direct-message JSON shapes are unchanged; both messages are inbound-only
+	// and treated as telemetry.
+	Generation int  `json:"generation,omitempty"` // relay_client_state / lockdown_status
+	Locked     bool `json:"locked,omitempty"`     // lockdown_status
 }
 
 var generatedCodeRegex = regexp.MustCompile(`^[a-z0-9]{8}$`)
@@ -236,6 +243,40 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Contr
 					continue
 				}
 				handleDeregister(ctx, conn, h, app, apiKeyID, msg.Code, msg.Reason)
+
+			case "relay_client_state":
+				// §11.1 telemetry: bounded, current-epoch only, never availability.
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before relay_client_state"})
+					continue
+				}
+				if ctrl == nil || !ctrl.IsCurrentEpoch(apiKeyID, conn) {
+					continue // stale socket: drop
+				}
+				if err := relayctl.ValidateRelayClientState(msg.Generation, msg.Status, msg.Reason); err != nil {
+					log.Printf("relay_client_state rejected (api_key_id=%s): %v", apiKeyID, err)
+					continue
+				}
+				// Telemetry only (§7.4): relay availability comes exclusively from
+				// the gateway presence view (Task 15); nothing here mutates share
+				// lifecycle. Diagnostics persistence lands with that task.
+
+			case "lockdown_status":
+				// §11.1 advisory fast-path telemetry: may suppress direct attempts
+				// agent-side, but can never establish route availability or change
+				// share lifecycle.
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before lockdown_status"})
+					continue
+				}
+				if ctrl == nil || !ctrl.IsCurrentEpoch(apiKeyID, conn) {
+					continue // stale socket: drop
+				}
+				if err := relayctl.ValidateLockdownStatus(msg.Generation, msg.Locked); err != nil {
+					log.Printf("lockdown_status rejected (api_key_id=%s): %v", apiKeyID, err)
+					continue
+				}
+				// Advisory only: deliberately no control-side state change (§11.1).
 			}
 		}
 	}
@@ -316,6 +357,7 @@ func handleRegisterShare(
 		response := map[string]any{"type": "share_registered", "code": code, "reconnected": false}
 		if ctrl != nil {
 			response["origin"] = origin
+			response["relay_origin"] = controlRelayOrigin(origin)
 		}
 		if exp := session.GetDateTime("expires_at"); !exp.IsZero() {
 			response["expires_at"] = exp.Time().Format(time.RFC3339)
@@ -357,12 +399,27 @@ func handleRegisterShare(
 	response := map[string]any{"type": "share_registered", "code": msg.Code, "reconnected": reconnected}
 	if ctrl != nil {
 		response["origin"] = origin
+		response["relay_origin"] = controlRelayOrigin(origin)
 	}
 	if exp := session.GetDateTime("expires_at"); !exp.IsZero() {
 		response["expires_at"] = exp.Time().Format(time.RFC3339)
 	}
 	hub.SendDirect(ctx, conn, response)
 	log.Printf("share registered: code=%s api_key_id=%s agent_id=%s reconnected=%v", msg.Code, apiKeyID, agentID, reconnected)
+}
+
+// controlRelayOrigin derives the §6 relay origin from the persisted direct
+// origin. The direct origin is always returned as `origin`; derivation failure
+// (never expected for control-allocated origins) yields an empty relay origin
+// rather than any agent-influenced value: no agent message may supply either
+// origin (§11.1).
+func controlRelayOrigin(origin string) string {
+	relayOrigin, err := relayctl.RelayOriginFromDirect(origin)
+	if err != nil {
+		log.Printf("relay origin derivation failed for %q: %v", origin, err)
+		return ""
+	}
+	return relayOrigin
 }
 
 // createSessionAndOrigin creates a session and (when a controller is present)

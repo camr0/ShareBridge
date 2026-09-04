@@ -16,6 +16,7 @@ import (
 	"sharebridge/control/internal/directctl"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
+	"sharebridge/control/internal/relayctl"
 )
 
 // setupAgentWSWithController boots an app (with agents + sessions.origin /
@@ -77,19 +78,30 @@ func TestRegisterShareReturnsOrigin(t *testing.T) {
 	require.Contains(t, string(raw), `"type":"share_registered"`)
 
 	var resp struct {
-		Type   string `json:"type"`
-		Code   string `json:"code"`
-		Origin string `json:"origin"`
+		Type        string `json:"type"`
+		Code        string `json:"code"`
+		Origin      string `json:"origin"`
+		RelayOrigin string `json:"relay_origin"`
 	}
 	require.NoError(t, json.Unmarshal(raw, &resp))
 	require.Equal(t, "share_registered", resp.Type)
 	require.Equal(t, "ORIGIN01", resp.Code)
 	require.Regexp(t, `^[0-9a-f]{12}\.sb[0-9a-f]{8}\.example\.com$`, resp.Origin)
 
+	// §6/§11.2: share_registered also returns the control-derived relay origin:
+	// the direct origin with ".relay." inserted before the namespace. The
+	// persisted origin stays the direct one.
+	require.Regexp(t, `^[0-9a-f]{12}\.relay\.sb[0-9a-f]{8}\.example\.com$`, resp.RelayOrigin)
+	expectedRelayOrigin, err := relayctl.RelayOriginFromDirect(resp.Origin)
+	require.NoError(t, err)
+	require.Equal(t, expectedRelayOrigin, resp.RelayOrigin)
+	require.NotEqual(t, resp.Origin, resp.RelayOrigin)
+
 	// The control-allocated origin must be persisted on the session row.
 	session := findSessionByCode(t, app, "ORIGIN01")
 	require.NotNil(t, session)
 	require.Equal(t, resp.Origin, session.GetString("origin"))
+	require.NotEqual(t, resp.RelayOrigin, session.GetString("origin"), "sessions persist the direct origin only")
 	require.True(t, session.GetBool("is_active"))
 }
 

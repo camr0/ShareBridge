@@ -86,6 +86,10 @@ type Controller struct {
 	allowPrivate bool
 	probeClient  *http.Client
 
+	// relay holds the §4.5 tunnel policy + credential signer when relay is
+	// enabled; nil disables relay_config emission entirely. See enroll.go.
+	relay *relayEmitter
+
 	ackTimeout time.Duration
 }
 
@@ -141,6 +145,13 @@ func (c *Controller) isCurrentEpoch(apiKeyID string, conn *websocket.Conn) bool 
 	defer c.epochMu.Unlock()
 	e := c.epochs[apiKeyID]
 	return e != nil && e.conn == conn
+}
+
+// IsCurrentEpoch is isCurrentEpoch exported for the handler package's
+// telemetry gating: an agent message from a superseded socket must be
+// rejected before it is treated as current-epoch telemetry.
+func (c *Controller) IsCurrentEpoch(apiKeyID string, conn *websocket.Conn) bool {
+	return c.isCurrentEpoch(apiKeyID, conn)
 }
 
 // AgentDisconnected drops the epoch for apiKeyID only if conn is still the

@@ -116,13 +116,20 @@ func RotateAPIKey(app core.App, sessionHub *hub.Hub) func(*core.RequestEvent) er
 			}
 
 			// Re-point the agent to the new key (namespace + cert survive), so
-			// rotation does not force a fresh namespace/re-enrollment.
+			// rotation does not force a fresh namespace/re-enrollment. A live
+			// relay assignment keeps its stable port, but the generation bumps
+			// (§7.2/§12): every outstanding credential is fenced at the gateway
+			// and the next relay_config is issued at the new generation under
+			// the new key identity.
 			agentRecs, agentErr := txApp.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": oldKeyID})
 			if agentErr != nil {
 				return agentErr
 			}
 			if len(agentRecs) > 0 {
 				agentRecs[0].Set("api_key_id", newRecord.Id)
+				if agentRecs[0].GetInt("relay_port") != 0 {
+					agentRecs[0].Set("relay_generation", agentRecs[0].GetInt("relay_generation")+1)
+				}
 				if err := txApp.Save(agentRecs[0]); err != nil {
 					return err
 				}

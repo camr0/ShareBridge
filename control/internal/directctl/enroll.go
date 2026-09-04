@@ -2,10 +2,63 @@ package directctl
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/pocketbase/pocketbase/core"
+	"sharebridge/control/internal/relayctl"
 )
+
+// relayEmitter carries the §4.5 tunnel policy and credential signer. It is
+// installed on the controller with EnableRelay; nil (the default) disables
+// relay_config emission so deployments without relay policy stay relay-free.
+type relayEmitter struct {
+	settings relayctl.Settings
+	signer   *relayctl.Signer
+}
+
+// EnableRelay attaches the relay tunnel policy and credential signer. It must
+// be called before the controller serves traffic; a zero settings or nil
+// signer leaves relay disabled.
+func (c *Controller) EnableRelay(settings relayctl.Settings, signer *relayctl.Signer) {
+	if signer == nil {
+		return
+	}
+	if err := settings.Validate(); err != nil {
+		log.Printf("relay disabled: invalid policy: %v", err)
+		return
+	}
+	c.relay = &relayEmitter{settings: settings, signer: signer}
+}
+
+// sendRelayConfig allocates (or reads the stable) relay assignment, mints a
+// fresh epoch-bound credential, and sends the §11.1 relay_config message to
+// the CURRENT epoch's connection. It runs only after baseline readiness (it
+// is called right behind enrollment_ready) and silently skips: unconfigured
+// relay, stale sockets, allocation/issuance failure, and it never logs
+// credential material (§7.2).
+func (c *Controller) sendRelayConfig(apiKeyID string, conn *websocket.Conn, rec *core.Record) {
+	if c.relay == nil {
+		return
+	}
+	if !c.isCurrentEpoch(apiKeyID, conn) {
+		return // a fenced socket never receives tunnel credentials
+	}
+	assignment, err := relayctl.EnsureAssignment(c.app, rec, c.relay.settings.PortRange)
+	if err != nil {
+		log.Printf("relay assignment failed for %s: %v", apiKeyID, err)
+		return
+	}
+	msg, err := relayctl.BuildRelayConfig(assignment, apiKeyID, c.relay.settings.GatewayAddr, c.relay.settings.GatewayPort, c.relay.signer)
+	if err != nil {
+		log.Printf("relay credential issue failed for %s: %v", apiKeyID, err)
+		return
+	}
+	if err := c.sendFn(context.Background(), conn, msg); err != nil {
+		log.Printf("relay_config send failed for %s: %v", apiKeyID, err)
+	}
+}
 
 // HandleHello enrolls an agent connection: it ensures the agent record exists,
 // installs a fresh epoch for this connection, and replies "enrolled" with the
@@ -98,7 +151,7 @@ func (c *Controller) HandleTLSReady(ctx context.Context, conn *websocket.Conn, a
 	}
 	c.epochMu.Unlock()
 	if shouldSend {
-		c.sendEnrollmentReady(apiKeyID, conn, e)
+		c.sendEnrollmentReady(apiKeyID, conn, rec, e)
 	}
 }
 
@@ -124,12 +177,17 @@ func (c *Controller) markReadyLocked(e *epochState) bool {
 // sendEnrollmentReady sends the enrollment_ready message outside epochMu. On a
 // send failure it clears readiness only if the SAME epoch still owns the conn
 // (a newer epoch must not have its readiness clobbered by a stale failure).
-func (c *Controller) sendEnrollmentReady(apiKeyID string, conn *websocket.Conn, e *epochState) {
+// When the send succeeds, relay_config follows immediately — baseline
+// readiness is exactly the point where §7.2 tunnel credentials are issued, on
+// the authenticated current epoch, never before enrollment.
+func (c *Controller) sendEnrollmentReady(apiKeyID string, conn *websocket.Conn, rec *core.Record, e *epochState) {
 	if err := c.sendFn(context.Background(), conn, map[string]string{"type": "enrollment_ready"}); err != nil {
 		c.epochMu.Lock()
 		if cur := c.epochs[apiKeyID]; cur == e && cur.conn == conn {
 			cur.ready = false
 		}
 		c.epochMu.Unlock()
+		return
 	}
+	c.sendRelayConfig(apiKeyID, conn, rec)
 }

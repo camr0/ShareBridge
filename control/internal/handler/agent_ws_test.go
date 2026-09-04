@@ -2,9 +2,19 @@ package handler
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,9 +25,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
+	"sharebridge/control/internal/certcoordinator"
 	"sharebridge/control/internal/config"
+	"sharebridge/control/internal/directctl"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
+	"sharebridge/control/internal/relayctl"
 	"sharebridge/control/migrations"
 )
 
@@ -45,6 +58,8 @@ func setupAgentTestApp(t *testing.T) (core.App, func()) {
 	err = migrations.CreateAgents(testApp)
 	require.NoError(t, err)
 	err = migrations.AddSessionsInactiveReason(testApp)
+	require.NoError(t, err)
+	err = migrations.AddAgentsRelaySTUN(testApp)
 	require.NoError(t, err)
 
 	cleanup := func() { testApp.Cleanup() }
@@ -546,4 +561,304 @@ func TestAgentWSRejectsEmptyHelloAndPreHelloDirectControl(t *testing.T) {
 	_, raw, err = conn.Read(ctx)
 	require.NoError(t, err)
 	require.Contains(t, string(raw), "hello required before report_endpoint")
+}
+
+// setupRelayAgentWS boots an AgentWS server whose controller carries a stub
+// cert coordinator (no network), a stub DDNS function, and an enabled relay
+// policy, so a real agent connection can be driven through baseline readiness
+// (csr → tls_ready → report_endpoint) to the relay_config emission.
+func setupRelayAgentWS(t *testing.T) (core.App, string, *relayctl.Signer, relayctl.Settings, func()) {
+	t.Helper()
+
+	app, appCleanup := setupAgentTestApp(t)
+	h := hub.New()
+	cfg := config.Load()
+
+	coord, err := certcoordinator.NewCoordinator(certcoordinator.CoordinatorConfig{AccountKeyPath: filepath.Join(t.TempDir(), "acct.pem")})
+	require.NoError(t, err)
+	coord.SetIssueFn(func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error) {
+		return stubLeafChainPEM(t), nil
+	})
+
+	ctrl := directctl.NewController(app, h, coord, nil, directctl.Config{
+		BaseDomain: "example.com",
+		DDNSFunc:   func(ctx context.Context, name, ip string, ttl int) (string, error) { return "", nil },
+	})
+	signer, err := relayctl.GenerateSigner()
+	require.NoError(t, err)
+	settings := relayctl.Settings{GatewayAddr: "relay.example.com", GatewayPort: 7000, PortRange: mustRelayPortRange(t, 11000, 11019)}
+	ctrl.EnableRelay(settings, signer)
+
+	authMiddleware := middleware.APIKeyAuth(app)
+	agentHandler := AgentWS(app, h, cfg, ctrl)
+	mux := http.NewServeMux()
+	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
+
+	server := httptest.NewServer(mux)
+	cleanup := func() {
+		server.Close()
+		appCleanup()
+	}
+	return app, server.URL, signer, settings, cleanup
+}
+
+func mustRelayPortRange(t *testing.T, min, max int) relayctl.PortRange {
+	t.Helper()
+	portRange, err := relayctl.NewPortRange(min, max)
+	require.NoError(t, err)
+	return portRange
+}
+
+// stubLeafChainPEM mints a valid future-dated self-signed leaf, mirroring the
+// directctl test fixture, so coordinator leaf lookups succeed.
+func stubLeafChainPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// stubLeafFingerprint returns the SHA-256 fingerprint of the stub chain's leaf.
+func stubLeafFingerprint(t *testing.T, chainPEM []byte) string {
+	t.Helper()
+	block, _ := pem.Decode(chainPEM)
+	require.NotNil(t, block)
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:])
+}
+
+// csrToFingerprint drives the csr_submit round trip and returns the leaf
+// fingerprint from the cert_issue chain, exactly as a real agent does.
+func csrToFingerprint(t *testing.T, conn *websocket.Conn) string {
+	t.Helper()
+	ctx := context.Background()
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"csr_submit","csr_pem":"stub-csr"}`)))
+	_, raw, err := conn.Read(ctx) // cert_issue
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "cert_issue")
+	var issued struct {
+		ChainPEM string `json:"chain_pem"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &issued))
+	return stubLeafFingerprint(t, []byte(issued.ChainPEM))
+}
+
+// finishBaselineReadiness completes readiness from an issued fingerprint:
+// tls_ready → report_endpoint → enrollment_ready (consumed).
+func finishBaselineReadiness(t *testing.T, conn *websocket.Conn, fingerprint string) {
+	t.Helper()
+	ctx := context.Background()
+
+	tlsReadyPayload := fmt.Sprintf(`{"type":"tls_ready","fingerprint":%q}`, fingerprint)
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(tlsReadyPayload)))
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"report_endpoint","ip":"203.0.113.7","port":8443}`)))
+	_, raw, err := conn.Read(ctx) // enrollment_ready
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "enrollment_ready")
+}
+
+// readExpectSilence asserts that no frame arrives within the wait window.
+func readExpectSilence(t *testing.T, conn *websocket.Conn, wait time.Duration, msgAndArgs ...any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	_, raw, err := conn.Read(ctx)
+	require.Error(t, err, "expected no message within %s, got: %s", wait, raw)
+}
+
+// TestRelayConfigSentOnlyAfterBaselineReadiness pins §7.2/§11.1: relay_config
+// goes only to the authenticated current epoch AFTER baseline readiness, with
+// the exact wire shape and an Ed25519 credential whose claims match the
+// control-persisted assignment.
+func TestRelayConfigSentOnlyAfterBaselineReadiness(t *testing.T) {
+	app, serverURL, signer, settings, cleanup := setupRelayAgentWS(t)
+	defer cleanup()
+
+	fullKey := createTestAgentAPIKey(t, app)
+	apiKeyID := strings.SplitN(fullKey, ".", 2)[0]
+	ctx := context.Background()
+	conn := dialAgentAndEnroll(t, serverURL, fullKey, "agent-relay-config")
+	defer conn.CloseNow()
+
+	// Before readiness (tls_ready missing): DDNS may succeed but neither
+	// enrollment_ready nor relay_config may be emitted. Proven without timeout
+	// reads (which would kill the connection): the FIRST reply to csr_submit
+	// must be cert_issue, never a relay_config/enrollment_ready frame.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"report_endpoint","ip":"203.0.113.7","port":8443}`)))
+
+	agentRecs, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": apiKeyID})
+	require.NoError(t, err)
+	require.Len(t, agentRecs, 1)
+	require.Zero(t, agentRecs[0].GetInt("relay_port"), "no assignment before baseline readiness")
+
+	fingerprint := csrToFingerprint(t, conn) // first reply must be cert_issue
+
+	// Completing readiness (tls_ready + DDNS) is exactly what unlocks
+	// enrollment_ready + relay_config.
+	finishBaselineReadiness(t, conn, fingerprint)
+
+	_, raw, err := conn.Read(ctx) // relay_config follows enrollment_ready
+	require.NoError(t, err)
+
+	var relayMsg map[string]any
+	require.NoError(t, json.Unmarshal(raw, &relayMsg))
+	require.Equal(t, "relay_config", relayMsg["type"])
+
+	// Exact §11.1 wire keys (plus the framing "type"), nothing more.
+	expectedKeys := []string{"type", "version", "generation", "gateway_addr", "gateway_port", "proxy_name", "relay_port", "credential", "expires_at"}
+	gotKeys := make([]string, 0, len(relayMsg))
+	for key := range relayMsg {
+		gotKeys = append(gotKeys, key)
+	}
+	require.ElementsMatch(t, expectedKeys, gotKeys)
+
+	// The assignment must be persisted and echoed consistently.
+	persistedAgent, err := app.FindRecordById("agents", agentRecs[0].Id)
+	require.NoError(t, err)
+	assignedPort := persistedAgent.GetInt("relay_port")
+	require.NotZero(t, assignedPort)
+	require.True(t, settings.PortRange.Contains(assignedPort))
+	require.EqualValues(t, assignedPort, relayMsg["relay_port"])
+	require.EqualValues(t, persistedAgent.GetInt("relay_generation"), relayMsg["generation"])
+	require.Equal(t, settings.GatewayAddr, relayMsg["gateway_addr"])
+	require.EqualValues(t, settings.GatewayPort, relayMsg["gateway_port"])
+	require.Equal(t, relayctl.ProxyNameFor(persistedAgent.GetString("namespace")), relayMsg["proxy_name"])
+
+	// Credential: real signature verification + identity + fresh expiry.
+	credential, ok := relayMsg["credential"].(string)
+	require.True(t, ok)
+	claims, err := relayctl.VerifyCredential(signer.PublicKey(), []byte(credential))
+	require.NoError(t, err)
+	require.Equal(t, apiKeyID, claims.APIKeyID)
+	require.Equal(t, persistedAgent.Id, claims.AgentRecordID)
+	require.Equal(t, persistedAgent.GetString("namespace"), claims.Namespace)
+	require.Equal(t, assignedPort, claims.RelayPort)
+	require.True(t, claims.ExpiresAt.After(time.Now()))
+	expiresAt, ok := relayMsg["expires_at"].(string)
+	require.True(t, ok)
+	parsedExpiry, err := time.Parse(time.RFC3339, expiresAt)
+	require.NoError(t, err)
+	require.True(t, parsedExpiry.After(time.Now()))
+
+	// A reconnect (fresh epoch) re-issues a fresh credential with a distinct
+	// JTI — never a resend of the same token.
+	conn.CloseNow()
+	conn2 := dialAgentAndEnroll(t, serverURL, fullKey, "agent-relay-config")
+	defer conn2.CloseNow()
+	fingerprint2 := csrToFingerprint(t, conn2)
+	finishBaselineReadiness(t, conn2, fingerprint2)
+	_, raw2, err := conn2.Read(ctx)
+	require.NoError(t, err)
+	var relayMsg2 struct {
+		Credential string `json:"credential"`
+		RelayPort  int    `json:"relay_port"`
+	}
+	require.NoError(t, json.Unmarshal(raw2, &relayMsg2))
+	require.Equal(t, "relay_config", mustMessageType(t, raw2))
+	require.Equal(t, assignedPort, relayMsg2.RelayPort, "reconnect keeps the assigned port")
+	claims2, err := relayctl.VerifyCredential(signer.PublicKey(), []byte(relayMsg2.Credential))
+	require.NoError(t, err)
+	require.NotEqual(t, claims.JTI, claims2.JTI, "reconnect requires (and gets) a fresh credential")
+}
+
+func mustMessageType(t *testing.T, raw []byte) string {
+	t.Helper()
+	var frame struct {
+		Type string `json:"type"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &frame))
+	return frame.Type
+}
+
+// TestRelayClientStateTelemetryIsBoundedAndInert pins §11.1: relay_client_state
+// is accepted only from the enrolled current epoch, validated against the
+// bounded shape, and is pure telemetry — it never replies with availability,
+// never mutates share lifecycle, and invalid payloads are dropped.
+func TestRelayClientStateTelemetryIsBoundedAndInert(t *testing.T) {
+	app, serverURL, cleanup := setupAgentWSWithController(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, app)
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-relay-telemetry")
+	defer conn.CloseNow()
+	ctx := context.Background()
+
+	// A live share exists; telemetry must leave its lifecycle untouched.
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"TELEMETRY1","share_type":"immich"}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "share_registered")
+	before := findSessionByCode(t, app, "TELEMETRY1")
+	require.NotNil(t, before)
+
+	// probeAfter sends a message that must NOT be answered, then a control
+	// message with a deterministic reply (unregister_share on an unknown code
+	// always answers share_unregistered). Reading exactly ONE frame proves the
+	// probed message was silent — any reply would have arrived first.
+	probeAfter := func(payload string) {
+		t.Helper()
+		require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(payload)))
+		require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"unregister_share","code":"UNKNOWNCODE"}`)))
+		_, probeRaw, probeErr := conn.Read(ctx)
+		require.NoError(t, probeErr)
+		require.Contains(t, string(probeRaw), "share_unregistered",
+			"expected silence for %s, got an intervening reply first", payload)
+	}
+
+	// Valid telemetry: accepted silently (no reply, no state change), unknown
+	// JSON fields ignored.
+	probeAfter(`{"type":"relay_client_state","generation":1,"status":"running","reason":"tunnel up","unknown_field":"ignored"}`)
+
+	// Invalid payloads: dropped, no reply, no panic.
+	probeAfter(`{"type":"relay_client_state","generation":1,"status":"connected"}`)                                         // bad enum
+	probeAfter(`{"type":"relay_client_state","generation":-2,"status":"running"}`)                                          // bad generation
+	probeAfter(`{"type":"relay_client_state","generation":1,"status":"error","reason":"` + strings.Repeat("x", 257) + `"}`) // oversize reason
+
+	// Inertness: the session row is unchanged on lifecycle fields.
+	after := findSessionByCode(t, app, "TELEMETRY1")
+	require.NotNil(t, after)
+	require.Equal(t, before.GetString("origin"), after.GetString("origin"))
+	require.Equal(t, before.GetBool("is_active"), after.GetBool("is_active"))
+	require.Equal(t, before.GetString("inactive_reason"), after.GetString("inactive_reason"))
+	require.True(t, after.GetBool("is_active"))
+}
+
+func TestRelayLockdownStatusTelemetryIsInert(t *testing.T) {
+	app, serverURL, cleanup := setupAgentWSWithController(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, app)
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-lockdown-telemetry")
+	defer conn.CloseNow()
+	ctx := context.Background()
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"LOCKDWN001","share_type":"immich"}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "share_registered")
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"lockdown_status","generation":1,"locked":true}`)))
+	readExpectSilence(t, conn, 300*time.Millisecond, "lockdown telemetry must not reply")
+
+	session := findSessionByCode(t, app, "LOCKDWN001")
+	require.NotNil(t, session)
+	require.True(t, session.GetBool("is_active"), "lockdown telemetry must never mutate share lifecycle")
+
+	// Pre-enrollment rejection: a connection that never sent hello is rejected
+	// for telemetry just like every other control-plane message.
+	rawConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverURL, "http")+"/ws/agent?api_key="+apiKey, nil)
+	require.NoError(t, err)
+	defer rawConn.CloseNow()
+	require.NoError(t, rawConn.Write(ctx, websocket.MessageText, []byte(`{"type":"lockdown_status","generation":1,"locked":true}`)))
+	_, raw, err = rawConn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "hello required before lockdown_status")
 }

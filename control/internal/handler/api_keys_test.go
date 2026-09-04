@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"sharebridge/control/internal/hub"
+	"sharebridge/control/internal/relayctl"
 )
 
 func TestListAPIKeys_ReturnsOnlyAuthenticatedUsersKeys(t *testing.T) {
@@ -163,6 +164,73 @@ func TestRotatePreservesAgent(t *testing.T) {
 	assert.Equal(t, "sbdeadbeef", newAgents[0].GetString("namespace"))
 	assert.Equal(t, "ready", newAgents[0].GetString("cert_status"))
 	assert.Equal(t, "abc123", newAgents[0].GetString("cert_fingerprint"))
+}
+
+// TestAPIKeyRotationPreservesRelayAssignment pins the §7.2/§12 rotation rule:
+// rotation re-points the agent to the new key but KEEPS the stable relay port;
+// only the generation moves (+1), so credentials minted under the old key's
+// epoch are fenced at the gateway while the assignment itself survives.
+func TestAPIKeyRotationPreservesRelayAssignment(t *testing.T) {
+	app, cleanup := setupAgentTestApp(t)
+	defer cleanup()
+
+	alice, err := createTestUser(app, "alice-rotate-relay@example.com")
+	require.NoError(t, err)
+
+	oldKey, err := createTestAPIKey(app, alice.Id, "old-relay-secret")
+	require.NoError(t, err)
+	agent := createTestAgent(t, app, oldKey.Id, "sbrotrelay1", "ready")
+
+	portRange, err := relayctl.NewPortRange(12000, 12099)
+	require.NoError(t, err)
+	signer, err := relayctl.GenerateSigner()
+	require.NoError(t, err)
+
+	assignment, err := relayctl.EnsureAssignment(app, agent, portRange)
+	require.NoError(t, err)
+	require.Equal(t, 1, assignment.Generation)
+
+	// A pre-rotation credential for the old key identity.
+	oldClaims, oldToken, err := signer.SignCredential(assignment, oldKey.Id)
+	require.NoError(t, err)
+	require.Equal(t, 1, oldClaims.Generation)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/keys/"+oldKey.Id+"/rotate", bytes.NewBufferString(`{}`))
+	request.SetPathValue("id", oldKey.Id)
+	recorder := httptest.NewRecorder()
+	requestEvent := new(core.RequestEvent)
+	requestEvent.App = app
+	requestEvent.Request = request
+	requestEvent.Response = recorder
+	requestEvent.Auth = alice
+	require.NoError(t, RotateAPIKey(app, hub.New())(requestEvent))
+	require.Equal(t, http.StatusCreated, recorder.Code, recorder.Body.String())
+
+	var response CreateAPIKeyResponse
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+
+	// The same agent row now points at the new key with the SAME relay port,
+	// one generation higher (rotation fences outstanding credentials).
+	rotated, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": response.ID})
+	require.NoError(t, err)
+	require.Len(t, rotated, 1)
+	require.Equal(t, assignment.RelayPort, rotated[0].GetInt("relay_port"), "rotation must preserve the assigned port")
+	require.Equal(t, 2, rotated[0].GetInt("relay_generation"), "rotation must fence via a generation bump")
+	require.Equal(t, assignment.Namespace, rotated[0].GetString("namespace"))
+
+	// The assignment stays stable after rotation: same port, no further bump.
+	stability, err := relayctl.EnsureAssignment(app, rotated[0], portRange)
+	require.NoError(t, err)
+	require.Equal(t, assignment.RelayPort, stability.RelayPort)
+	require.Equal(t, 2, stability.Generation)
+
+	// The pre-rotation credential is now strictly superseded: same port but a
+	// generation the gateway no longer accepts, bound to the revoked key id.
+	verifiedOld, err := relayctl.VerifyCredential(signer.PublicKey(), oldToken)
+	require.NoError(t, err)
+	require.Equal(t, 1, verifiedOld.Generation)
+	require.Less(t, verifiedOld.Generation, rotated[0].GetInt("relay_generation"))
+	require.NotEqual(t, oldKey.Id, response.ID)
 }
 
 func TestRevokeDeletesAgent(t *testing.T) {

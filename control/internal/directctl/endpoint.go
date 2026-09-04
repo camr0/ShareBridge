@@ -56,7 +56,7 @@ func (c *Controller) HandleReportEndpoint(ctx context.Context, conn *websocket.C
 	}
 	c.epochMu.Unlock()
 	if shouldSend {
-		c.sendEnrollmentReady(apiKeyID, conn, e)
+		c.sendEnrollmentReady(apiKeyID, conn, rec, e)
 	}
 
 	rec.Set("endpoint_ip", ip)
