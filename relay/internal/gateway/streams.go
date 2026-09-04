@@ -84,6 +84,42 @@ func (registry *Streams) Register(hostname, agentRecordID string, conn net.Conn)
 	return stream
 }
 
+// RegisterAdmitted registers a live public stream like Register and then —
+// while still holding the registry lock, so no CloseRoute or CloseAgent can
+// drain the indexes in between — invokes admit to re-verify route liveness
+// at the exact moment of registration. This closes the lookup→register
+// window: a stream whose route was revoked after the caller's lookup but
+// before this call is un-indexed again as if never registered, so a stream
+// can never outlive the revoke that preceded its registration (spec §8).
+//
+// admit runs under the registry lock: it must never call back into the
+// registry, and nothing it calls may acquire the registry lock while holding
+// another lock.
+//
+// On success it returns the committed stream. When admit fails it returns a
+// nil stream together with admit's error; the registry is left exactly as if
+// the stream had never been registered, and the caller closes the connection
+// generically like any other rejection.
+func (registry *Streams) RegisterAdmitted(hostname, agentRecordID string, conn net.Conn, admit func() error) (*Stream, error) {
+	stream := &Stream{
+		Hostname:      hostname,
+		AgentRecordID: agentRecordID,
+		registry:      registry,
+		conn:          conn,
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.addTo(registry.byRoute, hostname, stream)
+	registry.addTo(registry.byAgent, agentRecordID, stream)
+	if err := admit(); err != nil {
+		registry.removeFrom(registry.byRoute, hostname, stream)
+		registry.removeFrom(registry.byAgent, agentRecordID, stream)
+		return nil, err
+	}
+	registry.live++
+	return stream, nil
+}
+
 // Len reports how many streams are currently indexed.
 func (registry *Streams) Len() int {
 	registry.mu.Lock()

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -64,6 +65,85 @@ func assertConnOpen(t *testing.T, label string, conn *fakeConn) {
 	if conn.closed.Load() {
 		t.Fatalf("%s: expected the connection to remain open", label)
 	}
+}
+
+func TestRegisterAdmittedCommitsOnlyLiveRoutes(t *testing.T) {
+	t.Run("admit failure leaves the registry untouched", func(t *testing.T) {
+		registry := NewStreams()
+		conn := &fakeConn{}
+
+		stream, admitErr := registry.RegisterAdmitted(streamRouteAlpha, streamAgentAnn, conn, func() error {
+			return errors.New("routes: route is inactive")
+		})
+		if stream != nil {
+			t.Fatalf("RegisterAdmitted returned a stream despite admit failure")
+		}
+		if admitErr == nil {
+			t.Fatalf("RegisterAdmitted returned no admit error")
+		}
+		if got := registry.Len(); got != 0 {
+			t.Fatalf("registry size after rejected registration = %d, want 0", got)
+		}
+		if closed := registry.CloseRoute(streamRouteAlpha); closed != 0 {
+			t.Fatalf("CloseRoute after rejected registration = %d, want 0", closed)
+		}
+		// The caller owns the generic close; the registry must not have
+		// touched the connection.
+		assertConnOpen(t, "connection after rejected registration", conn)
+	})
+
+	t.Run("admit success commits the stream to both indexes", func(t *testing.T) {
+		registry := NewStreams()
+		conn := &fakeConn{}
+
+		stream, admitErr := registry.RegisterAdmitted(streamRouteAlpha, streamAgentAnn, conn, func() error {
+			return nil
+		})
+		if stream == nil || admitErr != nil {
+			t.Fatalf("RegisterAdmitted = (%v, %v), want a committed stream", stream, admitErr)
+		}
+		if got := registry.Len(); got != 1 {
+			t.Fatalf("registry size after committed registration = %d, want 1", got)
+		}
+		if closed := registry.CloseRoute(streamRouteAlpha); closed != 1 {
+			t.Fatalf("CloseRoute on a committed stream = %d, want 1", closed)
+		}
+		assertConnClosed(t, "committed stream connection", conn)
+	})
+
+	t.Run("a concurrent revoke waits for admission and then closes the committed stream", func(t *testing.T) {
+		// This pins the coordination contract: admit runs while the registry
+		// lock is held, so a CloseRoute started mid-admission can never drain
+		// the indexes between indexing and the liveness re-check — it waits,
+		// then closes the committed stream like any revoke after admission.
+		registry := NewStreams()
+		conn := &fakeConn{}
+
+		admissionStarted := make(chan struct{})
+		admissionRelease := make(chan struct{})
+		revokeResult := make(chan int, 1)
+		go func() {
+			<-admissionStarted      // the revoke fires mid-admission...
+			close(admissionRelease) // ...but may only proceed once admission completed
+			revokeResult <- registry.CloseRoute(streamRouteAlpha)
+		}()
+
+		stream, admitErr := registry.RegisterAdmitted(streamRouteAlpha, streamAgentAnn, conn, func() error {
+			close(admissionStarted)
+			<-admissionRelease // hold admission open; the revoke must wait, not interleave
+			return nil
+		})
+		if stream == nil || admitErr != nil {
+			t.Fatalf("RegisterAdmitted = (%v, %v), want a committed stream", stream, admitErr)
+		}
+		if closed := <-revokeResult; closed != 1 {
+			t.Fatalf("revoke waiting on admission closed %d streams, want 1", closed)
+		}
+		assertConnClosed(t, "stream closed by the waiting revoke", conn)
+		if got := registry.Len(); got != 0 {
+			t.Fatalf("registry size after the waiting revoke = %d, want 0", got)
+		}
+	})
 }
 
 func TestRevokeClosesOnlyIndexedRouteStreams(t *testing.T) {
