@@ -1,7 +1,7 @@
 # Phase 4a — FRP Relay MVP
 
 **Date:** 2026-09-02
-**Status:** Draft — pending user review
+**Status:** Approved — user-reviewed 2026-09-03; two GLM 5.3 spec review rounds, SATISFIED
 **Companion to:** `docs/superpowers/specs/2026-07-25-native-https-tls-passthrough-design.md` and `docs/superpowers/specs/2026-08-14-direct-tcp-mode-design.md`
 **Builds on:** Phase 2 transport and Phase 3 Immich content serving on branch `v2` at `700df65`
 **Implements:** the availability fallback for CGNAT, disabled/unavailable UPnP, broken hairpin NAT, and recipient-specific direct-path failure
