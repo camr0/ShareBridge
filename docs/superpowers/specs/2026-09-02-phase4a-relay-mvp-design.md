@@ -114,6 +114,9 @@ optimizer.
   milestone; Phase 4a continues to serve the Phase 3 public Immich contract only.
 - **CT monitoring and CAA:** control-plane quick win performed separately by the user;
   this design retains the trust-boundary warning and references the security review.
+  This is a deliberate sequencing deviation from the review's “start of Phase 4”
+  recommendation, not a priority downgrade: Phase 4a implementation does not absorb
+  it, but CT monitoring and CAA are a release prerequisite before Phase 4b begins.
 
 ## 4. Architecture Questions and Decisions
 
@@ -178,19 +181,28 @@ recipient request.
 ### 4.4 Timeout budgets
 
 **Decision:** use one overall four-second control-preparation budget and one four-second
-recipient-path budget.
+recipient-path budget. Keep STUN observations warm proactively (§10.2) rather than
+assuming an on-demand STUN round trip will fit every cold open.
 
-- `open_signal` + `open_ack` + control probe share a four-second context. Existing
-  three-second component timeouts may remain but cannot exceed the overall budget.
+- A missing or stale current-epoch STUN observation is refreshed inside the same
+  preparation context. That refresh may run concurrently with `open_signal` /
+  `open_ack`, but the public direct probe cannot start until the STUN match succeeds.
+- STUN refresh + `open_signal` + `open_ack` + control probe share a four-second
+  context. Existing three-second component timeouts may remain but cannot exceed the
+  overall budget.
 - The interstitial direct `GET /s/<code>/connect` has a four-second
   `AbortController` deadline.
 - Gateway ClientHello read: five seconds.
 - Gateway-to-FRP loopback connect: two seconds.
 
-Warm direct opens normally complete far below these ceilings. The worst bounded delay
-before relay navigation is approximately eight seconds. The UI displays progress and
-an immediate “Use relay now” action; that action cancels the direct attempt and uses
-the already-returned relay URL.
+A cold UPnP open may consume 1–3 seconds before the STUN/probe work finishes. Missing
+the four-second preparation budget therefore falls back to an available relay for that
+navigation; this is accepted MVP cold-open behavior, not a durable direct-failure
+classification. Proactive refresh and a later warm open may succeed. Warm direct opens
+normally complete far below these ceilings. The worst bounded delay before relay
+navigation is approximately eight seconds. The UI displays progress and an immediate
+“Use relay now” action; that action cancels the direct attempt and uses the
+already-returned relay URL.
 
 ### 4.5 FRP configuration ownership
 
@@ -281,11 +293,27 @@ Phase 4a provisions the second wildcard A record at enrollment:
 ```
 
 It is static for the lifetime of the gateway assignment and does not change when a
-share is created. The existing direct record remains:
+share is created. Operators also provision the non-browser FRP transport record used
+in `relay_config`:
+
+```text
+<relay-tunnel-host> → relay VM public IP
+```
+
+That stable record is authenticated by the dedicated FRP transport certificate; it is
+not an agent content origin, wildcard, or per-enrollment record. The existing direct
+record remains:
 
 ```text
 *.<namespace>.sharebridgeusercontent.com → agent public IPv4 via DDNS
 ```
+
+Normative DNS invariant: the `sharebridgeusercontent.com` zone must never publish
+HTTPS/SVCB records (in particular any `ech` key), and all relay, tunnel, and direct
+records stay DNS-only. If browsers ever obtain ECH keys for these origins, SNI becomes
+hidden and both the gateway and the agent Binder silently lose the ability to route.
+Provider configuration is audited at deploy time and re-checked by the operational
+checklist.
 
 The control plane continues storing the direct origin in `sessions.origin`:
 
@@ -339,10 +367,18 @@ cannot report a usable direct endpoint and therefore never registers a share.
 Phase 4a changes the invariant:
 
 ```text
-baseline enrollment ready = current-epoch TLS ready + relay DNS provisioned
-direct eligible            = baseline ready + live WS + STUN match + DDNS + endpoint
-relay eligible             = baseline ready + active gateway tunnel-presence lease
+baseline enrollment ready       = current-epoch TLS ready + relay DNS provisioned
+direct preparation candidate    = baseline ready + live WS + DDNS + endpoint
+                                  + no fresh STUN mismatch
+direct eligible                  = direct preparation candidate
+                                  + fresh current-epoch STUN match
+relay eligible                   = baseline ready + active gateway tunnel-presence lease
 ```
+
+These are live predicates. Route selection recomputes them from the current WebSocket
+epoch, current endpoint/DDNS state, STUN observation, and gateway lease; it never reads
+a persisted status snapshot as authority. A missing/stale STUN observation is a
+refreshable preparation case, while a fresh mismatch is ineligible.
 
 An agent may register supported shares after baseline enrollment even when direct is
 unavailable. Direct state becomes an optional route capability, not an enrollment gate.
@@ -399,7 +435,9 @@ online
 
 Every event carries the gateway boot ID and a monotonically increasing revision.
 Control discards events from an older boot/revision. Persisted `relay_last_seen_at` is
-diagnostic only; route selection uses the in-memory leased view.
+diagnostic only; route selection uses the in-memory leased view. The generated `frpc`
+configuration requests an authenticated Ping every 10 seconds, well below the
+45-second lease; the pinned-release gate in §23 must prove the effective setting.
 
 ### 7.4 Agent process lifecycle
 
@@ -467,25 +505,28 @@ if relay_only:
     if relay available: redirect to relay
     else: show agent-offline/unavailable page
 
-else if direct eligible:
-    serve interstitial
-    interstitial asks control to prepare direct
-    if preparation succeeds:
-        browser tests direct for at most 4s
-        success → direct origin
-        failure → relay origin if available, otherwise offline page
-    else:
-        relay origin if available, otherwise offline page
-
-else if relay available:
-    redirect to relay
-
 else:
-    show agent-offline/unavailable page
+    evaluate the live direct predicate (never a persisted status snapshot)
+    if direct eligible, or only STUN freshness is missing/stale:
+        serve interstitial
+        interstitial asks control to prepare direct
+        if preparation succeeds:
+            browser tests direct for at most 4s
+            success → direct origin
+            failure → relay origin if available, otherwise offline page
+        else:
+            relay origin if available, otherwise offline page
+    else if relay available:
+        redirect to relay
+    else:
+        show agent-offline/unavailable page
 ```
 
-Phase 4a does not compare measured direct and relay performance. “Direct eligible” is a
-boolean safety/availability predicate, not a speed score.
+Preparation re-evaluates every live input and refreshes STUN inline only when the
+current epoch has no fresh observation. A four-second preparation budget miss uses an
+available relay for that navigation and does not persist a lasting direct-ineligible
+state. Phase 4a does not compare measured direct and relay performance. “Direct
+eligible” is a boolean safety/availability predicate, not a speed score.
 
 ### 9.2 Relay path has no open signal
 
@@ -506,15 +547,19 @@ split from navigation:
 GET /share/<code> or /s/<code>
   → unknown/revoked: 404
   → expired/unsupported: 410
-  → relayOnly or direct-ineligible + relay-present: 302 relay
-  → direct candidate: 200 no-store interstitial
+  → relayOnly or non-STUN direct-ineligible + relay-present: 302 relay
+  → direct eligible, or only STUN missing/stale (never `relayOnly`):
+    200 no-store interstitial
   → no usable transport: 503 agent-offline page
 
 POST /api/shares/<code>/prepare-route
-  → live lifecycle re-check
-  → direct open_signal + ack + STUN/verified-tuple check + probe, overall ≤4s
-  → JSON containing control-constructed direct URL, optional relay URL,
+  → live lifecycle and direct-predicate re-check
+  → if current-epoch STUN is missing/stale, issue one inline challenge
+  → direct open_signal + ack + STUN match + verified-tuple probe, overall ≤4s
+     (mapping/open and STUN may overlap; the public probe waits for STUN)
+  → success: JSON containing control-constructed direct URL, optional relay URL,
     and directTimeoutMs=4000
+  → timeout/failure: JSON selecting the available relay, or unavailable
 ```
 
 The interstitial performs a CORS request to:
@@ -533,6 +578,21 @@ never embeds either content origin in an iframe.
 The prepare response and page are non-cacheable. Control constructs both origins from
 persisted origin/namespace state; neither an agent nor a request parameter can provide
 an arbitrary redirect target.
+
+The interstitial's per-response CSP keeps `default-src 'none'`, permits its nonce-bound
+script and same-origin preparation call, and adds a control-constructed, namespace-
+scoped direct host source with any HTTPS port to `connect-src` (equivalent to
+`https://*.<namespace>.sharebridgeusercontent.com:*`). This is required because the
+actual mapped port is learned only after the page headers are sent. The namespace is
+loaded from the authenticated session record, never request input; unrelated agent
+namespaces, HTTP, frames, objects, and other network destinations remain forbidden.
+Browser tests pin the effective policy rather than relying only on string comparison.
+
+When a relay URL is available, the page also includes a `<noscript>` meta-refresh to
+the exact control-constructed relay URL plus a visible relay link. Thus a recipient
+without JavaScript does not remain stranded on a direct-candidate page. If relay is not
+available, `<noscript>` renders the no-usable-transport message and a canonical retry
+link; no-JS direct preparation is deliberately unsupported in the MVP.
 
 ### 9.4 Mixed direct/relay behavior
 
@@ -572,12 +632,31 @@ The receipt proves the agent received the response at the observed address and p
 a blind source-spoofed UDP packet from manufacturing an observation. Challenges are
 single-use, expire after 60 seconds, and are rate-limited per agent.
 
-### 10.2 Policy
+### 10.2 Cadence and freshness
+
+Control sends a challenge immediately after the authenticated WebSocket completes its
+current-epoch enrollment handshake, including after every reconnect. While that socket
+remains connected, control re-challenges four minutes after each accepted observation,
+with small jitter to avoid synchronized bursts. Since observations expire after five
+minutes and are bound to one WebSocket epoch, this normally leaves at least one minute
+to retry before direct eligibility becomes stale.
+
+`prepare-route` reuses a fresh current-epoch observation. It issues an inline challenge
+only when that observation is missing or stale; it does not challenge on every open.
+The inline challenge shares the overall four-second preparation context (§4.4), may run
+in parallel with port preparation, and must finish before the public HTTPS probe. A
+reconnect therefore starts immediate reacquisition rather than leaving direct disabled
+until the next recipient arrives. Challenge failures retry with bounded backoff and
+jitter, subject to the per-agent rate limit.
+
+### 10.3 Policy
 
 - Exact IPv4 match and a fresh observation (default five minutes) are required for
   direct eligibility.
-- Mismatch, timeout, blocked STUN, private/reserved/CGNAT address, or stale observation
-  makes the agent relay-only until a later observation succeeds.
+- Mismatch, timeout, blocked STUN, or a private/reserved/CGNAT address makes the agent
+  use relay fallback until a later observation succeeds. A missing/stale observation
+  first permits the bounded inline refresh in §10.2, then falls back if it does not
+  succeed inside the preparation budget.
 - A mismatch stops before the HTTPS reachability probe, closing the Phase 2 SSRF/scanner
   gap.
 - Relay availability is independent of STUN.
@@ -598,7 +677,7 @@ types remain versioned, bounded, and tolerant of unknown fields.
 | agent → control | `relay_client_state` | `{ generation, status: "starting"|"running"|"stopped"|"error", reason? }` — telemetry only |
 | control → agent | `stun_challenge` | `{ version, challenge, server, expires_at }` |
 | agent → control | `stun_result` | `{ challenge, transaction_id, receipt }` |
-| agent → control | `lockdown_status` | `{ generation, locked: bool }` — changes route availability, not share lifecycle |
+| agent → control | `lockdown_status` | `{ generation, locked: bool }` — advisory fast-path telemetry; may suppress attempts but cannot establish route availability or change share lifecycle |
 | control → agent | `lockdown_ack` | optional acknowledgement of control-side transport deactivation |
 
 `share_registered` adds `relay_origin`. `origin` remains the direct origin. No agent
@@ -638,8 +717,8 @@ A new forward migration extends `agents`:
 | `relay_last_seen_at` | date | diagnostic gateway observation; never sufficient for routing |
 | `stun_observed_ip` | text | last control-observed public IPv4 |
 | `stun_observed_at` | date | observation freshness/audit timestamp |
-| `direct_status` | text | `unknown`, `eligible`, or `relay_only` |
-| `direct_status_reason` | text | bounded code such as `stun_mismatch`, `stun_timeout`, `no_mapper`, `probe_failed` |
+| `direct_status` | text | diagnostic snapshot: `unknown`, `eligible`, or `relay_fallback` |
+| `direct_status_reason` | text | diagnostic bounded code such as `stun_mismatch`, `stun_timeout`, `no_mapper`, `probe_failed` |
 
 Indexes:
 
@@ -655,6 +734,11 @@ No new `sessions` field is required:
 
 Tunnel online/offline is deliberately not a durable boolean. On process restart,
 persisted presence is stale by definition and must be reacquired from the gateway.
+Likewise, `direct_status` and `direct_status_reason` are derived audit/UI diagnostics
+recorded from the last evaluation, not routing inputs. `eligible` never survives as an
+authority across a request or restart: selection always recomputes the §7.1 live
+predicate. The agent-level diagnostic value is named `relay_fallback` specifically to
+avoid collision with the per-share `sessions.relay_only` policy flag.
 
 ## 13. Agent Changes and Shared Serving Contract
 
@@ -709,7 +793,13 @@ atomically/best-effort concurrently:
 3. stops `frpc`, causing gateway presence to expire/close;
 4. removes local Binder admissions while retaining source/session state for unlock;
 5. closes established direct and relay recipient connections;
-6. reports locked state to control so canonical links show unavailable.
+6. reports advisory locked state to control so it can suppress futile preparation as
+   a fast path.
+
+The report is not authoritative: `locked=true` may self-deny availability, while a
+false or stale `locked=false` cannot create it. Direct still requires a current-epoch
+`open_ack` plus the verified probe, and relay still requires gateway-authoritative
+presence; local `SignalGate`/Binder enforcement remains final.
 
 Unlock requires explicit local action, restores bindings from source-verified sessions,
 starts the HTTPS listener/tunnel, and reacquires fresh transport presence. It does not
@@ -735,6 +825,7 @@ telemetry without changing the protocol:
 | Concurrent streams per agent | 64 |
 | Global streams per gateway process | 8,192 or lower host file-descriptor budget |
 | FRP proxies per agent | exactly 1 |
+| FRP authenticated Ping interval | 10 seconds |
 | Tunnel presence lease | 45 seconds, renewed by authenticated Ping |
 | Gateway route lease | 120 seconds, refreshed every 30 seconds while control sync is healthy |
 | Agent reconnect backoff | exponential with jitter, capped at 60 seconds |
@@ -756,8 +847,11 @@ tunnel layer.
 
 `frps` is configured with `maxPortsPerClient=1`, a narrow `allowPorts` range,
 `proxyBindAddr=127.0.0.1`, forced verified transport TLS, bounded heartbeat/user-
-connection timeouts, and no public dashboard. systemd sets `LimitNOFILE`, `MemoryMax`,
-restart policy, and log-rate bounds for both relay processes.
+connection timeouts, and no public dashboard. `frpc` explicitly requests a 10-second
+Ping interval rather than relying on FRP's default. With four nominal Ping
+opportunities per lease, one delayed or missed Ping does not flap presence. systemd
+sets `LimitNOFILE`, `MemoryMax`, restart policy, and log-rate bounds for both relay
+processes.
 
 ## 15. Failure Handling
 
@@ -789,8 +883,12 @@ membership is invented.
 
 Direct cannot open a new port because no authenticated signal path exists. A healthy
 existing relay tunnel and agent HTTPS listener may continue serving already-active
-routes under finite gateway route leases. If control cannot renew route state, the
-gateway fails closed when the route lease expires. Reconnect establishes a new
+routes under finite gateway route leases. If control cannot renew route state, route-
+lease expiry blocks only NEW connections (generic TCP close); established streams
+continue under the existing idle and absolute-lifetime limits — with control
+unreachable no new canonical opens exist, and killing healthy transfers adds harm
+without security benefit. Only an explicit route revoke or lockdown closes active
+streams. Reconnect establishes a new
 `SignalGate` epoch and fresh tunnel credentials without killing a healthy tunnel until
 replacement succeeds.
 
@@ -929,7 +1027,8 @@ Control gains the internal relay sync client/server, STUN UDP listener, route se
 and interstitial assets. Its existing HTTP server remains out of the bulk byte path.
 Static relay DNS records are created through the existing provider abstraction during
 enrollment. Cloudflare's record ceiling remains a scaling trigger for Route53, not an
-MVP blocker.
+MVP blocker. The deployment audit also verifies the §6 DNS invariant: no HTTPS/SVCB
+(ECH) records exist for the zone and all content records remain DNS-only.
 
 ### 17.3 Metrics
 
@@ -971,18 +1070,28 @@ No metric requires plaintext content.
 - complete route-selection matrix (`relayOnly`, direct eligible/ineligible, relay
   present/absent, lifecycle statuses);
 - relay selection never emits `open_signal` or runs a direct probe;
-- direct preparation observes the overall timeout;
+- direct preparation observes the overall timeout and a budget miss selects available
+  relay without persisting a durable direct failure;
+- STUN scheduling challenges immediately on each enrolled WS epoch, re-challenges at
+  the four-minute cadence, reuses fresh observations, and challenges inline only when
+  missing/stale;
 - interstitial response/JSON is no-store and redirect targets are control-derived;
+- generated CSP permits the current namespace's direct origin on a non-443 HTTPS port
+  while rejecting unrelated namespaces and destinations;
 - gateway snapshot and revision-gap reconciliation;
-- durable fields never make stale tunnel presence available;
+- durable fields never make stale tunnel presence or stale `direct_status` available;
+- route selection ignores diagnostic `direct_status` and recomputes the live predicate;
+- advisory `lockdown_status` can suppress attempts but cannot make direct or relay
+  available;
 - relay port allocation uniqueness and API-key rotation preservation;
-- STUN receipt, freshness, spoof/mismatch/timeout, and no-probe-on-mismatch.
+- STUN receipt, epoch/freshness, spoof/mismatch/timeout, and no-probe-on-mismatch.
 
 **Agent:**
 
 - managed `frpc` config has fixed local target, one proxy, correct generation, 0600
   permissions, and no shell expansion;
 - reconnect/backoff/credential replacement/lockdown;
+- generated `frpc` configuration sets the authenticated Ping interval to 10 seconds;
 - both origins bind to one content session and revoke together;
 - relay traffic does not open or hold the direct mapping;
 - local HTTPS server survives control-WebSocket reconnect;
@@ -1005,8 +1114,10 @@ register share
 ```
 
 It verifies HTTP status, headers, byte equality, Range/seek, cancellation, download
-accounting, concurrency limits, revocation, and tunnel restart. Existing Phase 3 parity
-tests run unchanged against both direct and relay base URLs.
+accounting, concurrency limits, revocation, and tunnel restart. It also delays one Ping
+past the configured 10-second interval and verifies the 45-second lease does not flap,
+then suppresses Pings through lease expiry and verifies offline transition. Existing
+Phase 3 parity tests run unchanged against both direct and relay base URLs.
 
 ### 18.3 Recipient/browser tests
 
@@ -1017,7 +1128,11 @@ tests run unchanged against both direct and relay base URLs.
 - gallery/lightbox/video seeking/original/archive work over relay in the supported
   browser matrix;
 - direct failure after load returns through the canonical route and recovers on relay;
-- CSP has zero violations and the connect endpoint exposes no content/cookie.
+- CSP has zero violations, permits a prepared non-443 direct connection only within
+  the control-derived agent namespace, and blocks unrelated destinations;
+- with JavaScript disabled, a direct-candidate page follows the exact relay
+  `<noscript>` fallback when relay is available and otherwise shows unavailable;
+- the connect endpoint exposes no content/cookie.
 
 ### 18.4 L4 passthrough proof
 
@@ -1042,12 +1157,18 @@ stream delivered to the agent after FRP decapsulation must still be byte-identic
 - restart agent during idle and active transfers;
 - drop the agent control WebSocket while keeping the tunnel alive;
 - expire presence without `CloseProxy` and verify bounded offline detection;
+- expire the gateway route lease (control sync loss beyond 120 seconds) and verify
+  established relay streams complete while new connections receive a generic close
+  until routes refresh;
 - revoke a share during a long relay transfer;
 - force lockdown during direct and relay transfers;
 - saturate per-IP/origin/agent/global limits without cross-agent starvation;
 - stream longer than the five-minute idle window while bytes remain active;
 - pause all bytes past idle and verify closure;
-- confirm no unbounded goroutine, file-descriptor, or buffer growth.
+- confirm no unbounded goroutine, file-descriptor, or buffer growth;
+- force a stale epoch-bound STUN observation during a cold 1–3 second mapping open,
+  verify the total preparation context never exceeds four seconds, and verify a miss
+  falls back to relay without poisoning a later warm direct attempt.
 
 Phase 4a load tests establish safety and a baseline only. They do not choose the faster
 route. Phase 4b must use bandwidth-bounded packet impairment; RTT/loss-only loopback
@@ -1084,8 +1205,19 @@ the applicable manual network cases:
     active connection, and makes canonical links unavailable until explicit unlock.
 11. **Content parity:** Phase 3 gallery, preview, original, archive, accounting, and
     Range/seek tests pass unchanged through relay.
-12. **STUN mismatch:** a mismatch marks direct relay-only, prevents the public probe,
-    and successfully routes through relay.
+12. **STUN mismatch:** a mismatch marks the agent's direct diagnostic as
+    `relay_fallback`, prevents the public probe, and successfully routes through relay.
+13. **STUN cadence and cold budget:** a challenge is sent immediately after reconnect,
+    refreshes at about four minutes while connected, and is not repeated during a warm
+    prepare. A stale-observation cold open either completes all preparation within four
+    seconds or falls back to relay; a later warm direct open can still succeed.
+14. **No-JS/CSP fallback:** a JavaScript-disabled browser follows the exact relay
+    fallback, while the normal interstitial can connect to a non-443 direct origin in
+    its own namespace with zero CSP violations and cannot connect elsewhere.
+15. **Heartbeat margin and tunnel DNS:** production configuration resolves
+    `<relay-tunnel-host>`, authenticates its dedicated transport certificate, emits
+    Pings every 10 seconds, tolerates one delayed Ping without presence flapping, and
+    goes unavailable after the 45-second lease truly expires.
 
 ## 20. Rollout and Compatibility
 
@@ -1100,8 +1232,10 @@ the applicable manual network cases:
 
 There are zero external v2 users and no legacy compatibility requirement. Phase 4a does
 not restore deleted v1 protocol code, Noise, WebRTC, SCTP, or service-worker transport.
-Rollback disables relay selection and route distribution; direct Phase 3 behavior
-remains available. Database additions are forward-compatible and can remain unused.
+Rollback disables relay selection and route distribution but leaves Phase 4a's new
+direct flow—control interstitial, `prepare-route`, live STUN eligibility, and recipient
+path check—in place. It does not restore the old Phase 3 redirect path. Database
+additions are forward-compatible and can remain unused.
 
 ## 21. Alternatives Considered
 
@@ -1163,15 +1297,32 @@ control-hosted interstitial is the only layer reachable before either content pa
 - Keep tunnel presence ephemeral; persisted last-seen is diagnostics only.
 - Decouple baseline enrollment from direct DDNS/UPnP readiness.
 - Put the bounded fallback interstitial and offline page on `sharebridge.app`.
-- Use four-second preparation and recipient-path budgets, with immediate manual relay.
+- Use four-second preparation and recipient-path budgets, with immediate manual relay;
+  a preparation miss is accepted cold-open fallback and not durable direct failure.
+- Keep STUN warm with an immediate challenge per enrolled WS epoch and approximately
+  four-minute re-challenges; refresh inline only when missing/stale.
 - Land the control-observed STUN cross-check before any direct public probe.
+- Treat `direct_status` as derived diagnostics only, use `relay_fallback` as its
+  agent-level fallback value, and always select from the live predicate.
+- Treat `lockdown_status` as advisory fast-path telemetry; SignalGate/probe and gateway
+  presence remain authoritative.
+- Use a namespace-scoped any-HTTPS-port `connect-src` and a no-JS relay fallback on the
+  control-hosted interstitial.
+- Set the FRP authenticated Ping interval to 10 seconds for the 45-second lease, and
+  provision the dedicated `<relay-tunnel-host>` DNS record.
 - Restore `relayOnly` for public Immich shares and document its precise privacy limit.
 - Keep agent HTTPS/tunnel alive across control-WebSocket reconnects under finite leases.
 - Make lockdown stop the tunnel, close both route kinds, and remain reversible without
   tombstoning shares.
 - Deploy relay on a separate same-region Hetzner VM under systemd for the production
   MVP.
+- Keep CT monitoring and CAA outside Phase 4a despite the security review's preferred
+  start-of-Phase-4 sequencing, but require that separate work before Phase 4b begins.
 - Defer performance-based selection to Phase 4b's packet-level impairment work.
+- Accept the uniform interstitial cost on direct navigations in 4a (two to three extra
+  round trips versus Phase 3's hidden-wait 302); a cookie-based warm fast-path that
+  302s straight to the direct origin after a recent browser-verified success is a
+  Phase 4b candidate.
 
 ## 23. Validation Gates Before Implementation Commitment
 
@@ -1185,16 +1336,26 @@ These are evidence gates, not unresolved product choices:
 3. Prove fragmented ClientHello replay through gateway → FRP → agent for browser TLS
    1.2/1.3 and HTTP/1.1 + HTTP/2.
 4. Prove the four-second browser check is reliable in supported Safari/iOS, Chrome, and
-   Firefox and that CORS `204` is observable without cookies.
+   Firefox, that CORS `204` is observable without cookies, that the namespace-scoped CSP
+   admits non-443 direct origins without broader network access, and that no-JS
+   recipients take the relay fallback.
 5. Prove the STUN authenticated extension/receipt works through representative NATs and
    fails closed under spoof, timeout, and mismatched egress.
-6. Measure one-agent and multi-agent relay throughput/CPU/memory only to establish
+6. Prove immediate post-reconnect and four-minute proactive STUN scheduling preserves a
+   fresh current-epoch observation, that warm prepares do not re-challenge, and that a
+   stale-observation cold open either finishes within four seconds or falls back to
+   relay without creating sticky direct-ineligible state.
+7. Prove the pinned FRP release honors the configured 10-second authenticated Ping
+   interval, tolerates a delayed Ping under the 45-second lease, and transitions absent
+   on true lease expiry.
+8. Measure one-agent and multi-agent relay throughput/CPU/memory only to establish
    capacity and safe default limits; do not turn the result into Phase 4b selection.
-7. Confirm separate-VM private-network control sync and restart ordering on the actual
-   Hetzner environment.
+9. Confirm `<relay-tunnel-host>` DNS/transport-certificate validation, separate-VM
+   private-network control sync, and restart ordering on the actual Hetzner environment.
 
-Failure of gates 1–5 blocks enabling automatic relay fallback. It does not authorize a
-plaintext-terminating proxy or custom SCTP/Noise revival as a shortcut.
+Failure of gates 1–7 blocks enabling automatic relay fallback; failure of gate 9 blocks
+production rollout on the separate VM. It does not authorize a plaintext-terminating
+proxy or custom SCTP/Noise revival as a shortcut.
 
 ## 24. Self-Review and Expected Fresh-Reviewer Concerns
 
@@ -1223,13 +1384,32 @@ focus on:
    shipped shared namespace/DDNS model and keeps stronger DNS privacy out of 4a.
 9. **Why a separate box?** §4.6 identifies the existing 443 conflict and isolates the
    availability backbone from control and bulk traffic.
-10. **Are timeout/limit numbers product law?** §4.4/§14 make them tested MVP defaults,
+10. **Can a cold open fit the budget after reconnect?** §4.4/§10.2 keep STUN warm,
+    reacquire immediately per epoch, and explicitly accept relay fallback when the
+    combined cold preparation exceeds four seconds; §18/§19/§23 test recovery on a
+    later warm attempt.
+11. **Can stale DB state select direct?** §7.1/§12 define `direct_status` as a derived
+    diagnostic snapshot, rename its fallback value to `relay_fallback`, and require
+    every selection to recompute the live predicate.
+12. **Can an agent self-report make a route available?** §11.1/§13.4 make
+    `lockdown_status` advisory only; direct ack/probe and gateway presence remain the
+    authorities.
+13. **Can the interstitial reach a random high direct port safely?** §9.3 makes the CSP
+    namespace-scoped with any HTTPS port and tests that unrelated destinations remain
+    blocked; its `<noscript>` path uses only the exact control-derived relay URL.
+14. **Will FRP's default heartbeat flap a 45-second lease?** §7.3/§14 set an explicit
+    10-second Ping and test both delay tolerance and real expiry; §6 provisions the
+    separate tunnel hostname used by that connection.
+15. **Why are CT monitoring and CAA still deferred?** §3.2 records the intentional
+    sequencing deviation from the security review and makes the separate mitigation a
+    prerequisite before Phase 4b, without absorbing it into this MVP.
+16. **Are timeout/limit numbers product law?** §4.4/§14 make them tested MVP defaults,
     observable and tuneable without changing wire semantics.
-11. **What happens mid-transfer?** §9.4/§15 state the honest boundary: new canonical
+17. **What happens mid-transfer?** §9.4/§15 state the honest boundary: new canonical
     navigation recovers; 4a does not migrate an in-flight cross-origin response.
-12. **Could the STUN design become bespoke security protocol?** §10 keeps it narrow—an
-    authenticated observation feeding a boolean direct-eligibility check—and gate 5
-    requires proof before enablement.
+18. **Could the STUN design become bespoke security protocol?** §10 keeps it narrow—an
+    authenticated observation feeding a boolean direct-eligibility check—and gates 5–6
+    require proof before enablement.
 
 ## 25. References
 
