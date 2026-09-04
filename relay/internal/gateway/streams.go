@@ -92,9 +92,21 @@ func (registry *Streams) Register(hostname, agentRecordID string, conn net.Conn)
 // before this call is un-indexed again as if never registered, so a stream
 // can never outlive the revoke that preceded its registration (spec §8).
 //
+// The fence holds only under a control-side ordering invariant: every path
+// that revokes, re-points, or expires routing state (table Revoke/Apply,
+// presence expiry) must mutate that state BEFORE it calls CloseRoute or
+// CloseAgent. The drain must follow, never precede, the mutation that
+// motivates it — a control task that drains first and tombstones or expires
+// presence afterwards would drain before a not-yet-registered stream and
+// then flip the table, silently reopening this race. Tasks 10–14 (control
+// sync, presence registry, FRP plugin) must preserve this order.
+//
 // admit runs under the registry lock: it must never call back into the
 // registry, and nothing it calls may acquire the registry lock while holding
-// another lock.
+// another lock. Because admit re-routes through the presence check,
+// presence.Online executes under the registry lock too — the Task 14
+// presence implementation must answer from in-memory state without blocking
+// or re-entering the registry.
 //
 // On success it returns the committed stream. When admit fails it returns a
 // nil stream together with admit's error; the registry is left exactly as if
@@ -130,6 +142,12 @@ func (registry *Streams) Len() int {
 // CloseRoute closes and deregisters every stream bound to the exact relay
 // hostname and returns how many open streams it closed. Streams already
 // closed elsewhere are neither recounted nor re-closed.
+//
+// Ordering invariant (see RegisterAdmitted): the control path that motivates
+// this drain — a route revoke or drop — must apply the table/presence
+// mutation first and call CloseRoute only afterwards. Draining before the
+// mutation lets a not-yet-registered stream slip past the fence and outlive
+// the revoke.
 func (registry *Streams) CloseRoute(hostname string) int {
 	return registry.closeAll(registry.takeRoute(hostname))
 }
@@ -137,6 +155,11 @@ func (registry *Streams) CloseRoute(hostname string) int {
 // CloseAgent closes and deregisters every stream bound to the agent record —
 // the lockdown path (spec §13.4, §15.6) — and returns how many open streams
 // it closed.
+//
+// Ordering invariant (see RegisterAdmitted): the control path that motivates
+// this drain — a lockdown or agent state change — must apply the
+// table/presence mutation first and call CloseAgent only afterwards, for the
+// same reason as CloseRoute.
 func (registry *Streams) CloseAgent(agentRecordID string) int {
 	return registry.closeAll(registry.takeAgent(agentRecordID))
 }

@@ -259,6 +259,11 @@ func (server *Server) handleConnection(publicConn net.Conn) {
 // different agent/port/generation join after the initial lookup fences the
 // not-yet-registered stream instead of letting it outlive the revoke that
 // preceded its registration (spec §8 conditions 2–3).
+//
+// That guarantee depends on the control-side ordering invariant documented
+// on Streams.RegisterAdmitted: control paths must mutate table/presence
+// state (Revoke/Apply, presence expiry) before calling CloseRoute/CloseAgent
+// — the drain follows, never precedes, the mutation.
 func (server *Server) admitStream(dialed routes.Route) func() error {
 	return func() error {
 		current, err := server.routes.Lookup(dialed.Hostname)
