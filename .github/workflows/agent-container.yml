@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "agent/**"
+      - "relay/**"
       - ".github/workflows/agent-container.yml"
   push:
     branches:
@@ -40,11 +41,32 @@ jobs:
           go-version-file: agent/go.mod
           cache-dependency-path: agent/go.sum
 
+      # The relay tests run real pinned frps/frpc binaries. The cache key
+      # includes the manifest digest, so a re-pin forces a fresh verified
+      # download instead of reusing artifacts from the previous pin.
+      - name: Restore FRP release cache
+        uses: actions/cache@v4
+        with:
+          path: relay/.cache/frp
+          key: frp-${{ hashFiles('relay/frp/manifest.json') }}
+
+      - name: Fetch pinned FRP release
+        run: ./scripts/fetch-frp.sh
+        working-directory: relay
+
       - name: Test
         run: go test ./...
 
       - name: Vet
         run: go vet ./...
+
+      - name: Test relay module
+        run: go test ./...
+        working-directory: relay
+
+      - name: Vet relay module
+        run: go vet ./...
+        working-directory: relay
 
   build:
     needs: test

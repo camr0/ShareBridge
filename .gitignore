@@ -15,6 +15,10 @@ coverage.txt
 # Local runtime data
 pb_data/
 
+# FRP release cache (downloaded and checksum-verified by relay/scripts/fetch-frp.sh;
+# binaries are never committed — release packaging bundles verified executables)
+relay/.cache/
+
 # Local secrets (never committed)
 .env
 .env.*
