@@ -45,13 +45,16 @@ const (
 
 	defaultMaxReplayEntries = 4096
 	defaultMaxSessions      = 1024
+	defaultMaxPendingEvents = 1024
 	maxRunIDBytes           = 128
 	maxSharedSecretBytes    = 512
 )
 
-// PresenceFact is the credential-free fact stream consumed by Task 14's
-// presence registry. It contains only bounded routing identity and lifecycle
-// data already validated at the FRP boundary.
+// PresenceFact is the credential-free authorization fact stream consumed by
+// Task 14's presence registry. Login and NewProxy facts confirm only that the
+// FRP plugin authorized those calls; FRP v0.71.0 provides no callback that can
+// confirm downstream proxy registration. Each fact contains only bounded
+// routing identity and lifecycle data validated at the FRP boundary.
 type PresenceFact struct {
 	Operation     string `json:"operation"`
 	AgentRecordID string `json:"agent_record_id"`
@@ -63,8 +66,8 @@ type PresenceFact struct {
 }
 
 // PresenceEvents is deliberately small so Task 14 can attach the leased
-// registry without coupling it to FRP request structs. ObserveFRPEvent must
-// return promptly and must not call back into Server.
+// registry without coupling it to FRP request structs. Server invokes one
+// callback at a time, in authorization order, outside its admission mutex.
 type PresenceEvents interface {
 	ObserveFRPEvent(PresenceFact)
 }
@@ -82,6 +85,7 @@ type Config struct {
 	RelayPortMax       int
 	MaxReplayEntries   int
 	MaxSessions        int
+	MaxPendingEvents   int
 	Now                func() time.Time
 	PresenceEvents     PresenceEvents
 }
@@ -97,6 +101,8 @@ type Server struct {
 	maxSessions        int
 	now                func() time.Time
 	presenceEvents     PresenceEvents
+	eventQueue         chan PresenceFact
+	eventSlots         chan struct{}
 
 	mu              sync.Mutex
 	replayedJTI     map[string]time.Time
@@ -108,7 +114,7 @@ type sessionState struct {
 	claims          CredentialClaims
 	tokenHash       [sha256.Size]byte
 	runID           string
-	proxyRegistered bool
+	proxyAuthorized bool
 	closed          bool
 }
 
@@ -207,7 +213,10 @@ func NewServer(config Config) (*Server, error) {
 	if config.MaxSessions == 0 {
 		config.MaxSessions = defaultMaxSessions
 	}
-	if config.MaxReplayEntries < 0 || config.MaxSessions < 0 {
+	if config.MaxPendingEvents == 0 {
+		config.MaxPendingEvents = defaultMaxPendingEvents
+	}
+	if config.MaxReplayEntries < 0 || config.MaxSessions < 0 || config.MaxPendingEvents < 0 {
 		return nil, errors.New("state bounds must be positive")
 	}
 	if config.Now == nil {
@@ -217,7 +226,7 @@ func NewServer(config Config) (*Server, error) {
 		config.PresenceEvents = discardPresenceEvents{}
 	}
 
-	return &Server{
+	server := &Server{
 		controlPublicKey:   append(ed25519.PublicKey(nil), config.ControlPublicKey...),
 		pluginSharedSecret: config.PluginSharedSecret,
 		relayPortMin:       config.RelayPortMin,
@@ -226,10 +235,14 @@ func NewServer(config Config) (*Server, error) {
 		maxSessions:        config.MaxSessions,
 		now:                config.Now,
 		presenceEvents:     config.PresenceEvents,
+		eventQueue:         make(chan PresenceFact, config.MaxPendingEvents),
+		eventSlots:         make(chan struct{}, config.MaxPendingEvents),
 		replayedJTI:        make(map[string]time.Time),
 		agentSessions:      make(map[string]*sessionState),
 		sessionsByToken:    make(map[[sha256.Size]byte]*sessionState),
-	}, nil
+	}
+	go server.dispatchPresenceEvents()
+	return server, nil
 }
 
 func (server *Server) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {
@@ -333,18 +346,23 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	now := server.now().UTC()
+	if !credential.claims.ExpiresAt.After(now) {
+		return false
+	}
 	server.pruneExpiredReplayLocked(now)
 	if _, replayed := server.replayedJTI[credential.claims.JTI]; replayed {
 		return false
 	}
 	current, exists := server.agentSessions[credential.claims.AgentRecordID]
-	if exists && current.claims.Generation > credential.claims.Generation {
+	if exists && (current.claims.Generation > credential.claims.Generation ||
+		(current.claims.Generation == credential.claims.Generation &&
+			!credential.claims.IssuedAt.After(current.claims.IssuedAt))) {
 		return false
 	}
 	if !exists && len(server.agentSessions) >= server.maxSessions {
 		return false
 	}
-	if len(server.replayedJTI) >= server.maxReplayEntries {
+	if len(server.replayedJTI) >= server.maxReplayEntries || !server.reserveEventLocked() {
 		return false
 	}
 
@@ -359,7 +377,7 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 	}
 	server.agentSessions[credential.claims.AgentRecordID] = session
 	server.sessionsByToken[credential.tokenHash] = session
-	server.emitLocked(OperationLogin, credential.claims, content.RunID)
+	server.emitReservedLocked(OperationLogin, credential.claims, content.RunID)
 	return true
 }
 
@@ -371,13 +389,20 @@ func (server *Server) handleNewProxy(rawContent json.RawMessage) bool {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	session, ok := server.validSessionUserLocked(content.User)
-	if !ok || session.proxyRegistered || content.ProxyName != session.claims.ProxyName ||
+	if !ok || content.ProxyName != session.claims.ProxyName ||
 		content.ProxyType != "tcp" || content.RemotePort != session.claims.RelayPort ||
 		content.RemotePort < server.relayPortMin || content.RemotePort > server.relayPortMax {
 		return false
 	}
-	session.proxyRegistered = true
-	server.emitLocked(OperationNewProxy, session.claims, session.runID)
+	if session.proxyAuthorized {
+		return true
+	}
+	if !server.reserveEventLocked() {
+		return false
+	}
+	server.bindRunIDLocked(session, content.User.RunID)
+	session.proxyAuthorized = true
+	server.emitReservedLocked(OperationNewProxy, session.claims, session.runID)
 	return true
 }
 
@@ -389,10 +414,11 @@ func (server *Server) handlePing(rawContent json.RawMessage) bool {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	session, ok := server.validSessionUserLocked(content.User)
-	if !ok {
+	if !ok || !server.reserveEventLocked() {
 		return false
 	}
-	server.emitLocked(OperationPing, session.claims, session.runID)
+	server.bindRunIDLocked(session, content.User.RunID)
+	server.emitReservedLocked(OperationPing, session.claims, session.runID)
 	return true
 }
 
@@ -404,11 +430,12 @@ func (server *Server) handleCloseProxy(rawContent json.RawMessage) bool {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	session, ok := server.validSessionUserLocked(content.User)
-	if !ok || !session.proxyRegistered || content.ProxyName != session.claims.ProxyName {
+	if !ok || !session.proxyAuthorized || content.ProxyName != session.claims.ProxyName || !server.reserveEventLocked() {
 		return false
 	}
+	server.bindRunIDLocked(session, content.User.RunID)
 	session.closed = true
-	server.emitLocked(OperationCloseProxy, session.claims, session.runID)
+	server.emitReservedLocked(OperationCloseProxy, session.claims, session.runID)
 	return true
 }
 
@@ -427,9 +454,7 @@ func (server *Server) validSessionUserLocked(user userInfo) (*sessionState, bool
 		subtle.ConstantTimeCompare(providedHash[:], session.tokenHash[:]) != 1 {
 		return nil, false
 	}
-	if session.runID == "" {
-		session.runID = user.RunID
-	} else if user.RunID != session.runID {
+	if session.runID != "" && user.RunID != session.runID {
 		return nil, false
 	}
 	return session, true
@@ -443,8 +468,25 @@ func (server *Server) pruneExpiredReplayLocked(now time.Time) {
 	}
 }
 
-func (server *Server) emitLocked(operation string, claims CredentialClaims, runID string) {
-	server.presenceEvents.ObserveFRPEvent(PresenceFact{
+func (server *Server) bindRunIDLocked(session *sessionState, runID string) {
+	if session.runID == "" {
+		session.runID = runID
+	}
+}
+
+// reserveEventLocked fails closed instead of waiting when the bounded ordered
+// dispatcher already has its configured number of queued or in-flight facts.
+func (server *Server) reserveEventLocked() bool {
+	select {
+	case server.eventSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (server *Server) emitReservedLocked(operation string, claims CredentialClaims, runID string) {
+	server.eventQueue <- PresenceFact{
 		Operation:     operation,
 		AgentRecordID: claims.AgentRecordID,
 		Namespace:     claims.Namespace,
@@ -452,7 +494,14 @@ func (server *Server) emitLocked(operation string, claims CredentialClaims, runI
 		RelayPort:     claims.RelayPort,
 		Generation:    claims.Generation,
 		RunID:         runID,
-	})
+	}
+}
+
+func (server *Server) dispatchPresenceEvents() {
+	for fact := range server.eventQueue {
+		server.presenceEvents.ObserveFRPEvent(fact)
+		<-server.eventSlots
+	}
 }
 
 func validRunID(runID string) bool {

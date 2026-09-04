@@ -39,6 +39,45 @@ type eventRecorder struct {
 	events []PresenceFact
 }
 
+type blockingEventRecorder struct {
+	mu          sync.Mutex
+	events      []PresenceFact
+	entered     chan struct{}
+	release     chan struct{}
+	enteredOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func (recorder *blockingEventRecorder) ObserveFRPEvent(fact PresenceFact) {
+	recorder.mu.Lock()
+	recorder.events = append(recorder.events, fact)
+	recorder.mu.Unlock()
+	recorder.enteredOnce.Do(func() {
+		close(recorder.entered)
+		<-recorder.release
+	})
+}
+
+func (recorder *blockingEventRecorder) unblock() {
+	recorder.releaseOnce.Do(func() { close(recorder.release) })
+}
+
+func (recorder *blockingEventRecorder) waitForCount(t *testing.T, count int) []PresenceFact {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		recorder.mu.Lock()
+		events := append([]PresenceFact(nil), recorder.events...)
+		recorder.mu.Unlock()
+		if len(events) >= count {
+			return events
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d events", count)
+	return nil
+}
+
 func (recorder *eventRecorder) ObserveFRPEvent(fact PresenceFact) {
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
@@ -49,6 +88,20 @@ func (recorder *eventRecorder) snapshot() []PresenceFact {
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
 	return append([]PresenceFact(nil), recorder.events...)
+}
+
+func (recorder *eventRecorder) waitForCount(t *testing.T, count int) []PresenceFact {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		events := recorder.snapshot()
+		if len(events) >= count {
+			return events
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d events", count)
+	return nil
 }
 
 type pluginFixture struct {
@@ -247,7 +300,7 @@ func TestPluginAcceptsExactLoginAndSingleTCPProxy(t *testing.T) {
 	requireAllowed(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
 	requireAllowed(t, fixture.request(OperationCloseProxy, fixture.closeContent(fixture.token, fixture.claims.Generation)))
 
-	events := fixture.recorder.snapshot()
+	events := fixture.recorder.waitForCount(t, 4)
 	if len(events) != 4 {
 		t.Fatalf("events = %d, want 4: %+v", len(events), events)
 	}
@@ -276,7 +329,7 @@ func TestPluginAcceptsFirstLoginWithoutRunIDAndBindsServerRunID(t *testing.T) {
 	requireAllowed(t, fixture.request(OperationLogin, login))
 	requireAllowed(t, fixture.request(OperationNewProxy, fixture.proxyContent(fixture.token, fixture.claims.Generation)))
 
-	events := fixture.recorder.snapshot()
+	events := fixture.recorder.waitForCount(t, 2)
 	if len(events) != 2 || events[0].RunID != "" || events[1].RunID != fixture.runID {
 		t.Fatalf("unexpected first-login run IDs: %+v", events)
 	}
@@ -363,6 +416,97 @@ func TestAcceptedTunnelMayOutliveCredentialExpiry(t *testing.T) {
 	requireAllowed(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
 }
 
+func TestPluginRejectsCredentialThatExpiresWhileWaitingForAdmissionLock(t *testing.T) {
+	clock := testNow
+	var clockMu sync.Mutex
+	prevalidated := make(chan struct{})
+	var clockOnce sync.Once
+	fixture := newPluginFixture(t, func(config *Config) {
+		config.Now = func() time.Time {
+			clockMu.Lock()
+			now := clock
+			clockMu.Unlock()
+			clockOnce.Do(func() { close(prevalidated) })
+			return now
+		}
+	})
+	fixture.claims.ExpiresAt = testNow.Add(time.Second)
+	fixture.token = signTestCredential(t, fixture.privateKey, fixture.claims)
+	server := fixture.handler.(*Server)
+	server.mu.Lock()
+	responses := make(chan testPluginResponse, 1)
+	go func() {
+		responses <- fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims))
+	}()
+	<-prevalidated
+	clockMu.Lock()
+	clock = fixture.claims.ExpiresAt
+	clockMu.Unlock()
+	server.mu.Unlock()
+	requireRejected(t, <-responses)
+}
+
+func TestPluginDispatchesEventsInOrderWithoutCallbackControllingAdmissionLatency(t *testing.T) {
+	recorder := &blockingEventRecorder{entered: make(chan struct{}), release: make(chan struct{})}
+	defer recorder.unblock()
+	fixture := newPluginFixture(t, func(config *Config) { config.PresenceEvents = recorder })
+	responses := make(chan testPluginResponse, 1)
+	go func() {
+		responses <- fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims))
+	}()
+	<-recorder.entered
+	select {
+	case response := <-responses:
+		requireAllowed(t, response)
+	case <-time.After(time.Second):
+		recorder.unblock()
+		<-responses
+		t.Fatal("presence callback controlled Login admission latency")
+	}
+	requireAllowed(t, fixture.request(OperationNewProxy, fixture.proxyContent(fixture.token, fixture.claims.Generation)))
+	requireAllowed(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
+	recorder.unblock()
+	events := recorder.waitForCount(t, 3)
+	for index, operation := range []string{OperationLogin, OperationNewProxy, OperationPing} {
+		if events[index].Operation != operation {
+			t.Fatalf("event %d = %q, want %q", index, events[index].Operation, operation)
+		}
+	}
+}
+
+func TestPluginRejectsAdmissionWhenOrderedEventQueueIsFull(t *testing.T) {
+	recorder := &blockingEventRecorder{entered: make(chan struct{}), release: make(chan struct{})}
+	defer recorder.unblock()
+	fixture := newPluginFixture(t, func(config *Config) {
+		config.PresenceEvents = recorder
+		config.MaxPendingEvents = 2
+	})
+
+	loginResponses := make(chan testPluginResponse, 1)
+	go func() {
+		loginResponses <- fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims))
+	}()
+	<-recorder.entered
+	select {
+	case response := <-loginResponses:
+		requireAllowed(t, response)
+	case <-time.After(time.Second):
+		recorder.unblock()
+		<-loginResponses
+		t.Fatal("presence callback controlled Login admission latency")
+	}
+
+	requireAllowed(t, fixture.request(OperationNewProxy, fixture.proxyContent(fixture.token, fixture.claims.Generation)))
+	requireRejected(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
+
+	recorder.unblock()
+	events := recorder.waitForCount(t, 2)
+	if events[0].Operation != OperationLogin || events[1].Operation != OperationNewProxy {
+		t.Fatalf("events after overload = %+v, want ordered Login and NewProxy authorization facts", events)
+	}
+	requireAllowed(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
+}
+
 func TestPluginRejectsReplayedCredential(t *testing.T) {
 	fixture := newPluginFixture(t)
 	loginFixture(t, fixture)
@@ -386,6 +530,42 @@ func TestPluginRejectsSupersededCredential(t *testing.T) {
 
 	fixture.runID = "run-one"
 	requireRejected(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, 1)))
+}
+
+func TestPluginRejectsOlderUnusedCredentialAtSameGeneration(t *testing.T) {
+	fixture := newPluginFixture(t)
+	loginFixture(t, fixture)
+	older := validTestClaims(1, "older-unused-jti")
+	older.IssuedAt = fixture.claims.IssuedAt.Add(-time.Second)
+	older.ExpiresAt = older.IssuedAt.Add(10 * time.Minute)
+	token := signTestCredential(t, fixture.privateKey, older)
+	fixture.runID = "older-run"
+	requireRejected(t, fixture.request(OperationLogin, fixture.loginContent(token, older)))
+}
+
+func TestPluginAcceptsStrictlyNewerCredentialAtSameGeneration(t *testing.T) {
+	fixture := newPluginFixture(t)
+	loginFixture(t, fixture)
+	newer := validTestClaims(1, "newer-unused-jti")
+	newer.IssuedAt = fixture.claims.IssuedAt.Add(time.Second)
+	newer.ExpiresAt = newer.IssuedAt.Add(10 * time.Minute)
+	token := signTestCredential(t, fixture.privateKey, newer)
+	fixture.runID = "newer-run"
+	requireAllowed(t, fixture.request(OperationLogin, fixture.loginContent(token, newer)))
+
+	fixture.runID = "run-one"
+	requireRejected(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
+}
+
+func TestPluginRejectsDistinctCredentialWithEqualIssuanceAtSameGeneration(t *testing.T) {
+	fixture := newPluginFixture(t)
+	loginFixture(t, fixture)
+	equalTime := validTestClaims(1, "equal-time-distinct-jti")
+	equalTime.IssuedAt = fixture.claims.IssuedAt
+	equalTime.ExpiresAt = fixture.claims.ExpiresAt
+	token := signTestCredential(t, fixture.privateKey, equalTime)
+	fixture.runID = "equal-time-run"
+	requireRejected(t, fixture.request(OperationLogin, fixture.loginContent(token, equalTime)))
 }
 
 func TestPluginRetainsBoundedGenerationFenceAfterClose(t *testing.T) {
@@ -475,10 +655,26 @@ func TestPluginRejectsNonTCPProxy(t *testing.T) {
 	requireRejected(t, fixture.request(OperationNewProxy, content))
 }
 
+func TestPluginAllowsIdenticalNewProxyAuthorizationRetry(t *testing.T) {
+	fixture := newPluginFixture(t)
+	loginAndProxyFixture(t, fixture)
+	requireAllowed(t, fixture.request(OperationNewProxy, fixture.proxyContent(fixture.token, fixture.claims.Generation)))
+	requireAllowed(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
+
+	events := fixture.recorder.waitForCount(t, 3)
+	for index, operation := range []string{OperationLogin, OperationNewProxy, OperationPing} {
+		if events[index].Operation != operation {
+			t.Fatalf("event %d = %q, want %q; identical retry emitted a duplicate authorization fact", index, events[index].Operation, operation)
+		}
+	}
+}
+
 func TestPluginRejectsSecondProxy(t *testing.T) {
 	fixture := newPluginFixture(t)
 	loginAndProxyFixture(t, fixture)
-	requireRejected(t, fixture.request(OperationNewProxy, fixture.proxyContent(fixture.token, fixture.claims.Generation)))
+	second := fixture.proxyContent(fixture.token, fixture.claims.Generation)
+	second["proxy_name"] = "second-proxy"
+	requireRejected(t, fixture.request(OperationNewProxy, second))
 }
 
 func TestPluginRejectsOutOfRangePort(t *testing.T) {
