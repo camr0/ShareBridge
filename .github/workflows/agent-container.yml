@@ -106,7 +106,7 @@ jobs:
             echo "::error::FRP staging marker ${marker_digest} does not match the pinned manifest digest ${expected_digest}" >&2
             exit 1
           fi
-          tarball_path="$(find "${CACHE_ROOT}/downloads" -name "frp_${pinned_version}_linux_amd64.tar.gz" | head -n 1)"
+          tarball_path="$(find "${CACHE_ROOT}/downloads" -name "frp_${pinned_version}_linux_amd64.tar.gz" -print -quit)"
           actual_digest="$(sha256sum "${tarball_path}" | awk '{print $1}')"
           if [[ "${actual_digest}" != "${expected_digest}" ]]; then
             echo "::error::cached FRP tarball digest ${actual_digest} does not match the pinned manifest digest ${expected_digest}" >&2

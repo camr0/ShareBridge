@@ -30,6 +30,7 @@ control/server
 agent/opencloudshare
 agent/agent
 agent/benchdirect
+agent/frpc
 
 # macOS + editor/agent tooling artifacts
 .DS_Store
