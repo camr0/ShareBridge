@@ -155,7 +155,14 @@ The gateway exposes FRP's local authorization/presence plugin endpoint to `frps`
 true:
 
 1. the signed control-issued tunnel credential is valid;
-2. `frps` has accepted the one expected TCP proxy on its assigned loopback port;
+2. the gateway has confirmed, for the current generation, that `frps` has actually
+   bound the one expected TCP proxy on its assigned loopback port, via its own
+   bounded loopback readiness probe plus a correlated `NewUserConn` callback
+   (correlation tuple: proxy name, server-assigned run ID, generation metadata, and
+   the probe socket's source address as seen by `frps`). An authorized `NewProxy` alone is not acceptance:
+   in the pinned release `NewProxy` fires before downstream registration, so a
+   registration failure would otherwise present as a permanently online but
+   unroutable tunnel while authenticated `Ping`s continue;
 3. the gateway has observed a `Ping` within the 45-second presence lease;
 4. the gateway has the active exact share route and its route revision is current.
 
@@ -194,6 +201,8 @@ assuming an on-demand STUN round trip will fit every cold open.
   `AbortController` deadline.
 - Gateway ClientHello read: five seconds.
 - Gateway-to-FRP loopback connect: two seconds.
+- Relay readiness probe: at most five loopback connect attempts with ~500 ms backoff
+  against a 2.5-second hard deadline, re-checked before each wait.
 
 A cold UPnP open may consume 1–3 seconds before the STUN/probe work finishes. Missing
 the four-second preparation budget therefore falls back to an available relay for that
@@ -387,7 +396,11 @@ unavailable. Direct state becomes an optional route capability, not an enrollmen
 
 After baseline enrollment, control sends `relay_config` with a signed credential. The
 credential is short-lived for admission (default ten minutes), but an accepted tunnel
-may remain connected beyond token expiry. A reconnect requires a fresh credential.
+may remain connected beyond token expiry. The `jti` is one-use: a second `Login` with
+the same credential is replay-rejected, so any reconnect — including after an `frps`
+restart — requires a fresh credential: the agent tunnel manager owns the trigger and sends a bounded, rate-limited `relay_credential_request` (§11.1), and control responds with a fresh `relay_config` over the authenticated WebSocket. Control signs with a single clock reading (`issued_at` and
+`expires_at` derived from one `now`) so the admission lifetime never exceeds the
+ten-minute maximum.
 
 Normative claims:
 
@@ -425,13 +438,26 @@ certificate or key valid for any browser content origin and no DNS/ACME credenti
 
 ```text
 absent
-  └─ valid Login + exact NewProxy ─► online
+  └─ valid Login + authorized NewProxy + probe-confirmed NewUserConn ─► online
 online
   ├─ current Ping renews 45s lease ─► online
   ├─ CloseProxy / logout ──────────► absent
   ├─ lease expiry ─────────────────► absent
   └─ replacement generation ───────► fenced, then new online
 ```
+
+The gateway closes the readiness loop itself: after each authorized `NewProxy` it runs
+the bounded loopback readiness probe (§4.4), and the tunnel becomes online only when a
+`NewUserConn` callback arrives for that exact current generation, correlated by proxy
+name, server-assigned run ID, generation metadata, and the probe socket's source
+address as seen by `frps`.
+`NewProxy` is pre-registration authorization in the pinned release; downstream
+registration can still fail after it, in which case no confirmation ever arrives and
+the tunnel stays absent even though authenticated `Ping`s continue. `NewUserConn` is
+readiness-only — never an authorization input — rides the same bounded fail-closed
+event path as the other operations, and is deduplicated per user connection. The
+pinned release sends its first `Ping` immediately after login; the configured
+10-second interval governs subsequent Pings.
 
 Every event carries the gateway boot ID and a monotonically increasing revision.
 Control discards events from an older boot/revision. Persisted `relay_last_seen_at` is
@@ -674,6 +700,7 @@ types remain versioned, bounded, and tolerant of unknown fields.
 | Direction | Message | Payload / role |
 |---|---|---|
 | control → agent | `relay_config` | `{ version, generation, gateway_addr, gateway_port, proxy_name, relay_port, credential, expires_at }` |
+| agent → control | `relay_credential_request` | `{ reason: "replay_rejected"|"expired"|"restart" }` — the tunnel manager's bounded, rate-limited request for a fresh `relay_config` after the one-use credential is burned (e.g. `frps` restart) or nearing expiry; control responds with a fresh `relay_config` (§7.2, §15.2) |
 | agent → control | `relay_client_state` | `{ generation, status: "starting"|"running"|"stopped"|"error", reason? }` — telemetry only |
 | control → agent | `stun_challenge` | `{ version, challenge, server, expires_at }` |
 | agent → control | `stun_result` | `{ challenge, transaction_id, receipt }` |
@@ -826,6 +853,7 @@ telemetry without changing the protocol:
 | Global streams per gateway process | 8,192 or lower host file-descriptor budget |
 | FRP proxies per agent | exactly 1 |
 | FRP authenticated Ping interval | 10 seconds |
+| Readiness probe per authorized NewProxy | ≤5 loopback attempts, ~500 ms backoff, 2.5 s hard deadline |
 | Tunnel presence lease | 45 seconds, renewed by authenticated Ping |
 | Gateway route lease | 120 seconds, refreshed every 30 seconds while control sync is healthy |
 | Agent reconnect backoff | exponential with jitter, capped at 60 seconds |
@@ -835,11 +863,17 @@ close because the gateway cannot produce an HTTP response. Counters are decremen
 all close/error paths. Buffers are pooled and bounded; the gateway never buffers a
 complete response or file.
 
-Per-agent byte and active-stream counters are mandatory. FRP's server-side
-`bandwidthLimitMode` remains available and the signed assignment may carry an operator
-cap. Phase 4a ships with no product-tier bandwidth throttle by default so it can gather
-honest relay throughput data; host egress, per-agent usage, and saturation alerts are
-still measured. A hard emergency cap is operator-configurable without agent trust.
+Per-agent byte and active-stream counters are mandatory. Phase 4a ships with no
+product-tier bandwidth throttle: the pinned release's only bandwidth-limit input is
+the client-declared proxy option, which the fail-closed plugin policy already
+rejects, and no approved server-side cap mechanism exists; un-throttled
+operation gathers honest relay throughput data for Phase 4b. Host egress limits,
+per-agent usage counters, and saturation alerts remain the operator's emergency
+tools. Deferred Phase 4b design sketch (recorded so it need not be rediscovered): an
+operator cap is carried inside the signed assignment, the agent renders it into the
+`frpc` proxy configuration, and the authorization plugin enforces exact-match —
+rejecting a proxy that omits or alters the operator-set limit whenever a cap policy
+is in force.
 
 Compression is disabled for content traffic: files are commonly pre-compressed, and
 compression wastes CPU and creates unnecessary content-dependent behavior at the
@@ -847,8 +881,12 @@ tunnel layer.
 
 `frps` is configured with `maxPortsPerClient=1`, a narrow `allowPorts` range,
 `proxyBindAddr=127.0.0.1`, forced verified transport TLS, bounded heartbeat/user-
-connection timeouts, and no public dashboard. `frpc` explicitly requests a 10-second
-Ping interval rather than relying on FRP's default. With four nominal Ping
+connection timeouts, and no public dashboard; its local plugin handles `Login`,
+`NewProxy`, `CloseProxy`, `Ping`, and `NewUserConn` (readiness-only, §7.3). `frpc`
+explicitly requests a 10-second Ping interval rather than relying on FRP's default,
+disables TCP multiplexing (which suppresses application Pings), pins `poolCount=1`,
+and sets `trustedCaFile` plus `serverName` so transport verification cannot silently
+degrade — these are hard requirements on the agent config renderer. With four nominal Ping
 opportunities per lease, one delayed or missed Ping does not flap presence. systemd
 sets `LimitNOFILE`, `MemoryMax`, restart policy, and log-rate bounds for both relay
 processes.
@@ -860,15 +898,21 @@ processes.
 The public listener stays closed until the gateway has authenticated with control and
 loaded a full route snapshot. Gateway boot ID changes, invalidating old presence
 events. `frps` is either restarted with it or all prior proxy presence is treated
-absent. Agent `frpc` reconnects with jitter, re-registers its exact proxy, and only then
+absent. Agent `frpc` reconnects with jitter using a freshly re-issued credential
+(`relay_credential_request`, §7.2), re-registers its exact proxy, and only then
 does control regain a relay-available lease. Canonical links show preparing/offline or
 use direct during the gap; they never redirect based on persisted `relay_last_seen_at`.
 
 ### 15.2 `frps` restart without gateway restart
 
-All tunnel presence is cleared immediately. Existing relayed streams terminate. Agent
-clients reconnect and `NewProxy` re-establishes presence. Gateway route state remains
-but is unroutable until the matching tunnel generation is online.
+All tunnel presence is cleared immediately. Existing relayed streams terminate.
+Credentials are one-use (`jti`), so the agent's next `Login` with the previous
+credential is replay-rejected: the tunnel manager must send
+`relay_credential_request` (§11.1) over the still-connected control WebSocket and
+receive a fresh `relay_config` before re-login. Presence is re-established
+only after fresh `Login`, authorized `NewProxy`, and probe-confirmed `NewUserConn`
+(§7.3). Gateway route state remains but is unroutable until the matching tunnel
+generation is online.
 
 ### 15.3 Agent restart
 
@@ -1091,7 +1135,9 @@ No metric requires plaintext content.
 - managed `frpc` config has fixed local target, one proxy, correct generation, 0600
   permissions, and no shell expansion;
 - reconnect/backoff/credential replacement/lockdown;
-- generated `frpc` configuration sets the authenticated Ping interval to 10 seconds;
+- generated `frpc` configuration sets the authenticated Ping interval to 10 seconds,
+  pins `poolCount=1`, disables TCP multiplexing, and configures `trustedCaFile` plus
+  `serverName` so transport verification fails closed;
 - both origins bind to one content session and revoke together;
 - relay traffic does not open or hold the direct mapping;
 - local HTTPS server survives control-WebSocket reconnect;
@@ -1108,7 +1154,7 @@ server with a test certificate, and a fake Phase 3 content backend:
 register share
 → receive direct + relay origins
 → gateway route snapshot
-→ tunnel NewProxy/presence
+→ tunnel registration + probe-confirmed presence
 → TLS through gateway
 → page/items/thumb/preview/original/playback/archive
 ```
@@ -1329,10 +1375,18 @@ control-hosted interstitial is the only layer reachable before either content pa
 These are evidence gates, not unresolved product choices:
 
 1. Prove the selected pinned FRP release invokes fail-closed `Login`, `NewProxy`,
-   `CloseProxy`, and `Ping` plugin operations with the metadata and disconnect behavior
-   assumed by §7.
-2. Prove `proxyBindAddr=127.0.0.1`, `allowPorts`, one-proxy enforcement, transport TLS
-   verification, and server-side bandwidth configuration on the target release.
+   `CloseProxy`, `Ping`, and `NewUserConn` plugin operations with the metadata and
+   disconnect behavior assumed by §7 — including that `NewProxy` precedes downstream
+   registration, that a bounded gateway loopback probe correlated with `NewUserConn`
+   (proxy name, run ID, generation, probe remote address) confirms only a proxy the
+   pinned release actually registered, that a forced registration failure is never
+   confirmed while authenticated `Ping`s continue, and that stale generations,
+   `frpc` restarts, and `frps` restarts cannot confirm a current generation.
+2. Prove `proxyBindAddr=127.0.0.1`, runtime `allowPorts` and one-proxy enforcement
+   (second-proxy and out-of-range-port attempts rejected), and transport TLS
+   verification on the target release; the agent-side `trustedCaFile`+`serverName`
+   rendering requirement is enforced by the Task 9 renderer tests. Server-side
+   bandwidth configuration is deferred to Phase 4b (§14).
 3. Prove fragmented ClientHello replay through gateway → FRP → agent for browser TLS
    1.2/1.3 and HTTP/1.1 + HTTP/2.
 4. Prove the four-second browser check is reliable in supported Safari/iOS, Chrome, and

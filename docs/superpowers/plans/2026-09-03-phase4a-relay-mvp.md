@@ -221,6 +221,14 @@ Implementers must keep these names and meanings consistent across tasks:
 - [ ] **Step 4 — Verify GREEN:** run focused tests, `go test ./...`, and `go build ./...` in `control/`.
 - [ ] **Step 5 — Commit:** `git commit -m "feat(control): assign relay tunnels and issue epoch credentials"`.
 
+**Amendment (2026-09-04, post-readiness-spike):** handle the new agent→control
+`relay_credential_request` message (§11.1): requires the authenticated session,
+rate-limited per agent (§16.4 bounds), responds with a freshly signed `relay_config`
+for the current assignment/generation. The signer is already safe
+(`control/internal/relayctl/credentials.go` derives `issued_at`/`expires_at` from a
+single `nowFn()` reading). Test:
+`TestRelayCredentialRequestIssuesFreshConfigRateLimited`.
+
 ### Task 7: Implement the fail-closed FRP authorization plugin [L]
 
 **Purpose / spec:** Enforce §§4.2, 7.2 and 16.2 at the FRP boundary.
@@ -234,17 +242,41 @@ Implementers must keep these names and meanings consistent across tasks:
 - [ ] **Step 4 — Verify GREEN:** run focused tests with `-race`, then `go test ./... && go build ./...` in `relay/`.
 - [ ] **Step 5 — Commit:** `git commit -m "feat(relay): fail-closed FRP authorization plugin"`.
 
+**Amendment (2026-09-04, post-readiness-spike):** add a readiness-only `NewUserConn`
+handler on the existing bounded fail-closed event path: never an authorization input,
+always returns FRP's accept response, records the correlation tuple (proxy name,
+server-assigned run ID, generation metadata, remote address) for the presence
+registry, and deduplicates per user connection. Probe connections are accepted
+(spike-proven accept-mode, at most one zero-byte connection at the agent) rather than
+the spike's suggested reject-mode, keeping the plugin response surface uniform.
+Tests:
+`TestNewUserConnIsReadinessOnlyAndNeverAuthorizes`,
+`TestNewUserConnCorrelationTupleRecordedBounded`.
+
 ### Task 8: Prove pinned FRP plugin, loopback, port, TLS and heartbeat behavior — BLOCKING §23.1/§23.2/§23.7 [L]
 
 **Purpose / spec:** Turn FRP assumptions into go/no-go evidence before relying on the release.
 
 **Files:** Create `relay/internal/frptest/plugin_gate_test.go`, `relay/internal/frptest/config_gate_test.go`, `relay/internal/frptest/heartbeat_gate_test.go`, `relay/frp/GATE-EVIDENCE.md`; create `relay/config/frps.toml`.
 
-- [ ] **Step 1 — Test first:** write real-binary tests `TestPinnedFRPInvokesRequiredPluginOperations`, `TestPinnedFRPDisconnectsOnPluginRejection`, `TestPinnedFRPProxyBindAddrIsLoopback`, `TestPinnedFRPAllowPortsAndOneProxy`, `TestPinnedFRPVerifiesTransportTLS`, `TestPinnedFRPBandwidthCap`, and `TestPinnedFRPPingIntervalAndLeaseMargin`.
-- [ ] **Step 2 — Verify RED:** run `cd relay && SHAREBRIDGE_FRP_GATE=1 go test ./internal/frptest -run 'Plugin|ProxyBind|AllowPorts|TransportTLS|Bandwidth|Ping' -v`; expect failure until real config and adapter assumptions match the pinned release.
-- [ ] **Step 3 — Implement/prove:** lock `proxyBindAddr=127.0.0.1`, narrow `allowPorts`, `maxPortsPerClient=1`, mandatory local plugin, verified transport TLS, bounded heartbeat/user-connection timeouts, no public dashboard, compression disabled, optional operator bandwidth cap, and explicit 10-second authenticated Ping.
-- [ ] **Step 4 — Go/no-go:** require observed Login/NewProxy/CloseProxy/Ping metadata and rejection disconnect behavior. If any required operation or enforcement is unavailable, record **NO-GO** and stop; do not weaken the spec. On success, save command output/version/config digest in `GATE-EVIDENCE.md` and rerun all relay tests.
+- [ ] **Step 1 — Test first:** write real-binary tests `TestPinnedFRPInvokesRequiredPluginOperations`, `TestPinnedFRPDisconnectsOnPluginRejection`, `TestPinnedFRPProxyBindAddrIsLoopback`, `TestPinnedFRPAllowPortsAndOneProxy`, `TestPinnedFRPVerifiesTransportTLS`, and `TestPinnedFRPPingIntervalAndLeaseMargin`.
+- [ ] **Step 2 — Verify RED:** run `cd relay && SHAREBRIDGE_FRP_GATE=1 go test ./internal/frptest -run 'TestPinnedFRP' -v`; expect failure until real config and adapter assumptions match the pinned release.
+- [ ] **Step 3 — Implement/prove:** lock `proxyBindAddr=127.0.0.1`, narrow `allowPorts`, `maxPortsPerClient=1`, mandatory local plugin, verified transport TLS, bounded heartbeat/user-connection timeouts, no public dashboard, compression disabled, and explicit 10-second authenticated Ping (operator bandwidth cap deferred to Phase 4b per §14).
+- [ ] **Step 4 — Go/no-go:** require observed Login/NewProxy/CloseProxy/Ping/NewUserConn metadata and rejection disconnect behavior. If any required operation or enforcement is unavailable, record **NO-GO** and stop; do not weaken the spec. On success, save command output/version/config digest in `GATE-EVIDENCE.md` and rerun all relay tests.
 - [ ] **Step 5 — Commit:** `git commit -m "test(relay): prove pinned FRP security and heartbeat gates"`.
+
+**Amendment (2026-09-04, post-readiness-spike):** gate the probe-confirmed readiness
+predicate of §23.1 instead of the original Login+NewProxy+Ping presence assumption,
+building on the retained uncommitted harness and
+`frp-readiness-spike-report.md`. Replace `TestPinnedFRPBandwidthCap` (cap deferred to
+4b per §14) with `TestPinnedFRPReadinessProbeConfirmsOnlyRegisteredProxy`: healthy
+registration confirms in one attempt; a pre-bound port forcing post-`NewProxy`
+registration failure yields zero confirmations while authenticated `Ping` continues;
+stale old-generation callbacks and `frpc`/`frps` restarts never confirm the current
+generation. Add delayed-Ping tolerance and true 45-second lease-expiry transition
+tests (§23.7) and runtime second-proxy/out-of-range-port rejection tests (§23.2).
+Record per-gate GO/NO-GO in `GATE-EVIDENCE.md` (annotate the retained `TestPinnedFRPBandwidthCap` entry as
+superseded by this deferral).
 
 ### Task 9: Supervise `frpc` with an agent `TunnelManager` [L]
 
@@ -257,6 +289,16 @@ Implementers must keep these names and meanings consistent across tasks:
 - [ ] **Step 3 — Implement:** validate `relay_config`; render only `tcp`, assigned name/port, fixed `127.0.0.1:8443`, transport server-name/certificate verification and 10-second Ping; use `exec.CommandContext` argument arrays, atomic rename and 0600 mode; emit diagnostics through a callback.
 - [ ] **Step 4 — Verify GREEN:** run focused tests with `-race`, then `cd agent && go test ./... && go build ./...`; inspect the image/release layout to prove the Task 1 verified `frpc` is bundled.
 - [ ] **Step 5 — Commit:** `git commit -m "feat(agent): supervise the pinned FRP client"`.
+
+**Amendment (2026-09-04, post-readiness-spike):** the renderer has hard security
+requirements proven by Task 8: `transport.trustedCaFile` + `transport.serverName`
+(verification must fail closed), `transport.poolCount=1`, TCP multiplexing disabled
+(mux suppresses application Pings), and the explicit 10-second Ping interval (the
+first Ping arrives immediately after login). Extend
+`TestManagerRefreshesExpiredReconnectCredential`: after an `frps` restart the burned
+one-use `jti` is replay-rejected, and the manager must request a fresh credential
+over the authenticated control WebSocket before re-login rather than looping on the
+stale one. Bandwidth-limit rendering is out of scope (§14 defers the cap to Phase 4b).
 
 ### Task 10: Decouple baseline enrollment from direct DDNS and provision relay DNS [L]
 
@@ -321,9 +363,19 @@ Implementers must keep these names and meanings consistent across tasks:
 
 - [ ] **Step 1 — Test first:** add `TestPresenceLoginPlusExactProxyBecomesOnline`, `TestCurrentPingRenews45SecondLease`, `TestCloseLogoutAndExpiryBecomeAbsent`, `TestReplacementGenerationFencesOldTunnel`, `TestBootIDAndRevisionMonotonic`, and `TestDelayedPingDoesNotFlapLease`.
 - [ ] **Step 2 — Verify RED:** run `cd relay && go test ./internal/presence -v`; expect missing registry.
-- [ ] **Step 3 — Implement:** require valid Login plus exact NewProxy before online; renew only authenticated current-generation Ping; clear on CloseProxy/logout/frps reset/expiry; produce boot-ID and monotonic revision events and join presence against route agent/port/generation.
+- [ ] **Step 3 — Implement:** require valid Login plus authorized NewProxy and probe-confirmed current-generation `NewUserConn` before online; renew only authenticated current-generation Ping; clear on CloseProxy/logout/frps reset/expiry; produce boot-ID and monotonic revision events and join presence against route agent/port/generation.
 - [ ] **Step 4 — Verify GREEN:** run focused tests with fake clock and `-race`, then relay full suite/build.
 - [ ] **Step 5 — Commit:** `git commit -m "feat(relay): gateway-authoritative tunnel presence leases"`.
+
+**Amendment (2026-09-04, post-readiness-spike):** online requires probe-confirmed
+registration, not `Login`+`NewProxy` alone (§7.3): after each authorized `NewProxy`
+the gateway performs the bounded loopback readiness probe (§4.4: ≤5 attempts,
+~500 ms backoff, 2.5 s hard deadline, deadline re-checked before each wait) and only
+a correlated current-generation `NewUserConn` fact yields online. Replace
+`TestPresenceLoginPlusExactProxyBecomesOnline` with
+`TestPresenceRequiresProbeConfirmedNewUserConn` and add
+`TestRegistrationFailureNeverBecomesOnlineWhilePingContinues` and
+`TestStaleGenerationNewUserConnNeverConfirmsCurrentGeneration`.
 
 ### Task 15: Maintain control’s ephemeral relay availability view [L]
 
@@ -507,6 +559,14 @@ Implementers must keep these names and meanings consistent across tasks:
 - [ ] **Step 4 — Verify GREEN:** run daemon/tunnel race tests, then full agent suite/build.
 - [ ] **Step 5 — Commit:** `git commit -m "feat(agent): keep relay serving across control reconnects"`.
 
+**Amendment (2026-09-04, post-readiness-spike):** add
+`TestFRPCRestartObtainsFreshCredentialAfterReplayRejection`: after an `frps` restart
+the burned one-use `jti` is replay-rejected, and the manager must request a fresh
+credential over the reconnected control WebSocket before re-login instead of
+retry-looping the stale one (§§7.2, 15.2). The WebSocket may still be connected in an
+`frps`-restart scenario; the request rides it, or the reconnected one after a full
+agent–control disconnect.
+
 ### Task 29: Make connection accounting route-aware and closable [L]
 
 **Purpose / spec:** Implement §§9.4 and 13.2 so relay traffic cannot hold the home mapping.
@@ -527,7 +587,7 @@ Implementers must keep these names and meanings consistent across tasks:
 
 - [ ] **Step 1 — Test first:** add `TestLockdownSetsGateDeletesMappingStopsTunnelRevokesBinderAndClosesBothRoutes`, `TestLockdownStatusOnlySuppressesNeverCreatesAvailability`, `TestUnlockRestoresSourceVerifiedBindingsAndUsesFreshCredential`, and `TestLockdownDoesNotTombstoneSession`.
 - [ ] **Step 2 — Verify RED:** run focused agent/control tests; current behavior does not coordinate tunnel/relay streams.
-- [ ] **Step 3 — Implement:** concurrently/best-effort execute all six §13.4 actions; make local enforcement final; add explicit local unlock that rebuilds admissions, starts listener/tunnel and requests current credential/presence; optional control `lockdown_ack` acknowledges deactivation only.
+- [ ] **Step 3 — Implement:** concurrently/best-effort execute all six §13.4 actions; make local enforcement final; add explicit local unlock that rebuilds admissions, starts listener/tunnel and requests current credential/presence (via `relay_credential_request`, §11.1); optional control `lockdown_ack` acknowledges deactivation only.
 - [ ] **Auth/rejection review:** lockdown/unlock caller is the existing authenticated local agent admin API/UI, not recipient/control. WS status is current-epoch advisory; reject stale generation and never let `locked=false` make a route available.
 - [ ] **Step 4 — Verify GREEN:** run race tests and full agent/control builds.
 - [ ] **Step 5 — Commit:** `git commit -m "feat(agent): stop direct and relay paths during reversible lockdown"`.
@@ -556,7 +616,7 @@ Implementers must keep these names and meanings consistent across tasks:
 
 - [ ] **Step 1 — Test first:** add tests for 16/source-IP, 32/origin, 64/agent, 8192/global-or-lower-FD, one proxy, 64-KiB hello, 5-second hello, 2-second dial, 5-minute no-byte idle, 24-hour absolute close, per-agent bytes/active streams and every error/close counter-release path.
 - [ ] **Step 2 — Verify RED:** run `cd relay && go test ./internal/limits ./internal/gateway -run 'Limit|Timeout|Lifetime|Counter' -v`.
-- [ ] **Step 3 — Implement:** atomically acquire global→IP→agent→origin before dial, release in reverse on every exit; track activity without buffering payload; make defaults configurable/tested; add operator emergency bandwidth cap while default product-tier throttle remains off.
+- [ ] **Step 3 — Implement:** atomically acquire global→IP→agent→origin before dial, release in reverse on every exit; track activity without buffering payload; make defaults configurable/tested; per-agent byte/stream counters and saturation alerts are the operator's emergency tools while the product-tier throttle stays off (cap deferred to Phase 4b per §14).
 - [ ] **Step 4 — Verify GREEN:** run focused tests with `-race` and leak checks, then full relay suite/build.
 - [ ] **Step 5 — Commit:** `git commit -m "feat(relay): enforce bounded gateway resources"`.
 
@@ -605,7 +665,7 @@ Implementers must keep these names and meanings consistent across tasks:
 
 - [ ] **Step 1 — Test first:** add one-agent/multi-agent throughput, limit saturation without cross-agent starvation, active stream beyond idle, no-byte idle close, absolute lifetime, cancellation and goroutine/FD/buffer plateau cases.
 - [ ] **Step 2 — Verify RED:** run bounded local load with conservative thresholds; expect missing counters/plateau evidence.
-- [ ] **Step 3 — Execute:** collect throughput, CPU, RSS, FDs, buffers, NIC saturation and per-agent bytes on the target VM size; choose global limit no higher than host FD budget; test emergency cap but keep default bandwidth throttle disabled.
+- [ ] **Step 3 — Execute:** collect throughput, CPU, RSS, FDs, buffers, NIC saturation and per-agent bytes on the target VM size; choose global limit no higher than host FD budget; keep default bandwidth throttle disabled (cap deferred to Phase 4b per §14).
 - [ ] **Step 4 — Verify GREEN:** record safe defaults and graphs/tables in operations doc; explicitly state results do not alter route selection and do not substitute for Phase 4b packet-impairment work.
 - [ ] **Step 5 — Commit:** `git commit -m "test(relay): establish MVP capacity and safety baseline"`.
 
@@ -731,7 +791,7 @@ Implementers must keep these names and meanings consistent across tasks:
 | §19 #14 no-JS/CSP fallback | Tasks 22, 24 |
 | §19 #15 heartbeat margin and tunnel DNS | Tasks 8, 31, 35, 43 |
 | §23.1 plugin operations/disconnect | Task 8 — blocking |
-| §23.2 bind/ports/one-proxy/TLS/bandwidth | Task 8 — blocking |
+| §23.2 bind/ports/one-proxy/TLS | Task 8 — blocking |
 | §23.3 fragmented TLS 1.2/1.3 + HTTP/1.1/2 | Task 31 — blocking |
 | §23.4 4-second Safari/Chrome/Firefox + CORS/CSP/noscript | Task 24 — blocking |
 | §23.5 real-NAT STUN/spoof/mismatch | Task 25 — blocking |
