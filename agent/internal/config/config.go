@@ -34,6 +34,17 @@ type Config struct {
 	UIPassword          string `json:"ui_password,omitempty"`
 	BaseDomain          string `json:"base_domain,omitempty"` // content base domain for direct/relay origins
 
+	// Relay tunnel supervision settings (phase 4a §7.4). The generated frpc
+	// configuration is written into the tunnel data directory; the pinned
+	// frpc binary is bundled with the agent distribution and verified by CI
+	// against relay/frp/manifest.json. The local target stays fixed at
+	// 127.0.0.1:8443 and the relay transport CA bundle is provisioned by the
+	// operator (transport verification fails closed without it).
+	TunnelDataDir     string `json:"tunnel_data_dir,omitempty"`
+	TunnelFRPCPath    string `json:"tunnel_frpc_path,omitempty"`
+	TunnelLocalTarget string `json:"tunnel_local_target,omitempty"`
+	TunnelCAFile      string `json:"tunnel_ca_file,omitempty"`
+
 	// Legacy fields for backward compatibility
 	SignalingServer string `json:"-"` // Deprecated: use SignalingURL
 	Password        string `json:"-"` // Deprecated: use UIPassword
@@ -188,6 +199,18 @@ func (m *Manager) load() (*Config, error) {
 	if v := os.Getenv("CONTENT_BASE_DOMAIN"); v != "" {
 		cfg.BaseDomain = v
 	}
+	if v := os.Getenv("SHAREBRIDGE_TUNNEL_DATA_DIR"); v != "" {
+		cfg.TunnelDataDir = v
+	}
+	if v := os.Getenv("SHAREBRIDGE_FRPC_PATH"); v != "" {
+		cfg.TunnelFRPCPath = v
+	}
+	if v := os.Getenv("SHAREBRIDGE_TUNNEL_LOCAL_TARGET"); v != "" {
+		cfg.TunnelLocalTarget = v
+	}
+	if v := os.Getenv("SHAREBRIDGE_RELAY_CA_FILE"); v != "" {
+		cfg.TunnelCAFile = v
+	}
 
 	if cfg.SignalingURL == "" {
 		cfg.SignalingURL = "wss://sharebridge.app"
@@ -204,8 +227,31 @@ func (m *Manager) load() (*Config, error) {
 	if cfg.UIAddr == "" {
 		cfg.UIAddr = "0.0.0.0"
 	}
+	if cfg.TunnelDataDir == "" {
+		cfg.TunnelDataDir = filepath.Join(filepath.Dir(m.filePath), "tunnel")
+	}
+	if cfg.TunnelFRPCPath == "" {
+		cfg.TunnelFRPCPath = defaultFRPCPath()
+	}
+	if cfg.TunnelLocalTarget == "" {
+		cfg.TunnelLocalTarget = "127.0.0.1:8443"
+	}
+	// TunnelCAFile intentionally defaults to empty: relay transport
+	// verification fails closed until the operator provisions the relay CA
+	// bundle, and the direct path never depends on it.
 
 	return cfg, nil
+}
+
+// defaultFRPCPath resolves the bundled pinned frpc binary next to the agent
+// executable (the release layout places them side by side); it falls back to
+// a PATH lookup when the executable path cannot be determined.
+func defaultFRPCPath() string {
+	executablePath, err := os.Executable()
+	if err != nil {
+		return "frpc"
+	}
+	return filepath.Join(filepath.Dir(executablePath), "frpc")
 }
 
 // save atomically writes the configuration to the config file.

@@ -75,6 +75,48 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      # The agent image bundles the pinned frpc binary. The cache key
+      # includes the manifest digest, so a re-pin forces a fresh verified
+      # download instead of reusing artifacts from the previous pin.
+      - name: Restore FRP release cache
+        uses: actions/cache@v4
+        with:
+          path: relay/.cache/frp
+          key: frp-${{ hashFiles('relay/frp/manifest.json') }}
+
+      # Fetches the exact pinned release over HTTPS and fails closed on any
+      # digest mismatch (Task 1 mechanism); never falls back to "latest".
+      - name: Fetch pinned FRP release
+        run: ./scripts/fetch-frp.sh
+        working-directory: relay
+
+      # Belt-and-braces verification for the image build: re-verify the
+      # cached tarball and the digest marker of the staging directory the
+      # bundled binary comes from against relay/frp/manifest.json. Any
+      # mismatch fails the build here, before the image is built.
+      - name: Verify and stage pinned frpc into the agent build context
+        working-directory: relay
+        run: |
+          set -euo pipefail
+          staged_dir="$(./scripts/fetch-frp.sh)"
+          expected_digest="$(jq -r '.artifacts.linux_amd64.sha256' frp/manifest.json)"
+          pinned_version="$(jq -r '.version' frp/manifest.json)"
+          marker_digest="$(cat "${staged_dir}/.verified")"
+          if [[ "${marker_digest}" != "${expected_digest}" ]]; then
+            echo "::error::FRP staging marker ${marker_digest} does not match the pinned manifest digest ${expected_digest}" >&2
+            exit 1
+          fi
+          tarball_path="$(find "${CACHE_ROOT}/downloads" -name "frp_${pinned_version}_linux_amd64.tar.gz" | head -n 1)"
+          actual_digest="$(sha256sum "${tarball_path}" | awk '{print $1}')"
+          if [[ "${actual_digest}" != "${expected_digest}" ]]; then
+            echo "::error::cached FRP tarball digest ${actual_digest} does not match the pinned manifest digest ${expected_digest}" >&2
+            exit 1
+          fi
+          cp "${staged_dir}/frpc" "${GITHUB_WORKSPACE}/agent/frpc"
+          echo "Bundled verified frpc (FRP v${pinned_version}, tarball sha256 ${actual_digest}) into the agent build context"
+        env:
+          CACHE_ROOT: ${{ github.workspace }}/relay/.cache/frp
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

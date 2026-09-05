@@ -18,6 +18,14 @@ WORKDIR /app
 
 COPY --from=builder /app/agent .
 
+# The pinned FRP client (relay/frp/manifest.json) must be staged into this
+# build context as `frpc` before building: the release workflow copies it
+# there only after relay/scripts/fetch-frp.sh verified its SHA-256 against
+# the pinned digest, and that verification fails the build on mismatch.
+# The binary is what agent/internal/tunnel supervises; its default path is
+# next to the agent executable.
+COPY frpc /app/frpc
+
 EXPOSE 7878
 
 CMD ["./agent", "daemon"]
