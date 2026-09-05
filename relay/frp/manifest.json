@@ -1,7 +1,7 @@
 {
-  "note": "Pinned FRP release for the ShareBridge relay module. The fetch script downloads exactly these URLs over HTTPS, verifies the SHA-256 digests, and stages frps/frpc into a version+digest-keyed cache. FRP binaries are never committed; release packaging bundles executables verified through this manifest. Pin ruled PROVISIONAL by the controller pending user approval.",
+  "note": "Pinned FRP release for the ShareBridge relay module. The fetch script downloads exactly these URLs over HTTPS, verifies the SHA-256 digests, and stages frps/frpc into a version+digest-keyed cache. FRP binaries are never committed; release packaging bundles executables verified through this manifest. Pin approved by the user after official upstream checksum verification.",
   "version": "0.71.0",
-  "pin_status": "provisional-pending-user-approval",
+  "pin_status": "approved",
   "artifacts": {
     "darwin_arm64": {
       "url": "https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_darwin_arm64.tar.gz",

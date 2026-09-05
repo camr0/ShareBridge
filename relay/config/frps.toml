@@ -1,0 +1,34 @@
+# Root-owned ShareBridge FRP server policy. Rendered by FRP with the
+# operator-only plugin secret supplied through the service environment; no
+# agent receives this secret or a shared FRP authentication token.
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "127.0.0.1"
+
+# The gateway alone owns public :443. FRP only accepts agent transport here,
+# and agent proxy listeners can exist only in this control-assigned range.
+allowPorts = [{ start = 10000, end = 10099 }]
+maxPortsPerClient = 1
+userConnTimeout = 10
+
+# Application Pings are required for the 45 second gateway presence lease.
+# TCP mux would suppress them, so it must stay disabled on both frps and frpc.
+transport.tcpMux = false
+transport.heartbeatTimeout = 45
+transport.tls.force = true
+transport.tls.certFile = "/etc/sharebridge/relay/tunnel-server.crt"
+transport.tls.keyFile = "/etc/sharebridge/relay/tunnel-server.key"
+
+# No configured webServer means no FRP dashboard, metrics, pprof, or admin
+# listener. auth.token is intentionally omitted: the mandatory local plugin,
+# not a token distributed to agents, is the admission authority.
+auth.method = "token"
+
+[[httpPlugins]]
+name = "sharebridge-authorize-presence"
+addr = "http://sharebridge-frps:{{ .Envs.SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET }}@127.0.0.1:9001"
+path = "/frp/authorize"
+# NewUserConn is readiness-only (spec §7.3): it never authorizes anything,
+# rides the same bounded fail-closed event path, and lets the gateway
+# correlate its own loopback readiness probe per proxy registration.
+ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewUserConn"]

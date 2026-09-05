@@ -328,7 +328,7 @@ func (server *Server) decodeRequest(request *http.Request) (pluginRequest, error
 
 func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 	var content loginContent
-	if json.Unmarshal(rawContent, &content) != nil || !validOptionalRunID(content.RunID) || content.PoolCount != 0 ||
+	if json.Unmarshal(rawContent, &content) != nil || !validOptionalRunID(content.RunID) || content.PoolCount < 0 || content.PoolCount > 1 ||
 		content.ClientID != "" || content.ClientSpec.Type != "" || content.ClientSpec.AlwaysAuthPass ||
 		!validLoginMetadata(content.Metas) {
 		return false

@@ -735,7 +735,7 @@ func TestPluginRejectsUnapprovedLoginOptions(t *testing.T) {
 		name   string
 		mutate func(map[string]any)
 	}{
-		{name: "connection pool", mutate: func(content map[string]any) { content["pool_count"] = 1 }},
+		{name: "oversized connection pool", mutate: func(content map[string]any) { content["pool_count"] = 2 }},
 		{name: "client identity override", mutate: func(content map[string]any) { content["client_id"] = "custom-client" }},
 		{name: "client spec", mutate: func(content map[string]any) { content["client_spec"] = map[string]any{"always_auth_pass": true} }},
 		{name: "extra metadata", mutate: func(content map[string]any) {
