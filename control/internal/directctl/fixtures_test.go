@@ -38,13 +38,15 @@ func newTestController(t *testing.T) (core.App, *Controller) {
 	}
 	// Apply the full session-field migration chain so the sessions collection
 	// carries relay_only/share_type/is_password_protected/inactive_reason for
-	// the tombstone-aware resolver tests.
+	// the tombstone-aware resolver tests, plus migration 9 so relay
+	// assignment/persistence (EnableRelay → EnsureAssignment) works.
 	for _, fn := range []func(core.App) error{
 		mig.AddRelayOnly,
 		mig.AddSessionRelayStaticPub,
 		mig.AddImmichSessionFields,
 		mig.CreateAgents,
 		mig.AddSessionsInactiveReason,
+		mig.AddAgentsRelaySTUN,
 	} {
 		if err := fn(app); err != nil {
 			t.Fatalf("session schema: %v", err)

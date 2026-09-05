@@ -36,11 +36,11 @@ import (
 
 // TestEndToEndDirectFlow drives the full direct-mode control flow through the
 // real HTTP + WebSocket stack: agent hello → enrolled → CSR → cert_issue →
-// tls_ready → report_endpoint (DDNS) → enrollment_ready → register_share →
-// share_registered{origin} → GET /s/<code> → open_signal → open_ack → loopback
-// nonce probe → 302. The coordinator issues a fixed stub chain and the probe
-// runs against a loopback TLS server that echoes the nonce, so no production
-// certs, Cloudflare, or UPnP are touched.
+// tls_ready (relay DNS provisioned at hello) → enrollment_ready →
+// register_share → share_registered{origin} → GET /s/<code> → open_signal →
+// open_ack → loopback nonce probe → 302. The coordinator issues a fixed stub
+// chain and the probe runs against a loopback TLS server that echoes the
+// nonce, so no production certs, Cloudflare, or UPnP are touched.
 func TestEndToEndDirectFlow(t *testing.T) {
 	app, appCleanup := setupAgentTestApp(t)
 	defer appCleanup()
@@ -62,6 +62,10 @@ func TestEndToEndDirectFlow(t *testing.T) {
 		AllowPrivateProbes: true, // loopback probe target in this test
 		DDNSFunc: func(ctx context.Context, name, ip string, ttl int) (string, error) {
 			return "", nil // succeed DDNS without a live Cloudflare zone
+		},
+		RelayGatewayIPv4: "203.0.113.10",
+		RelayDNSFunc: func(ctx context.Context, name, ip string, ttl int) (string, error) {
+			return "", nil // provision relay DNS without a live Cloudflare zone
 		},
 	})
 
@@ -127,13 +131,14 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	leafFP := e2eLeafFP(certIssue.ChainPEM)
 	require.NotEmpty(t, leafFP)
 
-	// 3. tls_ready (no immediate reply), then report_endpoint triggers DDNS and
-	//    completes readiness → enrollment_ready.
+	// 3. tls_ready completes baseline readiness (relay DNS was provisioned at
+	//    hello); report_endpoint afterwards is the optional direct capability
+	//    (§7.1) and expects no reply.
 	require.NoError(t, conn.Write(context.Background(), websocket.MessageText,
 		[]byte(fmt.Sprintf(`{"type":"tls_ready","fingerprint":%q}`, leafFP))))
+	require.Contains(t, string(readE2E(t, conn)), `"type":"enrollment_ready"`)
 	require.NoError(t, conn.Write(context.Background(), websocket.MessageText,
 		[]byte(fmt.Sprintf(`{"type":"report_endpoint","ip":"127.0.0.1","port":%d,"status":""}`, asPort))))
-	require.Contains(t, string(readE2E(t, conn)), `"type":"enrollment_ready"`)
 
 	// 4. register_share → share_registered {origin}.
 	const code = "e2e-code-1234"

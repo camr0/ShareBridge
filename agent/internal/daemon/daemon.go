@@ -137,8 +137,10 @@ const (
 // directState is the daemon's direct-TCP transport state. It is nil when direct
 // transport is not configured (e.g. in tests using NewWithSignaling).
 type directState struct {
-	mu         sync.Mutex
-	namespace  string
+	mu        sync.Mutex
+	namespace string
+	// ready is baseline enrollment readiness: enrollment_ready received for
+	// the current epoch (§7.1 — TLS + relay DNS, never direct DDNS).
 	ready      bool
 	cert       *cert.Manager
 	binder     *direct.Binder
@@ -159,8 +161,10 @@ type directState struct {
 	cond *sync.Cond // readiness signal (lazily created; guarded by mu)
 }
 
-// canRegisterDirect reports whether direct shares may be registered: the direct
-// transport must be configured and the agent must have completed enrollment.
+// canRegisterDirect reports whether shares may be registered: baseline
+// enrollment must be complete. Baseline readiness is TLS + relay DNS only
+// (§7.1) — a working direct transport is an optional capability, so a no-mapper
+// agent registers shares just the same.
 func (d *Daemon) canRegisterDirect() bool {
 	if d.direct == nil {
 		return false
@@ -180,9 +184,11 @@ func (ds *directState) condLocked() *sync.Cond {
 }
 
 // waitForDirectReady blocks until the CURRENT connection epoch has reached
-// enrollment_ready (or ctx is cancelled). It is a no-op when direct transport
-// is not configured. The condition is reset on disconnect, so a waiter sleeps
-// through reconnects and only proceeds once a live epoch signals readiness.
+// baseline enrollment (enrollment_ready, i.e. TLS + relay DNS; §7.1) or ctx is
+// cancelled. It is a no-op when direct transport is not configured. The
+// condition is reset on disconnect, so a waiter sleeps through reconnects and
+// only proceeds once a live epoch signals readiness. Direct availability is
+// NOT part of the waited-on condition.
 func (d *Daemon) waitForDirectReady(ctx context.Context) error {
 	ds := d.direct
 	if ds == nil {
@@ -810,8 +816,9 @@ func (d *Daemon) handleCertIssue(msg signaling.Message) {
 		return
 	}
 	d.sendTLSReady()
-	// TLS is now ready; learn and report the public IP so the control can run
-	// DDNS and complete enrollment (enrollment_ready).
+	// TLS is now ready; the control completes baseline enrollment from TLS +
+	// relay DNS (§7.1). Learning and reporting the public IP here only feeds
+	// the optional direct capability and never gates enrollment.
 	d.learnAndReportPublicIP()
 }
 
@@ -819,8 +826,10 @@ func (d *Daemon) handleCertError(msg signaling.Message) {
 	log.Printf("cert issuance error: %s", msg.Reason)
 }
 
-// handleEnrollmentReady marks the current connection epoch ready: direct shares
-// may now be registered and opened.
+// handleEnrollmentReady marks the current connection epoch baseline-ready:
+// supported shares may now be registered and the HTTPS server/tunnel start.
+// It no longer claims direct reachability (§11.2); direct state is an optional
+// route capability.
 func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
 	ds := d.direct
 	if ds == nil {
@@ -834,10 +843,11 @@ func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
 	ds.mu.Unlock()
 
 	// Learn/report the public IP and start the direct HTTPS server. Both are
-	// idempotent and re-run safely on every reconnect.
+	// idempotent, re-run safely on every reconnect, and are no-ops when the
+	// direct path is unavailable (e.g. no port mapper behind CGNAT).
 	d.learnAndReportPublicIP()
 	d.startDirectServer()
-	log.Printf("direct enrollment ready")
+	log.Printf("baseline enrollment ready")
 }
 
 // sendTLSReady reports the installed leaf fingerprint + not_after to the control.
@@ -864,8 +874,9 @@ func (d *Daemon) sendTLSReady() {
 // learnAndReportPublicIP fetches the agent's public IP from the port mapper and
 // (a) records it on the endpoint reporter so subsequent open/close transitions
 // carry a fresh IP, and (b) sends an initial report_endpoint {ip, 0} so the
-// control provisions DDNS and can emit enrollment_ready. It is idempotent and a
-// no-op when the mapper is unavailable or the IP is empty.
+// control can provision the direct wildcard DDNS record. It is idempotent and a
+// no-op when the mapper is unavailable or the IP is empty. It never affects
+// baseline enrollment (§7.1) — only the optional direct capability.
 func (d *Daemon) learnAndReportPublicIP() {
 	ds := d.direct
 	if ds == nil || ds.mapper == nil {

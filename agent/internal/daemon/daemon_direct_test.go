@@ -23,6 +23,7 @@ import (
 	"sharebridge/agent/internal/cert"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/direct"
+	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/signaling"
 )
 
@@ -33,6 +34,159 @@ const (
 
 func testOriginFor(label string) string {
 	return label + "." + testDirectNS + "." + testDirectBase
+}
+
+// newBaselineCertFixture builds an UNINSTALLED cert.Manager for testDirectNS
+// plus a minted chain (both §6 SANs, signed by a fresh test root). Feeding the
+// returned chain through cert_issue drives the manager's real install path.
+func newBaselineCertFixture(t *testing.T, dir string) (*cert.Manager, string) {
+	t.Helper()
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "baseline-test-root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatalf("parse root: %v", err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+
+	cm := cert.NewManager(dir, testDirectBase, roots)
+	if err := cm.SetNamespace(testDirectNS); err != nil {
+		t.Fatal(err)
+	}
+	csrPEM, err := cm.GenerateCSR()
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrBlock, _ := pem.Decode(csrPEM)
+	if csrBlock == nil || csrBlock.Type != "CERTIFICATE REQUEST" {
+		t.Fatalf("bad CSR PEM block: %+v", csrBlock)
+	}
+	csr, err := x509.ParseCertificateRequest(csrBlock.Bytes)
+	if err != nil {
+		t.Fatalf("parse CSR: %v", err)
+	}
+	pub, ok := csr.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("CSR public key is %T", csr.PublicKey)
+	}
+	sans := []string{
+		fmt.Sprintf("*.%s.%s", testDirectNS, testDirectBase),
+		fmt.Sprintf("*.relay.%s.%s", testDirectNS, testDirectBase),
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: sans[0]},
+		DNSNames:     sans,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, root, pub, rootKey)
+	if err != nil {
+		t.Fatalf("create leaf: %v", err)
+	}
+	chainPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	chainPEM = append(chainPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})...)
+	return cm, string(chainPEM)
+}
+
+// TestDirectDDNSFailureDoesNotBlockShareRegistration pins the §7.1 baseline
+// decoupling at the daemon: an agent whose direct path is dead — no port
+// mapper, so no public IP can be learned and direct DDNS can never succeed —
+// still completes baseline enrollment from enrollment_ready alone and
+// registers a supported share afterwards.
+func TestDirectDDNSFailureDoesNotBlockShareRegistration(t *testing.T) {
+	dir := t.TempDir()
+	cm, chainPEM := newBaselineCertFixture(t, dir)
+
+	cfg := &config.Config{
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		DefaultRelayOnly:  false,
+		ImmichURL:         "http://immich.lan:2283",
+		ImmichAllowedHost: "immich.lan:2283",
+		ImmichAPIKey:      "api",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	// Direct state WITHOUT mapper/port/reporter: the direct transport (and
+	// with it the public-IP report that feeds control-side direct DDNS) can
+	// never come up.
+	ds := &directState{
+		namespace:  testDirectNS,
+		baseDomain: testDirectBase,
+		cert:       cm,
+		gate:       direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+		origin:     map[string]string{},
+		listenAddr: "127.0.0.1:0",
+	}
+	d := &Daemon{
+		config:    cfg,
+		configMgr: cfgMgr,
+		store:     st,
+		signaling: sig,
+		resolver:  direct.NewResolverRegistry(),
+		sessions:  make(map[string]*Session),
+		direct:    ds,
+	}
+	d.syncDirectServe()
+
+	// The agent installs the issued chain (cert_issue) and reports
+	// tls_ready. Without a mapper it can NEVER follow up with a public-IP
+	// report_endpoint.
+	certIssue := signaling.Message{Type: "cert_issue", ChainPEM: chainPEM}
+	d.handleSignalingMessage(certIssue)
+	if !sig.hasSentMessage("tls_ready", nil) {
+		t.Fatalf("expected tls_ready after cert_issue, got %#v", sig.messagesSnapshot())
+	}
+	if sig.hasSentMessage("report_endpoint", nil) {
+		t.Fatalf("a no-mapper agent must never send report_endpoint, got %#v", sig.messagesSnapshot())
+	}
+
+	// Baseline enrollment completes control-side (TLS + relay DNS); the
+	// daemon only ever sees the resulting enrollment_ready.
+	d.handleSignalingMessage(signaling.Message{Type: "enrollment_ready"})
+
+	if !d.canRegisterDirect() {
+		t.Fatalf("baseline readiness must not depend on the direct mapper/DDNS path")
+	}
+
+	// Share registration proceeds end-to-end despite the dead direct path.
+	d.newImmichPoller = func() (immichPoller, error) {
+		return &fakeImmichPoller{shares: []immich.SharedLink{
+			{Key: "IMMICHBASE", Type: "ALBUM"},
+		}}, nil
+	}
+	session, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: "IMMICHBASE", Type: "ALBUM"}, 10, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("share registration must not be blocked by direct DDNS failure: %v", err)
+	}
+	if session == nil || session.Code != "IMMICHBASE" {
+		t.Fatalf("unexpected session %+v", session)
+	}
+	if !sig.registeredCode("IMMICHBASE") {
+		t.Fatalf("share was not registered with the control: %#v", sig.registeredSnapshot())
+	}
+	d.onSignalingDisconnect()
 }
 
 func TestRegistrationGatedOnReadiness(t *testing.T) {
@@ -466,7 +620,8 @@ func TestLearnAndReportPublicIPReportsClosedEndpoint(t *testing.T) {
 
 // TestStartDirectServerGuardedAndStopsOnDisconnect asserts the double-start
 // guard holds and that onSignalingDisconnect cancels the server context and
-// clears the started flag.
+// clears the started flag. All flag reads take ds.mu: the server goroutine
+// writes started/cancel under the lock when a bind fails.
 func TestStartDirectServerGuardedAndStopsOnDisconnect(t *testing.T) {
 	gate := direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true })
 	ds := &directState{
@@ -475,26 +630,35 @@ func TestStartDirectServerGuardedAndStopsOnDisconnect(t *testing.T) {
 	}
 	d := &Daemon{direct: ds}
 
+	directStateSnapshot := func() (started, cancelSet bool) {
+		ds.mu.Lock()
+		defer ds.mu.Unlock()
+		return ds.started, ds.cancel != nil
+	}
+
 	d.startDirectServer()
-	if !ds.started {
+	started, cancelSet := directStateSnapshot()
+	if !started {
 		t.Fatalf("startDirectServer should set started=true")
 	}
-	if ds.cancel == nil {
+	if !cancelSet {
 		t.Fatalf("startDirectServer should install a cancel func")
 	}
 
 	// Double-start guard: a second call must be a no-op (started stays true and
 	// no replacement cancel is installed).
 	d.startDirectServer()
-	if !ds.started {
+	started, _ = directStateSnapshot()
+	if !started {
 		t.Fatalf("double start must leave started=true")
 	}
 
 	d.onSignalingDisconnect()
-	if ds.started {
+	started, cancelSet = directStateSnapshot()
+	if started {
 		t.Fatalf("onSignalingDisconnect should reset started=false")
 	}
-	if ds.cancel != nil {
+	if cancelSet {
 		t.Fatalf("onSignalingDisconnect should clear cancel")
 	}
 }

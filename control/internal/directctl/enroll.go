@@ -3,12 +3,102 @@ package directctl
 import (
 	"context"
 	"log"
+	"net"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/pocketbase/pocketbase/core"
 	"sharebridge/control/internal/relayctl"
 )
+
+// relayWildcardTTL is the A-record TTL for the static relay content wildcard
+// (zone A records use a 60-second TTL).
+const relayWildcardTTL = 60
+
+// relayNamespacePattern matches the namespaces GenerateNamespace issues
+// ("sb" + 8 lowercase hex). The relay wildcard name composes only from a
+// well-formed namespace of the authenticated agent row, so a drifted or
+// agent-influenced value can never reach the DNS provider (§17.2: DNS targets
+// come only from the authenticated agent row and operator config).
+var relayNamespacePattern = regexp.MustCompile(`^sb[0-9a-f]{8}$`)
+
+// relayWildcardName derives the §6 relay content wildcard for the agent's
+// namespace: "*.relay.<namespace>.<base-domain>" — the name baked into the
+// agent certificate's second SAN and the suffix of every derived relay origin.
+func (c *Controller) relayWildcardName(namespace string) string {
+	return "*.relay." + namespace + "." + c.cfg.BaseDomain
+}
+
+// validRelayGatewayIPv4 strictly parses the operator-supplied gateway address
+// as a plain IPv4 literal. Absent, malformed, or IPv6-mapped values are
+// rejected so a broken record can never be provisioned.
+func validRelayGatewayIPv4(value string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.Contains(trimmed, ":") {
+		return "", false
+	}
+	parsed := net.ParseIP(trimmed)
+	if parsed == nil || parsed.To4() == nil {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
+// ensureRelayDNS idempotently provisions the §6 relay content wildcard for
+// the agent's namespace and marks the CURRENT epoch relay-DNS-ready, which
+// may complete baseline readiness (TLS + relay DNS) and emit enrollment_ready
+// (§7.1). It never blocks enrollment: a failure only keeps readiness off, is
+// logged, and is retried on the next hello/tls_ready of the epoch. The name
+// composes exclusively from the authenticated agent record's namespace and
+// the operator's configuration — never from agent messages.
+func (c *Controller) ensureRelayDNS(ctx context.Context, apiKeyID string, rec *core.Record, e *epochState) {
+	gatewayIPv4, valid := validRelayGatewayIPv4(c.cfg.RelayGatewayIPv4)
+	if !valid {
+		log.Printf("relay dns not provisioned for %s: RELAY_GATEWAY_IPV4 absent or invalid", apiKeyID)
+		return
+	}
+	namespace := rec.GetString("namespace")
+	if !relayNamespacePattern.MatchString(namespace) {
+		log.Printf("relay dns not provisioned for %s: agent namespace %q malformed", apiKeyID, namespace)
+		return
+	}
+	if !c.provisionRelayWildcard(ctx, namespace, gatewayIPv4) {
+		return
+	}
+	c.epochMu.Lock()
+	var shouldSend bool
+	if cur := c.epochs[apiKeyID]; cur == e {
+		e.relayDNSReady = true
+		shouldSend = c.markReadyLocked(e)
+	}
+	c.epochMu.Unlock()
+	if shouldSend {
+		c.sendEnrollmentReady(apiKeyID, e.conn, rec, e)
+	}
+}
+
+// provisionRelayWildcard ensures the namespace's wildcard A record points at
+// gatewayIPv4, using a process-local cache so repeated enrollments of the same
+// namespace are provider-free. Reports whether the record is (now) correct.
+func (c *Controller) provisionRelayWildcard(ctx context.Context, namespace, gatewayIPv4 string) bool {
+	c.relayDNSMu.Lock()
+	cached, cachedOK := c.relayDNSProvisioned[namespace]
+	c.relayDNSMu.Unlock()
+	if cachedOK && cached == gatewayIPv4 {
+		return true
+	}
+	wildcardName := c.relayWildcardName(namespace)
+	if _, err := c.relayDNSFn(ctx, wildcardName, gatewayIPv4, relayWildcardTTL); err != nil {
+		log.Printf("relay wildcard provisioning failed for %q: %v", wildcardName, err)
+		return false
+	}
+	c.relayDNSMu.Lock()
+	c.relayDNSProvisioned[namespace] = gatewayIPv4
+	c.relayDNSMu.Unlock()
+	return true
+}
 
 // relayEmitter carries the §4.5 tunnel policy and credential signer. It is
 // installed on the controller with EnableRelay; nil (the default) disables
@@ -61,9 +151,10 @@ func (c *Controller) sendRelayConfig(apiKeyID string, conn *websocket.Conn, rec 
 }
 
 // HandleHello enrolls an agent connection: it ensures the agent record exists,
-// installs a fresh epoch for this connection, and replies "enrolled" with the
-// agent's namespace. The epoch is connection-local, so a replacement socket
-// starts un-ready.
+// installs a fresh epoch for this connection, idempotently provisions the §6
+// relay content wildcard for the agent's namespace (baseline readiness half),
+// and replies "enrolled" with the agent's namespace. The epoch is
+// connection-local, so a replacement socket starts un-ready.
 func (c *Controller) HandleHello(ctx context.Context, conn *websocket.Conn, apiKeyID, accountID, agentID string) {
 	rec, _, err := LoadOrCreateAgent(c.app, apiKeyID)
 	if err != nil {
@@ -72,7 +163,12 @@ func (c *Controller) HandleHello(ctx context.Context, conn *websocket.Conn, apiK
 	}
 	c.epochMu.Lock()
 	c.epochs[apiKeyID] = &epochState{agentID: agentID, namespace: rec.GetString("namespace"), conn: conn}
+	epoch := c.epochs[apiKeyID]
 	c.epochMu.Unlock()
+	// Provision relay DNS before the enrolled reply: the record is half of
+	// baseline readiness (§7.1) and must exist even if TLS fails later. A
+	// failure is retried at tls_ready and on the next enrollment.
+	c.ensureRelayDNS(ctx, apiKeyID, rec, epoch)
 	c.sendFn(ctx, conn, map[string]string{"type": "enrolled", "namespace": rec.GetString("namespace")})
 }
 
@@ -144,15 +240,19 @@ func (c *Controller) HandleTLSReady(ctx context.Context, conn *websocket.Conn, a
 
 	c.epochMu.Lock()
 	e := c.epochs[apiKeyID]
-	var shouldSend bool
-	if e != nil && e.conn == conn {
+	isCurrent := e != nil && e.conn == conn
+	if isCurrent {
 		e.tlsReady = true
-		shouldSend = c.markReadyLocked(e)
 	}
 	c.epochMu.Unlock()
-	if shouldSend {
-		c.sendEnrollmentReady(apiKeyID, conn, rec, e)
+	if !isCurrent {
+		return
 	}
+	// Baseline readiness = current-epoch TLS + relay DNS (§7.1): complete any
+	// missing relay DNS provisioning from hello (no-op when already done) and
+	// emit enrollment_ready when both halves hold. Direct endpoint/DDNS state
+	// is an optional live capability and never gates this.
+	c.ensureRelayDNS(ctx, apiKeyID, rec, e)
 }
 
 // HandleTLSError is a no-op beyond logging at this layer; the agent retries
@@ -161,13 +261,13 @@ func (c *Controller) HandleTLSError(ctx context.Context, apiKeyID, reason string
 	// No-op beyond logging at this layer; the agent retries with backoff.
 }
 
-// markReadyLocked flips e.ready to true when both TLS and DDNS succeeded and
-// returns whether the epoch JUST became ready. Caller holds epochMu. The
+// markReadyLocked flips e.ready to true when both TLS and relay DNS are ready
+// and returns whether the epoch JUST became ready. Caller holds epochMu. The
 // enrollment_ready message must be sent AFTER releasing epochMu (see
 // sendEnrollmentReady); sending under the lock would hold it across a
 // WebSocket write.
 func (c *Controller) markReadyLocked(e *epochState) bool {
-	if e.tlsReady && e.ddnsReady && !e.ready {
+	if e.tlsReady && e.relayDNSReady && !e.ready {
 		e.ready = true
 		return true
 	}

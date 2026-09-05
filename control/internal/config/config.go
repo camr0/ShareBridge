@@ -33,6 +33,12 @@ type Config struct {
 	RelayPortMin     int    // RELAY_PORT_MIN (inclusive, default 10000)
 	RelayPortMax     int    // RELAY_PORT_MAX (inclusive, default 10099)
 	RelayAuthKeySeed string // RELAY_AUTH_KEY_SEED (64-char hex Ed25519 seed; the gateway holds only the public key)
+
+	// RelayGatewayIPv4 is the public IPv4 of the relay gateway (§6). Baseline
+	// enrollment points the per-namespace content wildcard
+	// *.relay.<namespace>.<base-domain> at it; absent or invalid values keep
+	// baseline readiness unreachable (§7.1 makes relay DNS an enrollment gate).
+	RelayGatewayIPv4 string // RELAY_GATEWAY_IPV4 (public relay gateway IPv4)
 }
 
 func Load() *Config {
@@ -57,6 +63,7 @@ func Load() *Config {
 		RelayPortMin:     getEnvInt("RELAY_PORT_MIN", 10000),
 		RelayPortMax:     getEnvInt("RELAY_PORT_MAX", 10099),
 		RelayAuthKeySeed: getEnv("RELAY_AUTH_KEY_SEED", ""),
+		RelayGatewayIPv4: getEnv("RELAY_GATEWAY_IPV4", ""),
 	}
 }
 

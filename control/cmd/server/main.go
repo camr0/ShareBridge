@@ -56,7 +56,10 @@ func main() {
 		}
 	}
 
-	ctrl := directctl.NewController(app, h, coord, dnsClient, directctl.Config{BaseDomain: cfg.BaseDomain})
+	ctrl := directctl.NewController(app, h, coord, dnsClient, directctl.Config{
+		BaseDomain:       cfg.BaseDomain,
+		RelayGatewayIPv4: cfg.RelayGatewayIPv4,
+	})
 
 	// IMPORTANT: wire PocketBase to cfg.DataDir and cfg.Port explicitly.
 

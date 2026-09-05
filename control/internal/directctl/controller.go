@@ -17,22 +17,29 @@ import (
 // Config holds controller configuration.
 type Config struct {
 	BaseDomain string
+	// RelayGatewayIPv4 is the public IPv4 of the relay gateway (§6). Baseline
+	// enrollment points the per-namespace content wildcard
+	// *.relay.<namespace>.<base-domain> at it; an absent or invalid value
+	// keeps baseline readiness unreachable (§7.1).
+	RelayGatewayIPv4 string
 	// Test-only (default zero values = production behavior):
-	AllowPrivateProbes bool                                                        // disables the SSRF denylist
+	AllowPrivateProbes bool                                                                // disables the SSRF denylist
 	DDNSFunc           func(ctx context.Context, name, ip string, ttl int) (string, error) // overrides the real ddns client
+	RelayDNSFunc       func(ctx context.Context, name, ip string, ttl int) (string, error) // overrides the relay wildcard provisioning client
 }
 
 // epochState captures the readiness of a single agent WebSocket connection.
 // Readiness is connection-epoch-local: a persisted cert_status=ready does NOT
 // authorize readiness alone — the current connection must complete
-// enrolled → tls_ready (+ DDNS) → enrollment_ready itself.
+// enrolled → tls_ready (+ relay DNS provisioning) → enrollment_ready itself
+// (§7.1: baseline = TLS + relay DNS; direct DDNS is an optional capability).
 type epochState struct {
-	agentID   string
-	namespace string
-	conn      *websocket.Conn
-	tlsReady  bool
-	ddnsReady bool
-	ready     bool
+	agentID       string
+	namespace     string
+	conn          *websocket.Conn
+	tlsReady      bool
+	relayDNSReady bool
+	ready         bool
 }
 
 // OpenAck is the control-side acknowledgement of an open_signal. It is a
@@ -67,9 +74,18 @@ type Controller struct {
 
 	sendFn        func(ctx context.Context, conn *websocket.Conn, msg any) error
 	ddnsFn        func(ctx context.Context, name, ip string, ttl int) (string, error)
+	relayDNSFn    func(ctx context.Context, name, ip string, ttl int) (string, error)
 	sendToAgentFn func(ctx context.Context, apiKeyID string, msg any) error
 	emitOpenFn    func(ctx context.Context, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error)
 	probeFn       func(ctx context.Context, origin, code, apiKeyID string, ack OpenAck) error
+
+	// relayDNSProvisioned caches the namespaces whose relay wildcard was
+	// already ensured at the current gateway IPv4 in this process, so repeated
+	// enrollments never churn the provider (the record is static for the
+	// gateway assignment lifetime; a control restart re-checks at the provider
+	// once via the idempotent EnsureA).
+	relayDNSMu          sync.Mutex
+	relayDNSProvisioned map[string]string
 
 	epochMu sync.Mutex
 	epochs  map[string]*epochState // apiKeyID -> current connection epoch
@@ -98,11 +114,12 @@ type Controller struct {
 func NewController(app core.App, h *hub.Hub, coord *certcoordinator.Coordinator, dnsClient *ddns.Cloudflare, cfg Config) *Controller {
 	c := &Controller{
 		app: app, hub: h, coord: coord, ddns: dnsClient, cfg: cfg,
-		epochs:     map[string]*epochState{},
-		waiters:    map[string]*openWaiter{},
-		seq:        map[string]uint64{},
-		verified:   map[string]string{},
-		ackTimeout: 3 * time.Second,
+		epochs:              map[string]*epochState{},
+		waiters:             map[string]*openWaiter{},
+		seq:                 map[string]uint64{},
+		verified:            map[string]string{},
+		relayDNSProvisioned: map[string]string{},
+		ackTimeout:          3 * time.Second,
 	}
 	c.sendFn = func(ctx context.Context, conn *websocket.Conn, msg any) error {
 		return hub.SendDirect(ctx, conn, msg)
@@ -112,6 +129,12 @@ func NewController(app core.App, h *hub.Hub, coord *certcoordinator.Coordinator,
 			return "", errors.New("ddns not configured")
 		}
 		return dnsClient.UpsertA(ctx, name, ip, ttl)
+	}
+	c.relayDNSFn = func(ctx context.Context, name, ip string, ttl int) (string, error) {
+		if dnsClient == nil {
+			return "", errors.New("relay dns not configured")
+		}
+		return dnsClient.EnsureA(ctx, name, ip, ttl)
 	}
 	c.sendToAgentFn = func(ctx context.Context, apiKeyID string, msg any) error {
 		return h.SendToAgent(ctx, apiKeyID, msg)
@@ -123,6 +146,9 @@ func NewController(app core.App, h *hub.Hub, coord *certcoordinator.Coordinator,
 	}
 	if cfg.DDNSFunc != nil {
 		c.ddnsFn = cfg.DDNSFunc
+	}
+	if cfg.RelayDNSFunc != nil {
+		c.relayDNSFn = cfg.RelayDNSFunc
 	}
 	return c
 }

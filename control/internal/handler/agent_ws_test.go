@@ -564,9 +564,10 @@ func TestAgentWSRejectsEmptyHelloAndPreHelloDirectControl(t *testing.T) {
 }
 
 // setupRelayAgentWS boots an AgentWS server whose controller carries a stub
-// cert coordinator (no network), a stub DDNS function, and an enabled relay
-// policy, so a real agent connection can be driven through baseline readiness
-// (csr → tls_ready → report_endpoint) to the relay_config emission.
+// cert coordinator (no network), stub DDNS + relay-DNS functions, and an
+// enabled relay policy, so a real agent connection can be driven through
+// baseline readiness (csr → tls_ready; relay DNS is provisioned at hello) to
+// the relay_config emission.
 func setupRelayAgentWS(t *testing.T) (core.App, string, *relayctl.Signer, relayctl.Settings, func()) {
 	t.Helper()
 
@@ -581,8 +582,10 @@ func setupRelayAgentWS(t *testing.T) (core.App, string, *relayctl.Signer, relayc
 	})
 
 	ctrl := directctl.NewController(app, h, coord, nil, directctl.Config{
-		BaseDomain: "example.com",
-		DDNSFunc:   func(ctx context.Context, name, ip string, ttl int) (string, error) { return "", nil },
+		BaseDomain:       "example.com",
+		DDNSFunc:         func(ctx context.Context, name, ip string, ttl int) (string, error) { return "", nil },
+		RelayGatewayIPv4: "203.0.113.10",
+		RelayDNSFunc:     func(ctx context.Context, name, ip string, ttl int) (string, error) { return "", nil },
 	})
 	signer, err := relayctl.GenerateSigner()
 	require.NoError(t, err)
@@ -651,15 +654,16 @@ func csrToFingerprint(t *testing.T, conn *websocket.Conn) string {
 	return stubLeafFingerprint(t, []byte(issued.ChainPEM))
 }
 
-// finishBaselineReadiness completes readiness from an issued fingerprint:
-// tls_ready → report_endpoint → enrollment_ready (consumed).
+// finishBaselineReadiness completes baseline readiness from an issued
+// fingerprint: tls_ready → enrollment_ready (consumed). Relay DNS is
+// provisioned during hello (§6), so no report_endpoint is required — direct
+// endpoint/DDNS is an optional capability and never gates enrollment (§7.1).
 func finishBaselineReadiness(t *testing.T, conn *websocket.Conn, fingerprint string) {
 	t.Helper()
 	ctx := context.Background()
 
 	tlsReadyPayload := fmt.Sprintf(`{"type":"tls_ready","fingerprint":%q}`, fingerprint)
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(tlsReadyPayload)))
-	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"report_endpoint","ip":"203.0.113.7","port":8443}`)))
 	_, raw, err := conn.Read(ctx) // enrollment_ready
 	require.NoError(t, err)
 	require.Contains(t, string(raw), "enrollment_ready")
@@ -688,10 +692,11 @@ func TestRelayConfigSentOnlyAfterBaselineReadiness(t *testing.T) {
 	conn := dialAgentAndEnroll(t, serverURL, fullKey, "agent-relay-config")
 	defer conn.CloseNow()
 
-	// Before readiness (tls_ready missing): DDNS may succeed but neither
-	// enrollment_ready nor relay_config may be emitted. Proven without timeout
-	// reads (which would kill the connection): the FIRST reply to csr_submit
-	// must be cert_issue, never a relay_config/enrollment_ready frame.
+	// Before readiness (tls_ready missing): neither enrollment_ready nor
+	// relay_config may be emitted — the relay wildcard is provisioned during
+	// hello, but TLS is still missing. Proven without timeout reads (which
+	// would kill the connection): the FIRST reply to csr_submit must be
+	// cert_issue, never a relay_config/enrollment_ready frame.
 	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"report_endpoint","ip":"203.0.113.7","port":8443}`)))
 
 	agentRecs, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": apiKeyID})
@@ -701,8 +706,8 @@ func TestRelayConfigSentOnlyAfterBaselineReadiness(t *testing.T) {
 
 	fingerprint := csrToFingerprint(t, conn) // first reply must be cert_issue
 
-	// Completing readiness (tls_ready + DDNS) is exactly what unlocks
-	// enrollment_ready + relay_config.
+	// Completing readiness (tls_ready; relay DNS was provisioned at hello) is
+	// exactly what unlocks enrollment_ready + relay_config.
 	finishBaselineReadiness(t, conn, fingerprint)
 
 	_, raw, err := conn.Read(ctx) // relay_config follows enrollment_ready
