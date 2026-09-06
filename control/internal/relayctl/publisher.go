@@ -339,6 +339,20 @@ func (p *Publisher) publishDeltaLocked(operation string, identity routeIdentity,
 	p.pruneLocked()
 }
 
+// CurrentRevision returns control's current monotonic route revision — the
+// revision every published delta so far is at or below, and the next delta
+// will exceed. It is the route-currency term of the Task 15 presence view's
+// Available join: a caller's route read is servable only while its revision
+// is still current, so a route that moved (re-registered, claimed, revoked,
+// or merely lease-refreshed) between the read and the predicate is refused
+// fail-closed and the caller re-reads. Single lock read; no I/O. This
+// accessor satisfies relayctl.RouteRevisionSource.
+func (p *Publisher) CurrentRevision() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.revision
+}
+
 // RouteSnapshot implements RouteSource: the full §11.3 snapshot of every
 // currently routable route, rebuilt from PocketBase. Routes never tracked
 // since process start (registered before a control restart) enter the

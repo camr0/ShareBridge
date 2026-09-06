@@ -12,6 +12,7 @@ import (
 	"sharebridge/control/internal/certcoordinator"
 	"sharebridge/control/internal/ddns"
 	"sharebridge/control/internal/hub"
+	"sharebridge/control/internal/relayctl"
 )
 
 // Config holds controller configuration.
@@ -105,6 +106,12 @@ type Controller struct {
 	// relay holds the §4.5 tunnel policy + credential signer when relay is
 	// enabled; nil disables relay_config emission entirely. See enroll.go.
 	relay *relayEmitter
+
+	// relayPresence holds the Task 15 gateway-authoritative presence view
+	// when installed with EnableRelayPresence; nil makes RelayAvailable fail
+	// closed (never available). It is the ONLY presence state selection may
+	// read (§4.2, §12: never the relay_last_seen_at diagnostic).
+	relayPresence *relayctl.PresenceView
 
 	ackTimeout time.Duration
 }
@@ -206,4 +213,31 @@ func (c *Controller) AgentDisconnected(apiKeyID string, conn *websocket.Conn) {
 		}
 	}
 	c.waiterMu.Unlock()
+}
+
+// EnableRelayPresence installs the Task 15 gateway-authoritative presence
+// view. It must be called before the controller serves traffic; nil is
+// ignored and leaves RelayAvailable fail-closed (never available). The view
+// is the ONLY relay presence state selection may read: it is fed exclusively
+// by the Task 11 mTLS sync server's presence endpoints, and agent
+// relay_client_state telemetry never reaches it (§4.2, §7.4, §12).
+func (c *Controller) EnableRelayPresence(view *relayctl.PresenceView) {
+	if view == nil {
+		return
+	}
+	c.relayPresence = view
+}
+
+// RelayAvailable is the read-only §7.1 relay-eligibility presence term:
+// "relay eligible = baseline ready + active gateway tunnel-presence lease".
+// It delegates to the presence view's Available predicate, which joins the
+// live (agent, port, generation) lease against the caller's route revision
+// and the given instant. With no view installed it is always false (fail
+// closed). It never reads the persisted relay_last_seen_at diagnostic and
+// never consults agent telemetry (§12, §15.7).
+func (c *Controller) RelayAvailable(agentID string, relayPort int, generation uint64, routeRevision uint64, now time.Time) bool {
+	if c.relayPresence == nil {
+		return false
+	}
+	return c.relayPresence.Available(agentID, relayPort, generation, routeRevision, now)
 }
