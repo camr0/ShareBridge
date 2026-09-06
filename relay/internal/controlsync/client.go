@@ -288,6 +288,12 @@ func (client *Client) FetchDeltas(ctx context.Context, since uint64) (DeltaPage,
 	if page.Since != since {
 		return DeltaPage{}, fmt.Errorf("%w: page since %d does not answer requested %d", ErrBadRevision, page.Since, since)
 	}
+	if page.Status == DeltaStatusGap {
+		// A well-formed gap page is still an error for the caller: control has
+		// no deltas in (since, latest] and the gateway must reconcile from a
+		// fresh snapshot instead of believing it is caught up (§11.3, §15.7).
+		return DeltaPage{}, fmt.Errorf("%w: gap at revision %d", ErrBadRevision, page.LatestRevision)
+	}
 	return page, nil
 }
 

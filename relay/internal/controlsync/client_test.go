@@ -528,6 +528,31 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 		}
 	})
 
+	t.Run("bad revision: valid gap page forces snapshot reconciliation", func(t *testing.T) {
+		// A well-formed gap page (no deltas, latest strictly ahead) is served
+		// 200 by control but must reach the Task 13 applier as ErrBadRevision —
+		// never as an empty success at a stale since (§11.3, §15.7).
+		gap := DeltaPage{Version: ProtocolVersion, Status: DeltaStatusGap, Since: 4, LatestRevision: 40}
+		payload, err := json.Marshal(gap)
+		if err != nil {
+			t.Fatalf("marshal gap page: %v", err)
+		}
+		stub := newStubControlServer(t, certs, func(t *testing.T, request *http.Request) (int, []byte) {
+			if request.URL.RawQuery != "since=4" {
+				t.Errorf("deltas query = %q, want since=4", request.URL.RawQuery)
+			}
+			return http.StatusOK, payload
+		})
+		client := stub.newTestClient(t, nil)
+		page, err := client.FetchDeltas(context.Background(), 4)
+		if !errors.Is(err, ErrBadRevision) {
+			t.Fatalf("valid gap page error = %v, want ErrBadRevision", err)
+		}
+		if page.Status != "" || page.Since != 0 || page.LatestRevision != 0 || page.Deltas != nil {
+			t.Fatalf("gap page returned a payload, want zero value: %+v", page)
+		}
+	})
+
 	t.Run("oversize POST body is refused before sending", func(t *testing.T) {
 		stub := newStubControlServer(t, certs, func(t *testing.T, request *http.Request) (int, []byte) {
 			t.Errorf("oversize envelope must not reach the wire")
