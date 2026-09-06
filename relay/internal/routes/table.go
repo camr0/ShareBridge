@@ -51,9 +51,17 @@ type Limits struct {
 }
 
 // Presence reports whether the tunnel for one agent/port/generation join key
-// is currently online (spec §7.3). The leased presence registry arrives in
-// Task 14; until then tests stub this interface, and a nil Presence fails
-// every lookup closed.
+// is currently online (spec §7.3). presence.Registry implements this for the
+// gateway (Task 14): online means a valid Login plus an authorized NewProxy
+// plus a probe-confirmed current-generation NewUserConn, leased 45 seconds
+// and renewed only by authenticated current-generation Pings. Online answers
+// from in-memory state without blocking and never re-enters the streams
+// registry — Streams.RegisterAdmitted calls it under its own lock — and a
+// nil Presence still fails every lookup closed (Task 34 owns the wiring).
+// Join domain: facts enter the registry as non-negative int credential
+// generations range-checked at the frpplugin fact boundary (the Task 13
+// uint64↔int carry-forward), so a route whose uint64 generation exceeds
+// math.MaxInt64 can never join and always fails closed.
 type Presence interface {
 	Online(agentRecordID string, relayPort int, generation uint64) bool
 }

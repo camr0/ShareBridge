@@ -27,6 +27,10 @@ const (
 	OperationNewProxy   = "NewProxy"
 	OperationCloseProxy = "CloseProxy"
 	OperationPing       = "Ping"
+	// OperationNewUserConn is the readiness-only op (Task 7 amendment, spec
+	// §7.3): it never rejects and never authorizes, it only records the
+	// readiness correlation tuple for the presence registry.
+	OperationNewUserConn = "NewUserConn"
 
 	// APIPath is configured as the HTTP server-plugin path in frps.
 	APIPath = "/frp/authorize"
@@ -48,13 +52,28 @@ const (
 	defaultMaxPendingEvents = 1024
 	maxRunIDBytes           = 128
 	maxSharedSecretBytes    = 512
+
+	// maxUserConnDedupEntries bounds the per-user-connection deduplication
+	// set (Task 7 amendment). When full it is reset wholesale: dedup is
+	// best-effort metadata hygiene — a dropped dedup entry can let a
+	// duplicate readiness fact through, which the presence registry
+	// ignores idempotently; the bound itself never lapses.
+	maxUserConnDedupEntries = 1024
+	// maxRemoteAddrBytes bounds one correlation remote address
+	// ("127.0.0.1:port" and the IPv6 loopback form both fit comfortably).
+	maxRemoteAddrBytes = 64
 )
 
-// PresenceFact is the credential-free authorization fact stream consumed by
-// Task 14's presence registry. Login and NewProxy facts confirm only that the
-// FRP plugin authorized those calls; FRP v0.71.0 provides no callback that can
-// confirm downstream proxy registration. Each fact contains only bounded
-// routing identity and lifecycle data validated at the FRP boundary.
+// PresenceFact is the credential-free fact stream consumed by Task 14's
+// presence registry. Login/NewProxy/CloseProxy/Ping facts confirm only that
+// the FRP plugin authorized those calls. NewUserConn is the readiness-only
+// correlation fact (Task 7 amendment): frps fires it from the accept loop of
+// a listener it actually bound, and the registry confirms readiness only when
+// its four correlation fields (proxy name, server-assigned run id, generation
+// metadata, and remote_addr — the gateway probe socket's source address as
+// seen by frps) match the exact current generation. Each fact contains only
+// bounded routing identity and lifecycle data validated at the FRP boundary;
+// never credential material.
 type PresenceFact struct {
 	Operation     string `json:"operation"`
 	AgentRecordID string `json:"agent_record_id"`
@@ -63,6 +82,9 @@ type PresenceFact struct {
 	RelayPort     int    `json:"relay_port"`
 	Generation    int    `json:"generation"`
 	RunID         string `json:"run_id"`
+	// RemoteAddr is the NewUserConn correlation address ("ip:port" as seen
+	// by frps); empty for all other operations.
+	RemoteAddr string `json:"remote_addr,omitempty"`
 }
 
 // PresenceEvents is deliberately small so Task 14 can attach the leased
@@ -108,6 +130,7 @@ type Server struct {
 	replayedJTI     map[string]time.Time
 	agentSessions   map[string]*sessionState
 	sessionsByToken map[[sha256.Size]byte]*sessionState
+	userConnSeen    map[[sha256.Size]byte]struct{}
 }
 
 type sessionState struct {
@@ -196,6 +219,13 @@ type closeProxyContent struct {
 	ProxyName string   `json:"proxy_name,omitempty"`
 }
 
+type newUserConnContent struct {
+	User       userInfo `json:"user"`
+	ProxyName  string   `json:"proxy_name,omitempty"`
+	ProxyType  string   `json:"proxy_type,omitempty"`
+	RemoteAddr string   `json:"remote_addr,omitempty"`
+}
+
 // NewServer validates all fail-closed dependencies before returning a handler.
 func NewServer(config Config) (*Server, error) {
 	if len(config.ControlPublicKey) != ed25519.PublicKeySize {
@@ -240,6 +270,7 @@ func NewServer(config Config) (*Server, error) {
 		replayedJTI:        make(map[string]time.Time),
 		agentSessions:      make(map[string]*sessionState),
 		sessionsByToken:    make(map[[sha256.Size]byte]*sessionState),
+		userConnSeen:       make(map[[sha256.Size]byte]struct{}),
 	}
 	go server.dispatchPresenceEvents()
 	return server, nil
@@ -269,6 +300,12 @@ func (server *Server) ServeHTTP(responseWriter http.ResponseWriter, request *htt
 		accepted = server.handleCloseProxy(requestEnvelope.Content)
 	case OperationPing:
 		accepted = server.handlePing(requestEnvelope.Content)
+	case OperationNewUserConn:
+		// Readiness-only: the response is FRP's accept response regardless of
+		// the callback's content (accept-mode probe, spec §7.3). It is never
+		// an authorization input and never rejects a user connection.
+		server.handleNewUserConn(requestEnvelope.Content)
+		accepted = true
 	default:
 		accepted = false
 	}
@@ -439,6 +476,84 @@ func (server *Server) handleCloseProxy(rawContent json.RawMessage) bool {
 	return true
 }
 
+// handleNewUserConn records the readiness correlation tuple of one frps
+// user connection for the presence registry (Task 7 amendment, spec §7.3).
+// It is strictly readiness-only: it never rejects, never mutates admission or
+// authorization state, and its outcome gates nothing — frps receives the
+// accept response unconditionally. Unattributable or malformed callbacks are
+// accepted silently with no fact emitted.
+func (server *Server) handleNewUserConn(rawContent json.RawMessage) {
+	var content newUserConnContent
+	if json.Unmarshal(rawContent, &content) != nil {
+		return
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	session, ok := server.readinessSessionLocked(content.User)
+	if !ok || !boundedUserConnTuple(content) {
+		return
+	}
+	// Deduplicate per user connection: one bounded hash over the session and
+	// the correlation tuple, so a repeated callback for the same connection
+	// is recorded once.
+	tuple := make([]byte, 0, sha256.Size+len(content.ProxyName)+len(content.User.RunID)+len(content.RemoteAddr)+8)
+	tuple = append(tuple, session.tokenHash[:]...)
+	tuple = append(tuple, '|')
+	tuple = append(tuple, content.ProxyName...)
+	tuple = append(tuple, '|')
+	tuple = append(tuple, content.User.RunID...)
+	tuple = append(tuple, '|')
+	tuple = append(tuple, content.RemoteAddr...)
+	sum := sha256.Sum256(tuple)
+	if !server.reserveEventLocked() {
+		return // queue full: the fact is dropped, the connection still accepted
+	}
+	// The dedup set holds delivered facts only: a fact dropped under
+	// backpressure has not been seen by the registry, so a repeated callback
+	// for the same connection can still be recorded once the queue drains.
+	if _, duplicate := server.userConnSeen[sum]; duplicate {
+		server.releaseEventSlotLocked()
+		return
+	}
+	if len(server.userConnSeen) >= maxUserConnDedupEntries {
+		server.userConnSeen = make(map[[sha256.Size]byte]struct{})
+	}
+	server.userConnSeen[sum] = struct{}{}
+	server.eventQueue <- PresenceFact{
+		Operation:     OperationNewUserConn,
+		AgentRecordID: session.claims.AgentRecordID,
+		Namespace:     session.claims.Namespace,
+		ProxyName:     content.ProxyName,
+		RelayPort:     session.claims.RelayPort,
+		Generation:    session.claims.Generation,
+		RunID:         content.User.RunID,
+		RemoteAddr:    content.RemoteAddr,
+	}
+}
+
+// readinessSessionLocked resolves the login session a user connection
+// belongs to, deliberately WITHOUT the authorization-op checks: no closed-
+// state or run-id pinning, so a stale listener's late callback is still
+// recordable and the presence registry — not the plugin — rules on
+// correlation. NewUserConn facts never authorize anything, so the looser
+// lookup cannot widen authority.
+func (server *Server) readinessSessionLocked(user userInfo) (*sessionState, bool) {
+	if !validRunID(user.RunID) || !validLoginMetadata(user.Metas) || user.User != "" {
+		return nil, false
+	}
+	providedHash := sha256.Sum256([]byte(user.Metas[CredentialMetadataKey]))
+	session, ok := server.sessionsByToken[providedHash]
+	if !ok {
+		return nil, false
+	}
+	return session, true
+}
+
+func boundedUserConnTuple(content newUserConnContent) bool {
+	return content.ProxyName != "" && len(content.ProxyName) <= maxIdentifierBytes &&
+		len(content.RemoteAddr) > 0 && len(content.RemoteAddr) <= maxRemoteAddrBytes
+}
+
 func (server *Server) validSessionUserLocked(user userInfo) (*sessionState, bool) {
 	if !validRunID(user.RunID) || !validLoginMetadata(user.Metas) {
 		return nil, false
@@ -483,6 +598,12 @@ func (server *Server) reserveEventLocked() bool {
 	default:
 		return false
 	}
+}
+
+// releaseEventSlotLocked returns a reserved slot when a fact is not emitted
+// after all (a deduplicated NewUserConn callback). Caller holds server.mu.
+func (server *Server) releaseEventSlotLocked() {
+	<-server.eventSlots
 }
 
 func (server *Server) emitReservedLocked(operation string, claims CredentialClaims, runID string) {

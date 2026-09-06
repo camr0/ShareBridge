@@ -754,7 +754,204 @@ func TestPluginRejectsUnapprovedLoginOptions(t *testing.T) {
 
 func TestPluginRejectsUnknownOperation(t *testing.T) {
 	fixture := newPluginFixture(t)
-	requireRejected(t, fixture.request("NewUserConn", map[string]any{}))
+	requireRejected(t, fixture.request("Bogus", map[string]any{}))
+}
+
+// Task 7 amendment (2026-09-04): NewUserConn is readiness-only. It always
+// returns FRP's accept response — never an authorization input, never a
+// rejection — and records the correlation tuple for the presence registry.
+func TestNewUserConnIsReadinessOnlyAndNeverAuthorizes(t *testing.T) {
+	t.Run("accepts without a session and creates none", func(t *testing.T) {
+		fixture := newPluginFixture(t)
+		content := map[string]any{
+			"user":        fixture.user(fixture.token, fixture.claims.Generation),
+			"proxy_name":  fixture.claims.ProxyName,
+			"proxy_type":  "tcp",
+			"remote_addr": "127.0.0.1:54321",
+		}
+		requireAllowed(t, fixture.request(OperationNewUserConn, content))
+		requireAllowed(t, fixture.request(OperationNewUserConn, map[string]any{}))
+		if events := fixture.recorder.snapshot(); len(events) != 0 {
+			t.Fatalf("unattributable NewUserConn emitted facts: %+v", events)
+		}
+		// Readiness handling must not have created admission state.
+		requireRejected(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
+	})
+
+	t.Run("never flips proxy authorization", func(t *testing.T) {
+		fixture := newPluginFixture(t)
+		loginFixture(t, fixture)
+		content := map[string]any{
+			"user":        fixture.user(fixture.token, fixture.claims.Generation),
+			"proxy_name":  fixture.claims.ProxyName,
+			"proxy_type":  "tcp",
+			"remote_addr": "127.0.0.1:54321",
+		}
+		requireAllowed(t, fixture.request(OperationNewUserConn, content))
+		requireAllowed(t, fixture.request(OperationNewUserConn, content))
+		// CloseProxy is only accepted for an authorized proxy; if NewUserConn
+		// had flipped proxyAuthorized it would now be accepted.
+		requireRejected(t, fixture.request(OperationCloseProxy, fixture.closeContent(fixture.token, fixture.claims.Generation)))
+		// The only emitted facts are the authorization facts, not user conns.
+		events := fixture.recorder.waitForCount(t, 1)
+		if events[0].Operation != OperationLogin {
+			t.Fatalf("first event = %+v, want only the Login fact", events[0])
+		}
+	})
+
+	t.Run("accepts malformed and unattributable callbacks on a live session", func(t *testing.T) {
+		fixture := newPluginFixture(t)
+		loginAndProxyFixture(t, fixture)
+		foreign := validTestClaims(9, "foreign-jti")
+		foreignToken := signTestCredential(t, fixture.privateKey, foreign)
+		baseTuple := func() map[string]any {
+			return map[string]any{
+				"user":        fixture.user(fixture.token, fixture.claims.Generation),
+				"proxy_name":  fixture.claims.ProxyName,
+				"proxy_type":  "tcp",
+				"remote_addr": "127.0.0.1:54321",
+			}
+		}
+		emptyRunID := baseTuple()
+		emptyRunID["user"] = map[string]any{
+			"user":   "",
+			"metas":  fixture.user(fixture.token, fixture.claims.Generation)["metas"],
+			"run_id": "",
+		}
+		variants := []struct {
+			name    string
+			content map[string]any
+		}{
+			{name: "empty content", content: map[string]any{}},
+			{name: "wrong proxy name", content: func() map[string]any {
+				content := baseTuple()
+				content["proxy_name"] = "sb-other"
+				return content
+			}()},
+			{name: "unknown credential", content: func() map[string]any {
+				content := baseTuple()
+				content["user"] = fixture.user(foreignToken, 9)
+				return content
+			}()},
+			{name: "missing remote address", content: func() map[string]any {
+				content := baseTuple()
+				delete(content, "remote_addr")
+				return content
+			}()},
+			{name: "empty run id", content: emptyRunID},
+			{name: "oversized remote address", content: func() map[string]any {
+				content := baseTuple()
+				content["remote_addr"] = strings.Repeat("a", 80)
+				return content
+			}()},
+		}
+		for _, variant := range variants {
+			t.Run(variant.name, func(t *testing.T) {
+				requireAllowed(t, fixture.request(OperationNewUserConn, variant.content))
+			})
+		}
+		// The session and its authorization state are untouched.
+		requireAllowed(t, fixture.request(OperationPing, fixture.pingContent(fixture.token, fixture.claims.Generation)))
+	})
+}
+
+func TestNewUserConnCorrelationTupleRecordedBounded(t *testing.T) {
+	t.Run("records the correlation tuple once per user connection", func(t *testing.T) {
+		fixture := newPluginFixture(t)
+		loginAndProxyFixture(t, fixture)
+		first := map[string]any{
+			"user":        fixture.user(fixture.token, fixture.claims.Generation),
+			"proxy_name":  fixture.claims.ProxyName,
+			"proxy_type":  "tcp",
+			"remote_addr": "127.0.0.1:54321",
+		}
+		requireAllowed(t, fixture.request(OperationNewUserConn, first))
+		requireAllowed(t, fixture.request(OperationNewUserConn, first)) // duplicate callback
+		second := map[string]any{
+			"user":        fixture.user(fixture.token, fixture.claims.Generation),
+			"proxy_name":  fixture.claims.ProxyName,
+			"proxy_type":  "tcp",
+			"remote_addr": "127.0.0.1:54322",
+		}
+		requireAllowed(t, fixture.request(OperationNewUserConn, second))
+
+		events := fixture.recorder.waitForCount(t, 4)
+		wantSources := []string{"127.0.0.1:54321", "127.0.0.1:54322"}
+		for index, fact := range events[2:] {
+			if fact.Operation != OperationNewUserConn ||
+				fact.ProxyName != fixture.claims.ProxyName ||
+				fact.RunID != fixture.runID ||
+				fact.Generation != fixture.claims.Generation ||
+				fact.AgentRecordID != fixture.claims.AgentRecordID ||
+				fact.Namespace != fixture.claims.Namespace ||
+				fact.RelayPort != fixture.claims.RelayPort ||
+				fact.RemoteAddr != wantSources[index] {
+				t.Fatalf("correlation fact %d = %+v", index, fact)
+			}
+			encoded, err := json.Marshal(fact)
+			if err != nil {
+				t.Fatalf("marshal fact: %v", err)
+			}
+			if bytes.Contains(encoded, []byte(fixture.token)) {
+				t.Fatal("NewUserConn fact exposed credential material")
+			}
+		}
+	})
+
+	t.Run("drops facts when the ordered queue is full but still accepts", func(t *testing.T) {
+		recorder := &blockingEventRecorder{entered: make(chan struct{}), release: make(chan struct{})}
+		defer recorder.unblock()
+		fixture := newPluginFixture(t, func(config *Config) {
+			config.PresenceEvents = recorder
+			config.MaxPendingEvents = 2
+		})
+		loginResponses := make(chan testPluginResponse, 1)
+		go func() {
+			loginResponses <- fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims))
+		}()
+		<-recorder.entered // dispatcher blocked with the Login fact in flight
+		requireAllowed(t, fixture.request(OperationNewProxy, fixture.proxyContent(fixture.token, fixture.claims.Generation)))
+
+		tuple := map[string]any{
+			"user":        fixture.user(fixture.token, fixture.claims.Generation),
+			"proxy_name":  fixture.claims.ProxyName,
+			"proxy_type":  "tcp",
+			"remote_addr": "127.0.0.1:54321",
+		}
+		requireAllowed(t, fixture.request(OperationNewUserConn, tuple)) // queue full: fact dropped, never rejected
+
+		recorder.unblock()
+		events := recorder.waitForCount(t, 2)
+		if events[0].Operation != OperationLogin || events[1].Operation != OperationNewProxy {
+			t.Fatalf("events after overload = %+v", events)
+		}
+		requireAllowed(t, fixture.request(OperationNewUserConn, tuple)) // slot free again: recorded
+		events = recorder.waitForCount(t, 3)
+		if events[2].Operation != OperationNewUserConn || events[2].RemoteAddr != "127.0.0.1:54321" {
+			t.Fatalf("third event = %+v, want the NewUserConn correlation fact", events[2])
+		}
+	})
+
+	t.Run("bounds the deduplication state", func(t *testing.T) {
+		fixture := newPluginFixture(t)
+		loginAndProxyFixture(t, fixture)
+		for index := 0; index < maxUserConnDedupEntries+80; index++ {
+			tuple := map[string]any{
+				"user":        fixture.user(fixture.token, fixture.claims.Generation),
+				"proxy_name":  fixture.claims.ProxyName,
+				"proxy_type":  "tcp",
+				"remote_addr": fmt.Sprintf("127.0.0.1:%d", 20000+index),
+			}
+			requireAllowed(t, fixture.request(OperationNewUserConn, tuple))
+		}
+		server := fixture.handler.(*Server)
+		server.mu.Lock()
+		size := len(server.userConnSeen)
+		server.mu.Unlock()
+		if size > maxUserConnDedupEntries {
+			t.Fatalf("dedup map size = %d, bound %d", size, maxUserConnDedupEntries)
+		}
+	})
 }
 
 func TestPluginRejectsMalformedOversizeAndProtocolMismatch(t *testing.T) {
