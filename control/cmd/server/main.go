@@ -6,8 +6,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/pocketbase/pocketbase"
@@ -20,6 +22,7 @@ import (
 	"sharebridge/control/internal/handler"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
+	"sharebridge/control/internal/relayctl"
 	_ "sharebridge/control/migrations"
 )
 
@@ -61,6 +64,21 @@ func main() {
 		RelayGatewayIPv4: cfg.RelayGatewayIPv4,
 	})
 
+	// Task 12 route publisher: derives exact relay routes from PocketBase
+	// rows and feeds them to agent-WS lifecycle hooks (add after successful
+	// registration, revoke before local lifecycle removal) while Run
+	// refreshes the gateway's finite 120-second route leases every 30
+	// seconds while sync is healthy (§14). Zero config selects the §14
+	// defaults; agents without a relay assignment produce no routes, so
+	// deployments with relay unconfigured behave exactly as before.
+	routePublisher, err := relayctl.NewPublisher(app, relayctl.PublisherConfig{})
+	if err != nil {
+		log.Fatalf("route publisher: %v", err)
+	}
+	publisherCtx, stopPublisher := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopPublisher()
+	go routePublisher.Run(publisherCtx)
+
 	// IMPORTANT: wire PocketBase to cfg.DataDir and cfg.Port explicitly.
 
 	// Configure SMTP if provided (must be done before Bootstrap so email flows work).
@@ -84,7 +102,7 @@ func main() {
 		router.GET("/ws/agent", func(e *core.RequestEvent) error {
 			// Apply API key auth middleware then handler
 			authMiddleware := middleware.APIKeyAuth(app)
-			handlerFunc := handler.AgentWS(app, h, cfg, ctrl)
+			handlerFunc := handler.AgentWS(app, h, cfg, ctrl, routePublisher)
 			authMiddleware(http.HandlerFunc(handlerFunc)).ServeHTTP(e.Response, e.Request)
 			return nil
 		})
@@ -148,7 +166,7 @@ func main() {
 
 		// Cron: clean up expired sessions every 5 minutes
 		app.Cron().MustAdd("expiry_cleanup", "*/5 * * * *", func() {
-			if err := deleteExpiredSessions(app); err != nil {
+			if err := deleteExpiredSessions(app, routePublisher); err != nil {
 				log.Printf("error cleaning expired sessions: %v", err)
 			}
 		})
@@ -177,7 +195,7 @@ func main() {
 	}
 }
 
-func deleteExpiredSessions(app core.App) error {
+func deleteExpiredSessions(app core.App, routes handler.RoutePublisher) error {
 	records, err := app.FindAllRecords("sessions")
 	if err != nil {
 		return err
@@ -195,6 +213,14 @@ func deleteExpiredSessions(app core.App) error {
 		expiresAt := record.GetDateTime("expires_at")
 		if expiresAt.IsZero() || expiresAt.Time().After(now) {
 			continue
+		}
+		// Revoke the relay route before the local lifecycle removal (plan
+		// Task 12): the gateway stops routing no later than the share
+		// disappears control-side. Publishing first is fail-closed — a
+		// failed save leaves a temporarily unroutable share, never a
+		// routable tombstone.
+		if err := routes.PublishRevoke(record.Id); err != nil {
+			return fmt.Errorf("revoke relay route for expired session %s: %w", record.Id, err)
 		}
 		record.Set("is_active", false)
 		record.Set("inactive_reason", "expired")

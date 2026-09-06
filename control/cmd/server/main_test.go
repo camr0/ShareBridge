@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"sharebridge/control/internal/directctl"
 	"sharebridge/control/internal/hub"
+	"sharebridge/control/internal/relayctl"
 	"sharebridge/control/migrations"
 )
 
@@ -183,6 +184,16 @@ func TestServerRoutesGallerySessionRedirectsNotWebClient(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "direct unavailable")
 }
 
+// newServerTestPublisher builds the Task 12 route publisher wired the same
+// way main.go wires it, so deleteExpiredSessions exercises the real revoke
+// path (sessions without an agent relay assignment simply publish nothing).
+func newServerTestPublisher(t *testing.T, app core.App) *relayctl.Publisher {
+	t.Helper()
+	publisher, err := relayctl.NewPublisher(app, relayctl.PublisherConfig{})
+	require.NoError(t, err)
+	return publisher
+}
+
 func TestDeleteExpiredSessions_PreservesSessionsWithoutExpiry(t *testing.T) {
 	app, cleanup := setupServerTestApp(t)
 	defer cleanup()
@@ -191,7 +202,7 @@ func TestDeleteExpiredSessions_PreservesSessionsWithoutExpiry(t *testing.T) {
 	apiKey := createServerTestAPIKey(t, app, user.Id)
 	createServerTestSession(t, app, apiKey.Id, "NOEXPIRY1", nil)
 
-	require.NoError(t, deleteExpiredSessions(app))
+	require.NoError(t, deleteExpiredSessions(app, newServerTestPublisher(t, app)))
 	require.True(t, testSessionExists(t, app, "NOEXPIRY1"))
 }
 
@@ -208,7 +219,7 @@ func TestDeleteExpiredSessions_DeletesOnlyExpiredSessions(t *testing.T) {
 	createServerTestSession(t, app, apiKey.Id, "EXPIRED1", &expiredAt)
 	createServerTestSession(t, app, apiKey.Id, "FUTURE01", &futureAt)
 
-	require.NoError(t, deleteExpiredSessions(app))
+	require.NoError(t, deleteExpiredSessions(app, newServerTestPublisher(t, app)))
 	// Soft-delete: the expired row still exists (so its origin is never reused)
 	// but is marked inactive.
 	require.True(t, testSessionExists(t, app, "EXPIRED1"))

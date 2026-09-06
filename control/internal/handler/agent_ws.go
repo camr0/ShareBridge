@@ -96,10 +96,28 @@ var externalCodeRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{8,128}$`)
 
 var errCodeAlreadyInUse = errors.New("code already in use")
 
+// RoutePublisher distributes relay route lifecycle changes to the §11.3
+// gateway sync (plan Task 12; implemented by *relayctl.Publisher). It is an
+// optional AgentWS dependency: deployments without relay publishing pass no
+// implementation and behave exactly as before. Implementations derive every
+// field from PocketBase rows keyed by the session record ID — never from
+// agent or HTTP parameters (§11.1).
+type RoutePublisher interface {
+	// PublishAdd publishes the route_add delta after a share registration
+	// has committed.
+	PublishAdd(sessionRecordID string) error
+	// PublishRevoke publishes the route_revoke delta before (or together
+	// with) the session's local lifecycle removal.
+	PublishRevoke(sessionRecordID string) error
+}
+
 // AgentWS handles WebSocket connections from agents.
 // It expects the api_key_id to be set in the request context by APIKeyAuth middleware.
 // The controller parameter is optional - if nil, origin allocation is disabled.
-func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Controller) http.HandlerFunc {
+// routePublishers is an optional variadic dependency: when supplied, its
+// first element receives route add/revoke publications alongside share
+// lifecycle transitions (plan Task 12).
+func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Controller, routePublishers ...RoutePublisher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract API key ID and account ID from context (set by APIKeyAuth middleware)
 		apiKeyID := middleware.GetAPIKeyID(r.Context())
@@ -107,6 +125,10 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Contr
 		if apiKeyID == "" {
 			http.Error(w, `{"error":"missing api_key"}`, http.StatusUnauthorized)
 			return
+		}
+		var routes RoutePublisher
+		if len(routePublishers) > 0 {
+			routes = routePublishers[0]
 		}
 
 		// Upgrade to WebSocket
@@ -227,13 +249,13 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Contr
 					})
 					continue
 				}
-				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg, ctrl)
+				handleRegisterShare(ctx, conn, h, app, apiKeyID, accountID, agentID, msg, ctrl, routes)
 
 			case "unregister_share":
 				if agentID == "" {
 					continue
 				}
-				handleUnregisterShare(ctx, conn, h, app, apiKeyID, msg.Code)
+				handleUnregisterShare(ctx, conn, h, app, apiKeyID, msg.Code, routes)
 
 			case "deregister":
 				// Agent-initiated lifecycle transition (RevokeSession or
@@ -242,7 +264,7 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Contr
 				if agentID == "" {
 					continue
 				}
-				handleDeregister(ctx, conn, h, app, apiKeyID, msg.Code, msg.Reason)
+				handleDeregister(ctx, conn, h, app, apiKeyID, msg.Code, msg.Reason, routes)
 
 			case "relay_client_state":
 				// §11.1 telemetry: bounded, current-epoch only, never availability.
@@ -315,6 +337,7 @@ func handleRegisterShare(
 	agentID string,
 	msg agentMsg,
 	ctrl *directctl.Controller,
+	routes RoutePublisher,
 ) {
 	// Phase 3 serves only direct, unprotected Immich gallery shares. Reject
 	// unsupported registrations before any session claim/create or origin
@@ -354,6 +377,7 @@ func handleRegisterShare(
 			return
 		}
 		h.RegisterCode(code, apiKeyID)
+		publishRouteAdd(routes, session.Id)
 		response := map[string]any{"type": "share_registered", "code": code, "reconnected": false}
 		if ctrl != nil {
 			response["origin"] = origin
@@ -396,6 +420,8 @@ func handleRegisterShare(
 
 	h.RegisterCode(msg.Code, apiKeyID)
 
+	publishRouteAdd(routes, session.Id)
+
 	response := map[string]any{"type": "share_registered", "code": msg.Code, "reconnected": reconnected}
 	if ctrl != nil {
 		response["origin"] = origin
@@ -420,6 +446,35 @@ func controlRelayOrigin(origin string) string {
 		return ""
 	}
 	return relayOrigin
+}
+
+// publishRouteAdd forwards a successful registration to the Task 12 route
+// publisher (add after successful registration). Publication failure is
+// logged and never fails the registration: the share is committed, and the
+// publisher's snapshot/lease-refresh reconciles gateway state.
+func publishRouteAdd(routes RoutePublisher, sessionRecordID string) {
+	if routes == nil {
+		return
+	}
+	if err := routes.PublishAdd(sessionRecordID); err != nil {
+		log.Printf("relay route add publish failed for session %s: %v", sessionRecordID, err)
+	}
+}
+
+// publishRouteRevoke forwards a lifecycle removal to the Task 12 route
+// publisher. Callers invoke it BEFORE the local lifecycle removal so the
+// gateway stops routing no later than the share disappears control-side.
+// The PocketBase rows stay authoritative: if the subsequent save fails, the
+// still-active row is simply re-touched by the 30-second lease refresh, so
+// the transient state is DB-consistent in both directions; a revoked
+// (tombstoned) row can never become routable again.
+func publishRouteRevoke(routes RoutePublisher, sessionRecordID string) {
+	if routes == nil {
+		return
+	}
+	if err := routes.PublishRevoke(sessionRecordID); err != nil {
+		log.Printf("relay route revoke publish failed for session %s: %v", sessionRecordID, err)
+	}
 }
 
 // createSessionAndOrigin creates a session and (when a controller is present)
@@ -485,7 +540,7 @@ func claimSessionAndOrigin(app core.App, code, apiKeyID, accountID, agentID stri
 	return session, reconnected, origin, err
 }
 
-func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app core.App, apiKeyID, code string) {
+func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app core.App, apiKeyID, code string, routes RoutePublisher) {
 	if code == "" {
 		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "code required"})
 		return
@@ -510,6 +565,7 @@ func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub
 		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "session not owned by this api key"})
 		return
 	}
+	publishRouteRevoke(routes, session.Id)
 	session.Set("is_active", false)
 	session.Set("inactive_reason", "revoked")
 	if err := app.Save(session); err != nil {
@@ -523,7 +579,7 @@ func handleUnregisterShare(ctx context.Context, conn *websocket.Conn, h *hub.Hub
 // handleDeregister applies an agent-initiated lifecycle transition
 // (RevokeSession → "revoked", pruneExpiredSessions → "expired"). Unlike
 // unregister_share it is fire-and-forget: the agent does not wait for an ack.
-func handleDeregister(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app core.App, apiKeyID, code, reason string) {
+func handleDeregister(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app core.App, apiKeyID, code, reason string, routes RoutePublisher) {
 	if code == "" || !externalCodeRegex.MatchString(code) {
 		return
 	}
@@ -538,6 +594,7 @@ func handleDeregister(ctx context.Context, conn *websocket.Conn, h *hub.Hub, app
 	if inactiveReason != "expired" && inactiveReason != "revoked" && inactiveReason != "unsupported" {
 		inactiveReason = "revoked"
 	}
+	publishRouteRevoke(routes, session.Id)
 	session.Set("is_active", false)
 	session.Set("inactive_reason", inactiveReason)
 	if err := app.Save(session); err != nil {
