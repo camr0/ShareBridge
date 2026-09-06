@@ -23,6 +23,7 @@ import (
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/middleware"
 	"sharebridge/control/internal/relayctl"
+	"sharebridge/control/internal/stun"
 	_ "sharebridge/control/migrations"
 )
 
@@ -78,6 +79,43 @@ func main() {
 	publisherCtx, stopPublisher := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopPublisher()
 	go routePublisher.Run(publisherCtx)
+
+	// Task 16: authenticated STUN observation listener (§10.1, §16.4). UDP
+	// 3478 is the only new public control listener; a misconfigured bind
+	// address or an unbindable port fails the process closed at startup.
+	// The receipt key is fresh per process: pending challenges and accepted
+	// observations are process-local state that die with it, and agents
+	// re-challenge immediately after reconnect (§10.2). Challenge scheduling
+	// over the agent WebSocket is Task 18's wiring; the issuer/claimer API
+	// (IssueChallenge/TakeObservation) is served by this instance.
+	if cfg.STUNEnabled() {
+		if _, err := stun.ParseBindAddr(cfg.STUNBindAddr); err != nil {
+			log.Fatalf("stun listener: %v", err)
+		}
+		stunKey, err := stun.NewKey()
+		if err != nil {
+			log.Fatalf("stun listener: %v", err)
+		}
+		stunServer, err = stun.NewServer(stun.Config{
+			Key:      stunKey,
+			BindAddr: cfg.STUNBindAddr,
+		})
+		if err != nil {
+			log.Fatalf("stun listener: %v", err)
+		}
+		stunConn, err := stunServer.Listen()
+		if err != nil {
+			log.Fatalf("stun listener: %v", err)
+		}
+		stunCtx, stopStun := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stopStun()
+		go func() {
+			if err := stunServer.Serve(stunCtx, stunConn); err != nil {
+				log.Printf("stun listener stopped: %v", err)
+			}
+		}()
+		log.Printf("stun observation listener on %s (udp/3478)", cfg.STUNBindAddr)
+	}
 
 	// IMPORTANT: wire PocketBase to cfg.DataDir and cfg.Port explicitly.
 
@@ -194,6 +232,12 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+// stunServer holds the Task 16 listener instance for the Task 18 challenge
+// scheduler: the agent-WS handler will call stunServer.IssueChallenge when it
+// emits stun_challenge and stunServer.TakeObservation when stun_result
+// arrives. Package-level because main itself does not read it yet.
+var stunServer *stun.Server
 
 func deleteExpiredSessions(app core.App, routes handler.RoutePublisher) error {
 	records, err := app.FindAllRecords("sessions")

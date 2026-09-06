@@ -39,6 +39,13 @@ type Config struct {
 	// *.relay.<namespace>.<base-domain> at it; absent or invalid values keep
 	// baseline readiness unreachable (§7.1 makes relay DNS an enrollment gate).
 	RelayGatewayIPv4 string // RELAY_GATEWAY_IPV4 (public relay gateway IPv4)
+
+	// STUN observation listener (§10.1, plan Task 16). STUNBindAddr selects
+	// the UDP bind address; UDP 3478 is the only new public control listener
+	// and any other port fails closed at startup (stun.ParseBindAddr). The
+	// value "off" disables the listener entirely (direct mode then has no
+	// observations and always falls back to relay, §10.3).
+	STUNBindAddr string // STUN_BIND_ADDR (default "0.0.0.0:3478", "off" disables)
 }
 
 func Load() *Config {
@@ -64,7 +71,16 @@ func Load() *Config {
 		RelayPortMax:     getEnvInt("RELAY_PORT_MAX", 10099),
 		RelayAuthKeySeed: getEnv("RELAY_AUTH_KEY_SEED", ""),
 		RelayGatewayIPv4: getEnv("RELAY_GATEWAY_IPV4", ""),
+		STUNBindAddr:     getEnv("STUN_BIND_ADDR", "0.0.0.0:3478"),
 	}
+}
+
+// STUNEnabled reports whether the §10.1 STUN observation listener should run.
+// The explicit "off" value disables it; everything else is treated as a bind
+// address that must parse (with port 3478) at startup or the server refuses
+// to start (fail closed).
+func (c *Config) STUNEnabled() bool {
+	return c.STUNBindAddr != "" && c.STUNBindAddr != "off"
 }
 
 func getEnv(key, def string) string {
