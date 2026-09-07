@@ -61,8 +61,9 @@ func main() {
 	}
 
 	ctrl := directctl.NewController(app, h, coord, dnsClient, directctl.Config{
-		BaseDomain:       cfg.BaseDomain,
-		RelayGatewayIPv4: cfg.RelayGatewayIPv4,
+		BaseDomain:            cfg.BaseDomain,
+		RelayGatewayIPv4:      cfg.RelayGatewayIPv4,
+		RelaySelectionEnabled: cfg.RelaySelectionEnabled,
 	})
 
 	// Task 12 route publisher: derives exact relay routes from PocketBase
@@ -153,23 +154,18 @@ func main() {
 			return nil
 		})
 
-		// Redirect /share/{code} and /s/{code} through the single tombstone-aware
-		// resolver. Active gallery shares 302 to the agent's direct origin;
-		// expired/unsupported return 410 and revoked/unknown return 404 (§8).
-		router.GET("/share/{code}", serveShareRedirect(ctrl))
+		// Canonical routes: /share/{code} and /s/{code} both resolve through
+		// the single tombstone-aware resolver (§8) and then — for lifecycle-
+		// active shares — the §9.1 route-selection matrix: 200 no-store
+		// interstitial for direct candidates, 302 to the control-constructed
+		// relay origin for relayOnly/hard-direct-ineligible sessions when
+		// RELAY_SELECTION_ENABLED=true and a presence lease backs it, and the
+		// 503 offline page otherwise. Expired/unsupported return 410 and
+		// revoked/unknown return 404. The legacy Phase 3 direct 302 is not
+		// part of this dispatch in any flag state.
+		router.GET("/share/{code}", serveCanonicalRoute(ctrl))
 
-		router.GET("/s/{code}", func(e *core.RequestEvent) error {
-			code := e.Request.PathValue("code")
-			_, status := ctrl.ResolveForRedirect(code)
-			switch status {
-			case http.StatusFound:
-				return ctrl.Redirect(e.Response, e.Request, code)
-			case http.StatusGone:
-				return e.Error(http.StatusGone, "share expired or unsupported", nil)
-			default:
-				return e.NotFoundError("session not found", nil)
-			}
-		})
+		router.GET("/s/{code}", serveCanonicalRoute(ctrl))
 		// Homepage (marketing)
 		router.GET("/", handler.ServeFileNoCache("./web/home.html"))
 
@@ -284,16 +280,19 @@ func deleteExpiredSessions(app core.App, routes handler.RoutePublisher) error {
 	return nil
 }
 
-// serveShareRedirect resolves a /share/{code} code through the tombstone-aware
-// resolver and 302s active gallery shares to the agent's direct origin.
-// Expired/unsupported return 410; revoked/unknown return 404 (§8).
-func serveShareRedirect(ctrl *directctl.Controller) func(*core.RequestEvent) error {
+// serveCanonicalRoute resolves a /share/{code} or /s/{code} canonical
+// navigation through the tombstone-aware lifecycle resolver and, for active
+// shares, the §9.1 route-selection matrix (directctl.SelectRoute):
+// expired/unsupported return 410; revoked/unknown return 404; lifecycle-
+// active shares get the interstitial, a relay 302, or the 503 offline page
+// per the live predicates. Never a legacy direct 302.
+func serveCanonicalRoute(ctrl *directctl.Controller) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		code := e.Request.PathValue("code")
-		_, status := ctrl.ResolveForRedirect(code)
+		rec, status := ctrl.ResolveForRedirect(code)
 		switch status {
 		case http.StatusFound:
-			return ctrl.Redirect(e.Response, e.Request, code)
+			return ctrl.SelectRoute(e.Response, e.Request, rec, code)
 		case http.StatusGone:
 			return e.Error(http.StatusGone, "share expired or unsupported", nil)
 		default:

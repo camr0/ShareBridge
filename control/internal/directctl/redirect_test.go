@@ -184,6 +184,40 @@ func TestResolveForRedirect(t *testing.T) {
 	}
 }
 
+// TestResolveForRedirectRelayOnlyLifecycleFlagGated pins the Task 20
+// lifecycle ruling: with RelaySelectionEnabled the active public unprotected
+// Immich relay_only share is a servable type (Found — SelectRoute then owns
+// the relay-or-503 choice, §9.1); without the flag it stays 410 (Phase 3
+// classification). Password-protected stays 410 in both states (deferred
+// share type, Task 27), and selection-time gating never changes Task 6's
+// share_registered message shape.
+func TestResolveForRedirectRelayOnlyLifecycleFlagGated(t *testing.T) {
+	cases := []struct {
+		name    string
+		enabled bool
+		mutate  func(*core.Record)
+		want    int
+	}{
+		{name: "flag off relayOnly stays 410", enabled: false, mutate: func(r *core.Record) { r.Set("relay_only", true) }, want: http.StatusGone},
+		{name: "flag on public relayOnly servable", enabled: true, mutate: func(r *core.Record) { r.Set("relay_only", true) }, want: http.StatusFound},
+		{name: "flag on protected relayOnly still 410", enabled: true, mutate: func(r *core.Record) { r.Set("relay_only", true); r.Set("is_password_protected", true) }, want: http.StatusGone},
+		{name: "flag on non-immich relayOnly still 410", enabled: true, mutate: func(r *core.Record) { r.Set("relay_only", true); r.Set("share_type", "opencloud") }, want: http.StatusGone},
+		{name: "flag on expired relayOnly 410", enabled: true, mutate: func(r *core.Record) { r.Set("relay_only", true); r.Set("expires_at", time.Now().Add(-time.Hour)) }, want: http.StatusGone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, base := newTestController(t)
+			base.cfg.RelaySelectionEnabled = tc.enabled
+			code := "flagrelay"
+			seedResolveSession(t, app, code, tc.mutate)
+			_, got := base.ResolveForRedirect(code)
+			if got != tc.want {
+				t.Fatalf("status = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRedirectUnavailableGrantedPortZero seeds a fully-ready session/epoch/agent
 // but stubs emitOpenFn to return GrantedPort 0 with Status "ok", asserting the
 // port-range rejection (port 0 must never redirect).

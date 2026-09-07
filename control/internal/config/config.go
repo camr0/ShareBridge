@@ -46,6 +46,17 @@ type Config struct {
 	// value "off" disables the listener entirely (direct mode then has no
 	// observations and always falls back to relay, §10.3).
 	STUNBindAddr string // STUN_BIND_ADDR (default "0.0.0.0:3478", "off" disables)
+
+	// RelaySelectionEnabled is the Task 20 operator flag (§9.1, §20 rollout)
+	// gating every live relay route selection. Default FALSE: with the flag
+	// off, control runs in rollback mode — canonical resolution keeps the
+	// Phase 3 lifecycle statuses (relay_only stays 410/unsupported), direct
+	// candidates still receive the Phase 4a interstitial, and relay is never
+	// selected (relay-dependent cases return 503). The legacy Phase 3 direct
+	// 302 is never restored in either state. Set RELAY_SELECTION_ENABLED=true
+	// only after the relay gateway, route distribution, and presence sync are
+	// verified (the release gate blocks on it).
+	RelaySelectionEnabled bool // RELAY_SELECTION_ENABLED (default false = rollback mode)
 }
 
 func Load() *Config {
@@ -72,6 +83,8 @@ func Load() *Config {
 		RelayAuthKeySeed: getEnv("RELAY_AUTH_KEY_SEED", ""),
 		RelayGatewayIPv4: getEnv("RELAY_GATEWAY_IPV4", ""),
 		STUNBindAddr:     getEnv("STUN_BIND_ADDR", "0.0.0.0:3478"),
+
+		RelaySelectionEnabled: getEnvBool("RELAY_SELECTION_ENABLED", false),
 	}
 }
 
@@ -105,6 +118,20 @@ func getEnvInt(key string, def int) int {
 		n, err := strconv.Atoi(v)
 		if err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// getEnvBool parses Go bool literals ("1"/"t"/"T"/"TRUE"/"true"/"True" and
+// the false forms); any other value — including unparseable input — fails
+// closed to def. Task 20's flag uses it so a typo like "ture" can never
+// silently enable relay selection.
+func getEnvBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
 		}
 	}
 	return def

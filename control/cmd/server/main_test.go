@@ -1,8 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,25 +134,178 @@ func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
 	ctrl := directctl.NewController(app, hub.New(), nil, nil, directctl.Config{BaseDomain: "example.com"})
 
 	// Canonical routes: /share/{code} and /s/{code} both resolve through the
-	// tombstone-aware resolver (§8). Active gallery shares 302 to the direct
-	// origin; expired/unsupported return 410 and revoked/unknown return 404.
-	pbRouter.GET("/share/{code}", serveShareRedirect(ctrl))
-	pbRouter.GET("/s/{code}", func(e *core.RequestEvent) error {
-		code := e.Request.PathValue("code")
-		_, status := ctrl.ResolveForRedirect(code)
-		switch status {
-		case http.StatusFound:
-			return ctrl.Redirect(e.Response, e.Request, code)
-		case http.StatusGone:
-			return e.Error(http.StatusGone, "share expired or unsupported", nil)
-		default:
-			return e.NotFoundError("session not found", nil)
-		}
-	})
+	// tombstone-aware resolver and then the §9.1 route-selection matrix
+	// (matching main.go's dispatch). Lifecycle statuses are unchanged:
+	// expired/unsupported 410, revoked/unknown 404; lifecycle-active shares
+	// get the interstitial/relay-302/503 selection outcomes.
+	pbRouter.GET("/share/{code}", serveCanonicalRoute(ctrl))
+	pbRouter.GET("/s/{code}", serveCanonicalRoute(ctrl))
 
 	mux, err := pbRouter.BuildMux()
 	require.NoError(t, err)
 	return app, mux
+}
+
+// fixedStubRevision is a relayctl.RouteRevisionSource with a constant
+// revision, shared by the test controller and the test presence view so the
+// Available route-revision join agrees.
+type fixedStubRevision struct{ rev uint64 }
+
+func (s *fixedStubRevision) CurrentRevision() uint64 { return s.rev }
+
+// seedCanonicalAgent creates the agents row for apiKeyID with a DDNS-verified
+// endpoint and a uniquely-assigned relay port (the column is uniquely
+// indexed), returning (record id, relay port) for presence.
+func seedCanonicalAgent(t *testing.T, app core.App, apiKeyID, endpointIP string) (string, int) {
+	t.Helper()
+	agentsCol, err := app.FindCollectionByNameOrId("agents")
+	require.NoError(t, err)
+	seq := canonicalAgentSeq.Add(1)
+	port := int(10000 + seq)
+	rec := core.NewRecord(agentsCol)
+	rec.Set("api_key_id", apiKeyID)
+	// Namespace is uniquely indexed: derive a unique one per seeded agent.
+	rec.Set("namespace", fmt.Sprintf("sbdead%04x", seq))
+	rec.Set("cert_status", "ready")
+	rec.Set("endpoint_ip", endpointIP)
+	rec.Set("endpoint_port", 8443)
+	rec.Set("relay_port", port)
+	rec.Set("relay_generation", 7)
+	require.NoError(t, app.Save(rec))
+	return rec.Id, port
+}
+
+// canonicalAgentSeq hands out unique relay ports across agents in one app.
+var canonicalAgentSeq atomic.Uint64
+
+// grantCanonicalPresence applies a gateway presence snapshot granting
+// (port, generation 7) for agentID with a 45 s lease.
+func grantCanonicalPresence(t *testing.T, view *relayctl.PresenceView, agentID string, port int) {
+	t.Helper()
+	env := relayctl.PresenceEnvelope{
+		Version: relayctl.ProtocolVersion,
+		Events: []relayctl.PresenceEvent{{
+			GatewayBootID:  "boot-canonical",
+			Revision:       1,
+			AgentRecordID:  agentID,
+			RelayPort:      port,
+			Generation:     7,
+			State:          relayctl.PresenceStateOnline,
+			LeaseExpiresAt: time.Now().Add(45 * time.Second).Format(time.RFC3339),
+		}},
+	}
+	require.NoError(t, view.ApplyPresenceSnapshot(env))
+}
+
+// TestBothCanonicalRoutesPreserve404410Interstitial302And503 walks the §9.3
+// canonical-resolution outcomes over BOTH canonical routes (GET /share/{code}
+// and GET /s/{code}) with RELAY_SELECTION_ENABLED=true:
+// unknown/revoked → 404; expired/unsupported → 410; direct candidate (only
+// STUN freshness missing) → 200 no-store interstitial; relayOnly with a live
+// presence lease → 302 to the derived relay hostname; direct-ineligible with
+// no relay → 503. The 404/410/interstitial/302/503 outcomes are identical on
+// both paths.
+func TestBothCanonicalRoutesPreserve404410Interstitial302And503(t *testing.T) {
+	app, cleanup := setupServerTestApp(t)
+	defer cleanup()
+	require.NoError(t, migrations.AddAgentsRelaySTUN(app))
+
+	revision := &fixedStubRevision{rev: 42}
+	view, err := relayctl.NewPresenceView(relayctl.PresenceViewConfig{Routes: revision})
+	require.NoError(t, err)
+
+	ctrl := directctl.NewController(app, hub.New(), nil, nil, directctl.Config{
+		BaseDomain:            "example.com",
+		RelaySelectionEnabled: true,
+		RelayPresence:         view,
+		Routes:                revision,
+	})
+
+	pbRouter, err := apis.NewRouter(app)
+	require.NoError(t, err)
+	pbRouter.GET("/share/{code}", serveCanonicalRoute(ctrl))
+	pbRouter.GET("/s/{code}", serveCanonicalRoute(ctrl))
+	mux, err := pbRouter.BuildMux()
+	require.NoError(t, err)
+
+	mkSession := func(code string, relayOnly bool, expires *time.Time, mutate func(*core.Record)) string {
+		user := createServerTestUser(t, app, code+"@canonical.example")
+		apiKey := createServerTestAPIKey(t, app, user.Id)
+		record := createServerTestSession(t, app, apiKey.Id, code, expires)
+		record.Set("share_type", "immich")
+		// Unique per-session origin (sessions.origin is uniquely indexed);
+		// lowercased so the label is a valid hostname component.
+		record.Set("origin", strings.ToLower(code)+".sbdeadbeef.example.com")
+		if relayOnly {
+			record.Set("relay_only", true)
+		}
+		if mutate != nil {
+			mutate(record)
+		}
+		require.NoError(t, app.Save(record))
+		return apiKey.Id
+	}
+
+	scenarios := []struct {
+		name     string
+		seed     func(t *testing.T) string
+		wantCode int
+		wantLoc  string
+	}{
+		{name: "unknown 404", seed: func(t *testing.T) string { return "UNKNOWN0000" }, wantCode: http.StatusNotFound},
+		{name: "revoked 404", seed: func(t *testing.T) string {
+			code := "REVOKED0001"
+			mkSession(code, false, nil, func(r *core.Record) {
+				r.Set("is_active", false)
+				r.Set("inactive_reason", "revoked")
+			})
+			return code
+		}, wantCode: http.StatusNotFound},
+		{name: "expired 410", seed: func(t *testing.T) string {
+			code := "EXPIRED0002"
+			past := time.Now().Add(-time.Hour)
+			mkSession(code, false, &past, nil)
+			return code
+		}, wantCode: http.StatusGone},
+		{name: "interstitial 200 no-store only STUN freshness missing", seed: func(t *testing.T) string {
+			code := "INTERST0003"
+			apiKey := mkSession(code, false, nil, nil)
+			seedCanonicalAgent(t, app, apiKey, "203.0.113.7")
+			ctrl.InstallReadyEpochForTest(apiKey, "sbdeadbeef")
+			return code
+		}, wantCode: http.StatusOK},
+		{name: "relayOnly lease 302 relay", seed: func(t *testing.T) string {
+			code := "RELAY30204"
+			apiKey := mkSession(code, true, nil, nil)
+			agentID, port := seedCanonicalAgent(t, app, apiKey, "203.0.113.7")
+			grantCanonicalPresence(t, view, agentID, port)
+			return code
+		}, wantCode: http.StatusFound, wantLoc: "https://relay30204.relay.sbdeadbeef.example.com/s/"},
+		{name: "direct-ineligible WS-down no lease 503", seed: func(t *testing.T) string {
+			code := "OFFLINE505"
+			mkSession(code, false, nil, nil)
+			return code
+		}, wantCode: http.StatusServiceUnavailable},
+	}
+
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			code := sc.seed(t)
+			for _, path := range []string{"/s/", "/share/"} {
+				req := httptest.NewRequest(http.MethodGet, path+code, nil)
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, req)
+				require.Equal(t, sc.wantCode, rec.Code, "path %s body %q", path, rec.Body.String())
+				if sc.wantLoc != "" {
+					require.Equal(t, sc.wantLoc+code, rec.Header().Get("Location"))
+					require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+				}
+				if sc.wantCode == http.StatusOK {
+					require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+				}
+			}
+		})
+	}
 }
 
 func TestServerRoutesRelayOnlySessionGone(t *testing.T) {

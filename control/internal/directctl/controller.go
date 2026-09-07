@@ -25,6 +25,24 @@ type Config struct {
 	// *.relay.<namespace>.<base-domain> at it; an absent or invalid value
 	// keeps baseline readiness unreachable (§7.1).
 	RelayGatewayIPv4 string
+	// RelaySelectionEnabled is the Task 20 §9.1 operator flag. Zero value
+	// (false) is the safe default: rollback mode — direct candidates get the
+	// Phase 4a interstitial, relay is never selected (relay-dependent cases
+	// return 503), and the legacy Phase 3 direct 302 is never restored.
+	// Every relay selection in this package is gated on it.
+	RelaySelectionEnabled bool
+	// RelayPresence installs the Task 15 gateway-authoritative presence view
+	// at construction (preferred over the removed EnableRelayPresence setter,
+	// Task 20 carry-forward c: the view must be in place before the
+	// controller serves traffic, and constructor wiring makes that
+	// precondition structural). nil makes RelayAvailable fail closed (never
+	// available) — e.g. Phase 3-style deployments with no relay sync.
+	RelayPresence *relayctl.PresenceView
+	// Routes supplies the route publisher's current revision for the Task 15
+	// read-then-check contract (see routes.go readRouteFacts). nil makes the
+	// revision read 0, which the presence view's Available rejects — fail
+	// closed.
+	Routes relayctl.RouteRevisionSource
 	// Test-only (default zero values = production behavior):
 	AllowPrivateProbes bool                                                                // disables the SSRF denylist
 	DDNSFunc           func(ctx context.Context, name, ip string, ttl int) (string, error) // overrides the real ddns client
@@ -119,10 +137,18 @@ type Controller struct {
 	relay *relayEmitter
 
 	// relayPresence holds the Task 15 gateway-authoritative presence view
-	// when installed with EnableRelayPresence; nil makes RelayAvailable fail
-	// closed (never available). It is the ONLY presence state selection may
-	// read (§4.2, §12: never the relay_last_seen_at diagnostic).
+	// when injected at construction (Config.RelayPresence); nil makes
+	// RelayAvailable fail closed (never available). It is the ONLY presence
+	// state selection may read (§4.2, §12: never the relay_last_seen_at
+	// diagnostic). Installed exclusively via Config — no post-construction
+	// setter survives Task 20 (carry-forward c), so the before-serving
+	// precondition is structural.
 	relayPresence *relayctl.PresenceView
+
+	// routes supplies the current route revision for the Task 15
+	// read-then-check contract (routes.go). *relayctl.Publisher implements
+	// it; nil reads revision 0, which the presence view rejects.
+	routes relayctl.RouteRevisionSource
 
 	// STUN challenge scheduling (Task 18, stun.go). stunServer is installed
 	// with EnableSTUN before serving; nil keeps scheduling disabled. nowFn
@@ -149,6 +175,8 @@ type Controller struct {
 func NewController(app core.App, h *hub.Hub, coord *certcoordinator.Coordinator, dnsClient *ddns.Cloudflare, cfg Config) *Controller {
 	c := &Controller{
 		app: app, hub: h, coord: coord, ddns: dnsClient, cfg: cfg,
+		relayPresence:       cfg.RelayPresence,
+		routes:              cfg.Routes,
 		epochs:              map[string]*epochState{},
 		waiters:             map[string]*openWaiter{},
 		seq:                 map[string]uint64{},
@@ -274,17 +302,24 @@ func (c *Controller) evaluateCurrentDirectMatch(apiKeyID string, now time.Time, 
 	return observation, fresh, evaluateDirectSTUNMatch(observation, fresh, requiredIPs...)
 }
 
-// EnableRelayPresence installs the Task 15 gateway-authoritative presence
-// view. It must be called before the controller serves traffic; nil is
-// ignored and leaves RelayAvailable fail-closed (never available). The view
-// is the ONLY relay presence state selection may read: it is fed exclusively
-// by the Task 11 mTLS sync server's presence endpoints, and agent
-// relay_client_state telemetry never reaches it (§4.2, §7.4, §12).
-func (c *Controller) EnableRelayPresence(view *relayctl.PresenceView) {
-	if view == nil {
-		return
-	}
-	c.relayPresence = view
+// EnableRelayPresence was the Task 15 setter; Task 20 (carry-forward c)
+// removes it in favor of constructor-time injection via Config.RelayPresence.
+// The unsynchronized setter allowed installing a presence view after the
+// controller was already serving, violating the documented before-serving
+// precondition; Config wiring makes the precondition structural. Tests that
+// need to seed controller internals use newTestController / Config directly.
+
+// InstallReadyEpochForTest is a TEST-ONLY seam (unreachable from production
+// paths, which earn readiness exclusively through the enrollment flow):
+// it installs a ready connection epoch and hub presence for apiKeyID so
+// route-selection tests in packages that cannot reach controller internals
+// (cmd/server) can seed the WS-state matrix dimension without replaying a
+// full WebSocket enrollment.
+func (c *Controller) InstallReadyEpochForTest(apiKeyID, namespace string) {
+	c.epochMu.Lock()
+	c.epochs[apiKeyID] = &epochState{agentID: "agent-test", namespace: namespace, ready: true}
+	c.epochMu.Unlock()
+	c.hub.RegisterAgent(apiKeyID, nil)
 }
 
 // RelayAvailable is the read-only §7.1 relay-eligibility presence term:
