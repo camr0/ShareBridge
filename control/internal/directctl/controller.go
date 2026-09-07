@@ -253,6 +253,27 @@ func (c *Controller) AgentDisconnected(apiKeyID string, conn *websocket.Conn) {
 	c.waiterMu.Unlock()
 }
 
+// CurrentDirectMatch evaluates the §10.3 live predicate against the CURRENT
+// connection epoch's fresh observation for apiKeyID (single clock reading
+// taken here). requiredIPs are the surfaces being gated (report_endpoint IP
+// and/or open_ack public IP). This is the read Task 20's route selection will
+// reuse; it NEVER consults the persisted direct_status diagnostics (§12,
+// §15.7). When STUN scheduling is not wired there is no observation and the
+// outcome is a closed fail (stun_timeout).
+func (c *Controller) CurrentDirectMatch(apiKeyID string, requiredIPs ...string) DirectMatch {
+	now := c.nowFn() // single clock reading for the freshness decision
+	_, _, match := c.evaluateCurrentDirectMatch(apiKeyID, now, requiredIPs...)
+	return match
+}
+
+// evaluateCurrentDirectMatch is CurrentDirectMatch with the caller-supplied
+// single clock reading; it also returns the observation so the gated flow can
+// persist the driving observation as diagnostics (§12).
+func (c *Controller) evaluateCurrentDirectMatch(apiKeyID string, now time.Time, requiredIPs ...string) (STUNObservation, bool, DirectMatch) {
+	observation, fresh := c.CurrentSTUNObservation(apiKeyID, now)
+	return observation, fresh, evaluateDirectSTUNMatch(observation, fresh, requiredIPs...)
+}
+
 // EnableRelayPresence installs the Task 15 gateway-authoritative presence
 // view. It must be called before the controller serves traffic; nil is
 // ignored and leaves RelayAvailable fail-closed (never available). The view

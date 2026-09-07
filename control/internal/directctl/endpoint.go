@@ -15,6 +15,15 @@ import (
 // share registration. endpoint_ip is saved ONLY after DDNS succeeds, so a
 // failed update is retried on the next report. conn is verified against the
 // current epoch so a fenced socket cannot drive DDNS.
+//
+// §10.3 gate (plan Task 19): when STUN challenge scheduling is wired, the
+// direct DDNS update runs ONLY after a fresh current-epoch observation that
+// is public-classified and EXACTLY equals (IPv4) the reported IP. A
+// mismatch, a non-public (private/reserved/CGNAT) observation, or a missing
+// /stale observation stops BEFORE the DDNS update (§11.2: a relay tunnel
+// never manufactures a direct endpoint this way) and persists its bounded
+// diagnostic outcome (§12) — which nothing reads back as routing input
+// (§15.7).
 func (c *Controller) HandleReportEndpoint(ctx context.Context, conn *websocket.Conn, apiKeyID, ip string, port int, status string) {
 	if !c.isCurrentEpoch(apiKeyID, conn) {
 		return
@@ -33,9 +42,21 @@ func (c *Controller) HandleReportEndpoint(ctx context.Context, conn *websocket.C
 	}
 	prev := rec.GetString("endpoint_ip")
 
-	// Empty IP: no endpoint yet — do NOT save.
+	// Empty IP: no endpoint yet — do NOT save (and nothing to evaluate).
 	if ip == "" {
 		return
+	}
+
+	// §10.3 STUN gate before any DDNS work. Single clock reading for the
+	// whole evaluation (freshness + diagnostic stamp).
+	if c.stunEnabled() {
+		now := c.nowFn()
+		observation, fresh := c.CurrentSTUNObservation(apiKeyID, now)
+		outcome := evaluateDirectSTUNMatch(observation, fresh, ip)
+		c.recordDirectDiagnostics(rec, observation, fresh, outcome, now)
+		if !outcome.Matched {
+			return // stop BEFORE the DDNS update (spy-proven in tests)
+		}
 	}
 
 	// DDNS is only attempted on a changed IP; endpoint_ip is saved ONLY after

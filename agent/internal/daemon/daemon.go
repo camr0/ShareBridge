@@ -20,6 +20,7 @@ import (
 	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
+	"sharebridge/agent/internal/tunnel"
 )
 
 type immichPoller interface {
@@ -159,6 +160,51 @@ type directState struct {
 	listenAddr string             // override for tests; empty => :directIntPort
 
 	cond *sync.Cond // readiness signal (lazily created; guarded by mu)
+}
+
+// relayStateSender is the signaling capability that forwards §11.1
+// relay_client_state telemetry to control. It is asserted, not required: the
+// production signaling client implements it; minimal signaling fakes without
+// it simply drop the telemetry instead of failing the tunnel lifecycle.
+type relayStateSender interface {
+	SendRelayClientState(ctx context.Context, state signaling.RelayClientState) error
+}
+
+// TunnelStatusCallback returns the onStatus callback the Task 9 tunnel
+// Manager is constructed with (agent/internal/tunnel.NewManager): it is the
+// ONLY wiring between the FRP tunnel lifecycle and the control connection.
+// The callback forwards every transition exclusively as a §11.1
+// relay_client_state telemetry message (§7.4) — it never sends
+// report_endpoint, never touches the direct transport state (reporter,
+// mapper, port), and never creates direct or relay availability: control
+// treats relay_client_state as telemetry, with relay availability coming
+// solely from the gateway presence lease (§4.2, §12). Reasons are produced by
+// the tunnel manager itself and never contain credential material (§16.6).
+func (d *Daemon) TunnelStatusCallback() func(tunnel.StatusReport) {
+	return d.handleTunnelStatus
+}
+
+// handleTunnelStatus maps one tunnel manager diagnostic to the §11.1
+// relay_client_state wire message. The status vocabulary is identical by
+// construction (tunnel.StatusKind and signaling.RelayClientStatus pin the
+// same four values). Sending happens on a background context with a bounded
+// timeout; a failure is logged and never retried here (the next lifecycle
+// transition re-reports).
+func (d *Daemon) handleTunnelStatus(report tunnel.StatusReport) {
+	sender, ok := d.signaling.(relayStateSender)
+	if !ok {
+		return // telemetry sink unavailable: drop, never fall back to direct state
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state := signaling.RelayClientState{
+		Generation: report.Generation,
+		Status:     signaling.RelayClientStatus(report.Status),
+		Reason:     report.Reason,
+	}
+	if err := sender.SendRelayClientState(ctx, state); err != nil {
+		log.Printf("send relay_client_state: %v", err)
+	}
 }
 
 // canRegisterDirect reports whether shares may be registered: baseline

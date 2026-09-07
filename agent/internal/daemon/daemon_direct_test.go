@@ -25,6 +25,7 @@ import (
 	"sharebridge/agent/internal/direct"
 	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/signaling"
+	"sharebridge/agent/internal/tunnel"
 )
 
 const (
@@ -105,6 +106,22 @@ func newBaselineCertFixture(t *testing.T, dir string) (*cert.Manager, string) {
 	chainPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
 	chainPEM = append(chainPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})...)
 	return cm, string(chainPEM)
+}
+
+// SendRelayClientState records one §11.1 relay_client_state telemetry send
+// through the shared message log (same shape the real signaling client puts
+// on the wire). Defining it on the mock (same package, separate file) lets the
+// daemon's relayStateSender capability assertion observe telemetry in tests.
+func (m *mockSignalingClient) SendRelayClientState(ctx context.Context, state signaling.RelayClientState) error {
+	msg := map[string]any{
+		"type":       "relay_client_state",
+		"generation": state.Generation,
+		"status":     string(state.Status),
+	}
+	if state.Reason != "" {
+		msg["reason"] = state.Reason
+	}
+	return m.Send(ctx, msg)
 }
 
 // TestDirectDDNSFailureDoesNotBlockShareRegistration pins the §7.1 baseline
@@ -980,4 +997,164 @@ func TestDirectServerEndToEndSNIAdmissionAndDownload(t *testing.T) {
 	if _, err := badClient.Do(badReq); err == nil {
 		t.Fatalf("unknown SNI must fail the TLS handshake")
 	}
+}
+
+// TestRelayTunnelOnlyAgentDoesNotReportOrAuthorizeFakePublicEndpoint is the
+// agent half of the §11.2 relay-only isolation (control half lives in
+// control/internal/directctl/directpredicate_test.go): an agent whose ONLY
+// established transport is the FRP tunnel (Task 9 manager) sends
+// relay_client_state telemetry and NOTHING else that could manufacture direct
+// endpoint state — no report_endpoint, and an open_signal is answered with an
+// error ack that never carries a public IP or granted port.
+func TestRelayTunnelOnlyAgentDoesNotReportOrAuthorizeFakePublicEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	cm, chainPEM := newBaselineCertFixture(t, dir)
+
+	cfg := &config.Config{
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		DefaultRelayOnly:  false,
+		ImmichURL:         "http://immich.lan:2283",
+		ImmichAllowedHost: "immich.lan:2283",
+		ImmichAPIKey:      "api",
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	// Direct transport state WITHOUT mapper/port/reporter: this agent can
+	// never serve direct traffic (CGNAT/UPnP failure); only the relay tunnel
+	// will ever be established.
+	ds := &directState{
+		namespace:  testDirectNS,
+		baseDomain: testDirectBase,
+		cert:       cm,
+		gate:       direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+		origin:     map[string]string{},
+		listenAddr: "127.0.0.1:0",
+	}
+	d := &Daemon{
+		config:    cfg,
+		configMgr: cfgMgr,
+		store:     st,
+		signaling: sig,
+		resolver:  direct.NewResolverRegistry(),
+		sessions:  make(map[string]*Session),
+		direct:    ds,
+	}
+	d.syncDirectServe()
+
+	// Complete baseline enrollment (cert_issue → tls_ready) so the daemon is
+	// fully operational as a relay-only agent.
+	d.handleSignalingMessage(signaling.Message{Type: "cert_issue", ChainPEM: chainPEM})
+	if !sig.hasSentMessage("tls_ready", nil) {
+		t.Fatalf("expected tls_ready after cert_issue, got %#v", sig.messagesSnapshot())
+	}
+	d.handleSignalingMessage(signaling.Message{Type: "enrollment_ready"})
+	if !d.canRegisterDirect() {
+		t.Fatalf("relay-only agent must reach baseline readiness")
+	}
+
+	// Establish ONLY the FRP tunnel: the Task 9 manager reports lifecycle
+	// transitions through its status callback, and the daemon must forward
+	// them exclusively as relay_client_state telemetry.
+	tunnelStatus := d.TunnelStatusCallback()
+	if tunnelStatus == nil {
+		t.Fatalf("tunnel status callback must be wired (Task 9 manager onStatus)")
+	}
+	tunnelStatus(tunnel.StatusReport{Generation: 3, Status: tunnel.StatusStarting, Reason: "frpc started"})
+	tunnelStatus(tunnel.StatusReport{Generation: 3, Status: tunnel.StatusRunning, Reason: "frpc process stable"})
+
+	if !sig.hasSentMessage("relay_client_state", map[string]any{"generation": 3, "status": "running"}) {
+		t.Fatalf("tunnel lifecycle must surface as relay_client_state telemetry, got %#v", sig.messagesSnapshot())
+	}
+
+	// The tunnel must NEVER manufacture a direct endpoint report.
+	for _, msg := range sig.messagesSnapshot() {
+		if msg["type"] == "report_endpoint" {
+			t.Fatalf("a relay-only tunnel must never send report_endpoint, saw %#v", msg)
+		}
+	}
+
+	// And it must never authorize a public endpoint: an open_signal against
+	// the mapper-less agent is answered with an error ack that carries no
+	// public IP and no granted port (the mock records zero values for what
+	// the real client's omitempty wire tags leave absent entirely).
+	d.handleOpenSignal(openSignalMessage())
+	for _, msg := range sig.messagesSnapshot() {
+		if msg["type"] != "open_ack" {
+			continue
+		}
+		if msg["status"] != "error" {
+			t.Fatalf("open_signal must fail closed for a relay-only agent, got %#v", msg)
+		}
+		if ip, _ := msg["public_ip"].(string); ip != "" {
+			t.Fatalf("error open_ack must not carry a manufactured public_ip, got %#v", msg)
+		}
+		if port, _ := msg["granted_port"].(int); port != 0 {
+			t.Fatalf("error open_ack must not carry a granted_port, got %#v", msg)
+		}
+	}
+	d.onSignalingDisconnect()
+}
+
+// TestDirectEligibleAgentStillReportsRealPublicEndpoint pins the no-regression
+// half of Task 19 (§11.2): a direct-capable agent (mapper present) keeps the
+// existing real reporting behavior — the initial report_endpoint {ip,0} after
+// enrollment_ready, a transition report on port open, and an open_ack echoing
+// the mapper's real public IP — and it sends no relay_client_state telemetry
+// because no tunnel status was reported.
+func TestDirectEligibleAgentStillReportsRealPublicEndpoint(t *testing.T) {
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	const realIP = "203.0.113.7"
+	mapper := &fakeDirectMapper{ip: realIP}
+	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	rec := &endpointRecorder{}
+	reporter := direct.NewReporter(rec.record)
+	reporter.SetIP(realIP)
+	port.SetTransitionCallback(reporter.OnTransition)
+
+	d := &Daemon{
+		store:     st,
+		signaling: sig,
+		direct: &directState{
+			ready:    false,
+			gate:     direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+			port:     port,
+			mapper:   mapper,
+			reporter: reporter,
+		},
+	}
+
+	// Baseline readiness learns and reports the REAL mapper public IP.
+	d.handleEnrollmentReady(signaling.Message{})
+	if !sig.hasSentMessage("report_endpoint", map[string]any{"ip": realIP, "port": 0}) {
+		t.Fatalf("direct-capable agent must report its real public IP after enrollment_ready, got %#v", sig.messagesSnapshot())
+	}
+
+	// The open-signal flow acks the real IP + granted port and the open
+	// transition produces the real-IP endpoint report.
+	d.handleOpenSignal(openSignalMessage())
+	if !sig.hasSentMessage("open_ack", map[string]any{
+		"status":       "ok",
+		"public_ip":    realIP,
+		"granted_port": 443,
+	}) {
+		t.Fatalf("direct-capable agent must ack with the real public endpoint, got %#v", sig.messagesSnapshot())
+	}
+	reports := waitForEndpoints(t, rec, 1)
+	if reports[0].ip != realIP || reports[0].port != 443 {
+		t.Fatalf("open transition must report the real IP + port, got %#v", reports[0])
+	}
+
+	// No tunnel status was reported, so no relay telemetry may appear.
+	for _, msg := range sig.messagesSnapshot() {
+		if msg["type"] == "relay_client_state" {
+			t.Fatalf("direct reporting must not be accompanied by tunnel telemetry, saw %#v", msg)
+		}
+	}
+	d.onSignalingDisconnect()
 }

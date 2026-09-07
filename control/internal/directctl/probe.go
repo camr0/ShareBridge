@@ -45,6 +45,29 @@ func isGloballyRoutable(ip string) bool {
 }
 
 func (c *Controller) Probe(ctx context.Context, origin, code, apiKeyID string, ack OpenAck) error {
+	// §10.3 STUN gate (plan Task 19, §15.7 "STUN mismatch: never probe
+	// direct"): when the observation listener is wired, the probe runs ONLY
+	// with a fresh current-epoch observation that is public-classified and
+	// exactly equals (IPv4) the open_ack public IP. The gate wraps — not
+	// deletes — the probe, preserving it for matched agents, and precedes the
+	// verified-tuple cache so a fresh mismatch stops even a previously
+	// verified tuple. The refusal and the probe outcome are persisted as
+	// bounded §12 diagnostics that are never read back as routing input.
+	var (
+		gateObservation STUNObservation
+		gateFresh       bool
+		gateEvaluated   bool
+	)
+	if c.stunEnabled() {
+		now := c.nowFn() // single clock reading for gate + diagnostics stamp
+		observation, fresh, outcome := c.evaluateCurrentDirectMatch(apiKeyID, now, ack.PublicIP)
+		gateObservation, gateFresh, gateEvaluated = observation, fresh, true
+		if !outcome.Matched {
+			c.persistDirectDiagnostics(apiKeyID, observation, fresh, outcome, now)
+			return fmt.Errorf("direct probe not authorized by STUN policy (%s)", string(outcome.Reason))
+		}
+	}
+
 	tuple := fmt.Sprintf("%s:%d", ack.PublicIP, ack.GrantedPort)
 	c.verifiedMu.Lock()
 	if c.verified[apiKeyID] == tuple {
@@ -86,16 +109,37 @@ func (c *Controller) Probe(ctx context.Context, origin, code, apiKeyID string, a
 
 	resp, err := client.Do(req)
 	if err != nil {
+		c.recordProbeOutcome(apiKeyID, gateObservation, gateFresh, gateEvaluated, false)
 		return err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if resp.StatusCode != http.StatusOK || string(body) != ack.Nonce {
+		c.recordProbeOutcome(apiKeyID, gateObservation, gateFresh, gateEvaluated, false)
 		return fmt.Errorf("probe nonce mismatch (status %d)", resp.StatusCode)
 	}
 
 	c.verifiedMu.Lock()
 	c.verified[apiKeyID] = tuple
 	c.verifiedMu.Unlock()
+	c.recordProbeOutcome(apiKeyID, gateObservation, gateFresh, gateEvaluated, true)
 	return nil
+}
+
+// recordProbeOutcome persists the §12 diagnostics for a STUN-gated probe
+// outcome: eligible on success, relay_fallback with the bounded probe_failed
+// code on failure (the detailed failure text stays in the returned error, is
+// static, and never includes credential material). It is a no-op when the
+// §10.3 gate did not run (STUN scheduling unwired — Phase 3 behavior
+// preserved exactly), and best-effort: diagnostics never alter the probe
+// result.
+func (c *Controller) recordProbeOutcome(apiKeyID string, observation STUNObservation, observationFresh, gateEvaluated, succeeded bool) {
+	if !gateEvaluated {
+		return
+	}
+	outcome := DirectMatch{Matched: true, Status: DirectStatusEligible, Reason: DirectReasonNone}
+	if !succeeded {
+		outcome = DirectMatch{Matched: false, Status: DirectStatusRelayFallback, Reason: DirectReasonProbeFailed}
+	}
+	c.persistDirectDiagnostics(apiKeyID, observation, observationFresh, outcome, c.nowFn())
 }
