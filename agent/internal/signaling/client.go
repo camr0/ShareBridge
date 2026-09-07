@@ -1,12 +1,18 @@
 package signaling
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 )
@@ -39,6 +45,12 @@ type Message struct {
 	ChainPEM       string `json:"chain_pem,omitempty"`
 	Reason         string `json:"reason,omitempty"`
 	AgentID        string `json:"agent_id,omitempty"`
+
+	// Relay/STUN wire fields (§11.1). Additive with omitempty so every
+	// existing direct-message JSON shape is unchanged.
+	RelayOrigin string `json:"relay_origin,omitempty"` // share_registered
+	Challenge   string `json:"challenge,omitempty"`    // stun_challenge packed credential
+	Server      string `json:"server,omitempty"`       // stun_challenge UDP listener host:port
 }
 
 // OpenAck is the agent-side acknowledgement of an open_signal. Its json tags
@@ -229,6 +241,215 @@ func (c *Client) TLSError(ctx context.Context, reason string) error {
 		"type":   "tls_error",
 		"reason": reason,
 	})
+}
+
+// ---------- §11.1 relay/STUN wire helpers (plan Task 17) ----------
+
+// maxTelemetryReasonBytes is control's relay_client_state telemetry reason
+// bound (control/internal/relayctl rejects anything longer). The bounded
+// senders below enforce the same bound so a diagnostic can never get the
+// whole message rejected at control.
+const maxTelemetryReasonBytes = 256
+
+// Wire bounds for the §11.1 stun_result fields, mirroring what the agent's
+// own STUN client (internal/stun) can produce: the challenge echo is the
+// 32-hex-character challenge ID, transaction_id is the lowercase hex of the
+// 12-byte STUN transaction ID, and receipt is the lowercase hex of the opaque
+// integrity-protected attribute bytes (16 bytes today, bounded at 128 bytes).
+const (
+	maxSTUNResultChallengeLength = 128
+	stunTransactionIDHexLength   = 2 * 12
+	maxSTUNResultReceiptHexBytes = 2 * 128
+)
+
+// STUNChallenge is the parsed §11.1 control → agent stun_challenge payload:
+// {version, challenge, server, expires_at}. Challenge is the packed one-use
+// credential "<hex id>.<hex secret>" the stun client splits; Secret material
+// stays inside the packed field and must never be logged.
+type STUNChallenge struct {
+	Version   int
+	Challenge string
+	Server    string
+	ExpiresAt time.Time
+}
+
+// ParseSTUNChallenge decodes the exact §11.1 stun_challenge wire message.
+// Per the Task 7 ruling (unknown-field tolerance for versioned wire
+// compatibility, spec §11) unknown JSON fields are tolerated, but trailing
+// data after the value is rejected. The parse is structural only: version,
+// server, and expiry-vs-clock validation happen in the stun client before
+// any request is made (fail-closed, internal/stun.ParseChallenge).
+func ParseSTUNChallenge(data []byte) (STUNChallenge, error) {
+	var message struct {
+		Type      string `json:"type"`
+		Version   int    `json:"version"`
+		Challenge string `json:"challenge"`
+		Server    string `json:"server"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&message); err != nil {
+		return STUNChallenge{}, fmt.Errorf("decode stun_challenge: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return STUNChallenge{}, errors.New("trailing data after stun_challenge value")
+	}
+	if message.Type != "stun_challenge" {
+		return STUNChallenge{}, fmt.Errorf("unexpected stun_challenge message type %q", message.Type)
+	}
+	expiresAt, err := time.Parse(time.RFC3339, message.ExpiresAt)
+	if err != nil {
+		return STUNChallenge{}, fmt.Errorf("parse stun_challenge expires_at: %w", err)
+	}
+	return STUNChallenge{
+		Version:   message.Version,
+		Challenge: message.Challenge,
+		Server:    message.Server,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+// STUNResult is the §11.1 agent → control stun_result payload:
+// {challenge, transaction_id, receipt}. Receipt holds the opaque
+// integrity-protected attribute bytes; SendSTUNResult hex-encodes them onto
+// the wire. It never carries the one-use secret or the mapped address.
+type STUNResult struct {
+	Challenge     string
+	TransactionID string
+	Receipt       []byte
+}
+
+// SendSTUNResult echoes one observation receipt over the authenticated
+// WebSocket. The payload is validated against the exact §11.1 shape before
+// anything is written: control cannot claim an observation that deviates
+// from it, so an invalid result fails closed here instead.
+func (c *Client) SendSTUNResult(ctx context.Context, result STUNResult) error {
+	if result.Challenge == "" || len(result.Challenge) > maxSTUNResultChallengeLength {
+		return fmt.Errorf("stun_result challenge length %d out of range", len(result.Challenge))
+	}
+	if len(result.TransactionID) != stunTransactionIDHexLength || !isLowercaseHex(result.TransactionID) {
+		return fmt.Errorf("stun_result transaction_id must be %d lowercase hex characters", stunTransactionIDHexLength)
+	}
+	if len(result.Receipt) == 0 || 2*len(result.Receipt) > maxSTUNResultReceiptHexBytes {
+		return fmt.Errorf("stun_result receipt length %d bytes out of range", len(result.Receipt))
+	}
+	return c.Send(ctx, struct {
+		Type          string `json:"type"`
+		Challenge     string `json:"challenge"`
+		TransactionID string `json:"transaction_id"`
+		Receipt       string `json:"receipt"`
+	}{
+		Type:          "stun_result",
+		Challenge:     result.Challenge,
+		TransactionID: result.TransactionID,
+		Receipt:       hex.EncodeToString(result.Receipt),
+	})
+}
+
+// RelayClientStatus is one of the four closed §11.1 relay_client_state
+// status values. The vocabulary must stay identical to the tunnel manager's
+// diagnostics (internal/tunnel.StatusKind); the wire-shape test pins the
+// equality so the two cannot drift.
+type RelayClientStatus string
+
+// The four statuses control accepts for relay_client_state telemetry.
+const (
+	RelayStatusStarting RelayClientStatus = "starting"
+	RelayStatusRunning  RelayClientStatus = "running"
+	RelayStatusStopped  RelayClientStatus = "stopped"
+	RelayStatusError    RelayClientStatus = "error"
+)
+
+// RelayClientState is one §11.1 agent → control relay_client_state telemetry
+// report: {generation, status, reason?}. Telemetry only — it can never
+// create relay availability or mutate share lifecycle.
+type RelayClientState struct {
+	Generation int
+	Status     RelayClientStatus
+	Reason     string
+}
+
+// SendRelayClientState forwards one tunnel diagnostic to control. Generation
+// must be non-negative and the status one of the four §11.1 values (the
+// tunnel manager's StatusReport is the source of both); an oversize reason
+// is truncated at control's telemetry bound rather than dropping the report.
+func (c *Client) SendRelayClientState(ctx context.Context, state RelayClientState) error {
+	if state.Generation < 0 {
+		return fmt.Errorf("relay_client_state generation %d out of range", state.Generation)
+	}
+	switch state.Status {
+	case RelayStatusStarting, RelayStatusRunning, RelayStatusStopped, RelayStatusError:
+	default:
+		return fmt.Errorf("invalid relay_client_state status %q", string(state.Status))
+	}
+	return c.Send(ctx, struct {
+		Type       string `json:"type"`
+		Generation int    `json:"generation"`
+		Status     string `json:"status"`
+		Reason     string `json:"reason,omitempty"`
+	}{
+		Type:       "relay_client_state",
+		Generation: state.Generation,
+		Status:     string(state.Status),
+		Reason:     truncateTelemetryReason(state.Reason),
+	})
+}
+
+// LockdownStatus is the §11.1 agent → control lockdown_status payload:
+// {generation, locked}. Advisory fast-path telemetry only; it may suppress
+// attempts but can never establish route availability or change share
+// lifecycle.
+type LockdownStatus struct {
+	Generation int
+	Locked     bool
+}
+
+// SendLockdownStatus reports one lockdown transition. locked is always sent
+// (both polarities) so the §11.1 bool field stays explicit on the wire.
+func (c *Client) SendLockdownStatus(ctx context.Context, status LockdownStatus) error {
+	if status.Generation < 0 {
+		return fmt.Errorf("lockdown_status generation %d out of range", status.Generation)
+	}
+	return c.Send(ctx, struct {
+		Type       string `json:"type"`
+		Generation int    `json:"generation"`
+		Locked     bool   `json:"locked"`
+	}{
+		Type:       "lockdown_status",
+		Generation: status.Generation,
+		Locked:     status.Locked,
+	})
+}
+
+// truncateTelemetryReason bounds a diagnostic reason at control's telemetry
+// limit without splitting a UTF-8 rune (a cut rune would end the report in
+// an invalid string, which encoding/json then mangles into U+FFFD). Losing a
+// suffix of a reason is acceptable; losing the whole telemetry message is
+// not.
+func truncateTelemetryReason(reason string) string {
+	if len(reason) <= maxTelemetryReasonBytes {
+		return reason
+	}
+	cut := maxTelemetryReasonBytes
+	// If the byte at the cut is a continuation byte, the rune it belongs to
+	// started before the cut: move the cut back to that rune's start so the
+	// result ends on a boundary.
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
+}
+
+// isLowercaseHex reports whether s is a non-empty lowercase hex string.
+func isLowercaseHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	return strings.IndexFunc(s, func(character rune) bool {
+		isHex := (character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f')
+		return !isHex
+	}) < 0
 }
 
 // Send serializes msg as JSON and writes it to the WebSocket.
