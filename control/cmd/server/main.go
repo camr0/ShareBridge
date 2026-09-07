@@ -114,6 +114,14 @@ func main() {
 				log.Printf("stun listener stopped: %v", err)
 			}
 		}()
+		// Task 18: install the listener on the controller so the §10.2
+		// scheduler issues stun_challenge over the agent WebSocket (immediate
+		// after enrollment_ready, re-challenge at 4 min + jitter) and claims
+		// observations via stun_result at the current WS epoch. The advertise
+		// address is the STUN_BIND_ADDR value: deployments must bind a
+		// publicly resolvable address (or terminate NAT forwarding for
+		// UDP 3478) for agents to reach the listener.
+		ctrl.EnableSTUN(stunServer, cfg.STUNBindAddr)
 		log.Printf("stun observation listener on %s (udp/3478)", cfg.STUNBindAddr)
 	}
 

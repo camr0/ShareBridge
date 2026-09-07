@@ -89,6 +89,15 @@ type agentMsg struct {
 	// and treated as telemetry.
 	Generation int  `json:"generation,omitempty"` // relay_client_state / lockdown_status
 	Locked     bool `json:"locked,omitempty"`     // lockdown_status
+
+	// STUN result fields (§11.1 stun_result, plan Task 18): the challenge
+	// ID echo (ID only — never the packed secret), the STUN transaction ID
+	// and the lowercase-hex integrity-protected receipt, which control
+	// hex-decodes before TakeObservation. Inbound-only; sizes are validated
+	// in directctl before any state is touched.
+	Challenge     string `json:"challenge,omitempty"`
+	TransactionID string `json:"transaction_id,omitempty"`
+	Receipt       string `json:"receipt,omitempty"`
 }
 
 var generatedCodeRegex = regexp.MustCompile(`^[a-z0-9]{8}$`)
@@ -299,6 +308,21 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Contr
 					continue
 				}
 				// Advisory only: deliberately no control-side state change (§11.1).
+
+			case "stun_result":
+				// §11.1 observation echo: accepted only from the current
+				// API-key socket after hello; all validation (sizes, epoch,
+				// challenge/transaction/receipt match, single use, expiry)
+				// happens in the controller's claim path and never touches
+				// relay availability (§10.3).
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before stun_result"})
+					continue
+				}
+				if ctrl == nil || !ctrl.IsCurrentEpoch(apiKeyID, conn) {
+					continue // stale socket: drop
+				}
+				ctrl.HandleSTUNResult(conn, apiKeyID, msg.Challenge, msg.TransactionID, msg.Receipt)
 			}
 		}
 	}

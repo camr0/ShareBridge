@@ -11,6 +11,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/pocketbase/pocketbase/core"
 	"sharebridge/control/internal/relayctl"
+	"sharebridge/control/internal/stun"
 )
 
 // relayWildcardTTL is the A-record TTL for the static relay content wildcard
@@ -151,10 +152,12 @@ func (c *Controller) sendRelayConfig(apiKeyID string, conn *websocket.Conn, rec 
 }
 
 // HandleHello enrolls an agent connection: it ensures the agent record exists,
-// installs a fresh epoch for this connection, idempotently provisions the §6
-// relay content wildcard for the agent's namespace (baseline readiness half),
-// and replies "enrolled" with the agent's namespace. The epoch is
-// connection-local, so a replacement socket starts un-ready.
+// installs a fresh epoch for this connection (a new monotonic epoch number;
+// any prior epoch's STUN challenge state is torn down — reconnect invalidates
+// the old observation, §10.2), idempotently provisions the §6 relay content
+// wildcard for the agent's namespace (baseline readiness half), and replies
+// "enrolled" with the agent's namespace. The epoch is connection-local, so a
+// replacement socket starts un-ready.
 func (c *Controller) HandleHello(ctx context.Context, conn *websocket.Conn, apiKeyID, accountID, agentID string) {
 	rec, _, err := LoadOrCreateAgent(c.app, apiKeyID)
 	if err != nil {
@@ -162,7 +165,13 @@ func (c *Controller) HandleHello(ctx context.Context, conn *websocket.Conn, apiK
 		return
 	}
 	c.epochMu.Lock()
-	c.epochs[apiKeyID] = &epochState{agentID: agentID, namespace: rec.GetString("namespace"), conn: conn}
+	if old := c.epochs[apiKeyID]; old != nil {
+		c.stunMu.Lock()
+		c.stunTeardownLocked(old)
+		c.stunMu.Unlock()
+	}
+	c.epochSeq++
+	c.epochs[apiKeyID] = &epochState{agentID: agentID, namespace: rec.GetString("namespace"), conn: conn, epoch: stun.Epoch(c.epochSeq)}
 	epoch := c.epochs[apiKeyID]
 	c.epochMu.Unlock()
 	// Provision relay DNS before the enrolled reply: the record is half of
@@ -279,7 +288,10 @@ func (c *Controller) markReadyLocked(e *epochState) bool {
 // (a newer epoch must not have its readiness clobbered by a stale failure).
 // When the send succeeds, relay_config follows immediately — baseline
 // readiness is exactly the point where §7.2 tunnel credentials are issued, on
-// the authenticated current epoch, never before enrollment.
+// the authenticated current epoch, never before enrollment — and the §10.2
+// immediate STUN challenge is issued last: the current-epoch enrollment
+// handshake has now completed, so observation acquisition starts right away
+// (including after every reconnect) rather than waiting for a recipient.
 func (c *Controller) sendEnrollmentReady(apiKeyID string, conn *websocket.Conn, rec *core.Record, e *epochState) {
 	if err := c.sendFn(context.Background(), conn, map[string]string{"type": "enrollment_ready"}); err != nil {
 		c.epochMu.Lock()
@@ -290,4 +302,5 @@ func (c *Controller) sendEnrollmentReady(apiKeyID string, conn *websocket.Conn, 
 		return
 	}
 	c.sendRelayConfig(apiKeyID, conn, rec)
+	c.stunChallengeAfterEnrollment(apiKeyID, conn, e)
 }

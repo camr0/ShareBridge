@@ -3,6 +3,7 @@ package directctl
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"sharebridge/control/internal/ddns"
 	"sharebridge/control/internal/hub"
 	"sharebridge/control/internal/relayctl"
+	"sharebridge/control/internal/stun"
 )
 
 // Config holds controller configuration.
@@ -34,13 +36,22 @@ type Config struct {
 // authorize readiness alone — the current connection must complete
 // enrolled → tls_ready (+ relay DNS provisioning) → enrollment_ready itself
 // (§7.1: baseline = TLS + relay DNS; direct DDNS is an optional capability).
+//
+// epoch is a monotonic per-process connection epoch number (Task 18): it is
+// the value bound into STUN challenges at IssueChallenge and re-checked at
+// TakeObservation, so a reconnect (new number) can never claim an old
+// observation and a control restart (fresh counter + fresh per-process
+// receipt key) behaves exactly like a reconnect. conn is written once at
+// install time and never mutated.
 type epochState struct {
 	agentID       string
 	namespace     string
 	conn          *websocket.Conn
+	epoch         stun.Epoch
 	tlsReady      bool
 	relayDNSReady bool
 	ready         bool
+	stun          *epochSTUN // per-epoch STUN challenge state; guarded by stunMu
 }
 
 // OpenAck is the control-side acknowledgement of an open_signal. It is a
@@ -113,6 +124,23 @@ type Controller struct {
 	// read (§4.2, §12: never the relay_last_seen_at diagnostic).
 	relayPresence *relayctl.PresenceView
 
+	// STUN challenge scheduling (Task 18, stun.go). stunServer is installed
+	// with EnableSTUN before serving; nil keeps scheduling disabled. nowFn
+	// and randFn are clock/jitter seams (§10.2 cadence tests inject a fake
+	// clock like Task 15/16); stunIssueFn defaults to the listener's
+	// IssueChallenge (the ONLY rate limiter — the Task 16 per-agent token
+	// bucket, §16.4) and exists so tests can exercise bounded backoff.
+	stunServer    *stun.Server
+	stunAdvertise string
+	stunIssueFn   func(agentID string, epoch stun.Epoch) (stun.Challenge, error)
+	nowFn         func() time.Time
+	randFn        func() float64
+	stunMu        sync.Mutex
+
+	// epochSeq feeds epochState.epoch (monotonic, per-process; §10.2
+	// "including after every reconnect").
+	epochSeq uint64
+
 	ackTimeout time.Duration
 }
 
@@ -127,6 +155,8 @@ func NewController(app core.App, h *hub.Hub, coord *certcoordinator.Coordinator,
 		verified:            map[string]string{},
 		relayDNSProvisioned: map[string]string{},
 		ackTimeout:          3 * time.Second,
+		nowFn:               time.Now,
+		randFn:              rand.Float64,
 	}
 	c.sendFn = func(ctx context.Context, conn *websocket.Conn, msg any) error {
 		return hub.SendDirect(ctx, conn, msg)
@@ -191,17 +221,25 @@ func (c *Controller) IsCurrentEpoch(apiKeyID string, conn *websocket.Conn) bool 
 // connection that owns it (a stale old-socket disconnect must not disrupt a
 // replacement socket). It also drops that epoch's waiters WITHOUT closing
 // their channels (closing would make a later EmitOpen read a zero-ack and
-// treat it as success).
+// treat it as success), and tears down the epoch's STUN challenge state
+// (stopping its timer and failing inline waiters — no goroutine leaks).
 func (c *Controller) AgentDisconnected(apiKeyID string, conn *websocket.Conn) {
 	c.epochMu.Lock()
 	matched := false
+	var torn *epochState
 	if e, ok := c.epochs[apiKeyID]; ok && e.conn == conn {
 		delete(c.epochs, apiKeyID)
 		matched = true
+		torn = e
 	}
 	c.epochMu.Unlock()
 	if !matched {
 		return
+	}
+	if torn != nil {
+		c.stunMu.Lock()
+		c.stunTeardownLocked(torn)
+		c.stunMu.Unlock()
 	}
 	c.seqMu.Lock()
 	delete(c.seq, apiKeyID)
