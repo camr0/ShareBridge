@@ -648,6 +648,58 @@ func TestRelayConfigAndClientStateWireShapes(t *testing.T) {
 		}
 	})
 
+	t.Run("relay_credential_request_exact_field_set", func(t *testing.T) {
+		// §11.1: { reason: "replay_rejected"|"expired"|"restart" } plus the
+		// framing "type" — exactly two fields, nothing more.
+		for _, reason := range []tunnel.CredentialRequestReason{
+			tunnel.ReasonReplayRejected, tunnel.ReasonExpired, tunnel.ReasonRestart,
+		} {
+			got := captureAgentMessage(t, func(ctx context.Context, c *Client) error {
+				return c.SendRelayCredentialRequest(ctx, reason)
+			})
+			assertExactlyKeys(t, got, "type", "reason")
+			if got["type"] != "relay_credential_request" {
+				t.Fatalf("type = %v, want relay_credential_request", got["type"])
+			}
+			if got["reason"] != string(reason) {
+				t.Fatalf("reason = %v, want %q", got["reason"], string(reason))
+			}
+		}
+	})
+
+	t.Run("relay_credential_request_rejects_unknown_reason", func(t *testing.T) {
+		client := newConnectedClient(t)
+		ctx := context.Background()
+		if err := client.SendRelayCredentialRequest(ctx, tunnel.CredentialRequestReason("because_i_said_so")); err == nil {
+			t.Fatal("unknown reason must be rejected (closed §11.1 enum; control strictly parses it)")
+		}
+		if err := client.SendRelayCredentialRequest(ctx, ""); err == nil {
+			t.Fatal("empty reason must be rejected")
+		}
+	})
+
+	t.Run("parse_relay_config_via_signaling_reuses_strict_parser", func(t *testing.T) {
+		// The receive-side helper must be Task 9's strict parser (unknown
+		// fields and trailing data rejected), not a second looser parser.
+		wire := `{"type":"relay_config","version":1,"generation":2,` +
+			`"gateway_addr":"relay.example.net","gateway_port":7000,` +
+			`"proxy_name":"agent-2-relay","relay_port":41001,` +
+			`"credential":"a.b.c","expires_at":"2026-09-03T12:00:00Z"}`
+		config, err := ParseRelayConfig([]byte(wire))
+		if err != nil {
+			t.Fatalf("ParseRelayConfig: %v", err)
+		}
+		if config.Generation != 2 || config.RelayPort != 41001 {
+			t.Fatalf("generation/relay_port = %d/%d, want 2/41001", config.Generation, config.RelayPort)
+		}
+		if _, err := ParseRelayConfig([]byte(`{"type":"relay_config","version":1,"generation":2,"gateway_addr":"g","gateway_port":7000,"proxy_name":"p","relay_port":1,"credential":"a.b.c","expires_at":"2026-09-03T12:00:00Z","extra":1}`)); err == nil {
+			t.Fatal("unknown field must be rejected (strict parse)")
+		}
+		if _, err := ParseRelayConfig([]byte(wire + ` {"type":"relay_config"}`)); err == nil {
+			t.Fatal("trailing data must be rejected (strict parse)")
+		}
+	})
+
 	t.Run("lockdown_status_exact_field_set", func(t *testing.T) {
 		for _, locked := range []bool{true, false} {
 			got := captureAgentMessage(t, func(ctx context.Context, c *Client) error {

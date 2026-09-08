@@ -109,6 +109,17 @@ func NewSigner(seed []byte) (*Signer, error) {
 	return &Signer{privateKey: ed25519.NewKeyFromSeed(seed)}, nil
 }
 
+// NewSignerFromHexSeed builds a signer from the operator-provisioned 64-character
+// hex Ed25519 seed (config RELAY_AUTH_KEY_SEED). The gateway holds only the
+// matching public key (§7.2).
+func NewSignerFromHexSeed(seedHex string) (*Signer, error) {
+	seed, err := hex.DecodeString(seedHex)
+	if err != nil {
+		return nil, fmt.Errorf("relay auth seed is not valid hex: %w", err)
+	}
+	return NewSigner(seed)
+}
+
 // GenerateSigner creates a signer with a fresh random key (test/development
 // convenience; production keys come from persistent operator state).
 func GenerateSigner() (*Signer, error) {
@@ -490,4 +501,28 @@ func ValidateLockdownStatus(generation int, locked bool) error {
 		return fmt.Errorf("lockdown generation %d out of range", generation)
 	}
 	return nil
+}
+
+// RelayCredentialRequestReason enumerates the exact §11.1
+// relay_credential_request reason values. Anything else is rejected before
+// any state is touched: the message is the trigger for a freshly signed
+// credential, so the parse is strict.
+const (
+	ReasonReplayRejected = "replay_rejected"
+	ReasonExpired        = "expired"
+	ReasonRestart        = "restart"
+)
+
+// ValidateRelayCredentialRequest validates the bounded §11.1
+// relay_credential_request payload: the reason must be exactly one of the
+// three enumerated values. Rejection diagnostics never include the raw
+// agent-supplied value beyond its length, so unbounded input cannot reach
+// the log.
+func ValidateRelayCredentialRequest(reason string) error {
+	switch reason {
+	case ReasonReplayRejected, ReasonExpired, ReasonRestart:
+		return nil
+	default:
+		return fmt.Errorf("invalid relay credential request reason (len=%d, want replay_rejected|expired|restart)", len(reason))
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -323,8 +324,180 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Contr
 					continue // stale socket: drop
 				}
 				ctrl.HandleSTUNResult(conn, apiKeyID, msg.Challenge, msg.TransactionID, msg.Receipt)
+
+			case "relay_credential_request":
+				// §11.1 (Task 6 amendment): the tunnel manager's bounded,
+				// rate-limited request for a fresh relay_config after the
+				// one-use credential is burned or nearing expiry. Same guards
+				// as stun_result: authenticated session post-hello, current
+				// epoch only — a fenced socket never receives credentials.
+				if agentID == "" {
+					hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "hello required before relay_credential_request"})
+					continue
+				}
+				if ctrl == nil || !ctrl.IsCurrentEpoch(apiKeyID, conn) {
+					continue // stale socket: drop
+				}
+				if err := relayctl.ValidateRelayCredentialRequest(msg.Reason); err != nil {
+					log.Printf("relay_credential_request rejected (api_key_id=%s): %v", apiKeyID, err)
+					continue
+				}
+				if !allowRelayCredentialRequest(apiKeyID) {
+					// §16.4: rate limits bound credential requests. No reply:
+					// the agent's bounded wait re-requests.
+					log.Printf("relay_credential_request rate limited (api_key_id=%s)", apiKeyID)
+					continue
+				}
+				handleRelayCredentialRequest(ctx, conn, app, apiKeyID, cfg)
 			}
 		}
+	}
+}
+
+// §16.4 rate-limit bounds for relay_credential_request, following the Task 16
+// per-agent token-bucket pattern (control/internal/stun): a bucket of N tokens
+// that refills one token per interval, per agent, with a bounded number of
+// tracked agents and lazy idle reclaim. A malformed or broken agent therefore
+// cannot churn credential issuance beyond a bounded sustained rate, and limiter
+// state cannot grow without bound.
+const (
+	// relayCredentialRequestsPerMinute is the bucket capacity AND the
+	// sustained grant rate (one token per refill interval): four immediate
+	// requests, then four per minute. Legitimate recovery (§15.1/§15.2:
+	// frps restart, agent restart, expiry refresh) needs far less; the STUN
+	// challenge bucket uses the same 4/minute bound.
+	relayCredentialRequestsPerMinute = 4
+	// relayCredentialRefillInterval = 60s / relayCredentialRequestsPerMinute.
+	relayCredentialRefillInterval = 15 * time.Second
+	// maxRelayCredentialAgents bounds tracked buckets (matches the STUN
+	// listener's per-agent state cap). Beyond the cap, idle buckets are
+	// reclaimed; if none are idle the request fails closed.
+	maxRelayCredentialAgents = 4096
+	// relayCredentialBucketIdleTTL reclaims buckets of agents that have not
+	// requested within the window (same idle horizon as STUN agent state).
+	relayCredentialBucketIdleTTL = 10 * time.Minute
+)
+
+// relayCredentialBucket is one agent's token bucket. Guarded by
+// relayCredentialLimiter.mu.
+type relayCredentialBucket struct {
+	tokens     float64
+	lastRefill time.Time
+}
+
+// relayCredentialLimiter is the process-wide per-agent limiter. It is keyed by
+// API key (the agent identity) so a reconnecting socket cannot reset its own
+// budget: the epoch fencing already drops stale sockets, and this bound
+// additionally limits churn across the current epoch.
+var relayCredentialLimiter = struct {
+	sync.Mutex
+	buckets map[string]*relayCredentialBucket
+}{buckets: make(map[string]*relayCredentialBucket)}
+
+// allowRelayCredentialRequest reports whether the agent may be served now,
+// consuming one token when it may.
+func allowRelayCredentialRequest(apiKeyID string) bool {
+	return allowRelayCredentialRequestAt(apiKeyID, time.Now())
+}
+
+// allowRelayCredentialRequestAt is allowRelayCredentialRequest with an
+// injectable clock for tests.
+func allowRelayCredentialRequestAt(apiKeyID string, now time.Time) bool {
+	relayCredentialLimiter.Lock()
+	defer relayCredentialLimiter.Unlock()
+
+	bucket, ok := relayCredentialLimiter.buckets[apiKeyID]
+	if !ok {
+		if len(relayCredentialLimiter.buckets) >= maxRelayCredentialAgents {
+			relayCredentialReclaimIdleLocked(now)
+		}
+		if len(relayCredentialLimiter.buckets) >= maxRelayCredentialAgents {
+			return false // bounded state: fail closed rather than grow
+		}
+		bucket = &relayCredentialBucket{tokens: relayCredentialRequestsPerMinute, lastRefill: now}
+		relayCredentialLimiter.buckets[apiKeyID] = bucket
+	}
+
+	// Refill continuously: one token's worth of fraction per elapsed
+	// interval, capped at the capacity. The fraction carries across polls
+	// because lastRefill always advances to now.
+	elapsed := now.Sub(bucket.lastRefill)
+	if elapsed > 0 {
+		bucket.tokens += elapsed.Seconds() / relayCredentialRefillInterval.Seconds()
+		if bucket.tokens > relayCredentialRequestsPerMinute {
+			bucket.tokens = relayCredentialRequestsPerMinute
+		}
+		bucket.lastRefill = now
+	}
+	if bucket.tokens < 1 {
+		return false
+	}
+	bucket.tokens--
+	return true
+}
+
+// relayCredentialReclaimIdleLocked drops buckets idle past the TTL. Caller
+// holds relayCredentialLimiter.mu.
+func relayCredentialReclaimIdleLocked(now time.Time) {
+	for agent, bucket := range relayCredentialLimiter.buckets {
+		if now.Sub(bucket.lastRefill) >= relayCredentialBucketIdleTTL {
+			delete(relayCredentialLimiter.buckets, agent)
+		}
+	}
+}
+
+// handleRelayCredentialRequest serves an already-guarded, already-validated,
+// already-rate-checked §11.1 relay_credential_request: it issues a freshly
+// signed relay_config for the agent's CURRENT assignment/generation via the
+// existing §7.2 signer (a fresh random one-use jti per issue, issued_at and
+// expires_at derived from a single clock reading) and sends it on the current
+// epoch's connection. Relay-unconfigured deployments and missing assignments
+// fail closed: the request is dropped with a diagnostic and credential
+// material is never logged (§7.2/§16.6).
+func handleRelayCredentialRequest(ctx context.Context, conn *websocket.Conn, app core.App, apiKeyID string, cfg *config.Config) {
+	if !cfg.RelayPolicyEnabled() {
+		log.Printf("relay_credential_request dropped: relay policy unconfigured (api_key_id=%s)", apiKeyID)
+		return
+	}
+	settings := relayctl.Settings{
+		GatewayAddr: cfg.RelayGatewayHost,
+		GatewayPort: cfg.RelayGatewayPort,
+		PortRange:   relayctl.PortRange{Min: cfg.RelayPortMin, Max: cfg.RelayPortMax},
+	}
+	if err := settings.Validate(); err != nil {
+		log.Printf("relay_credential_request dropped: invalid relay policy (api_key_id=%s): %v", apiKeyID, err)
+		return
+	}
+	signer, err := relayctl.NewSignerFromHexSeed(cfg.RelayAuthKeySeed)
+	if err != nil {
+		log.Printf("relay_credential_request dropped: relay auth seed unusable (api_key_id=%s)", apiKeyID)
+		return
+	}
+
+	// The agent row exists (hello enrolled it); look it up read-only — a
+	// credential request must never create enrollment state.
+	agents, err := app.FindRecordsByFilter("agents", "api_key_id = {:k}", "", 1, 0, map[string]any{"k": apiKeyID})
+	if err != nil {
+		log.Printf("relay_credential_request dropped: agent lookup failed (api_key_id=%s)", apiKeyID)
+		return
+	}
+	if len(agents) == 0 {
+		log.Printf("relay_credential_request dropped: no agent record (api_key_id=%s)", apiKeyID)
+		return
+	}
+
+	assignment, err := relayctl.EnsureAssignment(app, agents[0], settings.PortRange)
+	if err != nil {
+		log.Printf("relay assignment failed for %s: %v", apiKeyID, err)
+		return
+	}
+	msg, err := relayctl.BuildRelayConfig(assignment, apiKeyID, settings.GatewayAddr, settings.GatewayPort, signer)
+	if err != nil {
+		log.Printf("relay credential issue failed for %s: %v", apiKeyID, err)
+		return
+	}
+	if err := hub.SendDirect(ctx, conn, msg); err != nil {
+		log.Printf("relay_config send failed for %s: %v", apiKeyID, err)
 	}
 }
 

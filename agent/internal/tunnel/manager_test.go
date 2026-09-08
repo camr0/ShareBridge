@@ -119,17 +119,21 @@ func (starter *recordingStarter) recordAt(index int) startRecord {
 }
 
 // fakeCredentialRequester stands in for the production control-WebSocket
-// relay_credential_request sender (wired in later tasks).
+// relay_credential_request sender (production: ControlCredentialRequester).
+// It records the §11.1 reason of every request so tests pin the reason
+// matrix: replay-rejected relogin ⇒ replay_rejected (§15.2).
 type fakeCredentialRequester struct {
 	mu           sync.Mutex
 	requests     int
+	reasons      []CredentialRequestReason
 	requestError error
 }
 
-func (requester *fakeCredentialRequester) RequestCredential(ctx context.Context) error {
+func (requester *fakeCredentialRequester) RequestCredential(ctx context.Context, reason CredentialRequestReason) error {
 	requester.mu.Lock()
 	defer requester.mu.Unlock()
 	requester.requests++
+	requester.reasons = append(requester.reasons, reason)
 	return requester.requestError
 }
 
@@ -137,6 +141,12 @@ func (requester *fakeCredentialRequester) requestCount() int {
 	requester.mu.Lock()
 	defer requester.mu.Unlock()
 	return requester.requests
+}
+
+func (requester *fakeCredentialRequester) requestReasons() []CredentialRequestReason {
+	requester.mu.Lock()
+	defer requester.mu.Unlock()
+	return append([]CredentialRequestReason(nil), requester.reasons...)
 }
 
 // statusCollector receives manager diagnostics from the run goroutine.
@@ -160,6 +170,24 @@ func (collector *statusCollector) hasStatus(status StatusKind) bool {
 		}
 	}
 	return false
+}
+
+// assertReportsNeverContainCredential scans every collected status report for
+// credential material (Task 9 review carry-forward): diagnostics must never
+// carry tunnel credential values (§7.2 log policy, §16.6). Callers pass every
+// distinct credential value the scenario armed so a leak of any of them is
+// caught.
+func assertReportsNeverContainCredential(t *testing.T, collector *statusCollector, credentials ...string) {
+	t.Helper()
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	for _, report := range collector.reports {
+		for _, credential := range credentials {
+			if credential != "" && strings.Contains(report.Reason, credential) {
+				t.Fatalf("status report %q leaked credential material", report.Reason)
+			}
+		}
+	}
 }
 
 // testManagerSettings builds manager settings inside a test temporary
@@ -232,7 +260,8 @@ func configFileContent(t *testing.T, configPath string) string {
 func TestManagerStartsWithoutShell(t *testing.T) {
 	settings := testManagerSettings(t)
 	starter := &recordingStarter{}
-	manager := newTestManager(t, settings, starter, &fakeCredentialRequester{}, &statusCollector{})
+	collector := &statusCollector{}
+	manager := newTestManager(t, settings, starter, &fakeCredentialRequester{}, collector)
 
 	if err := manager.ApplyConfig(validTestConfig()); err != nil {
 		t.Fatalf("ApplyConfig() error = %v", err)
@@ -256,12 +285,14 @@ func TestManagerStartsWithoutShell(t *testing.T) {
 	if _, err := os.Stat(settings.ConfigPath); err != nil {
 		t.Errorf("generated config missing after start: %v", err)
 	}
+	assertReportsNeverContainCredential(t, collector, validTestConfig().Credential)
 }
 
 func TestManagerReplacesOnlyHigherGeneration(t *testing.T) {
 	settings := testManagerSettings(t)
 	starter := &recordingStarter{stopsOnGraceful: true}
-	manager := newTestManager(t, settings, starter, &fakeCredentialRequester{}, &statusCollector{})
+	collector := &statusCollector{}
+	manager := newTestManager(t, settings, starter, &fakeCredentialRequester{}, collector)
 
 	generationOne := validTestConfig()
 	generationOne.Generation = 1
@@ -337,13 +368,17 @@ func TestManagerReplacesOnlyHigherGeneration(t *testing.T) {
 	if secondChild.gracefulStopCount() != 0 {
 		t.Error("fenced generation must not stop the current child")
 	}
+	assertReportsNeverContainCredential(t, collector,
+		"credential-generation-one", "credential-generation-one-refreshed",
+		"credential-stale", "credential-generation-two")
 }
 
 func TestManagerRefreshesExpiredReconnectCredential(t *testing.T) {
 	settings := testManagerSettings(t)
 	starter := &recordingStarter{}
 	requester := &fakeCredentialRequester{}
-	manager := newTestManager(t, settings, starter, requester, &statusCollector{})
+	collector := &statusCollector{}
+	manager := newTestManager(t, settings, starter, requester, collector)
 
 	initial := validTestConfig()
 	initial.Generation = 3
@@ -364,6 +399,11 @@ func TestManagerRefreshesExpiredReconnectCredential(t *testing.T) {
 	waitForCondition(t, "credential request after child exit", time.Second, func() bool {
 		return requester.requestCount() == 1
 	})
+	// Reason matrix (§11.1): the exited child's re-Login was replay-rejected
+	// (burned one-use jti, §15.2), so the request must carry replay_rejected.
+	if reasons := requester.requestReasons(); len(reasons) != 1 || reasons[0] != ReasonReplayRejected {
+		t.Errorf("credential request reasons = %v, want [replay_rejected]", reasons)
+	}
 
 	// No relogin retry-loop with the stale credential: with 1ms backoff a
 	// looping manager would accumulate many starts inside this window.
@@ -398,6 +438,9 @@ func TestManagerRefreshesExpiredReconnectCredential(t *testing.T) {
 	waitForCondition(t, "second credential request", time.Second, func() bool {
 		return requester.requestCount() == 2
 	})
+	if reasons := requester.requestReasons(); len(reasons) != 2 || reasons[1] != ReasonReplayRejected {
+		t.Errorf("second credential request reason = %v, want replay_rejected", reasons)
+	}
 	assertConditionStays(t, "no restart between exit and fresh credential", 120*time.Millisecond, func() bool {
 		return starter.startCount() == 2
 	})
@@ -414,6 +457,11 @@ func TestManagerRefreshesExpiredReconnectCredential(t *testing.T) {
 	if requester.requestCount() != 2 {
 		t.Errorf("credential requests overall = %d, want exactly 2", requester.requestCount())
 	}
+
+	// Credential-never-in-reports scan (Task 9 review carry-forward): none of
+	// the armed credential values may appear in any diagnostic reason.
+	assertReportsNeverContainCredential(t, collector,
+		"credential-burned-jti", "credential-fresh-jti", "credential-generation-four")
 }
 
 func TestManagerStopsAndKillsChild(t *testing.T) {
@@ -443,6 +491,7 @@ func TestManagerStopsAndKillsChild(t *testing.T) {
 		if err := manager.ApplyConfig(validTestConfig()); !errors.Is(err, errManagerStopped) {
 			t.Errorf("ApplyConfig() after Stop() = %v, want errManagerStopped", err)
 		}
+		assertReportsNeverContainCredential(t, collector, validTestConfig().Credential)
 	})
 
 	t.Run("unresponsive child is killed after the grace period", func(t *testing.T) {
@@ -467,6 +516,107 @@ func TestManagerStopsAndKillsChild(t *testing.T) {
 		}
 		if !collector.hasStatus(StatusStopped) {
 			t.Error("manager must report stopped status after killing the child")
+		}
+		assertReportsNeverContainCredential(t, collector, validTestConfig().Credential)
+	})
+}
+
+// TestControlCredentialRequesterSendsExactReasonWithoutBlockingLoop covers
+// the production CredentialRequester (§11.1): RequestCredential must enqueue
+// without blocking the caller (the manager's run loop must never wait on
+// WebSocket I/O — Task 9 carry-forward), pass the §11.1 reason through
+// untouched, reject unknown reasons, and keep the queue bounded.
+func TestControlCredentialRequesterSendsExactReasonWithoutBlockingLoop(t *testing.T) {
+	t.Run("enqueues without blocking and forwards the exact reason", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		type sendRecord struct {
+			reason CredentialRequestReason
+		}
+		sent := make(chan sendRecord, 8)
+		requester := NewControlCredentialRequester(ctx, func(ctx context.Context, reason CredentialRequestReason) error {
+			time.Sleep(150 * time.Millisecond) // simulated WebSocket write latency
+			sent <- sendRecord{reason: reason}
+			return nil
+		})
+
+		start := time.Now()
+		if err := requester.RequestCredential(ctx, ReasonReplayRejected); err != nil {
+			t.Fatalf("RequestCredential() error = %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			t.Errorf("RequestCredential blocked for %v; the manager loop must never wait on WS I/O", elapsed)
+		}
+
+		select {
+		case record := <-sent:
+			if record.reason != ReasonReplayRejected {
+				t.Errorf("sent reason = %q, want replay_rejected", record.reason)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("enqueued request was never sent")
+		}
+	})
+
+	t.Run("rejects unknown reasons before any send", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var sendCalls int
+		var mu sync.Mutex
+		requester := NewControlCredentialRequester(ctx, func(ctx context.Context, reason CredentialRequestReason) error {
+			mu.Lock()
+			mu.Unlock()
+			sendCalls++
+			return nil
+		})
+
+		if err := requester.RequestCredential(ctx, CredentialRequestReason("because_i_said_so")); err == nil {
+			t.Fatal("unknown reason must be rejected")
+		}
+		if err := requester.RequestCredential(ctx, ""); err == nil {
+			t.Fatal("empty reason must be rejected")
+		}
+		time.Sleep(50 * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		if sendCalls != 0 {
+			t.Errorf("send calls = %d, want 0 for rejected reasons", sendCalls)
+		}
+	})
+
+	t.Run("bounded queue fails fast instead of blocking", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		release := make(chan struct{})
+		requester := NewControlCredentialRequester(ctx, func(ctx context.Context, reason CredentialRequestReason) error {
+			<-release // block the single worker so the queue fills
+			return nil
+		})
+
+		// Fill the queue to its bound: every enqueue returns immediately.
+		for i := 0; i < credentialRequestQueueCapacity; i++ {
+			if err := requester.RequestCredential(ctx, ReasonExpired); err != nil {
+				t.Fatalf("RequestCredential(%d) error = %v", i, err)
+			}
+		}
+		// One beyond the bound must fail fast (the manager retries with
+		// backoff) instead of blocking the supervision loop.
+		if err := requester.RequestCredential(ctx, ReasonExpired); err == nil {
+			t.Fatal("enqueue beyond the queue bound must fail")
+		}
+		close(release)
+	})
+
+	t.Run("stops with the lifecycle context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		requester := NewControlCredentialRequester(ctx, func(ctx context.Context, reason CredentialRequestReason) error {
+			return nil
+		})
+		cancel()
+		if err := requester.RequestCredential(context.Background(), ReasonRestart); err == nil {
+			t.Fatal("RequestCredential after lifecycle cancellation must fail")
 		}
 	})
 }

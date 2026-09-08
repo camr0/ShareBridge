@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/websocket"
+	"sharebridge/agent/internal/tunnel"
 )
 
 // Message is any message received from the signaling server.
@@ -419,6 +420,37 @@ func (c *Client) SendLockdownStatus(ctx context.Context, status LockdownStatus) 
 		Generation: status.Generation,
 		Locked:     status.Locked,
 	})
+}
+
+// SendRelayCredentialRequest sends the §11.1 agent → control
+// relay_credential_request message: { reason } — the tunnel manager's
+// bounded, rate-limited request for a fresh relay_config after the one-use
+// credential is burned (e.g. frps restart) or nearing expiry. The reason is
+// the closed §11.1 enum shared with the tunnel manager
+// (tunnel.CredentialRequestReason); an unknown reason fails closed here
+// because control strictly parses it.
+func (c *Client) SendRelayCredentialRequest(ctx context.Context, reason tunnel.CredentialRequestReason) error {
+	switch reason {
+	case tunnel.ReasonReplayRejected, tunnel.ReasonExpired, tunnel.ReasonRestart:
+	default:
+		return fmt.Errorf("invalid relay_credential_request reason %q", string(reason))
+	}
+	return c.Send(ctx, struct {
+		Type   string `json:"type"`
+		Reason string `json:"reason"`
+	}{
+		Type:   "relay_credential_request",
+		Reason: string(reason),
+	})
+}
+
+// ParseRelayConfig decodes the exact §11.1 control → agent relay_config wire
+// message on the receive path. It is a deliberate re-export of Task 9's
+// strict tunnel parser (unknown fields and trailing data rejected, bounded
+// shapes, RFC3339 expiry) so there is exactly one parser for the message the
+// credential requester waits for.
+func ParseRelayConfig(data []byte) (tunnel.Config, error) {
+	return tunnel.ParseRelayConfig(data)
 }
 
 // truncateTelemetryReason bounds a diagnostic reason at control's telemetry

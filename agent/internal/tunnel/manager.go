@@ -58,13 +58,121 @@ type StatusReport struct {
 	Reason     string
 }
 
+// CredentialRequestReason is one of the three closed §11.1
+// relay_credential_request reason values: why the manager needs a fresh
+// relay admission credential. The values are the exact wire values control
+// strictly parses.
+type CredentialRequestReason string
+
+// The §11.1 relay_credential_request reasons:
+//
+//   - replay_rejected: the one-use jti was burned, so a re-Login would be
+//     replay-rejected (any child exit is treated this way, fail-closed);
+//   - expired: the armed credential is nearing expiry;
+//   - restart: a fresh credential after a restart recovery.
+const (
+	ReasonReplayRejected CredentialRequestReason = "replay_rejected"
+	ReasonExpired        CredentialRequestReason = "expired"
+	ReasonRestart        CredentialRequestReason = "restart"
+)
+
+// validCredentialRequestReason reports whether reason is exactly one of the
+// three §11.1 values.
+func validCredentialRequestReason(reason CredentialRequestReason) bool {
+	switch reason {
+	case ReasonReplayRejected, ReasonExpired, ReasonRestart:
+		return true
+	default:
+		return false
+	}
+}
+
 // CredentialRequester asks control for a fresh relay admission credential by
-// sending the §11.1 relay_credential_request message over the authenticated
-// agent WebSocket. The daemon/control wiring lands in later tasks; tests
-// inject fakes. The manager depends only on this narrow interface and never
-// touches the production WebSocket itself.
+// sending the §11.1 relay_credential_request message (with its reason) over
+// the authenticated agent WebSocket. Implementations MUST NOT block the
+// caller on WebSocket I/O: RequestCredential is invoked on the manager's
+// supervision loop, which must never wait on the network (the production
+// ControlCredentialRequester enqueues; the relay_config reply arrives later
+// via ApplyConfig). Tests inject fakes.
 type CredentialRequester interface {
-	RequestCredential(ctx context.Context) error
+	RequestCredential(ctx context.Context, reason CredentialRequestReason) error
+}
+
+// Control credential requester bounds (§16.4): the queue is bounded so a
+// stalled WebSocket cannot buffer unbounded work, and each send gets a
+// bounded write window.
+const (
+	// credentialRequestQueueCapacity bounds pending sends; an enqueue beyond
+	// it fails fast and the manager retries with backoff.
+	credentialRequestQueueCapacity = 4
+	// credentialRequestSendTimeout bounds one WebSocket write.
+	credentialRequestSendTimeout = 10 * time.Second
+)
+
+// ControlCredentialRequester is the production CredentialRequester: it owns a
+// single worker goroutine that performs the §11.1 relay_credential_request
+// send, so RequestCredential only enqueues and returns — the manager's run
+// loop never blocks on WebSocket I/O (Task 9 carry-forward). The relay_config
+// reply is NOT consumed here: it arrives on the WebSocket read loop and
+// reaches the manager through ApplyConfig (the existing config-apply path).
+type ControlCredentialRequester struct {
+	send      func(ctx context.Context, reason CredentialRequestReason) error
+	requests  chan CredentialRequestReason
+	lifecycle context.Context
+}
+
+// NewControlCredentialRequester builds the production requester around the
+// send function (wired to the signaling client's SendRelayCredentialRequest)
+// and starts its worker. The lifecycle context is the WebSocket/session
+// context: canceling it stops the worker and fails further requests.
+func NewControlCredentialRequester(lifecycle context.Context, send func(ctx context.Context, reason CredentialRequestReason) error) *ControlCredentialRequester {
+	requester := &ControlCredentialRequester{
+		send:      send,
+		requests:  make(chan CredentialRequestReason, credentialRequestQueueCapacity),
+		lifecycle: lifecycle,
+	}
+	go requester.work()
+	return requester
+}
+
+// work drains the queue until the lifecycle context ends. One send at a time,
+// each with a bounded write window.
+func (requester *ControlCredentialRequester) work() {
+	for {
+		select {
+		case reason := <-requester.requests:
+			sendCtx, cancelSend := context.WithTimeout(requester.lifecycle, credentialRequestSendTimeout)
+			_ = requester.send(sendCtx, reason)
+			cancelSend()
+		case <-requester.lifecycle.Done():
+			return
+		}
+	}
+}
+
+// RequestCredential validates the reason and enqueues the send without
+// blocking (or erroring if the queue is full or the lifecycle has ended —
+// the manager's retry machinery handles both). It never performs network
+// I/O on the calling goroutine.
+func (requester *ControlCredentialRequester) RequestCredential(ctx context.Context, reason CredentialRequestReason) error {
+	if !validCredentialRequestReason(reason) {
+		return fmt.Errorf("invalid relay credential request reason %q", string(reason))
+	}
+	if err := requester.lifecycle.Err(); err != nil {
+		return fmt.Errorf("relay credential requester stopped: %w", err)
+	}
+	select {
+	case requester.requests <- reason:
+		return nil
+	default:
+		// Queue full, or the worker exited right after the lifecycle check
+		// (benign race: a queued send would target a dead context anyway).
+		// Either way fail fast; the manager retries with backoff.
+		if err := requester.lifecycle.Err(); err != nil {
+			return fmt.Errorf("relay credential requester stopped: %w", err)
+		}
+		return fmt.Errorf("relay credential request queue full (%d)", credentialRequestQueueCapacity)
+	}
 }
 
 // childProcess is the supervisor's view of one frpc child.
@@ -204,16 +312,17 @@ type Manager struct {
 	publishedGeneration atomic.Int64
 
 	// State below is owned by the run goroutine.
-	armedConfig          Config
-	hasArmedConfig       bool
-	armedConsumed        bool // the armed credential was already used for one Login
-	currentGeneration    int
-	child                childProcess
-	childStartedAt       time.Time
-	restartAttempt       int
-	restartTimer         *time.Timer
-	pendingTimer         timerKind
-	waitingForCredential bool
+	armedConfig             Config
+	hasArmedConfig          bool
+	armedConsumed           bool // the armed credential was already used for one Login
+	currentGeneration       int
+	child                   childProcess
+	childStartedAt          time.Time
+	restartAttempt          int
+	restartTimer            *time.Timer
+	pendingTimer            timerKind
+	waitingForCredential    bool
+	pendingCredentialReason CredentialRequestReason
 }
 
 // ManagerOption adjusts test-visible lifecycle knobs.
@@ -404,9 +513,12 @@ func (manager *Manager) handleChildExited(event managerEvent) {
 	manager.emit(manager.currentGeneration, StatusStopped, fmt.Sprintf("frpc exited: %v", event.waitError))
 	// The credential's one-use jti may now be burned at the relay plugin:
 	// never re-login with it (§15.2). Any restart goes through a fresh
-	// relay_credential_request first.
+	// relay_credential_request first, with the replay_rejected reason: the
+	// next Login with the consumed jti would be replay-rejected (any child
+	// exit is treated as a burned jti, fail-closed).
 	manager.armedConsumed = true
 	manager.waitingForCredential = true
+	manager.pendingCredentialReason = ReasonReplayRejected
 	manager.requestCredentialAndScheduleRestart()
 }
 
@@ -460,15 +572,21 @@ func (manager *Manager) startChildNow() {
 // credential over the authenticated WebSocket (§15.2) and arms the retry
 // machinery: on success a bounded wait re-requests if control never answers;
 // on failure the request itself is retried with backoff. Either way the
-// manager never restarts the child with the stale credential.
+// manager never restarts the child with the stale credential. The §11.1
+// reason carried is the one recorded when the wait began (replay_rejected
+// today: every current recovery state is the burned-jti path).
 func (manager *Manager) requestCredentialAndScheduleRestart() {
 	if manager.requester == nil {
 		manager.emit(manager.currentGeneration, StatusError, "credential requester unavailable; tunnel stays down")
 		return
 	}
+	reason := manager.pendingCredentialReason
+	if !validCredentialRequestReason(reason) {
+		reason = ReasonReplayRejected
+	}
 	requestContext, cancelRequest := context.WithTimeout(context.Background(), manager.credentialWaitTimeout)
 	defer cancelRequest()
-	if err := manager.requester.RequestCredential(requestContext); err != nil {
+	if err := manager.requester.RequestCredential(requestContext, reason); err != nil {
 		manager.emit(manager.currentGeneration, StatusError, fmt.Sprintf("relay credential request failed: %v", err))
 		manager.restartAttempt++
 		manager.scheduleTimer(timerRetryCredentialRequest, manager.backoffDelayForAttempt())
