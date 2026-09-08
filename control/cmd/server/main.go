@@ -60,12 +60,6 @@ func main() {
 		}
 	}
 
-	ctrl := directctl.NewController(app, h, coord, dnsClient, directctl.Config{
-		BaseDomain:            cfg.BaseDomain,
-		RelayGatewayIPv4:      cfg.RelayGatewayIPv4,
-		RelaySelectionEnabled: cfg.RelaySelectionEnabled,
-	})
-
 	// Task 12 route publisher: derives exact relay routes from PocketBase
 	// rows and feeds them to agent-WS lifecycle hooks (add after successful
 	// registration, revoke before local lifecycle removal) while Run
@@ -73,10 +67,39 @@ func main() {
 	// seconds while sync is healthy (§14). Zero config selects the §14
 	// defaults; agents without a relay assignment produce no routes, so
 	// deployments with relay unconfigured behave exactly as before.
+	// Constructed BEFORE the controller: the controller's §9.1 relay terms
+	// join presence against the publisher's current route revision (Task 15
+	// read-then-check contract).
 	routePublisher, err := relayctl.NewPublisher(app, relayctl.PublisherConfig{})
 	if err != nil {
 		log.Fatalf("route publisher: %v", err)
 	}
+
+	// Task 15 presence view: control's gateway-authoritative relay
+	// availability. The Task 11 sync server feeds it via PresenceSink
+	// (ApplyPresenceSnapshot/ApplyPresenceEvents); the sync LISTENER itself
+	// (relayctl.NewServer TLS endpoint plus its certificate/env plumbing) is
+	// deliberately NOT wired here — it belongs to a later task's file list.
+	// Until that listener ships, the view stays empty in production, so
+	// every relay term fails CLOSED (RelayAvailable is always false — never
+	// a faked availability): direct candidates get the interstitial, and
+	// relay-dependent cases answer 503, exactly as before this wiring.
+	presenceView, err := relayctl.NewPresenceView(relayctl.PresenceViewConfig{
+		App:    app, // best-effort relay_last_seen_at diagnostics (§12)
+		Routes: routePublisher,
+	})
+	if err != nil {
+		log.Fatalf("relay presence view: %v", err)
+	}
+
+	ctrl := directctl.NewController(app, h, coord, dnsClient, directctl.Config{
+		BaseDomain:            cfg.BaseDomain,
+		RelayGatewayIPv4:      cfg.RelayGatewayIPv4,
+		RelaySelectionEnabled: cfg.RelaySelectionEnabled,
+		RelayPresence:         presenceView,
+		Routes:                routePublisher,
+	})
+
 	publisherCtx, stopPublisher := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopPublisher()
 	go routePublisher.Run(publisherCtx)
@@ -166,6 +189,17 @@ func main() {
 		router.GET("/share/{code}", serveCanonicalRoute(ctrl))
 
 		router.GET("/s/{code}", serveCanonicalRoute(ctrl))
+
+		// Task 21 bounded preparation endpoint (§9.3): the interstitial's
+		// same-origin fetch. The caller is the unauthenticated recipient
+		// holding the native share code (the bearer capability) — no auth
+		// middleware. One four-second preparation context covers the inline
+		// STUN refresh, open_signal/ack and the verified-tuple probe; the
+		// response is bounded no-store JSON with control-derived URLs only
+		// (404 revoked/unknown, 410 expired/unsupported inside the handler).
+		router.POST("/api/shares/{code}/prepare-route", func(e *core.RequestEvent) error {
+			return ctrl.PrepareRoute(e.Response, e.Request, e.Request.PathValue("code"))
+		})
 		// Homepage (marketing)
 		router.GET("/", handler.ServeFileNoCache("./web/home.html"))
 
