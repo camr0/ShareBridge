@@ -89,10 +89,11 @@ func DefaultRouteLimits() Limits {
 // PublisherConfig configures a Publisher. Zero durations/counts select the
 // §14 defaults; negative values and non-positive limit values are rejected.
 // RevisionSeed zero starts the monotonic route-revision counter at the
-// current Unix time (seconds): revisions must never regress across a
-// control restart while a gateway keeps its applied state, and a
-// time-seeded counter achieves that without a schema change. Tests inject a
-// small fixed seed.
+// current Unix time (seconds). Revision monotonicity holds ONLY within one
+// control epoch: across restarts the per-boot control epoch (Epoch below)
+// is the authority that makes new snapshots wholesale-adoptable regardless
+// of revision regression, so the seed needs no cross-restart guarantees
+// (R2, ruling 6). Tests inject small fixed seeds.
 type PublisherConfig struct {
 	// Limits attaches deterministic concurrency ceilings to every route
 	// (DefaultRouteLimits when left zero). Within a lease epoch these can
@@ -100,6 +101,12 @@ type PublisherConfig struct {
 	Limits Limits
 	// RevisionSeed starts the monotonic revision counter.
 	RevisionSeed uint64
+	// Epoch is the control epoch (boot identifier) stamped on every
+	// snapshot, delta page, and acknowledgement this publisher serves. Zero
+	// generates one from the boot time (UnixNano). The gateway compares
+	// epochs — never revisions — to adopt a restarted control's state, and
+	// acknowledgements from other epochs never satisfy sync health (R2).
+	Epoch uint64
 	// MaxRoutes bounds one snapshot (DefaultMaxPublisherRoutes).
 	MaxRoutes int
 	// DeltaRetentionWindow bounds the `since` history
@@ -151,9 +158,13 @@ type Publisher struct {
 	logger            *slog.Logger
 
 	mu sync.Mutex
+	// epoch is the control boot identifier stamped on every served payload
+	// (R2). Constant for the life of the process.
+	epoch uint64
 	// revision is the monotonic route-revision counter; it only moves
-	// forward for the life of the process and is time-seeded so a control
-	// restart cannot regress below what a live gateway already applied.
+	// forward for the life of the process and is time-seeded. Its guarantee
+	// is per-epoch only: cross-restart adoption is decided by epoch
+	// comparison at the gateway, not by revisions (R2, ruling 6).
 	revision uint64
 	// entries tracks the last published active route per hostname. An
 	// absent entry never implies absence on the gateway: after a control
@@ -214,6 +225,10 @@ func NewPublisher(app core.App, config PublisherConfig) (*Publisher, error) {
 	if revisionSeed == 0 {
 		revisionSeed = uint64(time.Now().UTC().Unix())
 	}
+	epoch := config.Epoch
+	if epoch == 0 {
+		epoch = uint64(time.Now().UTC().UnixNano())
+	}
 	nowFn := config.Now
 	if nowFn == nil {
 		nowFn = time.Now
@@ -227,10 +242,19 @@ func NewPublisher(app core.App, config PublisherConfig) (*Publisher, error) {
 		refreshInterval:   config.LeaseRefreshInterval,
 		nowFn:             nowFn,
 		logger:            slog.Default(),
+		epoch:             epoch,
 		revision:          revisionSeed,
 		entries:           make(map[string]publisherRoute),
 		revokedAt:         make(map[string]time.Time),
 	}, nil
+}
+
+// Epoch returns the control epoch (boot identifier) stamped on every
+// snapshot, delta page, and acknowledgement this publisher serves.
+func (p *Publisher) Epoch() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.epoch
 }
 
 // PublishAdd publishes the route_add delta for a session after its
@@ -384,7 +408,7 @@ func (p *Publisher) RouteSnapshot() (Snapshot, error) {
 		})
 	}
 	sort.Slice(routes, func(a, b int) bool { return routes[a].Hostname < routes[b].Hostname })
-	return Snapshot{Version: ProtocolVersion, Revision: p.revision, Routes: routes}, nil
+	return Snapshot{Version: ProtocolVersion, Epoch: p.epoch, Revision: p.revision, Routes: routes}, nil
 }
 
 // routeLimitsLocked returns the limits a snapshot route must carry: the
@@ -398,7 +422,10 @@ func (p *Publisher) routeLimitsLocked(hostname string) Limits {
 }
 
 // RouteDeltas implements RouteSource: the ordered delta page answering
-// `since`. The completeness rule is contiguity: an OK page is returned only
+// `since`, stamped with this control's epoch (R2: the gateway never applies
+// deltas across an epoch boundary — a page from any other epoch than the one
+// it last snapshotted forces reconciliation). The completeness rule is
+// contiguity: an OK page is returned only
 // when the ring still contains exactly the successor delta `since+1` (the
 // ring is a contiguous revision suffix, so everything after it is present
 // too); if the successor has aged out of the bounded retention — window or
@@ -414,9 +441,9 @@ func (p *Publisher) RouteDeltas(since uint64) (DeltaPage, error) {
 		return DeltaPage{}, fmt.Errorf("%w: requested since %d is ahead of control revision %d", ErrBadRevision, since, p.revision)
 	}
 	if since == p.revision {
-		return DeltaPage{Version: ProtocolVersion, Status: DeltaStatusOK, Since: since, LatestRevision: p.revision}, nil
+		return DeltaPage{Version: ProtocolVersion, Epoch: p.epoch, Status: DeltaStatusOK, Since: since, LatestRevision: p.revision}, nil
 	}
-	page := DeltaPage{Version: ProtocolVersion, Status: DeltaStatusGap, Since: since, LatestRevision: p.revision}
+	page := DeltaPage{Version: ProtocolVersion, Epoch: p.epoch, Status: DeltaStatusGap, Since: since, LatestRevision: p.revision}
 	collected := make([]RouteDelta, 0, len(p.deltas))
 	for _, retained := range p.deltas {
 		if retained.delta.Revision > since {
@@ -436,10 +463,19 @@ func (p *Publisher) RouteDeltas(since uint64) (DeltaPage, error) {
 // Acknowledge implements StatusSink: records the gateway's explicitly
 // acknowledged last-applied revision. A new gateway boot ID replaces the
 // recorded state wholesale (§15.1: a restarted gateway may report a lower
-// revision again); the same boot only moves forward.
+// revision again); the same boot only moves forward. Acks carrying another
+// control's epoch are stale in-flight traffic across a control restart and
+// are ignored without error — they must never satisfy the current epoch's
+// health watermark (R2); the gateway re-acks after reconciling to the new
+// epoch's snapshot.
 func (p *Publisher) Acknowledge(ack StatusAck) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if ack.ControlEpoch != p.epoch {
+		p.logger.Debug("relayctl: status ack for a foreign control epoch ignored",
+			"ack_epoch", ack.ControlEpoch, "epoch", p.epoch)
+		return nil
+	}
 	if ack.GatewayBootID != p.ackBootID {
 		p.ackBootID = ack.GatewayBootID
 		p.ackedRevision = ack.LastAppliedRevision
@@ -464,6 +500,23 @@ func (p *Publisher) Healthy() bool {
 
 func (p *Publisher) healthyLocked() bool {
 	return p.hasAck && p.ackedRevision >= p.revision
+}
+
+// AcknowledgedRevision reports the last route revision the current gateway
+// boot has explicitly acknowledged applying within this control epoch, or 0
+// before any acknowledgement. It is the route-currency term of the Task 15
+// presence view's Available join under the RouteSyncStatus contract: unlike
+// CurrentRevision (control's own publish watermark), this value proves what
+// the GATEWAY actually holds — a route read is servable only at a revision
+// the gateway has confirmed applying (R2, ruling 4; Sol Important-5). Single
+// lock read; no I/O.
+func (p *Publisher) AcknowledgedRevision() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.hasAck {
+		return 0
+	}
+	return p.ackedRevision
 }
 
 // RefreshLeases re-touches every currently routable route with a

@@ -485,3 +485,74 @@ func TestAgentTelemetryCannotSetAvailability(t *testing.T) {
 		t.Fatalf("fresh gateway fact did not restore availability")
 	}
 }
+
+// ackingRoutes is a RouteRevisionSource that also satisfies RouteSyncStatus,
+// modeling the Task 12 publisher's gateway-acknowledgement watermark and
+// sync health (R2 ruling 4, Sol Important-5).
+type ackingRoutes struct {
+	revision uint64
+	acked    uint64
+	healthy  bool
+}
+
+func (s *ackingRoutes) CurrentRevision() uint64      { return s.revision }
+func (s *ackingRoutes) AcknowledgedRevision() uint64 { return s.acked }
+func (s *ackingRoutes) Healthy() bool                { return s.healthy }
+
+// TestAvailableProvesGatewayAcknowledgedRevisionWhileSyncHealthy pins R2
+// ruling 4: when the route source exposes the gateway acknowledgement
+// watermark and sync health, the Available join is proved gateway-side — a
+// revision control published but the gateway has not acked is never
+// selectable, and sync being down (a control restart before the gateway
+// re-converges and re-acks) fails every relay term closed.
+func TestAvailableProvesGatewayAcknowledgedRevisionWhileSyncHealthy(t *testing.T) {
+	app := newPublisherTestApp(t)
+	_, agentA := createPublisherAgent(t, app, "ack5-a", "sb0a1b2c3d", 10001, 3)
+	clock := newFakeClock(presenceViewBase)
+
+	source := &ackingRoutes{revision: 42, acked: 41, healthy: true}
+	view := newPresenceTestView(t, app, source, clock.Now)
+	env := presenceSnapshot(presenceTestBoot, 1, []PresenceEvent{
+		presenceOnline(presenceTestBoot, 1, agentA, 10001, 3, presenceViewBase.Add(45*time.Second)),
+	})
+	if err := view.ApplyPresenceSnapshot(env); err != nil {
+		t.Fatalf("apply presence snapshot: %v", err)
+	}
+
+	// The gateway acked 41; control has since published 42. Only the acked
+	// revision is provably held by the gateway.
+	if !view.Available(agentA, 10001, 3, 41, presenceViewBase) {
+		t.Fatalf("Available at the gateway-acked revision 41 = false, want true")
+	}
+	if view.Available(agentA, 10001, 3, 42, presenceViewBase) {
+		t.Fatalf("Available at the published-but-unacked revision 42 = true, want false")
+	}
+
+	// Sync unhealthy (R2 belt-and-braces): relay unavailable even at the
+	// acked revision — a control restart must fail relay selection closed
+	// until the gateway re-converges and re-acks.
+	source.healthy = false
+	if view.Available(agentA, 10001, 3, 41, presenceViewBase) {
+		t.Fatalf("Available while sync is unhealthy = true, want false")
+	}
+	source.healthy = true
+
+	// No acknowledgement recorded at all: nothing is provably held.
+	source.acked = 0
+	if view.Available(agentA, 10001, 3, 41, presenceViewBase) {
+		t.Fatalf("Available with an empty ack watermark = true, want false")
+	}
+
+	// Legacy stub sources (RouteRevisionSource only) keep the historical
+	// publisher-watermark join, so existing test seams are unaffected.
+	legacy := newPresenceTestView(t, app, fixedRoutes{revision: 42}, clock.Now)
+	if err := legacy.ApplyPresenceSnapshot(env); err != nil {
+		t.Fatalf("apply presence snapshot (legacy source): %v", err)
+	}
+	if !legacy.Available(agentA, 10001, 3, 42, presenceViewBase) {
+		t.Fatalf("legacy watermark join broken: Available at the current revision = false, want true")
+	}
+	if legacy.Available(agentA, 10001, 3, 43, presenceViewBase) {
+		t.Fatalf("legacy watermark join broken: Available past the current revision = true, want false")
+	}
+}

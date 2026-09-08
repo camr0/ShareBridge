@@ -90,6 +90,28 @@ type RouteRevisionSource interface {
 	CurrentRevision() uint64
 }
 
+// RouteSyncStatus is the optional, richer contract a RouteRevisionSource may
+// also satisfy — *Publisher does. When the injected source implements it,
+// the Available join upgrades from "control published this revision" (the
+// publisher watermark) to the gateway-authoritative proof (R2, ruling 4;
+// Sol Important-5):
+//
+//   - AcknowledgedRevision is the last revision the gateway explicitly
+//     confirmed applying; comparing against it (instead of the local
+//     CurrentRevision watermark) means a route is servable only at a
+//     revision the gateway verifiably holds.
+//   - Healthy is the sync-health term (§14): while control↔gateway sync is
+//     down — including between a control restart and the gateway's first
+//     re-ack — nothing is relay-selectable (belt-and-braces fail-closed).
+//
+// Sources implementing only RouteRevisionSource keep the historical
+// watermark join (test stubs; a conservative-safe comparison documented on
+// Available).
+type RouteSyncStatus interface {
+	AcknowledgedRevision() uint64
+	Healthy() bool
+}
+
 // PresenceViewConfig is the fail-closed construction contract for the view.
 type PresenceViewConfig struct {
 	// App persists the relay_last_seen_at diagnostic (§12). nil disables the
@@ -171,6 +193,15 @@ func NewPresenceView(config PresenceViewConfig) (*PresenceView, error) {
 // accepted from any boot: the posting peer is the pinned gateway identity,
 // and its snapshot IS the current truth (the same wholesale-replacement-on-
 // new-boot posture the Task 11 ack records take).
+//
+// Task 34 republish requirement (Sol Important-4, R2 ruling 5): periodic
+// full-state republish must be wired by Task 34 — while sync is healthy the
+// gateway must re-post this snapshot on a cadence ≤ DefaultMaxLeaseTTL
+// (60 s), because every control-side lease is bounded by receipt + 60 s and
+// nothing else renews it: a silent gateway goes relay-unavailable within one
+// lease period even while its FRP pings stay healthy. Nothing here blocks
+// that wiring: this method already accepts wholesale republishes from any
+// boot, and the route snapshot fetch follows any epoch change (R2).
 func (view *PresenceView) ApplyPresenceSnapshot(envelope PresenceEnvelope) error {
 	if err := ValidatePresenceSnapshotEnvelope(envelope, MaxPresenceEventsPerEnvelope); err != nil {
 		return err
@@ -355,7 +386,16 @@ func (view *PresenceView) applyEventLocked(leases map[string]presenceLease, even
 //	Available = ∃ lease for agentID with lease.relayPort == relayPort
 //	            AND lease.generation == generation        (exact join)
 //	            AND lease.expiresAt.After(now)            (unexpired at now)
-//	            AND routeRevision == routes.CurrentRevision() (read still current)
+//	            AND route read is still current, proved gateway-side:
+//	              sync Healthy() AND routeRevision == AcknowledgedRevision()
+//	              (RouteSyncStatus, R2 ruling 4); sources implementing only
+//	              RouteRevisionSource (test stubs) fall back to
+//	              routeRevision == routes.CurrentRevision()
+//
+// The gateway-side proof (Sol Important-5): the acknowledged watermark is
+// what the gateway verifiably holds, so an unacked route add is never
+// selectable and a control restart (sync unhealthy until the gateway re-
+// conciles and re-acks) fails every relay term closed until convergence.
 //
 // A nil route source, an out-of-range port, or an out-of-int64-domain
 // generation is fail-closed false. The predicate is pure: it mutates nothing,
@@ -371,8 +411,14 @@ func (view *PresenceView) Available(agentID string, relayPort int, generation ui
 	if generation > math.MaxInt64 {
 		return false // cannot match a persisted int64 generation
 	}
-	currentRevision := view.routes.CurrentRevision()
-	if routeRevision != currentRevision {
+	if sync, ok := view.routes.(RouteSyncStatus); ok {
+		if !sync.Healthy() {
+			return false // sync down: relay unavailable, fail closed (R2 ruling 4)
+		}
+		if routeRevision != sync.AcknowledgedRevision() {
+			return false // the gateway has not verifiably applied this revision
+		}
+	} else if routeRevision != view.routes.CurrentRevision() {
 		return false // the caller's route read moved: re-read, never serve stale
 	}
 	view.mu.Lock()

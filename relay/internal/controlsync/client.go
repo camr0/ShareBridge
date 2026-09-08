@@ -103,8 +103,13 @@ type Route struct {
 }
 
 // Snapshot is the full route snapshot fetched at boot and on revision gaps.
+// Epoch is the control boot identifier that produced it — always present,
+// including on empty snapshots. The applier compares epochs (never
+// revisions) to decide that a newer control epoch wholesale-replaces route
+// state and that an older epoch must be rejected (R2, §15.1).
 type Snapshot struct {
 	Version  int     `json:"version"`
+	Epoch    uint64  `json:"epoch"`
 	Revision uint64  `json:"revision"`
 	Routes   []Route `json:"routes"`
 }
@@ -117,9 +122,12 @@ type RouteDelta struct {
 }
 
 // DeltaPage answers the gateway's ordered delta fetch. Status Gap forces
-// snapshot reconciliation; neither side guesses across a revision gap.
+// snapshot reconciliation; neither side guesses across a revision gap. The
+// page carries the control epoch that published it: the applier applies
+// deltas only from the epoch it last snapshotted (R2).
 type DeltaPage struct {
 	Version        int          `json:"version"`
+	Epoch          uint64       `json:"epoch"`
 	Status         string       `json:"status"`
 	Since          uint64       `json:"since"`
 	LatestRevision uint64       `json:"latest_revision"`
@@ -146,10 +154,13 @@ type PresenceEnvelope struct {
 }
 
 // StatusAck is the gateway's explicit acknowledgement of its last-applied
-// route revision, tagged with its boot ID.
+// route revision, tagged with its boot ID and the control epoch of the
+// applied state (R2: control ignores acks from foreign epochs, so a control
+// restart resets the sync-health watermark until reconciliation).
 type StatusAck struct {
 	Version             int    `json:"version"`
 	GatewayBootID       string `json:"gateway_boot_id"`
+	ControlEpoch        uint64 `json:"control_epoch"`
 	LastAppliedRevision uint64 `json:"last_applied_revision"`
 }
 
@@ -418,6 +429,9 @@ func ValidateSnapshot(snapshot Snapshot, maxRoutes int) error {
 	if snapshot.Version != ProtocolVersion {
 		return fmt.Errorf("%w: snapshot version %d", ErrUnsupportedVersion, snapshot.Version)
 	}
+	if snapshot.Epoch == 0 {
+		return fmt.Errorf("%w: snapshot control epoch is missing", ErrInvalidPayload)
+	}
 	if len(snapshot.Routes) > maxRoutes {
 		return fmt.Errorf("%w: snapshot carries %d routes, bound is %d", ErrOversize, len(snapshot.Routes), maxRoutes)
 	}
@@ -435,6 +449,9 @@ func ValidateSnapshot(snapshot Snapshot, maxRoutes int) error {
 func ValidateDeltaPage(page DeltaPage, maxDeltas int) error {
 	if page.Version != ProtocolVersion {
 		return fmt.Errorf("%w: delta page version %d", ErrUnsupportedVersion, page.Version)
+	}
+	if page.Epoch == 0 {
+		return fmt.Errorf("%w: delta page control epoch is missing", ErrInvalidPayload)
 	}
 	if len(page.Deltas) > maxDeltas {
 		return fmt.Errorf("%w: delta page carries %d deltas, bound is %d", ErrOversize, len(page.Deltas), maxDeltas)
@@ -562,6 +579,9 @@ func ValidatePresenceEventEnvelope(envelope PresenceEnvelope, maxEvents int) err
 func ValidateStatusAck(ack StatusAck) error {
 	if ack.Version != ProtocolVersion {
 		return fmt.Errorf("%w: status ack version %d", ErrUnsupportedVersion, ack.Version)
+	}
+	if ack.ControlEpoch == 0 {
+		return fmt.Errorf("%w: status ack control epoch is missing", ErrInvalidPayload)
 	}
 	return validateSyncIdentifier(ack.GatewayBootID, "gateway_boot_id")
 }

@@ -326,3 +326,54 @@ func TestRouteRevisionNeverRegresses(t *testing.T) {
 		}
 	})
 }
+
+// TestReplaceSnapshotFromNewEpochReplacesStoredRevisions pins the R2 epoch
+// authority at the table level: a snapshot from a NEWER control epoch
+// wholesale-replaces stored state — per-route revisions restart within an
+// epoch, so a lower incoming revision replaces a higher stored one — while
+// the same-epoch ReplaceSnapshot keeps the newer stored route (the monotonic
+// rule is unchanged within one control process lifetime).
+func TestReplaceSnapshotFromNewEpochReplacesStoredRevisions(t *testing.T) {
+	table := NewTable(newStubPresence(presenceKey{
+		agentRecordID: testAgentRecordID,
+		relayPort:     testRelayPort,
+		generation:    testGeneration,
+	}))
+	if err := table.Apply(testRoute(testRelayHostname, 20)); err != nil {
+		t.Fatalf("Apply(revision 20) = %v, want nil", err)
+	}
+
+	// Same epoch: the regressed re-push keeps the newer stored route.
+	if dropped := table.ReplaceSnapshot([]Route{testRoute(testRelayHostname, 4)}); len(dropped) != 0 {
+		t.Fatalf("same-epoch ReplaceSnapshot dropped = %v, want none", dropped)
+	}
+	route, err := table.Lookup(testRelayHostname)
+	if err != nil {
+		t.Fatalf("Lookup after same-epoch re-push = %v, want nil", err)
+	}
+	if route.Revision != 20 {
+		t.Fatalf("same-epoch re-push stored revision = %d, want 20 (monotonic within an epoch)", route.Revision)
+	}
+
+	// Newer epoch: the snapshot is wholesale-authoritative even at revision 4.
+	if dropped := table.ReplaceSnapshotFromNewEpoch([]Route{testRoute(testRelayHostname, 4)}); len(dropped) != 0 {
+		t.Fatalf("new-epoch ReplaceSnapshot dropped = %v, want none (the route stays live at its new revision)", dropped)
+	}
+	route, err = table.Lookup(testRelayHostname)
+	if err != nil {
+		t.Fatalf("Lookup after new-epoch replace = %v, want nil", err)
+	}
+	if route.Revision != 4 {
+		t.Fatalf("new-epoch replace stored revision = %d, want 4 (per-route revisions restart within the epoch)", route.Revision)
+	}
+
+	// Omission from a newer-epoch snapshot is authoritative revocation
+	// state: the live route is reported dropped for the post-mutation drain.
+	dropped := table.ReplaceSnapshotFromNewEpoch(nil)
+	if len(dropped) != 1 || dropped[0] != testRelayHostname {
+		t.Fatalf("new-epoch omission dropped = %v, want [%s]", dropped, testRelayHostname)
+	}
+	if _, err := table.Lookup(testRelayHostname); !errors.Is(err, ErrRouteNotFound) {
+		t.Fatalf("Lookup after new-epoch omission = %v, want %v", err, ErrRouteNotFound)
+	}
+}

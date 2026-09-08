@@ -166,6 +166,48 @@ func (script *scriptedControl) setRawSnapshot(t *testing.T, raw []byte) {
 	script.snapshotBody = raw
 }
 
+func (script *scriptedControl) setRawDelta(t *testing.T, raw []byte) {
+	t.Helper()
+	script.mu.Lock()
+	defer script.mu.Unlock()
+	script.deltaBody = raw
+}
+
+// rawSnapshotBody encodes a §11.3 snapshot payload carrying an explicit
+// top-level control epoch (R2: the epoch is ALWAYS present, including on
+// empty snapshots). It is built from an anonymous wire-shaped struct so the
+// test pins the exact JSON on the wire, independent of the Go struct's field
+// set — an applier that ignores the epoch fails these tests behaviorally.
+func rawSnapshotBody(t *testing.T, epoch, revision uint64, routes []Route) []byte {
+	t.Helper()
+	payload := struct {
+		Version  int     `json:"version"`
+		Epoch    uint64  `json:"epoch"`
+		Revision uint64  `json:"revision"`
+		Routes   []Route `json:"routes"`
+	}{Version: ProtocolVersion, Epoch: epoch, Revision: revision, Routes: routes}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal raw snapshot: %v", err)
+	}
+	return encoded
+}
+
+// rawDeltaBody encodes a §11.3 delta page carrying the control epoch that
+// published it (R2: deltas carry the same epoch as snapshots and acks).
+func rawDeltaBody(t *testing.T, epoch uint64, page DeltaPage) []byte {
+	t.Helper()
+	payload := struct {
+		Epoch uint64 `json:"epoch"`
+		DeltaPage
+	}{Epoch: epoch, DeltaPage: page}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal raw delta page: %v", err)
+	}
+	return encoded
+}
+
 func (script *scriptedControl) setDelta(t *testing.T, page DeltaPage) {
 	t.Helper()
 	encoded, err := json.Marshal(page)
@@ -364,6 +406,7 @@ func TestGatewayRejectsPublicTrafficBeforeInitialSnapshot(t *testing.T) {
 	// Boot reconciliation: fetch + apply the snapshot; readiness follows.
 	script.setSnapshot(t, Snapshot{
 		Version:  ProtocolVersion,
+		Epoch:    100,
 		Revision: 7,
 		Routes:   []Route{wireRoute(reconcileHostnameA, 7, reconcileAgentA, agentPort)},
 	})
@@ -440,6 +483,7 @@ func TestSnapshotAtomicallyReplacesRoutes(t *testing.T) {
 	t.Run("replacement drops omitted routes and drains their established streams", func(t *testing.T) {
 		script.setSnapshot(t, Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    100,
 			Revision: 10,
 			Routes: []Route{
 				wireRoute(reconcileHostnameA, 5, reconcileAgentA, reconcilePort),
@@ -461,6 +505,7 @@ func TestSnapshotAtomicallyReplacesRoutes(t *testing.T) {
 		// and one with an RFC 1123-invalid label (§6 namespace binding).
 		script.setSnapshot(t, Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    100,
 			Revision: 20,
 			Routes: []Route{
 				wireRoute(reconcileHostnameB, 7, reconcileAgentA, reconcilePort),
@@ -504,6 +549,7 @@ func TestSnapshotAtomicallyReplacesRoutes(t *testing.T) {
 		// success (SDD carry-forward) with no churn and no error.
 		script.setSnapshot(t, Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    100,
 			Revision: 20,
 			Routes: []Route{
 				wireRoute(reconcileHostnameB, 7, reconcileAgentA, reconcilePort),
@@ -516,14 +562,14 @@ func TestSnapshotAtomicallyReplacesRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("regressed snapshot after a control restart keeps newer per-route state", func(t *testing.T) {
-		// Task 12 concern c: after a control restart, never-tracked routes
-		// enter the snapshot at the new process's revision, which can sit
-		// BELOW revisions the gateway already applied. The applier must treat
-		// the snapshot as success, keep the higher per-route state, and move
-		// its delta cursor to the snapshot revision of the new control epoch.
+	t.Run("same-epoch regressed snapshot keeps newer per-route state", func(t *testing.T) {
+		// Task 12 concern c, WITHIN one control epoch: a snapshot entry whose
+		// revision sits below the stored one keeps the stored route (the
+		// monotonic rule is unchanged inside a single control process
+		// lifetime — R2 ruling 2). The cursor still follows the snapshot.
 		script.setSnapshot(t, Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    100,
 			Revision: 15,
 			Routes: []Route{
 				wireRoute(reconcileHostnameB, 3, reconcileAgentA, reconcilePort),
@@ -532,7 +578,31 @@ func TestSnapshotAtomicallyReplacesRoutes(t *testing.T) {
 		})
 		mustReconcileSnapshot(t, applier)
 		if revision := lookupRevision(t, table, reconcileHostnameB); revision != 7 {
-			t.Fatalf("B revision = %d, want stored 7 (a regressing snapshot must never roll route state back)", revision)
+			t.Fatalf("B revision = %d, want stored 7 (a same-epoch regressing snapshot must never roll route state back)", revision)
+		}
+		if applier.LastAppliedRevision() != 15 {
+			t.Fatalf("LastAppliedRevision = %d, want 15 (the cursor follows the snapshot)", applier.LastAppliedRevision())
+		}
+	})
+
+	t.Run("new-epoch regressed snapshot is wholesale-authoritative", func(t *testing.T) {
+		// R2 (Sol Critical-2): a control RESTART is a new epoch, and the new
+		// epoch's snapshot replaces stored state wholesale — per-route
+		// revisions restart within an epoch, so the old-epoch revision 7
+		// carries no weight against the new epoch's authoritative 3.
+		script.setRawSnapshot(t, rawSnapshotBody(t, 200, 15, []Route{
+			wireRoute(reconcileHostnameB, 3, reconcileAgentA, reconcilePort),
+			wireRoute(reconcileHostnameC, 4, reconcileAgentA, reconcilePort),
+		}))
+		mustReconcileSnapshot(t, applier)
+		if revision := lookupRevision(t, table, reconcileHostnameB); revision != 3 {
+			t.Fatalf("B revision = %d, want the new epoch's authoritative 3", revision)
+		}
+		if revision := lookupRevision(t, table, reconcileHostnameC); revision != 4 {
+			t.Fatalf("C revision = %d, want the new epoch's authoritative 4", revision)
+		}
+		if applier.AppliedEpoch() != 200 {
+			t.Fatalf("AppliedEpoch = %d, want 200", applier.AppliedEpoch())
 		}
 		if applier.LastAppliedRevision() != 15 {
 			t.Fatalf("LastAppliedRevision = %d, want 15 (cursor follows the fresh control epoch)", applier.LastAppliedRevision())
@@ -562,6 +632,7 @@ func TestSnapshotAtomicallyReplacesRoutes(t *testing.T) {
 		for revision := uint64(30); revision < 50; revision++ {
 			script.setSnapshot(t, Snapshot{
 				Version:  ProtocolVersion,
+				Epoch:    200,
 				Revision: revision,
 				Routes: []Route{
 					wireRoute(reconcileHostnameB, revision, reconcileAgentA, reconcilePort),
@@ -584,6 +655,7 @@ func TestSnapshotAtomicallyReplacesRoutes(t *testing.T) {
 		widened.Limits = Limits{MaxStreamsPerOrigin: 64, MaxStreamsPerAgent: 128, MaxStreamsGlobal: 16384}
 		script.setSnapshot(t, Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    300,
 			Revision: 60,
 			Routes:   []Route{widened},
 		})
@@ -614,6 +686,7 @@ func TestDeltaGapBlocksAndRefetchesSnapshot(t *testing.T) {
 
 	script.setSnapshot(t, Snapshot{
 		Version:  ProtocolVersion,
+		Epoch:    100,
 		Revision: 10,
 		Routes:   []Route{wireRoute(reconcileHostnameA, 10, reconcileAgentA, reconcilePort)},
 	})
@@ -625,6 +698,7 @@ func TestDeltaGapBlocksAndRefetchesSnapshot(t *testing.T) {
 	t.Run("a gap page blocks the applier without guessing", func(t *testing.T) {
 		script.setDelta(t, DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          100,
 			Status:         DeltaStatusGap,
 			Since:          10,
 			LatestRevision: 15,
@@ -648,6 +722,7 @@ func TestDeltaGapBlocksAndRefetchesSnapshot(t *testing.T) {
 	t.Run("reconcile answers a gap with a fresh snapshot and resyncs", func(t *testing.T) {
 		script.setSnapshot(t, Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    100,
 			Revision: 15,
 			Routes:   []Route{wireRoute(reconcileHostnameA, 15, reconcileAgentA, reconcilePort)},
 		})
@@ -680,6 +755,7 @@ func TestDeltaGapBlocksAndRefetchesSnapshot(t *testing.T) {
 	t.Run("an ok page resumes ordered application and explicit acks", func(t *testing.T) {
 		script.setDelta(t, DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          100,
 			Status:         DeltaStatusOK,
 			Since:          15,
 			LatestRevision: 16,
@@ -699,14 +775,15 @@ func TestDeltaGapBlocksAndRefetchesSnapshot(t *testing.T) {
 			t.Fatalf("A revision = %d, want 16", revision)
 		}
 		ack := script.lastStatusAck(t)
-		if ack.GatewayBootID != reconcileBootID || ack.LastAppliedRevision != 16 {
-			t.Fatalf("last ack = boot %q revision %d, want boot %q revision 16", ack.GatewayBootID, ack.LastAppliedRevision, reconcileBootID)
+		if ack.GatewayBootID != reconcileBootID || ack.LastAppliedRevision != 16 || ack.ControlEpoch != 100 {
+			t.Fatalf("last ack = boot %q epoch %d revision %d, want boot %q epoch 100 revision 16", ack.GatewayBootID, ack.ControlEpoch, ack.LastAppliedRevision, reconcileBootID)
 		}
 	})
 
 	t.Run("per-entry rejections never drop an otherwise-valid page", func(t *testing.T) {
 		script.setDelta(t, DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          100,
 			Status:         DeltaStatusOK,
 			Since:          16,
 			LatestRevision: 19,
@@ -747,6 +824,7 @@ func TestRouteLeaseExpiryBlocksNewButPreservesEstablishedStreams(t *testing.T) {
 
 	script.setSnapshot(t, Snapshot{
 		Version:  ProtocolVersion,
+		Epoch:    100,
 		Revision: 5,
 		Routes:   []Route{wireRoute(reconcileHostnameA, 5, reconcileAgentA, reconcilePort)},
 	})
@@ -782,6 +860,7 @@ func TestRouteLeaseExpiryBlocksNewButPreservesEstablishedStreams(t *testing.T) {
 	// lease: new connections are admitted again without any snapshot.
 	script.setDelta(t, DeltaPage{
 		Version:        ProtocolVersion,
+		Epoch:          100,
 		Status:         DeltaStatusOK,
 		Since:          5,
 		LatestRevision: 6,
@@ -815,6 +894,7 @@ func TestExplicitRevokeClosesEstablishedStreams(t *testing.T) {
 
 	script.setSnapshot(t, Snapshot{
 		Version:  ProtocolVersion,
+		Epoch:    100,
 		Revision: 5,
 		Routes:   []Route{wireRoute(reconcileHostnameA, 5, reconcileAgentA, reconcilePort)},
 	})
@@ -825,6 +905,7 @@ func TestExplicitRevokeClosesEstablishedStreams(t *testing.T) {
 
 	script.setDelta(t, DeltaPage{
 		Version:        ProtocolVersion,
+		Epoch:          100,
 		Status:         DeltaStatusOK,
 		Since:          5,
 		LatestRevision: 6,
@@ -863,55 +944,134 @@ func TestExplicitRevokeClosesEstablishedStreams(t *testing.T) {
 		t.Fatalf("drained hostnames = %v, want exactly [%s]", drained, reconcileHostnameA)
 	}
 
-	t.Run("stale revoke after snapshot regression is an idempotent no-op without draining", func(t *testing.T) {
-		// A control restart re-derived route state at lower revisions while
-		// the gateway kept its higher per-route revision from the old
-		// epoch. A subsequent revoke that is valid for the page cursor but
-		// stale against the stored route must not touch or drain it.
+	t.Run("revocation survives a control restart with regressed revisions", func(t *testing.T) {
+		// INVERSION of the formerly-committed unsafe semantics (Sol mid-
+		// project review Critical-2): a control restart re-derives route
+		// state at lower revisions while the gateway holds higher per-route
+		// revisions from the older control epoch. The new epoch's snapshot is
+		// wholesale-authoritative (per-route revisions restart within the
+		// epoch), so a subsequent valid revoke is EFFECTIVE — never an
+		// idempotent no-op that leaves the route live and the streams up.
 		//
-		// Step 1: epoch one carries C at revision 20 (stored, cursor 20).
-		script.setSnapshot(t, Snapshot{
-			Version:  ProtocolVersion,
-			Revision: 20,
-			Routes:   []Route{wireRoute(reconcileHostnameC, 20, reconcileAgentA, reconcilePort)},
-		})
+		// Step 1: control epoch 100 carries C at revision 20 (stored 20,
+		// cursor 20).
+		script.setRawSnapshot(t, rawSnapshotBody(t, 100, 20,
+			[]Route{wireRoute(reconcileHostnameC, 20, reconcileAgentA, reconcilePort)}))
 		mustReconcileSnapshot(t, applier)
-		// Step 2: a restarted control (new epoch, revision 15) re-derives
-		// C at revision 4; the applier keeps the stored revision 20 and
-		// moves the cursor to 15.
-		script.setSnapshot(t, Snapshot{
-			Version:  ProtocolVersion,
-			Revision: 15,
-			Routes:   []Route{wireRoute(reconcileHostnameC, 4, reconcileAgentA, reconcilePort)},
-		})
-		mustReconcileSnapshot(t, applier)
-		if revision := lookupRevision(t, table, reconcileHostnameC); revision != 20 {
-			t.Fatalf("C revision = %d, want stored 20", revision)
+		streamConn := newCountableConn()
+		streams.Register(reconcileHostnameC, reconcileAgentA, streamConn)
+		if streams.Len() != 1 {
+			t.Fatalf("streams.Len() = %d, want 1 after registering C's stream", streams.Len())
 		}
 
-		// Step 3: a revoke at 16 supersedes the cursor (15) but not the
-		// stored route (20): stale at the table, idempotent success at the
-		// applier, and nothing drained.
-		script.setDelta(t, func() DeltaPage {
-			stale := wireRoute(reconcileHostnameC, 16, reconcileAgentA, reconcilePort)
-			stale.Active = false
-			return DeltaPage{
-				Version:        ProtocolVersion,
-				Status:         DeltaStatusOK,
-				Since:          15,
-				LatestRevision: 16,
-				Deltas:         []RouteDelta{{Revision: 16, Operation: RouteOperationRevoke, Route: stale}},
-			}
-		}())
+		// Step 2: a restarted control (epoch 200, revision 15) re-derives C
+		// at revision 4. The newer epoch is authoritative: the stored route
+		// is replaced (revision 4, not the stale 20) and the cursor follows
+		// the new epoch.
+		script.setRawSnapshot(t, rawSnapshotBody(t, 200, 15,
+			[]Route{wireRoute(reconcileHostnameC, 4, reconcileAgentA, reconcilePort)}))
+		mustReconcileSnapshot(t, applier)
+		if revision := lookupRevision(t, table, reconcileHostnameC); revision != 4 {
+			t.Fatalf("C revision = %d, want the new epoch's authoritative 4", revision)
+		}
+
+		// Step 3: a revoke at 16 — valid for the new epoch's cursor (15) and
+		// its stored revision (4) — must tombstone C and drain the
+		// established stream. The formerly-committed behavior kept C live at
+		// the stale revision 20, mapped the stale revoke to idempotent
+		// success, and drained nothing.
+		inactive := wireRoute(reconcileHostnameC, 16, reconcileAgentA, reconcilePort)
+		inactive.Active = false
+		script.setRawDelta(t, rawDeltaBody(t, 200, DeltaPage{
+			Version:        ProtocolVersion,
+			Status:         DeltaStatusOK,
+			Since:          15,
+			LatestRevision: 16,
+			Deltas:         []RouteDelta{{Revision: 16, Operation: RouteOperationRevoke, Route: inactive}},
+		}))
 		mustApplyDeltas(t, applier)
 
-		if revision := lookupRevision(t, table, reconcileHostnameC); revision != 20 {
-			t.Fatalf("C revision = %d, want 20 (stale revoke must not touch the route)", revision)
+		if _, err := table.Lookup(reconcileHostnameC); !errors.Is(err, routes.ErrRouteInactive) {
+			t.Fatalf("Lookup(revoked route) error = %v, want %v (the revoke must be effective)", err, routes.ErrRouteInactive)
 		}
-		if drained := drainer.drained(); len(drained) != 1 {
-			t.Fatalf("drained hostnames = %v, want still just the earlier revoke", drained)
+		if streamConn.closeCount() != 1 {
+			t.Fatalf("revoked route's established stream closed %d times, want exactly 1 (§15.6)", streamConn.closeCount())
+		}
+		if streams.Len() != 0 {
+			t.Fatalf("streams.Len() = %d, want 0 after the effective revoke", streams.Len())
+		}
+		if drained := drainer.drained(); len(drained) != 2 || drained[1] != reconcileHostnameC {
+			t.Fatalf("drained hostnames = %v, want the earlier revoke followed by %s", drained, reconcileHostnameC)
 		}
 	})
+}
+
+// TestRevocationSurvivesControlRestartWithRegressedRevisions is the named
+// regression test for the Sol mid-project review Critical-2, reproducing its
+// exact scenario end to end: an old epoch leaves a high stored per-route
+// revision; control restarts and the new epoch serves regressed revisions; a
+// revoke that is valid within the new epoch must make the route go ABSENT and
+// drain its established streams. The formerly-committed behavior turned that
+// revoke into an idempotent no-op (ErrStaleRevision mapped to success) and the
+// route stayed live until its lease lapsed.
+func TestRevocationSurvivesControlRestartWithRegressedRevisions(t *testing.T) {
+	certs := newSyncTestCertificates(t)
+	script, client := newScriptedControl(t, certs)
+
+	joinC := reconcileJoin{agentRecordID: reconcileAgentA, relayPort: reconcilePort, generation: 3}
+	presence := newReconcilePresence(joinC)
+	table := routes.NewTable(presence)
+	streams := gateway.NewStreams()
+	drainer := &countingDrainer{inner: streams}
+	applier := mustApplier(t, client, table, drainer, nil)
+
+	// Epoch one: the route is published at the old epoch's high revision
+	// (time-seeded counters make cross-epoch revision comparisons
+	// meaningless — exactly the hazard under review).
+	script.setRawSnapshot(t, rawSnapshotBody(t, 100, 1750000100,
+		[]Route{wireRoute(reconcileHostnameC, 1750000100, reconcileAgentA, reconcilePort)}))
+	mustReconcileSnapshot(t, applier)
+	lookupRevision(t, table, reconcileHostnameC)
+
+	streamConn := newCountableConn()
+	streams.Register(reconcileHostnameC, reconcileAgentA, streamConn)
+
+	// Control restarts; the fresh epoch's publisher re-derives C at revision
+	// 4 — far below the stored revision 1750000100. The newer epoch is
+	// wholesale-authoritative: the stored route is replaced, not preserved.
+	script.setRawSnapshot(t, rawSnapshotBody(t, 200, 1750000115,
+		[]Route{wireRoute(reconcileHostnameC, 4, reconcileAgentA, reconcilePort)}))
+	mustReconcileSnapshot(t, applier)
+	if revision := lookupRevision(t, table, reconcileHostnameC); revision != 4 {
+		t.Fatalf("C revision = %d, want the new epoch's 4 (epoch authority replaces per-route state)", revision)
+	}
+
+	// The new epoch revokes C. The revoke is valid within its own epoch and
+	// must be effective: the route goes absent and the established stream is
+	// drained (§15.6).
+	inactive := wireRoute(reconcileHostnameC, 1750000116, reconcileAgentA, reconcilePort)
+	inactive.Active = false
+	script.setRawDelta(t, rawDeltaBody(t, 200, DeltaPage{
+		Version:        ProtocolVersion,
+		Status:         DeltaStatusOK,
+		Since:          1750000115,
+		LatestRevision: 1750000116,
+		Deltas:         []RouteDelta{{Revision: 1750000116, Operation: RouteOperationRevoke, Route: inactive}},
+	}))
+	mustApplyDeltas(t, applier)
+
+	if _, err := table.Lookup(reconcileHostnameC); !errors.Is(err, routes.ErrRouteInactive) {
+		t.Fatalf("Lookup(revoked route) error = %v, want %v", err, routes.ErrRouteInactive)
+	}
+	if streamConn.closeCount() != 1 {
+		t.Fatalf("revoked route's established stream closed %d times, want exactly 1", streamConn.closeCount())
+	}
+	if streams.Len() != 0 {
+		t.Fatalf("streams.Len() = %d, want 0 after the effective revoke", streams.Len())
+	}
+	if drained := drainer.drained(); len(drained) != 1 || drained[0] != reconcileHostnameC {
+		t.Fatalf("drained hostnames = %v, want exactly [%s]", drained, reconcileHostnameC)
+	}
 }
 
 // --- carry-forward: uint64/int edge conversions are rejected on the wire ---
@@ -1035,4 +1195,278 @@ func assertGenericClose(t *testing.T, label string, conn net.Conn) {
 	if received != 0 {
 		t.Fatalf("%s: browser received %d bytes; a generic close must return none", label, received)
 	}
+}
+
+// --- R2: epoch authority (Sol Critical-2 remediation) ---
+
+func TestSnapshotFromOlderEpochIsRejectedAndReconciles(t *testing.T) {
+	certs := newSyncTestCertificates(t)
+	script, client := newScriptedControl(t, certs)
+
+	joinC := reconcileJoin{agentRecordID: reconcileAgentA, relayPort: reconcilePort, generation: 3}
+	presence := newReconcilePresence(joinC)
+	table := routes.NewTable(presence)
+	streams := gateway.NewStreams()
+	applier := mustApplier(t, client, table, streams, nil)
+
+	script.setRawSnapshot(t, rawSnapshotBody(t, 200, 30,
+		[]Route{wireRoute(reconcileHostnameC, 30, reconcileAgentA, reconcilePort)}))
+	mustReconcileSnapshot(t, applier)
+
+	// An OLDER epoch's snapshot is rejected wholesale: no mutation, no
+	// cursor movement, readiness untouched.
+	script.setRawSnapshot(t, rawSnapshotBody(t, 100, 50,
+		[]Route{wireRoute(reconcileHostnameC, 50, reconcileAgentA, reconcilePort)}))
+	err := applier.ReconcileSnapshot(context.Background())
+	if !errors.Is(err, ErrStaleControlEpoch) {
+		t.Fatalf("ReconcileSnapshot(older epoch) = %v, want %v", err, ErrStaleControlEpoch)
+	}
+	if revision := lookupRevision(t, table, reconcileHostnameC); revision != 30 {
+		t.Fatalf("C revision = %d, want unchanged 30 (a stale-epoch snapshot must never mutate state)", revision)
+	}
+	if applier.LastAppliedRevision() != 30 || applier.AppliedEpoch() != 200 {
+		t.Fatalf("state moved: epoch %d revision %d, want epoch 200 revision 30", applier.AppliedEpoch(), applier.LastAppliedRevision())
+	}
+	if !applier.Ready() {
+		t.Fatalf("a stale-epoch rejection must not withdraw readiness")
+	}
+
+	// The reconcile half: a fresh snapshot from a NEWER epoch converges.
+	script.setRawSnapshot(t, rawSnapshotBody(t, 300, 35,
+		[]Route{wireRoute(reconcileHostnameC, 31, reconcileAgentA, reconcilePort)}))
+	mustReconcileSnapshot(t, applier)
+	if revision := lookupRevision(t, table, reconcileHostnameC); revision != 31 {
+		t.Fatalf("C revision = %d, want the newer epoch's 31", revision)
+	}
+	if applier.AppliedEpoch() != 300 {
+		t.Fatalf("AppliedEpoch = %d, want 300", applier.AppliedEpoch())
+	}
+}
+
+func TestDeltaPageFromWrongEpochIsNeverApplied(t *testing.T) {
+	certs := newSyncTestCertificates(t)
+	script, client := newScriptedControl(t, certs)
+
+	joinC := reconcileJoin{agentRecordID: reconcileAgentA, relayPort: reconcilePort, generation: 3}
+	presence := newReconcilePresence(joinC)
+	table := routes.NewTable(presence)
+	streams := gateway.NewStreams()
+	applier := mustApplier(t, client, table, streams, nil)
+
+	script.setRawSnapshot(t, rawSnapshotBody(t, 200, 30,
+		[]Route{wireRoute(reconcileHostnameC, 30, reconcileAgentA, reconcilePort)}))
+	mustReconcileSnapshot(t, applier)
+
+	touched := func(op string) RouteDelta {
+		route := wireRoute(reconcileHostnameC, 31, reconcileAgentA, reconcilePort)
+		if op == RouteOperationRevoke {
+			route.Active = false
+		}
+		return RouteDelta{Revision: 31, Operation: op, Route: route}
+	}
+
+	// Older-epoch page: must never be applied against newer-epoch state.
+	script.setRawDelta(t, rawDeltaBody(t, 100, DeltaPage{
+		Version: ProtocolVersion, Status: DeltaStatusOK, Since: 30, LatestRevision: 31,
+		Deltas: []RouteDelta{touched(RouteOperationLimit)},
+	}))
+	if err := applier.SyncDeltas(context.Background()); !errors.Is(err, ErrReconcileRequired) {
+		t.Fatalf("SyncDeltas(older-epoch page) = %v, want %v", err, ErrReconcileRequired)
+	}
+	// Newer-epoch page: meaningless before its announcing snapshot — also
+	// refused, routing the caller to reconciliation.
+	script.setRawDelta(t, rawDeltaBody(t, 300, DeltaPage{
+		Version: ProtocolVersion, Status: DeltaStatusOK, Since: 30, LatestRevision: 31,
+		Deltas: []RouteDelta{touched(RouteOperationRevoke)},
+	}))
+	if err := applier.SyncDeltas(context.Background()); !errors.Is(err, ErrReconcileRequired) {
+		t.Fatalf("SyncDeltas(newer-epoch page) = %v, want %v", err, ErrReconcileRequired)
+	}
+	if revision := lookupRevision(t, table, reconcileHostnameC); revision != 30 {
+		t.Fatalf("C revision = %d, want unchanged 30 (foreign-epoch deltas must never apply)", revision)
+	}
+	if applier.LastAppliedRevision() != 30 {
+		t.Fatalf("LastAppliedRevision = %d, want unchanged 30", applier.LastAppliedRevision())
+	}
+
+	// Reconcile converts the refusal into convergence: deltas fail, then the
+	// newer epoch's announcing snapshot is fetched and adopted.
+	script.setRawSnapshot(t, rawSnapshotBody(t, 300, 40,
+		[]Route{wireRoute(reconcileHostnameC, 40, reconcileAgentA, reconcilePort)}))
+	if err := applier.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after a foreign-epoch page: %v", err)
+	}
+	paths := script.recordedPaths()
+	lastDeltas, lastSnapshot := -1, -1
+	for index, path := range paths {
+		switch path {
+		case PathDeltas:
+			lastDeltas = index
+		case PathSnapshot:
+			lastSnapshot = index
+		}
+	}
+	if lastDeltas == -1 || lastSnapshot == -1 || lastDeltas > lastSnapshot {
+		t.Fatalf("request paths = %v, want the refused delta fetch followed by a recovery snapshot", paths)
+	}
+	if revision := lookupRevision(t, table, reconcileHostnameC); revision != 40 {
+		t.Fatalf("C revision = %d, want 40 after the epoch-300 adoption", revision)
+	}
+}
+
+func TestEmptySnapshotFromNewControlBootAdoptsAndWipes(t *testing.T) {
+	// T15-m1 / Sol Important-4: a restarted control that serves an EMPTY
+	// snapshot (no publishable routes yet) is exactly the payload the
+	// always-present epoch exists for — the newer epoch makes it wholesale-
+	// authoritative even at a revision below the gateway's stored state.
+	certs := newSyncTestCertificates(t)
+	script, client := newScriptedControl(t, certs)
+
+	joinA := reconcileJoin{agentRecordID: reconcileAgentA, relayPort: reconcilePort, generation: 3}
+	presence := newReconcilePresence(joinA)
+	table := routes.NewTable(presence)
+	streams := gateway.NewStreams()
+	drainer := &countingDrainer{inner: streams}
+	applier := mustApplier(t, client, table, drainer, nil)
+
+	script.setRawSnapshot(t, rawSnapshotBody(t, 100, 20,
+		[]Route{wireRoute(reconcileHostnameA, 20, reconcileAgentA, reconcilePort)}))
+	mustReconcileSnapshot(t, applier)
+	lookupRevision(t, table, reconcileHostnameA)
+
+	streamConn := newCountableConn()
+	streams.Register(reconcileHostnameA, reconcileAgentA, streamConn)
+
+	// The new control boot's EMPTY snapshot: adopted wholesale, routes
+	// wiped, established streams drained.
+	script.setRawSnapshot(t, rawSnapshotBody(t, 200, 9, nil))
+	mustReconcileSnapshot(t, applier)
+	if _, err := table.Lookup(reconcileHostnameA); !errors.Is(err, routes.ErrRouteNotFound) {
+		t.Fatalf("Lookup after the empty new-epoch snapshot = %v, want %v", err, routes.ErrRouteNotFound)
+	}
+	if streamConn.closeCount() != 1 {
+		t.Fatalf("wiped route's established stream closed %d times, want exactly 1", streamConn.closeCount())
+	}
+	if applier.AppliedEpoch() != 200 || applier.LastAppliedRevision() != 9 {
+		t.Fatalf("epoch/revision after adoption = %d/%d, want 200/9", applier.AppliedEpoch(), applier.LastAppliedRevision())
+	}
+	if !applier.Ready() {
+		t.Fatalf("the gateway must be ready after adopting the new (empty) boot")
+	}
+
+	// The epoch was genuinely adopted: deltas of the new epoch apply.
+	revived := wireRoute(reconcileHostnameA, 10, reconcileAgentA, reconcilePort)
+	script.setRawDelta(t, rawDeltaBody(t, 200, DeltaPage{
+		Version: ProtocolVersion, Status: DeltaStatusOK, Since: 9, LatestRevision: 10,
+		Deltas: []RouteDelta{{Revision: 10, Operation: RouteOperationAdd, Route: revived}},
+	}))
+	mustApplyDeltas(t, applier)
+	if revision := lookupRevision(t, table, reconcileHostnameA); revision != 10 {
+		t.Fatalf("A revision = %d, want 10 after the new epoch's add", revision)
+	}
+}
+
+func TestStaleRevokeAgainstActiveStoredRouteForcesReconciliation(t *testing.T) {
+	// R2 ruling 3 hardening (defense in depth): within one epoch a
+	// stale-revision revoke against an ACTIVE stored route is divergence —
+	// never an idempotent success. Reaching it requires internal divergence
+	// (a coherent same-epoch cursor can never produce it), so the test
+	// simulates the divergence by applying an out-of-band higher revision
+	// directly to the table, then proves the applier aborts the page and
+	// reconciles from a full snapshot.
+	certs := newSyncTestCertificates(t)
+	script, client := newScriptedControl(t, certs)
+
+	joinC := reconcileJoin{agentRecordID: reconcileAgentA, relayPort: reconcilePort, generation: 3}
+	presence := newReconcilePresence(joinC)
+	table := routes.NewTable(presence)
+	streams := gateway.NewStreams()
+	drainer := &countingDrainer{inner: streams}
+	applier := mustApplier(t, client, table, drainer, nil)
+
+	script.setSnapshot(t, Snapshot{
+		Version:  ProtocolVersion,
+		Epoch:    100,
+		Revision: 50,
+		Routes:   []Route{wireRoute(reconcileHostnameC, 50, reconcileAgentA, reconcilePort)},
+	})
+	mustReconcileSnapshot(t, applier)
+	streamConn := newCountableConn()
+	streams.Register(reconcileHostnameC, reconcileAgentA, streamConn)
+
+	// Simulated divergence: stored state outruns the page cursor.
+	divergent := wireRoute(reconcileHostnameC, 60, reconcileAgentA, reconcilePort)
+	if err := table.Apply(routes.Route{
+		Hostname:      divergent.Hostname,
+		AgentRecordID: divergent.AgentRecordID,
+		RelayPort:     divergent.RelayPort,
+		Generation:    divergent.Generation,
+		SessionID:     divergent.SessionID,
+		Revision:      divergent.Revision,
+		Active:        divergent.Active,
+		Limits: routes.Limits{
+			MaxStreamsPerOrigin: divergent.Limits.MaxStreamsPerOrigin,
+			MaxStreamsPerAgent:  divergent.Limits.MaxStreamsPerAgent,
+			MaxStreamsGlobal:    divergent.Limits.MaxStreamsGlobal,
+		},
+	}); err != nil {
+		t.Fatalf("seed divergence: %v", err)
+	}
+
+	inactive := wireRoute(reconcileHostnameC, 51, reconcileAgentA, reconcilePort)
+	inactive.Active = false
+	stalePage := DeltaPage{
+		Version: ProtocolVersion, Status: DeltaStatusOK, Since: 50, LatestRevision: 51,
+		Deltas: []RouteDelta{{Revision: 51, Operation: RouteOperationRevoke, Route: inactive}},
+	}
+
+	// Direct application (white-box, bypassing the client's page validation
+	// on purpose: the page is protocol-valid but divergent from stored state).
+	if err := applier.applyDeltas(stalePage); !errors.Is(err, ErrReconcileRequired) {
+		t.Fatalf("applyDeltas(stale revoke on active route) = %v, want %v", err, ErrReconcileRequired)
+	}
+	route, err := table.Lookup(reconcileHostnameC)
+	if err != nil {
+		t.Fatalf("Lookup after the aborted page = %v, want nil (the route must stay live)", err)
+	}
+	if route.Revision != 60 || !route.Active {
+		t.Fatalf("stored route = revision %d active %v, want revision 60 active (the stale revoke must not touch it)", route.Revision, route.Active)
+	}
+	if applier.LastAppliedRevision() != 50 {
+		t.Fatalf("LastAppliedRevision = %d, want unchanged 50 (the aborted page never advances the cursor)", applier.LastAppliedRevision())
+	}
+	if streamConn.closeCount() != 0 {
+		t.Fatalf("streams closed %d times during the aborted page, want 0", streamConn.closeCount())
+	}
+
+	// Reconcile recovers: the delta refetch fails again, the snapshot wins.
+	script.setRawDelta(t, rawDeltaBody(t, 100, stalePage))
+	script.setSnapshot(t, Snapshot{
+		Version:  ProtocolVersion,
+		Epoch:    100,
+		Revision: 70,
+		Routes:   []Route{wireRoute(reconcileHostnameC, 65, reconcileAgentA, reconcilePort)},
+	})
+	if err := applier.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after the divergent revoke: %v", err)
+	}
+	if revision := lookupRevision(t, table, reconcileHostnameC); revision != 65 {
+		t.Fatalf("C revision = %d, want the snapshot's 65 after reconciliation", revision)
+	}
+
+	// Now the new epoch's revoke is genuinely effective: tombstone + drain.
+	revoked := wireRoute(reconcileHostnameC, 71, reconcileAgentA, reconcilePort)
+	revoked.Active = false
+	script.setRawDelta(t, rawDeltaBody(t, 100, DeltaPage{
+		Version: ProtocolVersion, Status: DeltaStatusOK, Since: 70, LatestRevision: 71,
+		Deltas: []RouteDelta{{Revision: 71, Operation: RouteOperationRevoke, Route: revoked}},
+	}))
+	mustApplyDeltas(t, applier)
+	if _, err := table.Lookup(reconcileHostnameC); !errors.Is(err, routes.ErrRouteInactive) {
+		t.Fatalf("Lookup after the effective revoke = %v, want %v", err, routes.ErrRouteInactive)
+	}
+	if streamConn.closeCount() != 1 {
+		t.Fatalf("revoked route's stream closed %d times, want exactly 1", streamConn.closeCount())
+	}
+	_ = drainer
 }

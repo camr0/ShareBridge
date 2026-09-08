@@ -35,6 +35,25 @@ import (
 	"sharebridge/relay/internal/routes"
 )
 
+// Failure classes the applier adds on top of the client's (R2). Both are
+// recovery signals: the caller re-reconciles from a full snapshot instead of
+// guessing.
+var (
+	// ErrStaleControlEpoch is returned when control serves a snapshot from an
+	// OLDER epoch than the one the gateway has already adopted (split-brain
+	// or a control that regressed behind the gateway's history). The snapshot
+	// is rejected without any state mutation; the caller keeps reconciling
+	// until a current-epoch snapshot arrives.
+	ErrStaleControlEpoch = errors.New("controlsync: snapshot from an older control epoch")
+	// ErrReconcileRequired is returned when the applied state can only be
+	// corrected by a full snapshot reconciliation: a delta page from any
+	// epoch other than the applied one (revisions restart within an epoch,
+	// so foreign-epoch deltas are meaningless on top of this state), or a
+	// stale-revision revoke against an ACTIVE stored route (an explicit
+	// revoke of a live route is never an idempotent no-op — Sol Critical-2).
+	ErrReconcileRequired = errors.New("controlsync: full snapshot reconciliation required")
+)
+
 // StreamDrainer is the established-stream drain seam (satisfied by
 // gateway.Streams). Only explicit revokes drain; see CloseRoute's ordering
 // invariant — every call here follows the table mutation that motivates it.
@@ -89,6 +108,7 @@ type Applier struct {
 
 	mu          sync.Mutex
 	applied     bool
+	epoch       uint64
 	lastApplied uint64
 }
 
@@ -146,64 +166,102 @@ func (applier *Applier) LastAppliedRevision() uint64 {
 	return applier.lastApplied
 }
 
+// AppliedEpoch reports the control epoch of the last applied full snapshot:
+// the epoch authority all further application is gated on. Zero until the
+// first snapshot has been adopted (R2).
+func (applier *Applier) AppliedEpoch() uint64 {
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	return applier.epoch
+}
+
 // ReconcileSnapshot fetches control's full route snapshot and applies it
 // atomically. This is the boot/reconnect path (§15.1) and the only recovery
-// from a revision gap (§11.3, §15.7). Errors from the client (transport,
-// ErrUnauthorized, ErrOversize, ErrUnsupportedVersion, ErrInvalidPayload,
-// ErrBadRevision) propagate unchanged; nothing is applied unless the fetch
-// and validation succeeded.
+// from a revision gap (§11.3, §15.7) — and from ErrReconcileRequired (R2).
+// Errors from the client (transport, ErrUnauthorized, ErrOversize,
+// ErrUnsupportedVersion, ErrInvalidPayload, ErrBadRevision) and from the
+// applier's epoch authority (ErrStaleControlEpoch) propagate unchanged;
+// nothing is applied unless the fetch and validation succeeded.
 func (applier *Applier) ReconcileSnapshot(ctx context.Context) error {
 	snapshot, err := applier.client.FetchSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	applier.applySnapshot(snapshot)
+	if err := applier.applySnapshot(snapshot); err != nil {
+		return err
+	}
 	applier.acknowledge(ctx)
 	return nil
 }
 
 // SyncDeltas fetches the ordered delta page answering the current cursor and
 // applies it. A gap page (ErrBadRevision) is propagated: the caller must
-// reconcile with a fresh snapshot instead of guessing (§15.7). A never-
-// applied applier fetches since 0; a well-formed control answers a gap for
-// any position the gateway cannot bridge, which routes the caller back to
-// ReconcileSnapshot, so starting from an empty table is never trusted to be
-// complete when it is not.
+// reconcile with a fresh snapshot instead of guessing (§15.7). So is
+// ErrReconcileRequired: a page from a foreign control epoch (revisions
+// restart within an epoch) or a stale-revision revoke against an active
+// route (never an idempotent success, R2) leaves the applied revision — and
+// therefore the ack — untouched. A never-applied applier fetches since 0; a
+// well-formed control answers a gap for any position the gateway cannot
+// bridge, which routes the caller back to ReconcileSnapshot, so starting
+// from an empty table is never trusted to be complete when it is not.
 func (applier *Applier) SyncDeltas(ctx context.Context) error {
 	page, err := applier.client.FetchDeltas(ctx, applier.LastAppliedRevision())
 	if err != nil {
 		return err
 	}
-	applier.applyDeltas(page)
+	if err := applier.applyDeltas(page); err != nil {
+		return err
+	}
 	applier.acknowledge(ctx)
 	return nil
 }
 
 // Reconcile is the one-step catch-up the sync loop calls: snapshot first on
-// boot, deltas otherwise, and a fresh snapshot whenever a delta fetch
-// reports a revision gap. Only ErrBadRevision triggers the recovery fetch —
-// it is the protocol's sole sanctioned gap signal; every other error is
-// returned for the caller's retry policy.
+// boot, deltas otherwise, and a fresh snapshot whenever the delta step fails
+// for ANY reason — a gap page (ErrBadRevision), a foreign-epoch page or a
+// stale-revision revoke against an active route (ErrReconcileRequired), or a
+// control that cannot answer at all (a restarted control answers 500 while
+// the gateway's cursor sits ahead of its fresh epoch's revision — R2 closes
+// that cross-restart convergence hole here). Nothing has been applied when
+// the delta step fails, so the authoritative snapshot fetch is always the
+// safe recovery; its error (if it also fails) is the one surfaced.
 func (applier *Applier) Reconcile(ctx context.Context) error {
 	if !applier.Ready() {
 		return applier.ReconcileSnapshot(ctx)
 	}
 	if err := applier.SyncDeltas(ctx); err != nil {
-		if errors.Is(err, ErrBadRevision) {
-			return applier.ReconcileSnapshot(ctx)
-		}
-		return err
+		return applier.ReconcileSnapshot(ctx)
 	}
 	return nil
 }
 
-// applySnapshot admits a fetched snapshot: per-route §6 validation first
-// (invalid entries are rejected individually with a bounded diagnostic — one
-// bad route never drops an otherwise well-formed snapshot; malformed pages
-// are already refused wholesale by the Task 11 validators), then the atomic
-// table replacement, then — and only then — the drain of the routes the
-// snapshot dropped (mutate-before-drain).
-func (applier *Applier) applySnapshot(snapshot Snapshot) {
+// applySnapshot admits a fetched snapshot under the R2 epoch authority:
+//
+//   - a snapshot from a NEWER control epoch (or the first snapshot) is
+//     wholesale-authoritative: every stored route is replaced — per-route
+//     revisions restart within an epoch, so stored revisions from older
+//     epochs carry no weight — and the dropped routes drain after the
+//     mutation;
+//   - a snapshot from the SAME epoch keeps the existing monotonic per-route
+//     revision logic (idempotent re-push; correct within one control
+//     process lifetime);
+//   - a snapshot from an OLDER epoch is rejected wholesale with
+//     ErrStaleControlEpoch and zero mutation; the caller re-reconciles.
+//
+// Per-route §6 validation runs first in both admissible cases (invalid
+// entries are rejected individually with a bounded diagnostic — one bad
+// route never drops an otherwise well-formed snapshot; malformed pages are
+// already refused wholesale by the Task 11 validators).
+func (applier *Applier) applySnapshot(snapshot Snapshot) error {
+	applier.mu.Lock()
+	currentEpoch := applier.epoch
+	applier.mu.Unlock()
+	if currentEpoch != 0 && snapshot.Epoch < currentEpoch {
+		return fmt.Errorf("%w: snapshot epoch %d is older than the applied epoch %d",
+			ErrStaleControlEpoch, snapshot.Epoch, currentEpoch)
+	}
+	newerEpoch := snapshot.Epoch != currentEpoch
+
 	admitted := make([]routes.Route, 0, len(snapshot.Routes))
 	invalidCount := 0
 	var invalidSamples []string
@@ -229,28 +287,53 @@ func (applier *Applier) applySnapshot(snapshot Snapshot) {
 			"first_error", invalidCause)
 	}
 
-	// Mutation commits inside ReplaceSnapshot; the dropped set it returns is
+	// Mutation commits inside the table; the dropped set it returns is
 	// therefore already ordered after the mutation (Streams ordering
-	// invariant), and draining follows.
-	dropped := applier.table.ReplaceSnapshot(admitted)
+	// invariant), and draining follows. A newer epoch replaces stored state
+	// wholesale; a same-epoch snapshot preserves newer stored revisions.
+	var dropped []string
+	if newerEpoch {
+		dropped = applier.table.ReplaceSnapshotFromNewEpoch(admitted)
+	} else {
+		dropped = applier.table.ReplaceSnapshot(admitted)
+	}
 	applier.drain(dropped)
 
-	applier.setState(snapshot.Revision)
+	applier.setState(snapshot.Epoch, snapshot.Revision)
 	applier.logger.Info("controlsync: route snapshot applied",
 		"routes", len(admitted),
 		"dropped", len(dropped),
-		"revision", snapshot.Revision)
+		"epoch", snapshot.Epoch,
+		"revision", snapshot.Revision,
+		"new_epoch", newerEpoch)
+	return nil
 }
 
-// applyDeltas admits one validated, strictly ordered delta page. Every entry
-// carries the full route state, so add and limit are the same table
-// operation; per-route staleness (ErrStaleRevision) is an idempotent success
-// — required after a control restart, where a kept higher gateway revision
-// meets the new epoch's lower deltas. An explicit revoke mutates the table
-// first and drains its established streams second (§8, §15.6). Lease expiry
-// never reaches this path: it is the absence of applied refreshes, not a
-// delta.
-func (applier *Applier) applyDeltas(page DeltaPage) {
+// applyDeltas admits one validated, strictly ordered delta page — but only
+// from the control epoch the gateway last snapshotted (R2): revisions
+// restart within an epoch, so a page from an older epoch must never mutate
+// newer-epoch state and a page from a newer epoch cannot be applied before
+// its announcing snapshot; both return ErrReconcileRequired with zero
+// mutation. Every entry carries the full route state, so add and limit are
+// the same table operation; per-route staleness (ErrStaleRevision) is an
+// idempotent success for adds/limits (the stored state already supersedes
+// the delta). A stale-revision REVOKE against an ACTIVE stored route is
+// never an idempotent success (R2, Sol Critical-2): it signals divergence,
+// aborts the page, and reports ErrReconcileRequired so the caller reconciles
+// from a full snapshot; against an already-tombstoned route it stays
+// idempotent (the desired end state holds). An explicit revoke mutates the
+// table first and drains its established streams second (§8, §15.6). Lease
+// expiry never reaches this path: it is the absence of applied refreshes,
+// not a delta.
+func (applier *Applier) applyDeltas(page DeltaPage) error {
+	applier.mu.Lock()
+	currentEpoch := applier.epoch
+	applier.mu.Unlock()
+	if page.Epoch != currentEpoch {
+		return fmt.Errorf("%w: delta page epoch %d does not match the applied epoch %d",
+			ErrReconcileRequired, page.Epoch, currentEpoch)
+	}
+
 	invalidCount := 0
 	var invalidSamples []string
 	var invalidCause error
@@ -270,8 +353,16 @@ func (applier *Applier) applyDeltas(page DeltaPage) {
 			case err == nil:
 				applier.drain([]string{hostname})
 			case errors.Is(err, routes.ErrStaleRevision):
-				// Idempotent success: the stored state already supersedes
-				// the revoke; nothing to drain.
+				// A stale-revision revoke against an ACTIVE stored route is
+				// divergence, never an idempotent success: the stored route
+				// is live and control believes it can revoke it, so our
+				// state must be re-derived from a full snapshot (R2).
+				if stored, ok := applier.table.Peek(hostname); ok && stored.Active {
+					return fmt.Errorf("%w: stale-revision revoke against the active route %q (stored revision %d)",
+						ErrReconcileRequired, hostname, stored.Revision)
+				}
+				// Already tombstoned at a higher revision: the desired end
+				// state holds; the revoke is an idempotent no-op.
 			case errors.Is(err, routes.ErrRouteNotFound):
 				// The page is validated and in-order, so control believes we
 				// hold this route; divergence means our state is behind —
@@ -304,7 +395,8 @@ func (applier *Applier) applyDeltas(page DeltaPage) {
 			"first_error", invalidCause)
 	}
 
-	applier.setState(page.LatestRevision)
+	applier.setState(currentEpoch, page.LatestRevision)
+	return nil
 }
 
 // noteInvalidRoute records one per-entry rejection for the bounded
@@ -390,26 +482,30 @@ func (applier *Applier) drain(hostnames []string) {
 	}
 }
 
-// setState records a fully applied revision. Snapshot applications flip
-// readiness on; nothing flips it back off (§15.4: a later gap must not
-// withdraw routing for already-served routes — the finite lease ages them
-// out if control stays unreachable).
-func (applier *Applier) setState(revision uint64) {
+// setState records a fully applied revision and its governing control epoch
+// (R2). Snapshot applications flip readiness on; nothing flips it back off
+// (§15.4: a later gap must not withdraw routing for already-served routes —
+// the finite lease ages them out if control stays unreachable).
+func (applier *Applier) setState(epoch uint64, revision uint64) {
 	applier.mu.Lock()
 	defer applier.mu.Unlock()
 	applier.applied = true
+	applier.epoch = epoch
 	applier.lastApplied = revision
 }
 
-// acknowledge reports the applied revision to control (§11.3 status). It is
-// deliberately non-fatal: the apply already committed, control's own
-// no-regression guard accepts equal re-acks, and the next reconcile re-acks.
-// Without acks control would stop refreshing leases (Healthy() requires the
-// current boot's explicit ack), so an ack failure is logged for operators.
+// acknowledge reports the applied revision to control (§11.3 status),
+// carrying the control epoch of the applied state (R2: control ignores acks
+// from foreign epochs). It is deliberately non-fatal: the apply already
+// committed, control's own no-regression guard accepts equal re-acks, and
+// the next reconcile re-acks. Without acks control would stop refreshing
+// leases (Healthy() requires the current boot's explicit ack), so an ack
+// failure is logged for operators.
 func (applier *Applier) acknowledge(ctx context.Context) {
 	ack := StatusAck{
 		Version:             ProtocolVersion,
 		GatewayBootID:       applier.bootID,
+		ControlEpoch:        applier.AppliedEpoch(),
 		LastAppliedRevision: applier.LastAppliedRevision(),
 	}
 	if _, err := applier.client.SendStatus(ctx, ack); err != nil {

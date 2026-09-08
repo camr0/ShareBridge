@@ -198,6 +198,25 @@ func (table *Table) Revoke(hostname string, revision uint64) error {
 	return nil
 }
 
+// Peek returns the stored route entry for hostname — normalized exactly as
+// Apply/Revoke would — without checking its lease, presence, or active flag.
+// It exists so the Task 13 applier can distinguish a stale-revision revoke
+// against a still-ACTIVE route (divergence: must reconcile, never an
+// idempotent no-op — R2, Sol Critical-2) from one against an already-
+// tombstoned route (desired end state holds). The result is a point-in-time
+// read: the applier's sync loop is the single writer, and the caller treats
+// a concurrently-changed entry as the next reconcile's business.
+func (table *Table) Peek(hostname string) (Route, bool) {
+	normalized, err := normalizeHostname(hostname)
+	if err != nil {
+		return Route{}, false
+	}
+	table.mu.RLock()
+	defer table.mu.RUnlock()
+	route, ok := table.byHost[normalized]
+	return route, ok
+}
+
 // ReplaceSnapshot atomically replaces the whole table with a full control
 // snapshot (spec §8, §15.1): the next lookup observes either the entire
 // previous state or the entire new one — never a partial blend. It returns
@@ -211,13 +230,34 @@ func (table *Table) Revoke(hostname string, revision uint64) error {
 //
 // A snapshot entry whose revision does not supersede the stored entry keeps
 // the stored entry without error (idempotent re-push; the SDD carry-forward
-// for Task 13): control restarts re-derive never-tracked routes at fresh,
-// possibly lower revisions, and the newer gateway-held state must survive.
-// Entries whose hostname is not a well-formed exact hostname are skipped
-// (treated as absent) rather than failing the whole snapshot; the Task 13
-// applier validates before admitting and reports them, so this is defense in
-// depth. Every live entry the snapshot affirms gets a fresh §14 lease.
+// for Task 13): within one control epoch, control re-derives routes it
+// never tracked at fresh, possibly lower revisions, and the newer
+// gateway-held state must survive. Entries whose hostname is not a
+// well-formed exact hostname are skipped (treated as absent) rather than
+// failing the whole snapshot; the Task 13 applier validates before admitting
+// and reports them, so this is defense in depth. Every live entry the
+// snapshot affirms gets a fresh §14 lease.
 func (table *Table) ReplaceSnapshot(incoming []Route) (dropped []string) {
+	return table.replaceSnapshot(incoming, false)
+}
+
+// ReplaceSnapshotFromNewEpoch atomically replaces the whole table with a
+// full control snapshot from a NEWER control epoch (R2, §15.1): the epoch is
+// the authority, so per-route stored revisions — published by older control
+// boots — carry no weight and every incoming entry replaces its stored
+// counterpart even at a lower revision (per-route revisions restart within
+// an epoch). This is what dissolves the cross-restart revision-regression
+// hazard: revokes issued by the new epoch are always effective against
+// pre-restart state. Dropped-set, lease, and drain semantics are exactly
+// ReplaceSnapshot's.
+func (table *Table) ReplaceSnapshotFromNewEpoch(incoming []Route) (dropped []string) {
+	return table.replaceSnapshot(incoming, true)
+}
+
+// replaceSnapshot is the shared atomic-replacement body. Caller chooses
+// whether stored revisions survive (same-epoch re-push) or not (new-epoch
+// wholesale authority). Caller holds no locks.
+func (table *Table) replaceSnapshot(incoming []Route, fromNewEpoch bool) (dropped []string) {
 	nextHost := make(map[string]Route, len(incoming))
 	nextLeases := make(map[string]time.Time, len(incoming))
 	for _, route := range incoming {
@@ -232,15 +272,18 @@ func (table *Table) ReplaceSnapshot(incoming []Route) (dropped []string) {
 	table.mu.Lock()
 	now := table.now()
 	// Resolve stale entries against the stored state before anything is
-	// committed: a superseded incoming entry keeps the stored route.
-	for hostname, stored := range table.byHost {
-		arrival, ok := nextHost[hostname]
-		if !ok || arrival.Revision > stored.Revision {
-			continue
-		}
-		nextHost[hostname] = stored
-		if stored.Active {
-			nextLeases[hostname] = now.Add(RouteLeaseTTL) // the snapshot re-affirmed it
+	// committed: a superseded incoming entry keeps the stored route — within
+	// the same epoch only (a newer epoch's snapshot replaces wholesale).
+	if !fromNewEpoch {
+		for hostname, stored := range table.byHost {
+			arrival, ok := nextHost[hostname]
+			if !ok || arrival.Revision > stored.Revision {
+				continue
+			}
+			nextHost[hostname] = stored
+			if stored.Active {
+				nextLeases[hostname] = now.Add(RouteLeaseTTL) // the snapshot re-affirmed it
+			}
 		}
 	}
 	for hostname, route := range nextHost {

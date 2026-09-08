@@ -316,6 +316,7 @@ func TestSyncGoldenPayloadsRoundTripBothModules(t *testing.T) {
 
 		constructed := Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    7777,
 			Revision: 42,
 			Routes: []Route{
 				{
@@ -367,6 +368,7 @@ func TestSyncGoldenPayloadsRoundTripBothModules(t *testing.T) {
 
 		constructed := DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          7777,
 			Status:         DeltaStatusOK,
 			Since:          40,
 			LatestRevision: 43,
@@ -507,7 +509,7 @@ func TestSyncRequiresMutualTLS(t *testing.T) {
 	certs := newSyncTestCertificates(t)
 
 	t.Run("accepted gateway identity receives the snapshot", func(t *testing.T) {
-		source := &stubRouteSource{snapshot: Snapshot{Version: ProtocolVersion, Revision: 7, Routes: []Route{syncTestRoute("photos.relay.sb1a2b3c4.photos.example.com", 7, true)}}}
+		source := &stubRouteSource{snapshot: Snapshot{Version: ProtocolVersion, Epoch: 7, Revision: 7, Routes: []Route{syncTestRoute("photos.relay.sb1a2b3c4.photos.example.com", 7, true)}}}
 		server, testServer := newSyncTestServer(t, certs, func(config *ServerConfig) {
 			config.RouteSource = source
 		})
@@ -697,6 +699,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 	t.Run("source snapshot with bad revision is never emitted", func(t *testing.T) {
 		source := &stubRouteSource{snapshot: Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    9,
 			Revision: 1,
 			Routes:   []Route{syncTestRoute("photos.relay.sb1a2b3c4.photos.example.com", 2, true)},
 		}}
@@ -714,9 +717,28 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 		}
 	})
 
+	t.Run("source snapshot without a control epoch is never emitted", func(t *testing.T) {
+		// R2: the epoch is ALWAYS present, even on an empty snapshot — a
+		// backend source that omits it produces an invalid payload (500).
+		source := &stubRouteSource{snapshot: Snapshot{Version: ProtocolVersion, Revision: 7}}
+		_, testServer := newSyncTestServer(t, certs, func(config *ServerConfig) {
+			config.RouteSource = source
+		})
+		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
+		response, err := client.Get(testServer.URL + PathSnapshot)
+		if err != nil {
+			t.Fatalf("GET snapshot: %v", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("epoch-less source snapshot status = %d, want 500", response.StatusCode)
+		}
+	})
+
 	t.Run("source delta page with regressing revisions is never emitted", func(t *testing.T) {
 		page := DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          9,
 			Status:         DeltaStatusOK,
 			Since:          4,
 			LatestRevision: 5,
@@ -746,7 +768,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 			syncTestRoute("c.relay.sb1a2b3c4.photos.example.com", 1, true),
 		}
 		_, testServer := newSyncTestServer(t, certs, func(config *ServerConfig) {
-			config.RouteSource = &stubRouteSource{snapshot: Snapshot{Version: ProtocolVersion, Revision: 1, Routes: routes}}
+			config.RouteSource = &stubRouteSource{snapshot: Snapshot{Version: ProtocolVersion, Epoch: 1, Revision: 1, Routes: routes}}
 			config.MaxRoutes = 2
 		})
 		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
@@ -814,7 +836,7 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 		})
 		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
 
-		decoded, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", LastAppliedRevision: 7})
+		decoded, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 9, LastAppliedRevision: 7})
 		if code != http.StatusOK {
 			t.Fatalf("ack status = %d, want 200", code)
 		}
@@ -836,10 +858,10 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 		})
 		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
 
-		if _, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", LastAppliedRevision: 7}); code != http.StatusOK {
+		if _, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 9, LastAppliedRevision: 7}); code != http.StatusOK {
 			t.Fatalf("first ack status = %d, want 200", code)
 		}
-		decoded, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", LastAppliedRevision: 5})
+		decoded, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 9, LastAppliedRevision: 5})
 		if code != http.StatusOK {
 			t.Fatalf("stale ack status = %d, want idempotent 200", code)
 		}
@@ -857,9 +879,20 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 	t.Run("invalid acknowledgement identity is rejected", func(t *testing.T) {
 		_, testServer := newSyncTestServer(t, certs, nil)
 		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
-		_, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "", LastAppliedRevision: 7})
+		_, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "", ControlEpoch: 9, LastAppliedRevision: 7})
 		if code != http.StatusBadRequest {
 			t.Fatalf("empty boot id status = %d, want 400", code)
+		}
+	})
+
+	t.Run("acknowledgement without a control epoch is rejected", func(t *testing.T) {
+		// R2: acks carry the control epoch of the applied state; a missing
+		// epoch is a malformed payload (fail closed, never forwarded).
+		_, testServer := newSyncTestServer(t, certs, nil)
+		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
+		_, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 0, LastAppliedRevision: 7})
+		if code != http.StatusBadRequest {
+			t.Fatalf("missing control epoch status = %d, want 400", code)
 		}
 	})
 
@@ -868,7 +901,7 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 			config.StatusSink = &stubStatusSink{err: errors.New("publisher unavailable")}
 		})
 		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
-		_, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", LastAppliedRevision: 7})
+		_, code := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 9, LastAppliedRevision: 7})
 		if code != http.StatusInternalServerError {
 			t.Fatalf("sink failure status = %d, want 500", code)
 		}

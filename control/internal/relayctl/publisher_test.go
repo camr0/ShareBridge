@@ -297,7 +297,7 @@ func TestPublisherOrdersAddRevokeLimitDeltas(t *testing.T) {
 	}
 
 	// Healthy sync (explicit ack) enables the lease-refresh limit touch.
-	publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, LastAppliedRevision: addDelta.Revision})
+	publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, ControlEpoch: publisher.Epoch(), LastAppliedRevision: addDelta.Revision})
 	if !publisher.Healthy() {
 		t.Fatalf("publisher not healthy after explicit ack of %d", addDelta.Revision)
 	}
@@ -435,6 +435,9 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 	if publisher.Healthy() {
 		t.Fatalf("publisher healthy without any acknowledgement")
 	}
+	if got := publisher.AcknowledgedRevision(); got != 0 {
+		t.Fatalf("AcknowledgedRevision before any ack = %d, want 0", got)
+	}
 	touched, err := publisher.RefreshLeases()
 	if err != nil {
 		t.Fatalf("refresh while unhealthy: %v", err)
@@ -451,7 +454,7 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 
 	// A stale acknowledgement (below the published revision) keeps sync
 	// unhealthy.
-	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, LastAppliedRevision: publisherTestSeed}); err != nil {
+	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, ControlEpoch: publisher.Epoch(), LastAppliedRevision: publisherTestSeed}); err != nil {
 		t.Fatalf("stale ack: %v", err)
 	}
 	if publisher.Healthy() {
@@ -459,11 +462,27 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 	}
 
 	// The explicit ack of the published revision makes sync healthy.
-	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, LastAppliedRevision: publisherTestSeed + 1}); err != nil {
+	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, ControlEpoch: publisher.Epoch(), LastAppliedRevision: publisherTestSeed + 1}); err != nil {
 		t.Fatalf("explicit ack: %v", err)
 	}
 	if !publisher.Healthy() {
 		t.Fatalf("publisher unhealthy after explicit ack of %d", publisherTestSeed+1)
+	}
+	if got := publisher.AcknowledgedRevision(); got != publisherTestSeed+1 {
+		t.Fatalf("AcknowledgedRevision = %d, want %d", got, publisherTestSeed+1)
+	}
+
+	// An ack from a foreign control epoch (in-flight across a control
+	// restart) is ignored wholesale: it must not reset the recorded state
+	// nor disturb the current epoch's health watermark (R2).
+	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: "gateway-boot-foreign", ControlEpoch: publisher.Epoch() + 1, LastAppliedRevision: 0}); err != nil {
+		t.Fatalf("foreign-epoch ack: %v", err)
+	}
+	if !publisher.Healthy() {
+		t.Fatalf("foreign-epoch ack must be ignored, not reset health")
+	}
+	if got := publisher.AcknowledgedRevision(); got != publisherTestSeed+1 {
+		t.Fatalf("AcknowledgedRevision after foreign-epoch ack = %d, want unchanged %d", got, publisherTestSeed+1)
 	}
 	touched, err = publisher.RefreshLeases()
 	if err != nil {
@@ -474,7 +493,7 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 	}
 
 	// A gateway restart (new boot ID) resets acknowledgement state wholesale.
-	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: "gateway-boot-test-2", LastAppliedRevision: 0}); err != nil {
+	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: "gateway-boot-test-2", ControlEpoch: publisher.Epoch(), LastAppliedRevision: 0}); err != nil {
 		t.Fatalf("new-boot ack: %v", err)
 	}
 	if publisher.Healthy() {
@@ -593,5 +612,67 @@ func TestPublisherGapForcesSnapshot(t *testing.T) {
 	}
 	if inCount.Status != DeltaStatusOK || len(inCount.Deltas) != 2 {
 		t.Fatalf("bridgeable since must return the two retained deltas, got %q %+v", inCount.Status, inCount.Deltas)
+	}
+}
+
+// TestPublisherStampsControlEpochOnSnapshotsAndDeltas pins R2 ruling 1: the
+// publisher's control epoch — generated per process start or injected — is
+// stamped on EVERY served payload, and an EMPTY snapshot (no publishable
+// routes: the fresh-control-boot state) still carries it, because the epoch
+// is the only authority that makes such a snapshot adoptable by a gateway
+// holding older-epoch state (the T15-m1 redelivery concern, Sol Important-4's
+// new-boot adoption gap).
+func TestPublisherStampsControlEpochOnSnapshotsAndDeltas(t *testing.T) {
+	app := newPublisherTestApp(t)
+	apiKey, _ := createPublisherAgent(t, app, "epoch", "sbeb3f1a2c", 10093, 5)
+
+	publisher := newTestPublisher(t, app, PublisherConfig{RevisionSeed: publisherTestSeed, Epoch: 7777})
+	if publisher.Epoch() != 7777 {
+		t.Fatalf("Epoch() = %d, want the configured 7777", publisher.Epoch())
+	}
+
+	// Empty snapshot (no published routes yet): the epoch is ALWAYS present.
+	snapshot, err := publisher.RouteSnapshot()
+	if err != nil {
+		t.Fatalf("empty snapshot: %v", err)
+	}
+	if len(snapshot.Routes) != 0 {
+		t.Fatalf("expected an empty snapshot, got %+v", snapshot.Routes)
+	}
+	if snapshot.Epoch != 7777 {
+		t.Fatalf("empty snapshot epoch = %d, want 7777 (always present, even empty)", snapshot.Epoch)
+	}
+	if err := ValidateSnapshot(snapshot, MaxRoutesPerSnapshot); err != nil {
+		t.Fatalf("empty snapshot with epoch rejected: %v", err)
+	}
+
+	sessionID := createPublisherSession(t, app, apiKey, "epochshare", "album.sbeb3f1a2c.example.com", nil)
+	if err := publisher.PublishAdd(sessionID); err != nil {
+		t.Fatalf("publish add: %v", err)
+	}
+
+	page, err := publisher.RouteDeltas(publisherTestSeed)
+	if err != nil {
+		t.Fatalf("delta fetch: %v", err)
+	}
+	if page.Epoch != 7777 {
+		t.Fatalf("delta page epoch = %d, want 7777", page.Epoch)
+	}
+	if err := ValidateDeltaPage(page, MaxDeltasPerPage); err != nil {
+		t.Fatalf("delta page with epoch rejected: %v", err)
+	}
+
+	gap, err := publisher.RouteDeltas(publisherTestSeed - 1)
+	if err != nil {
+		t.Fatalf("gap fetch: %v", err)
+	}
+	if gap.Status != DeltaStatusGap || gap.Epoch != 7777 {
+		t.Fatalf("gap page = status %q epoch %d, want gap at epoch 7777", gap.Status, gap.Epoch)
+	}
+
+	// A zero configured epoch generates a non-zero per-boot identifier.
+	generated := newTestPublisher(t, app, PublisherConfig{RevisionSeed: publisherTestSeed})
+	if generated.Epoch() == 0 {
+		t.Fatalf("generated epoch = 0, want a non-zero per-boot identifier")
 	}
 }

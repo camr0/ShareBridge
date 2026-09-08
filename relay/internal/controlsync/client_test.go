@@ -260,6 +260,7 @@ func TestSyncGoldenPayloadsRoundTripBothModules(t *testing.T) {
 
 		constructed := Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    7777,
 			Revision: 42,
 			Routes: []Route{
 				{
@@ -335,7 +336,7 @@ func TestSyncGoldenPayloadsRoundTripBothModules(t *testing.T) {
 
 func TestSyncRequiresMutualTLS(t *testing.T) {
 	certs := newSyncTestCertificates(t)
-	snapshotPayload, err := json.Marshal(Snapshot{Version: ProtocolVersion, Revision: 7, Routes: []Route{syncTestRoute("photos.relay.sb1a2b3c4.photos.example.com", 7, true)}})
+	snapshotPayload, err := json.Marshal(Snapshot{Version: ProtocolVersion, Epoch: 7, Revision: 7, Routes: []Route{syncTestRoute("photos.relay.sb1a2b3c4.photos.example.com", 7, true)}})
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
@@ -428,7 +429,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 	})
 
 	t.Run("unknown version in snapshot response", func(t *testing.T) {
-		payload, err := json.Marshal(Snapshot{Version: ProtocolVersion + 1, Revision: 9, Routes: []Route{validRoute}})
+		payload, err := json.Marshal(Snapshot{Version: ProtocolVersion + 1, Epoch: 9, Revision: 9, Routes: []Route{validRoute}})
 		if err != nil {
 			t.Fatalf("marshal snapshot: %v", err)
 		}
@@ -444,6 +445,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 	t.Run("bad revision: snapshot revision below a route revision", func(t *testing.T) {
 		payload, err := json.Marshal(Snapshot{
 			Version:  ProtocolVersion,
+			Epoch:    9,
 			Revision: 5,
 			Routes:   []Route{syncTestRoute("photos.relay.sb1a2b3c4.photos.example.com", 6, true)},
 		})
@@ -462,6 +464,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 	t.Run("bad revision: regressing delta revisions", func(t *testing.T) {
 		page := DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          9,
 			Status:         DeltaStatusOK,
 			Since:          4,
 			LatestRevision: 6,
@@ -486,6 +489,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 	t.Run("bad revision: page does not answer the requested since", func(t *testing.T) {
 		page := DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          9,
 			Status:         DeltaStatusOK,
 			Since:          3,
 			LatestRevision: 5,
@@ -510,6 +514,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 	t.Run("bad revision: gap page carrying deltas", func(t *testing.T) {
 		page := DeltaPage{
 			Version:        ProtocolVersion,
+			Epoch:          9,
 			Status:         DeltaStatusGap,
 			Since:          4,
 			LatestRevision: 40,
@@ -532,7 +537,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 		// A well-formed gap page (no deltas, latest strictly ahead) is served
 		// 200 by control but must reach the Task 13 applier as ErrBadRevision —
 		// never as an empty success at a stale since (§11.3, §15.7).
-		gap := DeltaPage{Version: ProtocolVersion, Status: DeltaStatusGap, Since: 4, LatestRevision: 40}
+		gap := DeltaPage{Version: ProtocolVersion, Epoch: 9, Status: DeltaStatusGap, Since: 4, LatestRevision: 40}
 		payload, err := json.Marshal(gap)
 		if err != nil {
 			t.Fatalf("marshal gap page: %v", err)
@@ -550,6 +555,29 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 		}
 		if page.Status != "" || page.Since != 0 || page.LatestRevision != 0 || page.Deltas != nil {
 			t.Fatalf("gap page returned a payload, want zero value: %+v", page)
+		}
+	})
+
+	t.Run("missing control epoch refuses snapshots and delta pages", func(t *testing.T) {
+		// R2: the control epoch is ALWAYS present on served payloads (even
+		// empty ones) — a payload without one is malformed and must fail
+		// closed at the client before the applier could ever trust it.
+		client := newStubControlServer(t, certs, func(t *testing.T, request *http.Request) (int, []byte) {
+			switch request.URL.Path {
+			case PathSnapshot:
+				return http.StatusOK, []byte(`{"version":1,"epoch":0,"revision":9,"routes":[]}`)
+			case PathDeltas:
+				return http.StatusOK, []byte(`{"version":1,"epoch":0,"status":"ok","since":4,"latest_revision":4,"deltas":[]}`)
+			default:
+				t.Errorf("unexpected path %q", request.URL.Path)
+				return http.StatusNotFound, nil
+			}
+		}).newTestClient(t, nil)
+		if _, err := client.FetchSnapshot(context.Background()); !errors.Is(err, ErrInvalidPayload) {
+			t.Fatalf("epoch-less snapshot error = %v, want %v", err, ErrInvalidPayload)
+		}
+		if _, err := client.FetchDeltas(context.Background(), 4); !errors.Is(err, ErrInvalidPayload) {
+			t.Fatalf("epoch-less delta page error = %v, want %v", err, ErrInvalidPayload)
 		}
 	})
 
@@ -591,6 +619,9 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 		if _, err := client.SendStatus(context.Background(), StatusAck{Version: ProtocolVersion, GatewayBootID: "", LastAppliedRevision: 3}); !errors.Is(err, ErrInvalidPayload) {
 			t.Fatalf("empty boot id error = %v, want ErrInvalidPayload", err)
 		}
+		if _, err := client.SendStatus(context.Background(), StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 0, LastAppliedRevision: 3}); !errors.Is(err, ErrInvalidPayload) {
+			t.Fatalf("missing control epoch error = %v, want ErrInvalidPayload (R2: acks carry the epoch)", err)
+		}
 		if stub.requests != 0 {
 			t.Fatalf("invalid payloads produced %d requests, want 0", stub.requests)
 		}
@@ -605,7 +636,7 @@ func TestSyncRejectsOversizeUnknownVersionAndBadRevision(t *testing.T) {
 			t.Fatalf("non-JSON response error = %v, want ErrInvalidPayload", err)
 		}
 
-		payload, err := json.Marshal(Snapshot{Version: ProtocolVersion, Revision: 9, Routes: []Route{validRoute}})
+		payload, err := json.Marshal(Snapshot{Version: ProtocolVersion, Epoch: 9, Revision: 9, Routes: []Route{validRoute}})
 		if err != nil {
 			t.Fatalf("marshal snapshot: %v", err)
 		}
@@ -664,7 +695,7 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 		})
 		client := stub.newTestClient(t, nil)
 
-		response, err := client.SendStatus(context.Background(), StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", LastAppliedRevision: 11})
+		response, err := client.SendStatus(context.Background(), StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 5, LastAppliedRevision: 11})
 		if err != nil {
 			t.Fatalf("SendStatus: %v", err)
 		}
@@ -673,6 +704,9 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 		}
 		if received["gateway_boot_id"] != "gwboot4k9x2m7qzr15" || received["last_applied_revision"] != float64(11) {
 			t.Fatalf("control received %v", received)
+		}
+		if received["control_epoch"] != float64(5) {
+			t.Fatalf("control received control_epoch %v, want 5 (R2: acks carry the applied epoch)", received["control_epoch"])
 		}
 	})
 
@@ -734,7 +768,7 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 		})
 		client := stub.newTestClient(t, nil)
 
-		response, err := client.SendStatus(context.Background(), StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", LastAppliedRevision: 5})
+		response, err := client.SendStatus(context.Background(), StatusAck{Version: ProtocolVersion, GatewayBootID: "gwboot4k9x2m7qzr15", ControlEpoch: 5, LastAppliedRevision: 5})
 		if err != nil {
 			t.Fatalf("SendStatus: %v", err)
 		}

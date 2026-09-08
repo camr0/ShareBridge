@@ -108,11 +108,18 @@ type Route struct {
 }
 
 // Snapshot is the full route snapshot served to the gateway (§11.3 full
-// snapshot fetch): control's current route revision and every route in one
-// atomic payload. A re-pushed snapshot over unchanged routes is idempotent at
-// the applier (routes.ErrStaleRevision maps to success — SDD carry-forward).
+// snapshot fetch): the control epoch that produced it, control's current
+// route revision within that epoch, and every route in one atomic payload.
+// The epoch is ALWAYS present — including on empty snapshots — because it is
+// the sole authority a restarted control carries: the gateway compares
+// epochs (never revisions) to decide that a new boot's snapshot wholesale-
+// replaces route state even where its per-route revisions restart lower
+// (R2, Sol Critical-2). A re-pushed same-epoch snapshot over unchanged
+// routes is idempotent at the applier (routes.ErrStaleRevision maps to
+// success — SDD carry-forward).
 type Snapshot struct {
 	Version  int     `json:"version"`
+	Epoch    uint64  `json:"epoch"`
 	Revision uint64  `json:"revision"`
 	Routes   []Route `json:"routes"`
 }
@@ -129,9 +136,13 @@ type RouteDelta struct {
 // deltas in (since, latest_revision] with strictly increasing revisions; a
 // page with Status Gap carries no deltas and reports the control revision the
 // gateway cannot reach incrementally, forcing snapshot reconciliation
-// (§11.3: a lost delta triggers snapshot reconciliation).
+// (§11.3: a lost delta triggers snapshot reconciliation). Every page carries
+// the control epoch that published it: the gateway never applies deltas
+// across an epoch boundary — a page from any other epoch than the one the
+// gateway last snapshotted forces reconciliation instead (R2).
 type DeltaPage struct {
 	Version        int          `json:"version"`
+	Epoch          uint64       `json:"epoch"`
 	Status         string       `json:"status"`
 	Since          uint64       `json:"since"`
 	LatestRevision uint64       `json:"latest_revision"`
@@ -162,13 +173,17 @@ type PresenceEnvelope struct {
 	Events  []PresenceEvent `json:"events"`
 }
 
-// StatusAck is the gateway's explicit acknowledgement: its boot ID and the
-// last route revision it applied (§11.3 explicit acknowledgements and
+// StatusAck is the gateway's explicit acknowledgement: its boot ID, the
+// control epoch of the state it applied, and the last route revision it
+// applied within that epoch (§11.3 explicit acknowledgements and
 // last-applied revision). Control's no-regression guard is per boot ID so a
-// restarted gateway (§15.1) can legitimately report a lower revision again.
+// restarted gateway (§15.1) can legitimately report a lower revision again,
+// and per control epoch so a control restart resets the health watermark
+// until the gateway has reconciled to the new epoch's snapshot (R2).
 type StatusAck struct {
 	Version             int    `json:"version"`
 	GatewayBootID       string `json:"gateway_boot_id"`
+	ControlEpoch        uint64 `json:"control_epoch"`
 	LastAppliedRevision uint64 `json:"last_applied_revision"`
 }
 
@@ -209,12 +224,17 @@ func ValidateRoute(route Route) error {
 	return nil
 }
 
-// ValidateSnapshot validates a full route snapshot: exact version, bounded
-// route count, every route valid, and the snapshot revision never below any
-// route revision (§11.3 bad-revision rejection).
+// ValidateSnapshot validates a full route snapshot: exact version, an
+// always-present control epoch (the empty new-boot snapshot is exactly the
+// payload the epoch authority exists for, R2), bounded route count, every
+// route valid, and the snapshot revision never below any route revision
+// (§11.3 bad-revision rejection).
 func ValidateSnapshot(snapshot Snapshot, maxRoutes int) error {
 	if snapshot.Version != ProtocolVersion {
 		return fmt.Errorf("%w: snapshot version %d", ErrUnsupportedVersion, snapshot.Version)
+	}
+	if snapshot.Epoch == 0 {
+		return fmt.Errorf("%w: snapshot control epoch is missing", ErrInvalidPayload)
 	}
 	if len(snapshot.Routes) > maxRoutes {
 		return fmt.Errorf("%w: snapshot carries %d routes, bound is %d", ErrPayloadTooLarge, len(snapshot.Routes), maxRoutes)
@@ -239,6 +259,9 @@ func ValidateSnapshot(snapshot Snapshot, maxRoutes int) error {
 func ValidateDeltaPage(page DeltaPage, maxDeltas int) error {
 	if page.Version != ProtocolVersion {
 		return fmt.Errorf("%w: delta page version %d", ErrUnsupportedVersion, page.Version)
+	}
+	if page.Epoch == 0 {
+		return fmt.Errorf("%w: delta page control epoch is missing", ErrInvalidPayload)
 	}
 	if len(page.Deltas) > maxDeltas {
 		return fmt.Errorf("%w: delta page carries %d deltas, bound is %d", ErrPayloadTooLarge, len(page.Deltas), maxDeltas)
@@ -383,11 +406,15 @@ func validatePresenceEnvelopeHeader(envelope PresenceEnvelope, maxEvents int) er
 	return nil
 }
 
-// ValidateStatusAck validates an explicit acknowledgement: exact version and a
-// bounded boot ID.
+// ValidateStatusAck validates an explicit acknowledgement: exact version, a
+// bounded boot ID, and the always-present control epoch of the applied state
+// (R2: acks carry the same epoch as the snapshot/deltas they follow).
 func ValidateStatusAck(ack StatusAck) error {
 	if ack.Version != ProtocolVersion {
 		return fmt.Errorf("%w: status ack version %d", ErrUnsupportedVersion, ack.Version)
+	}
+	if ack.ControlEpoch == 0 {
+		return fmt.Errorf("%w: status ack control epoch is missing", ErrInvalidPayload)
 	}
 	return validateIdentifier(ack.GatewayBootID, "gateway_boot_id")
 }
