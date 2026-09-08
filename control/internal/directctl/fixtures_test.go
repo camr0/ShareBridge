@@ -62,7 +62,12 @@ func newTestController(t *testing.T) (core.App, *Controller) {
 	coord.SetIssueFn(func(ctx context.Context, csrPEM []byte, namespace, apiKeyID string) ([]byte, error) {
 		return mustTestChain(t), nil
 	})
-	ctrl := NewController(app, hub.New(), coord, nil, Config{BaseDomain: "example.com"})
+	ctrl := NewController(app, hub.New(), coord, nil, Config{
+		BaseDomain: "example.com",
+		// Task 22: the real shipped route-interstitial assets, so every
+		// selection test exercises the production renderer (not a stub).
+		InterstitialAssets: mustInterstitialAssets(t),
+	})
 	ctrl.allowPrivate = true // loopback probe allowed in tests
 	ctrl.sendFn = func(ctx context.Context, conn *websocket.Conn, msg any) error { return nil }
 	return app, ctrl

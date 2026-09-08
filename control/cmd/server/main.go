@@ -92,12 +92,23 @@ func main() {
 		log.Fatalf("relay presence view: %v", err)
 	}
 
+	// Task 22: the three control-authored route-interstitial assets, loaded
+	// once at startup (a missing or oversized asset fails the process closed
+	// — the §9.3 page cannot render without it). The raw HTML template is
+	// never served; it exists only as rendered by the controller with a
+	// per-response nonce and the session-derived CSP.
+	interstitialAssets, err := directctl.LoadInterstitialAssets("./web")
+	if err != nil {
+		log.Fatalf("interstitial assets: %v", err)
+	}
+
 	ctrl := directctl.NewController(app, h, coord, dnsClient, directctl.Config{
 		BaseDomain:            cfg.BaseDomain,
 		RelayGatewayIPv4:      cfg.RelayGatewayIPv4,
 		RelaySelectionEnabled: cfg.RelaySelectionEnabled,
 		RelayPresence:         presenceView,
 		Routes:                routePublisher,
+		InterstitialAssets:    interstitialAssets,
 	})
 
 	publisherCtx, stopPublisher := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -199,6 +210,18 @@ func main() {
 		// (404 revoked/unknown, 410 expired/unsupported inside the handler).
 		router.POST("/api/shares/{code}/prepare-route", func(e *core.RequestEvent) error {
 			return ctrl.PrepareRoute(e.Response, e.Request, e.Request.PathValue("code"))
+		})
+
+		// Task 22: the interstitial's two same-origin assets (exact paths the
+		// rendered §9.3 page references; nonce-authorized by its CSP). Both
+		// are no-store, like every other response on this host.
+		router.GET("/web/route-interstitial.js", func(e *core.RequestEvent) error {
+			directctl.ServeInterstitialAsset(e.Response, interstitialAssets.JS, "text/javascript; charset=utf-8")
+			return nil
+		})
+		router.GET("/web/route-interstitial.css", func(e *core.RequestEvent) error {
+			directctl.ServeInterstitialAsset(e.Response, interstitialAssets.CSS, "text/css; charset=utf-8")
+			return nil
 		})
 		// Homepage (marketing)
 		router.GET("/", handler.ServeFileNoCache("./web/home.html"))

@@ -43,6 +43,11 @@ type Config struct {
 	// revision read 0, which the presence view's Available rejects — fail
 	// closed.
 	Routes relayctl.RouteRevisionSource
+	// InterstitialAssets holds the Task 22 control-authored route-interstitial
+	// assets (loaded once via LoadInterstitialAssets, which fails closed on a
+	// missing/oversized/marker-broken asset). The zero value makes the §9.3
+	// interstitial arm fail closed to 503 rather than render an empty page.
+	InterstitialAssets InterstitialAssets
 	// Test-only (default zero values = production behavior):
 	AllowPrivateProbes bool                                                                // disables the SSRF denylist
 	DDNSFunc           func(ctx context.Context, name, ip string, ttl int) (string, error) // overrides the real ddns client

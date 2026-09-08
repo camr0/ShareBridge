@@ -41,7 +41,6 @@ package directctl
 // that is not a derivable direct origin fails closed to 503.
 
 import (
-	"io"
 	"math"
 	"net/http"
 	"time"
@@ -245,7 +244,9 @@ func (c *Controller) SelectRoute(w http.ResponseWriter, r *http.Request, sess *c
 	if directPreparable(term) {
 		// Interstitial for non-relayOnly direct candidates (both flag
 		// states — rollback mode keeps the new direct flow, §20 rollout).
-		return c.serveInterstitial(w, r)
+		// Task 22: the real §9.3 page renderer; the persisted session row
+		// is its only origin/namespace authority.
+		return c.serveInterstitial(w, r, sess, code)
 	}
 
 	// Hard direct-ineligible → relay if selection is enabled and the
@@ -282,19 +283,5 @@ func (c *Controller) serveRelayRedirect(w http.ResponseWriter, r *http.Request, 
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, loc, http.StatusFound)
-	return nil
-}
-
-// serveInterstitial answers the §9.3 200 no-store interstitial. Task 20
-// fixes ONLY the response contract (200, no-store, no request reflection,
-// no content embedding); Task 22 replaces the body with the real
-// progress/relay/noscript page and its CSP. Nothing about this response is
-// cacheable and nothing reflects request input.
-func (c *Controller) serveInterstitial(w http.ResponseWriter, r *http.Request) error {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, "<!doctype html><html><head><title>ShareBridge</title></head>"+
-		"<body><p>Preparing your share route…</p></body></html>\n")
 	return nil
 }

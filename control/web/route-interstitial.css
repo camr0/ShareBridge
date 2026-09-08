@@ -1,0 +1,48 @@
+/* route-interstitial.css — ShareBridge control-owned interstitial (§4.3). */
+
+#sb-interstitial {
+  font-family: system-ui, -apple-system, sans-serif;
+  max-width: 32rem;
+  margin: 15vh auto 0;
+  padding: 0 1rem;
+  text-align: center;
+  color: #1c2430;
+}
+
+#sb-interstitial h1 {
+  font-size: 1.25rem;
+  letter-spacing: 0.02em;
+}
+
+#sb-status {
+  font-size: 1.05rem;
+  color: #46586e;
+}
+
+#sb-use-relay {
+  margin-top: 1.25rem;
+  padding: 0.6rem 1.4rem;
+  font-size: 1rem;
+  border-radius: 8px;
+  border: 1px solid #2b6cb0;
+  background: #2b6cb0;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+#sb-use-relay:hover {
+  background: #2c5282;
+}
+
+#sb-unavailable[hidden] {
+  display: none;
+}
+
+#sb-unavailable {
+  margin-top: 1.5rem;
+  color: #46586e;
+}
+
+#sb-retry {
+  color: #2b6cb0;
+}

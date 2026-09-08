@@ -219,6 +219,9 @@ func TestBothCanonicalRoutesPreserve404410Interstitial302And503(t *testing.T) {
 		RelaySelectionEnabled: true,
 		RelayPresence:         view,
 		Routes:                revision,
+		// Task 22: the real shipped route-interstitial assets so the 200
+		// interstitial row exercises the production renderer.
+		InterstitialAssets: mustServerTestInterstitialAssets(t),
 	})
 
 	pbRouter, err := apis.NewRouter(app)
@@ -343,6 +346,17 @@ func TestServerRoutesGallerySessionRedirectsNotWebClient(t *testing.T) {
 // newServerTestPublisher builds the Task 12 route publisher wired the same
 // way main.go wires it, so deleteExpiredSessions exercises the real revoke
 // path (sessions without an agent relay assignment simply publish nothing).
+// mustServerTestInterstitialAssets loads the real shipped route-interstitial
+// assets (control/web/route-interstitial.{html,js,css}) — the same files
+// main.go loads at startup and deploy-testing.sh copies — so the canonical-
+// route tests exercise the production §9.3 renderer rather than a stub.
+func mustServerTestInterstitialAssets(t *testing.T) directctl.InterstitialAssets {
+	t.Helper()
+	assets, err := directctl.LoadInterstitialAssets("../../web")
+	require.NoError(t, err)
+	return assets
+}
+
 func newServerTestPublisher(t *testing.T, app core.App) *relayctl.Publisher {
 	t.Helper()
 	publisher, err := relayctl.NewPublisher(app, relayctl.PublisherConfig{})

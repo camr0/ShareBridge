@@ -632,7 +632,11 @@ func TestOriginsAlwaysDerivedFromPersistedSession(t *testing.T) {
 		t.Fatalf("interstitial status = %d", dresp.Code)
 	}
 	body := dresp.Body.String()
-	if strings.Contains(body, "script") || strings.Contains(body, "evil.example") {
+	// Task 22 note: the real §9.3 page legitimately carries one nonce'd
+	// external <script> tag (Task 22's own contract pins exactly one and
+	// forbids every inline scripting vector), so this no-reflection guard
+	// asserts on the poison payloads themselves.
+	if strings.Contains(body, "alert(1)") || strings.Contains(body, "<script>alert") || strings.Contains(body, "evil.example") {
 		t.Fatalf("interstitial body reflects request input: %q", body)
 	}
 }

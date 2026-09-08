@@ -54,11 +54,15 @@ BIN="/tmp/sharebridge-server-linux"
 ( cd "$SCRIPT_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$BIN" ./cmd/server )
 echo "built $BIN"
 
-# ---- copy binary + web assets (four retained control-hosted pages) ----
+# ---- copy binary + web assets (four retained control-hosted pages + the
+# ---- Task 22 route-interstitial assets main.go loads from ./web at startup;
+# ---- startup fails closed without them) ----
 ssh "$HOST" "mkdir -p $REMOTE_DIR/web"
 scp -q "$BIN" "$HOST:$REMOTE_DIR/server"
 scp -q "$SCRIPT_DIR/web/home.html" "$SCRIPT_DIR/web/login.html" \
        "$SCRIPT_DIR/web/register.html" "$SCRIPT_DIR/web/account.html" \
+       "$SCRIPT_DIR/web/route-interstitial.html" "$SCRIPT_DIR/web/route-interstitial.js" \
+       "$SCRIPT_DIR/web/route-interstitial.css" \
        "$HOST:$REMOTE_DIR/web/"
 
 # ---- remote .env (token forwarded via ssh stdin, never echoed) ----

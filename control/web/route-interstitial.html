@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Preparing your share…</title>
+<link rel="stylesheet" href="/web/route-interstitial.css" nonce="{{NONCE}}">
+{{RELAY_HEAD_NOSCRIPT}}
+<script src="/web/route-interstitial.js" nonce="{{NONCE}}" defer></script>
+</head>
+<body>
+<main id="sb-interstitial" data-prepare-url="/api/shares/{{CODE}}/prepare-route">
+  <h1>ShareBridge</h1>
+  <p id="sb-status" role="status">Preparing your share…</p>
+  {{USE_RELAY_BUTTON}}
+  <div id="sb-unavailable" hidden>
+    <p>Your share can’t be opened right now.</p>
+    <p><a id="sb-retry" href="/s/{{CODE}}">Retry</a></p>
+  </div>
+</main>
+{{RELAY_BODY_NOSCRIPT}}
+</body>
+</html>
