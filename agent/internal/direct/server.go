@@ -125,6 +125,14 @@ func (s *DirectServer) TLSConfig() *tls.Config {
 func (s *DirectServer) Handler() http.Handler { return s.binder.Handler(http.HandlerFunc(s.route)) }
 
 func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
+	// The interstitial's CORS reachability check (§9.3) is dispatched before
+	// the shared GET/HEAD gate because it owns its method policy (GET only ⇒
+	// 404): a 405 would be neither 403 nor 404 and would leak the endpoint's
+	// existence on non-GET verbs.
+	if code, ok := shareCodeFromPath(r); ok && strings.TrimPrefix(r.URL.Path, "/s/"+code) == "/connect" {
+		s.handleConnect(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return

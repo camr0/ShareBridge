@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -422,5 +423,275 @@ func TestServerPageServesGalleryHTMLAndDownloadContentLength(t *testing.T) {
 	}
 	if cl := dl.Header.Get("Content-Length"); cl != "104857600" {
 		t.Fatalf("Content-Length = %q, want 104857600", cl)
+	}
+}
+
+// connectRecordingResolver counts Resolve invocations so the connect
+// endpoint's zero-resolver-work guarantee (§9.3) can be asserted.
+type connectRecordingResolver struct{ resolves atomic.Int32 }
+
+func (r *connectRecordingResolver) Resolve(code string) (*ContentSession, error) {
+	r.resolves.Add(1)
+	return &ContentSession{Membership: map[string]struct{}{}}, nil
+}
+
+// startConnectServer builds a TLS direct server for share "abc" on the demo
+// direct origin, backed by the given resolver and a recording session tracker
+// (returned so no-accounting guarantees can be asserted). When withRelay is
+// true the matching relay origin is bound too, so relay-binding rejections can
+// be exercised against the same binder.
+func startConnectServer(t *testing.T, r Resolver, withRelay bool) (*httptest.Server, *recordingTracker) {
+	t.Helper()
+	ns, base := "sbdeadbeef", "example.com"
+	cert := testServerCert(t, ns, base)
+	gate := NewSignalGate("a", func(string, RouteKind) bool { return true })
+	tr := &recordingTracker{}
+	srv := NewDirectServer(ns, base, tr, &rotatableCerts{cert}, gate, 1<<20)
+	_ = srv.Binder().Allow("demo."+ns+"."+base, RouteDirect, "abc")
+	if withRelay {
+		_ = srv.Binder().Allow("demo.relay."+ns+"."+base, RouteRelay, "abc")
+	}
+	srv.SetResolver(r)
+	ts := httptest.NewUnstartedServer(srv.Handler())
+	ts.TLS = srv.TLSConfig()
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	return ts, tr
+}
+
+// doConnect issues a request against the connect test server with explicit
+// SNI, Host, method, path, and Origin header (an empty origin omits it), via
+// the package's SNI-setting test client.
+func doConnect(t *testing.T, ts *httptest.Server, sni, host, method, path, origin string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, ts.URL+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest %s %s: %v", method, path, err)
+	}
+	req.Host = host
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	resp, err := tlsClient(sni).Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return resp
+}
+
+const (
+	connectDirectOrigin = "demo.sbdeadbeef.example.com"
+	connectRelayOrigin  = "demo.relay.sbdeadbeef.example.com"
+)
+
+// TestConnectReturns204NoStoreForAuthorizedDirectBinding verifies the §9.3
+// success contract: after Binder SNI/Host/code authorization with the
+// RouteDirect binding and the exact interstitial Origin, the connect check is
+// an empty 204 with no-store and exactly one ACAO for sharebridge.app.
+func TestConnectReturns204NoStoreForAuthorizedDirectBinding(t *testing.T) {
+	ts, _ := startConnectServer(t, stubResolver{}, false)
+
+	resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+		"/s/abc/connect", "https://sharebridge.app")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	acao := resp.Header.Values("Access-Control-Allow-Origin")
+	if len(acao) != 1 || acao[0] != "https://sharebridge.app" {
+		t.Fatalf("Access-Control-Allow-Origin = %v, want exactly [https://sharebridge.app]", acao)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) != 0 {
+		t.Fatalf("body = %q (err %v), want empty 204 body", body, err)
+	}
+}
+
+// TestConnectAllowsOnlyShareBridgeAppOrigin verifies the Origin gate: absent,
+// foreign, scheme-downgraded, suffixed, null, and case-variant origins are
+// refused with 403/404 and no ACAO (no origin reflection); only the exact
+// https://sharebridge.app value is accepted.
+func TestConnectAllowsOnlyShareBridgeAppOrigin(t *testing.T) {
+	ts, _ := startConnectServer(t, stubResolver{}, false)
+
+	for _, tc := range []struct{ name, origin string }{
+		{"absent", ""},
+		{"foreign https", "https://evil.example.com"},
+		{"scheme downgrade", "http://sharebridge.app"},
+		{"suffix host", "https://sharebridge.app.evil.com"},
+		{"null", "null"},
+		{"case variation", "https://SHAREBRIDGE.APP"},
+	} {
+		resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+			"/s/abc/connect", tc.origin)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: status = %d, want 403/404", tc.name, resp.StatusCode)
+		}
+		if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+			t.Fatalf("%s: Access-Control-Allow-Origin = %v, want none (no reflection)", tc.name, got)
+		}
+	}
+
+	// The exact origin value is the only accepted one.
+	resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+		"/s/abc/connect", "https://sharebridge.app")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("exact origin: status = %d, want 204", resp.StatusCode)
+	}
+	if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 1 || got[0] != "https://sharebridge.app" {
+		t.Fatalf("exact origin: Access-Control-Allow-Origin = %v, want exactly [https://sharebridge.app]", got)
+	}
+}
+
+// TestConnectSetsNoCookieAndTouchesNoBackend verifies the §18.3 "no content /
+// cookie" property structurally: a successful connect check never sets a
+// cookie, never consults the share resolver, and never runs session activity
+// accounting.
+func TestConnectSetsNoCookieAndTouchesNoBackend(t *testing.T) {
+	res := &connectRecordingResolver{}
+	ts, tr := startConnectServer(t, res, false)
+
+	resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+		"/s/abc/connect", "https://sharebridge.app")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if got := resp.Header.Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("Set-Cookie = %v, want none", got)
+	}
+	if resp.Cookies() != nil && len(resp.Cookies()) != 0 {
+		t.Fatalf("parsed cookies = %v, want none", resp.Cookies())
+	}
+	if n := res.resolves.Load(); n != 0 {
+		t.Fatalf("resolver.Resolve called %d times, want 0", n)
+	}
+	begins, acts, _ := tr.snapshot()
+	if len(begins) != 0 || len(acts) != 0 {
+		t.Fatalf("session accounting ran: begins=%v acts=%v, want none", begins, acts)
+	}
+}
+
+// TestConnectRejectsRelayBindingWrongHostWrongCodeAndNonGET verifies every
+// rejection axis: a relay-bound origin, a mismatched Host, a mismatched share
+// code, non-GET methods, and paths without the /s/<code> prefix are refused
+// with 403/404 and no ACAO.
+func TestConnectRejectsRelayBindingWrongHostWrongCodeAndNonGET(t *testing.T) {
+	ts, _ := startConnectServer(t, stubResolver{}, true)
+
+	t.Run("relay binding", func(t *testing.T) {
+		// The Binder authorizes the relay origin (Host/kind/code all match its
+		// relay binding), so the endpoint itself must refuse the non-direct
+		// binding and must not reveal a connect endpoint on relay origins.
+		resp := doConnect(t, ts, connectRelayOrigin, connectRelayOrigin, http.MethodGet,
+			"/s/abc/connect", "https://sharebridge.app")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		}
+		if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+			t.Fatalf("Access-Control-Allow-Origin = %v, want none", got)
+		}
+	})
+
+	t.Run("wrong Host", func(t *testing.T) {
+		resp := doConnect(t, ts, connectDirectOrigin, "evil.example.com", http.MethodGet,
+			"/s/abc/connect", "https://sharebridge.app")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", resp.StatusCode)
+		}
+		if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+			t.Fatalf("Access-Control-Allow-Origin = %v, want none", got)
+		}
+	})
+
+	t.Run("wrong code", func(t *testing.T) {
+		resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+			"/s/other/connect", "https://sharebridge.app")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", resp.StatusCode)
+		}
+		if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+			t.Fatalf("Access-Control-Allow-Origin = %v, want none", got)
+		}
+	})
+
+	t.Run("non-GET methods", func(t *testing.T) {
+		for _, m := range []string{http.MethodPost, http.MethodHead, http.MethodOptions, http.MethodPut} {
+			resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, m,
+				"/s/abc/connect", "https://sharebridge.app")
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("%s: status = %d, want 404", m, resp.StatusCode)
+			}
+			if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+				t.Fatalf("%s: Access-Control-Allow-Origin = %v, want none", m, got)
+			}
+		}
+	})
+
+	t.Run("unauthenticated path", func(t *testing.T) {
+		// Without the /s/<code> prefix the request never reaches the endpoint:
+		// the Binder rejects the code-less path with 403 (ErrWrongCode).
+		resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+			"/connect", "https://sharebridge.app")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 403/404", resp.StatusCode)
+		}
+		if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+			t.Fatalf("Access-Control-Allow-Origin = %v, want none", got)
+		}
+	})
+}
+
+// TestConnectPreflightIsNotBroadened pins the preflight ruling: the Task 22
+// interstitial issues a simple CORS GET (no custom headers), so browsers never
+// preflight and the endpoint must not implement preflight handling. An OPTIONS
+// request with preflight headers must fail as a plain error with none of the
+// Access-Control-* response headers, so no CORS capability is broadened.
+func TestConnectPreflightIsNotBroadened(t *testing.T) {
+	ts, _ := startConnectServer(t, stubResolver{}, false)
+
+	req, err := http.NewRequest(http.MethodOptions, ts.URL+"/s/abc/connect", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = connectDirectOrigin
+	req.Header.Set("Origin", "https://sharebridge.app")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers", "cache-control")
+	resp, err := tlsClient(connectDirectOrigin).Do(req)
+	if err != nil {
+		t.Fatalf("OPTIONS: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (preflight must not succeed)", resp.StatusCode)
+	}
+	for _, h := range []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Allow-Headers",
+		"Access-Control-Max-Age",
+		"Access-Control-Allow-Credentials",
+	} {
+		if got := resp.Header.Get(h); got != "" {
+			t.Fatalf("%s = %q, want none (preflight must not be broadened)", h, got)
+		}
 	}
 }

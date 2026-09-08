@@ -15,6 +15,54 @@ import (
 	"sharebridge/agent/internal/immich"
 )
 
+// connectAllowedOrigin is the single cross-origin caller of the connect
+// check: the control-hosted interstitial (§9.3). It is fixed — the endpoint
+// never reflects a request-supplied Origin.
+const connectAllowedOrigin = "https://sharebridge.app"
+
+// handleConnect serves GET /s/<code>/connect (§9.3): the interstitial's
+// credential-free, content-free CORS reachability check of the direct agent
+// origin. The Binder has already authorized SNI, Host, route namespace, and
+// share code for this request; this handler then additionally requires the
+// RouteDirect binding (a relay-bound origin must not reveal a connect
+// endpoint), the exact interstitial Origin, and GET.
+//
+// Success is 204 with no-store and exactly one ACAO for the fixed origin. The
+// check resolves no content, touches no backend, performs no session
+// accounting, and never sets a cookie (§18.3: the connect endpoint exposes no
+// content/cookie). Preflight (OPTIONS) is deliberately not implemented: the
+// interstitial issues a simple CORS GET, so browsers never preflight, and an
+// OPTIONS request fails as a plain 404 with no Access-Control-* headers —
+// CORS capability is never broadened.
+func (s *DirectServer) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	// Re-derive the admitted binding from the connection's SNI — the same
+	// authorization the Binder performed moments ago — and require the direct
+	// namespace. Failing closed on a missing TLS state keeps the direct-only
+	// requirement airtight.
+	sni := ""
+	if r.TLS != nil {
+		sni = r.TLS.ServerName
+	}
+	bd, err := s.binder.AdmitSNI(sni)
+	if err != nil || bd.RouteKind != RouteDirect {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if r.Header.Get("Origin") != connectAllowedOrigin {
+		// Absent or foreign Origin: refuse without echoing the value.
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("Access-Control-Allow-Origin", connectAllowedOrigin)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // classifyErr maps a backend error to an HTTP status per §4.5: upstream
 // NotFoundError → 404, AuthError → 403, any other UpstreamError → 502, and any
 // non-HTTP error (timeout / unreachable / transport) → 503.
