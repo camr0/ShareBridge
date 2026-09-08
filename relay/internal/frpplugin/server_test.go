@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1026,6 +1028,231 @@ func TestPluginBoundsReplayAndSessionState(t *testing.T) {
 	secondToken := signTestCredential(t, fixture.privateKey, secondClaims)
 	fixture.runID = "run-two"
 	requireRejected(t, fixture.request(OperationLogin, fixture.loginContent(secondToken, secondClaims)))
+}
+
+// Important-6 remediation (SOL mid-project review): admission replay state
+// (burned JTIs, issued-at/generation high-water) must survive a gateway
+// restart inside the ten-minute credential horizon. The restarted server
+// loads the persisted state file and keeps rejecting the burned credential.
+func TestBurnedCredentialRejectedAfterGatewayRestart(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "admission-state.json")
+	fixture := newPluginFixture(t, func(config *Config) { config.StatePath = statePath })
+	loginFixture(t, fixture) // burns the credential's JTI in the first process
+
+	// Simulated gateway restart: a fresh plugin server that reloads the
+	// persisted admission state.
+	restarted := newRestartedFixture(t, fixture, statePath)
+	restarted.runID = "run-replay"
+	requireRejected(t, restarted.request(OperationLogin, restarted.loginContent(restarted.token, restarted.claims)))
+
+	// The state file stays owner-only.
+	info, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("stat admission state: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("admission state mode = %o, want 600", got)
+	}
+}
+
+// newRestartedFixture builds a plugin server sharing the original fixture's
+// trust configuration and credential, simulating a gateway restart that
+// reloads the persisted admission state at statePath.
+func newRestartedFixture(t *testing.T, base *pluginFixture, statePath string) *pluginFixture {
+	t.Helper()
+	recorder := &eventRecorder{}
+	handler, err := NewServer(Config{
+		ControlPublicKey:   base.privateKey.Public().(ed25519.PublicKey),
+		PluginSharedSecret: testPluginSecret,
+		RelayPortMin:       11000,
+		RelayPortMax:       11099,
+		Now:                func() time.Time { return testNow },
+		PresenceEvents:     recorder,
+		StatePath:          statePath,
+	})
+	if err != nil {
+		t.Fatalf("new restarted plugin server: %v", err)
+	}
+	return &pluginFixture{
+		t:          t,
+		handler:    handler,
+		privateKey: base.privateKey,
+		recorder:   recorder,
+		claims:     base.claims,
+		token:      base.token,
+		runID:      "run-restart",
+	}
+}
+
+// The persisted high-water keeps a superseded credential rejected after a
+// gateway restart, even when its own JTI was never burned: only strictly
+// newer issued-at credentials at the same generation may admit.
+func TestSupersededIssuedAtRejectedAfterGatewayRestart(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "admission-state.json")
+	fixture := newPluginFixture(t, func(config *Config) { config.StatePath = statePath })
+	loginFixture(t, fixture) // admits gen 1 issued testNow-1min (jti-one)
+
+	// Second boot: a strictly newer same-generation credential is the normal
+	// re-credential path and admits, raising the persisted high-water.
+	newerClaims := validTestClaims(1, "jti-newer")
+	newerClaims.IssuedAt = fixture.claims.IssuedAt.Add(time.Second)
+	newerClaims.ExpiresAt = newerClaims.IssuedAt.Add(10 * time.Minute)
+	newerToken := signTestCredential(t, fixture.privateKey, newerClaims)
+	secondBoot := newRestartedFixture(t, fixture, statePath)
+	secondBoot.runID = "run-newer"
+	requireAllowed(t, secondBoot.request(OperationLogin, secondBoot.loginContent(newerToken, newerClaims)))
+
+	// Third boot: the burned jti-newer stays rejected...
+	thirdBoot := newRestartedFixture(t, fixture, statePath)
+	thirdBoot.runID = "run-replay"
+	requireRejected(t, thirdBoot.request(OperationLogin, thirdBoot.loginContent(newerToken, newerClaims)))
+
+	// ...and a never-burned credential superseded by the persisted high-water
+	// (equal generation, older issued_at) is rejected too.
+	supersededClaims := validTestClaims(1, "jti-superseded")
+	supersededClaims.IssuedAt = fixture.claims.IssuedAt
+	supersededClaims.ExpiresAt = supersededClaims.IssuedAt.Add(10 * time.Minute)
+	supersededToken := signTestCredential(t, fixture.privateKey, supersededClaims)
+	thirdBoot.runID = "run-superseded"
+	requireRejected(t, thirdBoot.request(OperationLogin, thirdBoot.loginContent(supersededToken, supersededClaims)))
+}
+
+// A corrupt, unknown-schema, or over-cap admission state file refuses
+// startup instead of admitting with wiped replay history.
+func TestCorruptAdmissionStateRefusesStartup(t *testing.T) {
+	validState := persistedAdmissionState{
+		Version: admissionStateFileVersion,
+		JTIs: []persistedJTI{
+			{JTI: "burned-jti", ExpiresAt: testNow.Add(5 * time.Minute)},
+		},
+		GenerationHighWater: []persistedAdmissionMark{
+			{AgentRecordID: "agent-record-one", Generation: 3, IssuedAt: testNow.Add(-time.Minute)},
+		},
+	}
+	validBytes, err := json.Marshal(validState)
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	overCap := validState
+	for index := 0; index < defaultMaxReplayEntries+1; index++ {
+		overCap.JTIs = append(overCap.JTIs, persistedJTI{
+			JTI:       fmt.Sprintf("jti-%04d", index),
+			ExpiresAt: testNow.Add(5 * time.Minute),
+		})
+	}
+	overCapBytes, err := json.Marshal(overCap)
+	if err != nil {
+		t.Fatalf("marshal over-cap state: %v", err)
+	}
+	tests := []struct {
+		name string
+		file []byte
+	}{
+		{name: "garbage bytes", file: []byte("\x00\x01not json at all")},
+		{name: "truncated json", file: validBytes[:len(validBytes)/2]},
+		{name: "empty file", file: nil},
+		{name: "trailing data", file: append(append([]byte(nil), validBytes...), []byte("{}")...)},
+		{name: "unknown schema version", file: mustJSON(t, persistedAdmissionState{Version: 99})},
+		{name: "unknown field", file: []byte(`{"version":1,"jtis":[],"generation_high_water":[],"extra":true}`)},
+		{name: "invalid replay entry", file: mustJSON(t, persistedAdmissionState{
+			Version: admissionStateFileVersion,
+			JTIs:    []persistedJTI{{JTI: "", ExpiresAt: testNow.Add(5 * time.Minute)}},
+		})},
+		{name: "invalid high-water entry", file: mustJSON(t, persistedAdmissionState{
+			Version:             admissionStateFileVersion,
+			GenerationHighWater: []persistedAdmissionMark{{AgentRecordID: "agent", Generation: -1, IssuedAt: testNow}},
+		})},
+		{name: "over replay cap", file: overCapBytes},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			statePath := filepath.Join(t.TempDir(), "admission-state.json")
+			if err := os.WriteFile(statePath, testCase.file, 0o600); err != nil {
+				t.Fatalf("write state file: %v", err)
+			}
+			if _, err := newPluginFixtureE(t, func(config *Config) { config.StatePath = statePath }); err == nil {
+				t.Fatal("startup admitted with a corrupt admission state file")
+			}
+		})
+	}
+
+	t.Run("missing file is a fresh first boot", func(t *testing.T) {
+		fixture := newPluginFixture(t, func(config *Config) {
+			config.StatePath = filepath.Join(t.TempDir(), "admission-state.json")
+		})
+		loginFixture(t, fixture)
+	})
+}
+
+// The admission state file stays bounded: entry caps keep its size far below
+// the startup read bound no matter how many credentials are admitted.
+func TestAdmissionStateFileStaysBounded(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "admission-state.json")
+	clock := testNow
+	fixture := newPluginFixture(t, func(config *Config) {
+		config.StatePath = statePath
+		config.MaxReplayEntries = 16
+		config.MaxSessions = 4
+		config.Now = func() time.Time { return clock }
+	})
+	for index := 0; index < 64; index++ {
+		if index > 0 && index%16 == 0 {
+			// Age the previous window's replay entries out of the ten-minute
+			// horizon, exactly as a long-lived process would.
+			clock = clock.Add(11 * time.Minute)
+		}
+		claims := validTestClaims(1, fmt.Sprintf("bounded-jti-%02d", index))
+		claims.IssuedAt = clock.Add(-time.Minute + time.Duration(index%16)*time.Second)
+		claims.ExpiresAt = claims.IssuedAt.Add(10 * time.Minute)
+		token := signTestCredential(t, fixture.privateKey, claims)
+		fixture.runID = fmt.Sprintf("run-bounded-%02d", index)
+		requireAllowed(t, fixture.request(OperationLogin, fixture.loginContent(token, claims)))
+	}
+	info, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("stat admission state: %v", err)
+	}
+	if info.Size() > 64*1024 {
+		t.Fatalf("admission state file = %d bytes, want bounded far below the startup cap", info.Size())
+	}
+	server := fixture.handler.(*Server)
+	server.mu.Lock()
+	jtis, marks := len(server.replayedJTI), len(server.admissionHighWater)
+	server.mu.Unlock()
+	if jtis > 16 || marks > 4 {
+		t.Fatalf("in-memory state = %d jtis, %d marks; want caps 16/4", jtis, marks)
+	}
+}
+
+func mustJSON(t *testing.T, state persistedAdmissionState) []byte {
+	t.Helper()
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	return data
+}
+
+// newPluginFixtureE is NewServer for tests that need to observe a
+// construction failure (corrupt state refusal) instead of a fatal.
+func newPluginFixtureE(t *testing.T, mutateConfig ...func(*Config)) (http.Handler, error) {
+	t.Helper()
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	config := Config{
+		ControlPublicKey:   publicKey,
+		PluginSharedSecret: testPluginSecret,
+		RelayPortMin:       11000,
+		RelayPortMax:       11099,
+		Now:                func() time.Time { return testNow },
+		PresenceEvents:     &eventRecorder{},
+	}
+	for _, mutate := range mutateConfig {
+		mutate(&config)
+	}
+	return NewServer(config)
 }
 
 func TestPluginConcurrentPingStateIsRaceSafe(t *testing.T) {

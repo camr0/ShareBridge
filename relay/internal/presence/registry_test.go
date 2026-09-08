@@ -553,13 +553,26 @@ func TestReplacementGenerationFencesOldTunnel(t *testing.T) {
 	fixture.requireOnline(2)
 	fixture.requireEventCount(3)
 
-	// An equal-generation Login cannot exist from the plugin (issued-at fence);
-	// if one ever arrived it must not reset or re-fence the live tunnel.
+	// An equal-generation Login cannot exist from the plugin (issued-at
+	// fence); if one ever arrived it is an authoritative session replacement
+	// (SOL review Critical-1): the live entry transitions offline with a
+	// fresh event before any replacement session state exists, and only a
+	// full readiness path may return it online.
 	fixture.observe(testFact(frpplugin.OperationLogin, 2, "run-2-forged"))
-	fixture.requireOnline(2)
-	fixture.requireEventCount(3)
+	fixture.requireOffline(2)
+	fixture.requireEventCount(4)
+	replacement := fixture.events()[3]
+	if replacement.State != StateOffline || replacement.Generation != 2 || replacement.BootID != testBootID {
+		t.Fatalf("replacement event = %+v, want gen-2 offline under %q", replacement, testBootID)
+	}
 
-	// A higher generation fences the live one again.
+	// The replacement session is unconfirmed: its facts never resurrect it.
+	fixture.observe(testFact(frpplugin.OperationPing, 2, "run-2-forged"))
+	fixture.requireOffline(2)
+	fixture.requireEventCount(4)
+
+	// A higher generation fences the unconfirmed replacement entry (already
+	// absent, so no new event) and records gen 3.
 	fixture.observe(testFact(frpplugin.OperationLogin, 3, "run-3"))
 	fixture.requireOffline(2)
 	fixture.requireEventCount(4)
@@ -620,6 +633,224 @@ func TestDelayedPingDoesNotFlapLease(t *testing.T) {
 	fixture.requireEventCount(2)
 	if state := fixture.events()[1].State; state != StateOffline {
 		t.Fatalf("expiry event state = %q", state)
+	}
+}
+
+// Critical-1 reproduction (SOL mid-project review): the plugin legitimately
+// accepts a fresh same-generation credential (new JTI, newer issued_at, new
+// run id) for an already-online entry, and the replacement session's
+// downstream NewProxy registration then fails. The replacement session's
+// authenticated Pings must never keep — or make — the entry online: the
+// same-generation Login is an authoritative session replacement that takes
+// the entry offline immediately, and only a fresh probe-confirmed
+// NewUserConn may return it online.
+func TestSameGenerationRecredentialWithFailedRegistrationStaysOffline(t *testing.T) {
+	fixture := newRegistryFixture(t)
+	fixture.probe.source = "127.0.0.1:55555"
+
+	// R1 comes online through the full readiness path with run id X.
+	fixture.registerOnline(1, "run-x", "127.0.0.1:55555")
+
+	// The plugin accepted a fresh same-generation credential and emitted its
+	// Login fact: an authoritative session replacement, offline immediately.
+	fixture.observe(testFact(frpplugin.OperationLogin, 1, "run-y"))
+	fixture.requireOffline(1)
+
+	// R2's NewProxy is authorized, but its downstream registration fails: no
+	// NewUserConn ever arrives for the replacement session.
+	fixture.probe.fail = true
+	fixture.observe(testFact(frpplugin.OperationNewProxy, 1, "run-y"))
+	fixture.registry.waitIdle()
+	fixture.requireOffline(1)
+
+	// R2's authenticated Pings arrive on the 10-second schedule. They are
+	// bounded diagnostic noise for an unconfirmed session, never renewal:
+	// the entry must still be offline well past the original lease horizon.
+	for elapsed := time.Duration(10); elapsed <= 60*time.Second; elapsed += 10 * time.Second {
+		fixture.clock.Advance(10 * time.Second)
+		fixture.observe(testFact(frpplugin.OperationPing, 1, "run-y"))
+		fixture.requireOffline(1)
+	}
+	fixture.requireEventCount(2) // R1 online, offline at the replacement
+	offline := fixture.events()[1]
+	if offline.State != StateOffline || offline.Generation != 1 {
+		t.Fatalf("replacement event = %+v, want gen-1 offline", offline)
+	}
+}
+
+// Agent-level generation high-water (SOL review, Task 14 finding m1): after
+// a replacement generation has fenced (and deleted) an older entry, a
+// replayed lower-generation Login must not resurrect fresh state for it.
+func TestLowerGenerationFactsCannotResurrectFencedEntry(t *testing.T) {
+	fixture := newRegistryFixture(t)
+	fixture.probe.source = "127.0.0.1:55555"
+	fixture.registerOnline(1, "run-1", "127.0.0.1:55555")
+
+	// The replacement generation fences and deletes the gen-1 entry.
+	fixture.observe(testFact(frpplugin.OperationLogin, 2, "run-2"))
+	fixture.requireOffline(1)
+
+	// A replayed lower-generation Login would previously recreate the deleted
+	// key from scratch; the agent-level high-water ignores it.
+	fixture.observe(testFact(frpplugin.OperationLogin, 1, "run-resurrect"))
+	fixture.requireOffline(1)
+
+	// No lower-generation fact may rebuild state: NewProxy arms no probe, a
+	// correlated NewUserConn confirms nothing, a Ping renews nothing.
+	fixture.observe(testFact(frpplugin.OperationNewProxy, 1, "run-resurrect"))
+	fixture.registry.waitIdle()
+	fixture.observe(frpplugin.PresenceFact{
+		Operation:     frpplugin.OperationNewUserConn,
+		AgentRecordID: testAgent,
+		Namespace:     testNamespace,
+		ProxyName:     testProxy,
+		RelayPort:     testPort,
+		Generation:    1,
+		RunID:         "run-resurrect",
+		RemoteAddr:    "127.0.0.1:55555",
+	})
+	fixture.observe(testFact(frpplugin.OperationPing, 1, "run-resurrect"))
+	fixture.requireOffline(1)
+	fixture.requireOffline(2)
+	if got := fixture.probe.callCount(); got != 1 {
+		t.Fatalf("lower-generation facts re-armed a probe: %d calls, want 1", got)
+	}
+	fixture.requireEventCount(2) // gen-1 online, gen-1 fence offline only
+}
+
+// A same-generation replacement cancels the superseded session's in-flight
+// probe expectation: the canceled probe's result must confirm nothing for
+// the replacement session, which follows its own full readiness path.
+func TestSameGenerationReplacementCancelsInFlightProbe(t *testing.T) {
+	started := make(chan struct{}, 4)
+	release := make(chan string)
+	clock := newFakeClock()
+	sink := &eventSink{}
+	registry, err := NewRegistry(Config{
+		BootID: testBootID,
+		Now:    clock.Now,
+		Sink:   sink,
+		Probe: func(_ context.Context, _ int) (string, error) {
+			started <- struct{}{}
+			return <-release, nil
+		},
+		Drainer: drainerFunc(func(string) int { return 0 }),
+	})
+	if err != nil {
+		t.Fatalf("new presence registry: %v", err)
+	}
+	fixture := &registryFixture{t: t, registry: registry, clock: clock, sink: sink}
+
+	// The first session arms a probe that is still in flight when the
+	// replacement Login arrives.
+	fixture.observe(testFact(frpplugin.OperationLogin, 1, "run-x"))
+	fixture.observe(testFact(frpplugin.OperationNewProxy, 1, "run-x"))
+	<-started
+	fixture.observe(testFact(frpplugin.OperationLogin, 1, "run-y")) // authoritative replacement
+	fixture.requireOffline(1)
+
+	// The canceled probe returns its source address; it must confirm nothing
+	// for either the replaced or the replacement session.
+	release <- "127.0.0.1:60001"
+	registry.waitIdle()
+	fixture.observe(frpplugin.PresenceFact{
+		Operation:     frpplugin.OperationNewUserConn,
+		AgentRecordID: testAgent,
+		Namespace:     testNamespace,
+		ProxyName:     testProxy,
+		RelayPort:     testPort,
+		Generation:    1,
+		RunID:         "run-x",
+		RemoteAddr:    "127.0.0.1:60001",
+	})
+	fixture.observe(frpplugin.PresenceFact{
+		Operation:     frpplugin.OperationNewUserConn,
+		AgentRecordID: testAgent,
+		Namespace:     testNamespace,
+		ProxyName:     testProxy,
+		RelayPort:     testPort,
+		Generation:    1,
+		RunID:         "run-y",
+		RemoteAddr:    "127.0.0.1:60001",
+	})
+	fixture.requireOffline(1)
+	fixture.requireEventCount(0)
+
+	// The replacement session confirms only through its own armed probe.
+	fixture.observe(testFact(frpplugin.OperationNewProxy, 1, "run-y"))
+	<-started
+	release <- "127.0.0.1:60002"
+	registry.waitIdle()
+	fixture.observe(frpplugin.PresenceFact{
+		Operation:     frpplugin.OperationNewUserConn,
+		AgentRecordID: testAgent,
+		Namespace:     testNamespace,
+		ProxyName:     testProxy,
+		RelayPort:     testPort,
+		Generation:    1,
+		RunID:         "run-y",
+		RemoteAddr:    "127.0.0.1:60002",
+	})
+	fixture.requireOnline(1)
+	fixture.requireEventCount(1)
+}
+
+// A Ping that does not carry the tunnel's exact current run id is bounded
+// diagnostic noise: it never renews the lease, so an online tunnel whose
+// current-session Pings stop goes absent at the lease boundary.
+func TestPingWithWrongRunIDNeverRenews(t *testing.T) {
+	fixture := newRegistryFixture(t)
+	fixture.probe.source = "127.0.0.1:55555"
+	fixture.registerOnline(1, "run-x", "127.0.0.1:55555")
+
+	// A foreign-session Ping 40 seconds in must not push the lease out.
+	fixture.clock.Advance(40 * time.Second)
+	fixture.observe(testFact(frpplugin.OperationPing, 1, "run-other"))
+	fixture.requireOnline(1)
+
+	fixture.clock.Advance(5 * time.Second) // exactly the un-renewed boundary
+	fixture.requireOffline(1)
+	fixture.requireEventCount(2)
+	if state := fixture.events()[1].State; state != StateOffline {
+		t.Fatalf("expiry event state = %q", state)
+	}
+}
+
+// Every replacement offline event carries the gateway boot ID and a strictly
+// increasing revision, in emission order.
+func TestReplacementOfflineEventCarriesBootIDAndFreshRevision(t *testing.T) {
+	fixture := newRegistryFixture(t)
+	fixture.probe.source = "127.0.0.1:55555"
+	fixture.registerOnline(1, "run-1", "127.0.0.1:55555") // event 1: online
+
+	fixture.observe(testFact(frpplugin.OperationLogin, 1, "run-2")) // event 2: replacement offline
+	fixture.observe(testFact(frpplugin.OperationNewProxy, 1, "run-2"))
+	fixture.registry.waitIdle()
+	fixture.observe(frpplugin.PresenceFact{
+		Operation:     frpplugin.OperationNewUserConn,
+		AgentRecordID: testAgent,
+		Namespace:     testNamespace,
+		ProxyName:     testProxy,
+		RelayPort:     testPort,
+		Generation:    1,
+		RunID:         "run-2",
+		RemoteAddr:    "127.0.0.1:55555",
+	}) // event 3: online
+	fixture.observe(testFact(frpplugin.OperationLogin, 1, "run-3")) // event 4: replacement offline
+
+	events := fixture.events()
+	fixture.requireEventCount(4)
+	wantState := []string{StateOnline, StateOffline, StateOnline, StateOffline}
+	for index, event := range events {
+		if event.BootID != testBootID {
+			t.Fatalf("event %d boot ID = %q, want %q", index, event.BootID, testBootID)
+		}
+		if event.Revision != uint64(index+1) {
+			t.Fatalf("event %d revision = %d, want %d", index, event.Revision, index+1)
+		}
+		if event.State != wantState[index] || event.Generation != 1 {
+			t.Fatalf("event %d = %+v, want state %q generation 1", index, event, wantState[index])
+		}
 	}
 }
 

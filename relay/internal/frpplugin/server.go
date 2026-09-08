@@ -10,10 +10,13 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net"
 	"net/http"
+	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -62,6 +65,14 @@ const (
 	// maxRemoteAddrBytes bounds one correlation remote address
 	// ("127.0.0.1:port" and the IPv6 loopback form both fit comfortably).
 	maxRemoteAddrBytes = 64
+
+	// admissionStateFileVersion is the persisted admission-state schema
+	// version; a file written by any other schema refuses startup.
+	admissionStateFileVersion = 1
+	// maxAdmissionStateBytes bounds the persisted admission-state file read
+	// at startup. The entry caps below bound a legitimate file far below
+	// this, so a larger file is corrupt or hostile and refuses startup.
+	maxAdmissionStateBytes = 2 << 20
 )
 
 // PresenceFact is the credential-free fact stream consumed by Task 14's
@@ -110,6 +121,17 @@ type Config struct {
 	MaxPendingEvents   int
 	Now                func() time.Time
 	PresenceEvents     PresenceEvents
+	// StatePath persists the admission replay state — the burned replay-JTI
+	// set and the per-agent issued-at/generation high-water — across gateway
+	// restarts for the ten-minute credential horizon (spec §7.2: any
+	// reconnect requires a fresh credential, including after a restart).
+	// The file holds identifiers and timestamps only, never token material;
+	// it is written atomically (temp file + rename) with mode 0600 and is
+	// TTL-pruned to the ten-minute window and hard-capped. An existing file
+	// is loaded at startup: an unreadable, corrupt, unknown-schema, or
+	// over-cap file fails startup (fail closed) rather than admitting with
+	// wiped replay history. Empty disables persistence (process memory only).
+	StatePath string
 }
 
 // Server is both the HTTP handler and the bounded, concurrency-safe admission
@@ -126,11 +148,44 @@ type Server struct {
 	eventQueue         chan PresenceFact
 	eventSlots         chan struct{}
 
-	mu              sync.Mutex
-	replayedJTI     map[string]time.Time
-	agentSessions   map[string]*sessionState
-	sessionsByToken map[[sha256.Size]byte]*sessionState
-	userConnSeen    map[[sha256.Size]byte]struct{}
+	mu          sync.Mutex
+	replayedJTI map[string]time.Time
+	// admissionHighWater is the per-agent issued-at/generation admission
+	// fence: the newest credential ever admitted for that agent record. It
+	// mirrors agentSessions' fence while a session is live and survives
+	// gateway restarts via the state file, so a replayed or superseded
+	// credential stays rejected within the ten-minute admission horizon.
+	admissionHighWater map[string]admissionMark
+	agentSessions      map[string]*sessionState
+	sessionsByToken    map[[sha256.Size]byte]*sessionState
+	userConnSeen       map[[sha256.Size]byte]struct{}
+	statePath          string
+}
+
+// admissionMark is the issued-at/generation admission high-water for one
+// agent record (see Server.admissionHighWater).
+type admissionMark struct {
+	generation int
+	issuedAt   time.Time
+}
+
+// persistedAdmissionState is the JSON schema of the admission-state file. It
+// carries identifiers and timestamps only — never credential token material.
+type persistedAdmissionState struct {
+	Version             int                      `json:"version"`
+	JTIs                []persistedJTI           `json:"jtis"`
+	GenerationHighWater []persistedAdmissionMark `json:"generation_high_water"`
+}
+
+type persistedJTI struct {
+	JTI       string    `json:"jti"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type persistedAdmissionMark struct {
+	AgentRecordID string    `json:"agent_record_id"`
+	Generation    int       `json:"generation"`
+	IssuedAt      time.Time `json:"issued_at"`
 }
 
 type sessionState struct {
@@ -268,9 +323,18 @@ func NewServer(config Config) (*Server, error) {
 		eventQueue:         make(chan PresenceFact, config.MaxPendingEvents),
 		eventSlots:         make(chan struct{}, config.MaxPendingEvents),
 		replayedJTI:        make(map[string]time.Time),
+		admissionHighWater: make(map[string]admissionMark),
 		agentSessions:      make(map[string]*sessionState),
 		sessionsByToken:    make(map[[sha256.Size]byte]*sessionState),
 		userConnSeen:       make(map[[sha256.Size]byte]struct{}),
+		statePath:          config.StatePath,
+	}
+	// Load persisted admission state BEFORE the event dispatcher starts and
+	// before any request can be admitted: a corrupt or over-cap state file
+	// fails startup (fail closed) instead of admitting with wiped history
+	// (SOL mid-project review Important-6).
+	if err := server.loadAdmissionState(); err != nil {
+		return nil, err
 	}
 	go server.dispatchPresenceEvents()
 	return server, nil
@@ -396,16 +460,45 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 			!credential.claims.IssuedAt.After(current.claims.IssuedAt))) {
 		return false
 	}
+	// The persisted high-water mirrors the live session's fence while a
+	// session exists and covers the post-restart window where agentSessions
+	// is empty: a replayed or superseded credential stays rejected within
+	// the ten-minute admission horizon (SOL mid-project review Important-6).
+	if mark, fenced := server.admissionHighWater[credential.claims.AgentRecordID]; fenced &&
+		(mark.generation > credential.claims.Generation ||
+			(mark.generation == credential.claims.Generation && !credential.claims.IssuedAt.After(mark.issuedAt))) {
+		return false
+	}
 	if !exists && len(server.agentSessions) >= server.maxSessions {
+		return false
+	}
+	// Keep the persisted high-water cardinality inside its hard cap: a brand
+	// new agent is admitted only while a high-water slot is free (fail
+	// closed; horizon pruning frees slots within the credential window).
+	if _, marked := server.admissionHighWater[credential.claims.AgentRecordID]; !marked && !exists &&
+		len(server.admissionHighWater) >= server.maxSessions {
 		return false
 	}
 	if len(server.replayedJTI) >= server.maxReplayEntries || !server.reserveEventLocked() {
 		return false
 	}
 
+	// Persist BEFORE mutating memory: a persistence failure rejects the
+	// login instead of admitting history the next boot would forget.
+	if server.statePath != "" {
+		if err := server.writeAdmissionStateLocked(credential.claims, now); err != nil {
+			server.releaseEventSlotLocked()
+			return false
+		}
+	}
+
 	server.replayedJTI[credential.claims.JTI] = credential.claims.ExpiresAt
 	if exists {
 		delete(server.sessionsByToken, current.tokenHash)
+	}
+	server.admissionHighWater[credential.claims.AgentRecordID] = admissionMark{
+		generation: credential.claims.Generation,
+		issuedAt:   credential.claims.IssuedAt,
 	}
 	session := &sessionState{
 		claims:    credential.claims,
@@ -581,6 +674,154 @@ func (server *Server) pruneExpiredReplayLocked(now time.Time) {
 			delete(server.replayedJTI, jti)
 		}
 	}
+	// High-water marks fence only inside the ten-minute credential horizon:
+	// past it, no credential with that issued_at can still be admitted or
+	// replayed (admission rejects expired credentials outright), and a live
+	// session's fence keeps covering the agent through agentSessions.
+	for agent, mark := range server.admissionHighWater {
+		if !mark.issuedAt.Add(credentialLifetime).After(now) {
+			delete(server.admissionHighWater, agent)
+		}
+	}
+}
+
+// loadAdmissionState restores the persisted replay-JTI set and generation
+// high-water at startup. Fail closed: an unreadable, corrupt,
+// unknown-schema, or over-cap existing file is a startup error — the gateway
+// must never admit with wiped replay history (SOL mid-project review
+// Important-6). A missing file is a fresh first boot. Entries outside the
+// ten-minute credential horizon are pruned on load.
+func (server *Server) loadAdmissionState() error {
+	if server.statePath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(server.statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // fresh first boot: nothing to restore
+	}
+	if err != nil {
+		return fmt.Errorf("frpplugin: admission state %q unreadable: %w", server.statePath, err)
+	}
+	if len(data) > maxAdmissionStateBytes {
+		return fmt.Errorf("frpplugin: admission state %q exceeds %d bytes", server.statePath, maxAdmissionStateBytes)
+	}
+	var state persistedAdmissionState
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil {
+		return fmt.Errorf("frpplugin: admission state %q corrupt: %w", server.statePath, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("frpplugin: admission state %q corrupt: trailing data", server.statePath)
+	}
+	if state.Version != admissionStateFileVersion {
+		return fmt.Errorf("frpplugin: admission state %q has unsupported schema version %d", server.statePath, state.Version)
+	}
+	now := server.now().UTC()
+	jtis := make(map[string]time.Time, len(state.JTIs))
+	for _, entry := range state.JTIs {
+		if entry.JTI == "" || len(entry.JTI) > maxIdentifierBytes || entry.ExpiresAt.IsZero() {
+			return fmt.Errorf("frpplugin: admission state %q contains an invalid replay entry", server.statePath)
+		}
+		if !entry.ExpiresAt.After(now) {
+			continue // outside the ten-minute admission horizon
+		}
+		jtis[entry.JTI] = entry.ExpiresAt.UTC()
+	}
+	if len(jtis) > server.maxReplayEntries {
+		return fmt.Errorf("frpplugin: admission state %q holds %d replay entries, cap %d", server.statePath, len(jtis), server.maxReplayEntries)
+	}
+	marks := make(map[string]admissionMark, len(state.GenerationHighWater))
+	for _, entry := range state.GenerationHighWater {
+		if entry.AgentRecordID == "" || len(entry.AgentRecordID) > maxIdentifierBytes ||
+			entry.Generation < 0 || entry.IssuedAt.IsZero() {
+			return fmt.Errorf("frpplugin: admission state %q contains an invalid high-water entry", server.statePath)
+		}
+		if !entry.IssuedAt.Add(credentialLifetime).After(now) {
+			continue // outside the ten-minute admission horizon
+		}
+		marks[entry.AgentRecordID] = admissionMark{generation: entry.Generation, issuedAt: entry.IssuedAt.UTC()}
+	}
+	if len(marks) > server.maxSessions {
+		return fmt.Errorf("frpplugin: admission state %q holds %d high-water entries, cap %d", server.statePath, len(marks), server.maxSessions)
+	}
+	server.replayedJTI = jtis
+	server.admissionHighWater = marks
+	// Repair permission drift on the loaded file: it holds replay
+	// identifiers and must stay owner-only.
+	if info, statErr := os.Stat(server.statePath); statErr == nil && info.Mode().Perm() != 0o600 {
+		_ = os.Chmod(server.statePath, 0o600)
+	}
+	return nil
+}
+
+// writeAdmissionStateLocked atomically persists the post-admission replay
+// state: temp file + rename in the state file's directory, mode 0600, entry
+// sets TTL-pruned to the ten-minute credential horizon and hard-capped.
+// Caller holds server.mu and passes the credential being admitted; the
+// in-memory state is mutated only after the write succeeds, so a persistence
+// failure rejects the login instead of admitting history the next boot would
+// forget. The file carries identifiers and timestamps only — never token
+// material.
+func (server *Server) writeAdmissionStateLocked(claims CredentialClaims, now time.Time) error {
+	jtis := make([]persistedJTI, 0, len(server.replayedJTI)+1)
+	for jti, expiry := range server.replayedJTI {
+		if expiry.After(now) {
+			jtis = append(jtis, persistedJTI{JTI: jti, ExpiresAt: expiry})
+		}
+	}
+	jtis = append(jtis, persistedJTI{JTI: claims.JTI, ExpiresAt: claims.ExpiresAt})
+	highWater := make([]persistedAdmissionMark, 0, len(server.admissionHighWater)+1)
+	for agent, mark := range server.admissionHighWater {
+		if agent == claims.AgentRecordID {
+			continue // the incoming credential's mark is appended below
+		}
+		if mark.issuedAt.Add(credentialLifetime).After(now) {
+			highWater = append(highWater, persistedAdmissionMark{AgentRecordID: agent, Generation: mark.generation, IssuedAt: mark.issuedAt})
+		}
+	}
+	highWater = append(highWater, persistedAdmissionMark{
+		AgentRecordID: claims.AgentRecordID,
+		Generation:    claims.Generation,
+		IssuedAt:      claims.IssuedAt,
+	})
+	if len(jtis) > server.maxReplayEntries || len(highWater) > server.maxSessions {
+		return errors.New("frpplugin: admission state entry cap exceeded")
+	}
+	sort.Slice(jtis, func(i, j int) bool { return jtis[i].JTI < jtis[j].JTI })
+	sort.Slice(highWater, func(i, j int) bool { return highWater[i].AgentRecordID < highWater[j].AgentRecordID })
+	data, err := json.Marshal(persistedAdmissionState{
+		Version:             admissionStateFileVersion,
+		JTIs:                jtis,
+		GenerationHighWater: highWater,
+	})
+	if err != nil {
+		return err
+	}
+	tempPath := server.statePath + ".tmp"
+	file, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := os.Rename(tempPath, server.statePath); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	return nil
 }
 
 func (server *Server) bindRunIDLocked(session *sessionState, runID string) {

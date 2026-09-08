@@ -13,11 +13,13 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -34,10 +36,19 @@ const (
 	envControlPublicKey    = "SHAREBRIDGE_CONTROL_RELAY_PUBLIC_KEY"
 	envRelayPortMin        = "SHAREBRIDGE_RELAY_PORT_MIN"
 	envRelayPortMax        = "SHAREBRIDGE_RELAY_PORT_MAX"
+	envRelayDataDir        = "SHAREBRIDGE_RELAY_DATA_DIR"
 
 	defaultPluginListenAddress = "127.0.0.1:9001"
 	defaultRelayPortMin        = 10000
 	defaultRelayPortMax        = 10099
+	defaultDataDirName         = ".sharebridge-relay"
+
+	// admissionStateFilename is the FRP plugin's persisted admission replay
+	// state inside the relay data directory: the burned replay-JTI set and
+	// the per-agent issued-at/generation high-water, so a burned-but-
+	// unexpired credential stays rejected across a gateway restart (spec
+	// §7.2 ten-minute credential horizon).
+	admissionStateFilename = "admission-state.json"
 )
 
 func main() {
@@ -145,17 +156,44 @@ func configuredPluginServer() (*frpplugin.Server, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	statePath, err := resolveAdmissionStatePath()
+	if err != nil {
+		return nil, "", err
+	}
 
 	pluginServer, err := frpplugin.NewServer(frpplugin.Config{
 		ControlPublicKey:   ed25519.PublicKey(publicKeyBytes),
 		PluginSharedSecret: sharedSecret,
 		RelayPortMin:       relayPortMin,
 		RelayPortMax:       relayPortMax,
+		StatePath:          statePath,
 	})
 	if err != nil {
 		return nil, "", err
 	}
 	return pluginServer, pluginListenAddress, nil
+}
+
+// resolveAdmissionStatePath resolves the FRP plugin's persisted admission
+// state path from SHAREBRIDGE_RELAY_DATA_DIR (default ~/.sharebridge-relay,
+// mirroring the agent's SHAREBRIDGE_DATA_DIR convention) and creates the
+// directory owner-only when missing. Startup fails closed when the data
+// directory is unavailable: the persisted replay state is what keeps a
+// burned credential rejected across restarts, so the gateway must not run
+// without it.
+func resolveAdmissionStatePath() (string, error) {
+	dataDir := os.Getenv(envRelayDataDir)
+	if dataDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", errors.New("relay data directory unavailable: set " + envRelayDataDir)
+		}
+		dataDir = filepath.Join(home, defaultDataDirName)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return "", fmt.Errorf("relay data directory %q unavailable: %w", dataDir, err)
+	}
+	return filepath.Join(dataDir, admissionStateFilename), nil
 }
 
 func environmentPort(name string, defaultValue int) (int, error) {

@@ -6,10 +6,16 @@
 //	absent
 //	  └─ valid Login + authorized NewProxy + probe-confirmed NewUserConn ─► online
 //	online
-//	  ├─ current Ping renews 45s lease ─► online
+//	  ├─ current Ping renews 45s lease (from the last authenticated Ping) ─► online
 //	  ├─ CloseProxy / logout / lease expiry ─► absent
 //	  ├─ frps reset (ClearAll) ─► absent
-//	  └─ replacement generation ─► fenced, then new online
+//	  └─ replacement Login (equal or higher generation) ─► offline, then new online
+//
+// Every plugin-accepted Login is an authoritative session replacement: a
+// same-generation re-credential (fresh issued_at, new JTI, new run id — the
+// normal post-exit recovery path) takes the previous entry offline before
+// the replacement session may confirm, and an agent-level generation
+// high-water ignores facts below any live or fenced entry of that agent.
 //
 // Online requires the probe-confirmed readiness predicate (§4.2 condition 2,
 // §23.1): an authorized NewProxy is pre-registration authorization in the
@@ -173,7 +179,13 @@ type tunnelState struct {
 	proxyAuthorized bool
 	online          bool
 	leaseExpiresAt  time.Time
-	probe           *probeState
+	// lastPingAt anchors the lease at the last authenticated Ping of the
+	// exact current session (matching run id, proxy-authorized): the 45-second
+	// lease expires from that timestamp, never from confirmation, so the ≤2.5
+	// second probe window cannot extend a session's authority. Zero until the
+	// session's first authenticated Ping arrives.
+	lastPingAt time.Time
+	probe      *probeState
 }
 
 // Registry is the gateway's leased tunnel presence state machine. Safe for
@@ -192,7 +204,13 @@ type Registry struct {
 	mu       sync.Mutex
 	revision uint64
 	tunnels  map[tunnelKey]*tunnelState
-	inflight sync.WaitGroup
+	// agentHighWater is the agent-level generation fence: the highest
+	// generation any plugin-accepted Login ever recorded per agent record.
+	// Facts for a LOWER generation than any live or fenced entry of that
+	// agent are ignored — a replayed lower-generation Login can never
+	// resurrect a fenced entry (Task 14 review finding m1).
+	agentHighWater map[string]uint64
+	inflight       sync.WaitGroup
 }
 
 // Registry satisfies the route table's presence join statically.
@@ -239,6 +257,7 @@ func NewRegistry(config Config) (*Registry, error) {
 		drainer:           config.Drainer,
 		probeHardDeadline: bounds.hardDeadline,
 		tunnels:           make(map[tunnelKey]*tunnelState),
+		agentHighWater:    make(map[string]uint64),
 	}, nil
 }
 
@@ -298,6 +317,14 @@ func (registry *Registry) ObserveFRPEvent(fact frpplugin.PresenceFact) {
 
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	// Agent-level generation high-water: ignore every fact for a lower
+	// generation than any live or fenced entry of that agent, whatever the
+	// operation. Fenced entries are deleted from the tunnel map, so without
+	// this fence a replayed lower-generation fact would recreate fresh state
+	// (Task 14 review finding m1).
+	if key.generation < registry.agentHighWater[fact.AgentRecordID] {
+		return
+	}
 	tunnel := registry.tunnels[key]
 	if tunnel != nil {
 		registry.expireIfDueLocked(key, tunnel)
@@ -308,7 +335,7 @@ func (registry *Registry) ObserveFRPEvent(fact frpplugin.PresenceFact) {
 	case frpplugin.OperationNewProxy:
 		registry.observeNewProxy(key, fact, tunnel)
 	case frpplugin.OperationPing:
-		registry.observePing(tunnel)
+		registry.observePing(tunnel, fact)
 	case frpplugin.OperationCloseProxy:
 		registry.observeCloseProxy(key, fact, tunnel)
 	case frpplugin.OperationNewUserConn:
@@ -316,20 +343,32 @@ func (registry *Registry) ObserveFRPEvent(fact frpplugin.PresenceFact) {
 	}
 }
 
-// observeLogin admits a new tunnel generation and fences every older
-// generation of the same agent. The plugin only emits strictly newer
-// generations (its issued-at/generation fences reject equal or older
-// credentials), so a fact for an existing key is replayed history and is
-// ignored fail-closed: live state can never regress.
+// observeLogin treats EVERY plugin-accepted Login as an authoritative
+// session replacement (SOL mid-project review Critical-1). The plugin only
+// emits strictly newer credentials (its issued-at/generation fences reject
+// equal or older ones), so a Login fact for an existing key is a legitimate
+// re-credential of the same generation — the normal post-exit recovery path
+// — never ignorable replay history. The replacement transitions every live
+// entry of the agent offline first (emitting the offline event with the
+// current boot ID and a fresh revision), cancels any in-flight probe
+// expectation, and only then records fresh run/proxy/confirmation state for
+// the new session. Equal-generation entries of the same agent are replaced
+// exactly like lower ones; higher-generation facts cannot reach this path
+// (the high-water gate drops them earlier).
 func (registry *Registry) observeLogin(key tunnelKey, fact frpplugin.PresenceFact) {
-	if registry.tunnels[key] != nil {
-		return
-	}
 	for otherKey, other := range registry.tunnels {
-		if otherKey.agentRecordID == key.agentRecordID && otherKey.generation < key.generation {
-			registry.absentLocked(otherKey, other)
-			delete(registry.tunnels, otherKey)
+		if otherKey.agentRecordID != key.agentRecordID {
+			continue
 		}
+		// Authoritative replacement for an equal generation, fencing for a
+		// lower one: either way the old entry goes absent (canceling its
+		// probe expectation) and leaves the map before the new session state
+		// is recorded.
+		registry.absentLocked(otherKey, other)
+		delete(registry.tunnels, otherKey)
+	}
+	if key.generation > registry.agentHighWater[key.agentRecordID] {
+		registry.agentHighWater[key.agentRecordID] = key.generation
 	}
 	registry.tunnels[key] = &tunnelState{
 		proxyName: fact.ProxyName,
@@ -360,14 +399,23 @@ func (registry *Registry) observeNewProxy(key tunnelKey, fact frpplugin.Presence
 	registry.startProbeLocked(key, tunnel)
 }
 
-// observePing renews the 45-second lease of an online tunnel. A Ping before
-// confirmation creates nothing; a Ping after expiry does not resurrect —
-// only the full probe-confirmed readiness path returns a tunnel to online.
-func (registry *Registry) observePing(tunnel *tunnelState) {
-	if tunnel == nil || !tunnel.online {
+// observePing renews the 45-second lease of an online tunnel. Renewal
+// requires the exact current session: the Ping must carry the tunnel's
+// current run id and the tunnel must be proxy-authorized and probe-confirmed
+// (online). Any other Ping — another session's, or one before authorization —
+// is bounded diagnostic noise from the plugin's dispatcher and never renews
+// (SOL mid-project review Critical-1). An authenticated Ping of the exact
+// current session also anchors the lease even before confirmation, so the
+// lease never extends past the last authenticated Ping by the probe window.
+func (registry *Registry) observePing(tunnel *tunnelState, fact frpplugin.PresenceFact) {
+	if tunnel == nil || !tunnel.proxyAuthorized || tunnel.runID == "" || fact.RunID != tunnel.runID {
 		return
 	}
-	tunnel.leaseExpiresAt = registry.now().Add(registry.leaseTTL)
+	now := registry.now()
+	tunnel.lastPingAt = now
+	if tunnel.online {
+		tunnel.leaseExpiresAt = now.Add(registry.leaseTTL)
+	}
 }
 
 // observeCloseProxy makes the tunnel absent. The entry stays as a tombstone:
@@ -450,10 +498,18 @@ func (registry *Registry) startProbeLocked(key tunnelKey, tunnel *tunnelState) {
 }
 
 // confirmLocked is the single absent -> online transition: probe-confirmed,
-// fully correlated, current generation. The lease starts here.
+// fully correlated, current generation. Confirmation still gates online;
+// renewal is gated by Ping alone. The lease anchor is the last authenticated
+// Ping of the session when one has already arrived (the pinned release Pings
+// immediately after login), so the ≤2.5 second probe window never extends
+// the session's authority; otherwise it is the confirmation itself.
 func (registry *Registry) confirmLocked(key tunnelKey, tunnel *tunnelState) {
 	tunnel.online = true
-	tunnel.leaseExpiresAt = registry.now().Add(registry.leaseTTL)
+	anchor := registry.now()
+	if !tunnel.lastPingAt.IsZero() && tunnel.lastPingAt.Before(anchor) {
+		anchor = tunnel.lastPingAt
+	}
+	tunnel.leaseExpiresAt = anchor.Add(registry.leaseTTL)
 	tunnel.probe = nil
 	registry.emitLocked(key, tunnel, StateOnline)
 }
