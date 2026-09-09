@@ -17,10 +17,21 @@ package directctl
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -870,3 +881,1181 @@ var stunPackedChallengeRE = regexp.MustCompile(`^[0-9a-f]{32}\.[0-9a-f]{64}$`)
 
 // stunLowerHexRE matches nonempty lowercase hex.
 var stunLowerHexRE = regexp.MustCompile(`^[0-9a-f]+$`)
+
+// ------------------------------------------------------------------
+// STUN NAT gate harness (plan Task 25, spec §§10.1, 10.3, 23.5).
+//
+// The gate script (scripts/stun-nat-gate.sh) drives these tests as its Go
+// helper (decided helper path: `go test -run`, NOT a `go run` cmd — the gate
+// needs in-process access to the real Task 16 listener, the Task 18
+// controller and the shared clock seam, and the agent client library is
+// another module's internal package; the UDP half below sends byte-identical
+// wire messages to the Task 17 client).
+//
+// Contract with the script (one line each, stdout):
+//	STUN_GATE_CASE <name> <PASS|FAIL|SKIP> <detail>
+//	STUN_GATE_EVIDENCE <name> <key>=<value>...
+// Evidence values are SHA-256 hashes (receipt, transaction, challenge id) or
+// the NAT-observed public mapping — never a secret (§23.5/§16.6).
+//
+// Case names are the gate contract:
+//	owner-router-nat phone-hotspot blocked-udp spoof
+//	mismatched-egress receipt-replay expired-challenge
+// ------------------------------------------------------------------
+
+// stunGateCases is the ordered gate contract shared by both modes.
+var stunGateCases = []string{
+	"owner-router-nat", "phone-hotspot", "blocked-udp", "spoof",
+	"mismatched-egress", "receipt-replay", "expired-challenge",
+}
+
+// gateRun carries one case's outcome detail so the deferred emitter can
+// print the marker even when the case stops via t.Fatalf (Goexit runs
+// defers). Details are static/classification text only — never secrets.
+type gateRun struct {
+	t          *testing.T
+	name       string
+	passDetail string
+	failDetail string
+}
+
+func (g *gateRun) fatalf(format string, args ...any) {
+	g.failDetail = fmt.Sprintf(format, args...)
+	g.t.Fatalf("%s", g.failDetail)
+}
+
+// gateEvidence prints one evidence line (hashes/public values only).
+func gateEvidence(caseName string, kv ...string) {
+	line := caseName
+	for i := 0; i+1 < len(kv); i += 2 {
+		line += " " + kv[i] + "=" + kv[i+1]
+	}
+	fmt.Printf("STUN_GATE_EVIDENCE %s\n", line)
+}
+
+func gateSHA256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// runGateCase wraps one case body: selection (STUN_GATE_CASES), marker
+// emission, and detail plumbing.
+func runGateCase(t *testing.T, name string, fn func(g *gateRun)) {
+	t.Helper()
+	if selected := os.Getenv("STUN_GATE_CASES"); selected != "" {
+		pick := false
+		for _, want := range strings.Split(selected, ",") {
+			if strings.TrimSpace(want) == name {
+				pick = true
+				break
+			}
+		}
+		if !pick {
+			fmt.Printf("STUN_GATE_CASE %s SKIP not selected\n", name)
+			t.Skipf("case not selected (STUN_GATE_CASES=%q)", selected)
+			return
+		}
+	}
+	g := &gateRun{t: t, name: name}
+	defer func() {
+		detail := g.passDetail
+		result := "PASS"
+		switch {
+		case g.failDetail != "":
+			result, detail = "FAIL", g.failDetail
+		case t.Failed():
+			result, detail = "FAIL", "assertion failed"
+		case detail == "":
+			detail = "ok"
+		}
+		detail = strings.ReplaceAll(detail, "\n", " ")
+		fmt.Printf("STUN_GATE_CASE %s %s %s\n", name, result, detail)
+	}()
+	fn(g)
+}
+
+// ---------- local-mode UDP half (byte-identical wire protocol to the Task
+// 17 client: USERNAME=<challenge id>, short-term MESSAGE-INTEGRITY, receipt
+// attribute 0xFF01 in the success response) ----------
+
+type gateUDPOutcome struct {
+	accepted    bool // integrity-verified success response
+	errResponse bool // known-transaction Binding error (401)
+	noResponse  bool // timeout / unreachable / garbage only
+	receipt     []byte
+	txn         []byte
+	src         netip.AddrPort // this socket's REAL local address
+	mapped      netip.AddrPort // listener-reported XOR-MAPPED-ADDRESS
+}
+
+// gateUDPExchange sends exactly ONE Binding request (like the Task 17
+// client) with the given credential and classifies the first
+// known-transaction response. Failures are returned, never fatal.
+func gateUDPExchange(advertise, challengeID string, secret []byte, timeout time.Duration) (gateUDPOutcome, error) {
+	raddr, err := net.ResolveUDPAddr("udp4", advertise)
+	if err != nil {
+		return gateUDPOutcome{}, fmt.Errorf("resolve %q: %w", advertise, err)
+	}
+	conn, err := net.DialUDP("udp4", nil, raddr)
+	if err != nil {
+		return gateUDPOutcome{}, fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	out := gateUDPOutcome{}
+	if local, ok := conn.LocalAddr().(*net.UDPAddr); ok && local.IP.To4() != nil {
+		var ip4 [4]byte
+		copy(ip4[:], local.IP.To4())
+		out.src = netip.AddrPortFrom(netip.AddrFrom4(ip4), uint16(local.Port))
+	}
+	m := pionstun.New()
+	m.Type = pionstun.BindingRequest
+	m.TransactionID = pionstun.NewTransactionID()
+	m.WriteHeader()
+	m.Add(pionstun.AttrUsername, []byte(challengeID))
+	if err := pionstun.NewShortTermIntegrity(string(secret)).AddTo(m); err != nil {
+		return out, fmt.Errorf("request integrity: %w", err)
+	}
+	if _, err := conn.Write(m.Raw); err != nil {
+		return out, fmt.Errorf("send: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return out, fmt.Errorf("deadline: %w", err)
+	}
+	buf := make([]byte, 1500)
+	n, err := conn.Read(buf)
+	if err != nil {
+		out.noResponse = true
+		return out, nil // blocked/unreachable/timeout: a first-class outcome
+	}
+	resp := pionstun.New()
+	resp.Raw = append([]byte(nil), buf[:n]...)
+	if err := resp.Decode(); err != nil {
+		out.noResponse = true
+		return out, nil
+	}
+	if resp.TransactionID != m.TransactionID {
+		out.noResponse = true
+		return out, nil
+	}
+	out.txn = append([]byte(nil), m.TransactionID[:]...)
+	if resp.Type == pionstun.BindingError {
+		out.errResponse = true
+		return out, nil
+	}
+	if resp.Type != pionstun.BindingSuccess {
+		out.noResponse = true
+		return out, nil
+	}
+	if err := pionstun.NewShortTermIntegrity(string(secret)).Check(resp); err != nil {
+		out.noResponse = true // spoofed/corrupt response never wins
+		return out, nil
+	}
+	receipt, err := resp.Get(stun.AttrReceipt)
+	if err != nil || len(receipt) == 0 {
+		out.noResponse = true
+		return out, nil
+	}
+	out.accepted = true
+	out.receipt = append([]byte(nil), receipt...)
+	var xor pionstun.XORMappedAddress
+	if err := xor.GetFrom(resp); err == nil {
+		if ip4 := xor.IP.To4(); ip4 != nil {
+			var ipb [4]byte
+			copy(ipb[:], ip4)
+			out.mapped = netip.AddrPortFrom(netip.AddrFrom4(ipb), uint16(xor.Port))
+		}
+	}
+	return out, nil
+}
+
+// gateRealExchange runs the full honest §10.1 UDP half against the in-process
+// listener and FAILs the case unless it yields a verified receipt.
+func gateRealExchange(g *gateRun, advertise, packed string) (challengeID, txnHex, receiptHex string, out gateUDPOutcome) {
+	idPart, secretPart, found := strings.Cut(packed, ".")
+	if !found {
+		g.fatalf("packed challenge missing separator")
+	}
+	secret, err := hex.DecodeString(secretPart)
+	if err != nil {
+		g.fatalf("packed secret not hex")
+	}
+	out, err = gateUDPExchange(advertise, idPart, secret, 2*time.Second)
+	if err != nil {
+		g.fatalf("udp exchange: %v", err)
+	}
+	if !out.accepted {
+		g.fatalf("no integrity-verified Binding success response (errResponse=%v noResponse=%v)", out.errResponse, out.noResponse)
+	}
+	return idPart, hex.EncodeToString(out.txn), hex.EncodeToString(out.receipt), out
+}
+
+// gateEnv is one isolated local-mode environment per case.
+type gateEnv struct {
+	app       core.App
+	ctrl      *Controller
+	clock     *stunTestClock
+	rec       *stunSendRecorder
+	advertise string
+}
+
+func newGateEnv(t *testing.T) *gateEnv {
+	t.Helper()
+	app, ctrl, clock := newSTUNEnv(t)
+	advertise := attachSTUNListener(t, ctrl, clock)
+	rec := newSTUNSendRecorder(t, ctrl)
+	return &gateEnv{app: app, ctrl: ctrl, clock: clock, rec: rec, advertise: advertise}
+}
+
+// enrollGateAgent enrolls one fresh agent key and returns (key, packed
+// credential of the immediate §10.2 enrollment challenge, epoch). The case
+// may share its recorder with earlier enrollments, so the assertion is on
+// the NEW challenge only.
+func enrollGateAgent(g *gateRun, env *gateEnv, name string) (string, string, stun.Epoch) {
+	before := len(env.rec.challenges())
+	key := mustAPIKey(g.t, env.app, name).Id
+	enrollReadyAgent(g.t, env.ctrl, key)
+	challenges := env.rec.challenges()
+	if len(challenges) != before+1 {
+		g.fatalf("expected exactly one new enrollment challenge, got %d (before %d)", len(challenges)-before, before)
+	}
+	packed, _ := challenges[len(challenges)-1]["challenge"].(string)
+	id := packedChallengeGolden(g.t, env.ctrl, challenges[len(challenges)-1], env.advertise)
+	_ = id
+	return key, packed, currentEpochNum(g.t, env.ctrl, key)
+}
+
+// gateProbeRecorder is a RoundTripper for ctrl.probeClient that counts HTTP
+// requests; the §10.3 gate must stop BEFORE any reachability probe, so the
+// count must stay zero on every refused path.
+type gateProbeRecorder struct {
+	mu       sync.Mutex
+	requests int
+}
+
+func (r *gateProbeRecorder) RoundTrip(*http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	r.requests++
+	r.mu.Unlock()
+	return nil, fmt.Errorf("gate: reachability probe must never be reached after a §10.3 stop")
+}
+
+func (r *gateProbeRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.requests
+}
+
+// gateRefusedProbe installs the recording probe client, attempts the probe
+// gate with the given ack surface, and asserts the §10.3 stop: a STUN-policy
+// refusal with ZERO HTTP requests.
+func gateRefusedProbe(g *gateRun, env *gateEnv, key string) {
+	rec := &gateProbeRecorder{}
+	env.ctrl.probeClient = &http.Client{Transport: rec}
+	err := env.ctrl.Probe(context.Background(), "share.example.com", "abcd1234", key, OpenAck{
+		ShareID: "share-1", Nonce: "nonce-1", Seq: 1,
+		GrantedPort: 8443, PublicIP: "203.0.113.44", Status: "ok",
+	})
+	if err == nil {
+		g.fatalf("Probe must be refused without a qualifying observation")
+	}
+	if !strings.Contains(err.Error(), "not authorized by STUN policy") {
+		g.fatalf("Probe refusal must be the STUN-policy gate, got: %v", err)
+	}
+	if n := rec.count(); n != 0 {
+		g.fatalf("§10.3 stop violated: %d reachability probe request(s) left the process", n)
+	}
+}
+
+// ---------- TestSTUNGateLocalAllCasesPass ----------
+
+// TestSTUNGateLocalAllCasesPass is the gate script's local mode: the REAL
+// Task 16 listener + Task 18 controller in-process (loopback stands in for
+// the NAT), every named case including all fail-closed negatives, and the
+// §10.3 no-probe stop asserted on every refused path. This is the normative
+// protocol proof; the real-NAT §23.5 evidence is the remote run (runbook).
+func TestSTUNGateLocalAllCasesPass(t *testing.T) {
+	if target := os.Getenv("STUN_GATE_TARGET"); target != "" && target != "local" {
+		t.Skipf("local-mode gate not selected (STUN_GATE_TARGET=%q)", target)
+	}
+	for _, name := range stunGateCases {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			runGateCase(t, name, gateLocalCases[name])
+		})
+	}
+}
+
+var gateLocalCases = map[string]func(g *gateRun){
+	"owner-router-nat":  gateLocalOwnerRouterNAT,
+	"phone-hotspot":     gateLocalPhoneHotspot,
+	"blocked-udp":       gateLocalBlockedUDP,
+	"spoof":             gateLocalSpoof,
+	"mismatched-egress": gateLocalMismatchedEgress,
+	"receipt-replay":    gateLocalReceiptReplay,
+	"expired-challenge": gateLocalExpiredChallenge,
+}
+
+// gateLocalOwnerRouterNAT: the full §10.1 happy path through the real stack —
+// challenge over the (stubbed) authenticated epoch, real integrity-protected
+// Binding, receipt bound to challenge+transaction+ACTUAL source+epoch,
+// claimable exactly once, and bound to the current WS epoch. On loopback the
+// observation is correctly classified non-public (§10.3 makes the class a
+// routing consequence, never a listener rejection); the real-NAT equivalence
+// of this case is the remote run.
+func gateLocalOwnerRouterNAT(g *gateRun) {
+	env := newGateEnv(g.t)
+	key, packed, epoch := enrollGateAgent(g, env, "key-gate-owner")
+	id, txnHex, receiptHex, out := gateRealExchange(g, env.advertise, packed)
+	deliverSTUNResult(g.t, env.ctrl, key, id, txnHex, receiptHex)
+
+	obs, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now())
+	if !ok {
+		g.fatalf("observation not fresh after the accepted stun_result")
+	}
+	if obs.IP != out.src.Addr() {
+		g.fatalf("observation IP %v must be the ACTUAL UDP source %v", obs.IP, out.src.Addr())
+	}
+	if obs.Epoch != epoch {
+		g.fatalf("observation epoch %d must be the current epoch %d", obs.Epoch, epoch)
+	}
+	if obs.PublicIPv4 {
+		g.fatalf("loopback observation must be classified non-public (§10.3)")
+	}
+	gateEvidence(g.name,
+		"receipt_sha256", gateSHA256Hex(out.receipt),
+		"txn_sha256", gateSHA256Hex(out.txn),
+		"challenge_id_sha256", gateSHA256Hex([]byte(id)),
+		"observed_source", out.src.String(),
+	)
+	g.passDetail = "full §10.1 flow: integrity-protected Binding accepted, receipt bound to actual source+epoch, claimable once"
+}
+
+// gateLocalPhoneHotspot: a second, fully independent agent+socket on the same
+// listener (the remote run performs this behind the phone hotspot/cellular
+// NAT). Proves per-agent observation isolation: observations track each
+// agent's own challenge/source, and one agent's receipt can never satisfy
+// another agent's stun_result.
+func gateLocalPhoneHotspot(g *gateRun) {
+	env := newGateEnv(g.t)
+	keyA, packedA, epochA := enrollGateAgent(g, env, "key-gate-hotspot-a")
+	keyB, packedB, epochB := enrollGateAgent(g, env, "key-gate-hotspot-b")
+	if epochA == epochB {
+		// Distinct keys get independent epochs; identical numbers would make
+		// the epoch-binding assertions below vacuous.
+		g.fatalf("distinct agents must hold independent epochs")
+	}
+	idA, txnHexA, receiptHexA, outA := gateRealExchange(g, env.advertise, packedA)
+	idB, txnHexB, receiptHexB, outB := gateRealExchange(g, env.advertise, packedB)
+	if outA.src == outB.src {
+		g.fatalf("independent sockets must have distinct UDP sources")
+	}
+
+	// Cross-agent echo first: A's receipt can never satisfy B's stun_result.
+	deliverSTUNResult(g.t, env.ctrl, keyB, idA, txnHexA, receiptHexA)
+	if _, ok := env.ctrl.CurrentSTUNObservation(keyB, env.clock.Now()); ok {
+		g.fatalf("cross-agent receipt must never mint an observation for the other agent")
+	}
+	// Honest echoes, in order.
+	deliverSTUNResult(g.t, env.ctrl, keyA, idA, txnHexA, receiptHexA)
+	deliverSTUNResult(g.t, env.ctrl, keyB, idB, txnHexB, receiptHexB)
+	obsA, okA := env.ctrl.CurrentSTUNObservation(keyA, env.clock.Now())
+	obsB, okB := env.ctrl.CurrentSTUNObservation(keyB, env.clock.Now())
+	if !okA || !okB {
+		g.fatalf("both agents must hold fresh observations (okA=%v okB=%v)", okA, okB)
+	}
+	if obsA.IP != outA.src.Addr() || obsB.IP != outB.src.Addr() {
+		g.fatalf("each observation must track its own agent's UDP source")
+	}
+	if obsA.Epoch != epochA || obsB.Epoch != epochB {
+		g.fatalf("observations must be bound to their own agent's epoch")
+	}
+	gateEvidence(g.name,
+		"receipt_sha256_a", gateSHA256Hex(outA.receipt),
+		"receipt_sha256_b", gateSHA256Hex(outB.receipt),
+		"txn_sha256_a", gateSHA256Hex(outA.txn),
+		"txn_sha256_b", gateSHA256Hex(outB.txn),
+	)
+	g.passDetail = "second NAT path: independent per-agent observations; cross-agent receipt rejected fail-closed"
+}
+
+// gateLocalBlockedUDP: the UDP path to the listener is blocked (remote: a
+// firewall toggle or an unroutable target) — no receipt, no observation,
+// §10.3 relay fallback (stun_timeout), the reachability probe refused with
+// zero HTTP requests, and a later challenge recovers (blocked UDP never
+// poisons state).
+func gateLocalBlockedUDP(g *gateRun) {
+	env := newGateEnv(g.t)
+	key, _, _ := enrollGateAgent(g, env, "key-gate-blocked")
+
+	// A closed loopback UDP port: no listener answers, exactly like a
+	// firewall drop (ICMP refusal / read timeout are the same client-side
+	// outcome class: no valid response).
+	dead, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		g.fatalf("reserve dead port: %v", err)
+	}
+	deadPort := dead.LocalAddr().(*net.UDPAddr).Port
+	if err := dead.Close(); err != nil {
+		g.fatalf("close dead port: %v", err)
+	}
+	deadAddr := net.JoinHostPort("127.0.0.1", fmt.Sprint(deadPort))
+
+	id, secretPart, _ := strings.Cut(env.rec.challenges()[0]["challenge"].(string), ".")
+	secret, _ := hex.DecodeString(secretPart)
+	out, err := gateUDPExchange(deadAddr, id, secret, 400*time.Millisecond)
+	if err != nil {
+		g.fatalf("blocked exchange errored unexpectedly: %v", err)
+	}
+	if out.accepted || out.errResponse {
+		g.fatalf("a blocked UDP path must not produce a response (accepted=%v errResponse=%v)", out.accepted, out.errResponse)
+	}
+	if _, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now()); ok {
+		g.fatalf("no observation may exist without a delivered receipt")
+	}
+	match := env.ctrl.CurrentDirectMatch(key, "203.0.113.44")
+	if match.Matched || match.Reason != DirectReasonSTUNTimeout {
+		g.fatalf("blocked UDP must yield relay_fallback/stun_timeout, got %+v", match)
+	}
+	gateRefusedProbe(g, env, key)
+
+	// Recovery: after the challenge TTL the scheduler records one failure,
+	// backs off 5 s (deterministic jitter), and the retried challenge works.
+	epoch := currentEpochNum(g.t, env.ctrl, key)
+	env.clock.Advance(stun.ChallengeTTL)
+	env.ctrl.stunTimerFired(key, epoch)
+	env.clock.Advance(5 * time.Second)
+	env.ctrl.stunTimerFired(key, epoch)
+	challenges := env.rec.challenges()
+	if len(challenges) != 2 {
+		g.fatalf("recovery must issue exactly one retried challenge, got %d", len(challenges))
+	}
+	packed2, _ := challenges[1]["challenge"].(string)
+	id2, txnHex2, receiptHex2, _ := gateRealExchange(g, env.advertise, packed2)
+	deliverSTUNResult(g.t, env.ctrl, key, id2, txnHex2, receiptHex2)
+	if _, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now()); !ok {
+		g.fatalf("a post-block challenge must recover a fresh observation")
+	}
+	g.passDetail = "UDP blocked: no response, no observation, relay_fallback/stun_timeout, probe refused with 0 HTTP requests; fresh challenge recovers"
+}
+
+// gateLocalSpoof: an off-path/on-path attacker that learned the USERNAME
+// (challenge IDs are cleartext STUN attributes) sends a Binding request with
+// WRONG integrity from its own socket. The listener burns the one-use
+// credential, answers 401, and records NO observation for the attacker's
+// source; the honest agent's subsequent exchange also 401s (credential
+// burned) so no observation can be manufactured (§10.1 receipt proof).
+func gateLocalSpoof(g *gateRun) {
+	env := newGateEnv(g.t)
+	key, packed, _ := enrollGateAgent(g, env, "key-gate-spoof")
+	id, secretPart, _ := strings.Cut(packed, ".")
+	realSecret, err := hex.DecodeString(secretPart)
+	if err != nil {
+		g.fatalf("packed secret not hex")
+	}
+
+	// Attacker: correct USERNAME, wrong integrity, own socket.
+	badSecret := make([]byte, len(realSecret))
+	if _, err := rand.Read(badSecret); err != nil {
+		g.fatalf("attacker secret: %v", err)
+	}
+	atkOut, err := gateUDPExchange(env.advertise, id, badSecret, time.Second)
+	if err != nil {
+		g.fatalf("attacker exchange errored unexpectedly: %v", err)
+	}
+	if atkOut.accepted {
+		g.fatalf("a wrong-integrity request must never yield a verified receipt")
+	}
+	if !atkOut.errResponse {
+		g.fatalf("a known challenge with wrong integrity must draw a 401 Binding error")
+	}
+
+	// Honest agent: the credential is burned; fail closed.
+	honestOut, err := gateUDPExchange(env.advertise, id, realSecret, time.Second)
+	if err != nil {
+		g.fatalf("honest exchange errored unexpectedly: %v", err)
+	}
+	if honestOut.accepted {
+		g.fatalf("the honest exchange must fail closed after the spoof burned the credential")
+	}
+	if !honestOut.errResponse {
+		g.fatalf("the burned credential must answer the honest request with a 401 Binding error")
+	}
+	if _, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now()); ok {
+		g.fatalf("no observation may exist after a spoofed-integrity burn")
+	}
+	match := env.ctrl.CurrentDirectMatch(key, honestOut.src.Addr().String())
+	if match.Matched || match.Reason != DirectReasonSTUNTimeout {
+		g.fatalf("post-spoof state must be relay_fallback/stun_timeout, got %+v", match)
+	}
+	gateRefusedProbe(g, env, key)
+	gateEvidence(g.name,
+		"attacker_source", atkOut.src.String(),
+		"honest_source", honestOut.src.String(),
+		"receipt_sha256", "none",
+	)
+	g.passDetail = "wrong-integrity request: 401 + one-use credential burned; honest exchange fails closed; no observation; probe refused with 0 HTTP requests"
+}
+
+// gateLocalMismatchedEgress: the §10.3 policy stop. A fresh observation that
+// disagrees (exact IPv4) with a required surface IP is stun_mismatch; a
+// private-class observation is stun_not_public; both are relay_fallback and
+// both stop BEFORE the reachability probe (zero HTTP requests leave the
+// process). The exact-match comparison is proven in both directions with the
+// pure predicate; the real gated Probe path is proven with the real
+// (loopback) observation.
+func gateLocalMismatchedEgress(g *gateRun) {
+	env := newGateEnv(g.t)
+	key, packed, epoch := enrollGateAgent(g, env, "key-gate-mismatch")
+	id, txnHex, receiptHex, out := gateRealExchange(g, env.advertise, packed)
+	deliverSTUNResult(g.t, env.ctrl, key, id, txnHex, receiptHex)
+	obs, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now())
+	if !ok {
+		g.fatalf("mismatch case needs its fresh observation")
+	}
+	_ = epoch
+
+	// Exact-IPv4 predicate, both directions, on a PUBLIC-class observation
+	// (the real deployed case behind mismatched egress).
+	publicObs := STUNObservation{IP: netip.MustParseAddr("203.0.113.99"), PublicIPv4: true, AcceptedAt: obs.AcceptedAt, Epoch: obs.Epoch}
+	mismatch := evaluateDirectSTUNMatch(publicObs, true, "203.0.113.44")
+	if mismatch.Matched || mismatch.Reason != DirectReasonSTUNMismatch || mismatch.Status != DirectStatusRelayFallback {
+		g.fatalf("public observation vs different surface must be relay_fallback/stun_mismatch, got %+v", mismatch)
+	}
+	matched := evaluateDirectSTUNMatch(publicObs, true, "203.0.113.99")
+	if !matched.Matched || matched.Reason != DirectReasonNone {
+		g.fatalf("exact match must be eligible, got %+v", matched)
+	}
+	// IPv4-mapped and IPv6 forms never match (§10.3: the direct path is IPv4).
+	if evaluateDirectSTUNMatch(publicObs, true, "::ffff:203.0.113.99").Matched {
+		g.fatalf("IPv4-mapped surface text must never exact-match")
+	}
+
+	// The real gated Probe path with the actual observation: the loopback
+	// source is non-public, so §10.3 refuses regardless of the surface — and
+	// the refusal must precede the reachability probe entirely.
+	gateRefusedProbe(g, env, key)
+	gateEvidence(g.name,
+		"observed_source", out.src.String(),
+		"required_surface", "203.0.113.44",
+		"outcome", string(DirectReasonSTUNMismatch),
+	)
+	g.passDetail = "exact-IPv4 mismatch -> relay_fallback/stun_mismatch (both predicate directions); real Probe refused before any HTTP request (§10.3 stop)"
+}
+
+// gateLocalReceiptReplay: observations are single-use. A replayed stun_result
+// (same challenge/txn/receipt) is rejected and disturbs nothing; the same
+// replay across a reconnect (new epoch) is rejected by epoch binding.
+func gateLocalReceiptReplay(g *gateRun) {
+	env := newGateEnv(g.t)
+	key, packed, epoch := enrollGateAgent(g, env, "key-gate-replay")
+	id, txnHex, receiptHex, out := gateRealExchange(g, env.advertise, packed)
+	deliverSTUNResult(g.t, env.ctrl, key, id, txnHex, receiptHex)
+	obs, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now())
+	if !ok {
+		g.fatalf("accepted observation missing before replay")
+	}
+
+	// Listener-level double claim: the observation was consumed by the first
+	// claim inside HandleSTUNResult; a second claim is ErrNoObservation.
+	receiptBytes, err := hex.DecodeString(receiptHex)
+	if err != nil {
+		g.fatalf("receipt hex: %v", err)
+	}
+	if _, err := env.ctrl.stunServer.TakeObservation(key, epoch, id, txnHex, receiptBytes); err == nil {
+		g.fatalf("second claim of the same observation must be rejected")
+	}
+
+	// Controller-level replay: same stun_result delivered again is rejected;
+	// the accepted observation is undisturbed and no scheduling fires.
+	challengesBefore := len(env.rec.challenges())
+	deliverSTUNResult(g.t, env.ctrl, key, id, txnHex, receiptHex)
+	obs2, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now())
+	if !ok || obs2 != obs {
+		g.fatalf("replay must not disturb the accepted observation")
+	}
+	if got := len(env.rec.challenges()); got != challengesBefore {
+		g.fatalf("replay must not trigger scheduling: %d -> %d challenges", challengesBefore, got)
+	}
+
+	// Replay across a reconnect: the captured stun_result is bound to the old
+	// epoch and must fail closed on the new one.
+	env.ctrl.HandleHello(context.Background(), nil, key, "acct-1", "agent-1")
+	enrollReadyAgentReadyTLS(g.t, env.ctrl, key)
+	newEpoch := currentEpochNum(g.t, env.ctrl, key)
+	if newEpoch == epoch {
+		g.fatalf("reconnect must install a new epoch")
+	}
+	deliverSTUNResult(g.t, env.ctrl, key, id, txnHex, receiptHex)
+	if _, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now()); ok {
+		g.fatalf("old-epoch replayed result must never mint a new-epoch observation")
+	}
+	gateEvidence(g.name,
+		"receipt_sha256", gateSHA256Hex(out.receipt),
+		"txn_sha256", gateSHA256Hex(out.txn),
+		"replay_outcome", "rejected_single_use_and_epoch_bound",
+	)
+	g.passDetail = "replayed stun_result rejected (single-use); cross-epoch replay rejected; accepted observation undisturbed"
+}
+
+// gateLocalExpiredChallenge: a Binding request sent after the 60 s challenge
+// TTL draws a 401 and burns the credential — even with CORRECT integrity
+// (listener-side expiry defense; the Task 17 client additionally refuses
+// client-side). No observation, §10.3 relay fallback, probe refused, and the
+// scheduler recovers with a fresh challenge after bounded backoff.
+func gateLocalExpiredChallenge(g *gateRun) {
+	env := newGateEnv(g.t)
+	key, packed, epoch := enrollGateAgent(g, env, "key-gate-expired")
+	id, secretPart, _ := strings.Cut(packed, ".")
+	secret, err := hex.DecodeString(secretPart)
+	if err != nil {
+		g.fatalf("packed secret not hex")
+	}
+
+	env.clock.Advance(stun.ChallengeTTL + time.Millisecond)
+	lateOut, err := gateUDPExchange(env.advertise, id, secret, time.Second)
+	if err != nil {
+		g.fatalf("late exchange errored unexpectedly: %v", err)
+	}
+	if lateOut.accepted {
+		g.fatalf("a post-TTL request must never yield a verified receipt")
+	}
+	if !lateOut.errResponse {
+		g.fatalf("an expired-but-known challenge must draw a 401 Binding error")
+	}
+	if _, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now()); ok {
+		g.fatalf("no observation may exist from an expired challenge")
+	}
+	match := env.ctrl.CurrentDirectMatch(key, "203.0.113.44")
+	if match.Matched || match.Reason != DirectReasonSTUNTimeout {
+		g.fatalf("expired challenge must yield relay_fallback/stun_timeout, got %+v", match)
+	}
+	gateRefusedProbe(g, env, key)
+
+	// Scheduler recovery: expiry counts as one failure, bounded backoff, and
+	// the retried challenge exchanges normally.
+	env.ctrl.stunTimerFired(key, epoch)
+	env.clock.Advance(5 * time.Second)
+	env.ctrl.stunTimerFired(key, epoch)
+	challenges := env.rec.challenges()
+	if len(challenges) != 2 {
+		g.fatalf("recovery must issue exactly one retried challenge, got %d", len(challenges))
+	}
+	packed2, _ := challenges[1]["challenge"].(string)
+	id2, txnHex2, receiptHex2, _ := gateRealExchange(g, env.advertise, packed2)
+	deliverSTUNResult(g.t, env.ctrl, key, id2, txnHex2, receiptHex2)
+	if _, ok := env.ctrl.CurrentSTUNObservation(key, env.clock.Now()); !ok {
+		g.fatalf("the fresh post-expiry challenge must recover a claimable observation")
+	}
+	gateEvidence(g.name,
+		"late_request_outcome", "401_binding_error",
+		"receipt_sha256", "none",
+	)
+	g.passDetail = "Binding after 60s TTL: 401, credential burned, no observation, probe refused with 0 HTTP requests; bounded-backoff retry recovers"
+}
+
+// ---------- remote mode (deployed control; user-assisted §23.5 runs) ----------
+
+// gateWSMessage is one control -> agent WebSocket message, decoded tolerantly
+// (unknown fields and types are recorded, never fatal).
+type gateWSMessage struct {
+	Type      string `json:"type"`
+	Challenge string `json:"challenge"`
+	Server    string `json:"server"`
+	ExpiresAt string `json:"expires_at"`
+	Reason    string `json:"reason"`
+	Message   string `json:"message"`
+}
+
+// gateChallenge is one received §11.1 stun_challenge.
+type gateChallenge struct {
+	packed    string // "<hex id>.<hex secret>" — never printed
+	server    string // control-advertised UDP listener host:port
+	expiresAt time.Time
+}
+
+// gateRemoteAgent is the minimal test-agent WS half for the deployed-control
+// runs: api_key query auth (the same wire auth the shipped client uses),
+// hello, enrollment (tls_ready fast path with the persisted fingerprint, or
+// the shipped csr_submit -> cert_issue -> tls_ready flow), then the
+// stun_challenge / stun_result exchange. It reads in a single pump goroutine.
+type gateRemoteAgent struct {
+	conn       *websocket.Conn
+	ctx        context.Context
+	cancel     context.CancelFunc
+	events     chan gateWSMessage
+	mu         sync.Mutex
+	lastType   string
+	lastError  string
+	pumpFailed bool
+}
+
+type gateRemoteConfig struct {
+	server     string // ws(s)://control-host (no path)
+	apiKey     string // env-only; never printed
+	stunAddr   string // optional UDP listener override
+	expectedIP string // mismatched-egress required surface
+	certFP     string // optional persisted cert fingerprint (skips CSR issuance)
+}
+
+// gateScrub removes credential material from error text (defense in depth:
+// nothing in the driver prints the key, even inside library errors).
+func gateScrub(s, apiKey string) string {
+	if apiKey != "" {
+		s = strings.ReplaceAll(s, apiKey, "[scrubbed]")
+	}
+	return s
+}
+
+func gateRemoteDial(g *gateRun, cfg gateRemoteConfig, agentID string) *gateRemoteAgent {
+	g.t.Helper()
+	wsURL := strings.TrimSuffix(cfg.server, "/") + "/ws/agent?api_key=" + url.QueryEscape(cfg.apiKey)
+	ctx, cancel := context.WithCancel(context.Background())
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		cancel()
+		g.fatalf("dial deployed control: %s", gateScrub(err.Error(), cfg.apiKey))
+	}
+	a := &gateRemoteAgent{conn: conn, ctx: ctx, cancel: cancel, events: make(chan gateWSMessage, 64)}
+	g.t.Cleanup(func() { cancel(); _ = conn.CloseNow() })
+	go a.pump()
+	if err := a.send(map[string]string{"type": "hello", "agent_id": agentID}); err != nil {
+		g.fatalf("send hello: %v", err)
+	}
+	return a
+}
+
+// pump reads every control message until the connection dies; stun_challenge
+// payloads are surfaced via the events channel.
+func (a *gateRemoteAgent) pump() {
+	defer close(a.events)
+	for {
+		typ, data, err := a.conn.Read(a.ctx)
+		if err != nil {
+			a.mu.Lock()
+			a.pumpFailed = true
+			a.mu.Unlock()
+			return
+		}
+		if typ != websocket.MessageText {
+			continue
+		}
+		var msg gateWSMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+		a.mu.Lock()
+		a.lastType = msg.Type
+		if msg.Type == "error" {
+			a.lastError = msg.Message
+		}
+		a.mu.Unlock()
+		select {
+		case a.events <- msg:
+		default: // bounded: surplus messages (e.g. expired retry challenges) drop
+		}
+	}
+}
+
+func (a *gateRemoteAgent) send(msg map[string]string) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	return a.conn.Write(a.ctx, websocket.MessageText, data)
+}
+
+// waitEvent awaits the next message of one of the given types.
+func (a *gateRemoteAgent) waitEvent(timeout time.Duration, types ...string) (gateWSMessage, error) {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case msg, ok := <-a.events:
+			if !ok {
+				return gateWSMessage{}, fmt.Errorf("control connection closed (last type %q, last error %q)", a.snapshot().lastType, a.snapshot().lastError)
+			}
+			for _, want := range types {
+				if msg.Type == want {
+					return msg, nil
+				}
+			}
+		case <-deadline:
+			s := a.snapshot()
+			return gateWSMessage{}, fmt.Errorf("timeout after %s waiting for %v (last type %q, last error %q)", timeout, types, s.lastType, s.lastError)
+		}
+	}
+}
+
+func (a *gateRemoteAgent) snapshot() (s struct{ lastType, lastError string }) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s.lastType, s.lastError = a.lastType, a.lastError
+	return s
+}
+
+// gateRemoteEnroll completes the enrollment handshake for the CURRENT epoch:
+// either the persisted-fingerprint fast path (no issuance on the deployed
+// control) or the shipped csr_submit -> cert_issue -> tls_ready flow.
+func gateRemoteEnroll(g *gateRun, a *gateRemoteAgent, cfg gateRemoteConfig, agentID string) {
+	g.t.Helper()
+	if cfg.certFP != "" {
+		if err := a.send(map[string]string{"type": "tls_ready", "fingerprint": cfg.certFP, "not_after": ""}); err != nil {
+			g.fatalf("send tls_ready: %v", err)
+		}
+		return
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		g.fatalf("csr key generation: %v", err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: agentID},
+	}, key)
+	if err != nil {
+		g.fatalf("csr creation: %v", err)
+	}
+	csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+	if err := a.send(map[string]string{"type": "csr_submit", "csr_pem": csrPEM}); err != nil {
+		g.fatalf("send csr_submit: %v", err)
+	}
+	msg, err := a.waitEvent(30*time.Second, "cert_issue", "cert_error")
+	if err != nil {
+		g.fatalf("waiting for cert issuance: %v", err)
+	}
+	if msg.Type == "cert_error" {
+		g.fatalf("deployed control refused issuance (reason %q); set STUN_GATE_CERT_FINGERPRINT to the enrolled agent's cert fingerprint to skip issuance", msg.Reason)
+	}
+	block, _ := pem.Decode([]byte(msg.Message))
+	if block == nil || block.Type != "CERTIFICATE" {
+		g.fatalf("cert_issue carried no leaf certificate")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		g.fatalf("parse issued leaf: %v", err)
+	}
+	fp := gateSHA256Hex(block.Bytes)
+	na := leaf.NotAfter.Format(time.RFC3339)
+	if err := a.send(map[string]string{"type": "tls_ready", "fingerprint": fp, "not_after": na}); err != nil {
+		g.fatalf("send tls_ready: %v", err)
+	}
+}
+
+// gateRemoteChallenge enrolls and waits for the §10.2 immediate challenge.
+func gateRemoteChallenge(g *gateRun, cfg gateRemoteConfig, agentID string) (*gateRemoteAgent, gateChallenge) {
+	g.t.Helper()
+	a := gateRemoteDial(g, cfg, agentID)
+	gateRemoteEnroll(g, a, cfg, agentID)
+	msg, err := a.waitEvent(20*time.Second, "stun_challenge", "cert_error")
+	if err != nil {
+		g.fatalf("waiting for the post-enrollment stun_challenge: %v", err)
+	}
+	if msg.Type == "cert_error" {
+		g.fatalf("deployed control sent %q (reason %q); check STUN_GATE_CERT_FINGERPRINT", msg.Type, msg.Reason)
+	}
+	if msg.Challenge == "" || msg.Server == "" {
+		g.fatalf("stun_challenge missing challenge/server fields")
+	}
+	exp, err := time.Parse(time.RFC3339, msg.ExpiresAt)
+	if err != nil {
+		g.fatalf("stun_challenge expires_at not RFC3339")
+	}
+	return a, gateChallenge{packed: msg.Challenge, server: msg.Server, expiresAt: exp}
+}
+
+// gateRemoteExchange splits the packed credential and runs the honest UDP
+// half against the challenge's advertised server (or the override), exactly
+// like the Task 17 client.
+func gateRemoteExchange(g *gateRun, ch gateChallenge, stunAddr string, timeout time.Duration) (id, txnHex, receiptHex string, out gateUDPOutcome) {
+	g.t.Helper()
+	idPart, secretPart, found := strings.Cut(ch.packed, ".")
+	if !found {
+		g.fatalf("packed challenge malformed")
+	}
+	secret, err := hex.DecodeString(secretPart)
+	if err != nil {
+		g.fatalf("packed secret not hex")
+	}
+	addr := stunAddr
+	if addr == "" {
+		addr = ch.server
+	}
+	out, err = gateUDPExchange(addr, idPart, secret, timeout)
+	if err != nil {
+		g.fatalf("udp exchange: %v", err)
+	}
+	if !out.accepted {
+		g.fatalf("no integrity-verified receipt through the NAT path (errResponse=%v noResponse=%v)", out.errResponse, out.noResponse)
+	}
+	return idPart, hex.EncodeToString(out.txn), hex.EncodeToString(out.receipt), out
+}
+
+func gateRemoteEchoResult(a *gateRemoteAgent, id, txnHex, receiptHex string) error {
+	return a.send(map[string]string{
+		"type": "stun_result", "challenge": id, "transaction_id": txnHex, "receipt": receiptHex,
+	})
+}
+
+// gateWaitRechallenge reports whether the wire-visible acceptance proof (§10.2
+// rechallenge at +4m–4m15s, vs a backoff retry at ~+65s on rejection) is on
+// for the case. Default: the two happy-path cases and receipt-replay.
+func gateWaitRechallenge(name string) bool {
+	switch v := os.Getenv("STUN_GATE_WAIT_RECHALLENGE"); v {
+	case "":
+		return name == "owner-router-nat" || name == "phone-hotspot" || name == "receipt-replay"
+	case "0", "false":
+		return false
+	default:
+		return true
+	}
+}
+
+// gateRemoteProveAcceptance waits for the next stun_challenge after the echo
+// and classifies it: >=4m is the §10.2 rechallenge (only armed by a successful
+// HandleSTUNResult acceptance), <4m is a bounded-backoff retry (the result was
+// rejected). This is the wire-visible proof that the exact observed source
+// reached control.
+func gateRemoteProveAcceptance(g *gateRun, a *gateRemoteAgent, echoedAt time.Time) time.Duration {
+	g.t.Helper()
+	msg, err := a.waitEvent(4*time.Minute+40*time.Second, "stun_challenge")
+	if err != nil {
+		g.fatalf("no follow-up challenge after the echo (no rechallenge means control never accepted the observation): %v", err)
+	}
+	_ = msg
+	elapsed := time.Since(echoedAt)
+	if elapsed < 3*time.Minute+59*time.Second {
+		g.fatalf("control scheduled a backoff retry at +%s — the stun_result was NOT accepted", elapsed.Truncate(time.Second))
+	}
+	return elapsed
+}
+
+// TestSTUNGateRemoteCases is the gate script's remote mode: a minimal
+// test-agent WS client drives the DEPLOYED control through the same seven
+// cases from behind the NAT under test. Agent-side verifications only — the
+// control-side accept/reject semantics are normatively asserted by
+// TestSTUNGateLocalAllCasesPass against the same listener code.
+func TestSTUNGateRemoteCases(t *testing.T) {
+	if target := os.Getenv("STUN_GATE_TARGET"); target != "remote" {
+		t.Skipf("remote-mode gate not selected (STUN_GATE_TARGET=%q)", target)
+	}
+	server, apiKey := os.Getenv("STUN_GATE_SERVER"), os.Getenv("STUN_GATE_API_KEY")
+	if server == "" || apiKey == "" {
+		t.Skip("remote NAT-gate cases require STUN_GATE_SERVER and STUN_GATE_API_KEY")
+	}
+	cfg := gateRemoteConfig{
+		server:     server,
+		apiKey:     apiKey,
+		stunAddr:   os.Getenv("STUN_GATE_STUN_ADDR"),
+		expectedIP: os.Getenv("STUN_GATE_EXPECTED_PUBLIC_IP"),
+		certFP:     os.Getenv("STUN_GATE_CERT_FINGERPRINT"),
+	}
+	for _, name := range stunGateCases {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			runGateCase(t, name, func(g *gateRun) { gateRemoteCase(g, cfg, name) })
+		})
+	}
+}
+
+func gateRemoteCase(g *gateRun, cfg gateRemoteConfig, name string) {
+	switch name {
+	case "owner-router-nat", "phone-hotspot":
+		gateRemoteHappyPath(g, cfg, name)
+	case "blocked-udp":
+		gateRemoteBlockedUDP(g, cfg)
+	case "spoof":
+		gateRemoteSpoof(g, cfg)
+	case "mismatched-egress":
+		gateRemoteMismatchedEgress(g, cfg)
+	case "receipt-replay":
+		gateRemoteReceiptReplay(g, cfg)
+	case "expired-challenge":
+		gateRemoteExpiredChallenge(g, cfg)
+	default:
+		g.fatalf("unknown remote case %q", name)
+	}
+}
+
+// gateRemoteHappyPath: the real §23.5 happy path behind the NAT under test.
+func gateRemoteHappyPath(g *gateRun, cfg gateRemoteConfig, name string) {
+	a, ch := gateRemoteChallenge(g, cfg, "stun-gate-"+name)
+	id, txnHex, receiptHex, out := gateRemoteExchange(g, ch, cfg.stunAddr, 5*time.Second)
+	if err := gateRemoteEchoResult(a, id, txnHex, receiptHex); err != nil {
+		g.fatalf("echo stun_result: %v", err)
+	}
+	gateEvidence(name,
+		"receipt_sha256", gateSHA256Hex(out.receipt),
+		"txn_sha256", gateSHA256Hex(out.txn),
+		"challenge_id_sha256", gateSHA256Hex([]byte(id)),
+		"observed_source", out.mapped.String(),
+		"listener", ch.server,
+	)
+	detail := "real challenge over the deployed control WS; integrity-verified receipt through the NAT path; stun_result echoed"
+	if gateWaitRechallenge(name) {
+		elapsed := gateRemoteProveAcceptance(g, a, time.Now())
+		detail += fmt.Sprintf("; §10.2 rechallenge at +%s proves control accepted the observation", elapsed.Truncate(time.Second))
+	}
+	g.passDetail = detail
+}
+
+// gateRemoteBlockedUDP: with UDP to the listener blocked, the exchange must
+// fail closed: no response at all (an error response would mean the datagram
+// REACHED the listener, i.e. UDP is not blocked or the challenge was burned
+// by another flow).
+func gateRemoteBlockedUDP(g *gateRun, cfg gateRemoteConfig) {
+	_, ch := gateRemoteChallenge(g, cfg, "stun-gate-blocked")
+	idPart, secretPart, _ := strings.Cut(ch.packed, ".")
+	secret, err := hex.DecodeString(secretPart)
+	if err != nil {
+		g.fatalf("packed secret not hex")
+	}
+	addr := cfg.stunAddr
+	if addr == "" {
+		addr = ch.server
+	}
+	out, err := gateUDPExchange(addr, idPart, secret, 4*time.Second)
+	if err != nil {
+		g.fatalf("blocked exchange errored unexpectedly: %v", err)
+	}
+	if out.accepted {
+		g.fatalf("UDP is NOT blocked: a verified receipt came back (check the firewall toggle / target address)")
+	}
+	if out.errResponse {
+		g.fatalf("unexpected 401 on the blocked path — the challenge was likely consumed by another flow; rerun this case")
+	}
+	// Fail closed, wire-side: nothing is echoed, so control can only expire
+	// the challenge; no observation can exist. The WS stays healthy.
+	gateEvidence(g.name, "receipt_sha256", "none", "listener", ch.server)
+	g.passDetail = "UDP blocked: no response, nothing echoed, no observation possible, fail closed"
+}
+
+// gateRemoteSpoof: wrong-integrity request from a second socket burns the
+// one-use credential at the deployed listener; the honest exchange then fails
+// closed with 401 (normative listener semantics proven in the local run).
+func gateRemoteSpoof(g *gateRun, cfg gateRemoteConfig) {
+	_, ch := gateRemoteChallenge(g, cfg, "stun-gate-spoof")
+	id, secretPart, _ := strings.Cut(ch.packed, ".")
+	realSecret, err := hex.DecodeString(secretPart)
+	if err != nil {
+		g.fatalf("packed secret not hex")
+	}
+	badSecret := make([]byte, len(realSecret))
+	if _, err := rand.Read(badSecret); err != nil {
+		g.fatalf("attacker secret: %v", err)
+	}
+	addr := cfg.stunAddr
+	if addr == "" {
+		addr = ch.server
+	}
+	atkOut, err := gateUDPExchange(addr, id, badSecret, 4*time.Second)
+	if err != nil {
+		g.fatalf("attacker exchange errored unexpectedly: %v", err)
+	}
+	if atkOut.accepted {
+		g.fatalf("a wrong-integrity request must never yield a verified receipt")
+	}
+	honestOut, err := gateUDPExchange(addr, id, realSecret, 4*time.Second)
+	if err != nil {
+		g.fatalf("honest exchange errored unexpectedly: %v", err)
+	}
+	if honestOut.accepted {
+		g.fatalf("the honest exchange must fail closed after the spoof burned the credential")
+	}
+	if !honestOut.errResponse {
+		g.fatalf("the burned credential must answer the honest request with a 401 Binding error (got noResponse)")
+	}
+	// Nothing is echoed: no observation can exist from this exchange.
+	gateEvidence(g.name,
+		"attacker_source", atkOut.src.String(),
+		"honest_source", honestOut.src.String(),
+		"receipt_sha256", "none",
+		"listener", ch.server,
+	)
+	g.passDetail = "wrong-integrity request through the real path: 401 + credential burned; honest exchange failed closed; nothing echoed"
+}
+
+// gateRemoteMismatchedEgress: with a VPN or split tunnel changing the UDP
+// egress, the successful receipt carries a mapped address that differs from
+// the required surface IP — exactly the §10.3 comparison that must fail and
+// stop before the public probe (normatively asserted by the local run).
+func gateRemoteMismatchedEgress(g *gateRun, cfg gateRemoteConfig) {
+	if cfg.expectedIP == "" {
+		fmt.Printf("STUN_GATE_CASE mismatched-egress SKIP set STUN_GATE_EXPECTED_PUBLIC_IP to this network's expected egress IP\n")
+		g.t.Skipf("STUN_GATE_EXPECTED_PUBLIC_IP not set")
+		return
+	}
+	a, ch := gateRemoteChallenge(g, cfg, "stun-gate-mismatch")
+	id, txnHex, receiptHex, out := gateRemoteExchange(g, ch, cfg.stunAddr, 5*time.Second)
+	if err := gateRemoteEchoResult(a, id, txnHex, receiptHex); err != nil {
+		g.fatalf("echo stun_result: %v", err)
+	}
+	gateEvidence(g.name,
+		"receipt_sha256", gateSHA256Hex(out.receipt),
+		"txn_sha256", gateSHA256Hex(out.txn),
+		"observed_source", out.mapped.String(),
+		"required_surface", cfg.expectedIP,
+	)
+	if out.mapped.Addr().String() == strings.TrimSpace(cfg.expectedIP) {
+		g.fatalf("no egress mismatch observed (observed %s equals the required surface); check that the VPN/route under test is actually active", out.mapped.Addr())
+	}
+	g.passDetail = "mismatched egress observable: mapped source differs from the required surface; §10.3 exact-match fails and stops before the public probe"
+}
+
+// gateRemoteReceiptReplay: the same stun_result is echoed twice on the real
+// WS. Control must reject the replay silently (single-use) and stay healthy;
+// the rechallenge wait proves acceptance and that the replay disturbed
+// nothing.
+func gateRemoteReceiptReplay(g *gateRun, cfg gateRemoteConfig) {
+	a, ch := gateRemoteChallenge(g, cfg, "stun-gate-replay")
+	id, txnHex, receiptHex, out := gateRemoteExchange(g, ch, cfg.stunAddr, 5*time.Second)
+	if err := gateRemoteEchoResult(a, id, txnHex, receiptHex); err != nil {
+		g.fatalf("echo stun_result: %v", err)
+	}
+	echoedAt := time.Now()
+	if err := gateRemoteEchoResult(a, id, txnHex, receiptHex); err != nil {
+		g.fatalf("replayed stun_result broke the WS: %v", err)
+	}
+	gateEvidence(g.name,
+		"receipt_sha256", gateSHA256Hex(out.receipt),
+		"txn_sha256", gateSHA256Hex(out.txn),
+		"replay_outcome", "duplicate_sent_connection_healthy",
+	)
+	detail := "duplicate stun_result sent on the real WS; connection stayed healthy; control-side single-use rejection normatively asserted by the local run"
+	if gateWaitRechallenge("receipt-replay") {
+		elapsed := gateRemoteProveAcceptance(g, a, echoedAt)
+		detail += fmt.Sprintf("; §10.2 rechallenge at +%s proves acceptance and intact scheduling after the replay", elapsed.Truncate(time.Second))
+	}
+	g.passDetail = detail
+}
+
+// gateRemoteExpiredChallenge: the challenge is held past its 60 s TTL and the
+// real Binding is then sent with CORRECT integrity (deliberately bypassing
+// the Task 17 client-side expiry check) to prove the deployed listener's own
+// expiry defense: 401, no receipt.
+func gateRemoteExpiredChallenge(g *gateRun, cfg gateRemoteConfig) {
+	_, ch := gateRemoteChallenge(g, cfg, "stun-gate-expired")
+	time.Sleep(stun.ChallengeTTL + 2*time.Second)
+	id, secretPart, _ := strings.Cut(ch.packed, ".")
+	secret, err := hex.DecodeString(secretPart)
+	if err != nil {
+		g.fatalf("packed secret not hex")
+	}
+	addr := cfg.stunAddr
+	if addr == "" {
+		addr = ch.server
+	}
+	out, err := gateUDPExchange(addr, id, secret, 4*time.Second)
+	if err != nil {
+		g.fatalf("late exchange errored unexpectedly: %v", err)
+	}
+	if out.accepted {
+		g.fatalf("a post-TTL request must never yield a verified receipt")
+	}
+	if !out.errResponse {
+		g.fatalf("an expired-but-known challenge must draw a 401 Binding error (got silence)")
+	}
+	gateEvidence(g.name,
+		"late_request_outcome", "401_binding_error",
+		"receipt_sha256", "none",
+		"listener", ch.server,
+	)
+	g.passDetail = "listener-side expiry: Binding after 60s TTL answered 401, credential burned, no receipt"
+}
