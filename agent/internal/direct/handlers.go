@@ -157,10 +157,12 @@ func (sw *statusWriter) Write(p []byte) (int, error) {
 // streamBody streams via the given function with a delayed status. A nil error
 // commits the success status (even for an empty body). A pre-first-byte error
 // commits the mapped status; a post-first-byte error logs and aborts the
-// stream via panic(http.ErrAbortHandler) (§4.5).
-func (s *DirectServer) streamBody(w http.ResponseWriter, status int, stream func(dst io.Writer) error) {
+// stream via panic(http.ErrAbortHandler) (§4.5). On a direct connection the
+// stream holds the on-demand port for its lifetime; relay streams never do
+// (§13.2).
+func (s *DirectServer) streamBody(r *http.Request, w http.ResponseWriter, status int, stream func(dst io.Writer) error) {
 	sw := &statusWriter{ResponseWriter: w, status: status}
-	dst, release := s.holdStream(sw)
+	dst, release := s.holdStream(r, sw)
 	defer release()
 	if err := stream(dst); err != nil {
 		if !sw.committed {
@@ -219,14 +221,14 @@ func writeOverloaded(w http.ResponseWriter, status int) {
 // semaphores. When saturated it writes the overload response (429/503) and
 // returns without streaming; otherwise the release is deferred so the slot is
 // freed on success, pre-first-byte error, and the mid-stream abort panic alike.
-func (s *DirectServer) streamBodyLimited(session *ContentSession, w http.ResponseWriter, status int, stream func(dst io.Writer) error) {
+func (s *DirectServer) streamBodyLimited(r *http.Request, session *ContentSession, w http.ResponseWriter, status int, stream func(dst io.Writer) error) {
 	release, overload, ok := s.acquireStreams(session)
 	if !ok {
 		writeOverloaded(w, overload)
 		return
 	}
 	defer release()
-	s.streamBody(w, status, stream)
+	s.streamBody(r, w, status, stream)
 }
 
 // resolveAndMember resolves the share and verifies {id} ∈ the snapshot
@@ -273,7 +275,7 @@ func (s *DirectServer) handleThumb(w http.ResponseWriter, r *http.Request, code,
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+	s.streamBody(r, w, http.StatusOK, func(dst io.Writer) error {
 		_, err := session.Backend.GetThumbnail(r.Context(), id, dst)
 		return err
 	})
@@ -295,7 +297,7 @@ func (s *DirectServer) handlePreview(w http.ResponseWriter, r *http.Request, cod
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	s.streamBody(w, http.StatusOK, func(dst io.Writer) error {
+	s.streamBody(r, w, http.StatusOK, func(dst io.Writer) error {
 		_, err := session.Backend.GetPreview(r.Context(), id, dst)
 		return err
 	})
@@ -383,7 +385,7 @@ func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code,
 		}
 	}()
 
-	s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
+	s.streamBodyLimited(r, session, w, http.StatusOK, func(dst io.Writer) error {
 		streamed, err := session.Backend.GetFile(r.Context(), id, dst)
 		// A positive asset metadata size is authoritative. A clean short
 		// upstream stream must release, rather than consume, the reservation.
@@ -457,7 +459,7 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 
 	if !known {
 		// Unknown total: ignore Range, serve 200 full body, no Accept-Ranges.
-		s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
+		s.streamBodyLimited(r, session, w, http.StatusOK, func(dst io.Writer) error {
 			_, err := session.Backend.GetVideoPlayback(r.Context(), id, dst)
 			return err
 		})
@@ -473,7 +475,7 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 	if r.Header.Get("Range") == "" {
 		// No Range header: serve the full body.
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
+		s.streamBodyLimited(r, session, w, http.StatusOK, func(dst io.Writer) error {
 			_, err := session.Backend.GetVideoPlayback(r.Context(), id, dst)
 			return err
 		})
@@ -491,7 +493,7 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, length))
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	limit := end - start + 1
-	s.streamBodyLimited(session, w, http.StatusPartialContent, func(dst io.Writer) error {
+	s.streamBodyLimited(r, session, w, http.StatusPartialContent, func(dst io.Writer) error {
 		bw := &boundedWriter{w: dst, limit: limit}
 		_, err := session.Backend.GetVideoPlaybackRange(r.Context(), id, start, bw)
 		if errors.Is(err, errBoundReached) {
@@ -680,7 +682,7 @@ func (s *DirectServer) handleArchivePart(w http.ResponseWriter, r *http.Request,
 	defer func() {
 		session.Archives.endPart(txn, part, completed)
 	}()
-	s.streamBodyLimited(session, w, http.StatusOK, func(dst io.Writer) error {
+	s.streamBodyLimited(r, session, w, http.StatusOK, func(dst io.Writer) error {
 		_, err := session.Backend.DownloadArchive(streamCtx, p.AssetIDs, dst)
 		if err == nil {
 			completed = true

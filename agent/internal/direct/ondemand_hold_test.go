@@ -130,8 +130,10 @@ func TestOnDemandPort_StaleEndAfterReopenIsIgnored(t *testing.T) {
 // TestContentRoutesRecordActivity verifies the carried requirement: the content
 // routes (/items, /thumb, /preview, /asset, /asset/{id}/playback, /archive)
 // record connection activity so browsing arms and refreshes the idle deadline.
-// A single connection's first request begins a session and each subsequent
-// request records Activity.
+// A single DIRECT connection's first request begins a session and each
+// subsequent request records Activity (§13.2: only direct connections drive
+// the port's session accounting, so the connection carries its Binder-admitted
+// direct binding).
 func TestContentRoutesRecordActivity(t *testing.T) {
 	backend := &handlerBackend{}
 	session := &ContentSession{Backend: backend, Membership: map[string]struct{}{"asset-1": {}}}
@@ -155,6 +157,9 @@ func TestContentRoutesRecordActivity(t *testing.T) {
 	}
 
 	cs := &connState{}
+	// A direct connection's route is noted from the Binder-admitted binding
+	// before its first request is dispatched.
+	cs.noteBinding(Binding{Origin: testOrigin, RouteKind: RouteDirect, ShareCode: "abc"})
 	for _, path := range paths {
 		rr := httptest.NewRecorder()
 		req := admittedRequest(http.MethodGet, path, testOrigin)

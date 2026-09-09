@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,13 +78,16 @@ type DirectServer struct {
 	// gate means unlimited.
 	globalStreams *streamGate
 
-	// connStates maps each raw net.Conn to its per-connection *connState.
-	// The key is the exact conn handed to ConnContext and later to ConnState
-	// on StateClosed — the same object for the connection's entire lifetime
-	// (with ServeTLS the listener is tls-wrapped at Accept, so c.rwc is never
-	// reassigned). A field (rather than a package-level map) keeps state per
-	// server instance.
-	connStates sync.Map // net.Conn -> *connState
+	// conns is the connection registry: each raw net.Conn mapped to its
+	// per-connection *connState carrying the Binder-admitted route/origin/share
+	// and the port session token. The key is the exact conn handed to
+	// ConnContext and later to ConnState on StateClosed — the same object for
+	// the connection's entire lifetime (with ServeTLS the listener is
+	// tls-wrapped at Accept, so c.rwc is never reassigned). The registry's
+	// close-by-route/share/all entry points (lockdown/revocation, §13.2) are
+	// exposed on DirectServer below; a field (rather than a package-level map)
+	// keeps state per server instance.
+	conns connRegistry
 }
 
 func NewDirectServer(namespace, baseDomain string, port SessionTracker, certs CertProvider, gate *SignalGate, maxContentBytes int64) *DirectServer {
@@ -100,6 +104,7 @@ func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker
 		maxContentBytes: maxContentBytes, binder: binder,
 		connectOrigin: config.ResolveConnectAllowedOrigin(),
 		globalStreams: newStreamGate(globalStreamLimit),
+		conns:         newConnRegistry(),
 	}
 }
 
@@ -141,15 +146,63 @@ func (s *DirectServer) TLSConfig() *tls.Config {
 			if err != nil {
 				return nil, fmt.Errorf("no certificate: %w", err)
 			}
-			return &tls.Config{Certificates: []tls.Certificate{*cert}}, nil
+			return &tls.Config{
+				Certificates: []tls.Certificate{*cert},
+				// The config returned from GetConfigForClient governs the
+				// whole handshake, ALPN included: without NextProtos every
+				// connection would be silently downgraded to HTTP/1.1 and no
+				// HTTP/2 streams could be served (§9.4 direct/relay
+				// coexistence runs on h2 streams too).
+				NextProtos: alpnProtos(hello.SupportedProtos),
+			}, nil
 		},
 	}
 }
 
-// Handler returns the direct path wrapped in the binder's HTTP authorization.
-// The binder re-derives the admitted binding from r.TLS.ServerName, so the
-// handler is only reached for SNI-admitted, Host- and code-authorized requests.
-func (s *DirectServer) Handler() http.Handler { return s.binder.Handler(http.HandlerFunc(s.route)) }
+// alpnPreference is the server's ALPN preference order; the offered protocols
+// are served in this order, so an h2-capable client always negotiates h2.
+var alpnPreference = []string{"h2", "http/1.1"}
+
+// alpnProtos intersects the client's offered ALPN protocols with the server's
+// preference, for the per-handshake config GetConfigForClient returns.
+func alpnProtos(offered []string) []string {
+	out := make([]string, 0, len(alpnPreference))
+	for _, want := range alpnPreference {
+		if slices.Contains(offered, want) {
+			out = append(out, want)
+		}
+	}
+	return out
+}
+
+// Handler returns the direct path wrapped in the binder's HTTP authorization
+// plus the §13.2 route note: after SNI admission and HTTP authorization
+// succeed, the admitted binding (route kind, origin, share) is recorded on
+// the connection's accounting state, before any handler (and therefore any
+// port session/hold accounting) runs. A connection that never serves an
+// authorized request keeps an unknown route and is treated as relay-like for
+// port accounting.
+func (s *DirectServer) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sni := ""
+		if r.TLS != nil {
+			sni = r.TLS.ServerName
+		}
+		bd, err := s.binder.AdmitSNI(sni)
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if err := s.binder.Authorize(bd, r); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if cs := connStateFromContext(r.Context()); cs != nil {
+			cs.noteBinding(bd)
+		}
+		s.route(w, r)
+	})
+}
 
 func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 	// The interstitial's CORS reachability check (§9.3) is dispatched before
@@ -350,19 +403,26 @@ func (s *DirectServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="sharebridge.bin"`)
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	dst, release := s.holdStream(w)
+	dst, release := s.holdStream(r, w)
 	defer release()
 	io.CopyN(dst, zeroReader{}, size)
 }
 
 // holdStream wraps dst so the on-demand port pauses its idle close for the
-// duration of a long streaming response: Begin fires on the first write and
-// End (via the returned release func, which the caller must defer) releases it
-// on completion, error, or the panic that aborts a mid-stream failure —
-// including a client disconnect, which surfaces as a write error and unwinds
-// the same defer. When the port does not support holds, dst is returned
-// unchanged and release is a no-op.
-func (s *DirectServer) holdStream(dst io.Writer) (io.Writer, func()) {
+// duration of a long streaming response on a DIRECT connection: Begin fires on
+// the first write and End (via the returned release func, which the caller
+// must defer) releases it on completion, error, or the panic that aborts a
+// mid-stream failure — including a client disconnect, which surfaces as a
+// write error and unwinds the same defer. Relay-routed connections (and
+// connections of unknown route) never hold the port: relay traffic must not
+// keep the home mapping open (§13.2). When the connection is not direct, or
+// the port does not support holds, dst is returned unchanged and release is a
+// no-op.
+func (s *DirectServer) holdStream(r *http.Request, dst io.Writer) (io.Writer, func()) {
+	cs := connStateFromContext(r.Context())
+	if cs == nil || cs.boundRoute() != RouteDirect {
+		return dst, func() {}
+	}
 	if h, ok := s.port.(HoldTracker); ok {
 		hw := &holdWriter{Writer: dst, h: h}
 		return hw, func() { _ = hw.Close() }
@@ -403,15 +463,17 @@ func (zeroReader) Read(p []byte) (int, error) {
 
 // activity ties each request to a connection-scoped session: BeginSession on
 // the first request of a connection, Activity on subsequent ones. EndSession
-// is driven by ConnState (StateClosed). The conn's mutex guards sessionID so a
-// connection (an HTTP/2 connection with concurrent streams) can't double-begin
-// or race a close.
+// is driven by ConnState (StateClosed). Only DIRECT connections drive the
+// port's session accounting (§13.2): relay connections must never begin,
+// renew, or hold the home mapping, so their requests skip the tracker. The
+// conn's mutex guards sessionID so a connection (an HTTP/2 connection with
+// concurrent streams) can't double-begin or race a close.
 func (s *DirectServer) activity(w http.ResponseWriter, r *http.Request, code string) {
 	if s.port == nil {
 		return
 	}
-	cs, _ := r.Context().Value(connStateKey{}).(*connState)
-	if cs == nil {
+	cs := connStateFromContext(r.Context())
+	if cs == nil || cs.boundRoute() != RouteDirect {
 		return
 	}
 	cs.mu.Lock()
@@ -424,17 +486,6 @@ func (s *DirectServer) activity(w http.ResponseWriter, r *http.Request, code str
 	}
 	cs.mu.Unlock()
 }
-
-// connState carries the per-connection session token. It is created in
-// ConnContext (which runs before ConnState's StateNew, so StateNew cannot
-// supply it) and stashed in both the request context and the server's
-// connStates map.
-type connState struct {
-	mu        sync.Mutex
-	sessionID string
-}
-
-type connStateKey struct{}
 
 // Server resource limits (§11): explicit header/keep-alive timeouts and the
 // streaming semaphore capacities.
@@ -495,14 +546,20 @@ func (g *streamGate) release() {
 }
 
 // newHTTPServer builds the fully-wired http.Server: Handler and TLSConfig, plus
-// ConnContext/ConnState that connect each net.Conn to its *connState.
+// ConnContext/ConnState that connect each net.Conn to its *connState in the
+// connection registry.
 //
-// Wiring (ordering matters): Go's Serve calls ConnContext BEFORE firing
-// ConnState(StateNew), so the *connState must be created and stashed in
-// ConnContext — not in StateNew. ConnContext stores it under the raw net.Conn
-// in connStates and returns a context carrying it; the handler's activity
-// reads it from r.Context(); ConnState(StateClosed) deletes it from connStates
-// and ends the session.
+// Wiring (ordering matters): Go's Serve calls ConnContext BEFORE the TLS
+// handshake (and before ConnState's StateNew), so the *connState must be
+// created and registered in ConnContext — not in StateNew — and it cannot
+// carry the SNI-derived route yet (the route is noted by Handler once the
+// first request is authorized). ConnContext registers it under the raw
+// net.Conn in the registry and returns a context carrying it; the handler's
+// activity reads it from r.Context(); ConnState(StateClosed) unregisters it
+// from the registry and ends the port session. HTTP/2 connections run through
+// the same hooks (ConnContext supplies their base context; the h2 server
+// leaves StateNew/StateClosed to net/http), so one registry serves both
+// protocols and both routes.
 func (s *DirectServer) newHTTPServer() *http.Server {
 	return &http.Server{
 		Handler:           s.Handler(),
@@ -512,18 +569,17 @@ func (s *DirectServer) newHTTPServer() *http.Server {
 		MaxHeaderBytes:    maxHeaderBytes,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			cs := &connState{}
-			s.connStates.Store(c, cs)
+			s.conns.register(c, cs)
 			return context.WithValue(ctx, connStateKey{}, cs)
 		},
 		ConnState: func(c net.Conn, st http.ConnState) {
 			if st != http.StateClosed {
 				return
 			}
-			v, ok := s.connStates.LoadAndDelete(c)
+			cs, ok := s.conns.unregister(c)
 			if !ok {
 				return
 			}
-			cs := v.(*connState)
 			cs.mu.Lock()
 			sid := cs.sessionID
 			cs.sessionID = ""
