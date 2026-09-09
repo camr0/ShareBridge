@@ -260,13 +260,14 @@ The Phase B checklist needs one share of each kind, from the enrolled agent
 | `<DIRECT>` | direct candidate | The existing phase-3 port-forward to the agent (mapped external port may be 443 or any). Agent must be STUN-match fresh — it will be, per §6.5. |
 | `<NON443>` | non-443 direct | Same network, but the router’s mapped **external** port ≠ 443 (e.g. forward external 8443 → agent 8443). |
 | `<RELAYONLY>` | relay-only | Create the share with the **Relay** mode toggle in the agent share form (`relay_only=true`). |
-| `<BLACKHOLE>` | direct + silent drop | Same as `<NON443>` or `<DIRECT>` mapping, then make the mapped port **DROP** (not REJECT) — options below; re-create/reuse a separate share code while the drop is active. |
+| `<BLACKHOLE>` | direct + silent drop | While the PnP mapping is live, make the mapped **external** port DROP (not REJECT) — options below; revert after the case. |
 
-BLACKHOLE options (pick one; revert after the case):
+BLACKHOLE options (pick one; revert after the case). The mapped external
+port is the one the agent reports (visible in control logs /
+`report_endpoint`), not a static forward:
 
-- **Router firewall**: WAN inbound rule on the mapped external port with
-  action **Drop** (most home routers: port-forward + firewall rule, or
-  DMZ-except trick). Nothing may answer — no RST, no ICMP-refused.
+- **Router firewall**: WAN inbound DROP rule on the currently mapped external
+  port. Nothing may answer — no RST, no ICMP-refused.
 - **Host iptables/nftables on the home server**:
   `sudo iptables -I INPUT -p tcp --dport <ext-port> -j DROP` **and**
   `sudo iptables -I FORWARD -p tcp --dport <ext-port> -j DROP` (DNAT’d
