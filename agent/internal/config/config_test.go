@@ -578,3 +578,79 @@ func TestNewManager_EnvAgentAPIKeyNotPersisted(t *testing.T) {
 		t.Errorf("config file contains agent_api_key field, should be omitted when from env")
 	}
 }
+
+// TestConnectAllowedOriginDefault verifies the fail-safe production default:
+// with CONNECT_ALLOWED_ORIGIN unset the config resolves to the exact production
+// interstitial origin, byte-identical to the previously hardcoded value.
+func TestConnectAllowedOriginDefault(t *testing.T) {
+	mgr := newTempConfigManager(t)
+	if got := mgr.Get().ConnectAllowedOrigin; got != "https://sharebridge.app" {
+		t.Fatalf("ConnectAllowedOrigin = %q, want default https://sharebridge.app", got)
+	}
+}
+
+// TestConnectAllowedOriginEnvOverride verifies the env override feeds the
+// config field verbatim when well-formed.
+func TestConnectAllowedOriginEnvOverride(t *testing.T) {
+	t.Setenv("CONNECT_ALLOWED_ORIGIN", "http://192.0.2.10:8080")
+	mgr := newTempConfigManager(t)
+	if got := mgr.Get().ConnectAllowedOrigin; got != "http://192.0.2.10:8080" {
+		t.Fatalf("ConnectAllowedOrigin = %q, want http://192.0.2.10:8080", got)
+	}
+}
+
+// TestConnectAllowedOriginMalformedEnvFailsClosed verifies malformed env values
+// never reach the config: every one fails closed to the production default.
+func TestConnectAllowedOriginMalformedEnvFailsClosed(t *testing.T) {
+	for _, v := range []string{
+		"not-an-origin",
+		"sharebridge.app",
+		"ftp://sharebridge.app",
+		"https://sharebridge.app/path",
+		"https://sharebridge.app?probe=1",
+		"https://user:pass@sharebridge.app",
+		"https://",
+		"null",
+	} {
+		t.Setenv("CONNECT_ALLOWED_ORIGIN", v)
+		mgr := newTempConfigManager(t)
+		if got := mgr.Get().ConnectAllowedOrigin; got != "https://sharebridge.app" {
+			t.Fatalf("CONNECT_ALLOWED_ORIGIN = %q: ConnectAllowedOrigin = %q, want fail-closed default https://sharebridge.app", v, got)
+		}
+	}
+}
+
+// TestValidateConnectOrigin pins the accepted grammar: an absolute origin with
+// an http/https scheme, a non-empty host with an optional numeric port, and no
+// userinfo, path, query, or fragment.
+func TestValidateConnectOrigin(t *testing.T) {
+	for _, v := range []string{
+		"https://sharebridge.app",
+		"http://192.0.2.10:8080",
+		"http://[::1]:8080",
+		"https://stun.example.com:3478",
+	} {
+		if err := ValidateConnectOrigin(v); err != nil {
+			t.Errorf("ValidateConnectOrigin(%q) = %v, want nil", v, err)
+		}
+	}
+	for _, v := range []string{
+		"",
+		"sharebridge.app",
+		"//sharebridge.app",
+		"ftp://sharebridge.app",
+		"https://sharebridge.app/path",
+		"https://sharebridge.app?q=1",
+		"https://sharebridge.app#frag",
+		"https://user:pass@sharebridge.app",
+		"https://sharebridge.app:",
+		"https://sharebridge.app:notaport",
+		"https://sharebridge.app:0",
+		"null",
+		"https://",
+	} {
+		if err := ValidateConnectOrigin(v); err == nil {
+			t.Errorf("ValidateConnectOrigin(%q) = nil, want error", v)
+		}
+	}
+}

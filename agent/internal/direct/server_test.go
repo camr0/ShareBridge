@@ -551,6 +551,85 @@ func TestConnectAllowsOnlyShareBridgeAppOrigin(t *testing.T) {
 	}
 }
 
+// TestConnectAllowedOriginConfigurable verifies the config-driven allowed
+// origin: with CONNECT_ALLOWED_ORIGIN set to a valid absolute origin, exactly
+// that origin is accepted (204 + exactly one ACAO echoing it) while every other
+// value — including the production default — is refused with 403 and no ACAO.
+func TestConnectAllowedOriginConfigurable(t *testing.T) {
+	t.Setenv("CONNECT_ALLOWED_ORIGIN", "http://192.0.2.10:8080")
+	ts, _ := startConnectServer(t, stubResolver{}, false)
+
+	resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+		"/s/abc/connect", "http://192.0.2.10:8080")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("configured origin: status = %d, want 204", resp.StatusCode)
+	}
+	acao := resp.Header.Values("Access-Control-Allow-Origin")
+	if len(acao) != 1 || acao[0] != "http://192.0.2.10:8080" {
+		t.Fatalf("configured origin: Access-Control-Allow-Origin = %v, want exactly [http://192.0.2.10:8080]", acao)
+	}
+
+	// Under the override the production origin is just a foreign origin:
+	// refused, no reflection.
+	resp = doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+		"/s/abc/connect", "https://sharebridge.app")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("production origin under override: status = %d, want 403", resp.StatusCode)
+	}
+	if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+		t.Fatalf("production origin under override: Access-Control-Allow-Origin = %v, want none", got)
+	}
+}
+
+// TestConnectAllowedOriginMalformedFailsClosed verifies that a malformed
+// CONNECT_ALLOWED_ORIGIN fails closed at server construction: the server keeps
+// the production default origin, so the exact production origin is accepted and
+// everything else is refused with 403 and no ACAO.
+func TestConnectAllowedOriginMalformedFailsClosed(t *testing.T) {
+	for _, v := range []string{
+		"not-an-origin",
+		"sharebridge.app",
+		"ftp://sharebridge.app",
+		"https://sharebridge.app/path",
+		"https://sharebridge.app?probe=1",
+		"https://user:pass@sharebridge.app",
+		"https://",
+		"null",
+	} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("CONNECT_ALLOWED_ORIGIN", v)
+			ts, _ := startConnectServer(t, stubResolver{}, false)
+
+			resp := doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+				"/s/abc/connect", "https://sharebridge.app")
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("malformed env %q: production origin status = %d, want 204 (fail closed to default)", v, resp.StatusCode)
+			}
+			acao := resp.Header.Values("Access-Control-Allow-Origin")
+			if len(acao) != 1 || acao[0] != "https://sharebridge.app" {
+				t.Fatalf("malformed env %q: Access-Control-Allow-Origin = %v, want exactly [https://sharebridge.app]", v, acao)
+			}
+
+			resp = doConnect(t, ts, connectDirectOrigin, connectDirectOrigin, http.MethodGet,
+				"/s/abc/connect", "http://192.0.2.10:8080")
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("malformed env %q: foreign origin status = %d, want 403", v, resp.StatusCode)
+			}
+			if got := resp.Header.Values("Access-Control-Allow-Origin"); len(got) != 0 {
+				t.Fatalf("malformed env %q: Access-Control-Allow-Origin = %v, want none", v, got)
+			}
+		})
+	}
+}
+
 // TestConnectSetsNoCookieAndTouchesNoBackend verifies the §18.3 "no content /
 // cookie" property structurally: a successful connect check never sets a
 // cookie, never consults the share resolver, and never runs session activity

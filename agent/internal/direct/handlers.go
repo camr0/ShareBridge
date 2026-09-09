@@ -15,19 +15,15 @@ import (
 	"sharebridge/agent/internal/immich"
 )
 
-// connectAllowedOrigin is the single cross-origin caller of the connect
-// check: the control-hosted interstitial (§9.3). It is fixed — the endpoint
-// never reflects a request-supplied Origin.
-const connectAllowedOrigin = "https://sharebridge.app"
-
 // handleConnect serves GET /s/<code>/connect (§9.3): the interstitial's
 // credential-free, content-free CORS reachability check of the direct agent
 // origin. The Binder has already authorized SNI, Host, route namespace, and
 // share code for this request; this handler then additionally requires the
-// RouteDirect binding (a relay-bound origin must not reveal a connect
-// endpoint), the exact interstitial Origin, and GET.
+// RouteDirect binding, the exact configured allowed origin (s.connectOrigin —
+// the production interstitial origin by default, CONNECT_ALLOWED_ORIGIN for
+// test deployments), and GET.
 //
-// Success is 204 with no-store and exactly one ACAO for the fixed origin. The
+// Success is 204 with no-store and exactly one ACAO for the allowed origin. The
 // check resolves no content, touches no backend, performs no session
 // accounting, and never sets a cookie (§18.3: the connect endpoint exposes no
 // content/cookie). Preflight (OPTIONS) is deliberately not implemented: the
@@ -52,14 +48,14 @@ func (s *DirectServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if r.Header.Get("Origin") != connectAllowedOrigin {
+	if r.Header.Get("Origin") != s.connectOrigin {
 		// Absent or foreign Origin: refuse without echoing the value.
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	h := w.Header()
 	h.Set("Cache-Control", "no-store")
-	h.Set("Access-Control-Allow-Origin", connectAllowedOrigin)
+	h.Set("Access-Control-Allow-Origin", s.connectOrigin)
 	w.WriteHeader(http.StatusNoContent)
 }
 

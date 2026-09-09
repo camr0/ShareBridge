@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"sharebridge/agent/internal/config"
 )
 
 // CertProvider supplies the current serving certificate. The cert Manager
@@ -61,6 +63,14 @@ type DirectServer struct {
 	binder          *Binder
 	resolver        Resolver
 
+	// connectOrigin is the single cross-origin caller of the direct path's
+	// /connect reachability check (§9.3): the control-hosted interstitial
+	// origin. The endpoint never reflects a request-supplied Origin; the
+	// value is resolved once at construction from CONNECT_ALLOWED_ORIGIN via
+	// config.ResolveConnectAllowedOrigin, failing closed to the production
+	// default (https://sharebridge.app) when unset or malformed.
+	connectOrigin string
+
 	// globalStreams bounds the total number of simultaneous streaming
 	// responses (asset/video/archive parts) across all shares (§11). A nil
 	// gate means unlimited.
@@ -87,6 +97,7 @@ func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker
 	return &DirectServer{
 		namespace: namespace, baseDomain: baseDomain, port: port, certs: certs, gate: gate,
 		maxContentBytes: maxContentBytes, binder: binder,
+		connectOrigin: config.ResolveConnectAllowedOrigin(),
 		globalStreams: newStreamGate(globalStreamLimit),
 	}
 }

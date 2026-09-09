@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 const currentConfigVersion = 2
@@ -33,6 +36,15 @@ type Config struct {
 	UIAddr              string `json:"ui_addr,omitempty"` // default: 0.0.0.0
 	UIPassword          string `json:"ui_password,omitempty"`
 	BaseDomain          string `json:"base_domain,omitempty"` // content base domain for direct/relay origins
+
+	// ConnectAllowedOrigin is the single cross-origin caller of the direct
+	// path's /connect reachability check (§9.3): the control-hosted
+	// interstitial origin. Production keeps the default
+	// (https://sharebridge.app); test deployments override it via the
+	// CONNECT_ALLOWED_ORIGIN env var to the test interstitial's origin.
+	// Values are validated at load (ValidateConnectOrigin); malformed values
+	// fail closed to the default.
+	ConnectAllowedOrigin string `json:"connect_allowed_origin,omitempty"`
 
 	// Relay tunnel supervision settings (phase 4a §7.4). The generated frpc
 	// configuration is written into the tunnel data directory; the pinned
@@ -211,6 +223,9 @@ func (m *Manager) load() (*Config, error) {
 	if v := os.Getenv("SHAREBRIDGE_RELAY_CA_FILE"); v != "" {
 		cfg.TunnelCAFile = v
 	}
+	if v := os.Getenv("CONNECT_ALLOWED_ORIGIN"); v != "" {
+		cfg.ConnectAllowedOrigin = v
+	}
 
 	if cfg.SignalingURL == "" {
 		cfg.SignalingURL = "wss://sharebridge.app"
@@ -236,11 +251,102 @@ func (m *Manager) load() (*Config, error) {
 	if cfg.TunnelLocalTarget == "" {
 		cfg.TunnelLocalTarget = "127.0.0.1:8443"
 	}
+	// ConnectAllowedOrigin: file value stands only when well-formed; an empty
+	// or malformed value (from either the file or the env override above)
+	// fails closed to the production default — the connect check must never
+	// end up comparing against an unusable origin.
+	if cfg.ConnectAllowedOrigin == "" {
+		cfg.ConnectAllowedOrigin = defaultConnectAllowedOrigin
+	} else if err := ValidateConnectOrigin(cfg.ConnectAllowedOrigin); err != nil {
+		log.Printf("config: invalid connect allowed origin %q (%v); failing closed to default %q",
+			cfg.ConnectAllowedOrigin, err, defaultConnectAllowedOrigin)
+		cfg.ConnectAllowedOrigin = defaultConnectAllowedOrigin
+	}
 	// TunnelCAFile intentionally defaults to empty: relay transport
 	// verification fails closed until the operator provisions the relay CA
 	// bundle, and the direct path never depends on it.
 
 	return cfg, nil
+}
+
+// defaultConnectAllowedOrigin is the production interstitial origin (§9.3);
+// the connect handler compares request Origins against the resolved value
+// byte-exactly and never reflects a request-supplied Origin.
+const defaultConnectAllowedOrigin = "https://sharebridge.app"
+
+// ValidateConnectOrigin reports whether v is an acceptable connect allowed
+// origin: an absolute origin with an http/https scheme, a non-empty host with
+// an optional numeric port, and no userinfo, path, query, or fragment — the
+// exact shape a browser sends in an Origin header. Anything else is rejected
+// so a typo fails closed to the default instead of silently breaking (or
+// broadening) the connect check.
+func ValidateConnectOrigin(v string) error {
+	u, err := url.Parse(v)
+	if err != nil {
+		return fmt.Errorf("parse origin: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("scheme %q: want http or https", u.Scheme)
+	}
+	if u.User != nil {
+		return fmt.Errorf("userinfo not allowed")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("missing host")
+	}
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return fmt.Errorf("origin must not carry a path, query, or fragment")
+	}
+	if err := validateOriginHostPort(u.Host); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateOriginHostPort validates the host[:port] part of an origin: the port
+// suffix, when present, must be numeric in range 1-65535; a bare bracketed
+// IPv6 literal is allowed.
+func validateOriginHostPort(host string) error {
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if h == "" {
+			return fmt.Errorf("empty host")
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid port %q", port)
+		}
+		return nil
+	}
+	// SplitHostPort failed: the only acceptable form left is a bare bracketed
+	// IPv6 literal (no port).
+	if strings.HasPrefix(host, "[") {
+		if !strings.HasSuffix(host, "]") || len(host) <= len("[]") {
+			return fmt.Errorf("invalid host %q", host)
+		}
+		return nil
+	}
+	if strings.Contains(host, ":") {
+		return fmt.Errorf("invalid host %q", host)
+	}
+	return nil
+}
+
+// ResolveConnectAllowedOrigin resolves the effective connect allowed origin
+// from the environment: CONNECT_ALLOWED_ORIGIN when set and well-formed, the
+// production default otherwise (fail closed). The direct server calls this at
+// construction so a test deployment's override takes effect without any other
+// wiring; production behavior is byte-identical when the variable is unset.
+func ResolveConnectAllowedOrigin() string {
+	v := os.Getenv("CONNECT_ALLOWED_ORIGIN")
+	if v == "" {
+		return defaultConnectAllowedOrigin
+	}
+	if err := ValidateConnectOrigin(v); err != nil {
+		log.Printf("config: invalid CONNECT_ALLOWED_ORIGIN %q (%v); failing closed to default %q",
+			v, err, defaultConnectAllowedOrigin)
+		return defaultConnectAllowedOrigin
+	}
+	return v
 }
 
 // defaultFRPCPath resolves the bundled pinned frpc binary next to the agent
