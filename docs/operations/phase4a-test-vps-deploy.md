@@ -93,17 +93,22 @@ cd control
 
 What it does, in order: validates `.env.testing` (seed/secret charset, port
 collisions, IPv4/hostname shape) → derives the gateway’s Ed25519 verification
-key from `RELAY_AUTH_KEY_SEED` → cross-compiles control + gateway static
-Linux binaries → downloads the **pinned frps v0.71.0** and verifies its
-SHA-256 against `relay/frp/manifest.json` (fails closed on mismatch) →
-ensures the transport CA and issues a fresh server cert → `scp`s binaries,
-web assets, certs → writes remote `.env`, `relay-gateway.env`, `frps.toml`
-(over ssh stdin; secrets never on a command line) → installs and **restarts**
-all three systemd units → applies UFW rules (only if ufw is already active)
-→ prints on-box service/listener evidence and a verification checklist.
+key from `RELAY_AUTH_KEY_SEED` (the seed is piped to a throwaway Go helper
+over **stdin**, never on an argv element, so it is invisible to `ps`) →
+cross-compiles control + gateway static Linux binaries → downloads the
+**pinned frps v0.71.0** and verifies its SHA-256 against
+`relay/frp/manifest.json` (fails closed on mismatch) → ensures the transport
+CA and issues a fresh server cert → `scp`s binaries, web assets, certs →
+writes remote `.env`, `relay-gateway.env`, `frps.toml` (over ssh stdin;
+secrets never on a command line) → installs and **restarts** all three
+systemd units → applies UFW rules (only if ufw is already active) → prints
+on-box service/listener evidence and a verification checklist.
 
-`--bootstrap` additionally creates a throwaway user + API key and prints the
-agent env block, the CA copy line and the ready-made Task 25 gate command.
+`--bootstrap` additionally creates a throwaway user + API key and writes the
+agent env block (including `CONNECT_ALLOWED_ORIGIN`, the CA copy line and
+the ready-made Task 25 gate command) to
+`.env.testing.d/bootstrap-<host>.env` with mode 0600. Only the file path is
+printed — the secrets never appear in terminal scrollback.
 
 `--teardown` stops and disables all three units (binaries, `pb_data`,
 `relay-data` and configs stay on the box; delete the box in the cloud
@@ -159,12 +164,21 @@ The home server runs the agent from Docker via `agent/redeploy.sh`
    For an arm64 home server use the `linux_arm64` artifact instead — verify
    the digest yourself against `relay/frp/manifest.json`.
 2. **Set the agent env** (compose reads `agent/.env` for variable
-   substitution):
+   substitution — copy these from the `--bootstrap` env file,
+   `.env.testing.d/bootstrap-<host>.env`):
 
    ```
    SIGNALING_SERVER=ws://<vps-host>:8080
-   SHAREBRIDGE_API_KEY=<from --bootstrap output>
+   SHAREBRIDGE_API_KEY=<from the --bootstrap env file>
+   CONNECT_ALLOWED_ORIGIN=http://<vps-host>:8080
    ```
+
+   `CONNECT_ALLOWED_ORIGIN` must be the **exact** interstitial origin of the
+   test deployment (`http://<vps-host>:8080`): the agent’s `/connect` CORS
+   check compares byte-exactly against this value. It is a test-only
+   override — unset (production) keeps the `https://sharebridge.app`
+   default; a malformed value fails closed to that same default at config
+   load.
 
 3. **Copy the relay transport CA into the container’s data volume.** The
    agent verifies frps transport TLS against `tunnel_ca_file` from its
@@ -289,7 +303,8 @@ the gate client. The gate script and its seven cases:
 `scripts/stun-nat-gate.sh` (see its header for the full contract).
 
 ```bash
-export STUN_GATE_API_KEY=<agent API key>     # env-only: never a flag/argv
+export STUN_GATE_API_KEY=<agent API key — copy from the --bootstrap env file
+                             .env.testing.d/bootstrap-<host>.env>  # env-only: never a flag/argv
 scripts/stun-nat-gate.sh --target remote \
   --server ws://<vps-host>:8080 \
   --stun-addr <STUN_ADVERTISE_ADDR> \
@@ -327,7 +342,8 @@ Open `e2e/browser/PHASE-B-SAFARI.md` and apply these substitutions for the
 |------------------------|------------|
 | `https://sharebridge.app` (canonical share URL base) | `http://<vps-host>:8080` |
 | `<NS>` | `<namespace>.<CONTENT_BASE_DOMAIN>` |
-| `<DIRECT>` / `<NON443>` / `<RELAYONLY>` / `<BLACKHOLE>` | codes from §7 |
+| `<DIRECT>` / `<NON443>` / `<RELAYONLY>` / `<BLACKHOLE>` / `<PARKED>` | codes from §7 |
+| expected ACAO + ACAO/CSP origin in cases 2.6–2.7 (`https://sharebridge.app`) | `http://<vps-host>:8080` — the agent runs with `CONNECT_ALLOWED_ORIGIN=http://<vps-host>:8080` (§5); test-only override, production keeps the `https://sharebridge.app` default |
 
 Device prerequisites: one macOS Safari and one iOS Safari, each on its own
 normal network (iOS: Wi-Fi; optionally cellular for extra coverage), same
