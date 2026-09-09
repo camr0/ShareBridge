@@ -107,6 +107,8 @@ func TestSTUNAdvertise(t *testing.T) {
 		{name: "empty host rejected", bind: "0.0.0.0:3478", advertise: ":3478", wantErr: true},
 		{name: "hostname with invalid rune rejected", bind: "0.0.0.0:3478", advertise: "stun ex.ample.com:3478", wantErr: true},
 		{name: "hostname with empty label rejected", bind: "0.0.0.0:3478", advertise: "stun..example.com:3478", wantErr: true},
+		{name: "hostname with underscore label rejected", bind: "0.0.0.0:3478", advertise: "stun_gate_example:3478", wantErr: true},
+		{name: "hostname with embedded underscore rejected", bind: "0.0.0.0:3478", advertise: "stun_gate.example.com:3478", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

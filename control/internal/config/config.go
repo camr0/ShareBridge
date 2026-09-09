@@ -161,6 +161,10 @@ func (c *Config) STUNAdvertise() (string, error) {
 	}
 	// Hostname: conservative RFC 1123 charset, non-empty labels, bounded
 	// length — the address rides the §11.1 wire and must stay well-formed.
+	// RFC 1123 §11.2.2 hostnames admit letters, digits, and hyphens only:
+	// `_` is deliberately absent (it is common in service labels but is not
+	// a legal hostname rune), so a `stun_gate_example`-style value fails
+	// closed at startup instead of advertising an unresolvable name.
 	if len(host) > 253 {
 		return "", fmt.Errorf("stun advertise address %q: hostname too long", v)
 	}
@@ -170,7 +174,7 @@ func (c *Config) STUNAdvertise() (string, error) {
 		}
 		for _, r := range label {
 			switch {
-			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
 			default:
 				return "", fmt.Errorf("stun advertise address %q: invalid hostname rune %q", v, r)
 			}
