@@ -20,6 +20,7 @@ import (
 	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
+	"sharebridge/agent/internal/stun"
 	"sharebridge/agent/internal/tunnel"
 )
 
@@ -116,6 +117,21 @@ type Daemon struct {
 	sessions  map[string]*Session      // code -> Session
 	mu        sync.RWMutex
 
+	// tunnel supervises the pinned frpc child (§7.4). Process-lifetime by
+	// design: it is constructed in Start with the process context and — once
+	// a healthy tunnel exists — survives every control-WebSocket reconnect
+	// (§15.4), until replacement by a higher generation, lockdown, or daemon
+	// shutdown. Written only before the signaling goroutines start and by the
+	// tests' startTunnelManager; readers need no additional synchronization.
+	tunnel *tunnel.Manager
+
+	// STUN cross-check state (§10.1, Task 17 add-on): the exchange client, a
+	// test clock seam, and the one-slot bound that keeps at most a single
+	// challenge exchange in flight at a time.
+	stunClient   *stun.Client
+	stunInFlight chan struct{}
+	now          func() time.Time
+
 	webServer          WebServer
 	startTime          time.Time
 	signalingConnected bool // true once welcome received
@@ -171,8 +187,16 @@ type directState struct {
 
 	started    bool               // DirectServer.Start guard (under mu)
 	startGen   uint64             // increments per start attempt (under mu)
-	cancel     context.CancelFunc // cancels the direct server ctx on disconnect
+	cancel     context.CancelFunc // cancels the direct server ctx on shutdown
 	listenAddr string             // override for tests; empty => :directIntPort
+
+	// pendingRelayBinds records relay-only shares whose single §13.3 binding
+	// could not be installed at hydration time because the binder (namespace)
+	// was not built yet: share code → the control-allocated direct origin (the
+	// §6 derivation input). syncDirectServe replays them deterministically as
+	// soon as the binder exists, instead of silently waiting for a future
+	// control re-allocation (Task 27 carry-forward).
+	pendingRelayBinds map[string]string
 
 	cond *sync.Cond // readiness signal (lazily created; guarded by mu)
 }
@@ -219,6 +243,222 @@ func (d *Daemon) handleTunnelStatus(report tunnel.StatusReport) {
 	}
 	if err := sender.SendRelayClientState(ctx, state); err != nil {
 		log.Printf("send relay_client_state: %v", err)
+	}
+}
+
+// relayCredentialRequestSender is the signaling capability the production
+// credential requester is built on: the §11.1 relay_credential_request send.
+// Capability-asserted (not required) so minimal signaling fakes without it
+// simply leave the tunnel without a requester (the manager stays down and
+// says so) instead of failing construction.
+type relayCredentialRequestSender interface {
+	SendRelayCredentialRequest(ctx context.Context, reason tunnel.CredentialRequestReason) error
+}
+
+// stunResultSender is the signaling capability the §10.1 challenge answer
+// rides: the §11.1 stun_result echo over the authenticated WebSocket.
+type stunResultSender interface {
+	SendSTUNResult(ctx context.Context, result signaling.STUNResult) error
+}
+
+// startTunnelManager constructs the relay tunnel supervision (§7.4, Task 9)
+// wired to the control connection. The manager and its credential requester
+// live on the given process context — NOT on a WebSocket epoch: §15.4 keeps a
+// healthy tunnel across reconnects, and §15.2's fresh-credential request must
+// ride whichever connection (current or reconnected) is up when it fires.
+// options forwards the tunnel package's test-visible knobs; production calls
+// it without options.
+func (d *Daemon) startTunnelManager(ctx context.Context, options ...tunnel.ManagerOption) {
+	d.mu.Lock()
+	if d.tunnel != nil {
+		d.mu.Unlock()
+		return
+	}
+	d.mu.Unlock()
+
+	cfg := d.GetConfig()
+	if cfg == nil {
+		log.Printf("relay tunnel supervision disabled: no configuration available")
+		return
+	}
+	settings := tunnel.Settings{
+		FRPCBinaryPath: cfg.TunnelFRPCPath,
+		ConfigPath:     filepath.Join(cfg.TunnelDataDir, "frpc.toml"),
+		TrustedCAFile:  cfg.TunnelCAFile,
+		LocalTarget:    tunnel.LocalTarget,
+	}
+	if settings.FRPCBinaryPath == "" || settings.ConfigPath == "" {
+		// Degenerate configuration (unit tests, hand-built configs): relay
+		// supervision stays off rather than failing daemon construction.
+		log.Printf("relay tunnel supervision disabled: frpc binary or config path not configured")
+		return
+	}
+
+	// The credential requester (§7.2/§11.1) sends over the signaling client's
+	// CURRENT connection: the send path re-resolves the WebSocket per call, so
+	// a request enqueued before a reconnect rides the reconnected socket.
+	var requester tunnel.CredentialRequester
+	if sender, ok := d.signaling.(relayCredentialRequestSender); ok {
+		requester = tunnel.NewControlCredentialRequester(ctx, sender.SendRelayCredentialRequest)
+	} else {
+		log.Printf("relay credential requester unavailable: signaling client lacks relay_credential_request")
+	}
+
+	manager, err := tunnel.NewManager(settings, requester, d.handleTunnelStatus, options...)
+	if err != nil {
+		log.Printf("relay tunnel supervision unavailable: %v", err)
+		return
+	}
+	d.mu.Lock()
+	d.tunnel = manager
+	d.mu.Unlock()
+}
+
+// stopTunnelManager stops the frpc child and the supervision loop (§7.4
+// step 6: lockdown and daemon shutdown are the only legitimate stops).
+// Idempotent.
+func (d *Daemon) stopTunnelManager() {
+	d.mu.RLock()
+	manager := d.tunnel
+	d.mu.RUnlock()
+	if manager != nil {
+		manager.Stop()
+	}
+}
+
+// applyRelayConfig routes one control relay_config message into the tunnel
+// manager's generation-fenced ApplyConfig (§7.4 step 1 validation happens in
+// the strict parser and again inside the manager). The message reaches the
+// daemon only on the authenticated current epoch; an absent manager (relay
+// supervision never enabled) drops it with a diagnostic.
+func (d *Daemon) applyRelayConfig(msg signaling.Message) {
+	d.mu.RLock()
+	manager := d.tunnel
+	d.mu.RUnlock()
+	if manager == nil {
+		log.Printf("relay_config ignored: tunnel supervision unavailable")
+		return
+	}
+	if len(msg.Raw) == 0 {
+		log.Printf("relay_config ignored: raw payload unavailable for strict parse")
+		return
+	}
+	config, err := signaling.ParseRelayConfig(msg.Raw)
+	if err != nil {
+		log.Printf("invalid relay_config rejected: %v", err)
+		return
+	}
+	if err := manager.ApplyConfig(config); err != nil {
+		log.Printf("apply relay_config: %v", err)
+	}
+}
+
+// stunExchangeSlot lazily creates and returns the single-exchange bound.
+// Caller must hold d.mu (write lock not required: the channel is only read
+// after creation — use the write lock at call sites for simplicity).
+func (d *Daemon) stunExchangeSlotLocked() chan struct{} {
+	if d.stunInFlight == nil {
+		d.stunInFlight = make(chan struct{}, 1)
+	}
+	return d.stunInFlight
+}
+
+// beginStunExchange reports whether a new §10.1 exchange may start. The bound
+// is one in-flight exchange at a time: challenges are one-use and short-lived,
+// so a challenge arriving while another exchange runs is dropped (control
+// re-issues; the failed observation falls back to relay per §10.3).
+func (d *Daemon) beginStunExchange() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	slot := d.stunExchangeSlotLocked()
+	select {
+	case slot <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// endStunExchange releases the single-exchange slot.
+func (d *Daemon) endStunExchange() {
+	d.mu.Lock()
+	slot := d.stunExchangeSlotLocked()
+	d.mu.Unlock()
+	select {
+	case <-slot:
+	default:
+	}
+}
+
+// stunNow returns the daemon's clock reading (test seam, defaulting to the
+// real clock) so challenge TTL validation is deterministic under test.
+func (d *Daemon) stunNow() time.Time {
+	d.mu.RLock()
+	now := d.now
+	d.mu.RUnlock()
+	if now == nil {
+		return time.Now()
+	}
+	return now()
+}
+
+// handleStunChallenge answers one §11.1 stun_challenge (§10.1): validate the
+// one-use credential (version, shape, server, expiry — fail-closed BEFORE any
+// network activity), then run exactly one integrity-protected STUN exchange
+// via the Task 17 client and echo {challenge, transaction_id, receipt} back
+// over the authenticated WebSocket. The secret and the mapped address are
+// never echoed or logged (§16.6). The exchange runs off the WebSocket read
+// loop so the control connection stays responsive.
+func (d *Daemon) handleStunChallenge(msg signaling.Message) {
+	sender, ok := d.signaling.(stunResultSender)
+	if !ok {
+		return // no echo sink: nothing useful can be done with the challenge
+	}
+	expiresAt, err := time.Parse(time.RFC3339, msg.ExpiresAt)
+	if err != nil {
+		log.Printf("stun_challenge dropped: invalid expires_at")
+		return
+	}
+	challenge, err := stun.ParseChallenge(msg.Version, msg.Challenge, msg.Server, expiresAt, d.stunNow())
+	if err != nil {
+		// Validation failures never carry credential material (§16.6).
+		log.Printf("stun_challenge dropped: %v", err)
+		return
+	}
+	if !d.beginStunExchange() {
+		log.Printf("stun_challenge dropped: another exchange is in flight")
+		return
+	}
+	go d.runStunExchange(sender, challenge, expiresAt)
+}
+
+// runStunExchange performs the single UDP exchange and the WebSocket echo.
+// The context deadline is the challenge's own TTL: the echo must land inside
+// control's claim window, and the client's own response timeout bounds the
+// UDP wait (one request per challenge, no retransmission).
+func (d *Daemon) runStunExchange(sender stunResultSender, challenge stun.Challenge, expiresAt time.Time) {
+	defer d.endStunExchange()
+	ctx, cancel := context.WithDeadline(context.Background(), expiresAt)
+	defer cancel()
+
+	d.mu.RLock()
+	client := d.stunClient
+	d.mu.RUnlock()
+	if client == nil {
+		client = stun.NewClient()
+	}
+	result, err := client.Exchange(ctx, challenge)
+	if err != nil {
+		log.Printf("stun exchange failed: %v", err)
+		return
+	}
+	echo := signaling.STUNResult{
+		Challenge:     result.ChallengeID,
+		TransactionID: result.TransactionID,
+		Receipt:       result.Receipt,
+	}
+	if err := sender.SendSTUNResult(ctx, echo); err != nil {
+		log.Printf("send stun_result: %v", err)
 	}
 }
 
@@ -354,6 +594,17 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 	binder := ds.binder
 	ds.mu.Unlock()
 	if binder == nil {
+		// The binder (namespace) is not built yet — e.g. hydration racing
+		// ahead of `enrolled`. Record the pending binding so syncDirectServe
+		// installs it deterministically as soon as the binder exists, instead
+		// of silently waiting for a future control re-allocation (Task 27
+		// carry-forward).
+		ds.mu.Lock()
+		if ds.pendingRelayBinds == nil {
+			ds.pendingRelayBinds = make(map[string]string)
+		}
+		ds.pendingRelayBinds[code] = directOrigin
+		ds.mu.Unlock()
 		return "", false
 	}
 	relayOrigin, err := binder.RelayOriginFor(directOrigin)
@@ -370,6 +621,7 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 		ds.relayOrigins = make(map[string]string)
 	}
 	ds.relayOrigins[code] = relayOrigin
+	delete(ds.pendingRelayBinds, code)
 	ds.mu.Unlock()
 	return relayOrigin, true
 }
@@ -421,12 +673,30 @@ func (d *Daemon) syncDirectServe() {
 	if ds.binder != nil && ds.serveNS == ds.namespace {
 		return
 	}
+	// The namespace changed: the currently-serving listener (if any) is bound
+	// to the previous namespace's server object, so it must leave service;
+	// the next enrollment_ready rebinds the rebuilt server (§13.1 re-allow
+	// after namespace/listener rebuild). A reconnect with an UNCHANGED
+	// namespace never reaches this branch — the listener keeps serving.
+	if ds.started && ds.cancel != nil {
+		cancel := ds.cancel
+		ds.cancel = nil
+		ds.started = false
+		ds.startGen++
+		cancel()
+	}
 	ds.binder = direct.NewBinder(ds.namespace, ds.baseDomain)
 	// Share ONE binder between the daemon (which records control-allocated
 	// origin pairs via bindOrigin) and the DirectServer (which consults it for
 	// SNI admission + per-request authorization). A private server binder would
 	// reject every direct handshake as an unknown origin.
 	ds.server = direct.NewDirectServerWithBinder(ds.namespace, ds.baseDomain, ds.port, ds.cert, ds.gate, directMaxContentBytes, ds.binder)
+	// The §9.3 connect check must honor the resolved config.json value, not
+	// only the environment variable (construction-time resolution is env-only).
+	// An empty value (hand-built test configs) keeps the constructor default.
+	if cfg := d.config; cfg != nil && cfg.ConnectAllowedOrigin != "" {
+		ds.server.SetConnectAllowedOrigin(cfg.ConnectAllowedOrigin)
+	}
 	if d.resolver != nil {
 		ds.server.SetResolver(d.resolver)
 	}
@@ -445,6 +715,30 @@ func (d *Daemon) syncDirectServe() {
 		if err := ds.binder.Allow(relayOrigin, direct.RouteRelay, code); err != nil {
 			log.Printf("re-allow relay origin for share %s after binder rebuild: %v", code, err)
 		}
+	}
+	// Relay-only bindings whose binder was not built at hydration time are
+	// installed here deterministically (Task 27 carry-forward): as soon as the
+	// binder exists, the pending §13.3 binding is derived and admitted — no
+	// waiting for a future control re-allocation.
+	for code, directOrigin := range ds.pendingRelayBinds {
+		relayOrigin, err := ds.binder.RelayOriginFor(directOrigin)
+		if err != nil {
+			log.Printf("derive pending relay origin for share %s: %v", code, err)
+			continue
+		}
+		if err := ds.binder.Allow(relayOrigin, direct.RouteRelay, code); err != nil {
+			// Kept pending: a stale-namespace origin stays recorded until the
+			// control re-allocates it for the current namespace (bounded by the
+			// session count) — but a namespace-valid origin binds right here.
+			log.Printf("re-allow pending relay origin for share %s after binder rebuild: %v", code, err)
+			continue
+		}
+		if ds.relayOrigins == nil {
+			ds.relayOrigins = make(map[string]string)
+		}
+		ds.relayOrigins[code] = relayOrigin
+		delete(ds.pendingRelayBinds, code)
+		log.Printf("re-bound pending relay-only origin for share %s after binder build", code)
 	}
 	ds.serveNS = ds.namespace
 }
@@ -570,6 +864,12 @@ func (d *Daemon) SetWebServer(ws WebServer) {
 func (d *Daemon) Start(ctx context.Context) <-chan error {
 	errChan := make(chan error, 10)
 
+	// Relay tunnel supervision is process-lifetime (§7.4): the manager is
+	// constructed once here — on the SAME signal.NotifyContext process context
+	// the daemon runs on — and survives every control-WebSocket reconnect
+	// (§15.4) until replacement, lockdown, or shutdown.
+	d.startTunnelManager(ctx)
+
 	// Set up message handler before the reconnect loop starts the listener.
 	d.signaling.SetOnMessage(d.handleSignalingMessage)
 
@@ -651,7 +951,11 @@ func (d *Daemon) runSignalingLoop(ctx context.Context, errChan chan<- error) {
 
 // onSignalingDisconnect resets the direct-transport epoch: readiness is
 // connection-local, and the gate forgets nonces/sequence numbers so signals
-// from the previous connection cannot replay.
+// from the previous connection cannot replay. It deliberately does NOT touch
+// the local HTTPS listener (§7.4: the serving listener left the WS-epoch
+// lifecycle once a valid certificate exists — an established FRP tunnel
+// serves through it during the reconnect) and does NOT touch the tunnel
+// manager (§15.4: a healthy tunnel is preserved until replacement succeeds).
 func (d *Daemon) onSignalingDisconnect() {
 	if d.direct == nil {
 		return
@@ -659,15 +963,29 @@ func (d *Daemon) onSignalingDisconnect() {
 	ds := d.direct
 	ds.mu.Lock()
 	ds.ready = false
-	cancel := ds.cancel
-	ds.cancel = nil
-	ds.started = false
 	ds.mu.Unlock()
-	if cancel != nil {
-		cancel() // close the direct HTTPS server for this epoch
-	}
 	if ds.gate != nil {
 		ds.gate.Reset()
+	}
+}
+
+// stopDirectServer tears the local HTTPS listener down (daemon shutdown —
+// the only legitimate stop short of lockdown, §7.4). The generation bump
+// ensures a stale bind-failure from the old attempt cannot re-latch state.
+func (d *Daemon) stopDirectServer() {
+	if d.direct == nil {
+		return
+	}
+	ds := d.direct
+	ds.mu.Lock()
+	cancel := ds.cancel
+	ds.cancel = nil
+	started := ds.started
+	ds.started = false
+	ds.startGen++
+	ds.mu.Unlock()
+	if started && cancel != nil {
+		cancel()
 	}
 }
 
@@ -734,8 +1052,16 @@ func (d *Daemon) Stop() error {
 		d.closeSessionResources(session)
 	}
 
-	// Tear down the direct-transport epoch: cancel the direct HTTPS server and
-	// reset readiness/gate for a clean shutdown.
+	// Stop the relay tunnel first (§7.4 step 6): the frpc child is stopped
+	// gracefully (killed if it ignores the graceful stop), gateway presence
+	// then expires on its own.
+	d.stopTunnelManager()
+
+	// Tear down the direct serving path: the HTTPS listener leaves service
+	// only on daemon shutdown (§7.4) — never on a control-WebSocket
+	// disconnect — and the gate/readiness epoch state is reset for a clean
+	// shutdown.
+	d.stopDirectServer()
 	d.onSignalingDisconnect()
 
 	// Stop web server
@@ -897,6 +1223,12 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 
 	case "open_signal":
 		d.handleOpenSignal(msg)
+
+	case "relay_config":
+		d.applyRelayConfig(msg)
+
+	case "stun_challenge":
+		d.handleStunChallenge(msg)
 
 	case "error":
 		log.Printf("signaling error: %s", msg.Err)
@@ -1171,6 +1503,24 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			log.Printf("warning: could not create Immich client for %s: %v", entry.Code, err)
 			continue
 		}
+		// §15.3 restart ordering: hydrate the content snapshot BEFORE the
+		// re-registration (the report that makes the share publicly reachable
+		// again). The snapshot manager is keyed by the persisted share code,
+		// which control preserves for a preferred-code registration.
+		session := &Session{
+			Code:                entry.Code,
+			ShareURL:            entry.ShareURL,
+			ShareType:           "immich",
+			IsPasswordProtected: entry.IsPasswordProtected,
+			ExpiresAt:           entry.ExpiresAt,
+			MaxDownloads:        entry.MaxDownloads,
+			Downloads:           entry.Downloads,
+			RelayOnly:           entry.RelayOnly,
+			CreatedAt:           entry.CreatedAt,
+			immich:              client,
+		}
+		d.hydrateContentSession(session)
+
 		reg, ok := d.signaling.(shareOptionRegistrar)
 		if !ok {
 			log.Printf("warning: signaling client does not support Immich registration options for %s", entry.Code)
@@ -1187,6 +1537,13 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			log.Printf("warning: could not re-register Immich session %s: %v", entry.Code, err)
 			continue
 		}
+		if code != entry.Code {
+			// A reassigned code would orphan the just-hydrated snapshot and
+			// miskey download accounting: refuse to advertise the share rather
+			// than serve bookkeeping under two identities.
+			log.Printf("warning: control reassigned share code %s → %s during restore; skipping", entry.Code, code)
+			continue
+		}
 		if origin == "" {
 			origin = entry.Origin
 		}
@@ -1199,22 +1556,9 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			d.bindOrigin(code, origin)
 		}
 
-		session := &Session{
-			Code:                code,
-			ShareURL:            entry.ShareURL,
-			ShareType:           "immich",
-			IsPasswordProtected: entry.IsPasswordProtected,
-			ExpiresAt:           entry.ExpiresAt,
-			MaxDownloads:        entry.MaxDownloads,
-			Downloads:           entry.Downloads,
-			RelayOnly:           entry.RelayOnly,
-			CreatedAt:           entry.CreatedAt,
-			immich:              client,
-		}
 		d.mu.Lock()
 		d.sessions[code] = session
 		d.mu.Unlock()
-		d.hydrateContentSession(session)
 
 		if reconnected {
 			log.Printf("Immich session reconnected - code: %s", code)

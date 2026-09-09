@@ -52,6 +52,13 @@ type Message struct {
 	RelayOrigin string `json:"relay_origin,omitempty"` // share_registered
 	Challenge   string `json:"challenge,omitempty"`    // stun_challenge packed credential
 	Server      string `json:"server,omitempty"`       // stun_challenge UDP listener host:port
+
+	// Raw carries the undecoded JSON payload of this message on the receive
+	// path (Listen populates it before dispatch; locally constructed messages
+	// leave it empty). Strict re-parsing of versioned control messages —
+	// relay_config (§11.1) — runs against the raw bytes so unknown fields and
+	// trailing data are rejected exactly once, by the one shared parser.
+	Raw json.RawMessage `json:"-"`
 }
 
 // OpenAck is the agent-side acknowledgement of an open_signal. Its json tags
@@ -533,6 +540,7 @@ func (c *Client) Listen(ctx context.Context) error {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+		msg.Raw = data // strict re-parse source for relay_config (§11.1)
 
 		// Route registration responses to RegisterShare if one is in flight.
 		if msg.Type == "share_registered" || msg.Type == "error" {

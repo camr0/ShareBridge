@@ -17,6 +17,7 @@ import (
 	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/store"
+	"sharebridge/agent/internal/tunnel"
 )
 
 // mockConfigManager implements ConfigManagerInterface for testing.
@@ -223,6 +224,31 @@ func (m *mockSignalingClient) Listen(ctx context.Context) error {
 	// Block until context is cancelled
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+// SendSTUNResult records one §11.1 stun_result echo through the shared
+// message log (same shape the real signaling client puts on the wire), so the
+// daemon's STUN challenge handler can be observed end to end. Defining it on
+// the mock (test helper) lets the stunResultSender capability assertion find
+// the sink in tests.
+func (m *mockSignalingClient) SendSTUNResult(ctx context.Context, result signaling.STUNResult) error {
+	return m.Send(ctx, map[string]any{
+		"type":           "stun_result",
+		"challenge":      result.Challenge,
+		"transaction_id": result.TransactionID,
+		"receipt":        result.Receipt,
+	})
+}
+
+// SendRelayCredentialRequest records one §11.1 relay_credential_request send
+// (test helper): the daemon's production credential requester is wired to the
+// signaling client's sender, so the amendment test observes the fresh-
+// credential request the tunnel manager issues after a replay rejection.
+func (m *mockSignalingClient) SendRelayCredentialRequest(ctx context.Context, reason tunnel.CredentialRequestReason) error {
+	return m.Send(ctx, map[string]any{
+		"type":   "relay_credential_request",
+		"reason": string(reason),
+	})
 }
 
 func (m *mockSignalingClient) SetOnMessage(handler func(signaling.Message)) {

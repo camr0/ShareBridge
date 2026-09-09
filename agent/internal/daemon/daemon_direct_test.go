@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,6 +9,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -15,16 +18,20 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	pionstun "github.com/pion/stun/v3"
 	"sharebridge/agent/internal/cert"
 	"sharebridge/agent/internal/config"
 	"sharebridge/agent/internal/direct"
 	"sharebridge/agent/internal/immich"
 	"sharebridge/agent/internal/signaling"
+	"sharebridge/agent/internal/store"
+	"sharebridge/agent/internal/stun"
 	"sharebridge/agent/internal/tunnel"
 )
 
@@ -864,11 +871,14 @@ func TestLearnAndReportPublicIPReportsClosedEndpoint(t *testing.T) {
 	}
 }
 
-// TestStartDirectServerGuardedAndStopsOnDisconnect asserts the double-start
-// guard holds and that onSignalingDisconnect cancels the server context and
-// clears the started flag. All flag reads take ds.mu: the server goroutine
-// writes started/cancel under the lock when a bind fails.
-func TestStartDirectServerGuardedAndStopsOnDisconnect(t *testing.T) {
+// TestStartDirectServerGuardedAndStopsOnlyOnShutdown pins the §7.4/§15.4
+// lifecycle split: the double-start guard holds; a control-WebSocket
+// disconnect leaves the serving listener UP (the direct HTTPS server left the
+// WS-epoch lifecycle once it exists); only stopDirectServer — the daemon
+// shutdown path — cancels the server context and clears the started flag.
+// All flag reads take ds.mu: the server goroutine writes started/cancel under
+// the lock when a bind fails.
+func TestStartDirectServerGuardedAndStopsOnlyOnShutdown(t *testing.T) {
 	gate := direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true })
 	ds := &directState{
 		server:     direct.NewDirectServer(testDirectNS, testDirectBase, nil, nil, gate, 1<<20),
@@ -899,13 +909,25 @@ func TestStartDirectServerGuardedAndStopsOnDisconnect(t *testing.T) {
 		t.Fatalf("double start must leave started=true")
 	}
 
+	// §15.4: a control-WebSocket disconnect must NOT stop the serving listener.
 	d.onSignalingDisconnect()
 	started, cancelSet = directStateSnapshot()
+	if !started {
+		t.Fatalf("onSignalingDisconnect must leave the HTTPS listener serving")
+	}
+	if !cancelSet {
+		t.Fatalf("onSignalingDisconnect must leave the server context armed")
+	}
+
+	// Only the daemon-shutdown path (Stop → the direct-server teardown) stops
+	// the listener.
+	d.Stop()
+	started, cancelSet = directStateSnapshot()
 	if started {
-		t.Fatalf("onSignalingDisconnect should reset started=false")
+		t.Fatalf("daemon shutdown should reset started=false")
 	}
 	if cancelSet {
-		t.Fatalf("onSignalingDisconnect should clear cancel")
+		t.Fatalf("daemon shutdown should clear cancel")
 	}
 }
 
@@ -1062,6 +1084,19 @@ func waitForCond(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("condition not met within deadline")
+}
+
+// assertConditionStays asserts the condition keeps holding across an
+// observation window during which a wrongly looping component would act.
+func assertConditionStays(t *testing.T, description string, observeWindow time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(observeWindow)
+	for time.Now().Before(deadline) {
+		if !condition() {
+			t.Fatalf("condition violated while observing %s", description)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestDirectServerEndToEndSNIAdmissionAndDownload runs the REAL agent stack —
@@ -1386,4 +1421,917 @@ func TestDirectEligibleAgentStillReportsRealPublicEndpoint(t *testing.T) {
 		}
 	}
 	d.onSignalingDisconnect()
+}
+
+// ---------- Task 28: serving survives control-WebSocket reconnects ----------
+
+// reserveLoopbackAddr returns a loopback TCP address whose port was free at
+// reservation time (the same bounded-race pattern the occupied-port test
+// uses): callers bind it immediately afterwards.
+func reserveLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve loopback address: %v", err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+	return addr
+}
+
+// waitDialable polls until a TCP dial to addr succeeds (the server goroutine
+// binds asynchronously) or fails after the deadline.
+func waitDialable(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("listener at %s never became dialable", addr)
+}
+
+// assertDialStaysUp repeatedly dials addr across an observation window and
+// fails the test the moment a dial is refused (a closed listener would fail
+// within milliseconds).
+func assertDialStaysUp(t *testing.T, addr string, window time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			t.Fatalf("listener at %s stopped accepting during the observation window: %v", addr, err)
+		}
+		conn.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestHTTPSServerSurvivesControlWebSocketReconnect pins §7.4/§15.4: once the
+// local HTTPS listener exists it must stay up across a control-WebSocket
+// disconnect — only the direct SignalGate and baseline readiness reset for
+// the new epoch. An established FRP tunnel serves through the same listener,
+// so killing it on disconnect would kill healthy relay serving.
+func TestHTTPSServerSurvivesControlWebSocketReconnect(t *testing.T) {
+	addr := reserveLoopbackAddr(t)
+	gate := direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true })
+	ds := &directState{
+		baseDomain: testDirectBase,
+		namespace:  testDirectNS,
+		gate:       gate,
+		server:     direct.NewDirectServer(testDirectNS, testDirectBase, nil, nil, gate, 1<<20),
+		origins:    map[string]originPair{},
+		listenAddr: addr,
+	}
+	d := &Daemon{direct: ds}
+
+	// Baseline enrollment starts the listener once.
+	d.handleSignalingMessage(signaling.Message{Type: "enrollment_ready"})
+	waitDialable(t, addr)
+
+	// Seed a high gate watermark so the epoch reset is observably tested.
+	if err := gate.Admit(direct.OpenSignal{
+		Version: 1, AgentID: "test-agent-id", ShareID: "SHARE123",
+		RouteKind: direct.RouteDirect, Nonce: "nonce-seed", Seq: 10,
+		ExpiresAt: time.Now().Add(time.Minute), Lease: 30 * time.Second,
+	}); err != nil {
+		t.Fatalf("seed admit: %v", err)
+	}
+
+	// The control WebSocket drops. The listener must keep serving.
+	d.onSignalingDisconnect()
+
+	assertDialStaysUp(t, addr, 150*time.Millisecond)
+	if d.canRegisterDirect() {
+		t.Fatalf("baseline readiness must reset on disconnect")
+	}
+	replay := direct.OpenSignal{
+		Version: 1, AgentID: "test-agent-id", ShareID: "SHARE123",
+		RouteKind: direct.RouteDirect, Nonce: "nonce-replay", Seq: 1,
+		ExpiresAt: time.Now().Add(time.Minute), Lease: 30 * time.Second,
+	}
+	if err := gate.Admit(replay); err != nil {
+		t.Fatalf("gate must reset on disconnect: low-seq signal rejected: %v", err)
+	}
+
+	// The next epoch's enrollment_ready must find the listener already up
+	// (started guard) and keep serving on the SAME address.
+	d.handleSignalingMessage(signaling.Message{Type: "enrollment_ready"})
+	assertDialStaysUp(t, addr, 100*time.Millisecond)
+
+	d.Stop() // daemon shutdown is the only legitimate listener teardown
+}
+
+// registrationOrderRecorder wraps the mock signaling client so the test can
+// inspect daemon state at the exact moment share registration (the restart
+// serving-readiness report) runs.
+type registrationOrderRecorder struct {
+	*mockSignalingClient
+	onRegister func()
+}
+
+func (r *registrationOrderRecorder) RegisterShareWithOptions(ctx context.Context, opts signaling.RegisterShareOptions) (string, string, bool, error) {
+	if r.onRegister != nil {
+		r.onRegister()
+	}
+	return r.mockSignalingClient.RegisterShareWithOptions(ctx, opts)
+}
+
+// TestAgentRestartHydratesBeforeContentReady pins the §15.3 restart ordering:
+// the agent hydrates the persisted content snapshot BEFORE re-registering the
+// share with control (the report that makes it publicly reachable again), so
+// the restored share never advertises a not-yet-hydrated resolver.
+func TestAgentRestartHydratesBeforeContentReady(t *testing.T) {
+	baseURL, host := newImmichTestServer(t)
+	st := newMockStore()
+	const code = "IMMICHORDER1"
+	if err := st.SaveSession(store.SessionEntry{
+		Code:         code,
+		ShareURL:     "immich://" + code,
+		ShareType:    "immich",
+		RelayOnly:    false,
+		MaxDownloads: 5,
+		CreatedAt:    time.Now().Add(-time.Hour),
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("persist session: %v", err)
+	}
+
+	cfg := &config.Config{
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		ImmichURL:         baseURL,
+		ImmichAllowedHost: host,
+		ImmichAPIKey:      "api",
+		DefaultRelayOnly:  false,
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	mockSig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	mockSig.shareOrigin = func(returnedCode, shareURL string) string { return testOriginFor("sborder1") }
+
+	var hydratedAtRegistration bool
+	var d *Daemon
+	sig := &registrationOrderRecorder{
+		mockSignalingClient: mockSig,
+		onRegister: func() {
+			hydratedAtRegistration = d != nil && d.resolver.Get(code) != nil
+		},
+	}
+	var err error
+	d, err = NewWithSignaling(cfgMgr, st, sig)
+	if err != nil {
+		t.Fatalf("NewWithSignaling: %v", err)
+	}
+
+	d.loadSessionsFromStore(context.Background())
+
+	if !sig.registeredCode(code) {
+		t.Fatalf("persisted session must be re-registered with control")
+	}
+	if !hydratedAtRegistration {
+		t.Fatalf("content snapshot must be hydrated BEFORE the share is re-registered (serving readiness)")
+	}
+	if d.GetSession(code) == nil {
+		t.Fatalf("restored session missing from memory")
+	}
+}
+
+// ---------- Task 28 STUN add-on: the daemon answers stun_challenge ----------
+
+// Fixed test material mirroring the control listener's issuance sizes (same
+// shapes the T17 stun client tests use): a 16-byte hex challenge ID, a 32-byte
+// hex one-use secret, and a 16-byte integrity-protected receipt.
+var (
+	daemonChallengeID    = "5b1e8f22a94c03d76bf091382eaa475c"
+	daemonChallengeCover = "112a435c758ea7c0d9f20b243d566f88a1bad3ec051e375069829bb4cde6ff18"
+	daemonReceipt        = []byte{
+		0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67,
+		0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98,
+	}
+)
+
+func daemonChallengeField() string { return daemonChallengeID + "." + daemonChallengeCover }
+
+// startDaemonSTUNListener binds one loopback UDP socket answering the first
+// request via the respond callback (the T17 fake-listener pattern). Every
+// datagram is recorded: the daemon must produce exactly one Binding request
+// per challenge, so any second datagram is a failure signal. The respond
+// callback must not touch *testing.T (it runs on a goroutine).
+func startDaemonSTUNListener(t *testing.T, respond func(conn *net.UDPConn, request []byte, src *net.UDPAddr)) (*net.UDPAddr, <-chan []byte) {
+	t.Helper()
+	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen fake control STUN listener: %v", err)
+	}
+	t.Cleanup(func() { listener.Close() })
+
+	requests := make(chan []byte, 4)
+	go func() {
+		buffer := make([]byte, 1500)
+		n, src, err := listener.ReadFromUDP(buffer)
+		if err != nil {
+			return
+		}
+		request := append([]byte(nil), buffer[:n]...)
+		select {
+		case requests <- request:
+		default:
+		}
+		if respond != nil {
+			respond(listener, request, src)
+		}
+		_ = listener.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if extra, _, err := listener.ReadFromUDP(buffer); err == nil {
+			select {
+			case requests <- append([]byte(nil), buffer[:extra]...):
+			default:
+			}
+		}
+	}()
+	return listener.LocalAddr().(*net.UDPAddr), requests
+}
+
+// buildDaemonSTUNSuccessResponse mirrors the control listener's success path:
+// attributes before MESSAGE-INTEGRITY, which is added last so the HMAC covers
+// exactly the wire bytes.
+func buildDaemonSTUNSuccessResponse(transactionID [pionstun.TransactionIDSize]byte, src *net.UDPAddr, secret, receipt []byte) []byte {
+	response := pionstun.New()
+	response.Type = pionstun.BindingSuccess
+	response.TransactionID = transactionID
+	response.WriteHeader()
+	ip := net.IP(src.IP.To4())
+	if err := (pionstun.XORMappedAddress{IP: ip, Port: src.Port}).AddTo(response); err != nil {
+		return nil
+	}
+	response.Add(pionstun.AttrType(0xFF01), receipt)
+	if err := pionstun.NewShortTermIntegrity(string(secret)).AddTo(response); err != nil {
+		return nil
+	}
+	return response.Raw
+}
+
+// assertOneIntegrityProtectedRequest verifies the recorded request exactly
+// matches the T17 wire contract and returns its transaction ID.
+func assertOneIntegrityProtectedRequest(t *testing.T, requests <-chan []byte) [pionstun.TransactionIDSize]byte {
+	t.Helper()
+	time.Sleep(400 * time.Millisecond) // longer than the listener stray-read window
+	if len(requests) != 1 {
+		t.Fatalf("recorded request count = %d, want exactly 1 (one Binding request per challenge)", len(requests))
+	}
+	request := <-requests
+	if !pionstun.IsMessage(request) {
+		t.Fatalf("recorded request is not a STUN message")
+	}
+	message := pionstun.New()
+	message.Raw = request
+	if err := message.Decode(); err != nil {
+		t.Fatalf("decode recorded request: %v", err)
+	}
+	var username pionstun.Username
+	if err := username.GetFrom(message); err != nil || string(username) != daemonChallengeID {
+		t.Fatalf("request USERNAME = %q, want challenge ID", string(username))
+	}
+	if err := pionstun.NewShortTermIntegrity(string(mustHex(t, daemonChallengeCover))).Check(message); err != nil {
+		t.Fatalf("request MESSAGE-INTEGRITY invalid for the one-use secret: %v", err)
+	}
+	return message.TransactionID
+}
+
+func mustHex(t *testing.T, s string) []byte {
+	t.Helper()
+	raw, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("hex decode test material: %v", err)
+	}
+	return raw
+}
+
+// stunChallengeMessage builds the §11.1 stun_challenge as the daemon's WS
+// handler receives it.
+func stunChallengeMessage(server string, expiresAt time.Time, version int) signaling.Message {
+	return signaling.Message{
+		Type:      "stun_challenge",
+		Version:   version,
+		Challenge: daemonChallengeField(),
+		Server:    server,
+		ExpiresAt: expiresAt.Format(time.RFC3339),
+	}
+}
+
+// findStunResult scans the recorded sends for one stun_result echo and
+// returns it (nil when absent).
+func findStunResult(messages []map[string]any) map[string]any {
+	for _, msg := range messages {
+		if msg["type"] == "stun_result" {
+			return msg
+		}
+	}
+	return nil
+}
+
+func TestDaemonAnswersStunChallengeAndSendsResult(t *testing.T) {
+	t.Run("valid_challenge_gets_exactly_one_request_and_stun_result_echo", func(t *testing.T) {
+		d, sig := newTestDaemon(t)
+
+		serverAddr, requests := startDaemonSTUNListener(t, func(conn *net.UDPConn, request []byte, src *net.UDPAddr) {
+			message := pionstun.New()
+			message.Raw = request
+			if err := message.Decode(); err != nil {
+				return
+			}
+			response := buildDaemonSTUNSuccessResponse(message.TransactionID, src, mustHex(t, daemonChallengeCover), daemonReceipt)
+			if response == nil {
+				return
+			}
+			_, _ = conn.WriteToUDP(response, src)
+		})
+
+		d.handleSignalingMessage(stunChallengeMessage(serverAddr.String(), time.Now().Add(30*time.Second), stun.ChallengeVersion))
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if result := findStunResult(sig.messagesSnapshot()); result != nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		result := findStunResult(sig.messagesSnapshot())
+		if result == nil {
+			t.Fatalf("daemon must answer a valid stun_challenge with stun_result, got %#v", sig.messagesSnapshot())
+		}
+		if result["challenge"] != daemonChallengeID {
+			t.Fatalf("stun_result challenge = %v, want the challenge ID echo", result["challenge"])
+		}
+		transactionID := assertOneIntegrityProtectedRequest(t, requests)
+		wantTransactionID := hex.EncodeToString(transactionID[:])
+		if result["transaction_id"] != wantTransactionID {
+			t.Fatalf("stun_result transaction_id = %v, want %q", result["transaction_id"], wantTransactionID)
+		}
+		receipt, _ := result["receipt"].([]byte)
+		if !bytes.Equal(receipt, daemonReceipt) {
+			t.Fatalf("stun_result receipt = %x, want %x (opaque bytes echoed unmodified)", receipt, daemonReceipt)
+		}
+	})
+
+	t.Run("expired_challenge_makes_no_request", func(t *testing.T) {
+		d, sig := newTestDaemon(t)
+
+		serverAddr, requests := startDaemonSTUNListener(t, func(conn *net.UDPConn, request []byte, src *net.UDPAddr) {})
+
+		// Already-expired challenge: the daemon must drop it before any
+		// network activity (fail-closed, no request, no echo).
+		d.handleSignalingMessage(stunChallengeMessage(serverAddr.String(), time.Now().Add(-time.Second), stun.ChallengeVersion))
+
+		time.Sleep(200 * time.Millisecond)
+		if result := findStunResult(sig.messagesSnapshot()); result != nil {
+			t.Fatalf("expired challenge must never be answered, got %#v", result)
+		}
+		if len(requests) != 0 {
+			t.Fatalf("expired challenge must make no STUN request, got %d", len(requests))
+		}
+	})
+
+	t.Run("challenge_expiring_within_ttl_is_dropped_under_fake_clock", func(t *testing.T) {
+		d, sig := newTestDaemon(t)
+		// Fake clock (the T17 seam pattern): the daemon's own TTL validation
+		// drops the challenge before any network activity even though the
+		// wire expiry still looks future-dated to a real clock.
+		d.mu.Lock()
+		d.now = func() time.Time { return time.Now().Add(time.Hour) }
+		d.mu.Unlock()
+
+		serverAddr, requests := startDaemonSTUNListener(t, func(conn *net.UDPConn, request []byte, src *net.UDPAddr) {})
+
+		d.handleSignalingMessage(stunChallengeMessage(serverAddr.String(), time.Now().Add(30*time.Second), stun.ChallengeVersion))
+
+		time.Sleep(200 * time.Millisecond)
+		if result := findStunResult(sig.messagesSnapshot()); result != nil {
+			t.Fatalf("challenge expired under the daemon clock must never be answered, got %#v", result)
+		}
+		if len(requests) != 0 {
+			t.Fatalf("challenge expired under the daemon clock must make no STUN request, got %d", len(requests))
+		}
+	})
+
+	t.Run("unsupported_version_makes_no_request", func(t *testing.T) {
+		d, sig := newTestDaemon(t)
+
+		serverAddr, requests := startDaemonSTUNListener(t, func(conn *net.UDPConn, request []byte, src *net.UDPAddr) {})
+
+		d.handleSignalingMessage(stunChallengeMessage(serverAddr.String(), time.Now().Add(30*time.Second), stun.ChallengeVersion+1))
+
+		time.Sleep(200 * time.Millisecond)
+		if result := findStunResult(sig.messagesSnapshot()); result != nil {
+			t.Fatalf("unsupported challenge version must never be answered, got %#v", result)
+		}
+		if len(requests) != 0 {
+			t.Fatalf("unsupported challenge version must make no STUN request, got %d", len(requests))
+		}
+	})
+}
+
+// ---------- Ledger item 1: config.json connect_allowed_origin reaches the handler ----------
+
+// TestConnectAllowedOriginConfigFileReachesDirectHandler pins the ledger item:
+// the resolved config.json connect_allowed_origin — not just the
+// CONNECT_ALLOWED_ORIGIN env var — must drive the §9.3 connect check when the
+// daemon builds the DirectServer.
+func TestConnectAllowedOriginConfigFileReachesDirectHandler(t *testing.T) {
+	t.Setenv("CONNECT_ALLOWED_ORIGIN", "") // env unset: the file path must win
+	const configuredOrigin = "http://192.0.2.10:8080"
+
+	cfg := &config.Config{
+		SignalingURL:         "ws://localhost:8080",
+		APIKey:               "test-key",
+		BaseDomain:           testDirectBase,
+		ConnectAllowedOrigin: configuredOrigin,
+	}
+	ds := &directState{
+		namespace:  testDirectNS,
+		baseDomain: testDirectBase,
+		origins:    map[string]originPair{},
+	}
+	d := &Daemon{config: cfg, direct: ds}
+	d.syncDirectServe()
+
+	const code = "CONNORIG1"
+	origin := testOriginFor("sbconn1")
+	if _, bound := d.bindOrigin(code, origin); !bound {
+		t.Fatalf("bindOrigin must succeed for the test origin")
+	}
+
+	doConnect := func(requestOrigin string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "https://"+origin+"/s/"+code+"/connect", nil)
+		req.Host = origin
+		req.Header.Set("Origin", requestOrigin)
+		req.TLS = &tls.ConnectionState{ServerName: origin}
+		rec := httptest.NewRecorder()
+		ds.server.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	resp := doConnect(configuredOrigin)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("configured config.json origin: status = %d, want 204 (body: %s)", resp.Code, resp.Body.String())
+	}
+	acao := resp.Header().Values("Access-Control-Allow-Origin")
+	if len(acao) != 1 || acao[0] != configuredOrigin {
+		t.Fatalf("configured config.json origin: Access-Control-Allow-Origin = %v, want exactly [%s]", acao, configuredOrigin)
+	}
+
+	resp = doConnect("https://sharebridge.app")
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("production origin under config.json override: status = %d, want 403", resp.Code)
+	}
+	if got := resp.Header().Values("Access-Control-Allow-Origin"); len(got) != 0 {
+		t.Fatalf("production origin under config.json override must not be reflected, got %v", got)
+	}
+}
+
+// ---------- Ledger item 2: relay-only restore re-binds deterministically ----------
+
+// TestRelayOnlyRestoreRebindsWhenBinderArrivesLate pins the Task 27 concern:
+// a relay-only binding whose binder/namespace is not built yet at hydration
+// time must be re-bound deterministically once the binder exists — not
+// silently dropped until an indefinite future re-allocation.
+func TestRelayOnlyRestoreRebindsWhenBinderArrivesLate(t *testing.T) {
+	dir := t.TempDir()
+	cm, _ := newBaselineCertFixture(t, dir)
+
+	st := newMockStore()
+	const code = "IMMICHLATE1"
+	now := time.Now()
+	directOrigin := testOriginFor("sblate1")
+	relayOrigin := relayOriginForLabel("sblate1")
+	if err := st.SaveSession(store.SessionEntry{
+		Code: code, ShareURL: "immich://" + code, ShareType: "immich",
+		RelayOnly: true, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		Origin: directOrigin, RelayOrigin: relayOrigin,
+	}); err != nil {
+		t.Fatalf("persist relay-only session: %v", err)
+	}
+
+	cfg := &config.Config{
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		ImmichURL:         "http://immich.lan:2283",
+		ImmichAllowedHost: "immich.lan:2283",
+		ImmichAPIKey:      "api",
+		DefaultRelayOnly:  false,
+	}
+	cfgMgr := &mockConfigManager{cfg: cfg}
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	sig.shareOrigin = func(returnedCode, shareURL string) string { return directOrigin }
+
+	// directState with NO namespace yet: the binder is not built, so a
+	// hydration racing ahead of `enrolled` cannot install the binding.
+	ds := &directState{
+		baseDomain:   testDirectBase,
+		cert:         cm,
+		origins:      map[string]originPair{},
+		relayOrigins: map[string]string{},
+	}
+	d := &Daemon{
+		config:    cfg,
+		configMgr: cfgMgr,
+		store:     st,
+		signaling: sig,
+		resolver:  direct.NewResolverRegistry(),
+		sessions:  make(map[string]*Session),
+		direct:    ds,
+	}
+
+	// enrollment_ready WITHOUT enrolled: readiness gates open while the
+	// binder is still unbuilt (the window the ledger item describes).
+	d.handleSignalingMessage(signaling.Message{Type: "enrollment_ready"})
+	if !d.canRegisterDirect() {
+		t.Fatalf("precondition: readiness reached before the namespace arrived")
+	}
+
+	d.loadSessionsFromStore(context.Background())
+
+	if !sig.registeredCode(code) {
+		t.Fatalf("relay-only session must be restored/registered")
+	}
+	if session := d.GetSession(code); session == nil {
+		t.Fatalf("relay-only session must be loaded into memory")
+	}
+
+	// `enrolled` arrives: the binder is built and the pending relay-only
+	// binding must be installed deterministically during this hydration —
+	// without waiting for a future control re-allocation.
+	d.handleSignalingMessage(signaling.Message{Type: "enrolled", Namespace: testDirectNS})
+
+	if ds.binder == nil {
+		t.Fatalf("enrolled must build the binder")
+	}
+	binding, err := ds.binder.AdmitSNI(relayOrigin)
+	if err != nil {
+		t.Fatalf("pending relay-only binding must be re-bound once the binder exists: %v", err)
+	}
+	if binding.RouteKind != direct.RouteRelay || binding.ShareCode != code {
+		t.Fatalf("re-bound binding = %+v, want RouteRelay for code %s", binding, code)
+	}
+	if got := ds.relayOrigins[code]; got != relayOrigin {
+		t.Fatalf("relayOrigins[%s] = %q, want %q", code, got, relayOrigin)
+	}
+}
+
+// ---------- Task 28: the tunnel survives reconnects and shutdown ----------
+
+// fakeTunnelChild is a controllable tunnel.ChildProcess: the test decides
+// whether a graceful stop terminates it and when it exits.
+type fakeTunnelChild struct {
+	mu              sync.Mutex
+	gracefulStops   int
+	kills           int
+	stopsOnGraceful bool
+	exitSignal      chan struct{}
+	exitOnce        sync.Once
+	waitError       error
+}
+
+func newFakeTunnelChild(stopsOnGraceful bool) *fakeTunnelChild {
+	return &fakeTunnelChild{stopsOnGraceful: stopsOnGraceful, exitSignal: make(chan struct{})}
+}
+
+func (child *fakeTunnelChild) Wait() error {
+	<-child.exitSignal
+	child.mu.Lock()
+	defer child.mu.Unlock()
+	return child.waitError
+}
+
+func (child *fakeTunnelChild) GracefulStop() error {
+	child.mu.Lock()
+	child.gracefulStops++
+	stop := child.stopsOnGraceful
+	child.mu.Unlock()
+	if stop {
+		child.signalExit(nil)
+	}
+	return nil
+}
+
+func (child *fakeTunnelChild) Kill() error {
+	child.mu.Lock()
+	child.kills++
+	child.mu.Unlock()
+	child.signalExit(fmt.Errorf("signal: killed"))
+	return nil
+}
+
+func (child *fakeTunnelChild) signalExit(waitError error) {
+	child.mu.Lock()
+	child.waitError = waitError
+	child.mu.Unlock()
+	child.exitOnce.Do(func() { close(child.exitSignal) })
+}
+
+func (child *fakeTunnelChild) gracefulStopCount() int {
+	child.mu.Lock()
+	defer child.mu.Unlock()
+	return child.gracefulStops
+}
+
+func (child *fakeTunnelChild) killCount() int {
+	child.mu.Lock()
+	defer child.mu.Unlock()
+	return child.kills
+}
+
+// tunnelStartRecord captures one child start invocation.
+type tunnelStartRecord struct {
+	binaryPath string
+	arguments  []string
+	child      *fakeTunnelChild
+}
+
+// recordingTunnelStarter replaces the exec seam so daemon-level tunnel tests
+// observe exactly what would run without launching real processes.
+type recordingTunnelStarter struct {
+	mu              sync.Mutex
+	records         []tunnelStartRecord
+	stopsOnGraceful bool
+}
+
+func (starter *recordingTunnelStarter) start(ctx context.Context, binaryPath string, arguments []string) (tunnel.ChildProcess, error) {
+	starter.mu.Lock()
+	defer starter.mu.Unlock()
+	child := newFakeTunnelChild(starter.stopsOnGraceful)
+	starter.records = append(starter.records, tunnelStartRecord{binaryPath: binaryPath, arguments: arguments, child: child})
+	return child, nil
+}
+
+func (starter *recordingTunnelStarter) startCount() int {
+	starter.mu.Lock()
+	defer starter.mu.Unlock()
+	return len(starter.records)
+}
+
+func (starter *recordingTunnelStarter) recordAt(index int) tunnelStartRecord {
+	starter.mu.Lock()
+	defer starter.mu.Unlock()
+	if index >= len(starter.records) {
+		return tunnelStartRecord{}
+	}
+	return starter.records[index]
+}
+
+// tunnelTestConfig returns agent configuration with usable tunnel settings
+// inside a temporary directory.
+func tunnelTestConfig(t *testing.T) *config.Config {
+	t.Helper()
+	dataDir := t.TempDir()
+	return &config.Config{
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		TunnelDataDir:     dataDir,
+		TunnelFRPCPath:    "/opt/sharebridge/bin/frpc",
+		TunnelCAFile:      filePath(dataDir, "relay-ca.pem"),
+		TunnelLocalTarget: tunnel.LocalTarget,
+	}
+}
+
+// filePath joins dir and name without importing path/filepath spelling noise
+// at every call site.
+func filePath(dir, name string) string {
+	return dir + string(os.PathSeparator) + name
+}
+
+// relayConfigMessage builds the §11.1 relay_config wire message the daemon's
+// handler receives (the strict parser runs against the raw payload).
+func relayConfigMessage(t *testing.T, generation int, credential string) signaling.Message {
+	t.Helper()
+	wire := fmt.Sprintf(`{"type":"relay_config","version":1,"generation":%d,`+
+		`"gateway_addr":"relay.example.net","gateway_port":7000,`+
+		`"proxy_name":"agent-%d-relay","relay_port":%d,`+
+		`"credential":%q,"expires_at":%q}`,
+		generation, generation, 41000+generation, credential,
+		time.Now().Add(10*time.Minute).Format(time.RFC3339))
+	return signaling.Message{Type: "relay_config", Raw: json.RawMessage(wire)}
+}
+
+// startTunnelForTest constructs the daemon's tunnel supervision with the fake
+// process starter and fast timing knobs, then returns the starter for
+// assertions. The daemon must own the manager exactly as production Start
+// does (requester wired to the signaling client, status callback wired to
+// relay_client_state telemetry).
+func startTunnelForTest(t *testing.T, d *Daemon) *recordingTunnelStarter {
+	t.Helper()
+	starter := &recordingTunnelStarter{stopsOnGraceful: true}
+	d.startTunnelManager(context.Background(),
+		tunnel.WithProcessStarter(starter.start),
+		tunnel.WithBackoffBase(time.Millisecond),
+		tunnel.WithKillGracePeriod(20*time.Millisecond),
+		tunnel.WithCredentialWaitTimeout(time.Hour),
+		tunnel.WithRunningStabilityWindow(time.Hour),
+	)
+	if d.tunnel == nil {
+		t.Fatalf("tunnel manager must be constructed when tunnel settings are configured")
+	}
+	t.Cleanup(func() { d.stopTunnelManager() })
+	return starter
+}
+
+// TestSignalGateResetsButTunnelContinues pins §15.4: a control-WebSocket
+// disconnect resets the direct SignalGate epoch (and baseline readiness) but
+// leaves a healthy tunnel running — the frpc child is neither stopped nor
+// restarted by the disconnect.
+func TestSignalGateResetsButTunnelContinues(t *testing.T) {
+	cfg := tunnelTestConfig(t)
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	d := &Daemon{config: cfg, configMgr: &mockConfigManager{cfg: cfg}, store: st, signaling: sig}
+
+	gate := direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true })
+	d.direct = &directState{
+		ready:      true,
+		gate:       gate,
+		baseDomain: testDirectBase,
+		namespace:  testDirectNS,
+		origins:    map[string]originPair{},
+	}
+
+	starter := startTunnelForTest(t, d)
+	d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-generation-one"))
+	waitForCond(t, func() bool { return starter.startCount() == 1 })
+
+	// Seed a high gate watermark for the reset assertion.
+	if err := gate.Admit(direct.OpenSignal{
+		Version: 1, AgentID: st.GetAgentID(), ShareID: "SHARE123",
+		RouteKind: direct.RouteDirect, Nonce: "nonce-seed", Seq: 10,
+		ExpiresAt: time.Now().Add(time.Minute), Lease: 30 * time.Second,
+	}); err != nil {
+		t.Fatalf("seed admit: %v", err)
+	}
+
+	// The control WebSocket drops: gate resets, tunnel continues.
+	d.onSignalingDisconnect()
+
+	if d.canRegisterDirect() {
+		t.Fatalf("readiness must reset on disconnect")
+	}
+	if err := gate.Admit(direct.OpenSignal{
+		Version: 1, AgentID: st.GetAgentID(), ShareID: "SHARE123",
+		RouteKind: direct.RouteDirect, Nonce: "nonce-replay", Seq: 1,
+		ExpiresAt: time.Now().Add(time.Minute), Lease: 30 * time.Second,
+	}); err != nil {
+		t.Fatalf("gate must reset on disconnect: %v", err)
+	}
+
+	// Across an observation window the healthy child is untouched.
+	assertConditionStays(t, "healthy tunnel untouched by disconnect", 120*time.Millisecond, func() bool {
+		return starter.startCount() == 1 && starter.recordAt(0).child.gracefulStopCount() == 0
+	})
+}
+
+// TestHigherGenerationReplacesTunnelWithoutPrematureKill pins §15.4: after a
+// reconnect, a higher-generation relay_config replaces the running child —
+// but the healthy child is killed only as part of the replacement succeeding,
+// never before, and never more than once.
+func TestHigherGenerationReplacesTunnelWithoutPrematureKill(t *testing.T) {
+	cfg := tunnelTestConfig(t)
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	d := &Daemon{config: cfg, configMgr: &mockConfigManager{cfg: cfg}, store: st, signaling: sig}
+
+	starter := startTunnelForTest(t, d)
+	d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-generation-one"))
+	waitForCond(t, func() bool { return starter.startCount() == 1 })
+	firstChild := starter.recordAt(0).child
+
+	// Control-WebSocket reconnect: the healthy child keeps running.
+	d.onSignalingDisconnect()
+	assertConditionStays(t, "no premature kill across the reconnect window", 120*time.Millisecond, func() bool {
+		return firstChild.gracefulStopCount() == 0 && starter.startCount() == 1
+	})
+
+	// The reconnected epoch delivers the replacement generation.
+	d.handleSignalingMessage(relayConfigMessage(t, 2, "credential-generation-two"))
+	waitForCond(t, func() bool { return starter.startCount() == 2 })
+	waitForCond(t, func() bool { return firstChild.gracefulStopCount() == 1 })
+
+	if firstChild.killCount() != 0 {
+		t.Fatalf("healthy replacement must not need a kill, got %d", firstChild.killCount())
+	}
+	assertConditionStays(t, "replacement runs exactly once", 120*time.Millisecond, func() bool {
+		return starter.startCount() == 2 && starter.recordAt(1).child.gracefulStopCount() == 0
+	})
+}
+
+// TestDaemonShutdownStopsHTTPSAndFRPC pins §7.4 step 6: daemon shutdown stops
+// BOTH serving paths — the local HTTPS listener is torn down and the frpc
+// child is stopped gracefully; the tunnel manager rejects further configs.
+func TestDaemonShutdownStopsHTTPSAndFRPC(t *testing.T) {
+	addr := reserveLoopbackAddr(t)
+	cfg := tunnelTestConfig(t)
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+
+	gate := direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true })
+	d := &Daemon{config: cfg, configMgr: &mockConfigManager{cfg: cfg}, store: st, signaling: sig}
+	d.direct = &directState{
+		ready:      true,
+		gate:       gate,
+		baseDomain: testDirectBase,
+		namespace:  testDirectNS,
+		server:     direct.NewDirectServer(testDirectNS, testDirectBase, nil, nil, gate, 1<<20),
+		origins:    map[string]originPair{},
+		listenAddr: addr,
+	}
+
+	starter := startTunnelForTest(t, d)
+	d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-generation-one"))
+	waitForCond(t, func() bool { return starter.startCount() == 1 })
+
+	d.handleSignalingMessage(signaling.Message{Type: "enrollment_ready"})
+	waitDialable(t, addr)
+
+	// Daemon shutdown: HTTPS listener and frpc child both stop.
+	d.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err != nil {
+			break // listener closed
+		}
+		conn.Close()
+		time.Sleep(10 * time.Millisecond)
+		if time.Now().After(deadline.Add(-time.Millisecond)) {
+			t.Fatalf("HTTPS listener still accepting after daemon shutdown")
+		}
+	}
+
+	child := starter.recordAt(0).child
+	if child.gracefulStopCount() != 1 {
+		t.Fatalf("frpc child graceful stops = %d, want 1", child.gracefulStopCount())
+	}
+	if child.killCount() != 0 {
+		t.Fatalf("graceful shutdown must not need a kill, got %d", child.killCount())
+	}
+	afterStop := tunnel.Config{
+		Version: tunnel.RelayConfigVersion, Generation: 9,
+		GatewayAddr: "relay.example.net", GatewayPort: 7000,
+		ProxyName: "agent-9-relay", RelayPort: 41009,
+		Credential: "credential-after-stop",
+		ExpiresAt:  time.Now().Add(10 * time.Minute),
+	}
+	if err := d.tunnel.ApplyConfig(afterStop); err == nil {
+		t.Fatalf("tunnel manager must reject configs after daemon shutdown")
+	}
+}
+
+// TestFRPCRestartObtainsFreshCredentialAfterReplayRejection is the 2026-09-04
+// amendment (§§7.2, 15.2): after an frps restart the burned one-use jti is
+// replay-rejected — the child exits — and the manager must obtain a fresh
+// credential via relay_credential_request over the (still-connected or
+// reconnected) control WebSocket instead of retry-looping the stale one. The
+// daemon wiring under test: the production ControlCredentialRequester sends
+// through the signaling client on the CURRENT connection.
+func TestFRPCRestartObtainsFreshCredentialAfterReplayRejection(t *testing.T) {
+	cfg := tunnelTestConfig(t)
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	d := &Daemon{config: cfg, configMgr: &mockConfigManager{cfg: cfg}, store: st, signaling: sig}
+
+	starter := startTunnelForTest(t, d)
+
+	// Initial assignment: the child starts with generation 1's credential.
+	d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-burned-jti"))
+	waitForCond(t, func() bool { return starter.startCount() == 1 })
+
+	// frps restart: the child's re-Login is replay-rejected and frpc exits
+	// (loginFailExit). The exit is the supervisor-visible trigger.
+	starter.recordAt(0).child.signalExit(fmt.Errorf("exit status 1"))
+
+	// The daemon-wired requester must send relay_credential_request over the
+	// control WebSocket with the replay_rejected reason.
+	waitForCond(t, func() bool {
+		return sig.hasSentMessage("relay_credential_request", map[string]any{"reason": "replay_rejected"})
+	})
+
+	// No stale-credential relogin loop: without a fresh relay_config the
+	// manager must not restart the child (a looping manager would rack up
+	// starts inside this window — its backoff base is 1ms).
+	assertConditionStays(t, "no stale-credential restart loop", 150*time.Millisecond, func() bool {
+		return starter.startCount() == 1
+	})
+
+	// Control answers over the same WebSocket with a fresh relay_config for
+	// the current generation (new one-use jti): the child restarts, exactly
+	// once, with the fresh credential.
+	d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-fresh-jti"))
+	waitForCond(t, func() bool { return starter.startCount() == 2 })
+	assertConditionStays(t, "no duplicate restart with the fresh credential", 120*time.Millisecond, func() bool {
+		return starter.startCount() == 2
+	})
+	if starter.recordAt(0).child.gracefulStopCount() != 0 && starter.startCount() != 2 {
+		t.Fatalf("unexpected child churn: %d starts", starter.startCount())
+	}
 }

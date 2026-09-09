@@ -85,7 +85,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	d.SetWebServer(webServer)
 	webServer.SetDaemon(d)
 
-	// Handle Ctrl-C gracefully
+	// Handle Ctrl-C gracefully: the NotifyContext process context drives the
+	// signaling loop, the relay tunnel supervision (manager + credential
+	// requester, §7.4), and every other daemon goroutine.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -101,6 +103,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	case err := <-errChan:
 		log.Printf("daemon error: %v", err)
 	}
+
+	// Cancel the process context BEFORE tearing down so the WebSocket read
+	// loops, the tunnel credential-requester worker, and every other
+	// context-driven goroutine end deterministically; d.Stop then shuts the
+	// HTTPS listener, the frpc child (graceful → kill), and session resources
+	// down in order.
+	cancel()
 
 	// Stop gracefully
 	if err := d.Stop(); err != nil {

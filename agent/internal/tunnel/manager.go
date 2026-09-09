@@ -328,6 +328,47 @@ type Manager struct {
 // ManagerOption adjusts test-visible lifecycle knobs.
 type ManagerOption func(*Manager)
 
+// ChildProcess is the exported alias of the supervisor's child-process view.
+// The daemon package (and its tests) construct children through the
+// WithProcessStarter seam, which needs a nameable type; the alias keeps the
+// existing unexported spelling valid for the tunnel package's own tests.
+type ChildProcess = childProcess
+
+// ProcessStarter is the exported alias of the child-start seam (see
+// ChildProcess).
+type ProcessStarter = processStarter
+
+// WithProcessStarter is the exported form of withProcessStarter: the daemon's
+// tests supply a non-exec child seam so the full daemon→manager wiring runs
+// without launching real processes.
+func WithProcessStarter(starter ProcessStarter) ManagerOption {
+	return withProcessStarter(starter)
+}
+
+// WithBackoffBase is the exported form of withBackoffBase (restart-backoff
+// base; production default 1s).
+func WithBackoffBase(base time.Duration) ManagerOption {
+	return withBackoffBase(base)
+}
+
+// WithKillGracePeriod is the exported form of withKillGracePeriod (graceful
+// stop → kill escalation window).
+func WithKillGracePeriod(grace time.Duration) ManagerOption {
+	return withKillGracePeriod(grace)
+}
+
+// WithCredentialWaitTimeout is the exported form of withCredentialWaitTimeout
+// (how long the manager waits for control's relay_config before re-requesting).
+func WithCredentialWaitTimeout(timeout time.Duration) ManagerOption {
+	return withCredentialWaitTimeout(timeout)
+}
+
+// WithRunningStabilityWindow is the exported form of
+// withRunningStabilityWindow (uptime before the "running" telemetry fires).
+func WithRunningStabilityWindow(window time.Duration) ManagerOption {
+	return withRunningStabilityWindow(window)
+}
+
 func withProcessStarter(starter processStarter) ManagerOption {
 	return func(manager *Manager) { manager.startChild = starter }
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -103,6 +104,21 @@ func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker
 }
 
 func (s *DirectServer) Binder() *Binder { return s.binder }
+
+// SetConnectAllowedOrigin overrides the construction-time resolved allowed
+// origin. The daemon calls it when building the server so the resolved
+// config.json connect_allowed_origin reaches the §9.3 connect check —
+// construction-time resolution alone only sees the environment variable. The
+// value must be a well-formed origin (the same validation the config loader
+// applies); anything malformed is rejected and the previous origin is kept,
+// failing closed.
+func (s *DirectServer) SetConnectAllowedOrigin(origin string) {
+	if err := config.ValidateConnectOrigin(origin); err != nil {
+		log.Printf("direct: reject invalid connect allowed origin: %v", err)
+		return
+	}
+	s.connectOrigin = origin
+}
 
 // SetResolver installs the share-code resolver consulted for content routes.
 // It is a setter (not a constructor argument) so the daemon can wire the
