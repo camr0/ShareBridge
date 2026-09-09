@@ -1,0 +1,23 @@
+# ShareBridge interstitial CSP golden — Task 24 Phase A drift guard.
+#
+# Pins the §9.3 Content-Security-Policy header string that control's
+# control/internal/directctl buildInterstitialCSP produces for each
+# interstitial page variant, generated through the real
+# renderInterstitialPage/buildInterstitialCSP path by
+# TestInterstitialCSPGolden. e2e/browser/fixture.mjs asserts its
+# hand-ported buildInterstitialCSP reproduces every block at fixture
+# startup; drift on either side now fails loudly.
+#
+# Shared constants (keep both sides in sync):
+#   nonce:            Z29sZGVuLWNzcC1waW4tbm9uY2UtMDAw
+#   namespace domain: sb0a1b2c3.example.com  (fixture NS_DOMAIN)
+#
+# Regenerate deliberately after an intentional policy change:
+#   cd control && go test ./internal/directctl -run TestInterstitialCSPGolden -update
+# then update e2e/browser/fixture.mjs to match and commit both together.
+
+# variant: relay-available
+default-src 'none'; script-src 'nonce-Z29sZGVuLWNzcC1waW4tbm9uY2UtMDAw'; style-src 'nonce-Z29sZGVuLWNzcC1waW4tbm9uY2UtMDAw'; connect-src 'self' https://*.sb0a1b2c3.example.com:*; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+
+# variant: relay-unavailable
+default-src 'none'; script-src 'nonce-Z29sZGVuLWNzcC1waW4tbm9uY2UtMDAw'; style-src 'nonce-Z29sZGVuLWNzcC1waW4tbm9uY2UtMDAw'; connect-src 'self' https://*.sb0a1b2c3.example.com:*; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
