@@ -22,6 +22,9 @@ and mark the case OBSERVED-LIMITED).
   - a **relay-only** share — code `<RELAYONLY>`;
   - a **blackhole direct** share (agent network where the mapped port is
     silently dropped, e.g. firewall DROP, not REJECT) — code `<BLACKHOLE>`;
+  - a **parked direct** share (an additional direct-candidate share whose
+    agent can be stopped or disconnected from the network for one case, then
+    started again) — code `<PARKED>`;
   - the agent's namespace domain `<NS>` (the part after the first label of the
     share's direct origin, e.g. `sb0a1b2c3.example.com`).
 - RELAY_SELECTION_ENABLED=true on the control, relay gateway reachable, and
@@ -98,17 +101,29 @@ gallery renders. Screenshot `04-relayonly-<device>.png`.
 Expected: gallery renders on the non-443 direct origin with zero console CSP
 errors. Screenshot `05-non443-<device>.png` (page + inspector).
 
-### 2.6 Unrelated destinations are blocked (macOS Safari)
+### 2.6 Unrelated destinations are blocked by the interstitial CSP (macOS Safari)
 
-1. With the `<NON443>` gallery still open (from 2.5), open Web Inspector →
-   Console.
-2. Run:
+The probe must run while a control interstitial document is the loaded page —
+that document's CSP is the one carrying the scoped `connect-src`; the agent
+serves a different, gallery-side policy after navigation. Park the `<PARKED>`
+share so the interstitial stays up for the probe:
+
+1. Stop the agent that serves `<PARKED>` (or disconnect its network), then
+   open `https://sharebridge.app/s/<PARKED>` in a fresh tab. The
+   interstitial must remain on screen — its "Preparing…" state or its
+   "can't be opened right now" state are both fine, but the browser must
+   not navigate away. If it navigates, the share is not parked; fix and
+   restart the case.
+2. Open Web Inspector → Console for that tab and run:
    `fetch("https://probe.unrelated.example.com/s/x/connect").then(r => "allowed " + r.status, e => "blocked " + e.name)`
 
 Expected: the promise resolves to `blocked TypeError` (or similar blocked
 error) within a moment, and the Console shows a Content Security Policy
 message naming `connect-src`. No request to the unrelated host appears in the
-Network tab. Screenshot `06-blocked-<device>.png` (console).
+Network tab. Screenshot `06-blocked-<device>.png` (console, interstitial
+still up).
+
+3. Restart the parked agent to complete the case.
 
 ### 2.7 Connect has no cookies/content (macOS Safari)
 
