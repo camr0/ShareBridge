@@ -1,7 +1,6 @@
 package directctl
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 
@@ -16,16 +15,6 @@ const (
 	inactiveReasonRevoked     = "revoked"
 	inactiveReasonUnsupported = "unsupported"
 )
-
-// sessionRef is a concrete view of a live session resolved by code. It is
-// constructed only from a persisted session that passed the active lookup
-// filter; `active` is additionally gated on the session's expiry so a
-// non-expiring row cannot outlive its lease.
-type sessionRef struct {
-	apiKeyID string
-	origin   string
-	active   bool
-}
 
 // ResolveForRedirect is the single owner of the canonical-route status logic
 // (§8, §9.3). It resolves a share code — including inactive tombstones — to
@@ -105,64 +94,6 @@ func isRelayOnlyPublicImmichSession(rec *core.Record) bool {
 	return rec.GetString("share_type") == "immich" &&
 		rec.GetBool("relay_only") &&
 		!rec.GetBool("is_password_protected")
-}
-
-// sessionByCode resolves a session by its share code using a concrete lookup:
-// the filter already requires is_active = true (so soft-deleted rows never
-// match), and the live expiry is re-checked here so an expired session is not
-// treated as active. Ownership is the api_key_id stored on the session row.
-func (c *Controller) sessionByCode(code string) (*sessionRef, error) {
-	recs, err := c.app.FindRecordsByFilter("sessions", "code = {:code} && is_active = true", "", 1, 0, map[string]any{"code": code})
-	if err != nil || len(recs) == 0 {
-		return nil, err
-	}
-	rec := recs[0]
-	s := &sessionRef{apiKeyID: rec.GetString("api_key_id"), origin: rec.GetString("origin"), active: true}
-	if exp := rec.GetDateTime("expires_at"); !exp.IsZero() && exp.Time().Before(time.Now()) {
-		s.active = false
-	}
-	return s, nil
-}
-
-// Redirect is the LEGACY Phase 3 direct-connect flow: open_signal → open_ack
-// → reachability probe → 302 to the agent's direct origin. It is retired from
-// the canonical routes as of Task 20 (route selection, §9.3, owns GET
-// /s/{code} and /share/{code}; the legacy server-side direct 302 is never
-// restored in any flag state). It is retained ONLY because the Phase 3
-// end-to-end test (internal/handler/e2e_test.go) still exercises this exact
-// flow against its own route wiring; Task 21's bounded prepare-route flow
-// subsumes the open-signal/probe machinery with a four-second budget, after
-// which this method (and its probe lease constant) should be deleted.
-func (c *Controller) Redirect(w http.ResponseWriter, r *http.Request, code string) error {
-	sess, err := c.sessionByCode(code)
-	if err != nil || sess == nil || !sess.active {
-		return c.unavailable(w)
-	}
-	apiKeyID, origin := sess.apiKeyID, sess.origin
-	if origin == "" {
-		return c.unavailable(w)
-	}
-	if !c.epochReady(apiKeyID) || !c.hub.AgentConnected(apiKeyID) {
-		return c.unavailable(w)
-	}
-	ack, err := c.emitOpenFn(r.Context(), apiKeyID, code, origin, 120*time.Second)
-	if err != nil || ack.Status != "ok" {
-		return c.unavailable(w)
-	}
-	if ack.GrantedPort < 1 || ack.GrantedPort > 65535 {
-		return c.unavailable(w)
-	}
-	if err := c.probeFn(r.Context(), origin, code, apiKeyID, ack); err != nil {
-		return c.unavailable(w)
-	}
-	loc := "https://" + origin
-	if ack.GrantedPort != 443 {
-		loc += fmt.Sprintf(":%d", ack.GrantedPort)
-	}
-	loc += "/s/" + code
-	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, loc, http.StatusFound)
-	return nil
 }
 
 func (c *Controller) unavailable(w http.ResponseWriter) error {

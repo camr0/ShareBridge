@@ -129,8 +129,8 @@ func setupRouterForTest(t *testing.T) (core.App, http.Handler) {
 	require.NoError(t, err)
 
 	// Direct-mode controller for the /s/{code} dispatch. Coordinator and DDNS
-	// are nil: Redirect's gates only need the hub + epoch state, which the
-	// route-level tests exercise independently.
+	// are nil: selection's direct gates only need the hub + epoch state, which
+	// the route-level tests exercise independently.
 	ctrl := directctl.NewController(app, hub.New(), nil, nil, directctl.Config{BaseDomain: "example.com"})
 
 	// Canonical routes: /share/{code} and /s/{code} both resolve through the
@@ -343,9 +343,6 @@ func TestServerRoutesGallerySessionRedirectsNotWebClient(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "direct unavailable")
 }
 
-// newServerTestPublisher builds the Task 12 route publisher wired the same
-// way main.go wires it, so deleteExpiredSessions exercises the real revoke
-// path (sessions without an agent relay assignment simply publish nothing).
 // mustServerTestInterstitialAssets loads the real shipped route-interstitial
 // assets (control/web/route-interstitial.{html,js,css}) — the same files
 // main.go loads at startup and deploy-testing.sh copies — so the canonical-
@@ -357,6 +354,9 @@ func mustServerTestInterstitialAssets(t *testing.T) directctl.InterstitialAssets
 	return assets
 }
 
+// newServerTestPublisher builds the Task 12 route publisher wired the same
+// way main.go wires it, so deleteExpiredSessions exercises the real revoke
+// path (sessions without an agent relay assignment simply publish nothing).
 func newServerTestPublisher(t *testing.T, app core.App) *relayctl.Publisher {
 	t.Helper()
 	publisher, err := relayctl.NewPublisher(app, relayctl.PublisherConfig{})

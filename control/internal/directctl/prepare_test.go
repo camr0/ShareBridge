@@ -770,3 +770,19 @@ func assertNoMachinery(t *testing.T, spy *selectionSpy) {
 		t.Fatalf("lifecycle rejection touched direct machinery: %d %d %d %d %d %d", emitOpens, probes, agentSends, stunIssues, ddns, relayDNS)
 	}
 }
+
+// TestDirectURLOmitsDefaultPort pins the shared §6 direct-URL builder used by
+// every direct-URL construction (R4 item 1 hoist; the 443-omitted form was
+// previously covered only by the deleted legacy-Redirect test): port 443 is
+// the TLS default and omitted, every other granted port is spelled out.
+func TestDirectURLOmitsDefaultPort(t *testing.T) {
+	if got := directURL("demo.sb1.example.com", 443, "code1"); got != "https://demo.sb1.example.com/s/code1" {
+		t.Fatalf("directURL(443) = %q, want the port-omitted form", got)
+	}
+	if got := directURL("demo.sb1.example.com", 8443, "code1"); got != "https://demo.sb1.example.com:8443/s/code1" {
+		t.Fatalf("directURL(8443) = %q, want the explicit-port form", got)
+	}
+	if got := directURL("demo.sb1.example.com", 1, "code1"); got != "https://demo.sb1.example.com:1/s/code1" {
+		t.Fatalf("directURL(1) = %q, want the explicit-port form", got)
+	}
+}

@@ -461,3 +461,31 @@ func TestInterstitialWithoutRelayShowsUnavailableAndRetry(t *testing.T) {
 		})
 	}
 }
+
+// TestInterstitialZeroValueAssetsFailClosed pins the T22-m1 guard: a controller
+// constructed with the zero-value InterstitialAssets (no LoadInterstitialAssets
+// wiring) answers the §9.3 interstitial arm with the 503 unavailable response —
+// never a 200 with an empty body. Production fails earlier at startup
+// (main.go log.Fatalf); this guard makes the documented fail-closed 503 claim
+// true for every construction of the controller.
+func TestInterstitialZeroValueAssetsFailClosed(t *testing.T) {
+	// The shared harness injects the real assets; clear them to the ZERO
+	// value to model a controller constructed without any wiring.
+	app, ctrl, _, _, _ := newSelectionController(t, true)
+	ctrl.cfg.InterstitialAssets = InterstitialAssets{}
+	seedInterstitialDirect(t, app, ctrl, nil, "zeroasset")
+
+	resp := renderInterstitial(t, ctrl, "zeroasset", nil)
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body %q)", resp.Code, resp.Body.String())
+	}
+	if cc := resp.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", cc)
+	}
+	if body := resp.Body.String(); strings.Contains(body, "<html") || len(body) == 0 {
+		t.Fatalf("unavailable response must be the bounded JSON body, got %q", body)
+	}
+	if loc := resp.Header().Get("Location"); loc != "" {
+		t.Fatalf("unavailable response carried Location %q", loc)
+	}
+}

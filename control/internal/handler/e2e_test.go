@@ -37,10 +37,12 @@ import (
 // TestEndToEndDirectFlow drives the full direct-mode control flow through the
 // real HTTP + WebSocket stack: agent hello → enrolled → CSR → cert_issue →
 // tls_ready (relay DNS provisioned at hello) → enrollment_ready →
-// register_share → share_registered{origin} → GET /s/<code> → open_signal →
-// open_ack → loopback nonce probe → 302. The coordinator issues a fixed stub
-// chain and the probe runs against a loopback TLS server that echoes the
-// nonce, so no production certs, Cloudflare, or UPnP are touched.
+// register_share → share_registered{origin} → GET /s/<code> (§9.3
+// interstitial) → POST /api/shares/<code>/prepare-route → open_signal →
+// open_ack → loopback nonce probe → direct_url → the direct download through
+// real SNI/Host admission. The coordinator issues a fixed stub chain and the
+// probe runs against a loopback TLS server that echoes the nonce, so no
+// production certs, Cloudflare, or UPnP are touched.
 func TestEndToEndDirectFlow(t *testing.T) {
 	app, appCleanup := setupAgentTestApp(t)
 	defer appCleanup()
@@ -57,6 +59,8 @@ func TestEndToEndDirectFlow(t *testing.T) {
 
 	h := hub.New()
 	cfg := config.Load()
+	interstitialAssets, err := directctl.LoadInterstitialAssets("../../web")
+	require.NoError(t, err)
 	ctrl := directctl.NewController(app, h, coord, nil, directctl.Config{
 		BaseDomain:         "example.com",
 		AllowPrivateProbes: true, // loopback probe target in this test
@@ -67,17 +71,39 @@ func TestEndToEndDirectFlow(t *testing.T) {
 		RelayDNSFunc: func(ctx context.Context, name, ip string, ttl int) (string, error) {
 			return "", nil // provision relay DNS without a live Cloudflare zone
 		},
+		// Task 22: the real shipped route-interstitial assets so the §9.3
+		// interstitial arm exercises the production renderer.
+		InterstitialAssets: interstitialAssets,
 	})
 
-	// Wire the real HTTP + WS stack: /ws/agent (auth + AgentWS) and /s/{code}
-	// (ctrl.Redirect), matching main.go's route shape.
+	// Wire the real HTTP + WS stack: /ws/agent (auth + AgentWS), the
+	// canonical /s/{code} dispatch (ResolveForRedirect + SelectRoute), and
+	// the Task 21 /api/shares/{code}/prepare-route endpoint — matching
+	// main.go's route shape. The legacy Phase 3 direct 302 is not part of
+	// this dispatch in any flag state.
 	authMiddleware := middleware.APIKeyAuth(app)
 	agentHandler := AgentWS(app, h, cfg, ctrl)
 	mux := http.NewServeMux()
 	mux.Handle("/ws/agent", authMiddleware(http.HandlerFunc(agentHandler)))
 	mux.HandleFunc("/s/", func(w http.ResponseWriter, r *http.Request) {
 		code := strings.TrimPrefix(r.URL.Path, "/s/")
-		_ = ctrl.Redirect(w, r, code)
+		rec, status := ctrl.ResolveForRedirect(code)
+		switch status {
+		case http.StatusFound:
+			_ = ctrl.SelectRoute(w, r, rec, code)
+		case http.StatusGone:
+			w.WriteHeader(http.StatusGone)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	mux.HandleFunc("/api/shares/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/shares/")
+		if !strings.HasSuffix(rest, "/prepare-route") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = ctrl.PrepareRoute(w, r, strings.TrimSuffix(rest, "/prepare-route"))
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -155,24 +181,36 @@ func TestEndToEndDirectFlow(t *testing.T) {
 	require.NotEmpty(t, shareReg.Origin)
 	as.SetOrigin(shareReg.Origin)
 
-	// 5. GET /s/<code> blocks on open_ack; drive it from a goroutine. The
-	//    default http.Get would follow the 302 to the loopback server, so use a
-	//    client that stops at the redirect.
-	redirectResult := make(chan *http.Response, 1)
-	redirectErr := make(chan error, 1)
+	// 5. GET /s/<code> answers the §9.3 no-store interstitial for a direct
+	//    candidate whose only unknown is STUN freshness (no listener is
+	//    wired in this test, so the observation is missing — the preparable
+	//    category). The page instructs the recipient to POST prepare-route;
+	//    drive that bounded preparation endpoint directly, from a goroutine,
+	//    exactly like the interstitial's same-origin fetch would.
+	interResp, err := http.Get(server.URL + "/s/" + code)
+	require.NoError(t, err)
+	defer interResp.Body.Close()
+	require.Equal(t, http.StatusOK, interResp.StatusCode)
+	require.Equal(t, "no-store", interResp.Header.Get("Cache-Control"))
+	require.Contains(t, interResp.Header.Get("Content-Type"), "text/html")
+	require.NotEmpty(t, interResp.Header.Get("Content-Security-Policy"))
+	interBody, err := io.ReadAll(interResp.Body)
+	require.NoError(t, err)
+	require.NotEmpty(t, interBody, "the interstitial must render the real page")
+
+	prepareResult := make(chan *http.Response, 1)
+	prepareErr := make(chan error, 1)
 	go func() {
-		client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}}
-		resp, err := client.Get(server.URL + "/s/" + code)
+		resp, err := http.Post(server.URL+"/api/shares/"+code+"/prepare-route", "application/json", nil)
 		if err != nil {
-			redirectErr <- err
+			prepareErr <- err
 			return
 		}
-		redirectResult <- resp
+		prepareResult <- resp
 	}()
 
-	// Agent receives open_signal and acks with the loopback endpoint.
+	// The preparation maps the port: the agent receives open_signal and acks
+	// with the loopback endpoint.
 	var openSignal struct {
 		Type    string `json:"type"`
 		ShareID string `json:"share_id"`
@@ -189,24 +227,33 @@ func TestEndToEndDirectFlow(t *testing.T) {
 		openSignal.ShareID, openSignal.Nonce, openSignal.Seq, asPort)
 	require.NoError(t, conn.Write(context.Background(), websocket.MessageText, []byte(ack)))
 
-	// Control probes the loopback nonce echo and 302s to the direct origin.
+	// Control probes the loopback nonce echo and answers with the bounded
+	// §9.3 preparation JSON whose direct URL is derived from the persisted
+	// session origin and the granted port.
 	select {
-	case err := <-redirectErr:
-		t.Fatalf("redirect request failed: %v", err)
-	case resp := <-redirectResult:
+	case err := <-prepareErr:
+		t.Fatalf("prepare-route request failed: %v", err)
+	case resp := <-prepareResult:
 		defer resp.Body.Close()
-		require.Equal(t, http.StatusFound, resp.StatusCode)
-		loc := resp.Header.Get("Location")
-		require.Contains(t, loc, "https://"+shareReg.Origin)
-		require.Contains(t, loc, "/s/"+code)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+		var prep struct {
+			Status    string `json:"status"`
+			DirectURL string `json:"direct_url"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&prep))
+		require.Equal(t, "direct", prep.Status)
+		require.Contains(t, prep.DirectURL, "https://"+shareReg.Origin)
+		require.Contains(t, prep.DirectURL, "/s/"+code)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for redirect response")
+		t.Fatal("timed out waiting for prepare-route response")
 	}
 
-	// Follow the redirect through REAL SNI/Host admission and download the
-	// synthetic content (I8). The Location points at https://<origin>:<port>/s/<code>;
-	// we dial the in-process admission server directly and present SNI + Host =
-	// origin, exactly like a browser would after DNS resolution.
+	// Follow the direct URL through REAL SNI/Host admission and download the
+	// synthetic content (I8). The direct URL points at
+	// https://<origin>:<port>/s/<code>; we dial the in-process admission
+	// server directly and present SNI + Host = origin, exactly like a browser
+	// would after DNS resolution.
 	downloadTransport := &http.Transport{
 		TLSClientConfig:    &tls.Config{ServerName: shareReg.Origin, InsecureSkipVerify: true},
 		ForceAttemptHTTP2:  false,

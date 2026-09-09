@@ -226,7 +226,11 @@ func (c *Controller) serveInterstitial(w http.ResponseWriter, r *http.Request, s
 	}
 
 	page, err := renderInterstitialPage(c.cfg.InterstitialAssets, nonce, code, relayLoc)
-	if err != nil || len(page) > maxInterstitialBodyBytes {
+	// Zero-value assets (T22-m1) or any render failure fail closed to the
+	// §9.3 unavailable response — never a 200 with an empty body. (Production
+	// wiring fails earlier at startup via LoadInterstitialAssets; this guard
+	// makes the documented 503 contract true for every construction.)
+	if err != nil || len(page) == 0 || len(page) > maxInterstitialBodyBytes {
 		return c.unavailable(w)
 	}
 

@@ -142,6 +142,19 @@ func main() {
 		if err != nil {
 			log.Fatalf("stun listener: %v", err)
 		}
+		// The advertise address (the stun_challenge `server` field agents
+		// dial, §10.2) is STUN_ADVERTISE_ADDR when set — validated as a
+		// public host:port by cfg.STUNAdvertise and advertised verbatim; an
+		// invalid value fails the process closed above. Unset ⇒ the
+		// STUN_BIND_ADDR value is advertised verbatim, which is DEV-ONLY
+		// whenever the bind is loopback/0.0.0.0: agents behind NAT can never
+		// reach such an address and direct mode fails closed to relay
+		// (§10.3). Task 25's real-NAT gate exercises a publicly resolvable
+		// advertise address.
+		advertise, err := cfg.STUNAdvertise()
+		if err != nil {
+			log.Fatalf("stun listener: %v", err)
+		}
 		stunCtx, stopStun := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stopStun()
 		go func() {
@@ -152,11 +165,8 @@ func main() {
 		// Task 18: install the listener on the controller so the §10.2
 		// scheduler issues stun_challenge over the agent WebSocket (immediate
 		// after enrollment_ready, re-challenge at 4 min + jitter) and claims
-		// observations via stun_result at the current WS epoch. The advertise
-		// address is the STUN_BIND_ADDR value: deployments must bind a
-		// publicly resolvable address (or terminate NAT forwarding for
-		// UDP 3478) for agents to reach the listener.
-		ctrl.EnableSTUN(stunServer, cfg.STUNBindAddr)
+		// observations via stun_result at the current WS epoch.
+		ctrl.EnableSTUN(stunServer, advertise)
 		log.Printf("stun observation listener on %s (udp/3478)", cfg.STUNBindAddr)
 	}
 

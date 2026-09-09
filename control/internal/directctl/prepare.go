@@ -67,6 +67,18 @@ const (
 	directOpenLease = 120 * time.Second
 )
 
+// directURL is the single §6 direct-URL builder: the PERSISTED session origin
+// plus the agent-granted port, with port 443 (the TLS default) omitted. Every
+// direct-URL construction uses this one helper (the §9.3 prepare response;
+// formerly also the legacy Phase 3 302) so the 443-omission rule can never
+// drift between call sites.
+func directURL(origin string, port int, code string) string {
+	if port == 443 {
+		return "https://" + origin + "/s/" + code
+	}
+	return fmt.Sprintf("https://%s:%d/s/%s", origin, port, code)
+}
+
 // prepareResponse is the entire bounded response body (§9.3): a coarse
 // status, control-derived URLs from the persisted session only, and the
 // interstitial's direct-check budget. It never carries agent identifiers,
@@ -179,13 +191,12 @@ func (c *Controller) PrepareRoute(w http.ResponseWriter, r *http.Request, code s
 	}
 
 	// Success: the direct URL is constructed from the PERSISTED session
-	// origin and the just-verified granted port (§6 form; port 443 is the
-	// default and omitted).
-	resp := prepareResponse{Status: "direct", DirectTimeoutMs: prepareDirectTimeoutMs}
-	if opened.ack.GrantedPort != 443 {
-		resp.DirectURL = fmt.Sprintf("https://%s:%d/s/%s", origin, opened.ack.GrantedPort, code)
-	} else {
-		resp.DirectURL = "https://" + origin + "/s/" + code
+	// origin and the just-verified granted port (§6 form via the shared
+	// directURL builder; port 443 is the default and omitted).
+	resp := prepareResponse{
+		Status:          "direct",
+		DirectTimeoutMs: prepareDirectTimeoutMs,
+		DirectURL:       directURL(origin, opened.ack.GrantedPort, code),
 	}
 	// The optional relay URL rides along only when selection is enabled and
 	// the presence lease currently backs it (§9.3 "optional relay URL").

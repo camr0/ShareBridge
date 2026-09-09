@@ -370,8 +370,14 @@ func (s *Server) IssueChallenge(agentID string, epoch Epoch) (Challenge, error) 
 	now := s.now() // single clock reading per issuance
 
 	as := s.byAgent[agentID]
+	// Global tombstone bound (§16.4, T16-m1): enforced on EVERY issuance —
+	// an existing agent whose pending entries keep the map at cap is also
+	// rejected here (fail closed before minting), not only brand-new agents.
+	if len(s.byChallenge) >= maxTotalChallenges {
+		return Challenge{}, ErrAgentCapacity
+	}
 	if as == nil {
-		if len(s.byAgent) >= s.maxAgents || len(s.byChallenge) >= maxTotalChallenges {
+		if len(s.byAgent) >= s.maxAgents {
 			return Challenge{}, ErrAgentCapacity
 		}
 		as = &agentState{tokens: s.maxPerMinute, lastRefill: now, lastSeen: now}

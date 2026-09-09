@@ -673,3 +673,47 @@ func TestParseBindAddr(t *testing.T) {
 		t.Fatalf("empty bind address must be rejected")
 	}
 }
+
+// TestSTUNGlobalChallengeCapAppliesToExistingAgents pins the T16-m1 fix
+// (§16.4): the global byChallenge tombstone cap is enforced on EVERY
+// issuance, so an EXISTING agent at the cap is rejected before minting — not
+// only brand-new agents whose state creation used to be the sole checkpoint.
+// All rejections are ErrAgentCapacity (fail closed: no challenge, no
+// observation, direct falls back to relay per §10.3).
+func TestSTUNGlobalChallengeCapAppliesToExistingAgents(t *testing.T) {
+	clock := newFakeClock()
+	// Per-agent bounds high enough to fill the global map with one agent's
+	// challenges (the production defaults themselves are asserted by
+	// TestSTUNRateLimitsPerAgent); no Serve loop runs, so nothing is swept.
+	srv, err := NewServer(Config{
+		Key:                            bytesOf(0x37, 32),
+		BindAddr:                       "127.0.0.1:0",
+		Now:                            clock.Now,
+		MaxChallengesPerAgentPerMinute: maxTotalChallenges + 1,
+		MaxPendingPerAgent:             maxTotalChallenges + 1,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	// Fill the global challenge map to exactly the cap with ONE existing
+	// agent's outstanding credentials.
+	issueOK(t, srv, "agent-cap", Epoch(1))
+	for i := 1; i < maxTotalChallenges; i++ {
+		if _, err := srv.IssueChallenge("agent-cap", Epoch(1)); err != nil {
+			t.Fatalf("challenge %d of %d: %v", i+1, maxTotalChallenges, err)
+		}
+	}
+
+	// The EXISTING agent itself must now hit the cap (fail closed before
+	// minting) — the fixed behavior; this previously minted.
+	if _, err := srv.IssueChallenge("agent-cap", Epoch(1)); !errors.Is(err, ErrAgentCapacity) {
+		t.Fatalf("existing agent beyond global cap: err = %v, want ErrAgentCapacity", err)
+	}
+
+	// A brand-new agent is rejected by the same cap (pre-existing behavior,
+	// pinned so the move cannot regress it).
+	if _, err := srv.IssueChallenge("agent-fresh", Epoch(1)); !errors.Is(err, ErrAgentCapacity) {
+		t.Fatalf("new agent beyond global cap: err = %v, want ErrAgentCapacity", err)
+	}
+}

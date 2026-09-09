@@ -988,6 +988,9 @@ func TestRelayCredentialRequestIssuesFreshConfigRateLimited(t *testing.T) {
 	}
 	require.NotEqual(t, jtis[0], jtis[1], "a second issue must mint a fresh one-use jti, never resend the token")
 	require.NotEqual(t, jtis[1], jtis[2], "jti uniqueness across issues")
+	// R3-m1: non-adjacent distinctness too — adjacent pairs alone could miss
+	// a repeating A/B/A/B pattern across the burst.
+	require.NotEqual(t, jtis[0], jtis[3], "first and last jtis of the burst must differ, not only adjacent pairs")
 
 	// The per-agent token bucket held exactly four tokens: the fifth request
 	// in the burst is dropped with no reply, and the unknown reason is
