@@ -135,6 +135,15 @@ const (
 	directPortIdle        = 5 * time.Minute
 )
 
+// originPair is one content session's §6 origin pair: the control-allocated
+// direct origin and its deterministic relay origin. Both bind the SAME share
+// code and are installed, re-admitted after rebuild, and revoked together —
+// never as two independent routes.
+type originPair struct {
+	directOrigin string
+	relayOrigin  string
+}
+
 // directState is the daemon's direct-TCP transport state. It is nil when direct
 // transport is not configured (e.g. in tests using NewWithSignaling).
 type directState struct {
@@ -151,8 +160,8 @@ type directState struct {
 	server     *direct.DirectServer
 	reporter   *direct.Reporter
 	baseDomain string
-	serveNS    string // namespace the binder/server were built for
-	origin     map[string]string
+	serveNS    string                // namespace the binder/server were built for
+	origins    map[string]originPair // share code → §6 origin pair (direct + relay)
 
 	started    bool               // DirectServer.Start guard (under mu)
 	startGen   uint64             // increments per start attempt (under mu)
@@ -261,7 +270,10 @@ func (d *Daemon) waitForDirectReady(ctx context.Context) error {
 }
 
 // directShareAuthorized is the SignalGate source-authorization check: a share is
-// only openable over direct once its origin is locally bound.
+// only openable over direct once its origin pair is locally bound. It stays
+// direct-only by name and by contract — relay traffic never opens the direct
+// public port (§13.1: SignalGate authorization remains direct-only; relay
+// serving is authorized per-request by the Binder).
 func (d *Daemon) directShareAuthorized(shareID string, kind direct.RouteKind) bool {
 	if kind != direct.RouteDirect {
 		return false
@@ -271,16 +283,21 @@ func (d *Daemon) directShareAuthorized(shareID string, kind direct.RouteKind) bo
 	}
 	d.direct.mu.Lock()
 	defer d.direct.mu.Unlock()
-	_, ok := d.direct.origin[shareID]
+	_, ok := d.direct.origins[shareID]
 	return ok
 }
 
-// bindOrigin records the control-allocated origin for a share code and admits it
-// in the binder. It is a no-op until the binder exists (namespace known).
-func (d *Daemon) bindOrigin(code, origin string) {
+// bindOrigin records the control-allocated origin pair for a share code and
+// admits BOTH route kinds in the binder as one atomic operation (§6, §13.1).
+// The relay origin is derived locally by the same deterministic §6 rule the
+// control plane applies — no agent message ever supplies an origin (§11.1).
+// It reports the installed pair and whether the binding succeeded; it is a
+// no-op (ok=false) until the binder exists (namespace known) or the direct
+// origin is empty/undervivable.
+func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 	ds := d.direct
-	if ds == nil || origin == "" {
-		return
+	if ds == nil || directOrigin == "" {
+		return originPair{}, false
 	}
 	// Snapshot the binder under the state lock: syncDirectServe swaps the
 	// binder under ds.mu, so an unlocked read here would race a namespace
@@ -289,36 +306,44 @@ func (d *Daemon) bindOrigin(code, origin string) {
 	binder := ds.binder
 	ds.mu.Unlock()
 	if binder == nil {
-		return
+		return originPair{}, false
 	}
-	if err := binder.Allow(origin, direct.RouteDirect, code); err != nil {
-		log.Printf("bind origin %q for share %s: %v", origin, code, err)
-		return
+	relayOrigin, err := binder.RelayOriginFor(directOrigin)
+	if err != nil {
+		log.Printf("derive relay origin for share %s: %v", code, err)
+		return originPair{}, false
 	}
+	if err := binder.AllowShare(directOrigin, relayOrigin, code); err != nil {
+		log.Printf("bind origins for share %s: %v", code, err)
+		return originPair{}, false
+	}
+	pair := originPair{directOrigin: directOrigin, relayOrigin: relayOrigin}
 	ds.mu.Lock()
-	if ds.origin == nil {
-		ds.origin = make(map[string]string)
+	if ds.origins == nil {
+		ds.origins = make(map[string]originPair)
 	}
-	ds.origin[code] = origin
+	ds.origins[code] = pair
 	ds.mu.Unlock()
+	return pair, true
 }
 
-// revokeOrigin drops the origin binding for a share code and revokes it in the
-// binder. It is a no-op if no origin was recorded.
+// revokeOrigin drops the origin pair for a share code and revokes BOTH binder
+// bindings as one logical operation (§6: revocation removes both bindings).
+// It is a no-op if no origin pair was recorded.
 func (d *Daemon) revokeOrigin(code string) {
 	ds := d.direct
 	if ds == nil {
 		return
 	}
 	ds.mu.Lock()
-	origin, ok := ds.origin[code]
+	pair, ok := ds.origins[code]
 	if ok {
-		delete(ds.origin, code)
+		delete(ds.origins, code)
 	}
 	binder := ds.binder
 	ds.mu.Unlock()
 	if ok && binder != nil {
-		binder.Revoke(origin)
+		binder.RevokeShare(pair.directOrigin, pair.relayOrigin)
 	}
 }
 
@@ -340,19 +365,20 @@ func (d *Daemon) syncDirectServe() {
 	}
 	ds.binder = direct.NewBinder(ds.namespace, ds.baseDomain)
 	// Share ONE binder between the daemon (which records control-allocated
-	// origins via bindOrigin) and the DirectServer (which consults it for SNI
-	// admission + per-request authorization). A private server binder would
+	// origin pairs via bindOrigin) and the DirectServer (which consults it for
+	// SNI admission + per-request authorization). A private server binder would
 	// reject every direct handshake as an unknown origin.
 	ds.server = direct.NewDirectServerWithBinder(ds.namespace, ds.baseDomain, ds.port, ds.cert, ds.gate, directMaxContentBytes, ds.binder)
 	if d.resolver != nil {
 		ds.server.SetResolver(d.resolver)
 	}
-	// Re-Allow currently-bound origins into the fresh binder (atomic under
-	// ds.mu). Origins from a previous namespace are rejected by Allow and are
-	// re-bound once the control re-allocates them for the new namespace.
-	for code, origin := range ds.origin {
-		if err := ds.binder.Allow(origin, direct.RouteDirect, code); err != nil {
-			log.Printf("re-allow origin %q for share %s after binder rebuild: %v", origin, code, err)
+	// Re-Allow currently-bound origin pairs into the fresh binder (atomic
+	// under ds.mu): BOTH route kinds are re-admitted for every bound session
+	// (§13.1). Origins from a previous namespace are rejected by AllowShare
+	// and are re-bound once the control re-allocates them for the new namespace.
+	for code, pair := range ds.origins {
+		if err := ds.binder.AllowShare(pair.directOrigin, pair.relayOrigin, code); err != nil {
+			log.Printf("re-allow origins for share %s after binder rebuild: %v", code, err)
 		}
 	}
 	ds.serveNS = ds.namespace
@@ -371,7 +397,7 @@ func (d *Daemon) buildDirectState(withNetwork bool) {
 
 	ds := &directState{
 		baseDomain: baseDomain,
-		origin:     make(map[string]string),
+		origins:    make(map[string]originPair),
 	}
 	d.direct = ds
 
@@ -1293,7 +1319,11 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 	if err != nil {
 		return nil, err
 	}
-	d.bindOrigin(code, origin)
+	pair, bound := d.bindOrigin(code, origin)
+	relayOrigin := ""
+	if bound {
+		relayOrigin = pair.relayOrigin
+	}
 	client, err := d.newImmichClient(code)
 	if err != nil {
 		_ = d.unregisterShare(ctx, code)
@@ -1322,6 +1352,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		ExpiresAt:           expiresAt,
 		CreatedAt:           now,
 		Origin:              origin,
+		RelayOrigin:         relayOrigin,
 	}); err != nil {
 		_ = d.unregisterShare(ctx, code)
 		return nil, err

@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -601,6 +602,104 @@ func TestSaveSession_PersistsFileID(t *testing.T) {
 	}
 	if loaded.FileID != "storage-users-1$abc!def" {
 		t.Errorf("FileID = %q, want storage-users-1$abc!def", loaded.FileID)
+	}
+}
+
+// TestSessionEntryRoundTripsBothOrigins pins the agent-side persistence of
+// the §6 origin pair: ONE session row carries the control-allocated direct
+// origin (unchanged, key "origin") and its deterministic relay origin (key
+// "relay_origin"), both surviving a full disk round-trip, while a legacy row
+// written before relay origins existed still loads with an empty RelayOrigin.
+func TestSessionEntryRoundTripsBothOrigins(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("SHAREBRIDGE_DATA_DIR", tmpDir)
+
+	const (
+		directOrigin = "sbabc123.v7q4km2x9pz6dn3w.sharebridgeusercontent.com"
+		relayOrigin  = "sbabc123.relay.v7q4km2x9pz6dn3w.sharebridgeusercontent.com"
+	)
+
+	st, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	session := SessionEntry{
+		Code:      "bothorigins",
+		ShareURL:  "immich://bothorigins",
+		ShareType: "immich",
+		CreatedAt: time.Now(),
+		Origin:    directOrigin,
+		// One row, both origins: the direct origin stays under its existing
+		// key and the relay origin rides alongside it.
+		RelayOrigin: relayOrigin,
+	}
+	if err := st.SaveSession(session); err != nil {
+		t.Fatalf("SaveSession failed: %v", err)
+	}
+
+	// Reload from disk: exactly one row, both origins intact.
+	reloaded, err := New()
+	if err != nil {
+		t.Fatalf("New() reload failed: %v", err)
+	}
+	rows := reloaded.ListSessions(false)
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly 1 session row (one row per session, both origins), got %d", len(rows))
+	}
+	got := reloaded.GetSession("bothorigins")
+	if got == nil {
+		t.Fatalf("GetSession returned nil after reload")
+	}
+	if got.Origin != directOrigin {
+		t.Errorf("Origin = %q, want %q (unchanged)", got.Origin, directOrigin)
+	}
+	if got.RelayOrigin != relayOrigin {
+		t.Errorf("RelayOrigin = %q, want %q", got.RelayOrigin, relayOrigin)
+	}
+
+	// The persisted JSON keys are exactly the §6/§11.1 names.
+	raw, err := os.ReadFile(filepath.Join(tmpDir, "sessions.json"))
+	if err != nil {
+		t.Fatalf("read sessions.json: %v", err)
+	}
+	var disk struct {
+		Sessions []map[string]any `json:"sessions"`
+	}
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		t.Fatalf("unmarshal sessions.json: %v", err)
+	}
+	if len(disk.Sessions) != 1 {
+		t.Fatalf("expected exactly 1 session object on disk, got %d", len(disk.Sessions))
+	}
+	row := disk.Sessions[0]
+	if row["origin"] != directOrigin {
+		t.Errorf("sessions.json key %q = %v, want %q (direct origin unchanged)", "origin", row["origin"], directOrigin)
+	}
+	if row["relay_origin"] != relayOrigin {
+		t.Errorf("sessions.json key %q = %v, want %q", "relay_origin", row["relay_origin"], relayOrigin)
+	}
+
+	// Legacy tolerance: a row persisted before relay origins existed (no
+	// relay_origin key) loads with an empty RelayOrigin.
+	legacyDir := t.TempDir()
+	t.Setenv("SHAREBRIDGE_DATA_DIR", legacyDir)
+	legacyJSON := `{"agent_id":"legacy-agent","sessions":[{"code":"legacy","share_url":"immich://legacy","share_type":"immich","origin":"` + directOrigin + `"}]}`
+	if err := os.WriteFile(filepath.Join(legacyDir, "sessions.json"), []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("write legacy sessions.json: %v", err)
+	}
+	legacyStore, err := New()
+	if err != nil {
+		t.Fatalf("New() legacy failed: %v", err)
+	}
+	legacy := legacyStore.GetSession("legacy")
+	if legacy == nil {
+		t.Fatalf("GetSession(legacy) returned nil")
+	}
+	if legacy.Origin != directOrigin {
+		t.Errorf("legacy Origin = %q, want %q", legacy.Origin, directOrigin)
+	}
+	if legacy.RelayOrigin != "" {
+		t.Errorf("legacy RelayOrigin = %q, want empty (row predates relay origins)", legacy.RelayOrigin)
 	}
 }
 

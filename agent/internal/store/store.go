@@ -31,6 +31,12 @@ type SessionEntry struct {
 	RelayOnly           bool      `json:"relay_only"`
 	CreatedAt           time.Time `json:"created_at"`
 	Origin              string    `json:"origin,omitempty"`
+	// RelayOrigin is the §6 relay namespace origin ("<origin>.relay.<ns>.<base>")
+	// paired with Origin for the SAME session: one row carries both origins,
+	// both bound to the same share code (§13.1). Deterministic from Origin;
+	// additive and omitempty so rows persisted before relay origins existed
+	// still load unchanged.
+	RelayOrigin string `json:"relay_origin,omitempty"`
 }
 
 type storeData struct {

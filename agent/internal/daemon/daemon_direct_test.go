@@ -153,7 +153,7 @@ func TestDirectDDNSFailureDoesNotBlockShareRegistration(t *testing.T) {
 		baseDomain: testDirectBase,
 		cert:       cm,
 		gate:       direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
-		origin:     map[string]string{},
+		origins:    map[string]originPair{},
 		listenAddr: "127.0.0.1:0",
 	}
 	d := &Daemon{
@@ -219,8 +219,8 @@ func TestRegistrationGatedOnReadiness(t *testing.T) {
 
 func TestBinderBoundOnOrigin(t *testing.T) {
 	d := &Daemon{direct: &directState{
-		binder: direct.NewBinder(testDirectNS, testDirectBase),
-		origin: map[string]string{},
+		binder:  direct.NewBinder(testDirectNS, testDirectBase),
+		origins: map[string]originPair{},
 	}}
 	const code = "SHARE123"
 	origin := testOriginFor("sbabc123")
@@ -233,15 +233,15 @@ func TestBinderBoundOnOrigin(t *testing.T) {
 	if bd.ShareCode != code {
 		t.Fatalf("binding share code = %q, want %q", bd.ShareCode, code)
 	}
-	if got := d.direct.origin[code]; got != origin {
-		t.Fatalf("origin[%q] = %q, want %q", code, got, origin)
+	if got, ok := d.direct.origins[code]; !ok || got.directOrigin != origin {
+		t.Fatalf("origins[%q] = %+v, want direct origin %q", code, got, origin)
 	}
 }
 
 func TestBinderRevokedOnDelete(t *testing.T) {
 	d := &Daemon{direct: &directState{
-		binder: direct.NewBinder(testDirectNS, testDirectBase),
-		origin: map[string]string{},
+		binder:  direct.NewBinder(testDirectNS, testDirectBase),
+		origins: map[string]originPair{},
 	}}
 	const code = "SHARE123"
 	origin := testOriginFor("sbabc123")
@@ -252,8 +252,237 @@ func TestBinderRevokedOnDelete(t *testing.T) {
 	if _, err := d.direct.binder.AdmitSNI(origin); err == nil {
 		t.Fatalf("Revoke was not recorded: origin still admitted")
 	}
-	if _, ok := d.direct.origin[code]; ok {
-		t.Fatalf("origin[%q] should be cleared after revoke", code)
+	if _, ok := d.direct.origins[code]; ok {
+		t.Fatalf("origins[%q] should be cleared after revoke", code)
+	}
+}
+
+// relayOriginForLabel derives the §6 relay origin for a test direct origin
+// label: the same origin label under the .relay.<ns>.<base> namespace.
+func relayOriginForLabel(label string) string {
+	return label + ".relay." + testDirectNS + "." + testDirectBase
+}
+
+// TestShareRegisteredReturnsAndPersistsBothOrigins pins §6/§11.1/§13.1 on the
+// registration flow: control returns both origins for a share (the mock
+// registrar stands in for the share_registered response carrying origin +
+// relay_origin), and the agent persists BOTH on the ONE session row — the
+// direct origin unchanged under its existing key — and installs BOTH binder
+// bindings (RouteDirect + RouteRelay) pointing at the same content session.
+func TestShareRegisteredReturnsAndPersistsBothOrigins(t *testing.T) {
+	dir := t.TempDir()
+	cm, _ := newBaselineCertFixture(t, dir)
+
+	cfg := &config.Config{
+		SignalingURL:      "ws://localhost:8080",
+		APIKey:            "test-key",
+		DefaultRelayOnly:  false,
+		ImmichURL:         "http://immich.lan:2283",
+		ImmichAllowedHost: "immich.lan:2283",
+		ImmichAPIKey:      "api",
+	}
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	// share_registered returns the control-allocated DIRECT origin; the relay
+	// origin is its §6 deterministic pair.
+	directOrigin := testOriginFor("sbpair01")
+	relayOrigin := relayOriginForLabel("sbpair01")
+	sig.shareOrigin = func(code, shareURL string) string { return directOrigin }
+
+	ds := &directState{
+		namespace:  testDirectNS,
+		baseDomain: testDirectBase,
+		cert:       cm,
+		ready:      true,
+		gate:       direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+		origins:    map[string]originPair{},
+		listenAddr: "127.0.0.1:0",
+	}
+	d := &Daemon{
+		config:    cfg,
+		store:     st,
+		signaling: sig,
+		resolver:  direct.NewResolverRegistry(),
+		sessions:  make(map[string]*Session),
+		direct:    ds,
+	}
+	d.syncDirectServe()
+
+	const code = "BOTHPAIR1"
+	session, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: code, Type: "ALBUM"}, 10, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("registerImmichShare: %v", err)
+	}
+	if session == nil || session.Code != code {
+		t.Fatalf("unexpected session %+v", session)
+	}
+
+	// Persisted: exactly ONE row carrying BOTH origins, direct unchanged.
+	rows := st.ListSessions(false)
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly 1 persisted session row (one row, both origins), got %d", len(rows))
+	}
+	entry := st.GetSession(code)
+	if entry == nil {
+		t.Fatalf("session %s not persisted", code)
+	}
+	if entry.Origin != directOrigin {
+		t.Fatalf("persisted origin = %q, want %q (unchanged)", entry.Origin, directOrigin)
+	}
+	if entry.RelayOrigin != relayOrigin {
+		t.Fatalf("persisted relay_origin = %q, want %q", entry.RelayOrigin, relayOrigin)
+	}
+
+	// Bound: both origins are admitted for the same content session.
+	db, err := ds.binder.AdmitSNI(directOrigin)
+	if err != nil {
+		t.Fatalf("direct origin not bound after registration: %v", err)
+	}
+	rb, err := ds.binder.AdmitSNI(relayOrigin)
+	if err != nil {
+		t.Fatalf("relay origin not bound after registration: %v", err)
+	}
+	if db.RouteKind != direct.RouteDirect || rb.RouteKind != direct.RouteRelay {
+		t.Fatalf("route kinds = %s/%s, want direct/relay", db.RouteKind, rb.RouteKind)
+	}
+	if db.ShareCode != code || rb.ShareCode != code {
+		t.Fatalf("share codes = %q/%q, want both %q", db.ShareCode, rb.ShareCode, code)
+	}
+}
+
+// TestBothOriginsResolveSameContentSession pins §6: the direct and relay
+// bindings of one share both point at the SAME content session — the same
+// share code in the Binder and exactly ONE resolver/snapshot manager for the
+// code, with no parallel bookkeeping for the second route kind.
+func TestBothOriginsResolveSameContentSession(t *testing.T) {
+	d := &Daemon{
+		config: &config.Config{
+			ImmichURL:         "http://immich.lan:2283",
+			ImmichAllowedHost: "immich.lan:2283",
+			ImmichAPIKey:      "api",
+		},
+		direct: &directState{
+			binder:  direct.NewBinder(testDirectNS, testDirectBase),
+			origins: map[string]originPair{},
+		},
+		resolver: direct.NewResolverRegistry(),
+		sessions: make(map[string]*Session),
+	}
+
+	const code = "SHARE123"
+	directOrigin := testOriginFor("sbabc123")
+	relayOrigin := relayOriginForLabel("sbabc123")
+	d.bindOrigin(code, directOrigin)
+
+	db, err := d.direct.binder.AdmitSNI(directOrigin)
+	if err != nil {
+		t.Fatalf("direct origin not bound: %v", err)
+	}
+	rb, err := d.direct.binder.AdmitSNI(relayOrigin)
+	if err != nil {
+		t.Fatalf("relay origin not bound: %v", err)
+	}
+	if db.ShareCode != code || rb.ShareCode != code {
+		t.Fatalf("bindings resolve to %q/%q, want the same content session %q", db.ShareCode, rb.ShareCode, code)
+	}
+	if db.RouteKind != direct.RouteDirect || rb.RouteKind != direct.RouteRelay {
+		t.Fatalf("route kinds = %s/%s, want direct/relay", db.RouteKind, rb.RouteKind)
+	}
+
+	// ONE resolver/snapshot per content session: hydrating the share creates
+	// a single manager keyed by the code, and re-hydrating (the poller's
+	// keep-fresh path) reuses it instead of bookkeeping a second one.
+	client, err := d.newImmichClient(code)
+	if err != nil {
+		t.Fatalf("newImmichClient: %v", err)
+	}
+	session := &Session{Code: code, immich: client}
+	d.hydrateContentSession(session)
+	mgr := d.resolver.Get(code)
+	if mgr == nil {
+		t.Fatalf("no snapshot manager for the content session")
+	}
+	d.hydrateContentSession(session)
+	if again := d.resolver.Get(code); again != mgr {
+		t.Fatalf("hydration produced a second snapshot manager: parallel bookkeeping")
+	}
+}
+
+// TestRevocationRemovesBothBindings pins §6: revocation removes BOTH origin
+// bindings and the daemon's origin bookkeeping for the share, as one logical
+// operation — neither route kind stays routable after revoke.
+func TestRevocationRemovesBothBindings(t *testing.T) {
+	d := &Daemon{direct: &directState{
+		binder:  direct.NewBinder(testDirectNS, testDirectBase),
+		origins: map[string]originPair{},
+	}}
+	const code = "SHARE123"
+	directOrigin := testOriginFor("sbabc123")
+	relayOrigin := relayOriginForLabel("sbabc123")
+	d.bindOrigin(code, directOrigin)
+
+	// Sanity: both are admitted before revocation.
+	if _, err := d.direct.binder.AdmitSNI(directOrigin); err != nil {
+		t.Fatalf("direct origin not admitted before revoke: %v", err)
+	}
+	if _, err := d.direct.binder.AdmitSNI(relayOrigin); err != nil {
+		t.Fatalf("relay origin not admitted before revoke: %v", err)
+	}
+
+	d.revokeOrigin(code)
+
+	if _, err := d.direct.binder.AdmitSNI(directOrigin); err == nil {
+		t.Fatalf("direct origin still admitted after revoke")
+	}
+	if _, err := d.direct.binder.AdmitSNI(relayOrigin); err == nil {
+		t.Fatalf("relay origin still admitted after revoke (pair not revoked)")
+	}
+	if _, ok := d.direct.origins[code]; ok {
+		t.Fatalf("origin bookkeeping for %q should be cleared after revoke", code)
+	}
+}
+
+// TestBinderRebuildReallowsBothRouteKinds pins §13.1: after a binder/listener
+// rebuild (namespace known, serve state resynced) BOTH route kinds of every
+// bound session are re-admitted into the fresh binder, and the rebuilt server
+// still shares that one binder with the daemon.
+func TestBinderRebuildReallowsBothRouteKinds(t *testing.T) {
+	ds := &directState{
+		namespace:  testDirectNS,
+		baseDomain: testDirectBase,
+		origins:    map[string]originPair{},
+		gate:       direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true }),
+	}
+	d := &Daemon{direct: ds}
+	d.syncDirectServe()
+
+	const code = "SHARE123"
+	directOrigin := testOriginFor("sbabc123")
+	relayOrigin := relayOriginForLabel("sbabc123")
+	d.bindOrigin(code, directOrigin)
+
+	// Force a rebuild of the binder/server (as a listener rebuild would).
+	ds.mu.Lock()
+	ds.binder = nil
+	ds.mu.Unlock()
+	d.syncDirectServe()
+
+	if ds.server == nil || ds.server.Binder() != ds.binder {
+		t.Fatalf("rebuilt server must share the daemon's fresh binder")
+	}
+	db, err := ds.binder.AdmitSNI(directOrigin)
+	if err != nil {
+		t.Fatalf("direct origin not re-allowed after binder rebuild: %v", err)
+	}
+	rb, err := ds.binder.AdmitSNI(relayOrigin)
+	if err != nil {
+		t.Fatalf("relay origin not re-allowed after binder rebuild: %v", err)
+	}
+	if db.RouteKind != direct.RouteDirect || rb.RouteKind != direct.RouteRelay {
+		t.Fatalf("re-allowed kinds = %s/%s, want direct/relay", db.RouteKind, rb.RouteKind)
+	}
+	if db.ShareCode != code || rb.ShareCode != code {
+		t.Fatalf("re-allowed share codes = %q/%q, want both %q", db.ShareCode, rb.ShareCode, code)
 	}
 }
 
@@ -688,7 +917,7 @@ func TestDirectServerSharesDaemonBinder(t *testing.T) {
 	ds := &directState{
 		namespace:  testDirectNS,
 		baseDomain: testDirectBase,
-		origin:     map[string]string{},
+		origins:    map[string]originPair{},
 		gate:       direct.NewSignalGate("test-agent-id", func(string, direct.RouteKind) bool { return true }),
 	}
 	d := &Daemon{direct: ds}
@@ -925,7 +1154,7 @@ func TestDirectServerEndToEndSNIAdmissionAndDownload(t *testing.T) {
 		gate:       gate,
 		port:       port,
 		mapper:     mapper,
-		origin:     map[string]string{},
+		origins:    map[string]originPair{},
 	}
 	d := &Daemon{direct: ds}
 	d.syncDirectServe()
@@ -1030,7 +1259,7 @@ func TestRelayTunnelOnlyAgentDoesNotReportOrAuthorizeFakePublicEndpoint(t *testi
 		baseDomain: testDirectBase,
 		cert:       cm,
 		gate:       direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
-		origin:     map[string]string{},
+		origins:    map[string]originPair{},
 		listenAddr: "127.0.0.1:0",
 	}
 	d := &Daemon{

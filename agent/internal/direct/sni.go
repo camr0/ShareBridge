@@ -101,6 +101,68 @@ func (b *Binder) Revoke(origin string) {
 	b.mu.Unlock()
 }
 
+// RelayOriginFor derives the §6 relay origin for a control-allocated direct
+// origin: the same origin label under the agent's relay namespace
+// ("<label>.relay.<namespace>.<base>"). This is the same deterministic rule
+// the control plane applies (relayctl.RelayOriginFromDirect), so both sides
+// compute the identical hostname for a share — the agent never accepts an
+// origin from any agent-supplied message (§11.1). Origins that are already
+// relay origins or live outside the agent's direct namespace are rejected.
+func (b *Binder) RelayOriginFor(directOrigin string) (string, error) {
+	host := normalizeHost(directOrigin)
+	if !validHostname(host) {
+		return "", fmt.Errorf("direct: invalid origin %q", directOrigin)
+	}
+	if strings.HasSuffix(host, b.relaySuffix) {
+		return "", fmt.Errorf("direct: origin %q is already a relay origin", host)
+	}
+	if len(host) <= len(b.directSuffix) || !strings.HasSuffix(host, b.directSuffix) {
+		return "", fmt.Errorf("direct: origin %q is not in the agent namespace %q", directOrigin, b.namespace)
+	}
+	return host[:len(host)-len(b.directSuffix)] + b.relaySuffix, nil
+}
+
+// AllowShare admits BOTH §6 origins of one content session as a single
+// atomic operation: the direct origin under RouteDirect and its relay origin
+// under RouteRelay, both bound to the same native share code. Either both
+// bindings are installed or neither is — a validation failure on either
+// origin (malformed, foreign namespace, or mismatched route kind) leaves the
+// binder state completely untouched. The request path independently
+// re-authorizes Host + route kind + code per connection (§6).
+func (b *Binder) AllowShare(directOrigin, relayOrigin, shareCode string) error {
+	directHost := normalizeHost(directOrigin)
+	relayHost := normalizeHost(relayOrigin)
+	if !validHostname(directHost) {
+		return fmt.Errorf("direct: invalid direct origin %q", directOrigin)
+	}
+	if !validHostname(relayHost) {
+		return fmt.Errorf("direct: invalid relay origin %q", relayOrigin)
+	}
+	if kind, ok := b.routeKindFor(directHost); !ok || kind != RouteDirect {
+		return fmt.Errorf("%w: %q is not a direct origin of namespace %q", ErrWrongRouteKind, directHost, b.namespace)
+	}
+	if kind, ok := b.routeKindFor(relayHost); !ok || kind != RouteRelay {
+		return fmt.Errorf("%w: %q is not a relay origin of namespace %q", ErrWrongRouteKind, relayHost, b.namespace)
+	}
+	b.mu.Lock()
+	b.active[directHost] = Binding{Origin: directHost, RouteKind: RouteDirect, ShareCode: shareCode}
+	b.active[relayHost] = Binding{Origin: relayHost, RouteKind: RouteRelay, ShareCode: shareCode}
+	b.mu.Unlock()
+	return nil
+}
+
+// RevokeShare removes BOTH §6 bindings of one content session in a single
+// operation (§6: "Revocation removes both bindings"). Revoking origins that
+// were never admitted is a no-op.
+func (b *Binder) RevokeShare(directOrigin, relayOrigin string) {
+	directHost := normalizeHost(directOrigin)
+	relayHost := normalizeHost(relayOrigin)
+	b.mu.Lock()
+	delete(b.active, directHost)
+	delete(b.active, relayHost)
+	b.mu.Unlock()
+}
+
 // AdmitSNI is TLS admission: the ClientHello SNI must be a non-empty, exact,
 // active origin. Rejecting here fails the handshake before any HTTP is read.
 func (b *Binder) AdmitSNI(serverName string) (Binding, error) {

@@ -448,6 +448,44 @@ func TestSendHelpers_WireShape(t *testing.T) {
 	})
 }
 
+// TestRegisterShareWithOptions_OriginUnchangedWithRelayOriginPresent pins the
+// §11.1 additive wire compatibility of share_registered: the payload now also
+// carries relay_origin, and the registration path must keep returning origin
+// (the direct origin) and the other existing fields EXACTLY as before —
+// existing consumers are untouched by the relay origin's addition (§11.1:
+// "origin remains the direct origin").
+func TestRegisterShareWithOptions_OriginUnchangedWithRelayOriginPresent(t *testing.T) {
+	server := newRegisterShareTestServer(t, func(t *testing.T, raw []byte) []byte {
+		return []byte(`{"type":"share_registered","code":"SHARE123",` +
+			`"origin":"abc123.sharebridgeusercontent.com",` +
+			`"relay_origin":"abc123.relay.sharebridgeusercontent.com","reconnected":true}`)
+	})
+	defer server.Close()
+
+	client := New("ws"+strings.TrimPrefix(server.URL, "http"), "api", "agent")
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	go client.Listen(context.Background())
+
+	code, origin, reconnected, err := client.RegisterShareWithOptions(context.Background(), RegisterShareOptions{
+		ShareURL:      "immich://SHARE123",
+		PreferredCode: "SHARE123",
+	})
+	if err != nil {
+		t.Fatalf("RegisterShareWithOptions: %v", err)
+	}
+	if code != "SHARE123" {
+		t.Fatalf("code = %q, want SHARE123", code)
+	}
+	if origin != "abc123.sharebridgeusercontent.com" {
+		t.Fatalf("origin = %q, want abc123.sharebridgeusercontent.com unchanged (relay_origin must not leak into it)", origin)
+	}
+	if !reconnected {
+		t.Fatalf("reconnected = false, want true")
+	}
+}
+
 func TestRegisterShareWithOptions_ReturnsOrigin(t *testing.T) {
 	server := newRegisterShareTestServer(t, func(t *testing.T, raw []byte) []byte {
 		return []byte(`{"type":"share_registered","code":"SHARE123","origin":"abc123.sharebridgeusercontent.com","reconnected":true}`)

@@ -129,6 +129,14 @@ func (c *Client) Connect(ctx context.Context) error {
 // RegisterShareWithOptions sends a register_share message and waits for the
 // response. It must not call conn.Read directly — all reads go through Listen.
 // The response is delivered via pendingReg, which Listen feeds.
+//
+// The §11.1 share_registered response carries BOTH origins: origin (the
+// direct origin, returned unchanged here) and the additive relay_origin
+// (parsed into Message.RelayOrigin). The direct origin is the only value
+// callers need: the relay origin is deterministic from it (§6), and the
+// daemon derives and binds the pair — both route kinds of one content
+// session — via the Binder (§13.1). No agent message ever supplies either
+// origin.
 func (c *Client) RegisterShareWithOptions(ctx context.Context, opts RegisterShareOptions) (string, string, bool, error) {
 	responseCh := make(chan Message, 1)
 	c.pendingRegMu.Lock()

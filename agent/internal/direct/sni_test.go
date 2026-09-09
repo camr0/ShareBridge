@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 const testNamespace = "v7q4km2x9pz6dn3w"
@@ -254,5 +255,129 @@ func TestBinder_BothNamespaces(t *testing.T) {
 	reqRelay.Host = relayOrigin
 	if err := b.Authorize(bd, reqRelay); !errors.Is(err, ErrHostMismatch) {
 		t.Fatalf("cross-namespace: want ErrHostMismatch, got %v", err)
+	}
+}
+
+// TestBinderRelayOriginForDerivesNamespacePair pins the agent-side §6
+// derivation: the relay origin for a control-allocated direct origin is the
+// same origin label under the .relay.<namespace>.<base> namespace — the same
+// rule the control plane applies, so both sides compute the same hostname.
+// Already-relay and foreign-namespace origins are rejected.
+func TestBinderRelayOriginForDerivesNamespacePair(t *testing.T) {
+	b := NewBinder(testNamespace, testBaseDomain)
+
+	got, err := b.RelayOriginFor(directOrigin)
+	if err != nil {
+		t.Fatalf("RelayOriginFor: %v", err)
+	}
+	if got != relayOrigin {
+		t.Fatalf("RelayOriginFor = %q, want %q", got, relayOrigin)
+	}
+
+	// An origin that is already a relay origin must never be paired again.
+	if _, err := b.RelayOriginFor(relayOrigin); err == nil {
+		t.Fatalf("RelayOriginFor of a relay origin must be rejected (no relay-of-relay)")
+	}
+	// Foreign-namespace origins have no pair in this binder.
+	if _, err := b.RelayOriginFor("r7k2m9p4x6.other.example.com"); err == nil {
+		t.Fatalf("RelayOriginFor of a foreign origin must be rejected")
+	}
+	// A bare origin with no label before the namespace is malformed.
+	if _, err := b.RelayOriginFor(testNamespace + "." + testBaseDomain); err == nil {
+		t.Fatalf("RelayOriginFor of a label-less origin must be rejected")
+	}
+}
+
+// TestBinderAllowShareAdmitsBothRouteKinds pins §13.1: one operation admits
+// BOTH §6 origins of a content session — direct under RouteDirect and relay
+// under RouteRelay — bound to the same share code. A validation failure on
+// either origin admits neither (atomic pair).
+func TestBinderAllowShareAdmitsBothRouteKinds(t *testing.T) {
+	b := NewBinder(testNamespace, testBaseDomain)
+	if err := b.AllowShare(directOrigin, relayOrigin, "code-pair"); err != nil {
+		t.Fatalf("AllowShare: %v", err)
+	}
+
+	db, err := b.AdmitSNI(directOrigin)
+	if err != nil {
+		t.Fatalf("direct SNI not admitted after AllowShare: %v", err)
+	}
+	rb, err := b.AdmitSNI(relayOrigin)
+	if err != nil {
+		t.Fatalf("relay SNI not admitted after AllowShare: %v", err)
+	}
+	if db.RouteKind != RouteDirect || rb.RouteKind != RouteRelay {
+		t.Fatalf("route kinds = %s/%s, want direct/relay", db.RouteKind, rb.RouteKind)
+	}
+	if db.ShareCode != "code-pair" || rb.ShareCode != "code-pair" {
+		t.Fatalf("share codes = %q/%q, want both code-pair (one content session)", db.ShareCode, rb.ShareCode)
+	}
+
+	// Atomicity: a mismatched relay origin (foreign namespace) leaves the
+	// previous state completely untouched — neither origin is rebound.
+	if err := b.AllowShare(directOrigin, "other.relay.other.example.com", "code-pair"); err == nil {
+		t.Fatalf("AllowShare with a foreign relay origin must fail")
+	}
+	rb2, err := b.AdmitSNI(relayOrigin)
+	if err != nil || rb2.ShareCode != "code-pair" || rb2.RouteKind != RouteRelay {
+		t.Fatalf("failed AllowShare mutated existing relay binding: %+v err=%v", rb2, err)
+	}
+}
+
+// TestBinderRevokeShareRemovesBoth pins §6/§13.1: revocation removes BOTH
+// bindings of the pair in one operation.
+func TestBinderRevokeShareRemovesBoth(t *testing.T) {
+	b := NewBinder(testNamespace, testBaseDomain)
+	if err := b.AllowShare(directOrigin, relayOrigin, "code-pair"); err != nil {
+		t.Fatalf("AllowShare: %v", err)
+	}
+
+	b.RevokeShare(directOrigin, relayOrigin)
+	if _, err := b.AdmitSNI(directOrigin); err == nil {
+		t.Fatalf("direct origin still admitted after RevokeShare")
+	}
+	if _, err := b.AdmitSNI(relayOrigin); err == nil {
+		t.Fatalf("relay origin still admitted after RevokeShare")
+	}
+}
+
+// TestSignalGateStillRejectsRouteRelay pins §13.1: even though the Binder now
+// admits both route kinds for a share, the SignalGate stays direct-only — a
+// RouteRelay open signal can never open the direct public port, regardless of
+// what the source-authorization callback would say.
+func TestSignalGateStillRejectsRouteRelay(t *testing.T) {
+	b := NewBinder(testNamespace, testBaseDomain)
+	if err := b.AllowShare(directOrigin, relayOrigin, "code-1"); err != nil {
+		t.Fatalf("AllowShare: %v", err)
+	}
+
+	// The authorization callback reflects the share being bound for either
+	// route (the Binder admits both) — the gate must STILL refuse relay.
+	gate := NewSignalGate("agent-1", func(shareID string, kind RouteKind) bool {
+		return shareID == "code-1"
+	})
+
+	base := OpenSignal{
+		Version:   1,
+		AgentID:   "agent-1",
+		ShareID:   "code-1",
+		Nonce:     "nonce-relay",
+		Seq:       1,
+		ExpiresAt: time.Now().Add(time.Minute),
+		Lease:     30 * time.Second,
+	}
+
+	relay := base
+	relay.RouteKind = RouteRelay
+	if err := gate.Admit(relay); !errors.Is(err, ErrWrongRouteKind) {
+		t.Fatalf("RouteRelay open signal: want ErrWrongRouteKind, got %v", err)
+	}
+
+	// Contrast: the same signal under RouteDirect is admissible, proving the
+	// rejection is the direct-only policy and not a broken gate.
+	direct := base
+	direct.RouteKind = RouteDirect
+	if err := gate.Admit(direct); err != nil {
+		t.Fatalf("RouteDirect open signal: %v", err)
 	}
 }
