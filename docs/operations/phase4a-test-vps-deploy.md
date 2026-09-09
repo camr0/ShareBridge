@@ -274,6 +274,11 @@ direct origin, e.g. `sb0a1b2c3.test.example.com`).
 > button (fail-closed §9.1). The direct-path cases (2.1, 2.5, 2.6, 2.7) are
 > executable regardless. Verify the current wiring state before scheduling
 > the human checklist session.
+>
+> The same gap blocks **creating** the `<RELAYONLY>` share: the daemon
+> currently rejects relay-only sessions at `agent/internal/daemon/daemon.go`
+> (phase-3 enforcement, lifted by Task 28). Fabricate `<DIRECT>`, `<NON443>`
+> and `<BLACKHOLE>` now; create `<RELAYONLY>` after Task 28 lands.
 
 ---
 

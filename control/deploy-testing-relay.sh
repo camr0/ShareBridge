@@ -133,6 +133,7 @@ is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 [[ "$RELAY_GATEWAY_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || fail "RELAY_GATEWAY_HOST must be an RFC 1123 hostname (letters, digits, hyphens, dots)"
 # Ports (relayctl.NewPortRange bounds: 1024-65535 inclusive).
 is_uint "$PORT" && is_uint "$TRANSPORT_PORT" && is_uint "$RELAY_PORT_MIN" && is_uint "$RELAY_PORT_MAX" || fail "PORT / RELAY_GATEWAY_PORT / RELAY_PORT_MIN / RELAY_PORT_MAX must be integers"
+(( TRANSPORT_PORT >= 1024 )) || fail "RELAY_GATEWAY_PORT must be >= 1024 (relayctl.NewPortRange lower bound)"
 (( RELAY_PORT_MIN >= 1024 && RELAY_PORT_MAX <= 65535 && RELAY_PORT_MIN <= RELAY_PORT_MAX )) || fail "RELAY_PORT_MIN/MAX must satisfy 1024 <= MIN <= MAX <= 65535 (relayctl.NewPortRange)"
 (( TRANSPORT_PORT != 443 && TRANSPORT_PORT != PORT && TRANSPORT_PORT != 3478 )) || fail "RELAY_GATEWAY_PORT must not collide with 443 (gateway), $PORT (control) or 3478 (STUN)"
 (( TRANSPORT_PORT < RELAY_PORT_MIN || TRANSPORT_PORT > RELAY_PORT_MAX )) || fail "RELAY_GATEWAY_PORT ($TRANSPORT_PORT) must stay outside the proxy port range [${RELAY_PORT_MIN}, ${RELAY_PORT_MAX}]"
@@ -258,7 +259,7 @@ ssh "$HOST" "chmod 600 $REMOTE_DIR/relay-transport/frps.key $REMOTE_DIR/relay-tr
 
 # ---- remote control .env (ssh stdin; every name verified against
 # ---- control/internal/config/config.go Load()) ----------------------------------
-ssh "$HOST" "cat > $REMOTE_DIR/.env" <<EOF
+ssh "$HOST" "cat > $REMOTE_DIR/.env && chmod 600 $REMOTE_DIR/.env" <<EOF
 # control (sharebridge.service)
 CLOUDFLARE_TOKEN=${CLOUDFLARE_TOKEN}
 CONTENT_BASE_DOMAIN=${BASE_DOMAIN}
