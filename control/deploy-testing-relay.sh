@@ -241,6 +241,11 @@ openssl x509 -req -in "$LEAF_CSR" -CA "$CA_PEM" -CAkey "$CA_KEY" -CAcreateserial
 rm -f "$LEAF_CSR" "$EXT_FILE" "$CA_DIR/relay-transport-ca.srl"
 echo "issued frps transport certificate for ${RELAY_GATEWAY_HOST} (SAN also includes ${RELAY_GATEWAY_IPV4})"
 
+# ---- stop any running units BEFORE copying binaries: Linux refuses to open
+# ---- a running binary for write (ETXTBSY), so an in-place upgrade must not
+# ---- scp over live executables. Units are restarted below after the copy.
+ssh "$HOST" "systemctl stop $SVC_FRPS $SVC_GATEWAY $SVC_CONTROL 2>/dev/null || true"
+
 # ---- copy binaries + assets + certs --------------------------------------------
 ssh "$HOST" "mkdir -p $REMOTE_DIR/web $REMOTE_DIR/relay-bin $REMOTE_DIR/frps $REMOTE_DIR/relay-transport $REMOTE_DIR/relay-data && chmod 700 $REMOTE_DIR/relay-data $REMOTE_DIR/relay-transport"
 scp -q "$BIN_CONTROL" "$HOST:$REMOTE_DIR/server"
