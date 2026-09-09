@@ -1,0 +1,4 @@
+# Task 24 runtime artifacts — never committed.
+node_modules/
+test-results/
+.state.json

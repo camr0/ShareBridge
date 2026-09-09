@@ -1,0 +1,16 @@
+{
+  "name": "@sharebridge/e2e-browser",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Task 24 — cross-browser (Chromium/Firefox/WebKit) proof of the §23.4 four-second route/CORS/CSP/noscript behavior against the real control + agent fixture.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test --project=chromium --project=firefox --project=webkit",
+    "test:chromium": "playwright test --project=chromium",
+    "test:firefox": "playwright test --project=firefox",
+    "test:webkit": "playwright test --project=webkit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
+  }
+}

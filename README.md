@@ -52,6 +52,21 @@ cd web
 npm test
 ```
 
+Cross-browser route-flow gate (Playwright; Chromium, Firefox, and WebKit
+against the hermetic real-control + real-agent fixture — Task 24, spec
+§23.4). Requires the Playwright browsers (`npx playwright install`) on first
+run:
+
+```bash
+cd e2e/browser
+npx playwright test --project=chromium --project=firefox --project=webkit
+```
+
+The fixture (control interstitial surface, loopback CONNECT proxy, and the
+real agent data plane) is booted by `global-setup.mjs` and torn down after
+the run; Safari macOS/iOS manual smoke steps live in
+[e2e/browser/PHASE-B-SAFARI.md](e2e/browser/PHASE-B-SAFARI.md).
+
 ## Deployment and compatibility
 
 Production deployment is currently operator-managed. See [docs/RELEASING.md](docs/RELEASING.md) for the complete verification, publication, deployment, smoke-test, and rollback checklist.
