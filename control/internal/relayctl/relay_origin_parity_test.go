@@ -44,7 +44,7 @@ func TestRelayOriginFromDirectDottedLabelIsAuthoritative(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RelayOriginFromDirect(%q): %v", dotted, err)
 	}
-	if want := "a.relay.b." + relayOriginParityNamespace + "." + relayOriginParityBase; got != want {
+	if want := "a.relay.b." + relayOriginParityNamespaceDomain; got != want {
 		t.Errorf("RelayOriginFromDirect(%q) = %q, want %q — the documented first-dot rule changed; re-derive the agent parity contract", dotted, got, want)
 	}
 }
