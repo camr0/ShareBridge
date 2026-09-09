@@ -22,6 +22,8 @@ relay/.cache/
 # Local secrets (never committed)
 .env
 .env.*
+# ...except the committed template (cp it to .env.testing and fill in real values)
+!.env.testing.example
 
 # Common local build outputs
 bin/
