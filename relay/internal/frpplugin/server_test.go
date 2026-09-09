@@ -1184,6 +1184,70 @@ func TestCorruptAdmissionStateRefusesStartup(t *testing.T) {
 	})
 }
 
+// Permission-drift repair on the loaded admission state must fail closed: a
+// chmod that errors — or silently does not take effect — is a startup error,
+// because the 0600 guarantee must never be silently absent. The failure is
+// injected through the Config.Chmod seam (mirroring Config.Now): a read-only
+// *directory* does not make the owner's chmod(2) fail on Linux or Darwin, so
+// the injection seam is the only portable way to exercise both failure paths.
+func TestAdmissionStatePermissionRepairFailsClosed(t *testing.T) {
+	validState := mustJSON(t, persistedAdmissionState{
+		Version: admissionStateFileVersion,
+		JTIs:    []persistedJTI{{JTI: "burned-jti", ExpiresAt: testNow.Add(5 * time.Minute)}},
+	})
+
+	t.Run("chmod error refuses startup", func(t *testing.T) {
+		statePath := filepath.Join(t.TempDir(), "admission-state.json")
+		if err := os.WriteFile(statePath, validState, 0o644); err != nil {
+			t.Fatalf("write state file: %v", err)
+		}
+		_, err := newPluginFixtureE(t, func(config *Config) {
+			config.StatePath = statePath
+			config.Chmod = func(string, os.FileMode) error { return fmt.Errorf("injected chmod failure") }
+		})
+		if err == nil {
+			t.Fatal("startup admitted although the 0600 permission repair failed")
+		}
+		if !strings.Contains(err.Error(), "permission repair") {
+			t.Fatalf("error = %v, want a permission-repair failure", err)
+		}
+	})
+
+	t.Run("chmod that does not take effect refuses startup", func(t *testing.T) {
+		statePath := filepath.Join(t.TempDir(), "admission-state.json")
+		if err := os.WriteFile(statePath, validState, 0o644); err != nil {
+			t.Fatalf("write state file: %v", err)
+		}
+		_, err := newPluginFixtureE(t, func(config *Config) {
+			config.StatePath = statePath
+			// A chmod reporting success while the mode stays wide (e.g. a
+			// filesystem that ignores the request) must not pass either: the
+			// post-repair stat pins the 0600 guarantee.
+			config.Chmod = func(string, os.FileMode) error { return nil }
+		})
+		if err == nil {
+			t.Fatal("startup admitted although the repair did not take effect")
+		}
+	})
+
+	t.Run("repairable drift still boots and ends 0600", func(t *testing.T) {
+		statePath := filepath.Join(t.TempDir(), "admission-state.json")
+		if err := os.WriteFile(statePath, validState, 0o644); err != nil {
+			t.Fatalf("write state file: %v", err)
+		}
+		if _, err := newPluginFixtureE(t, func(config *Config) { config.StatePath = statePath }); err != nil {
+			t.Fatalf("startup with repairable drift: %v", err)
+		}
+		info, err := os.Stat(statePath)
+		if err != nil {
+			t.Fatalf("stat state file: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("state mode after repair = %o, want 600", got)
+		}
+	})
+}
+
 // The admission state file stays bounded: entry caps keep its size far below
 // the startup read bound no matter how many credentials are admitted.
 func TestAdmissionStateFileStaysBounded(t *testing.T) {

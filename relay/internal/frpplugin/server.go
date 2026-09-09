@@ -132,6 +132,12 @@ type Config struct {
 	// over-cap file fails startup (fail closed) rather than admitting with
 	// wiped replay history. Empty disables persistence (process memory only).
 	StatePath string
+	// Chmod defaults to os.Chmod. It exists so tests can inject a failing
+	// (or no-op) implementation to prove the loaded state file's 0600
+	// permission repair fails closed — a read-only directory does not make
+	// the owner's chmod(2) fail, so the seam is the only portable way to
+	// exercise that path.
+	Chmod func(string, os.FileMode) error
 }
 
 // Server is both the HTTP handler and the bounded, concurrency-safe admission
@@ -160,6 +166,9 @@ type Server struct {
 	sessionsByToken    map[[sha256.Size]byte]*sessionState
 	userConnSeen       map[[sha256.Size]byte]struct{}
 	statePath          string
+	// chmod defaults to os.Chmod (see Config.Chmod): the injection seam that
+	// lets tests prove the state file's 0600 repair fails closed.
+	chmod func(string, os.FileMode) error
 }
 
 // admissionMark is the issued-at/generation admission high-water for one
@@ -307,6 +316,9 @@ func NewServer(config Config) (*Server, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
+	if config.Chmod == nil {
+		config.Chmod = os.Chmod
+	}
 	if config.PresenceEvents == nil {
 		config.PresenceEvents = discardPresenceEvents{}
 	}
@@ -328,6 +340,7 @@ func NewServer(config Config) (*Server, error) {
 		sessionsByToken:    make(map[[sha256.Size]byte]*sessionState),
 		userConnSeen:       make(map[[sha256.Size]byte]struct{}),
 		statePath:          config.StatePath,
+		chmod:              config.Chmod,
 	}
 	// Load persisted admission state BEFORE the event dispatcher starts and
 	// before any request can be admitted: a corrupt or over-cap state file
@@ -748,9 +761,21 @@ func (server *Server) loadAdmissionState() error {
 	server.replayedJTI = jtis
 	server.admissionHighWater = marks
 	// Repair permission drift on the loaded file: it holds replay
-	// identifiers and must stay owner-only.
+	// identifiers and must stay owner-only. A failed repair fails startup —
+	// the 0600 guarantee must never be silently absent — and the repair is
+	// verified afterwards so a chmod that reports success without taking
+	// effect cannot pass either.
 	if info, statErr := os.Stat(server.statePath); statErr == nil && info.Mode().Perm() != 0o600 {
-		_ = os.Chmod(server.statePath, 0o600)
+		if err := server.chmod(server.statePath, 0o600); err != nil {
+			return fmt.Errorf("frpplugin: admission state %q permission repair to 0600 failed: %w", server.statePath, err)
+		}
+		info, err := os.Stat(server.statePath)
+		if err != nil {
+			return fmt.Errorf("frpplugin: admission state %q post-repair stat failed: %w", server.statePath, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			return fmt.Errorf("frpplugin: admission state %q perms %o after repair, want 600", server.statePath, got)
+		}
 	}
 	return nil
 }
