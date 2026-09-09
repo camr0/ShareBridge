@@ -428,6 +428,7 @@ func (c *Controller) HandleSTUNResult(conn *websocket.Conn, apiKeyID, challenge,
 	es.attempt = 0
 	es.inFlightID = ""
 	es.rechallengeAt = obs.AcceptedAt.Add(stunRechallengeDelay(c.randFn()))
+	log.Printf("stun observation accepted for %s (source observed; details in direct posture, not logged)", apiKeyID)
 	c.armTimerLocked(apiKeyID, e, es, stunTimerRechallenge, es.rechallengeAt)
 	c.notifyWaitersLocked(es, *es.obs, true)
 	c.stunMu.Unlock()
