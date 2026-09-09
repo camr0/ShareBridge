@@ -27,9 +27,15 @@
 // exercised by Tasks 18–21 and 25; here each share code deterministically
 // stands for one §9.3 prepare outcome, exactly like control's own hermetic
 // e2e test stubs the coordinator/DDNS while running the real Controller.
-// Nothing that is under test in this gate is stubbed: the page, its assets,
-// its CSP, its four-second AbortController flow, the agent's admission,
-// connect endpoint and gallery are all the real shipped code.
+// Disclosed boundary: the control web assets (route-interstitial
+// html/.js/.css) and the agent behavior (Binder SNI admission, connect
+// endpoint, gallery) are the real shipped code; route dispatch (the §9.1
+// per-share outcome), the prepare-route JSON, the relay-URL derivation, and
+// the §9.3 CSP string construction are fixture ports of the control
+// implementations, not the control server binary. The ported CSP string is
+// drift-pinned against the shipped code by the shared golden
+// (control/web/testdata/route-interstitial-csp.golden), asserted at fixture
+// startup.
 
 import { spawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';

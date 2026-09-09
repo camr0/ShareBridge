@@ -53,9 +53,14 @@ npm test
 ```
 
 Cross-browser route-flow gate (Playwright; Chromium, Firefox, and WebKit
-against the hermetic real-control + real-agent fixture — Task 24, spec
-§23.4). Requires the Playwright browsers (`npx playwright install`) on first
-run:
+against the hermetic real-agent + control-surface fixture — Task 24, spec
+§23.4). The control interstitial assets and the agent behavior (admission,
+connect endpoint, gallery) are the real shipped code; route dispatch,
+prepare-route JSON, relay-URL derivation, and CSP string construction are
+fixture ports of the control implementations, with the ported CSP string
+drift-pinned by the shared golden — see the disclosed boundary in
+`e2e/browser/fixture.mjs`. Requires the Playwright browsers
+(`npx playwright install`) on first run:
 
 ```bash
 cd e2e/browser
