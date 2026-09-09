@@ -1072,9 +1072,10 @@ func TestSyncImmichSharesWiresClientForNewSession(t *testing.T) {
 }
 
 // TestRegisterImmichShareWaitsForDirectReady covers the I1-gap for Immich
-// polling: a direct (relay_only=false) Immich share must wait for the current
-// epoch's enrollment_ready before registering. Phase 3 rejects relay-only
-// registrations outright.
+// polling: every share — direct AND relay-only (§13.3: relay-only sessions
+// wait for BASELINE readiness, i.e. enrollment_ready, never direct DDNS
+// availability) — must wait for the current epoch's enrollment_ready before
+// registering.
 func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
 	setup := func(t *testing.T, relayOnly bool) (*Daemon, *mockSignalingClient) {
 		t.Helper()
@@ -1122,12 +1123,36 @@ func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
 		require.True(t, sig.registeredCode("IMMICHDIRECT1"))
 	})
 
-	t.Run("relay-only rejected", func(t *testing.T) {
+	t.Run("relay-only waits for baseline readiness too", func(t *testing.T) {
 		d, sig := setup(t, true)
 
-		_, err := d.registerImmichShare(context.Background(), link, 0, time.Time{})
-		require.ErrorContains(t, err, "relay-only")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := d.registerImmichShare(ctx, link, 0, time.Time{})
+			done <- err
+		}()
+
+		// Not ready: a relay-only registration must also wait — the same
+		// listener serves both routes, so baseline readiness is required.
+		select {
+		case err := <-done:
+			t.Fatalf("relay-only registerImmichShare returned before enrollment_ready: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
 		require.False(t, sig.registeredCode("IMMICHDIRECT1"))
+
+		d.handleEnrollmentReady(signaling.Message{})
+
+		select {
+		case err := <-done:
+			require.NoError(t, err, "relay-only registration must be accepted after baseline readiness")
+		case <-time.After(2 * time.Second):
+			t.Fatal("relay-only registerImmichShare did not unblock after enrollment_ready")
+		}
+		require.True(t, sig.registeredCode("IMMICHDIRECT1"))
 	})
 }
 

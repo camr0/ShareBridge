@@ -32,11 +32,13 @@ const (
 // RelaySelectionEnabled (Task 20), an active public unprotected Immich
 // relay_only share is servable (over relay only — selection routes it to the
 // relay URL or 503, never direct, §6.1/§13.3). Without the flag the Phase 3
-// classification stands: relay_only is unsupported (410). Password-protected
-// and non-Immich shares stay unsupported in both states (Task 27 owns their
-// restoration). Status classification does not depend on live transport
-// readiness (epoch, agent connectivity, open-signal, probe, presence) —
-// those are §9.1 selection terms evaluated later, per navigation.
+// classification stands: relay_only is unsupported (410) — relay-dependent
+// resolution is unavailable in rollback mode. Password-protected and
+// non-Immich shares stay unsupported in both states: §13.3's restoration is
+// scoped to supported public Immich gallery shares only, and tombstoned rows
+// are never reactivated here. Status classification does not depend on live
+// transport readiness (epoch, agent connectivity, open-signal, probe,
+// presence) — those are §9.1 selection terms evaluated later, per navigation.
 func (c *Controller) ResolveForRedirect(code string) (*core.Record, int) {
 	if code == "" {
 		return nil, http.StatusNotFound

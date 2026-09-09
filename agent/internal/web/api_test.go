@@ -1,6 +1,7 @@
 package web
 
 import (
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,7 +12,59 @@ import (
 	"sharebridge/agent/internal/config"
 )
 
-func TestShareForm_RelayRecommendedAndSelectedByDefault(t *testing.T) {
+// TestShareFormUsesAlwaysUseRelayCopy pins the §6.1 wording: the relay mode
+// is presented with the exact non-anonymity claim “Always use relay for this
+// share” in the share form and in the default-mode settings page, and the old
+// “Relay (recommended)” / “hides your IP” anonymity-promising copy is gone
+// wherever the share/default mode is presented.
+func TestShareFormUsesAlwaysUseRelayCopy(t *testing.T) {
+	cfg := &config.Config{DefaultRelayOnly: true}
+	ws, _ := newV1TestServer(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/share-form", nil)
+	rec := httptest.NewRecorder()
+	ws.shareFormHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	form := rec.Body.String()
+	if !strings.Contains(form, "Always use relay for this share") {
+		t.Errorf("share form must present the exact §6.1 copy %q", "Always use relay for this share")
+	}
+	for _, banned := range []string{"Relay (recommended)", "hides your IP"} {
+		if strings.Contains(form, banned) {
+			t.Errorf("share form must not contain %q (must not promise anonymity, §6.1)", banned)
+		}
+	}
+
+	// The settings page presents the same exact copy for the default mode.
+	layout, err := template.ParseFS(embeddedFS, "templates/layout.html")
+	if err != nil {
+		t.Fatalf("parse layout: %v", err)
+	}
+	settingsWS, _ := newV1TestServer(cfg)
+	settingsWS.layoutTmpl = layout
+
+	settingsRec := httptest.NewRecorder()
+	settingsWS.settingsHandler(settingsRec, httptest.NewRequest(http.MethodGet, "/settings", nil))
+
+	if settingsRec.Code != http.StatusOK {
+		t.Fatalf("settings status = %d: %s", settingsRec.Code, settingsRec.Body.String())
+	}
+	settings := settingsRec.Body.String()
+	if !strings.Contains(settings, "Always use relay for this share") {
+		t.Errorf("settings page must present the exact §6.1 copy for the default mode")
+	}
+	if strings.Contains(settings, "Relay (recommended)") {
+		t.Errorf("settings page must not contain %q (must not promise anonymity, §6.1)", "Relay (recommended)")
+	}
+}
+
+// TestShareForm_RelayModeSelectedByDefault pins the share-form mode radio
+// defaults: relay selected (and listed first) when DefaultRelayOnly is set,
+// with the §6.1 non-anonymity copy and the direct-mode warning intact.
+func TestShareForm_RelayModeSelectedByDefault(t *testing.T) {
 	cfg := &config.Config{DefaultRelayOnly: true}
 	ws, _ := newV1TestServer(cfg)
 
@@ -25,18 +78,18 @@ func TestShareForm_RelayRecommendedAndSelectedByDefault(t *testing.T) {
 	}
 
 	body := rec.Body.String()
-	relayIndex := strings.Index(body, "Relay (recommended)")
+	relayIndex := strings.Index(body, "Always use relay for this share")
 	directIndex := strings.Index(body, `>Direct<`)
 	if relayIndex == -1 || directIndex == -1 || relayIndex >= directIndex {
-		t.Errorf("Relay (recommended) must appear before Direct")
+		t.Errorf("relay mode must appear before Direct")
 	}
 	assertRadioChecked(t, body, "mode-relay", "true", true)
 	assertRadioChecked(t, body, "mode-direct", "false", false)
-	assertRadioLabelledBy(t, body, "mode-relay", "mode-relay-title", "Relay (recommended)")
+	assertRadioLabelledBy(t, body, "mode-relay", "mode-relay-title", "Always use relay for this share")
 	assertRadioLabelledBy(t, body, "mode-direct", "mode-direct-title", "Direct")
 
 	for _, want := range []string{
-		"End-to-end encrypted, hides your IP, and provides consistent performance.",
+		"End-to-end encrypted, and provides consistent performance.",
 		"Peer-to-peer, quota-free.",
 		"Direct transfers expose your IP address and may be slower due to browser protocol limitations. Use Relay for more consistent performance.",
 	} {
@@ -44,7 +97,7 @@ func TestShareForm_RelayRecommendedAndSelectedByDefault(t *testing.T) {
 			t.Errorf("body missing %q", want)
 		}
 	}
-	for _, old := range []string{"TURN", "Fast, free", "Requires TURN server"} {
+	for _, old := range []string{"TURN", "Fast, free", "Requires TURN server", "Relay (recommended)", "hides your IP"} {
 		if strings.Contains(body, old) {
 			t.Errorf("body contains obsolete copy %q", old)
 		}

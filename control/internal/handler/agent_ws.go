@@ -536,10 +536,13 @@ func handleRegisterShare(
 	ctrl *directctl.Controller,
 	routes RoutePublisher,
 ) {
-	// Phase 3 serves only direct, unprotected Immich gallery shares. Reject
-	// unsupported registrations before any session claim/create or origin
-	// allocation so they cannot become live control-plane state.
-	if msg.ShareType != "immich" || (msg.RelayOnly != nil && *msg.RelayOnly) || msg.IsPasswordProtected {
+	// Phase 4a serves direct AND relay-only public Immich gallery shares
+	// (§13.3: the temporary relay-only rejection is removed). Deferred share
+	// types stay rejected before any session claim/create or origin
+	// allocation so they cannot become live control-plane state: non-Immich
+	// shares and password-protected Immich shares (including protected
+	// relay-only payloads).
+	if msg.ShareType != "immich" || msg.IsPasswordProtected {
 		hub.SendDirect(ctx, conn, map[string]string{"type": "error", "message": "unsupported share type"})
 		return
 	}

@@ -342,6 +342,44 @@ func TestAgentWS_RegisterShare_PersistsRelayStaticPub(t *testing.T) {
 	require.Equal(t, "04abcd", session.GetString("relay_static_pub"))
 }
 
+// TestControlAcceptsSupportedRelayOnlyImmich pins §13.3: control
+// register_share validation accepts an active public (unprotected) Immich
+// relay-only registration — the Phase 3 temporary rejection is gone — and
+// treats it like any supported share: direct origin allocated, relay origin
+// derived by the §6 rule, relay_only persisted, session live.
+func TestControlAcceptsSupportedRelayOnlyImmich(t *testing.T) {
+	app, serverURL, cleanup := setupAgentWSWithController(t)
+	defer cleanup()
+
+	apiKey := createTestAgentAPIKey(t, app)
+	conn := dialAgentAndEnroll(t, serverURL, apiKey, "agent-relayonly")
+	defer conn.CloseNow()
+	ctx := context.Background()
+
+	require.NoError(t, conn.Write(ctx, websocket.MessageText, []byte(`{"type":"register_share","code":"RLYONLY01","share_type":"immich","relay_only":true}`)))
+	_, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"type":"share_registered"`)
+
+	var resp struct {
+		Type        string `json:"type"`
+		Origin      string `json:"origin"`
+		RelayOrigin string `json:"relay_origin"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &resp))
+	require.NotEmpty(t, resp.Origin)
+	expectedRelay, err := relayctl.RelayOriginFromDirect(resp.Origin)
+	require.NoError(t, err)
+	require.Equal(t, expectedRelay, resp.RelayOrigin, "share_registered returns both origins for a relay-only share")
+
+	session := findSessionByCode(t, app, "RLYONLY01")
+	require.NotNil(t, session, "supported relay-only registration must allocate a live session")
+	require.True(t, session.GetBool("relay_only"))
+	require.True(t, session.GetBool("is_active"))
+	require.Equal(t, "immich", session.GetString("share_type"))
+	require.False(t, session.GetBool("is_password_protected"))
+}
+
 func TestAgentWS_RegisterShare_RejectsUnsupportedPayloadBeforeSessionCreation(t *testing.T) {
 	testApp, serverURL, cleanup := setupAgentWSWithController(t)
 	defer cleanup()
@@ -355,8 +393,9 @@ func TestAgentWS_RegisterShare_RejectsUnsupportedPayloadBeforeSessionCreation(t 
 		name, payload string
 	}{
 		{"wrong type", `{"share_type":"webdav"}`},
-		{"relay only", `{"share_type":"immich","relay_only":true}`},
+		{"relay only non-immich", `{"share_type":"opencloud","relay_only":true}`},
 		{"protected", `{"share_type":"immich","is_password_protected":true}`},
+		{"protected relay only", `{"share_type":"immich","relay_only":true,"is_password_protected":true}`},
 	} {
 		code := "UNSUPPORTED" + strings.ReplaceAll(strings.ToUpper(tc.name), " ", "")
 		payload := fmt.Sprintf(`{"type":"register_share","code":%q,%s}`, code, tc.payload[1:len(tc.payload)-1])

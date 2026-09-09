@@ -162,6 +162,12 @@ type directState struct {
 	baseDomain string
 	serveNS    string                // namespace the binder/server were built for
 	origins    map[string]originPair // share code → §6 origin pair (direct + relay)
+	// relayOrigins tracks relay-only sessions' single RouteRelay binding
+	// (share code → relay origin). §13.3: a relay-only share gets zero
+	// direct-path setup — its direct origin is never bound and no originPair
+	// is created — so its lone binding is bookkept separately for rebuild
+	// and revocation.
+	relayOrigins map[string]string
 
 	started    bool               // DirectServer.Start guard (under mu)
 	startGen   uint64             // increments per start attempt (under mu)
@@ -327,9 +333,51 @@ func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 	return pair, true
 }
 
+// bindRelayOnlyOrigin admits ONLY the §6 relay origin of a relay-only share
+// (§13.3: zero direct-path setup — the direct origin is never bound, and no
+// originPair is created) and records the single binding for binder rebuild
+// and revocation. The control-allocated direct origin is only the derivation
+// input for the deterministic relay hostname (§6); it is never admitted, so
+// SignalGate authorization can never open the share direct either. It
+// reports the installed relay origin and whether the binding succeeded; it
+// is a no-op (ok=false) until the binder exists or the direct origin is
+// empty/undervivable.
+func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
+	ds := d.direct
+	if ds == nil || directOrigin == "" {
+		return "", false
+	}
+	// Snapshot the binder under the state lock: syncDirectServe swaps the
+	// binder under ds.mu, so an unlocked read here would race a namespace
+	// change/reconnect.
+	ds.mu.Lock()
+	binder := ds.binder
+	ds.mu.Unlock()
+	if binder == nil {
+		return "", false
+	}
+	relayOrigin, err := binder.RelayOriginFor(directOrigin)
+	if err != nil {
+		log.Printf("derive relay origin for share %s: %v", code, err)
+		return "", false
+	}
+	if err := binder.Allow(relayOrigin, direct.RouteRelay, code); err != nil {
+		log.Printf("bind relay origin for share %s: %v", code, err)
+		return "", false
+	}
+	ds.mu.Lock()
+	if ds.relayOrigins == nil {
+		ds.relayOrigins = make(map[string]string)
+	}
+	ds.relayOrigins[code] = relayOrigin
+	ds.mu.Unlock()
+	return relayOrigin, true
+}
+
 // revokeOrigin drops the origin pair for a share code and revokes BOTH binder
 // bindings as one logical operation (§6: revocation removes both bindings).
-// It is a no-op if no origin pair was recorded.
+// For a relay-only share it drops the single relay-origin binding recorded by
+// bindRelayOnlyOrigin instead. It is a no-op if no binding was recorded.
 func (d *Daemon) revokeOrigin(code string) {
 	ds := d.direct
 	if ds == nil {
@@ -340,10 +388,20 @@ func (d *Daemon) revokeOrigin(code string) {
 	if ok {
 		delete(ds.origins, code)
 	}
+	relayOrigin, relayOnlyBound := ds.relayOrigins[code]
+	if relayOnlyBound {
+		delete(ds.relayOrigins, code)
+	}
 	binder := ds.binder
 	ds.mu.Unlock()
-	if ok && binder != nil {
+	if binder == nil {
+		return
+	}
+	if ok {
 		binder.RevokeShare(pair.directOrigin, pair.relayOrigin)
+	}
+	if relayOnlyBound {
+		binder.Revoke(relayOrigin)
 	}
 }
 
@@ -374,11 +432,18 @@ func (d *Daemon) syncDirectServe() {
 	}
 	// Re-Allow currently-bound origin pairs into the fresh binder (atomic
 	// under ds.mu): BOTH route kinds are re-admitted for every bound session
-	// (§13.1). Origins from a previous namespace are rejected by AllowShare
-	// and are re-bound once the control re-allocates them for the new namespace.
+	// (§13.1). Relay-only sessions re-admit their single RouteRelay binding
+	// (§13.3). Origins from a previous namespace are rejected by
+	// AllowShare/Allow and are re-bound once the control re-allocates them
+	// for the new namespace.
 	for code, pair := range ds.origins {
 		if err := ds.binder.AllowShare(pair.directOrigin, pair.relayOrigin, code); err != nil {
 			log.Printf("re-allow origins for share %s after binder rebuild: %v", code, err)
+		}
+	}
+	for code, relayOrigin := range ds.relayOrigins {
+		if err := ds.binder.Allow(relayOrigin, direct.RouteRelay, code); err != nil {
+			log.Printf("re-allow relay origin for share %s after binder rebuild: %v", code, err)
 		}
 	}
 	ds.serveNS = ds.namespace
@@ -396,8 +461,9 @@ func (d *Daemon) buildDirectState(withNetwork bool) {
 	}
 
 	ds := &directState{
-		baseDomain: baseDomain,
-		origins:    make(map[string]originPair),
+		baseDomain:   baseDomain,
+		origins:      make(map[string]originPair),
+		relayOrigins: make(map[string]string),
 	}
 	d.direct = ds
 
@@ -687,13 +753,11 @@ func (d *Daemon) Stop() error {
 }
 
 // CreateSession creates a new share session and registers it with the
-// signaling server. Phase 3 only supports direct (non-relay) gallery shares:
-// relay-only and WebDAV/file (opencloud/nextcloud) shares are rejected.
+// signaling server. Phase 4a serves direct and relay-only public Immich
+// gallery shares (§13.3: the temporary relay-only rejection is removed;
+// relay-only mode follows the persisted DefaultRelayOnly setting). WebDAV/
+// file (opencloud/nextcloud) shares remain rejected deferred share types.
 func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
-	// Phase 3 enforcement: relay-only and WebDAV/file shares are unsupported.
-	if relayOnly {
-		return "", validationError{message: "relay-only shares are not supported"}
-	}
 	switch shareType {
 	case "immich":
 		return d.createManualImmichSession(ctx, shareURL, expiryDuration, maxDownloads)
@@ -1083,23 +1147,23 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 			continue
 		}
 
-		// Phase 3 enforcement: protected, relay-only, and WebDAV/file sessions
-		// are unsupported. Remove them and their control registrations.
-		if entry.IsPasswordProtected || entry.RelayOnly || entry.ShareType != "immich" {
+		// Deferred share types remain unsupported (§13.3): protected Immich
+		// and WebDAV/file (opencloud/nextcloud) sessions are still removed
+		// and their control registrations tombstoned. Relay-only public
+		// Immich sessions are restored instead (§13.3).
+		if entry.IsPasswordProtected || entry.ShareType != "immich" {
 			log.Printf("warning: removing unsupported persisted session %s (share_type=%s relay_only=%v protected=%v)", entry.Code, entry.ShareType, entry.RelayOnly, entry.IsPasswordProtected)
 			d.cleanupPersistedSession(ctx, entry)
 			continue
 		}
 
-		// Direct (non-relay) sessions must wait for the current epoch's
-		// enrollment_ready before re-registration; relay-only sessions proceed
-		// immediately. Without this gate a reconnect would register a direct
-		// session (and allocate an origin) before the certificate is usable.
-		if !entry.RelayOnly {
-			if err := d.waitForDirectReady(ctx); err != nil {
-				log.Printf("warning: direct transport not ready, deferring session %s: %v", entry.Code, err)
-				continue
-			}
+		// Every session waits for the current epoch's baseline readiness
+		// (enrollment_ready: TLS + relay DNS, §7.1) before re-registration —
+		// relay-only sessions included, since the same listener serves both
+		// routes. Direct AVAILABILITY (DDNS/public port) is never waited on.
+		if err := d.waitForDirectReady(ctx); err != nil {
+			log.Printf("warning: direct transport not ready, deferring session %s: %v", entry.Code, err)
+			continue
 		}
 
 		client, err := d.newImmichClient(entry.Code)
@@ -1126,7 +1190,14 @@ func (d *Daemon) loadSessionsFromStore(ctx context.Context) {
 		if origin == "" {
 			origin = entry.Origin
 		}
-		d.bindOrigin(code, origin)
+		// §13.3: a restored relay-only session binds its relay origin only —
+		// zero direct-path setup, no originPair; direct sessions bind the
+		// full §6 pair.
+		if entry.RelayOnly {
+			d.bindRelayOnlyOrigin(code, origin)
+		} else {
+			d.bindOrigin(code, origin)
+		}
 
 		session := &Session{
 			Code:                code,
@@ -1292,17 +1363,16 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 	passwordProtected := link.IsPasswordProtected()
 	relayOnly := d.GetConfig().DefaultRelayOnly
 
-	// Phase 3 enforcement: relay-only and protected Immich shares are
-	// unsupported at every entry point.
-	if relayOnly {
-		return nil, validationError{message: "relay-only shares are not supported"}
-	}
+	// Password-protected Immich shares remain a deferred share type (§13.3);
+	// relay-only public Immich shares are restored (Phase 4a).
 	if passwordProtected {
 		return nil, validationError{message: "password-protected Immich shares are not supported"}
 	}
 
-	// Direct Immich shares must wait for the current epoch's enrollment_ready
-	// before registration: a direct share needs a live origin + certificate.
+	// Every registration waits for the current epoch's baseline readiness
+	// (enrollment_ready: TLS + relay DNS, §7.1) — direct AND relay-only
+	// shares alike, since the same listener serves both routes. Direct
+	// availability (DDNS/public port) is never waited on.
 	if err := d.waitForDirectReady(ctx); err != nil {
 		return nil, fmt.Errorf("direct transport not ready: %w", err)
 	}
@@ -1319,9 +1389,13 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 	if err != nil {
 		return nil, err
 	}
-	pair, bound := d.bindOrigin(code, origin)
-	relayOrigin := ""
-	if bound {
+	// §13.3: a relay-only share binds its relay origin only — zero
+	// direct-path setup (the direct origin stays unbound and no originPair
+	// is created); a direct share binds the full §6 pair.
+	var relayOrigin string
+	if relayOnly {
+		relayOrigin, _ = d.bindRelayOnlyOrigin(code, origin)
+	} else if pair, bound := d.bindOrigin(code, origin); bound {
 		relayOrigin = pair.relayOrigin
 	}
 	client, err := d.newImmichClient(code)

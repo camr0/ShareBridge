@@ -9,6 +9,7 @@ package directctl
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,4 +119,83 @@ func TestResolveForRedirectRelayOnlyLifecycleFlagGated(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCanonicalRelayOnlyResolution pins §13.3/§6.1 on the canonical-route
+// entry point for the restored share type (Task 27): an active public Immich
+// relay_only share resolves — through the exact production dispatch pair —
+// to the RELAY origin and never to the direct origin or a direct candidate;
+// relay-dependent resolution stays unavailable with the selection flag off;
+// previously tombstoned unsupported rows are NOT reactivated.
+func TestCanonicalRelayOnlyResolution(t *testing.T) {
+	t.Run("flag on resolves to the relay origin only", func(t *testing.T) {
+		app, ctrl, _, view, spy := newSelectionController(t, true)
+		apiKeyID := routeSession(t, app, "canonrelay", func(r *core.Record) { r.Set("relay_only", true) })
+		port := seedAgentFacts(t, app, apiKeyID, routeDirectIP)
+		grantPresence(t, view, agentRecordID(t, app, apiKeyID), port)
+
+		status, resp := resolveAndSelect(t, ctrl, "canonrelay")
+		if status != http.StatusFound {
+			t.Fatalf("lifecycle status = %d, want 302 (servable type, §13.3)", status)
+		}
+		want := "https://" + routeRelayOriginFor("canonrelay") + "/s/canonrelay"
+		if resp.Code != http.StatusFound || resp.Header().Get("Location") != want {
+			t.Fatalf("canonical resolution = %d %q, want 302 %q", resp.Code, resp.Header().Get("Location"), want)
+		}
+		if strings.Contains(resp.Header().Get("Location"), routeOriginFor("canonrelay")) {
+			t.Fatalf("relayOnly canonical link must never reference the direct origin: %q", resp.Header().Get("Location"))
+		}
+		// §6.1/§9.2: canonical relayOnly resolution touches no direct machinery.
+		if emitOpens, probes, agentSends, stunIssues, ddns, relayDNS := spy.counts(); emitOpens != 0 || probes != 0 || agentSends != 0 || stunIssues != 0 || ddns != 0 || relayDNS != 0 {
+			t.Fatalf("relayOnly canonical resolution touched direct machinery: %d %d %d %d %d %d",
+				emitOpens, probes, agentSends, stunIssues, ddns, relayDNS)
+		}
+	})
+
+	t.Run("flag on without relay presence is 503 never direct", func(t *testing.T) {
+		app, ctrl, _, view, _ := newSelectionController(t, true)
+		apiKeyID := routeSession(t, app, "canonnopres", func(r *core.Record) { r.Set("relay_only", true) })
+		seedAgentFacts(t, app, apiKeyID, routeDirectIP) // assignment exists, no gateway presence lease granted
+		_ = view
+
+		status, resp := resolveAndSelect(t, ctrl, "canonnopres")
+		if status != http.StatusFound {
+			t.Fatalf("lifecycle status = %d, want 302", status)
+		}
+		if resp.Code != http.StatusServiceUnavailable || resp.Header().Get("Location") != "" {
+			t.Fatalf("relayOnly without presence = %d %q, want 503 with no Location", resp.Code, resp.Header().Get("Location"))
+		}
+	})
+
+	t.Run("flag off keeps relay-dependent resolution unavailable", func(t *testing.T) {
+		app, ctrl, _, _, _ := newSelectionController(t, false)
+		apiKeyID := routeSession(t, app, "canonrollbk", func(r *core.Record) { r.Set("relay_only", true) })
+		port := seedAgentFacts(t, app, apiKeyID, routeDirectIP)
+		_ = port
+
+		status, resp := resolveAndSelect(t, ctrl, "canonrollbk")
+		if status != http.StatusGone {
+			t.Fatalf("flag-off relayOnly lifecycle status = %d, want 410", status)
+		}
+		if resp.Header().Get("Location") != "" {
+			t.Fatalf("flag-off relayOnly must not reach selection: %q", resp.Header().Get("Location"))
+		}
+	})
+
+	t.Run("unsupported tombstones are not reactivated", func(t *testing.T) {
+		app, ctrl, _, _, _ := newSelectionController(t, true)
+		routeSession(t, app, "canontomb", func(r *core.Record) {
+			r.Set("relay_only", true)
+			r.Set("is_active", false)
+			r.Set("inactive_reason", "unsupported") // a Phase 3 tombstone
+		})
+
+		status, resp := resolveAndSelect(t, ctrl, "canontomb")
+		if status != http.StatusGone {
+			t.Fatalf("tombstoned relayOnly status = %d, want 410 (not resurrected)", status)
+		}
+		if resp.Header().Get("Location") != "" {
+			t.Fatalf("tombstoned relayOnly must not reach selection: %q", resp.Header().Get("Location"))
+		}
+	})
 }
