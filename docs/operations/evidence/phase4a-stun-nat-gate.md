@@ -67,8 +67,8 @@ hashes pasted verbatim from `STUN_GATE_EVIDENCE` lines.
 - Listener version+host: deployed control `3819bd07`, `178.156.174.47:3478`
 - Observed source IP (public, via VPN): `174.237.223.169:62945`
 - Required surface IP (`STUN_GATE_EXPECTED_PUBLIC_IP`): `173.54.233.213`
-- Result (PASS/FAIL — PASS = observed ≠ required, i.e. the §10.3 exact-match comparison fails and the flow stops before the public reachability probe): **PASS** — "mismatched egress observable: mapped source differs from the required surface; §10.3 exact-match fails and stops before the public probe"
-- Notes: receipt hash `439147ebcbf69297100bf3d7be7cf58a4f3554259608729d4fbcfb065126380b` (the UDP receipt itself verifies — the mismatch is refused at the policy layer, exactly as specified).
+- Result (PASS/FAIL — PASS = observed ≠ required, i.e. the mapped source differs from the required surface): **PASS** — "mismatched egress observable: mapped source differs from the required surface"
+- Notes: receipt hash `439147ebcbf69297100bf3d7be7cf58a4f3554259608729d4fbcfb065126380b` (the UDP receipt itself verifies — the mismatch is refused at the policy layer, exactly as specified). Scope: the remote run proves the mapped-source mismatch is observable through the real egress path; the §10.3 probe suppression itself is proven compositionally by the local production-code test.
 
 ## Case: receipt-replay
 
@@ -210,10 +210,10 @@ case 1 to record recovery on the unblocked path.
    ```
 
 PASS = the UDP exchange still verifies a receipt but its mapped source
-differs from the expected surface, i.e. the §10.3 exact-match comparison
-fails and direct selection stops before the public probe. (The probe stop
-itself is proven against the real listener code by the local pre-flight;
-this run proves the mismatch is observable through the real egress path.)
+differs from the expected surface. Scope: the remote run proves the
+mapped-source mismatch is observable through the real egress path; the
+§10.3 probe suppression itself is proven compositionally by the local
+production-code test (direct selection stops before the public probe).
 
 ### 5. Spoof, receipt-replay, expired-challenge
 
