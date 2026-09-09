@@ -58,6 +58,9 @@
 # Environment (remote mode; the API key is env-only so it never appears in
 # `ps` output or shell history):
 #   STUN_GATE_API_KEY            agent API key for the deployed control
+#   STUN_GATE_SERVER             deployed control wss:// URL (same as --server)
+#   STUN_GATE_STUN_ADDR          host:port for the UDP exchange if not the WS host (same as --stun-addr)
+#   STUN_GATE_EXPECTED_PUBLIC_IP this network's expected egress IP for the mismatched-egress case (same as --expected-public-ip)
 #   STUN_GATE_CERT_FINGERPRINT   optional: fingerprint of the already enrolled
 #                                agent cert (persisted agents row) to skip CSR
 #                                issuance on the deployed control
@@ -89,7 +92,7 @@ gate_cert_fp="${STUN_GATE_CERT_FINGERPRINT:-}"
 wait_rechallenge="${STUN_GATE_WAIT_RECHALLENGE:-}"
 
 usage() {
-  sed -n '2,72p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,78p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -145,7 +148,9 @@ export STUN_GATE_WAIT_RECHALLENGE="$wait_rechallenge"
 log "stun-nat-gate: target=${target} cases=${selected_cases:-all}"
 
 output_file="$(mktemp "${TMPDIR:-/tmp}/stun-nat-gate-output.XXXXXX")"
-trap 'rm -f -- "$output_file"' EXIT
+# Preserve the helper output for diagnosis when the run fails (its path is
+# printed and its tail shown below); remove it only on a clean exit.
+trap 'if [[ "${go_status:-1}" -eq 0 ]]; then rm -f -- "$output_file"; fi' EXIT
 
 # Run the helper. Markers on stdout:
 #   STUN_GATE_CASE     <name> <PASS|FAIL|SKIP> <detail...>
@@ -161,7 +166,9 @@ pushd "$control_dir" >/dev/null
 popd >/dev/null
 
 if [[ $go_status -ne 0 ]]; then
-  log "go test exited nonzero (status ${go_status}); helper output: ${output_file}"
+  log "go test exited nonzero (status ${go_status}); full helper output preserved at: ${output_file}"
+  log "last 40 lines of helper output:"
+  tail -n 40 "$output_file" >&2 || true
 fi
 
 # Parse markers into the gate table. Missing results are synthesized FAILs so

@@ -16,6 +16,7 @@ package directctl
 // the integrity-protected response, exactly like the Task 17 client.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -27,6 +28,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -965,6 +967,14 @@ func runGateCase(t *testing.T, name string, fn func(g *gateRun)) {
 			result, detail = "FAIL", g.failDetail
 		case t.Failed():
 			result, detail = "FAIL", "assertion failed"
+		case t.Skipped():
+			// A skip emits NO marker here: Goexit still runs this defer and
+			// t.Failed() is false for a skip, so without this guard a skip
+			// fell through to the PASS default and the script's last-wins
+			// parser counted it as PASS. The case function prints its own
+			// explicit SKIP marker BEFORE skipping (see
+			// gateRemoteMismatchedEgress).
+			return
 		case detail == "":
 			detail = "ok"
 		}
@@ -1825,6 +1835,47 @@ func gateRemoteProveAcceptance(g *gateRun, a *gateRemoteAgent, echoedAt time.Tim
 		g.fatalf("control scheduled a backoff retry at +%s — the stun_result was NOT accepted", elapsed.Truncate(time.Second))
 	}
 	return elapsed
+}
+
+// Regression (fix round): a skip raised inside fn AFTER the deferred marker
+// emitter is installed must emit NO marker. Goexit still runs the defer and
+// t.Failed() is false for a skip, so the emitter used to fall through to the
+// PASS default — the script's last-wins parser then counted skipped remote
+// cases (e.g. mismatched-egress without STUN_GATE_EXPECTED_PUBLIC_IP) as
+// PASS, reporting a false full-matrix §23.5 result. A SKIP marker is the
+// case function's own responsibility (see gateRemoteMismatchedEgress).
+func TestSTUNGateSkipInsideFnEmitsNoPassMarker(t *testing.T) {
+	t.Setenv("STUN_GATE_CASES", "")
+	t.Setenv("STUN_GATE_TARGET", "")
+
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	os.Stdout = w
+	captured := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		captured <- buf.String()
+	}()
+
+	t.Run("synthetic-skip-probe", func(t *testing.T) {
+		runGateCase(t, "skip-probe", func(g *gateRun) {
+			g.t.Skipf("synthetic skip after the marker emitter is installed")
+		})
+	})
+
+	os.Stdout = stdout
+	_ = w.Close()
+	out := <-captured
+	_ = r.Close()
+	for _, marker := range []string{"STUN_GATE_CASE skip-probe PASS", "STUN_GATE_CASE skip-probe FAIL"} {
+		if strings.Contains(out, marker) {
+			t.Fatalf("skip inside fn emitted a marker (%s) — a skip must never emit a PASS:\n%s", marker, out)
+		}
+	}
 }
 
 // TestSTUNGateRemoteCases is the gate script's remote mode: a minimal
