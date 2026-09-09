@@ -730,8 +730,20 @@ The separate Hetzner hosts use mutually authenticated private-network HTTP with:
 - explicit acknowledgements and last-applied revision;
 - bounded payloads and fail-closed authentication.
 
+- control epoch (boot identifier) stamped on every route snapshot, delta page, and
+  acknowledgement; always present, including on empty snapshots;
+- epoch-authoritative snapshot adoption: a full snapshot from a newer control epoch
+  wholesale-replaces gateway route state (per-route revisions restart within the epoch);
+  a snapshot from an older epoch is rejected and re-fetched; within one epoch,
+  application stays revision-monotonic;
+- an explicit revoke (or a snapshot omission) of an active route is never an idempotent
+  no-op: a stale-revision revoke against an active route forces snapshot reconciliation;
+- relay availability additionally proves the gateway holds the route state it is selected
+  on: selection requires healthy control↔gateway sync and a route revision the gateway has
+  acknowledged applying.
+
 The interface is not exposed publicly. A lost delta triggers snapshot reconciliation;
-neither side guesses across a revision gap.
+neither side guesses across a revision gap nor across an epoch boundary.
 
 ## 12. Database Changes
 
@@ -898,7 +910,11 @@ processes.
 The public listener stays closed until the gateway has authenticated with control and
 loaded a full route snapshot. Gateway boot ID changes, invalidating old presence
 events. `frps` is either restarted with it or all prior proxy presence is treated
-absent. Agent `frpc` reconnects with jitter using a freshly re-issued credential
+absent. A control restart begins a new control epoch carried on every route payload.
+Gateways adopt the new epoch by comparing epochs — never revisions — so a regressed
+per-route revision cannot shield a route from the new epoch's revocations; revocation
+state is re-derived from the epoch's snapshot, including an empty one. Agent `frpc`
+reconnects with jitter using a freshly re-issued credential
 (`relay_credential_request`, §7.2), re-registers its exact proxy, and only then
 does control regain a relay-available lease. Canonical links show preparing/offline or
 use direct during the gap; they never redirect based on persisted `relay_last_seen_at`.
