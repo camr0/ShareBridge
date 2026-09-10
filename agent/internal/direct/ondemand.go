@@ -37,8 +37,9 @@ const (
 )
 
 var (
-	ErrPortClosed  = errors.New("direct: port is closed")
-	ErrDeleteRetry = errors.New("direct: mapping deletion failed; retrying")
+	ErrPortClosed     = errors.New("direct: port is closed")
+	ErrDeleteRetry    = errors.New("direct: mapping deletion failed; retrying")
+	ErrOpenSuperseded = errors.New("direct: open superseded by a lockdown transition")
 )
 
 // portClock abstracts time so tests can drive the single state-loop timer
@@ -102,7 +103,8 @@ type portCommand struct {
 	callback  func(old, new PortState, grantedPort int)
 	reply     chan portReply
 
-	// stillCurrent is the optional generation fence of opCloseIf (see CloseIf).
+	// stillCurrent is the optional generation fence of opCloseIf/opOpenFor
+	// (see CloseIf and OpenForIf).
 	stillCurrent func() bool
 }
 
@@ -207,8 +209,22 @@ func (p *OnDemandPort) SetTransitionCallback(cb func(old, new PortState, granted
 // independently registered and source-verified may be passed here; the signal
 // handler enforces that (see opensignal.go), not this type.
 func (p *OnDemandPort) OpenFor(shareID string, lease time.Duration) error {
+	return p.OpenForIf(shareID, lease, nil)
+}
+
+// OpenForIf maps (or re-maps/renews) the port exactly like OpenFor, but only
+// while stillCurrent reports that the caller's admission generation is still
+// current. stillCurrent is evaluated ON THE STATE LOOP immediately before the
+// mapping is created or renewed — and again after the cold open's port
+// selection router I/O — so it is atomic with respect to the mapping mutation
+// and with respect to any concurrent CloseIf. A stale caller (an open signal
+// admitted before a §13.4 lockdown that then advanced the generation) fails
+// closed with ErrOpenSuperseded: no mapping is created, no renewal is issued,
+// and the port's state is left untouched. A nil stillCurrent is equivalent to
+// OpenFor. The caller holds no lock across the router I/O.
+func (p *OnDemandPort) OpenForIf(shareID string, lease time.Duration, stillCurrent func() bool) error {
 	ch := make(chan portReply, 1)
-	return p.send(portCommand{op: opOpenFor, shareID: shareID, lease: lease, reply: ch}).err
+	return p.send(portCommand{op: opOpenFor, shareID: shareID, lease: lease, stillCurrent: stillCurrent, reply: ch}).err
 }
 
 // BeginSession records a new recipient session for shareID and returns an
@@ -437,6 +453,15 @@ func (p *OnDemandPort) loop() {
 		case c := <-p.cmds:
 			switch c.op {
 			case opOpenFor:
+				// Generation fence, evaluated here on the state loop: an open
+				// signal admitted before a lockdown must not create or renew a
+				// mapping after the lockdown advanced the generation. This
+				// check and the mapping mutation below run in one loop step, so
+				// no CloseIf can interleave between them.
+				if c.stillCurrent != nil && !c.stillCurrent() {
+					c.reply <- portReply{err: ErrOpenSuperseded}
+					continue
+				}
 				l := c.lease
 				if l < minValidLease {
 					l = minValidLease
@@ -459,6 +484,13 @@ func (p *OnDemandPort) loop() {
 						continue
 					}
 					p.extPort = requested
+					// Re-evaluate as the last thing before the mapping is created:
+					// ChooseExternalPort above performs bounded router I/O during
+					// which a lockdown may have advanced the generation.
+					if c.stillCurrent != nil && !c.stillCurrent() {
+						c.reply <- portReply{err: ErrOpenSuperseded}
+						continue
+					}
 					granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(l.Seconds()))
 					if err != nil {
 						c.reply <- portReply{err: err}
@@ -494,6 +526,10 @@ func (p *OnDemandPort) loop() {
 					idleAt = time.Time{}
 				}
 				if now.Add(l).After(deadline) {
+					// Renewal is gated by the same generation fence: a stale open
+					// must not extend a mapping it no longer observes. The fence
+					// was evaluated at the top of this case, immediately before
+					// this renewal (no router I/O in between).
 					granted, err := p.mapper.AddPortMapping(grantedPort, p.intPort, p.desc(), int(l.Seconds()))
 					if err != nil {
 						renewFailed = true

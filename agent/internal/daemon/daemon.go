@@ -1749,6 +1749,19 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "rejected"})
 		return
 	}
+	// Capture the direct-state generation this open is admitted under BEFORE the
+	// slow ExternalIP lookup. A §13.4 lockdown (or lockdown+unlock) that advances
+	// the generation while we wait must fence this open: it may not create or
+	// renew a mapping after lockdown's CloseIf already ran. The OnDemandPort
+	// state loop re-checks this fence atomically with the mapping mutation (see
+	// OpenForIf), so the capture here is what makes the re-check decisive.
+	openEpoch, openCurrent := d.snapshotDirectOpenGeneration()
+	if !openCurrent {
+		log.Printf("open_signal %s refused: direct path is locked", msg.ShareID)
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "locked"})
+		return
+	}
 	// Fetch the fresh public IP and record it on the reporter BEFORE opening
 	// the port: OpenFor synchronously fires the open transition on the state
 	// loop, which snapshots the reporter's IP. Doing this first keeps the open
@@ -1764,7 +1777,15 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 		ds.reporter.SetIP(ip) // keep subsequent transition reports fresh
 	}
 	wasOpen := ds.port.Open()
-	if err := ds.port.OpenFor(msg.ShareID, sig.Lease); err != nil {
+	if err := ds.port.OpenForIf(msg.ShareID, sig.Lease, func() bool {
+		return d.directOpenGenerationCurrent(openEpoch)
+	}); err != nil {
+		if errors.Is(err, direct.ErrOpenSuperseded) {
+			log.Printf("open_signal %s refused: superseded by a lockdown transition", msg.ShareID)
+			_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+				ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "superseded"})
+			return
+		}
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
 		return
@@ -2421,6 +2442,41 @@ func (d *Daemon) lockdownEpochCurrent(epoch uint64) bool {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	return ds.lockdownEpoch == epoch
+}
+
+// snapshotDirectOpenGeneration captures the direct-state generation an
+// admitted open signal belongs to. It is taken BEFORE the slow ExternalIP
+// work so an open that waits there can be refused once lockdown supersedes it.
+// ok is false when the daemon is already locked at admission: there is no
+// generation to observe, so the open must fail closed without any mapping work.
+func (d *Daemon) snapshotDirectOpenGeneration() (epoch uint64, ok bool) {
+	ds := d.direct
+	if ds == nil {
+		return 0, false
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if ds.locked {
+		return ds.lockdownEpoch, false
+	}
+	return ds.lockdownEpoch, true
+}
+
+// directOpenGenerationCurrent reports whether epoch still owns the direct state
+// and the daemon is unlocked. It is safe to call from the OnDemandPort state
+// loop: no goroutine holding ds.mu ever calls into that loop, so the lock
+// cannot form a cycle (see lockdownEpochCurrent). A lockdown bumps
+// lockdownEpoch, so an open admitted under an older epoch is refused; an
+// Unlock bumps it again, so an open that never observed the locked generation
+// is refused too.
+func (d *Daemon) directOpenGenerationCurrent(epoch uint64) bool {
+	ds := d.direct
+	if ds == nil {
+		return false
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	return !ds.locked && ds.lockdownEpoch == epoch
 }
 
 // runLockdownLevers starts every best-effort lever concurrently and waits at
