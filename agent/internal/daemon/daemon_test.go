@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1602,6 +1603,263 @@ func TestLockdownGateIsFinalAndLeversFanOutBounded(t *testing.T) {
 	// the others or the return above.
 	release()
 	waitForCond(t, func() bool { return fx.mapper.deleteCount() > 0 })
+}
+
+// blockingLeverGate is a deterministic (channel-based) test gate for the
+// §13.4 best-effort levers: it holds the named levers at the very start of
+// their work until released, so a test can keep a specific lever alive past
+// the aggregation bound without any sleep-based synchronization, then release
+// it and prove what a superseded lever can and cannot still do.
+type blockingLeverGate struct {
+	mu      sync.Mutex
+	hold    map[string]bool
+	once    map[string]*sync.Once
+	reached map[string]chan struct{}
+	release chan struct{}
+}
+
+func newBlockingLeverGate(hold ...string) *blockingLeverGate {
+	g := &blockingLeverGate{
+		hold:    make(map[string]bool, len(hold)),
+		once:    make(map[string]*sync.Once, len(hold)),
+		reached: make(map[string]chan struct{}, len(hold)),
+		release: make(chan struct{}),
+	}
+	for _, name := range hold {
+		g.hold[name] = true
+		g.once[name] = &sync.Once{}
+		g.reached[name] = make(chan struct{})
+	}
+	return g
+}
+
+// wait blocks the calling lever until the test releases the gate. It is the
+// value installed as Daemon.lockdownLeverGate.
+func (g *blockingLeverGate) wait(name string) {
+	g.mu.Lock()
+	ch, holding := g.reached[name], g.hold[name]
+	once := g.once[name]
+	g.mu.Unlock()
+	if !holding {
+		return
+	}
+	once.Do(func() { close(ch) })
+	<-g.release
+}
+
+// awaitReached blocks until the named lever has entered the gate, failing
+// after a deadline. Channel-based, so it synchronizes rather than polls.
+func (g *blockingLeverGate) awaitReached(t *testing.T, name string) {
+	t.Helper()
+	g.mu.Lock()
+	ch := g.reached[name]
+	g.mu.Unlock()
+	if ch == nil {
+		t.Fatalf("lever %q is not gated by this test", name)
+	}
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("lockdown lever %q never reached its gate", name)
+	}
+}
+
+// countFanoutGoroutines counts the goroutines currently executing inside
+// runLockdownLevers: its lever goroutines, plus (before the fix) the detached
+// wg.Wait wrapper. The dump is requested with a buffer sized far above what
+// this test's dozen goroutines need.
+func countFanoutGoroutines(t *testing.T) int {
+	t.Helper()
+	buf := make([]byte, 4<<20)
+	dump := string(buf[:runtime.Stack(buf, true)])
+	n := 0
+	for _, g := range strings.Split(dump, "\ngoroutine ") {
+		if strings.Contains(g, "runLockdownLevers") {
+			n++
+		}
+	}
+	return n
+}
+
+// waitForFanoutGoroutines waits until exactly want goroutines remain in the
+// lockdown fan-out, failing after a deadline.
+func waitForFanoutGoroutines(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	got := countFanoutGoroutines(t)
+	for got != want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		got = countFanoutGoroutines(t)
+	}
+	if got != want {
+		t.Fatalf("goroutines still inside runLockdownLevers = %d, want %d (a detached fan-out wrapper is a leak)", got, want)
+	}
+}
+
+// TestLockdownAbandonedLeverExitsAndDoesNotBlockNextGeneration pins the round-2
+// lockdown contract for a lever that overruns the aggregation bound:
+//
+// (a) the fan-out detaches no wait-wrapper, and once the stalled lever's work
+// completes its goroutine exits (no leak);
+// (b) Unlock and a post-unlock OpenFor are not blocked by the stalled lever:
+// the router I/O bound makes the wedged close return, so the OnDemandPort
+// state loop serves the queued open;
+// (c) the later completion of the stalled close leaves the current
+// generation's mapping state intact.
+func TestLockdownAbandonedLeverExitsAndDoesNotBlockNextGeneration(t *testing.T) {
+	bm := &blockingCloseMapper{
+		recordingDirectMapper: &recordingDirectMapper{ip: "203.0.113.7"},
+		deleteStarted:         make(chan struct{}),
+		release:               make(chan struct{}),
+	}
+	fx := newLockdownFixtureWithPortMapper(t, bm.recordingDirectMapper, bm)
+	fx.d.lockdownLeverTimeout = 150 * time.Millisecond
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(bm.release) }) }
+	defer release()
+
+	// Pre-lockdown: healthy tunnel, open mapping, live listener.
+	fx.d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-overrun"))
+	waitForCond(t, func() bool { return fx.starter.startCount() == 1 })
+	require.NoError(t, fx.ds.port.OpenFor(fx.code, time.Minute))
+	if !fx.ds.port.Open() {
+		t.Fatalf("mapping must be open before lockdown")
+	}
+	fx.d.startDirectServer()
+	waitDialable(t, fx.ds.listenAddr)
+
+	require.NoError(t, fx.d.Lockdown())
+	// The mapping-close lever is wedged inside the router delete.
+	select {
+	case <-bm.deleteStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mapping-close lever never reached the router delete")
+	}
+
+	// Every other lever finished, so the only fan-out goroutine that may still
+	// be alive is the stalled one: exactly one, never a detached wait-wrapper.
+	assertListenerClosed(t, fx.ds.listenAddr)
+	child := fx.starter.recordAt(0).child
+	waitForCond(t, func() bool { return child.gracefulStopCount() == 1 })
+	waitForCond(t, func() bool {
+		return fx.sig.hasSentMessage("lockdown_status", map[string]any{"locked": true})
+	})
+	waitForFanoutGoroutines(t, 1)
+
+	// (b) Unlock completes while the stalled lever is still in the router.
+	unlockStart := time.Now()
+	require.NoError(t, fx.d.Unlock())
+	if elapsed := time.Since(unlockStart); elapsed >= 3*time.Second {
+		t.Fatalf("Unlock took %s, want it to proceed while the stale lever is stalled", elapsed)
+	}
+
+	// The router recovers: the stalled close returns and its goroutine exits.
+	// This is the explicit "no goroutine leak" assertion of the design: it is
+	// scoped to the fan-out goroutines themselves (the process-wide count moves
+	// concurrently with Unlock's listener/tunnel restore, so it cannot pin the
+	// lever). A detached wg.Wait wrapper would keep this above zero forever.
+	release()
+	waitForFanoutGoroutines(t, 0)
+
+	// (b) The queued post-unlock open is served once the close returned.
+	require.NoError(t, fx.ds.port.OpenFor(fx.code, time.Minute))
+	require.True(t, fx.ds.port.Open(), "mapping must be open after the wedged-then-recovered close")
+
+	// (c) The stale close already ran, so the current generation's mapping must
+	// stay open now that the state loop is settled.
+	assertConditionStays(t, "mapping open after the stale lever completed", 200*time.Millisecond, func() bool {
+		return fx.ds.port.Open()
+	})
+}
+
+// TestLockdownStaleLeversCannotTouchCurrentGeneration pins the §13.4
+// transition fences: levers held past the aggregation bound and released only
+// after an Unlock must not be able to touch the state the newer generation
+// owns — the restored Binder admissions, the restored listener, the mapping a
+// post-unlock open created, or the rebuilt tunnel manager.
+func TestLockdownStaleLeversCannotTouchCurrentGeneration(t *testing.T) {
+	gate := newBlockingLeverGate(
+		"close on-demand mapping",
+		"withdraw binder admissions",
+		"stop direct listener",
+		"stop tunnel manager",
+	)
+	fx := newLockdownFixture(t)
+	fx.d.lockdownLeverGate = gate.wait
+	fx.d.lockdownLeverTimeout = 150 * time.Millisecond
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate.release) }) }
+	defer release()
+
+	// Pre-lockdown: healthy tunnel, open mapping, live listener.
+	fx.d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-stale"))
+	waitForCond(t, func() bool { return fx.starter.startCount() == 1 })
+	require.NoError(t, fx.ds.port.OpenFor(fx.code, time.Minute))
+	fx.d.startDirectServer()
+	waitDialable(t, fx.ds.listenAddr)
+
+	require.NoError(t, fx.d.Lockdown())
+	for _, name := range []string{
+		"close on-demand mapping", "withdraw binder admissions",
+		"stop direct listener", "stop tunnel manager",
+	} {
+		gate.awaitReached(t, name)
+	}
+
+	// Unlock completes with every mutating lever still held.
+	require.NoError(t, fx.d.Unlock())
+	require.False(t, fx.d.IsLocked())
+
+	// The restored generation owns fresh state: admissions back, listener up,
+	// a new mapping open, and a rebuilt tunnel manager with its own child.
+	waitForCond(t, func() bool {
+		_, err := fx.ds.binder.AdmitSNI(fx.origin)
+		return err == nil
+	})
+	waitDialable(t, fx.ds.listenAddr)
+	require.NoError(t, fx.ds.port.OpenFor(fx.code, time.Minute))
+	require.True(t, fx.ds.port.Open())
+	fx.d.handleSignalingMessage(relayConfigMessage(t, 2, "credential-stale-2"))
+	waitForCond(t, func() bool { return fx.starter.startCount() == 2 })
+	newChild := fx.starter.recordAt(1).child
+	oldChild := fx.starter.recordAt(0).child
+
+	// Release the superseded levers and wait until they have all exited.
+	release()
+	waitForFanoutGoroutines(t, 0)
+
+	// (c) Each check below is reported rather than fatal so one RED run shows
+	// every fence that is missing.
+	// The restored Binder admission survives the stale withdrawal.
+	if _, err := fx.ds.binder.AdmitSNI(fx.origin); err != nil {
+		t.Errorf("stale withdraw lever cleared the current generation's admission: %v", err)
+	}
+	// The restored listener survives the stale stop.
+	listenerUp := false
+	for i := 0; i < 50 && !listenerUp; i++ {
+		if conn, err := net.DialTimeout("tcp", fx.ds.listenAddr, 100*time.Millisecond); err == nil {
+			_ = conn.Close()
+			listenerUp = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !listenerUp {
+		t.Errorf("stale listener-stop lever tore down the current generation's listener")
+	}
+	// The mapping opened by the current generation survives the stale close.
+	if !fx.ds.port.Open() {
+		t.Errorf("stale mapping-close lever closed the current generation's mapping")
+	}
+	// The rebuilt tunnel manager's child survives the stale manager stop.
+	if got := newChild.gracefulStopCount(); got != 0 {
+		t.Errorf("stale tunnel-stop lever stopped the new generation's child %d time(s)", got)
+	}
+	if got := newChild.killCount(); got != 0 {
+		t.Errorf("stale tunnel-stop lever killed the new generation's child %d time(s)", got)
+	}
+	// The stale levers did run: they stopped the pre-lockdown manager's child.
+	waitForCond(t, func() bool { return oldChild.gracefulStopCount() == 1 })
 }
 
 // TestUnlockRestoresSourceVerifiedBindingsAndUsesFreshCredential pins the

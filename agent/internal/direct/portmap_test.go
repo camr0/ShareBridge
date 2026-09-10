@@ -4,8 +4,15 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/huin/goupnp"
+	"github.com/huin/goupnp/dcps/internetgateway1"
 	"github.com/huin/goupnp/soap"
 )
 
@@ -192,6 +199,83 @@ func TestDeleteOwnedMapping_IdempotentWhenAbsent(t *testing.T) {
 	}
 	if _, ok := f.mappings[444]; !ok {
 		t.Fatalf("unrelated mapping disappeared: %v", f.mappings)
+	}
+}
+
+// TestUPnPMapperBoundedOnStalledRouter pins the root-cause fix for the
+// lockdown mapping-close lever: every router round trip the UPnP mapper makes
+// returns within RouterIOTimeout even when the router accepts the SOAP request
+// and never answers. goupnp's generated legacy methods use
+// context.Background() and its SOAP client sets no HTTP timeout, so without
+// this bound the call (and the OnDemandPort state loop behind it) hangs
+// forever — a permanently wedged port.Close() that later blocks OpenFor.
+func TestUPnPMapperBoundedOnStalledRouter(t *testing.T) {
+	release := make(chan struct{})
+	var received atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	endpoint, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse stalled router URL: %v", err)
+	}
+	client := &internetgateway1.WANIPConnection1{
+		ServiceClient: goupnp.ServiceClient{SOAPClient: soap.NewSOAPClient(*endpoint)},
+	}
+	// A short per-test bound keeps the assertion fast; the production value is
+	// RouterIOTimeout (see the const comment for why it is 3s).
+	m := &UPnPMapper{client: client, internalIP: "192.168.1.20", timeout: 250 * time.Millisecond}
+
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{"DeletePortMapping", func() error { return m.DeletePortMapping(443) }},
+		{"AddPortMapping", func() error {
+			_, err := m.AddPortMapping(443, 8443, "sharebridge-test", 60)
+			return err
+		}},
+		{"ExternalIP", func() error {
+			_, err := m.ExternalIP()
+			return err
+		}},
+		{"ListPortMappings", func() error {
+			_, err := m.ListPortMappings()
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := received.Load()
+			done := make(chan error, 1)
+			go func() { done <- tc.call() }()
+			// The request must actually reach the stalled router before the
+			// bounded return is meaningful.
+			deadline := time.Now().Add(3 * time.Second)
+			for received.Load() == before {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s never reached the stalled router", tc.name)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatalf("%s against a stalled router returned nil, want a deadline error", tc.name)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s did not return within 3s: the router I/O call is unbounded", tc.name)
+			}
+		})
 	}
 }
 

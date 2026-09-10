@@ -6,12 +6,24 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/huin/goupnp/dcps/internetgateway1"
 	"github.com/huin/goupnp/soap"
 	"github.com/jackpal/gateway"
 	"github.com/jackpal/go-nat-pmp"
 )
+
+// RouterIOTimeout bounds every router round trip the agent makes (UPnP SOAP
+// and NAT-PMP). A LAN-local round trip answers in single-digit milliseconds,
+// so this is roughly three orders of magnitude of headroom for a slow or
+// heavily loaded router, while keeping the worst-case lockdown mapping-close
+// lever (one bounded enumeration plus one bounded delete = 2×RouterIOTimeout
+// = 6s) comfortably inside defaultLockdownLeverTimeout (10s). The bound is a
+// router I/O bound — it applies to each device call — not merely a bound on
+// the lockdown lever aggregation, so a hidden router cannot hold the
+// OnDemandPort state loop (and therefore OpenFor) open past it.
+const RouterIOTimeout = 3 * time.Second
 
 // DescriptionPrefix marks mappings this agent created, so it never deletes or
 // overwrites a mapping owned by another service (spec §6).
@@ -47,18 +59,21 @@ type PortMapper interface {
 }
 
 // upnpConnection abstracts WANIPConnection1 and WANPPPConnection1, which have
-// identical method sets but distinct generated types.
+// identical method sets but distinct generated types. Only the Ctx variants
+// are used: the legacy ones hardcode context.Background(), which would make
+// every call unbounded against a wedged router.
 type upnpConnection interface {
-	AddPortMapping(NewRemoteHost string, NewExternalPort uint16, NewProtocol string, NewInternalPort uint16, NewInternalClient string, NewEnabled bool, NewPortMappingDescription string, NewLeaseDuration uint32) error
-	DeletePortMapping(NewRemoteHost string, NewExternalPort uint16, NewProtocol string) error
-	GetExternalIPAddress() (string, error)
-	GetGenericPortMappingEntry(NewPortMappingIndex uint16) (NewRemoteHost string, NewExternalPort uint16, NewProtocol string, NewInternalPort uint16, NewInternalClient string, NewEnabled bool, NewPortMappingDescription string, NewLeaseDuration uint32, err error)
+	AddPortMappingCtx(ctx context.Context, NewRemoteHost string, NewExternalPort uint16, NewProtocol string, NewInternalPort uint16, NewInternalClient string, NewEnabled bool, NewPortMappingDescription string, NewLeaseDuration uint32) error
+	DeletePortMappingCtx(ctx context.Context, NewRemoteHost string, NewExternalPort uint16, NewProtocol string) error
+	GetExternalIPAddressCtx(ctx context.Context) (string, error)
+	GetGenericPortMappingEntryCtx(ctx context.Context, NewPortMappingIndex uint16) (NewRemoteHost string, NewExternalPort uint16, NewProtocol string, NewInternalPort uint16, NewInternalClient string, NewEnabled bool, NewPortMappingDescription string, NewLeaseDuration uint32, err error)
 }
 
 // UPnPMapper maps ports using UPnP IGD (WANIPConnection1 or WANPPPConnection1).
 type UPnPMapper struct {
 	client     upnpConnection
 	internalIP string
+	timeout    time.Duration
 }
 
 func NewUPnPMapper(ctx context.Context) (*UPnPMapper, error) {
@@ -70,7 +85,19 @@ func NewUPnPMapper(ctx context.Context) (*UPnPMapper, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve LAN address toward gateway: %w", err)
 	}
-	return &UPnPMapper{client: client, internalIP: internal}, nil
+	return &UPnPMapper{client: client, internalIP: internal, timeout: RouterIOTimeout}, nil
+}
+
+// routerContext bounds one router round trip. goupnp's generated legacy
+// methods pass context.Background() (and its SOAP client sets no HTTP
+// timeout), so a wedged router — one that accepts the connection and never
+// answers — would otherwise block the caller forever.
+func (m *UPnPMapper) routerContext() (context.Context, context.CancelFunc) {
+	timeout := m.timeout
+	if timeout <= 0 {
+		timeout = RouterIOTimeout
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 // discoverUPnPClient tries WANIP then WANPPP (some routers expose only one).
@@ -87,32 +114,46 @@ func discoverUPnPClient(ctx context.Context) (upnpConnection, error) {
 func (m *UPnPMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
 	// The internal client is this host's real LAN address (not 0.0.0.0),
 	// resolved toward the gateway so the router forwards to the right host.
-	if err := m.client.AddPortMapping("", uint16(ext), "TCP", uint16(internal), m.internalIP, true, desc, uint32(lease)); err != nil {
+	ctx, cancel := m.routerContext()
+	defer cancel()
+	if err := m.client.AddPortMappingCtx(ctx, "", uint16(ext), "TCP", uint16(internal), m.internalIP, true, desc, uint32(lease)); err != nil {
 		return 0, err
 	}
 	return ext, nil
 }
 
 func (m *UPnPMapper) DeletePortMapping(ext int) error {
-	return m.client.DeletePortMapping("", uint16(ext), "TCP")
+	ctx, cancel := m.routerContext()
+	defer cancel()
+	return m.client.DeletePortMappingCtx(ctx, "", uint16(ext), "TCP")
 }
 
 func (m *UPnPMapper) ExternalIP() (string, error) {
-	return m.client.GetExternalIPAddress()
+	ctx, cancel := m.routerContext()
+	defer cancel()
+	return m.client.GetExternalIPAddressCtx(ctx)
 }
 
 func (m *UPnPMapper) InternalIP() string { return m.internalIP }
 
+// ListPortMappings enumerates the router's mappings under ONE deadline: the
+// enumeration is up to 256 round trips, so bounding each entry individually
+// would still let a wedged router hold the caller for minutes. The shared
+// context aborts the whole walk at RouterIOTimeout.
 func (m *UPnPMapper) ListPortMappings() ([]PortMapping, error) {
+	ctx, cancel := m.routerContext()
+	defer cancel()
 	var out []PortMapping
 	for i := 0; i < 256; i++ {
-		_, ext, proto, internal, client, _, desc, _, err := m.client.GetGenericPortMappingEntry(uint16(i))
+		_, ext, proto, internal, client, _, desc, _, err := m.client.GetGenericPortMappingEntryCtx(ctx, uint16(i))
 		if err != nil {
 			if isEndOfList(err) {
 				return out, nil // end-of-list reached cleanly
 			}
 			// A real enumeration error must NOT be treated as an empty list —
-			// otherwise an occupied 443 could look free (fail closed).
+			// otherwise an occupied 443 could look free (fail closed). The
+			// same applies to the shared deadline: a truncated walk must never
+			// read as "port 443 is free".
 			return nil, fmt.Errorf("enumerate port mapping %d: %w", i, err)
 		}
 		out = append(out, PortMapping{
@@ -161,7 +202,18 @@ type NATPMPMapper struct {
 }
 
 func NewNATPMPMapper(gatewayIP net.IP) *NATPMPMapper {
-	return &NATPMPMapper{client: natpmp.NewClient(gatewayIP)}
+	return NewNATPMPMapperWithTimeout(gatewayIP, RouterIOTimeout)
+}
+
+// NewNATPMPMapperWithTimeout builds a NAT-PMP mapper whose whole RPC retry
+// budget is bounded. go-nat-pmp's default is ~128 seconds, far beyond the
+// lockdown lever bound; the caller's bound keeps a wedged NAT-PMP gateway
+// from holding the OnDemandPort state loop open.
+func NewNATPMPMapperWithTimeout(gatewayIP net.IP, timeout time.Duration) *NATPMPMapper {
+	if timeout <= 0 {
+		timeout = RouterIOTimeout
+	}
+	return &NATPMPMapper{client: natpmp.NewClientWithTimeout(gatewayIP, timeout)}
 }
 
 func (m *NATPMPMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {

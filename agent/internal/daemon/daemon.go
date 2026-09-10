@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sharebridge/agent/internal/cert"
@@ -148,6 +149,12 @@ type Daemon struct {
 	// it to prove the bound without waiting the production value.
 	lockdownLeverTimeout time.Duration
 
+	// lockdownLeverGate is a TEST-ONLY seam: when non-nil it is called with a
+	// best-effort lever's name immediately before that lever starts its work.
+	// It lets the lockdown tests hold a named lever past the aggregation bound
+	// and prove the §13.4 transition fences. Production leaves it nil.
+	lockdownLeverGate func(name string)
+
 	// STUN cross-check state (§10.1, Task 17 add-on): the exchange client, a
 	// test clock seam, and the one-slot bound that keeps at most a single
 	// challenge exchange in flight at a time.
@@ -228,6 +235,13 @@ type directState struct {
 	// tombstone. Local enforcement is final: control's advisory
 	// lockdown_status can suppress attempts but never override this flag.
 	locked bool
+
+	// lockdownEpoch counts completed lockdown/unlock transitions (under mu).
+	// Every best-effort lockdown lever captures the epoch of the transition
+	// that created it and refuses to act once a newer transition owns the
+	// state, so a lever that overruns the aggregation bound can never mutate
+	// state behind an Unlock's back.
+	lockdownEpoch uint64
 
 	// pendingRelayBinds records relay-only shares whose single §13.3 binding
 	// could not be installed at hydration time because the binder (namespace)
@@ -2105,8 +2119,10 @@ type lockdownLever struct {
 // flag and SignalGate are set FIRST and are final; the remaining levers then
 // fan out independently and concurrently with a bounded wait, so no stalled
 // lever (blocking router delete, frpc kill grace) can prevent another lever
-// from running or make Lockdown hang. Nothing here tombstones a share, so
-// Unlock can restore availability. It is idempotent.
+// from running or make Lockdown hang. Every lever is additionally fenced to
+// the transition that created it (see lockdownEpoch), so a lever that outlives
+// the wait cannot mutate state an Unlock has since restored. Nothing here
+// tombstones a share, so Unlock can restore availability. It is idempotent.
 func (d *Daemon) Lockdown() error {
 	d.lockdownMu.Lock()
 	defer d.lockdownMu.Unlock()
@@ -2125,9 +2141,16 @@ func (d *Daemon) Lockdown() error {
 	// enforcement and it is final — set before any best-effort lever runs so
 	// a stalled lever can never leave the agent admitting traffic.
 	ds.locked = true
+	// Every lever below belongs to THIS transition. The epoch is bumped under
+	// the same lock the Unlock transition mutates under, so a lever that
+	// overruns the aggregation bound can be recognised as superseded and
+	// refused by the fences below.
+	ds.lockdownEpoch++
+	epoch := ds.lockdownEpoch
 	gate := ds.gate
 	port := ds.port
 	server := ds.server
+	binder := ds.binder
 	ds.mu.Unlock()
 
 	if gate != nil {
@@ -2145,20 +2168,28 @@ func (d *Daemon) Lockdown() error {
 	generation := d.nextLockdownGeneration()
 
 	levers := []lockdownLever{
-		// 2. Remove the UPnP/NAT-PMP mapping.
+		// 2. Remove the UPnP/NAT-PMP mapping. The fence is evaluated on the
+		// port's own state loop, atomically with OpenFor, so a lever that
+		// overruns past an Unlock cannot close a mapping the newer generation
+		// opened. The router I/O behind this call is bounded (RouterIOTimeout),
+		// so the state loop — and therefore a post-unlock OpenFor — always
+		// unblocks.
 		{name: "close on-demand mapping", run: func() error {
 			if port == nil {
 				return nil
 			}
-			return port.Close()
+			return port.CloseIf(func() bool { return d.lockdownEpochCurrent(epoch) })
 		}},
 		// 4. Withdraw the local Binder admissions, retaining the
-		// source/session state for unlock.
+		// source/session state for unlock. The lever acts on the binder this
+		// generation owns: Unlock forces syncDirectServe to rebuild the binder,
+		// so a superseded lever can only revoke a discarded binder.
 		{name: "withdraw binder admissions", run: func() error {
-			d.withdrawBinderAdmissions()
+			d.withdrawBinderAdmissions(binder)
 			return nil
 		}},
-		// 5. Close established direct AND relay recipient connections.
+		// 5. Close established direct AND relay recipient connections on the
+		// server this generation owns (Unlock builds a fresh DirectServer).
 		{name: "close recipient connections", run: func() error {
 			if server != nil {
 				server.CloseRecipientConns()
@@ -2167,10 +2198,11 @@ func (d *Daemon) Lockdown() error {
 		}},
 		// §7.4: the local HTTPS listener leaves service on lockdown.
 		{name: "stop direct listener", run: func() error {
-			d.stopDirectServer()
+			d.stopDirectServerForLockdown(epoch, server)
 			return nil
 		}},
-		// 3. Stop frpc; gateway presence then expires on its own.
+		// 3. Stop frpc; gateway presence then expires on its own. The lever acts
+		// on the snapshotted manager, never a manager Unlock built.
 		{name: "stop tunnel manager", run: func() error {
 			if manager != nil {
 				manager.Stop()
@@ -2186,32 +2218,62 @@ func (d *Daemon) Lockdown() error {
 	return nil
 }
 
+// lockdownEpochCurrent reports whether the given lockdown transition epoch
+// still owns the daemon's direct state. It is safe to call from the
+// OnDemandPort state loop: no goroutine holding ds.mu ever calls into that
+// loop (syncDirectServe only stores the port pointer; start/stop take ds.mu
+// after any port call has returned), so the lock cannot form a cycle.
+func (d *Daemon) lockdownEpochCurrent(epoch uint64) bool {
+	ds := d.direct
+	if ds == nil {
+		return false
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	return ds.lockdownEpoch == epoch
+}
+
 // runLockdownLevers starts every best-effort lever concurrently and waits at
 // most lockdownLeverTimeout (default defaultLockdownLeverTimeout) for them.
-// Local enforcement is already final, so a lever that outlives the bound is
-// logged and left to finish in the background instead of blocking the return.
-// Per-lever errors are logged with the lever name and never abort the others.
+//
+// Every lever is bounded by construction — the mapping close by
+// direct.RouterIOTimeout, and the rest by in-process work or their own bounded
+// waits — so a lever outliving the aggregation bound is a defensive
+// safety-net case rather than the expected path. The completion signal is
+// closed by the LAST lever rather than by a detached wg.Wait wrapper, so no
+// helper goroutine is ever left waiting on the levers; a lever that does
+// outrun the bound still exits when its work completes, and the transition
+// fences in Lockdown make its late completion harmless to the current
+// generation (see the levers' comments). Per-lever errors are logged with the
+// lever name and never abort the others.
 func (d *Daemon) runLockdownLevers(levers []lockdownLever) {
-	var wg sync.WaitGroup
+	if len(levers) == 0 {
+		return
+	}
+	remaining := int64(len(levers))
+	done := make(chan struct{})
 	for _, lever := range levers {
-		wg.Add(1)
 		go func(l lockdownLever) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("lockdown lever %q panicked: %v", l.name, r)
+			// The deferred recover is scoped to the lever's own work so the
+			// completion count is always decremented, panic or not.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("lockdown lever %q panicked: %v", l.name, r)
+					}
+				}()
+				if hook := d.lockdownLeverGate; hook != nil {
+					hook(l.name)
+				}
+				if err := l.run(); err != nil {
+					log.Printf("lockdown lever %q: %v", l.name, err)
 				}
 			}()
-			if err := l.run(); err != nil {
-				log.Printf("lockdown lever %q: %v", l.name, err)
+			if atomic.AddInt64(&remaining, -1) == 0 {
+				close(done)
 			}
 		}(lever)
 	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
 
 	timeout := d.lockdownLeverTimeout
 	if timeout <= 0 {
@@ -2245,6 +2307,11 @@ func (d *Daemon) Unlock() error {
 		return nil
 	}
 	ds.locked = false
+	// Supersede every in-flight lockdown lever BEFORE the gate re-opens: a
+	// post-unlock open must never be reachable by a stale close, and a stale
+	// listener stop must not tear down the listener restored below. Bumping
+	// under ds.mu makes the bump atomic with the fenced levers' checks.
+	ds.lockdownEpoch++
 	gate := ds.gate
 	// Force syncDirectServe to rebuild the Binder/DirectServer and re-admit
 	// every recorded origin (direct pairs, relay-only bindings, and pending
@@ -2264,15 +2331,18 @@ func (d *Daemon) Unlock() error {
 	return nil
 }
 
-// withdrawBinderAdmissions removes every local Binder admission without
-// deleting the recorded source/session state (§13.4 step 4).
-func (d *Daemon) withdrawBinderAdmissions() {
+// withdrawBinderAdmissions removes every admission from the binder the
+// lockdown generation owns, without deleting the recorded source/session state
+// (§13.4 step 4). The binder is the one snapshotted at Lockdown time, not the
+// live ds.binder: Unlock forces syncDirectServe to rebuild the binder, so a
+// lever that overruns past an Unlock revokes admissions on the discarded
+// binder and provably cannot clear the restored one.
+func (d *Daemon) withdrawBinderAdmissions(binder *direct.Binder) {
 	ds := d.direct
 	if ds == nil {
 		return
 	}
 	ds.mu.Lock()
-	binder := ds.binder
 	pairs := make([]originPair, 0, len(ds.origins))
 	for _, pair := range ds.origins {
 		pairs = append(pairs, pair)
@@ -2290,6 +2360,39 @@ func (d *Daemon) withdrawBinderAdmissions() {
 	}
 	for _, relayOrigin := range relayOrigins {
 		binder.Revoke(relayOrigin)
+	}
+}
+
+// stopDirectServerForLockdown is the lockdown listener lever. It always closes
+// the connections of the server the lockdown generation owns — that server
+// object is replaced by Unlock's syncDirectServe rebuild, so closing its
+// connections can never touch a newer one — and it stops the listener only
+// while epoch still owns the daemon's direct state. The check and the cancel
+// state mutation happen under the same ds.mu that the unlock transition
+// mutates under, so a lever that overruns past an Unlock cannot tear down the
+// listener Unlock just restored.
+func (d *Daemon) stopDirectServerForLockdown(epoch uint64, server *direct.DirectServer) {
+	if server != nil {
+		server.CloseAllConns()
+	}
+	ds := d.direct
+	if ds == nil {
+		return
+	}
+	ds.mu.Lock()
+	if ds.lockdownEpoch != epoch {
+		ds.mu.Unlock()
+		log.Printf("lockdown lever %q superseded by unlock; leaving the current listener in service", "stop direct listener")
+		return
+	}
+	cancel := ds.cancel
+	ds.cancel = nil
+	started := ds.started
+	ds.started = false
+	ds.startGen++
+	ds.mu.Unlock()
+	if started && cancel != nil {
+		cancel()
 	}
 }
 

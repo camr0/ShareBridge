@@ -76,6 +76,7 @@ const (
 	opBeginHold
 	opEndHold
 	opClose
+	opCloseIf
 	opIsOpen
 	opGrantedPort
 	opState
@@ -100,6 +101,9 @@ type portCommand struct {
 	token     uint64
 	callback  func(old, new PortState, grantedPort int)
 	reply     chan portReply
+
+	// stillCurrent is the optional generation fence of opCloseIf (see CloseIf).
+	stillCurrent func() bool
 }
 
 // OnDemandPort manages a public port that is closed by default and opened only
@@ -258,6 +262,19 @@ func (p *OnDemandPort) Close() error {
 	return p.send(portCommand{op: opClose, reply: ch}).err
 }
 
+// CloseIf removes the mapping exactly like Close, but only while stillCurrent
+// reports that the caller's generation is still current. stillCurrent is
+// evaluated ON THE STATE LOOP immediately before the close decision, so it is
+// atomic with respect to a concurrent OpenFor — the single-threaded loop
+// serializes the two. That makes a superseded caller (a §13.4 lockdown lever
+// that overran the aggregation bound past an Unlock) provably unable to close
+// a mapping the newer generation opened, without the caller holding any lock
+// across the router I/O. A nil stillCurrent is equivalent to Close.
+func (p *OnDemandPort) CloseIf(stillCurrent func() bool) error {
+	ch := make(chan portReply, 1)
+	return p.send(portCommand{op: opCloseIf, stillCurrent: stillCurrent, reply: ch}).err
+}
+
 // GrantedPort returns the external port the router actually granted (NAT-PMP
 // may remap), for endpoint reporting. Zero until the port is mapped.
 func (p *OnDemandPort) GrantedPort() int {
@@ -389,6 +406,30 @@ func (p *OnDemandPort) loop() {
 		inFlight = 0 // drop stale holds so a reopen can't stay held open forever
 		p.setState(StateClosing, grantedPort)
 		rearm() // first DeletePortMapping happens on the next tick
+	}
+	// closeNow is the shared body of opClose/opCloseIf. Its state mutation is
+	// the loop's own, so a fence evaluated by the caller immediately before
+	// this call is atomic with respect to any queued opOpenFor.
+	closeNow := func() portReply {
+		switch {
+		case open:
+			open = false
+			closing = true
+			closeFail = 0
+			sessions = map[string]time.Time{}
+			idleAt = time.Time{}
+			inFlight = 0
+			p.setState(StateClosing, grantedPort)
+			if tryDelete() {
+				return portReply{}
+			}
+			rearm()
+			return portReply{err: ErrDeleteRetry}
+		case closing:
+			return portReply{err: ErrDeleteRetry}
+		default:
+			return portReply{} // idempotent: already closed
+		}
 	}
 
 	for {
@@ -532,26 +573,17 @@ func (p *OnDemandPort) loop() {
 				c.reply <- portReply{}
 
 			case opClose:
-				switch {
-				case open:
-					open = false
-					closing = true
-					closeFail = 0
-					sessions = map[string]time.Time{}
-					idleAt = time.Time{}
-					inFlight = 0
-					p.setState(StateClosing, grantedPort)
-					if tryDelete() {
-						c.reply <- portReply{}
-					} else {
-						rearm()
-						c.reply <- portReply{err: ErrDeleteRetry}
-					}
-				case closing:
-					c.reply <- portReply{err: ErrDeleteRetry}
-				default:
-					c.reply <- portReply{} // idempotent: already closed
+				c.reply <- closeNow()
+
+			case opCloseIf:
+				// Close only while the caller's generation still owns this port.
+				// A superseded caller must not close a mapping that a
+				// post-unlock OpenFor opened.
+				if c.stillCurrent != nil && !c.stillCurrent() {
+					c.reply <- portReply{}
+					continue
 				}
+				c.reply <- closeNow()
 
 			case opIsOpen:
 				c.reply <- portReply{open: open}
