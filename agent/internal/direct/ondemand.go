@@ -265,6 +265,18 @@ func (p *OnDemandPort) generationCurrent(gen uint64) bool {
 	return p.fence.Load() == gen
 }
 
+// Generation returns the port's published generation stamp: the direct-state
+// lockdown/unlock epoch and whether the direct path is locked. It exposes the
+// exact stamp SetGeneration publishes and the fence re-readers consult, so a
+// caller can observe that a transition is published without polling an
+// unrelated flag (the daemon sets its local locked flag just before it calls
+// SetGeneration, so observing only that flag does not prove the fence is
+// visible to the state loop yet).
+func (p *OnDemandPort) Generation() (epoch uint64, locked bool) {
+	v := p.fence.Load()
+	return v & (fenceLockedBit - 1), v&fenceLockedBit != 0
+}
+
 // OpenFor maps (or re-maps/renews) the port for shareID with the given lease.
 // Leases below minValidLease are clamped up. Only shares the agent has
 // independently registered and source-verified may be passed here; the signal

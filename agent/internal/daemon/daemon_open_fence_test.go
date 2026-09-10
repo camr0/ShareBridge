@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -74,17 +75,25 @@ func newOpenFenceDaemon(t *testing.T, mapper direct.PortMapper) (*Daemon, *mockS
 	st := newMockStore()
 	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
 	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	reporter := direct.NewReporter(func(ctx context.Context, ip string, port int, status string) error {
+		return sig.ReportEndpoint(ctx, ip, port, status)
+	})
+	port.SetTransitionCallback(reporter.OnTransition)
 	d := &Daemon{
 		store:     st,
 		signaling: sig,
 		direct: &directState{
-			ready:  true,
-			gate:   direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
-			port:   port,
-			mapper: mapper,
+			ready:    true,
+			gate:     direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+			port:     port,
+			mapper:   mapper,
+			reporter: reporter,
 		},
 	}
-	t.Cleanup(func() { _ = port.Close() })
+	t.Cleanup(func() {
+		_ = port.Close()
+		reporter.Close()
+	})
 	return d, sig, port
 }
 

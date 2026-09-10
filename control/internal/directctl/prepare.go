@@ -191,6 +191,22 @@ func (c *Controller) PrepareRoute(w http.ResponseWriter, r *http.Request, code s
 		return c.prepareRelayFallback(w, apiKeyID, origin, code)
 	}
 
+	// Defense in depth (audit Important #3): the agent orders the endpoint
+	// report carrying the MAPPED external port BEFORE its OK open_ack, so the
+	// report is already persisted when EmitOpen returns (the agent WebSocket
+	// read loop handles report_endpoint and open_ack in order). If the
+	// persisted report does not carry the granted port — a dropped or
+	// out-of-order report, or a stale report from a previous open — fail
+	// closed to relay rather than hand a recipient a direct origin whose DDNS
+	// record was never provisioned for this port. This is belt-and-suspenders:
+	// the agent-side ordering makes the report the precondition of the ack,
+	// and this gate makes the ack's direct origin the precondition of the
+	// report. It never creates availability (still requires the live predicate
+	// and the probe below).
+	if reportFacts, ok := c.readRouteFacts(apiKeyID); !ok || reportFacts.endpointPort != opened.ack.GrantedPort {
+		return c.prepareRelayFallback(w, apiKeyID, origin, code)
+	}
+
 	// Verified-tuple probe, strictly sequenced AFTER the STUN refresh has
 	// concluded (§4.4: the public probe cannot start until the STUN match
 	// succeeds — enforced by the Task 19 gate inside Probe).

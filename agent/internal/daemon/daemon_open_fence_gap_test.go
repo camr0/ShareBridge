@@ -53,11 +53,25 @@ func openSignalMessageLease(seq uint64, nonce string, leaseSeconds int) signalin
 	return msg
 }
 
-// waitForLocked polls the daemon's local lockdown flag. The interleave itself
-// is channel-gated; this only observes that the transition has been published.
+// waitForLocked waits for the local lockdown flag AND the on-demand port's
+// published generation stamp. Lockdown sets ds.locked just BEFORE it calls
+// SetGeneration, so observing only the flag can let a test release a gated
+// mapping write before the fence that must supersede it is visible to the
+// state loop — a rare, timing-dependent false OK. Waiting for the port stamp
+// makes the interleave deterministic without weakening what is asserted.
 func waitForLocked(t *testing.T, d *Daemon) {
 	t.Helper()
-	waitForCond(t, d.IsLocked)
+	waitForCond(t, func() bool {
+		if !d.IsLocked() {
+			return false
+		}
+		ds := d.direct
+		if ds == nil || ds.port == nil {
+			return true
+		}
+		_, locked := ds.port.Generation()
+		return locked
+	})
 }
 
 // stateRecorder records every state transition the port publishes.

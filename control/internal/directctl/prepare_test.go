@@ -786,3 +786,56 @@ func TestDirectURLOmitsDefaultPort(t *testing.T) {
 		t.Fatalf("directURL(1) = %q, want the explicit-port form", got)
 	}
 }
+
+// TestPrepareRouteRequiresCurrentEndpointReport proves the defense-in-depth
+// gate for audit Important #3: a successful open_ack alone is NOT enough to
+// produce a direct origin. The agent's persisted endpoint report must carry the
+// granted port, so a missing, dropped, or stale report can never yield a direct
+// URL. The live predicate and STUN observation are fully satisfied in both
+// subtests, and the probe would succeed — only the endpoint report is wrong.
+func TestPrepareRouteRequiresCurrentEndpointReport(t *testing.T) {
+	cases := []struct {
+		name         string
+		reportedPort int
+	}{
+		{name: "stale previous-open port", reportedPort: 9999},
+		{name: "missing report (port 0)", reportedPort: 0},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			app, ctrl, _, view, _ := newSelectionController(t, true)
+			attachSTUNListener(t, ctrl, newSTUNTestClock())
+			code := "preprep01"
+			key := routeSession(t, app, code, nil)
+			port := seedAgentFacts(t, app, key, routeDirectIP)
+			grantPresence(t, view, agentRecordID(t, app, key), port)
+			connectWS(t, ctrl, key)
+			t.Cleanup(func() { ctrl.AgentDisconnected(key, nil) })
+			installObservation(t, ctrl, key, netip.MustParseAddr(routeDirectIP), true)
+
+			// Overwrite the seeded report with the stale/missing value: the
+			// endpoint report no longer matches the port the ack will grant.
+			rec := agentRow(t, app, key)
+			rec.Set("endpoint_port", tc.reportedPort)
+			if err := app.Save(rec); err != nil {
+				t.Fatalf("save agent row: %v", err)
+			}
+
+			ctrl.emitOpenFn = func(ctx context.Context, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error) {
+				return prepareOKAck(), nil // grants 8443
+			}
+			probes := 0
+			ctrl.probeFn = func(ctx context.Context, origin, code, apiKeyID string, ack OpenAck) error {
+				probes++
+				return nil
+			}
+
+			resp := prepareCall(t, ctrl, code, "", nil)
+			assertRelayFallback(t, app, resp, code, key)
+			if probes != 0 {
+				t.Fatalf("the probe ran %d time(s) without a current endpoint report", probes)
+			}
+		})
+	}
+}

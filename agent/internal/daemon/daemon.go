@@ -194,6 +194,16 @@ const (
 	// always make progress; the bound is a fail-closed safety net, not a
 	// routine timeout.
 	defaultDirectHandoffTimeout = 2 * time.Second
+
+	// defaultOpenReportTimeout bounds the open path's endpoint-report
+	// confirmation: the report carrying the router-granted external port must
+	// be sent AND confirmed inside this window before the OK open_ack. The
+	// report is sent from the Reporter's drain goroutine, so the wait is not a
+	// router bound and never runs while holding ds.mu, ackMu, or the port
+	// state loop. On timeout the open FAILS (error open_ack) and the mapping
+	// is torn down — the control must never receive an OK ack for an endpoint
+	// it was not told about.
+	defaultOpenReportTimeout = 3 * time.Second
 )
 
 // originPair is one content session's §6 origin pair: the control-allocated
@@ -269,6 +279,11 @@ type directState struct {
 	// handoffTimeout overrides defaultDirectHandoffTimeout in tests (zero uses
 	// the default). Owned under mu.
 	handoffTimeout time.Duration
+
+	// reportTimeout overrides defaultOpenReportTimeout in tests (zero uses the
+	// default). It bounds the open path's endpoint-report confirmation wait.
+	// It is read without ds.mu (it is set before any open-signal runs).
+	reportTimeout time.Duration
 
 	// startListenerFn overrides (*direct.DirectServer).Start in tests so a
 	// listener's bind/exit can be delayed deterministically. Owned under mu.
@@ -1057,8 +1072,8 @@ func (d *Daemon) buildDirectState(withNetwork bool) error {
 			ds.mapper = mapper
 			token := "sharebridge-" + shortHash(agentID)
 			ds.port = direct.NewOnDemandPortOwned(mapper, directExtPort, directIntPort, directPortIdle, token, mapper.InternalIP())
-			ds.reporter = direct.NewReporter(func(ip string, port int, status string) {
-				_ = d.signaling.ReportEndpoint(context.Background(), ip, port, status)
+			ds.reporter = direct.NewReporter(func(ctx context.Context, ip string, port int, status string) error {
+				return d.signaling.ReportEndpoint(ctx, ip, port, status)
 			})
 			ds.port.SetTransitionCallback(ds.reporter.OnTransition)
 		}
@@ -1771,6 +1786,16 @@ func (ds *directState) listenerHandoffTimeout() time.Duration {
 	return defaultDirectHandoffTimeout
 }
 
+// openReportTimeout resolves the bounded wait for the open path's endpoint
+// report confirmation, honoring the test override. Like listenerHandoffTimeout
+// it is read without ds.mu (it is set before any open-signal runs).
+func (ds *directState) openReportTimeout() time.Duration {
+	if ds.reportTimeout > 0 {
+		return ds.reportTimeout
+	}
+	return defaultOpenReportTimeout
+}
+
 // waitChanClosed reports whether ch was closed within bound. It is the
 // non-blocking-safe bounded join the listener handoff uses; the caller must
 // not hold ds.mu while waiting (the listener goroutine needs it to exit).
@@ -1862,10 +1887,49 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
 		return
 	}
+	// The mapping now exists, but the control may not advertise direct
+	// reachability until it has the ACTUAL mapped external port: the endpoint
+	// report provisions the per-agent DDNS wildcard the recipient's direct URL
+	// resolves through (audit Important #3). Report it synchronously and
+	// CONFIRM delivery inside a bounded context BEFORE the OK open_ack. The
+	// report is sent from the reporter's drain goroutine, so no port lock,
+	// ackMu, or router I/O is held while we wait. A failed, dropped, or
+	// unconfirmed report is an unsuccessful open: tear the mapping back down
+	// (reusing the ordinary close path, so no half-open mapping survives) and
+	// answer with an error ack instead of advertising an unreported endpoint.
+	grantedPort := ds.port.GrantedPort()
+	if reportErr := d.confirmOpenEndpoint(ds, grantedPort); reportErr != nil {
+		log.Printf("open_signal %s: endpoint report before open_ack failed: %v", msg.ShareID, reportErr)
+		if closeErr := ds.port.Close(); closeErr != nil {
+			// The mapping delete is retried by the port's own close timer and
+			// escalated via CloseError; the open is already unsuccessful.
+			log.Printf("open_signal %s: mapping teardown after report failure: %v", msg.ShareID, closeErr)
+		}
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
+		return
+	}
 	_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
-		GrantedPort: ds.port.GrantedPort(), PublicIP: ip,
+		GrantedPort: grantedPort, PublicIP: ip,
 		WasAlreadyOpen: wasOpen, Status: "ok"})
+}
+
+// confirmOpenEndpoint sends the open-path endpoint report carrying the
+// router-granted external port and blocks until its delivery is confirmed or
+// the bounded open-report window elapses. It must be called only after
+// OnDemandPort.OpenForIf has returned: the wait holds no ds.mu, ackMu, or port
+// state-loop lock, and performs no router I/O on the caller's goroutine (the
+// Reporter's drain performs the send). A nil reporter, a full reporter queue, a
+// failed send, or a missed deadline is returned as an error, and the caller
+// treats the open as unsuccessful.
+func (d *Daemon) confirmOpenEndpoint(ds *directState, grantedPort int) error {
+	if ds.reporter == nil {
+		return errors.New("direct: no endpoint reporter wired to confirm the open report")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ds.openReportTimeout())
+	defer cancel()
+	return ds.reporter.ReportOpen(ctx, grantedPort)
 }
 
 // loadSessionsFromStore loads persisted sessions from the store and

@@ -668,3 +668,26 @@ func TestOpenForIsUnfenced(t *testing.T) {
 		t.Fatalf("fenced open while locked err = %v, want ErrOpenSuperseded", err)
 	}
 }
+
+// TestOnDemandPortGenerationReflectsSetGeneration pins the introspection
+// accessor the daemon tests use to observe a published fence: it returns the
+// exact (epoch, locked) pair SetGeneration published, so a test can wait for a
+// transition to be visible to the state loop instead of polling a flag the
+// daemon sets just before publishing.
+func TestOnDemandPortGenerationReflectsSetGeneration(t *testing.T) {
+	fc := newFakeClock(time.Now())
+	p := newTestPort(fc, &recordingMapper{}, time.Minute)
+	defer p.Close()
+
+	if epoch, locked := p.Generation(); epoch != 0 || locked {
+		t.Fatalf("initial Generation() = (%d, %v), want (0, false)", epoch, locked)
+	}
+	p.SetGeneration(3, true)
+	if epoch, locked := p.Generation(); epoch != 3 || !locked {
+		t.Fatalf("Generation() after SetGeneration(3,true) = (%d, %v), want (3, true)", epoch, locked)
+	}
+	p.SetGeneration(4, false)
+	if epoch, locked := p.Generation(); epoch != 4 || locked {
+		t.Fatalf("Generation() after SetGeneration(4,false) = (%d, %v), want (4, false)", epoch, locked)
+	}
+}

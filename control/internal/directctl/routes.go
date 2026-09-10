@@ -66,6 +66,7 @@ type routeFacts struct {
 	apiKeyID      string
 	agentRecordID string
 	endpointIP    string
+	endpointPort  int
 	relayPort     int
 	generation    uint64
 	routeRevision uint64
@@ -99,6 +100,7 @@ func (c *Controller) readRouteFacts(apiKeyID string) (routeFacts, bool) {
 	rec := recs[0]
 	facts.agentRecordID = rec.Id
 	facts.endpointIP = rec.GetString("endpoint_ip")
+	facts.endpointPort = rec.GetInt("endpoint_port")
 	facts.relayPort = rec.GetInt("relay_port")
 	if gen := rec.GetInt("relay_generation"); gen >= 0 {
 		facts.generation = uint64(gen)

@@ -684,14 +684,19 @@ func newOpenSignalTestDaemon(t *testing.T, authz func(string, direct.RouteKind) 
 	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
 	mapper := &fakeDirectMapper{ip: "203.0.113.7"}
 	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	reporter := direct.NewReporter(func(ctx context.Context, ip string, port int, status string) error {
+		return sig.ReportEndpoint(ctx, ip, port, status)
+	})
+	port.SetTransitionCallback(reporter.OnTransition)
 	d := &Daemon{
 		store:     st,
 		signaling: sig,
 		direct: &directState{
-			ready:  true,
-			gate:   direct.NewSignalGate(st.GetAgentID(), authz),
-			port:   port,
-			mapper: mapper,
+			ready:    true,
+			gate:     direct.NewSignalGate(st.GetAgentID(), authz),
+			port:     port,
+			mapper:   mapper,
+			reporter: reporter,
 		},
 	}
 	return d, mapper, sig
@@ -767,10 +772,11 @@ type endpointRecorder struct {
 	events []reportedEndpoint
 }
 
-func (r *endpointRecorder) record(ip string, port int, status string) {
+func (r *endpointRecorder) record(ctx context.Context, ip string, port int, status string) error {
 	r.mu.Lock()
 	r.events = append(r.events, reportedEndpoint{ip: ip, port: port, status: status})
 	r.mu.Unlock()
+	return nil
 }
 
 func (r *endpointRecorder) snapshot() []reportedEndpoint {
