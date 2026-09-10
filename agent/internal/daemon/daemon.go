@@ -186,6 +186,14 @@ const (
 	// grace) can delay only its own completion — never the others, and never
 	// the return.
 	defaultLockdownLeverTimeout = 10 * time.Second
+
+	// defaultDirectHandoffTimeout bounds how long a listener rebuild waits for
+	// the previous listener goroutine to exit (releasing its socket) before it
+	// refuses to bind the replacement. The wait is never performed while
+	// holding ds.mu, so a listener that needs the lock to finish its exit can
+	// always make progress; the bound is a fail-closed safety net, not a
+	// routine timeout.
+	defaultDirectHandoffTimeout = 2 * time.Second
 )
 
 // originPair is one content session's §6 origin pair: the control-allocated
@@ -200,6 +208,15 @@ type originPair struct {
 // directState is the daemon's direct-TCP transport state. It is nil when direct
 // transport is not configured (e.g. in tests using NewWithSignaling).
 type directState struct {
+	// syncMu serializes syncDirectServe rebuilds AND startDirectServer, so a
+	// listener cannot be started on the old server while a rebuild is between
+	// its drain/cancel and its single publication point (which would race the
+	// old socket or revive the discarded server). The handoff releases ds.mu
+	// across the bounded listener-exit wait; syncMu is acquired before ds.mu on
+	// every path and is never held while blocking on another lock, so it cannot
+	// form a lock cycle.
+	syncMu sync.Mutex
+
 	mu        sync.Mutex
 	namespace string
 	// ready is baseline enrollment readiness: enrollment_ready received for
@@ -226,6 +243,26 @@ type directState struct {
 	startGen   uint64             // increments per start attempt (under mu)
 	cancel     context.CancelFunc // cancels the direct server ctx on shutdown
 	listenAddr string             // override for tests; empty => :directIntPort
+
+	// listenerDone is closed when the current listener goroutine's Start call
+	// returns, i.e. the listener's socket has been released. A rebuild waits on
+	// it (bounded) before binding the replacement so the new listener can never
+	// race the old socket (audit C1). Owned under mu.
+	listenerDone chan struct{}
+
+	// handoffErr is non-nil after a listener handoff failed closed: the old
+	// listener did not release its socket within the bound, so no replacement
+	// may bind. startDirectServer refuses to start while it is set; a later
+	// handoff that completes the wait clears it. Owned under mu.
+	handoffErr error
+
+	// handoffTimeout overrides defaultDirectHandoffTimeout in tests (zero uses
+	// the default). Owned under mu.
+	handoffTimeout time.Duration
+
+	// startListenerFn overrides (*direct.DirectServer).Start in tests so a
+	// listener's bind/exit can be delayed deterministically. Owned under mu.
+	startListenerFn func(ctx context.Context, server *direct.DirectServer, addr string) error
 
 	// locked is the local §13.4 lockdown state: an availability stop, NOT
 	// share revocation. While true the SignalGate refuses new opens, the
@@ -750,31 +787,79 @@ func (d *Daemon) revokeOrigin(code string) {
 // syncDirectServe (re)builds the binder and direct server once the namespace is
 // known. It is idempotent for an unchanged namespace so reconnect does not drop
 // live origin bindings.
+//
+// A rebuild is an ORDERED handoff (audit C1): the previous listener is drained
+// through its own registry, cancelled, and waited on (bounded) for its socket
+// to be released before the replacement binder/server is published. The wait
+// is never performed while holding ds.mu, so the listener goroutine — which
+// takes ds.mu to clear its start guard — can always exit; ds.syncMu serializes
+// concurrent rebuilds so two handoffs cannot both publish a live server.
 func (d *Daemon) syncDirectServe() {
 	ds := d.direct
 	if ds == nil {
 		return
 	}
+	ds.syncMu.Lock()
+	defer ds.syncMu.Unlock()
+
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
 	if ds.namespace == "" {
+		ds.mu.Unlock()
 		return
 	}
 	if ds.binder != nil && ds.serveNS == ds.namespace {
+		ds.mu.Unlock()
 		return
 	}
-	// The namespace changed: the currently-serving listener (if any) is bound
-	// to the previous namespace's server object, so it must leave service;
-	// the next enrollment_ready rebinds the rebuilt server (§13.1 re-allow
-	// after namespace/listener rebuild). A reconnect with an UNCHANGED
-	// namespace never reaches this branch — the listener keeps serving.
-	if ds.started && ds.cancel != nil {
-		cancel := ds.cancel
-		ds.cancel = nil
-		ds.started = false
-		ds.startGen++
+	// 1. Mark the old listener non-serving under ds.mu (no new start may latch
+	// it), but KEEP ds.server pointing at the old object: its route-aware
+	// registry must remain reachable to the T29 closers while it drains.
+	oldServer := ds.server
+	cancel := ds.cancel
+	done := ds.listenerDone
+	listenAddr := ds.listenAddr
+	ds.started = false
+	ds.startGen++
+	ds.mu.Unlock()
+
+	// 2. Drain the old server's active connections through its own registry,
+	// then cancel/close its listener.
+	if oldServer != nil {
+		oldServer.CloseAllConns()
+	}
+	if cancel != nil {
 		cancel()
 	}
+	// 3. Wait boundedly for the old listener goroutine to exit (release its
+	// socket) before binding the replacement. If it does not exit in time,
+	// fail closed: do NOT bind over a socket that may still be held, surface
+	// the error, and keep the old listener tracked so a later rebuild (or
+	// shutdown) can still wait on / tear down the same completion.
+	if done != nil {
+		if !waitChanClosed(done, ds.listenerHandoffTimeout()) {
+			err := fmt.Errorf("old listener at %q did not release its socket within %s", listenAddr, ds.listenerHandoffTimeout())
+			log.Printf("direct server: listener handoff failed closed: %v; refusing to bind the replacement", err)
+			ds.mu.Lock()
+			ds.handoffErr = err
+			ds.cancel = cancel
+			ds.listenerDone = done
+			// The listener goroutine has not returned, so the listener is still
+			// (partially) serving; keep the start guard latched so no bind can
+			// race it. A successful later handoff resets it before publishing.
+			ds.started = true
+			ds.mu.Unlock()
+			return
+		}
+	}
+
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	// 4. Single publication point: the old socket is provably released, so the
+	// fresh state is published atomically. Clear the handoff bookkeeping so
+	// startDirectServer may bind the replacement.
+	ds.handoffErr = nil
+	ds.cancel = nil
+	ds.listenerDone = nil
 	ds.binder = direct.NewBinder(ds.namespace, ds.baseDomain)
 	// Share ONE binder between the daemon (which records control-allocated
 	// origin pairs via bindOrigin) and the DirectServer (which consults it for
@@ -1485,19 +1570,38 @@ func (d *Daemon) learnAndReportPublicIP() {
 // closed when the context is cancelled on disconnect (onSignalingDisconnect).
 func (d *Daemon) startDirectServer() {
 	ds := d.direct
-	if ds == nil || ds.server == nil {
+	if ds == nil {
 		return
 	}
+	// Serialize with a rebuild handoff: while a rebuild is draining/waiting,
+	// ds.server still points at the old object, and starting it here would race
+	// the socket the handoff is releasing. Once the handoff publishes, this
+	// starts the fresh server exactly once.
+	ds.syncMu.Lock()
+	defer ds.syncMu.Unlock()
 	ds.mu.Lock()
-	if ds.locked || ds.started {
+	if ds.server == nil || ds.locked || ds.started {
 		ds.mu.Unlock()
 		return
 	}
+	// Fail closed: a prior handoff could not prove the old socket was released.
+	// Binding here would race that socket; a successful rebuild clears the error
+	// first.
+	if ds.handoffErr != nil {
+		err := ds.handoffErr
+		ds.mu.Unlock()
+		log.Printf("direct server: refusing to start while the listener handoff is fail-closed: %v", err)
+		return
+	}
+	server := ds.server
+	startFn := ds.startListenerFn
 	ds.started = true
 	ds.startGen++
 	gen := ds.startGen
 	ctx, cancel := context.WithCancel(context.Background())
 	ds.cancel = cancel
+	done := make(chan struct{})
+	ds.listenerDone = done
 	listenAddr := ds.listenAddr
 	ds.mu.Unlock()
 	if listenAddr == "" {
@@ -1505,7 +1609,14 @@ func (d *Daemon) startDirectServer() {
 	}
 
 	go func() {
-		if err := ds.server.Start(ctx, listenAddr); err != nil {
+		// Closing done (after Start has returned and the socket is released)
+		// is what a listener rebuild waits on before binding the replacement.
+		defer close(done)
+		start := server.Start
+		if startFn != nil {
+			start = func(ctx context.Context, addr string) error { return startFn(ctx, server, addr) }
+		}
+		if err := start(ctx, listenAddr); err != nil {
 			log.Printf("direct server: %v", err)
 			cancel() // release the epoch ctx
 			// A bind/start failure must not latch the epoch as started: reset
@@ -1516,10 +1627,48 @@ func (d *Daemon) startDirectServer() {
 			if ds.startGen == gen {
 				ds.cancel = nil
 				ds.started = false
+				ds.listenerDone = nil
 			}
 			ds.mu.Unlock()
 		}
 	}()
+}
+
+// listenerHandoffTimeout resolves the bounded wait for the previous listener's
+// exit, honoring the test override. Callers read it without ds.mu (it is set
+// before any listener starts).
+func (ds *directState) listenerHandoffTimeout() time.Duration {
+	if ds.handoffTimeout > 0 {
+		return ds.handoffTimeout
+	}
+	return defaultDirectHandoffTimeout
+}
+
+// waitChanClosed reports whether ch was closed within bound. It is the
+// non-blocking-safe bounded join the listener handoff uses; the caller must
+// not hold ds.mu while waiting (the listener goroutine needs it to exit).
+func waitChanClosed(ch <-chan struct{}, bound time.Duration) bool {
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// directHandoffErr reports the most recent fail-closed listener handoff error,
+// or nil when the last handoff completed. It is the diagnostic surface for the
+// audit-C1 ordering guarantee.
+func (d *Daemon) directHandoffErr() error {
+	ds := d.direct
+	if ds == nil {
+		return nil
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	return ds.handoffErr
 }
 
 // handleOpenSignal admits a control-plane open-signal, opens the on-demand
