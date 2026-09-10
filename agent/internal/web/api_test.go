@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"html/template"
 	"net/http"
 	"net/http/httptest"
@@ -476,6 +477,40 @@ func TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible(t *testing.T) 
 	plainMux.ServeHTTP(plainRec, plainReq)
 	if plainRec.Code != http.StatusNotImplemented {
 		t.Fatalf("unsupported lockdown = %d, want 501", plainRec.Code)
+	}
+}
+
+// TestUnlockEndpointSurfacesRestoreFailureAsServerError pins the admin-API
+// contract for a failed transport restore: the endpoint must answer with an
+// error status carrying the failure, never a {"locked":false} success body,
+// and the daemon's lockdown state must be left untouched (out of service).
+func TestUnlockEndpointSurfacesRestoreFailureAsServerError(t *testing.T) {
+	cfg := &config.Config{}
+	mock := &lockdownDaemonMock{mockDaemonV1: newMockDaemonV1(cfg)}
+	mock.locked = true
+	mock.unlockErr = errors.New("unlock: direct listener handoff failed closed")
+	ws := &WebServer{daemon: mock, password: "s3cret-admin"}
+
+	mux := http.NewServeMux()
+	ws.registerRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/unlock", nil)
+	req.Header.Set("HX-Request", "true")
+	req.SetBasicAuth("admin", "s3cret-admin")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("failed unlock = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unlock: direct listener handoff failed closed") {
+		t.Errorf("body = %q, want the restore failure", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"locked":false`) {
+		t.Errorf("body = %q must not claim the daemon is unlocked", rec.Body.String())
+	}
+	if !mock.locked {
+		t.Error("a failed unlock must leave the daemon out of service")
 	}
 }
 

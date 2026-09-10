@@ -250,11 +250,21 @@ type directState struct {
 	// race the old socket (audit C1). Owned under mu.
 	listenerDone chan struct{}
 
-	// handoffErr is non-nil after a listener handoff failed closed: the old
-	// listener did not release its socket within the bound, so no replacement
-	// may bind. startDirectServer refuses to start while it is set; a later
-	// handoff that completes the wait clears it. Owned under mu.
+	// handoffErr is the fail-closed start guard: non-nil after a listener
+	// handoff could not prove the old listener released its socket, so no
+	// replacement may bind. syncDirectServe RETURNS this error to its caller
+	// (the failure is never swallowed by private state) and startDirectServer
+	// refuses to start while it is set; a later handoff that completes the wait
+	// clears it before publishing. Owned under mu.
 	handoffErr error
+
+	// restorePending records that an Unlock did not complete: the listener
+	// could not be brought back, so the relay restore lifecycle (fresh tunnel
+	// manager + fresh credential) is still owed. Unlock re-runs the full
+	// restore while it is set instead of short-circuiting as an idempotent
+	// no-op, so a retried unlock after the handoff recovers completes the
+	// restore rather than falsely reporting success. Owned under mu.
+	restorePending bool
 
 	// handoffTimeout overrides defaultDirectHandoffTimeout in tests (zero uses
 	// the default). Owned under mu.
@@ -794,10 +804,16 @@ func (d *Daemon) revokeOrigin(code string) {
 // is never performed while holding ds.mu, so the listener goroutine — which
 // takes ds.mu to clear its start guard — can always exit; ds.syncMu serializes
 // concurrent rebuilds so two handoffs cannot both publish a live server.
-func (d *Daemon) syncDirectServe() {
+//
+// It RETURNS the fail-closed handoff error instead of stashing it: the caller
+// (Unlock, the signaling-loop enrolled/start paths, startup) must decide what
+// to report, and must never report success while the listener could not be
+// brought up. The ds.handoffErr latch is kept only as the start guard that
+// makes startDirectServer refuse to bind behind the stuck listener.
+func (d *Daemon) syncDirectServe() error {
 	ds := d.direct
 	if ds == nil {
-		return
+		return nil
 	}
 	ds.syncMu.Lock()
 	defer ds.syncMu.Unlock()
@@ -805,11 +821,11 @@ func (d *Daemon) syncDirectServe() {
 	ds.mu.Lock()
 	if ds.namespace == "" {
 		ds.mu.Unlock()
-		return
+		return nil
 	}
 	if ds.binder != nil && ds.serveNS == ds.namespace {
 		ds.mu.Unlock()
-		return
+		return nil
 	}
 	// 1. Mark the old listener non-serving under ds.mu (no new start may latch
 	// it), but KEEP ds.server pointing at the old object: its route-aware
@@ -832,9 +848,10 @@ func (d *Daemon) syncDirectServe() {
 	}
 	// 3. Wait boundedly for the old listener goroutine to exit (release its
 	// socket) before binding the replacement. If it does not exit in time,
-	// fail closed: do NOT bind over a socket that may still be held, surface
-	// the error, and keep the old listener tracked so a later rebuild (or
-	// shutdown) can still wait on / tear down the same completion.
+	// fail closed: do NOT bind over a socket that may still be held, keep the
+	// old listener tracked so a later rebuild (or shutdown) can still wait on /
+	// tear down the same completion, and RETURN the error to the caller (the
+	// latch below only makes the start guard refuse to bind).
 	if done != nil {
 		if !waitChanClosed(done, ds.listenerHandoffTimeout()) {
 			err := fmt.Errorf("old listener at %q did not release its socket within %s", listenAddr, ds.listenerHandoffTimeout())
@@ -848,7 +865,7 @@ func (d *Daemon) syncDirectServe() {
 			// race it. A successful later handoff resets it before publishing.
 			ds.started = true
 			ds.mu.Unlock()
-			return
+			return err
 		}
 	}
 
@@ -880,7 +897,7 @@ func (d *Daemon) syncDirectServe() {
 	// re-runs this function to restore them.
 	if ds.locked {
 		ds.serveNS = ds.namespace
-		return
+		return nil
 	}
 	// Re-Allow currently-bound origin pairs into the fresh binder (atomic
 	// under ds.mu): BOTH route kinds are re-admitted for every bound session
@@ -923,11 +940,17 @@ func (d *Daemon) syncDirectServe() {
 		log.Printf("re-bound pending relay-only origin for share %s after binder build", code)
 	}
 	ds.serveNS = ds.namespace
+	return nil
 }
 
 // buildDirectState constructs the daemon's direct-transport state. When withNetwork
-// is false (tests) the port mapper and on-demand port are left nil.
-func (d *Daemon) buildDirectState(withNetwork bool) {
+// is false (tests) the port mapper and on-demand port are left nil. It returns
+// the initial listener rebuild's error so a startup that could not come into
+// service is reported by New instead of silently running out of service. There
+// is no prior listener at startup (ds.listenerDone is nil), so the ordered
+// handoff cannot currently fail here; the propagation keeps that guarantee
+// honest if a future startup ever inherits one.
+func (d *Daemon) buildDirectState(withNetwork bool) error {
 	cfg := d.GetConfig()
 	agentID := d.store.GetAgentID()
 
@@ -968,7 +991,7 @@ func (d *Daemon) buildDirectState(withNetwork bool) {
 		}
 	}
 
-	d.syncDirectServe()
+	return d.syncDirectServe()
 }
 
 // shortHash returns a short stable hex digest of s, used to derive a per-agent
@@ -1015,7 +1038,9 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 		sessions:  make(map[string]*Session),
 		startTime: time.Now(),
 	}
-	d.buildDirectState(true)
+	if err := d.buildDirectState(true); err != nil {
+		return nil, fmt.Errorf("init direct transport: %w", err)
+	}
 	return d, nil
 }
 
@@ -1399,7 +1424,11 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 		d.signalingConnected = true
 
 	case "enrolled":
-		d.handleEnrolled(msg)
+		// A direct-path rebuild failure must not be swallowed: report it while
+		// the handler continues the §7.1 baseline enrollment work.
+		if err := d.handleEnrolled(msg); err != nil {
+			log.Printf("enrolled: %v", err)
+		}
 
 	case "cert_issue":
 		d.handleCertIssue(msg)
@@ -1408,7 +1437,9 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 		d.handleCertError(msg)
 
 	case "enrollment_ready":
-		d.handleEnrollmentReady(msg)
+		if err := d.handleEnrollmentReady(msg); err != nil {
+			log.Printf("enrollment_ready: %v", err)
+		}
 
 	case "open_signal":
 		d.handleOpenSignal(msg)
@@ -1426,10 +1457,14 @@ func (d *Daemon) handleSignalingMessage(msg signaling.Message) {
 
 // handleEnrolled persists the control-assigned namespace, rebuilds the binder
 // (if the namespace changed), and initiates or re-affirms certificate issuance.
-func (d *Daemon) handleEnrolled(msg signaling.Message) {
+// It returns the direct listener rebuild's fail-closed error, if any: §7.1
+// baseline enrollment (TLS + relay DNS) is never gated on the optional direct
+// path, so the certificate flow below still runs and the error is surfaced to
+// the signaling loop instead of being dropped.
+func (d *Daemon) handleEnrolled(msg signaling.Message) error {
 	ds := d.direct
 	if ds == nil || msg.Namespace == "" {
-		return
+		return nil
 	}
 
 	ds.mu.Lock()
@@ -1440,24 +1475,25 @@ func (d *Daemon) handleEnrolled(msg signaling.Message) {
 	if err := ds.cert.SetNamespace(msg.Namespace); err != nil {
 		log.Printf("persist namespace: %v", err)
 	}
-	d.syncDirectServe()
+	directErr := d.syncDirectServe()
 
 	if nsChanged || !ds.cert.Installed() || ds.cert.NeedsRenewal() {
 		csr, err := ds.cert.GenerateCSR()
 		if err != nil {
 			log.Printf("generate CSR: %v", err)
-			return
+			return directErr
 		}
 		if err := d.signaling.SubmitCSR(context.Background(), string(csr)); err != nil {
 			log.Printf("submit CSR: %v", err)
 		}
-		return
+		return directErr
 	}
 
 	// Reconnect reconciliation: cert already installed and not expiring —
 	// re-affirm tls_ready so the control marks the current epoch ready.
 	d.sendTLSReady()
 	d.learnAndReportPublicIP()
+	return directErr
 }
 
 // handleCertIssue validates and installs the issued chain, then reports the
@@ -1487,10 +1523,15 @@ func (d *Daemon) handleCertError(msg signaling.Message) {
 // supported shares may now be registered and the HTTPS server/tunnel start.
 // It no longer claims direct reachability (§11.2); direct state is an optional
 // route capability.
-func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
+//
+// It returns the listener start's fail-closed error, if any: baseline readiness
+// (§7.1 TLS + relay DNS) is latched before the listener is attempted and is not
+// rolled back, but the signaling loop and the tests must be able to see that the
+// daemon did not come fully into service rather than reading a success log.
+func (d *Daemon) handleEnrollmentReady(msg signaling.Message) error {
 	ds := d.direct
 	if ds == nil {
-		return
+		return nil
 	}
 	ds.mu.Lock()
 	ds.ready = true
@@ -1506,15 +1547,19 @@ func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
 		// explicit local unlock is the only way back.
 		d.reportLockdownState()
 		log.Printf("baseline enrollment ready (locked)")
-		return
+		return nil
 	}
 
 	// Learn/report the public IP and start the direct HTTPS server. Both are
 	// idempotent, re-run safely on every reconnect, and are no-ops when the
 	// direct path is unavailable (e.g. no port mapper behind CGNAT).
 	d.learnAndReportPublicIP()
-	d.startDirectServer()
+	if err := d.startDirectServer(); err != nil {
+		log.Printf("baseline enrollment ready (direct listener out of service): %v", err)
+		return err
+	}
 	log.Printf("baseline enrollment ready")
+	return nil
 }
 
 // sendTLSReady reports the installed leaf fingerprint + not_after to the control.
@@ -1568,10 +1613,16 @@ func (d *Daemon) learnAndReportPublicIP() {
 // startDirectServer starts the direct HTTPS server on the internal listen
 // address. It is idempotent (guarded by ds.started under ds.mu); the server is
 // closed when the context is cancelled on disconnect (onSignalingDisconnect).
-func (d *Daemon) startDirectServer() {
+//
+// It RETURNS an error when the listener could not be brought into service: a
+// prior handoff that failed closed latches the start guard, and reporting that
+// to the caller is what stops Unlock / the signaling loop from claiming the
+// daemon is in service. Starting is otherwise asynchronous, so a later bind
+// failure is logged and unlatches the guard for a retry, as before.
+func (d *Daemon) startDirectServer() error {
 	ds := d.direct
 	if ds == nil {
-		return
+		return nil
 	}
 	// Serialize with a rebuild handoff: while a rebuild is draining/waiting,
 	// ds.server still points at the old object, and starting it here would race
@@ -1580,18 +1631,20 @@ func (d *Daemon) startDirectServer() {
 	ds.syncMu.Lock()
 	defer ds.syncMu.Unlock()
 	ds.mu.Lock()
-	if ds.server == nil || ds.locked || ds.started {
-		ds.mu.Unlock()
-		return
-	}
-	// Fail closed: a prior handoff could not prove the old socket was released.
-	// Binding here would race that socket; a successful rebuild clears the error
-	// first.
+	// Fail closed FIRST: a prior handoff could not prove the old socket was
+	// released, and the guard it latched (ds.started) describes the old
+	// listener that may still be serving, so the ordinary not-started checks
+	// must not turn this into a silent no-op success. Binding here would race
+	// that socket; a successful rebuild clears the error first.
 	if ds.handoffErr != nil {
 		err := ds.handoffErr
 		ds.mu.Unlock()
 		log.Printf("direct server: refusing to start while the listener handoff is fail-closed: %v", err)
-		return
+		return err
+	}
+	if ds.server == nil || ds.locked || ds.started {
+		ds.mu.Unlock()
+		return nil
 	}
 	server := ds.server
 	startFn := ds.startListenerFn
@@ -1632,6 +1685,7 @@ func (d *Daemon) startDirectServer() {
 			ds.mu.Unlock()
 		}
 	}()
+	return nil
 }
 
 // listenerHandoffTimeout resolves the bounded wait for the previous listener's
@@ -1656,19 +1710,6 @@ func waitChanClosed(ch <-chan struct{}, bound time.Duration) bool {
 	case <-timer.C:
 		return false
 	}
-}
-
-// directHandoffErr reports the most recent fail-closed listener handoff error,
-// or nil when the last handoff completed. It is the diagnostic surface for the
-// audit-C1 ordering guarantee.
-func (d *Daemon) directHandoffErr() error {
-	ds := d.direct
-	if ds == nil {
-		return nil
-	}
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	return ds.handoffErr
 }
 
 // handleOpenSignal admits a control-plane open-signal, opens the on-demand
@@ -2442,6 +2483,16 @@ func (d *Daemon) runLockdownLevers(levers []lockdownLever) {
 // the tunnel manager and requests a FRESH credential (relay_credential_request
 // reason restart) — never reusing the pre-lockdown one-use credential. It is
 // idempotent.
+//
+// Failure semantics: if the ordered listener handoff fails closed (the old
+// listener did not release its socket within the bound), Unlock returns that
+// error to its caller (the admin API turns it into a non-2xx response) and
+// emits NONE of the unlocked-success lifecycle actions — no tunnel restart, no
+// credential request, no unlocked status report — so the daemon stays out of
+// service (the latched start guard keeps the replacement from binding and the
+// binder keeps its withdrawn admissions). ds.restorePending records the owed
+// relay restore, so a later Unlock retries it instead of short-circuiting as
+// an idempotent no-op and falsely reporting success.
 func (d *Daemon) Unlock() error {
 	d.lockdownMu.Lock()
 	defer d.lockdownMu.Unlock()
@@ -2451,32 +2502,55 @@ func (d *Daemon) Unlock() error {
 		return nil
 	}
 	ds.mu.Lock()
-	if !ds.locked {
+	// Idempotent no-op only when the daemon is genuinely unlocked AND no
+	// restore is owed: a prior failed unlock must not be reported as success.
+	if !ds.locked && !ds.restorePending {
 		ds.mu.Unlock()
 		return nil
 	}
-	ds.locked = false
-	// Supersede every in-flight lockdown lever BEFORE the gate re-opens: a
-	// post-unlock open must never be reachable by a stale close, and a stale
-	// listener stop must not tear down the listener restored below. Bumping
-	// under ds.mu makes the bump atomic with the fenced levers' checks.
-	ds.lockdownEpoch++
+	wasLocked := ds.locked
+	if wasLocked {
+		ds.locked = false
+		// Supersede every in-flight lockdown lever BEFORE the gate re-opens: a
+		// post-unlock open must never be reachable by a stale close, and a stale
+		// listener stop must not tear down the listener restored below. Bumping
+		// under ds.mu makes the bump atomic with the fenced levers' checks.
+		ds.lockdownEpoch++
+		// Force syncDirectServe to rebuild the Binder/DirectServer and re-admit
+		// every recorded origin (direct pairs, relay-only bindings, and pending
+		// relay-only bindings), reusing the tested namespace-rebuild path. The
+		// rebuild is required because lockdown withdrew the current binder's
+		// admissions. A retry (restorePending) reuses a binder that is already
+		// current; the owed relay lifecycle below is what must still run.
+		ds.serveNS = ""
+	}
 	gate := ds.gate
-	// Force syncDirectServe to rebuild the Binder/DirectServer and re-admit
-	// every recorded origin (direct pairs, relay-only bindings, and pending
-	// relay-only bindings), reusing the tested namespace-rebuild path.
-	ds.serveNS = ""
 	ds.mu.Unlock()
 
 	if gate != nil {
 		gate.SetLockdown(false)
 	}
-	d.syncDirectServe()
-	d.startDirectServer()
+	if err := d.syncDirectServe(); err != nil {
+		ds.mu.Lock()
+		ds.restorePending = true
+		ds.mu.Unlock()
+		log.Printf("unlock: direct listener handoff failed closed; the daemon stays out of service: %v", err)
+		return fmt.Errorf("unlock: %w", err)
+	}
+	if err := d.startDirectServer(); err != nil {
+		ds.mu.Lock()
+		ds.restorePending = true
+		ds.mu.Unlock()
+		log.Printf("unlock: direct listener did not start; the daemon stays out of service: %v", err)
+		return fmt.Errorf("unlock: %w", err)
+	}
 	d.learnAndReportPublicIP()
 	d.restartTunnelManager()
 	d.sendLockdownStatus(d.nextLockdownGeneration(), false)
 	d.requestRelayCredential()
+	ds.mu.Lock()
+	ds.restorePending = false
+	ds.mu.Unlock()
 	return nil
 }
 
