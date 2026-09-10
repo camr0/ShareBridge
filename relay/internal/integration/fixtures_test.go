@@ -33,6 +33,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -41,7 +42,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,58 +79,61 @@ const (
 )
 
 // requireIntegration skips unless the operator explicitly enabled the suite.
+// In required gate mode (SHAREBRIDGE_FRP_GATE=required) an unset integration
+// env is a FAILURE, never a skip: the §23.3 gate must be un-forgeable.
 func requireIntegration(t *testing.T) {
 	t.Helper()
 	if os.Getenv(integrationEnv) != "1" {
+		if gateRequired() {
+			t.Fatalf("%s=%s requires %s=1; the required §23.3 gate must never skip",
+				gateModeEnv, gateModeRequired, integrationEnv)
+		}
 		t.Skipf("set %s=1 to run the hermetic real-FRP integration suite", integrationEnv)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Pinned FRP binaries (mirrors relay/internal/frptest resolution)
+// Pinned FRP binaries (shared resolution with the gate's integrity checks)
 // ---------------------------------------------------------------------------
 
-type frpManifest struct {
-	Version   string `json:"version"`
-	Artifacts map[string]struct {
-		URL    string `json:"url"`
-		SHA256 string `json:"sha256"`
-	} `json:"artifacts"`
-}
-
-// pinnedFRPBinaries returns the checksum-verified frps/frpc paths for the
-// current platform, fetching through relay/scripts/fetch-frp.sh when the
-// version+digest-keyed cache is cold. The binaries are never committed.
+// pinnedFRPBinaries returns the pinned frps/frpc paths for the current
+// platform, fetching through relay/scripts/fetch-frp.sh when the
+// version+digest-keyed cache is cold. The binaries are never committed. In
+// required gate mode a missing platform pin is fatal, never a skip; TestMain
+// has already re-hashed the artifacts before any case runs.
 func pinnedFRPBinaries(t *testing.T) (string, string) {
 	t.Helper()
-	manifestPath := filepath.Join(relayRoot(t), "frp", "manifest.json")
-	raw, err := os.ReadFile(manifestPath)
+	root := relayRoot(t)
+	manifest, _, err := loadPinnedManifest(root)
 	if err != nil {
-		t.Fatalf("read pinned FRP manifest %s: %v", manifestPath, err)
+		t.Fatalf("%v", err)
 	}
-	var manifest frpManifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		t.Fatalf("parse pinned FRP manifest: %v", err)
+	pin, err := pinnedArtifact(manifest, pinnedPlatformKey)
+	if err != nil {
+		if gateRequired() {
+			t.Fatalf("required gate mode: %v", err)
+		}
+		if errors.Is(err, errNoPinnedArtifact) {
+			t.Skipf("%v", err)
+		}
+		t.Fatalf("resolve pinned FRP artifact: %v", err)
 	}
-	platform := runtime.GOOS + "_" + runtime.GOARCH
-	artifact, ok := manifest.Artifacts[platform]
-	if !ok {
-		t.Skipf("no pinned FRP artifact for %s", platform)
-	}
-	cacheRoot := os.Getenv("SHAREBRIDGE_FRP_CACHE")
-	if cacheRoot == "" {
-		cacheRoot = filepath.Join(relayRoot(t), ".cache", "frp")
-	}
-	keyDir := filepath.Join(cacheRoot, fmt.Sprintf("v%s-sha256-%s", manifest.Version, artifact.SHA256))
+	cacheRoot := resolveFRPCacheRootAt(root)
+	keyDir := filepath.Join(cacheRoot, fmt.Sprintf("v%s-sha256-%s", manifest.Version, pin.SHA256))
 	frps := filepath.Join(keyDir, "frps")
 	frpc := filepath.Join(keyDir, "frpc")
-	if _, err := os.Stat(frps); err != nil {
-		script := filepath.Join(relayRoot(t), "scripts", "fetch-frp.sh")
+	if _, statErr := os.Stat(frps); statErr != nil {
+		script := filepath.Join(root, "scripts", "fetch-frp.sh")
 		cmd := exec.Command(script)
 		cmd.Env = append(os.Environ(), "SHAREBRIDGE_FRP_CACHE="+cacheRoot)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("fetch checksum-verified pinned FRP: %v\n%s", err, out)
+		out, fetchErr := cmd.CombinedOutput()
+		if fetchErr != nil {
+			t.Fatalf("fetch checksum-verified pinned FRP: %v\n%s", fetchErr, out)
+		}
+	}
+	for _, binary := range []string{frps, frpc} {
+		if _, statErr := os.Stat(binary); statErr != nil {
+			t.Fatalf("pinned FRP binary %s is unavailable: %v", binary, statErr)
 		}
 	}
 	return frps, frpc
@@ -332,9 +335,15 @@ func (l *tapListener) Accept() (net.Conn, error) {
 
 // ---------------------------------------------------------------------------
 // TLS record fragmenter: splits the first handshake record (the ClientHello)
-// into N TLS records so the gateway's fragmented/multi-record parser and its
+// into N TLS RECORDS so the gateway's fragmented/multi-record parser and its
 // byte-for-byte replay are exercised by a real crypto/tls handshake. TLS
 // permits a handshake message to span records, so the server accepts it.
+//
+// Scope note: this is record-level fragmentation. Separate TCP Write calls do
+// NOT prove distinct kernel TCP segments, so this suite makes no
+// TCP-segmentation claim anywhere (see GATE-EVIDENCE.md §23.3). Proving
+// segment boundaries would need packet capture or platform-specific TCP_INFO,
+// neither of which this cross-platform stdlib-only harness has.
 // ---------------------------------------------------------------------------
 
 type recordFragmenter struct {
@@ -393,17 +402,17 @@ func (f *recordFragmenter) writeFragmented(record []byte) error {
 		_, err := f.conn.Write(record)
 		return err
 	}
-	per := (len(body) + parts - 1) / parts
-	for off := 0; off < len(body); off += per {
-		end := off + per
-		if end > len(body) {
-			end = len(body)
-		}
-		header := []byte{record[0], record[1], record[2], byte((end - off) >> 8), byte(end - off)}
+	// Exact parts-way split. A naive fixed-stride loop can emit fewer than
+	// `parts` chunks (e.g. 4 chunks for parts=5, bodyLen=11), which would make
+	// the gate's exact-record-count assertion unsound.
+	for i := 0; i < parts; i++ {
+		start := len(body) * i / parts
+		end := len(body) * (i + 1) / parts
+		header := []byte{record[0], record[1], record[2], byte((end - start) >> 8), byte(end - start)}
 		if _, err := f.conn.Write(header); err != nil {
 			return err
 		}
-		if _, err := f.conn.Write(body[off:end]); err != nil {
+		if _, err := f.conn.Write(body[start:end]); err != nil {
 			return err
 		}
 	}
@@ -411,9 +420,9 @@ func (f *recordFragmenter) writeFragmented(record []byte) error {
 }
 
 // handshakeRecordCount returns how many TLS records the first handshake
-// message spans, proving the ClientHello was genuinely fragmented.
-func handshakeRecordCount(t *testing.T, stream []byte) int {
-	t.Helper()
+// message spans, so the gate can assert an EXACT record count (>= is not a
+// fragmentation proof).
+func handshakeRecordCount(stream []byte) int {
 	records := 0
 	messageBytes := 0
 	messageLength := -1
@@ -517,6 +526,14 @@ type contentServer struct {
 
 func newContentServer(counts *contentCounts) *contentServer {
 	return &contentServer{counts: counts, slowCancelled: make(chan struct{})}
+}
+
+// connectCount returns the number of /connect probe requests observed. It
+// takes the same lock as the handler so the gate test can read it under -race.
+func (s *contentServer) connectCount() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connectHits
 }
 
 func (s *contentServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -761,10 +778,11 @@ type relayStack struct {
 	rawTargetLn net.Listener
 	rawTarget   *byteRecorder
 
-	// Relay-path privacy counters (acceptance #7): the relay data plane must
-	// never touch these.
-	mapperCalls  int64
-	signalAdmits int64
+	// dialMu guards dialTargets, the exact addresses the real gateway dialed
+	// (recorded through gateway.WithDialer). Every dial must target the
+	// resolved route's loopback FRP port (acceptance #7).
+	dialMu      sync.Mutex
+	dialTargets []string
 
 	relayHost  string
 	directHost string
@@ -885,7 +903,7 @@ func newRelayStack(t *testing.T) *relayStack {
 	// Route table joined against the presence registry.
 	s.routesTable = routes.NewTable(registry)
 	s.streams = gateway.NewStreams()
-	s.gatewaySrv = gateway.NewServer(s.routesTable, s.streams)
+	s.gatewaySrv = gateway.NewServer(s.routesTable, s.streams, gateway.WithDialer(s.recordDial))
 	s.gatewayLn = listenLoopback(t)
 	s.gatewayAddr = s.gatewayLn.Addr().String()
 	go func() { _ = s.gatewaySrv.Serve(s.gatewayLn) }()
@@ -897,6 +915,24 @@ func newRelayStack(t *testing.T) *relayStack {
 
 	t.Cleanup(s.close)
 	return s
+}
+
+// recordDial is the real gateway dial seam (gateway.WithDialer). It records
+// every address the relay data plane dials before delegating to the network,
+// so the relay-path privacy test can prove the relay path dials only the
+// resolved route's loopback FRP port and never a direct-path probe target.
+func (s *relayStack) recordDial(ctx context.Context, network, address string) (net.Conn, error) {
+	s.dialMu.Lock()
+	s.dialTargets = append(s.dialTargets, address)
+	s.dialMu.Unlock()
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
+
+// dialTargetsSnapshot returns a copy of every address the gateway has dialed.
+func (s *relayStack) dialTargetsSnapshot() []string {
+	s.dialMu.Lock()
+	defer s.dialMu.Unlock()
+	return append([]string(nil), s.dialTargets...)
 }
 
 func (s *relayStack) writeFrpsConfig() {
@@ -1306,6 +1342,7 @@ type parityDigest struct {
 	BrowserSHA256 string
 	AgentSHA256   string
 	Bytes         int
+	AgentBytes    int
 	ExtraAtAgent  int
 	Records       int
 }
@@ -1315,38 +1352,104 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// assertByteParity requires that the browser stream recorded before the
-// gateway equals the agent stream recorded after FRP decapsulation, byte for
-// byte, and returns the evidence digests.
+// compareParity is the §23.3 hard assertion: both captures must be non-empty,
+// the post-quiescence agent stream must be EXACTLY as long as the browser
+// stream (no injected trailing bytes and no truncation), and every byte must
+// match. It returns the evidence digest even on failure so a caller can report
+// the observed byte counts. ExtraAtAgent == 0 on success by construction.
+func compareParity(browserBytes, agentBytes []byte) (parityDigest, error) {
+	digest := parityDigest{
+		Bytes:         len(browserBytes),
+		AgentBytes:    len(agentBytes),
+		ExtraAtAgent:  len(agentBytes) - len(browserBytes),
+		BrowserSHA256: sha256Hex(browserBytes),
+		AgentSHA256:   sha256Hex(agentBytes),
+		Records:       handshakeRecordCount(browserBytes),
+	}
+	if len(browserBytes) == 0 {
+		return digest, errors.New("browser-side tap captured zero bytes; a parity proof over an empty capture is vacuous")
+	}
+	if len(agentBytes) == 0 {
+		return digest, errors.New("agent-side tap captured zero bytes after FRP decapsulation; an empty capture must FAIL, not read as zero extra bytes")
+	}
+	if len(agentBytes) != len(browserBytes) {
+		if len(agentBytes) > len(browserBytes) {
+			return digest, fmt.Errorf("agent tap holds %d byte(s) but the browser sent %d: %d injected/extra byte(s) arrived at the agent",
+				len(agentBytes), len(browserBytes), len(agentBytes)-len(browserBytes))
+		}
+		return digest, fmt.Errorf("agent tap holds %d byte(s) but the browser sent %d: FRP truncated %d byte(s)",
+			len(agentBytes), len(browserBytes), len(browserBytes)-len(agentBytes))
+	}
+	if !bytes.Equal(agentBytes, browserBytes) {
+		for i := range browserBytes {
+			if agentBytes[i] != browserBytes[i] {
+				return digest, fmt.Errorf("byte mismatch at offset %d: browser %#02x vs agent %#02x (same length, %d bytes)",
+					i, browserBytes[i], agentBytes[i], len(browserBytes))
+			}
+		}
+	}
+	return digest, nil
+}
+
+// checkFragmentation requires the exact expected TLS record count. `>=` is not
+// a fragmentation proof: fewer records than requested makes the case vacuous.
+func checkFragmentation(records, wantRecords int) error {
+	if wantRecords < 2 {
+		return fmt.Errorf("a %d-record ClientHello is not a fragmentation proof", wantRecords)
+	}
+	if records != wantRecords {
+		return fmt.Errorf("ClientHello spans %d TLS record(s), want exactly %d (record-level fragmentation)", records, wantRecords)
+	}
+	return nil
+}
+
+// checkDialTargets requires at least one observed gateway dial (so the
+// negative is not vacuous) and that every dial targeted exactly the resolved
+// route's loopback FRP port.
+func checkDialTargets(targets []string, relayPort int) error {
+	if len(targets) == 0 {
+		return errors.New("the gateway dial recorder observed no dials; the relay-path proof would be vacuous")
+	}
+	want := net.JoinHostPort("127.0.0.1", strconv.Itoa(relayPort))
+	for _, target := range targets {
+		if target != want {
+			return fmt.Errorf("gateway dialed %q; the relay path must dial only the route's loopback FRP port %q", target, want)
+		}
+	}
+	return nil
+}
+
+// assertByteParity quiesces the agent tap (bounded) so the comparison runs on a
+// settled post-EOF capture, then applies compareParity as a hard assertion and
+// emits the §23.3 per-case evidence line.
 func assertByteParity(t *testing.T, browser, agent *byteRecorder) parityDigest {
 	t.Helper()
 	browserBytes := browser.Bytes()
 
+	const quiet = 500 * time.Millisecond
 	deadline := time.Now().Add(15 * time.Second)
-	for agent.Len() < len(browserBytes) && time.Now().Before(deadline) {
+	last := agent.Len()
+	stableSince := time.Now()
+	for time.Now().Before(deadline) {
+		current := agent.Len()
+		if current != last {
+			last = current
+			stableSince = time.Now()
+		} else if time.Since(stableSince) >= quiet {
+			break
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	agentBytes := agent.Bytes()
-	if len(agentBytes) < len(browserBytes) {
-		t.Fatalf("agent received %d bytes after FRP decapsulation; browser sent %d (stream truncated)",
-			len(agentBytes), len(browserBytes))
+
+	digest, err := compareParity(browserBytes, agent.Bytes())
+	if err != nil {
+		t.Fatalf("§23.3 byte parity FAILED (case %s): %v", t.Name(), err)
 	}
-	if !bytes.Equal(agentBytes[:len(browserBytes)], browserBytes) {
-		for i := 0; i < len(browserBytes); i++ {
-			if agentBytes[i] != browserBytes[i] {
-				t.Fatalf("byte mismatch at offset %d: browser %#02x vs agent %#02x (browser %d bytes, agent %d bytes)",
-					i, browserBytes[i], agentBytes[i], len(browserBytes), len(agentBytes))
-			}
-		}
+	if digest.ExtraAtAgent != 0 {
+		t.Fatalf("§23.3 byte parity FAILED (case %s): agent tap holds %d extra byte(s) after quiescence; want exactly 0",
+			t.Name(), digest.ExtraAtAgent)
 	}
-	digest := parityDigest{
-		BrowserSHA256: sha256Hex(browserBytes),
-		AgentSHA256:   sha256Hex(agentBytes[:len(browserBytes)]),
-		Bytes:         len(browserBytes),
-		ExtraAtAgent:  len(agentBytes) - len(browserBytes),
-		Records:       handshakeRecordCount(t, browserBytes),
-	}
-	t.Logf("§23.3 byte parity: bytes=%d clientHelloRecords=%d agentExtraBytes=%d browserSHA256=%s agentSHA256=%s",
-		digest.Bytes, digest.Records, digest.ExtraAtAgent, digest.BrowserSHA256, digest.AgentSHA256)
+	t.Logf("§23.3 evidence case=%s tlsRecords=%d browserBytes=%d agentBytes=%d extraAtAgent=%d browserSHA256=%s agentSHA256=%s",
+		t.Name(), digest.Records, digest.Bytes, digest.AgentBytes, digest.ExtraAtAgent, digest.BrowserSHA256, digest.AgentSHA256)
 	return digest
 }

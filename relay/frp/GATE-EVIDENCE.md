@@ -141,15 +141,61 @@ Gate §23.3 is the blocking byte-preservation proof: the browser TLS record
 stream captured **before the gateway** must be byte-identical to the stream
 captured **at the agent after FRP decapsulation** (spec §16.1), for
 fragmented TLS 1.2/1.3 with HTTP/1.1 and HTTP/2. The Task 31 hermetic suite
-(`relay/internal/integration`, env-gated `SHAREBRIDGE_FRP_INTEGRATION=1`)
-runs the real pinned `frps`/`frpc`, the real `frpplugin.Server`, the real
-`presence.Registry`, the gateway, and an agent-side HTTPS listener with a
-test CA in front of a deterministic fake Phase 3 backend.
+(`relay/internal/integration`) runs the real pinned `frps`/`frpc`, the real
+`frpplugin.Server`, the real `presence.Registry`, the gateway, and an
+agent-side HTTPS listener with a test CA in front of a deterministic fake
+Phase 3 backend.
 
-Pin (unchanged from the Task 8 entry): FRP `v0.71.0`, darwin_arm64 cache
-SHA-256 `45be02b186860d375ed49a8941ae9569628a54bf14e67fc36b29c98c99dabcc6`;
-staged `frps` SHA-256 `71a4896060db4a9290bd830f48561334a3660545a0907c29dfade42f91f57037`,
-`frpc` SHA-256 `3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48`.
+### Non-skippable gate mode (fix round, Task 31 review)
+
+The gate is invoked in **required mode**, which cannot be satisfied by
+skipping:
+
+```text
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
+  go test ./internal/integration -v -race -count=2 -timeout 900s
+```
+
+`TestMain` in required mode fails closed (non-zero exit, no case started) when
+`SHAREBRIDGE_FRP_INTEGRATION=1` is unset or the pinned artifacts are missing,
+unpinned, corrupt, or poisoned, and fails after the run when any of the seven
+named cases did not start and complete — a SKIP is a failure, not a pass.
+Observed: `-short` (which skips the heartbeat case) exits 1 with
+`TestRealFRPRelayPresenceHeartbeatDelayAndExpiry: skipped`, and a `-run`
+subset exits 1 listing the six cases that never started. Required mode also
+re-hashes the pinned artifacts at gate time: the verified tarball against
+`manifest.json`, the `frps`/`frpc` extracted from that tarball against the
+staged cache executables, and `frps --version`/`frpc --version` against the
+manifest version.
+
+Default `go test ./...` remains skippable (`SHAREBRIDGE_FRP_INTEGRATION`
+unset ⇒ 7 × SKIP, exit 0). Regression tests prove both directions:
+`TestGateRequiredModeFailsClosedWithoutIntegrationEnv` (required-without-env
+exits non-zero with a clear message; default-without-env exits 0 with SKIP),
+`TestGateRequiredModeWithoutPinnedCacheFailsClosed` (poisoned cache fails
+before `m.Run()`), and `TestGateIntegrityRejectsPoisonedCache` (tampered
+cached binary, tampered tarball, missing binary, and missing tarball all
+rejected).
+
+### Gate-emitted pin evidence (verbatim from the required-mode run)
+
+```text
+GATE(EVIDENCE) §23.3 required gate — pinned FRP preconditions verified
+GATE(EVIDENCE) frp.version=0.71.0 platform=darwin_arm64
+GATE(EVIDENCE) manifest.sha256=d7903d1db66c714d817ebef82c43cbf061eb00d5e8c07118fea9ba490e8a3a93
+GATE(EVIDENCE) config_frps_toml.sha256=f1337711b6e383d3d3e7e31745407e5384da2d15880a22cfb82c8152c291ac10
+GATE(EVIDENCE) tarball.path=…/relay/.cache/frp/downloads/frp_0.71.0_darwin_arm64.tar.gz tarball.sha256=45be02b186860d375ed49a8941ae9569628a54bf14e67fc36b29c98c99dabcc6 tarball_matches_manifest=yes
+GATE(EVIDENCE) frps.path=…/relay/.cache/frp/v0.71.0-sha256-45be02b1…/frps frps.sha256=71a4896060db4a9290bd830f48561334a3660545a0907c29dfade42f91f57037 frps.version=0.71.0
+GATE(EVIDENCE) frpc.path=…/relay/.cache/frp/v0.71.0-sha256-45be02b1…/frpc frpc.sha256=3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48 frpc.version=0.71.0
+GATE(EVIDENCE) cache_artifact_digest_sum=9cb1c154ff8e3e44d7add45e9d06282e460ac04435811f6dc548ba8123266a42
+…
+GATE(EVIDENCE) all 7 named §23.3 gate cases executed to completion
+```
+
+(Pin: FRP `v0.71.0`, darwin_arm64; long cache paths shortened to the module
+form for readability — the run prints absolute paths. Every value above is
+emitted by the gate itself; `frps`/`frpc` are staged only by
+`relay/scripts/fetch-frp.sh` and no binary is committed.)
 
 ### Named tests
 
@@ -165,22 +211,50 @@ staged `frps` SHA-256 `71a4896060db4a9290bd830f48561334a3660545a0907c29dfade42f9
   `relay/internal/frptest/heartbeat_gate_test.go`)
 
 The browser-side bytes are recorded under a `crypto/tls` client whose first
-handshake record is deliberately split into N TLS records by a record-layer
-fragmenter, so the gateway's fragmented/multi-record ClientHello parser and
-its byte-for-byte replay run against a real handshake. The agent side is
-recorded by a raw listener tap in front of TLS termination.
+handshake record is deliberately split into N TLS records by an exact
+record-layer fragmenter, so the gateway's fragmented/multi-record ClientHello
+parser and its byte-for-byte replay run against a real handshake. The agent
+side is recorded by a raw listener tap in front of TLS termination.
 
-### Digest comparison table (representative `-race -count=2` run)
+Fragmentation scope (corrected in the fix round): the gate asserts an
+**exact** record count (2, 2, and 5 respectively — never `>=`) and the
+fragmenter is proven to emit exactly the requested number of records for a
+range of body lengths
+(`TestRecordFragmenterEmitsExactlyRequestedRecordCount`). This is
+**record-level fragmentation only**. Separate TCP `write()` calls do not prove
+distinct kernel TCP segments, and this cross-platform stdlib-only harness has
+no packet capture or `TCP_INFO` seam, so **no TCP-segmentation claim is made
+anywhere**. The substantive claim is that the ClientHello spans five real TLS
+records and the gateway replays those records byte-for-byte into a completing
+handshake.
 
-| case | TLS / ALPN | ClientHello records | bytes | browser SHA-256 | agent SHA-256 | exact |
+### Digest comparison table (from the fix-round required-mode `-race -count=2` run)
+
+| case | TLS / ALPN | ClientHello records | bytes | browser SHA-256 | agent SHA-256 | extraAtAgent |
 | --- | --- | --- | --- | --- | --- | --- |
-| TLS 1.2 / HTTP/1.1 | TLS1.2 / http/1.1 | 2 | 551 | `82c4a298a2eeb1e979eacc41727a2d78fe4b69920e080cda6f6e0802faf7dee8` | `82c4a298a2eeb1e979eacc41727a2d78fe4b69920e080cda6f6e0802faf7dee8` | **yes** |
-| TLS 1.3 / HTTP/2 | TLS1.3 / h2 | 2 | 1819 | `0e95d6218d74d0678f9b908846a13fa63e6002df3a6b8830e51628e7456e365d` | `0e95d6218d74d0678f9b908846a13fa63e6002df3a6b8830e51628e7456e365d` | **yes** |
-| fragmented replay | TLS1.3 / http/1.1 | 5 | 1811 | `a8103fe945882136420b2475289d800b0360828858d0fe935472d040522f1359` | `a8103fe945882136420b2475289d800b0360828858d0fe935472d040522f1359` | **yes** |
+| TLS 1.2 / HTTP/1.1 | TLS1.2 / http/1.1 | 2 | 551 | `ce4f7043345bd12ef8873e084b5863caa5bebec09d26f1d2e2b2eac2ccea8b9c` | `ce4f7043345bd12ef8873e084b5863caa5bebec09d26f1d2e2b2eac2ccea8b9c` | **0** |
+| TLS 1.3 / HTTP/2 | TLS1.3 / h2 | 2 | 1819 | `412d98ffa776cce31400d2e0c93bc2fac0d9d96230e24ee0456a58efd18c933a` | `412d98ffa776cce31400d2e0c93bc2fac0d9d96230e24ee0456a58efd18c933a` | **0** |
+| fragmented replay | TLS1.3 / http/1.1 | 5 | 1811 | `fee05659cbe33e678bb8dd5e298fd56aadda9366323f698ed1a18e0faada695c` | `fee05659cbe33e678bb8dd5e298fd56aadda9366323f698ed1a18e0faada695c` | **0** |
 
-Digests are per-run (TLS ClientHello randoms/key shares differ every
-connection); equality/replay is the invariant, not the digest value. In every
-run `agentExtraBytes=0`.
+These three lines are copy-pasted from the `§23.3 evidence case=…` lines the
+gate emitted in the run reported as `ok 134.267s` (the second `-count=2`
+iteration produced different per-run digests — see below). Digests are per-run
+(TLS ClientHello randoms/key shares differ every connection); equality/replay
+is the invariant, not the digest value. `assertByteParity` now requires
+non-empty captures, **exact post-quiescence length equality**, and
+`ExtraAtAgent == 0` as a hard assertion (the old code only logged the extra
+byte count and accepted any suffix).
+`TestParityComparatorRequiresExactLengthAndNonEmptyCaptures`
+and friends prove an injected trailing byte, a truncated capture, an empty
+capture, and a same-length bit flip all FAIL.
+
+Second-iteration emitted lines (same run, `-count=2`):
+
+```text
+§23.3 evidence case=TestRealFRPRelayEndToEndTLS12HTTP11 tlsRecords=2 browserBytes=551 agentBytes=551 extraAtAgent=0 browserSHA256=835fe008bb58d9bc949f09d11141508030f6a4d14af4d2c8a86f5637bfce621e agentSHA256=835fe008bb58d9bc949f09d11141508030f6a4d14af4d2c8a86f5637bfce621e
+§23.3 evidence case=TestRealFRPRelayEndToEndTLS13HTTP2 tlsRecords=2 browserBytes=1819 agentBytes=1819 extraAtAgent=0 browserSHA256=95f11087054105479d239a32165087c32d4fbd7c620238af9fc1af1e99de6007 agentSHA256=95f11087054105479d239a32165087c32d4fbd7c620238af9fc1af1e99de6007
+§23.3 evidence case=TestRealFRPFragmentedClientHelloReplay tlsRecords=5 browserBytes=1811 agentBytes=1811 extraAtAgent=0 browserSHA256=77cc5b0639dc94d018e6680833595870ec6c5c3a29769a5b9b61c56414cb4a94 agentSHA256=77cc5b0639dc94d018e6680833595870ec6c5c3a29769a5b9b61c56414cb4a94
+```
 
 ### §23.3 supporting results
 
@@ -195,8 +269,17 @@ is non-zero; eight concurrent relay requests succeed; revoke closes the
 established stream and blocks new connections; a graceful frpc stop
 transitions presence offline and a restart restores availability.
 - `TestRelayPathNeverEmitsOpenSignal`: the relay path issued zero `/connect`
-requests and zero port-mapper/open-signal operations, and the gateway holds
-no direct origin.
+requests; **every gateway dial, recorded through the real
+`gateway.WithDialer` seam, targeted exactly the resolved route's loopback FRP
+port** (with a non-empty-dial requirement so the negative is not vacuous); the
+route table resolved the relay origin (positive control) but exposed no
+route for the direct origin; and a real TLS hello carrying the direct
+origin's SNI reached no agent. Scope note: the agent-module `SignalGate` and
+port mapper cannot be instantiated from this stdlib-only relay test package;
+their semantics are proven by `agent/internal/direct/opensignal_test.go`. The
+test no longer reports dead `mapperCalls`/`signalAdmits` fixture counters.
+- The parity assertion is a hard comparison: non-empty captures, exact
+post-quiescence length equality, and `extraAtAgent == 0`.
 - `TestRealFRPRelayPresenceHeartbeatDelayAndExpiry`: a 14 s freeze of the real
 frpc does not flap the 45 s presence lease; sustained absence transitions
 offline only at true lease expiry (~45 s after the last authenticated Ping).
@@ -207,22 +290,36 @@ unchanged against both the direct and relay base URLs.
 ### Reproduction
 
 ```text
-# RED (package did not exist):
-cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test ./internal/integration -v
-# FAIL — directory not found
+# RED (fix round, tests first) — required mode did not exist:
+cd relay && go test ./internal/integration -v
+# PASS — exit 0, 7 × SKIP in 0.261s (the reviewed forge-by-omission defect)
+cd relay && go test ./internal/integration \
+  -run 'TestGateRequiredMode|TestRecordFragmenterEmitsExactly' -v -count=1
+# FAIL — exit 1: required mode exited 0; fragmenter emitted 4 records for parts=5, bodyLen=11
+cd relay && go test ./internal/integration -run '^TestParityComparator' -count=1
+# FAIL [build failed] — undefined: compareParity, checkFragmentation, checkDialTargets, hashCacheArtifacts
 
-# GREEN (§23.3 byte gate, with the race detector, twice):
-cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test ./internal/integration \
-  -v -race -count=2 -timeout 600s
-# PASS — ok sharebridge/relay/internal/integration 121.7s
+# GREEN (§23.3 non-skippable gate, race detector, twice):
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
+  go test ./internal/integration -v -race -count=2 -timeout 900s
+# PASS — exit 0; "all 7 named §23.3 gate cases executed to completion"; ok 134.267s
+
+# Negative controls (proven by the subprocess regression tests, reproducible):
+cd relay && SHAREBRIDGE_FRP_GATE=required go test ./internal/integration -v -count=1
+# FAIL — exit 1: "required gate mode ... needs SHAREBRIDGE_FRP_INTEGRATION=1"
+cd relay && go test ./internal/integration -v -count=1
+# PASS — exit 0, 7 × SKIP
 ```
 
 ### Verdict
 
 §23.3: **GO**. Fragmented ClientHello replay through gateway → FRP → agent is
-byte-for-byte exact for TLS 1.2/1.3 with HTTP/1.1 and HTTP/2; no mismatch,
-truncation, or injected byte was observed in any run (any mismatch would have
-been a NO-GO).
+byte-for-byte exact for TLS 1.2/1.3 with HTTP/1.1 and HTTP/2 — non-empty
+captures, exact post-quiescence length equality, and `extraAtAgent=0` asserted
+in every case (not merely logged). The gate is now non-skippable in required
+mode: missing integration env, missing/poisoned pins, and any skipped or
+incomplete named case all fail the run. Fragmentation is record-level (exact
+counts 2/2/5); no TCP-segmentation claim is made.
 
 ## Superseded entry
 
@@ -240,7 +337,7 @@ retained under a misleading name.
 | §23.1 plugin operations / ordering / correlated readiness | **GO** — all five operations invoked with correlation-grade metadata; probe confirms only registered proxies in one attempt; failure/stale/restart cases never confirm; Pings continuing without readiness can no longer present as online |
 | §23.2 loopback / runtime port+proxy enforcement / transport TLS | **GO** — loopback-only binding proven; second-proxy and out-of-range ports rejected at runtime by the plugin and by frps allowPorts respectively; transport TLS fails closed with a pinned untrusted CA |
 | §23.7 Ping cadence / delayed-Ping tolerance / true expiry | **GO** — immediate first Ping, ~10 s cadence, one missed beat tolerated with ≥31 s lease margin, offline only at the true 45 s expiry |
-| §23.3 fragmented TLS 1.2/1.3 + HTTP/1.1/2 replay / content parity | **GO** — browser-before-gateway and agent-after-FRP streams byte-identical (SHA-256 equal, 0 extra agent bytes) for TLS 1.2/HTTP/1.1, TLS 1.3/HTTP/2, and a 5-record fragmented ClientHello; exact routing, content parity, revocation, restart, and no-open-signal all proven |
+| §23.3 fragmented TLS 1.2/1.3 + HTTP/1.1/2 replay / content parity | **GO** — required-mode gate (non-skippable: missing env, poisoned pins, skips, and incomplete cases all fail), gate-emitted version + binary SHA-256, non-empty captures with exact length equality and `extraAtAgent=0` for TLS 1.2/HTTP/1.1, TLS 1.3/HTTP/2, and a 5-record record-level fragmented ClientHello; exact routing, content parity, revocation, restart, and a wired relay-path dial/`/connect` audit |
 
 Blocking Task 8 does not by itself enable `RELAY_SELECTION_ENABLED`; Task 31
 is now also GO (§23.3 above), and Tasks 24, 25, and 42 plus the Task 44 GO

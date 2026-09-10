@@ -39,9 +39,11 @@ func startPrimaryStack(t *testing.T) (*relayStack, tunnelSpec) {
 
 // TestRealFRPRelayEndToEndTLS12HTTP11 proves the full stack — gateway →
 // pinned frps → pinned frpc → agent HTTPS — completes a real TLS 1.2 /
-// HTTP/1.1 session with a ClientHello fragmented across TLS records, and that
-// the browser-side and post-FRP streams are byte-identical (§23.3).
+// HTTP/1.1 session with a ClientHello fragmented across two TLS RECORDS, and
+// that the browser-side and post-FRP streams are byte-identical (§23.3).
+// Record-level fragmentation only: TCP segment boundaries are not claimed.
 func TestRealFRPRelayEndToEndTLS12HTTP11(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, _ := startPrimaryStack(t)
 
@@ -66,18 +68,17 @@ func TestRealFRPRelayEndToEndTLS12HTTP11(t *testing.T) {
 	rc.client.CloseIdleConnections()
 
 	digest := assertByteParity(t, rc.wire, s.agentTap)
-	if digest.Records < 2 {
-		t.Fatalf("ClientHello was not fragmented across TLS records (records=%d)", digest.Records)
-	}
-	if digest.BrowserSHA256 != digest.AgentSHA256 {
-		t.Fatalf("digest mismatch: browser %s agent %s", digest.BrowserSHA256, digest.AgentSHA256)
+	if err := checkFragmentation(digest.Records, 2); err != nil {
+		t.Fatalf("TLS 1.2 / HTTP/1.1 case: %v", err)
 	}
 }
 
 // TestRealFRPRelayEndToEndTLS13HTTP2 is the TLS 1.3 / HTTP/2 counterpart of
-// the TLS 1.2 case: real h2 negotiation over the L4 relay with a fragmented
-// ClientHello and exact post-FRP byte preservation.
+// the TLS 1.2 case: real h2 negotiation over the L4 relay with a two-record
+// ClientHello and exact post-FRP byte preservation. Record-level
+// fragmentation only: TCP segment boundaries are not claimed.
 func TestRealFRPRelayEndToEndTLS13HTTP2(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, _ := startPrimaryStack(t)
 
@@ -105,16 +106,21 @@ func TestRealFRPRelayEndToEndTLS13HTTP2(t *testing.T) {
 	rc.client.CloseIdleConnections()
 
 	digest := assertByteParity(t, rc.wire, s.agentTap)
-	if digest.Records < 2 {
-		t.Fatalf("ClientHello was not fragmented across TLS records (records=%d)", digest.Records)
+	if err := checkFragmentation(digest.Records, 2); err != nil {
+		t.Fatalf("TLS 1.3 / HTTP/2 case: %v", err)
 	}
 }
 
 // TestRealFRPFragmentedClientHelloReplay drives a ClientHello split across
-// several TLS records through the gateway/FRP path and requires the exact
+// EXACTLY five TLS RECORDS through the gateway/FRP path and requires the exact
 // same bytes — headers and ClientHello fragments included — to arrive at the
 // agent after FRP decapsulation (§16.1, §23.3).
+//
+// Scope: this is TLS record-level fragmentation. Separate TCP write() calls do
+// not prove distinct kernel TCP segments, so no TCP-segmentation claim is made
+// here or in the evidence (see GATE-EVIDENCE.md §23.3).
 func TestRealFRPFragmentedClientHelloReplay(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, _ := startPrimaryStack(t)
 
@@ -128,8 +134,8 @@ func TestRealFRPFragmentedClientHelloReplay(t *testing.T) {
 	rc.client.CloseIdleConnections()
 
 	digest := assertByteParity(t, rc.wire, s.agentTap)
-	if digest.Records < 3 {
-		t.Fatalf("ClientHello spanned only %d TLS record(s); the fragmented replay proof would be vacuous", digest.Records)
+	if err := checkFragmentation(digest.Records, 5); err != nil {
+		t.Fatalf("fragmented replay: %v", err)
 	}
 }
 
@@ -137,6 +143,7 @@ func TestRealFRPFragmentedClientHelloReplay(t *testing.T) {
 // origin to its owning agent: a valid route reaches exactly one tunnel,
 // while random, bare, unknown, and tombstoned SNI reach no agent at all.
 func TestRealFRPExactRouting(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s := newRelayStack(t)
 
@@ -214,6 +221,7 @@ func TestRealFRPExactRouting(t *testing.T) {
 // through the real FRP relay and compares it byte-for-byte against the same
 // fake backend served directly by the agent (§18.2, acceptance #11).
 func TestRealFRPContentParity(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, _ := startPrimaryStack(t)
 
@@ -281,7 +289,7 @@ func TestRealFRPContentParity(t *testing.T) {
 				t.Fatalf("endpoint %q was never accounted", endpoint)
 			}
 		}
-		if got := s.content.connectHits; got != 0 {
+		if got := s.content.connectCount(); got != 0 {
 			t.Fatalf("relay content path hit /connect %d time(s); relay must never open the direct probe path", got)
 		}
 	})
@@ -389,12 +397,27 @@ func TestRealFRPContentParity(t *testing.T) {
 }
 
 // TestRelayPathNeverEmitsOpenSignal asserts the relay data plane never takes
-// the direct-path artifacts: no /connect request reaches the agent, no
-// port-mapper call is made, no open-signal is admitted, and no direct route
-// exists in the gateway for the relay hostname (acceptance #7).
+// the direct-path activation artifacts observable from this module
+// (acceptance #7):
+//
+//   - the agent's direct-path probe endpoint (/connect) is never hit;
+//   - every gateway dial — recorded through the REAL gateway dial seam
+//     (gateway.WithDialer) — targets exactly the resolved route's loopback FRP
+//     port, and at least one dial happened so the negative is not vacuous;
+//   - the gateway route table resolves the relay origin (positive control)
+//     but exposes no route for the direct origin; and
+//   - a real TLS ClientHello carrying the direct origin's SNI reaches no agent
+//     through the gateway.
+//
+// Scope: the agent-side SignalGate and port mapper live in the agent module
+// (sharebridge/agent) and cannot be instantiated from this stdlib-only relay
+// test package; their open-signal semantics are proven by
+// agent/internal/direct/opensignal_test.go. This test does not claim to
+// exercise them.
 func TestRelayPathNeverEmitsOpenSignal(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
-	s, _ := startPrimaryStack(t)
+	s, spec := startPrimaryStack(t)
 
 	relay := s.newRelayClient(tls.VersionTLS12, tls.VersionTLS13, []string{"http/1.1"}, 2).client
 	for _, path := range []string{"/s/" + fixtureCode, "/s/" + fixtureCode + "/items", "/s/" + fixtureCode + "/asset/img-1"} {
@@ -406,17 +429,35 @@ func TestRelayPathNeverEmitsOpenSignal(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	if got := s.content.connectHits; got != 0 {
+	// Real, wired collaborator evidence: the gateway dial seam recorded every
+	// dial the relay data plane made.
+	targets := s.dialTargetsSnapshot()
+	if err := checkDialTargets(targets, spec.proxyPort); err != nil {
+		t.Fatalf("relay path dial audit failed: %v (recorded targets: %v)", err, targets)
+	}
+	if got := s.content.connectCount(); got != 0 {
 		t.Fatalf("relay content path emitted %d /connect open-signal probe(s), want 0", got)
 	}
-	if s.mapperCalls != 0 {
-		t.Fatalf("relay path invoked the port mapper %d time(s), want 0", s.mapperCalls)
-	}
-	if s.signalAdmits != 0 {
-		t.Fatalf("relay path admitted %d open-signal(s), want 0", s.signalAdmits)
+
+	// Positive control: the relay origin resolves, so the direct-origin
+	// negative below is meaningful rather than vacuous.
+	if _, err := s.routesTable.Lookup(s.relayHost); err != nil {
+		t.Fatalf("relay origin %s did not resolve; the direct-origin negative would be vacuous: %v", s.relayHost, err)
 	}
 	if _, err := s.routesTable.Lookup(s.directHost); err == nil {
 		t.Fatal("gateway route table resolved a direct origin; relay routing must not expose direct routes")
+	}
+
+	// Data-path negative: a real browser hello for the direct origin reaches no
+	// agent through the gateway. Quiesce the agent tap first so the baseline is
+	// not racily short of the earlier relayed traffic's final records.
+	waitForStable(t, s.agentTap, 500*time.Millisecond, 5*time.Second)
+	agentBase := s.agentTap.Len()
+	sendTLSClientHello(t, s.gatewayAddr, s.directHost)
+	time.Sleep(750 * time.Millisecond)
+	waitForStable(t, s.agentTap, 500*time.Millisecond, 5*time.Second)
+	if s.agentTap.Len() != agentBase {
+		t.Fatalf("direct-origin SNI reached an agent through the gateway (%d -> %d)", agentBase, s.agentTap.Len())
 	}
 }
 
@@ -427,6 +468,7 @@ func TestRelayPathNeverEmitsOpenSignal(t *testing.T) {
 // lease expiry. The FRP-level cadence/expiry proof lives in
 // relay/internal/frptest/heartbeat_gate_test.go (Task 8, §23.7 GO).
 func TestRealFRPRelayPresenceHeartbeatDelayAndExpiry(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	if testing.Short() {
 		t.Skip("heartbeat lease timing test skipped in -short mode")
