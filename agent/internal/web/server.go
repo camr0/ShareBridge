@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -149,17 +150,87 @@ func (ws *WebServer) Stop() error {
 	return nil
 }
 
-// handler assembles the production request chain: the full route table wrapped
-// in the admin-auth middleware. Start uses it, and tests drive it so they
-// exercise the real wiring rather than a mock chain.
+// handler assembles the production request chain. There are two independent
+// surfaces:
+//
+//   - the admin surface is the whole legacy route table, wrapped in the admin
+//     credential middleware;
+//   - the /api/v1 JSON API is called cross-origin by the OpenCloud and
+//     Nextcloud browser extensions. A browser preflight carries no
+//     credentials, so this surface is NOT wrapped in adminAuthMiddleware: its
+//     handlers stay fail-closed behind apiKeyMiddleware, and the CORS
+//     preflight is answered by corsMiddleware.
+//
+// Start uses it, and tests drive it so they exercise the real wiring rather
+// than a mock chain.
 func (ws *WebServer) handler() http.Handler {
-	mux := http.NewServeMux()
-	ws.registerRoutes(mux)
-	return ws.adminAuthMiddleware(mux)
+	adminMux := http.NewServeMux()
+	ws.registerAdminRoutes(adminMux)
+	adminHandler := ws.adminAuthMiddleware(adminMux)
+
+	v1Mux := http.NewServeMux()
+	ws.registerV1Routes(v1Mux)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Classify on the escaped path, using the same canonicalization the
+		// ServeMux itself applies, so no prefix/case/encoding trick can move a
+		// request across the two surfaces.
+		if isV1APIPath(r.URL.EscapedPath()) {
+			v1Mux.ServeHTTP(w, r)
+			return
+		}
+		adminHandler.ServeHTTP(w, r)
+	})
 }
 
-// registerRoutes sets up all HTTP routes for the web server.
+// isV1APIPath reports whether an escaped request path belongs to the /api/v1
+// JSON API surface and may therefore bypass the admin Basic-auth gate.
+//
+// Only a canonical path is accepted. The ServeMux canonicalizes "."/".."/empty
+// segments (and sees different segments than the raw string suggests when
+// separators are percent-encoded) before routing, so a non-canonical path is
+// deliberately sent to the fail-closed admin branch instead.
+func isV1APIPath(escapedPath string) bool {
+	if !strings.HasPrefix(escapedPath, "/api/v1/") {
+		return false
+	}
+	return escapedPath == cleanURLPath(escapedPath)
+}
+
+// cleanURLPath mirrors net/http's internal cleanPath so the dispatch decision
+// agrees exactly with the canonicalization the ServeMux applies to
+// r.URL.EscapedPath() before matching.
+func cleanURLPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	np := path.Clean(p)
+	// path.Clean removes a trailing slash except for root; put it back.
+	if p[len(p)-1] == '/' && np != "/" {
+		if len(p) == len(np)+1 && strings.HasPrefix(p, np) {
+			np = p
+		} else {
+			np += "/"
+		}
+	}
+	return np
+}
+
+// registerRoutes sets up all HTTP routes for the web server on a single mux.
+// The production server dispatches between the two surfaces (see handler);
+// this flat composition is kept for tests that exercise the route table
+// directly.
 func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
+	ws.registerAdminRoutes(mux)
+	ws.registerV1Routes(mux)
+}
+
+// registerAdminRoutes sets up the credential-protected admin surface: pages,
+// HTML fragments, the legacy JSON APIs and every mutation.
+func (ws *WebServer) registerAdminRoutes(mux *http.ServeMux) {
 	// Static files - no CSRF needed
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(ws.staticFS)))
 
@@ -204,8 +275,12 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 
 	// Inline quota for share form (returns HTML, same style)
 	mux.HandleFunc("GET /api/quota-inline", ws.quotaInlineHandler)
+}
 
-	// v1 JSON API — CORS headers + API key auth on every request
+// registerV1Routes sets up the /api/v1 JSON API surface used by the OpenCloud
+// and Nextcloud extensions: CORS headers plus API-key auth on every request.
+// These routes are intentionally not behind the admin credential.
+func (ws *WebServer) registerV1Routes(mux *http.ServeMux) {
 	v1 := func(h http.HandlerFunc) http.HandlerFunc {
 		return ws.corsMiddleware(ws.apiKeyMiddleware(h))
 	}

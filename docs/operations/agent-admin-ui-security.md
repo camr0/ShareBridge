@@ -49,6 +49,15 @@ ignored). Unauthenticated requests — including ones that forge the
 runs. `GET /api/settings/secrets` (the reveal endpoint) is behind the same
 check.
 
+The `/api/v1/*` JSON API used by the OpenCloud/Nextcloud extensions is **not**
+an admin surface: it is gated by the `X-API-Key` header alone, and its CORS
+`OPTIONS` preflight is answered without credentials, so setting `UI_PASSWORD`
+does not break the extension's cross-origin flow. The exemption is exact: only
+canonical `/api/v1/` paths qualify, and any dot-segment, double-slash,
+percent-encoded separator or case variation falls back to the fail-closed
+admin gate. The admin surface itself sets no CORS headers, so its `OPTIONS`
+preflight still requires Basic auth.
+
 ## Breaking change (1.x admin UI)
 
 Before this change the default `UI_ADDR` was `0.0.0.0`. Any existing
