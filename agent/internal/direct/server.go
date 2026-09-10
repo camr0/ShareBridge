@@ -78,6 +78,13 @@ type DirectServer struct {
 	// gate means unlimited.
 	globalStreams *streamGate
 
+	// testHookAfterAuthorize is a test seam, nil in production: when set the
+	// Handler runs it after Binder authorization and before the admitted
+	// binding is committed to the connection. Tests use it to land a
+	// revocation exactly in the authorization→registration window (audit
+	// Critical #3) deterministically, without sleeping.
+	testHookAfterAuthorize func()
+
 	// conns is the connection registry: each raw net.Conn mapped to its
 	// per-connection *connState carrying the Binder-admitted route/origin/share
 	// and the port session token. The key is the exact conn handed to
@@ -109,6 +116,12 @@ func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker
 }
 
 func (s *DirectServer) Binder() *Binder { return s.binder }
+
+// SetTestHookAfterAuthorize installs a one-shot test seam invoked after Binder
+// authorization and before the connection's binding is recorded. It exists so
+// cross-package tests can land a revocation in the authorization→registration
+// window; production never sets it.
+func (s *DirectServer) SetTestHookAfterAuthorize(fn func()) { s.testHookAfterAuthorize = fn }
 
 // SetConnectAllowedOrigin overrides the construction-time resolved allowed
 // origin. The daemon calls it when building the server so the resolved
@@ -197,8 +210,32 @@ func (s *DirectServer) Handler() http.Handler {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		if cs := connStateFromContext(r.Context()); cs != nil {
+		cs := connStateFromContext(r.Context())
+		if s.testHookAfterAuthorize != nil {
+			s.testHookAfterAuthorize()
+		}
+		// Commit the admitted binding to the connection FIRST, so the T29
+		// close-by-share scan can find a connection whose request passed
+		// authorization. Then revalidate that this exact Binder entry is still
+		// active at the same generation before any dispatch.
+		//
+		// Linearization (audit Critical #3): revocation mutates the Binder and
+		// only then closes the share's connections. noteBinding happens-before
+		// the revalidation here. Therefore either the revocation's Binder
+		// mutation precedes revalidation (revalidation fails, we close the
+		// connection and serve nothing), or it follows it, in which case it also
+		// follows noteBinding and the subsequent close-by-share scan is
+		// guaranteed to match this connection. A revoked share can never start
+		// serving after revocation.
+		if cs != nil {
 			cs.noteBinding(bd)
+		}
+		if !s.binder.Revalidate(bd) {
+			if cs != nil {
+				s.conns.closeState(cs)
+			}
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
 		s.route(w, r)
 	})

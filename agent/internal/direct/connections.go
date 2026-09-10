@@ -128,6 +128,31 @@ func (r *connRegistry) closeAll() int {
 	return r.closeWhere(func(*connState) bool { return true })
 }
 
+// closeState closes the specific connection whose accounting record is cs and
+// marks it closing so repeated close calls skip it. It is the handler's
+// fail-closed teardown for a request whose binding was revoked between
+// authorization and registration (audit Critical #3): the revocation's
+// close-by-share scan may have already run before the binding was recorded, so
+// the handler must close its own connection rather than leave it usable. It
+// returns whether a matching live connection was closed.
+func (r *connRegistry) closeState(cs *connState) bool {
+	r.mu.Lock()
+	var target net.Conn
+	for c, e := range r.conns {
+		if e.cs == cs && !e.closing {
+			e.closing = true
+			target = c
+			break
+		}
+	}
+	r.mu.Unlock()
+	if target == nil {
+		return false
+	}
+	_ = target.Close()
+	return true
+}
+
 // closeWhere closes the connections whose record matches. Matched entries are
 // marked closing before Close runs (outside the registry lock, so the async
 // ConnState teardown can take it) and are skipped by later close calls.

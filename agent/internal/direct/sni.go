@@ -24,10 +24,19 @@ const (
 // Binding is an active origin→share authorization: an exact, normalized origin
 // hostname bound to its route kind and the native share code that authorizes
 // content for it (spec §11).
+//
+// epoch is the Binder generation the entry was installed at. It is bumped on
+// every Binder mutation, so an admission that was already authorized but not
+// yet committed to a connection can be revalidated against the exact entry it
+// was admitted from: a revoke (or a withdraw+re-add) changes the epoch and the
+// stale admission fails closed. It is unexported because it is internal
+// bookkeeping, never part of the wire-visible binding identity callers pass to
+// Authorize.
 type Binding struct {
 	Origin    string
 	RouteKind RouteKind
 	ShareCode string
+	epoch     uint64
 }
 
 var (
@@ -50,6 +59,17 @@ type Binder struct {
 	directSuffix string
 	relaySuffix  string
 	active       map[string]Binding
+	// gen is the monotonic Binder generation counter. Every Allow/AllowShare/
+	// Revoke/RevokeShare advances it and every installed entry stamps the new
+	// value, so Revalidate can tell an unchanged entry from one that was
+	// withdrawn and re-installed (even with identical origin/route/code).
+	gen uint64
+
+	// testHookBeforeAllow is a one-shot test seam: when set, the first Allow or
+	// AllowShare invocation runs it before taking the Binder lock. Tests use it
+	// to land a rebuild/revoke inside the snapshot→commit window. It is nil in
+	// production and clears itself on first use.
+	testHookBeforeAllow func()
 }
 
 func NewBinder(namespace, baseDomain string) *Binder {
@@ -88,8 +108,10 @@ func (b *Binder) Allow(origin string, kind RouteKind, shareCode string) error {
 	if k != kind {
 		return fmt.Errorf("%w: %q is %s, not %s", ErrWrongRouteKind, host, k, kind)
 	}
+	b.runBeforeAllowHook()
 	b.mu.Lock()
-	b.active[host] = Binding{Origin: host, RouteKind: kind, ShareCode: shareCode}
+	b.gen++
+	b.active[host] = Binding{Origin: host, RouteKind: kind, ShareCode: shareCode, epoch: b.gen}
 	b.mu.Unlock()
 	return nil
 }
@@ -97,6 +119,7 @@ func (b *Binder) Allow(origin string, kind RouteKind, shareCode string) error {
 func (b *Binder) Revoke(origin string) {
 	host := normalizeHost(origin)
 	b.mu.Lock()
+	b.gen++
 	delete(b.active, host)
 	b.mu.Unlock()
 }
@@ -144,9 +167,11 @@ func (b *Binder) AllowShare(directOrigin, relayOrigin, shareCode string) error {
 	if kind, ok := b.routeKindFor(relayHost); !ok || kind != RouteRelay {
 		return fmt.Errorf("%w: %q is not a relay origin of namespace %q", ErrWrongRouteKind, relayHost, b.namespace)
 	}
+	b.runBeforeAllowHook()
 	b.mu.Lock()
-	b.active[directHost] = Binding{Origin: directHost, RouteKind: RouteDirect, ShareCode: shareCode}
-	b.active[relayHost] = Binding{Origin: relayHost, RouteKind: RouteRelay, ShareCode: shareCode}
+	b.gen++
+	b.active[directHost] = Binding{Origin: directHost, RouteKind: RouteDirect, ShareCode: shareCode, epoch: b.gen}
+	b.active[relayHost] = Binding{Origin: relayHost, RouteKind: RouteRelay, ShareCode: shareCode, epoch: b.gen}
 	b.mu.Unlock()
 	return nil
 }
@@ -158,8 +183,32 @@ func (b *Binder) RevokeShare(directOrigin, relayOrigin string) {
 	directHost := normalizeHost(directOrigin)
 	relayHost := normalizeHost(relayOrigin)
 	b.mu.Lock()
+	b.gen++
 	delete(b.active, directHost)
 	delete(b.active, relayHost)
+	b.mu.Unlock()
+}
+
+// runBeforeAllowHook invokes (and clears) the one-shot test seam before an
+// Allow/AllowShare takes the Binder lock. It takes the lock only long enough to
+// claim the hook, so the hook runs without any Binder lock held and a test may
+// block inside it.
+func (b *Binder) runBeforeAllowHook() {
+	b.mu.Lock()
+	fn := b.testHookBeforeAllow
+	b.testHookBeforeAllow = nil
+	b.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// SetTestHookBeforeAllow installs the one-shot Allow/AllowShare test seam. It
+// exists so tests can land a concurrent rebuild/revocation inside the
+// Binder-mutation window; production never sets it.
+func (b *Binder) SetTestHookBeforeAllow(fn func()) {
+	b.mu.Lock()
+	b.testHookBeforeAllow = fn
 	b.mu.Unlock()
 }
 
@@ -177,6 +226,21 @@ func (b *Binder) AdmitSNI(serverName string) (Binding, error) {
 		return Binding{}, fmt.Errorf("%w: %q", ErrUnknownOrigin, serverName)
 	}
 	return bd, nil
+}
+
+// Revalidate reports whether bd is still the exact active Binder entry it was
+// admitted from, at the same generation. It is the commit-time check that
+// closes the authorization→registration window (audit Critical #3): the daemon
+// records the connection binding and then revalidates before dispatching, so a
+// revocation that lands in between fails the request closed instead of letting
+// it serve content after the share was revoked. A withdraw+re-add of the same
+// origin/route/code is a NEW generation and therefore does NOT revalidate the
+// old admission.
+func (b *Binder) Revalidate(bd Binding) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	cur, ok := b.active[bd.Origin]
+	return ok && cur == bd
 }
 
 // Authorize performs HTTP authorization for a connection already admitted by

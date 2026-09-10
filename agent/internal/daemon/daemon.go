@@ -649,12 +649,18 @@ func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 	if ds == nil || directOrigin == "" {
 		return originPair{}, false
 	}
-	// Snapshot the binder under the state lock: syncDirectServe swaps the
-	// binder under ds.mu, so an unlocked read here would race a namespace
-	// change/reconnect.
+	// Serialize the whole operation — Binder snapshot, Binder mutation, and the
+	// daemon-side bookkeeping commit — under ds.mu. syncDirectServe publishes a
+	// replacement binder only under ds.mu, so holding it across the mutation
+	// means a rebuild can no longer swap the Binder between the snapshot and the
+	// commit; the identity check below documents and enforces that invariant
+	// (audit Important #1). The Binder's own lock is a leaf (it never calls back
+	// into the daemon), and ds.mu → binder.mu is the order syncDirectServe
+	// already uses, so there is no lock cycle and no router I/O in the critical
+	// section.
 	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	binder := ds.binder
-	ds.mu.Unlock()
 	if binder == nil {
 		return originPair{}, false
 	}
@@ -664,7 +670,6 @@ func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 		return originPair{}, false
 	}
 	pair := originPair{directOrigin: directOrigin, relayOrigin: relayOrigin}
-	ds.mu.Lock()
 	if ds.locked {
 		// §13.4 step 4: lockdown removed the Binder admissions but retained
 		// the source/session state. A share registered while locked is
@@ -673,20 +678,24 @@ func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 			ds.origins = make(map[string]originPair)
 		}
 		ds.origins[code] = pair
-		ds.mu.Unlock()
 		return pair, true
 	}
-	ds.mu.Unlock()
 	if err := binder.AllowShare(directOrigin, relayOrigin, code); err != nil {
 		log.Printf("bind origins for share %s: %v", code, err)
 		return originPair{}, false
 	}
-	ds.mu.Lock()
+	if ds.binder != binder {
+		// Unreachable while ds.mu is held across the mutation above; kept as a
+		// fail-closed guard against a future refactor that moves the mutation
+		// outside the lock. Withdraw the admission rather than book a binding
+		// the serving Binder does not hold.
+		binder.RevokeShare(directOrigin, relayOrigin)
+		return originPair{}, false
+	}
 	if ds.origins == nil {
 		ds.origins = make(map[string]originPair)
 	}
 	ds.origins[code] = pair
-	ds.mu.Unlock()
 	return pair, true
 }
 
@@ -704,24 +713,23 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 	if ds == nil || directOrigin == "" {
 		return "", false
 	}
-	// Snapshot the binder under the state lock: syncDirectServe swaps the
-	// binder under ds.mu, so an unlocked read here would race a namespace
-	// change/reconnect.
+	// The whole Binder mutation + bookkeeping commit is one ds.mu critical
+	// section (audit Important #1), exactly like bindOrigin: a rebuild cannot
+	// swap the Binder mid-commit and the identity check below fails closed.
 	ds.mu.Lock()
+	defer ds.mu.Unlock()
 	binder := ds.binder
-	ds.mu.Unlock()
 	if binder == nil {
 		// The binder (namespace) is not built yet — e.g. hydration racing
 		// ahead of `enrolled`. Record the pending binding so syncDirectServe
 		// installs it deterministically as soon as the binder exists, instead
 		// of silently waiting for a future control re-allocation (Task 27
-		// carry-forward).
-		ds.mu.Lock()
+		// carry-forward). revokeOrigin deletes this entry, so a revoked share
+		// can never be installed later.
 		if ds.pendingRelayBinds == nil {
 			ds.pendingRelayBinds = make(map[string]string)
 		}
 		ds.pendingRelayBinds[code] = directOrigin
-		ds.mu.Unlock()
 		return "", false
 	}
 	relayOrigin, err := binder.RelayOriginFor(directOrigin)
@@ -729,7 +737,6 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 		log.Printf("derive relay origin for share %s: %v", code, err)
 		return "", false
 	}
-	ds.mu.Lock()
 	if ds.locked {
 		// §13.4 step 4: record the relay-only binding for unlock without
 		// admitting it into the Binder while lockdown is active.
@@ -738,21 +745,21 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 		}
 		ds.relayOrigins[code] = relayOrigin
 		delete(ds.pendingRelayBinds, code)
-		ds.mu.Unlock()
 		return relayOrigin, true
 	}
-	ds.mu.Unlock()
 	if err := binder.Allow(relayOrigin, direct.RouteRelay, code); err != nil {
 		log.Printf("bind relay origin for share %s: %v", code, err)
 		return "", false
 	}
-	ds.mu.Lock()
+	if ds.binder != binder {
+		binder.Revoke(relayOrigin)
+		return "", false
+	}
 	if ds.relayOrigins == nil {
 		ds.relayOrigins = make(map[string]string)
 	}
 	ds.relayOrigins[code] = relayOrigin
 	delete(ds.pendingRelayBinds, code)
-	ds.mu.Unlock()
 	return relayOrigin, true
 }
 
@@ -760,35 +767,57 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 // bindings as one logical operation (§6: revocation removes both bindings).
 // For a relay-only share it drops the single relay-origin binding recorded by
 // bindRelayOnlyOrigin instead. It is a no-op if no binding was recorded.
+//
+// Revocation is the invalidator (audit Critical #3 / Important #1): the Binder
+// mutation and the daemon-side bookkeeping deletion happen in ONE ds.mu
+// critical section, ordered strictly before the share's connections are
+// closed. That ordering is what makes the handler's post-noteBinding
+// revalidation decisive: a request admitted from the revoked entry either sees
+// the mutation (and fails closed) or has already recorded its connection
+// binding, so the close-by-share scan below matches it. Revocation also deletes
+// any pending relay-only bind (so syncDirectServe cannot install a revoked
+// binding later) and the share's resolver entry (so a raced authorization can
+// never resolve content after revocation).
 func (d *Daemon) revokeOrigin(code string) {
 	ds := d.direct
-	if ds == nil {
-		return
-	}
-	ds.mu.Lock()
-	pair, ok := ds.origins[code]
-	if ok {
-		delete(ds.origins, code)
-	}
-	relayOrigin, relayOnlyBound := ds.relayOrigins[code]
-	if relayOnlyBound {
-		delete(ds.relayOrigins, code)
-	}
-	binder := ds.binder
-	server := ds.server
-	ds.mu.Unlock()
-	if binder != nil {
+	var server *direct.DirectServer
+	if ds != nil {
+		ds.mu.Lock()
+		pair, ok := ds.origins[code]
 		if ok {
-			binder.RevokeShare(pair.directOrigin, pair.relayOrigin)
+			delete(ds.origins, code)
 		}
+		relayOrigin, relayOnlyBound := ds.relayOrigins[code]
 		if relayOnlyBound {
-			binder.Revoke(relayOrigin)
+			delete(ds.relayOrigins, code)
 		}
+		// A relay-only share whose binder did not exist yet has only a pending
+		// bind recorded. Delete it here or syncDirectServe would install the
+		// revoked binding as soon as the binder exists.
+		delete(ds.pendingRelayBinds, code)
+		binder := ds.binder
+		server = ds.server
+		if binder != nil {
+			if ok {
+				binder.RevokeShare(pair.directOrigin, pair.relayOrigin)
+			}
+			if relayOnlyBound {
+				binder.Revoke(relayOrigin)
+			}
+		}
+		ds.mu.Unlock()
+	}
+	// Resolver state is per-share content state and must not outlive the
+	// binding, for revoke and expiry alike. It is deleted even when direct
+	// transport is not configured, so the lifecycle cleanup stays consistent.
+	if d.resolver != nil {
+		d.resolver.Delete(code)
 	}
 	// T29 review Minor #1: an in-flight direct/relay stream on the revoked
 	// share must not keep the on-demand port held until it drains. Closing the
 	// share's connections tears them down through the normal ConnState path
-	// (EndSession + hold release).
+	// (EndSession + hold release). This runs strictly after the Binder mutation
+	// above, which is the ordering the handler revalidation proof relies on.
 	if server != nil {
 		server.CloseShareConns(code)
 	}
@@ -2069,9 +2098,19 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 	} else if pair, bound := d.bindOrigin(code, origin); bound {
 		relayOrigin = pair.relayOrigin
 	}
+	// rollback undoes everything this registration installed after the
+	// control-side registration succeeded: the local Binder admission, the
+	// daemon bookkeeping (origins/relayOrigins/pendingRelayBinds), any resolver
+	// state, and finally the control registration itself. Without it a failure
+	// creating the Immich client or saving the session would leave a locally
+	// admitted, signal-authorized half-binding behind (audit Important #2).
+	rollback := func() {
+		d.revokeOrigin(code)
+		_ = d.unregisterShare(ctx, code)
+	}
 	client, err := d.newImmichClient(code)
 	if err != nil {
-		_ = d.unregisterShare(ctx, code)
+		rollback()
 		return nil, err
 	}
 
@@ -2099,7 +2138,7 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 		Origin:              origin,
 		RelayOrigin:         relayOrigin,
 	}); err != nil {
-		_ = d.unregisterShare(ctx, code)
+		rollback()
 		return nil, err
 	}
 	d.hydrateContentSession(session)
