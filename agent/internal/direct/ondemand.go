@@ -150,6 +150,18 @@ type OnDemandPort struct {
 	closeMu  sync.RWMutex
 	closeErr error
 
+	// ackMu serializes the success choke point (commitOpenSuccess) against
+	// SetGeneration. Every OK open reply is handed to its caller while ackMu is
+	// held, so a §13.4 transition that publishes the stamp can never be ordered
+	// between the choke point's re-read and the reply. ackMu is held only across
+	// the choke point's bounded, I/O-free critical section (the stamp re-read,
+	// the in-memory state publication, and a buffered channel send); router I/O
+	// never happens under it, so a transition never waits on the state loop's
+	// router calls. Callers of SetGeneration must not hold a lock that a state
+	// transition callback can take, because the choke point runs the callback
+	// under ackMu.
+	ackMu sync.Mutex
+
 	// fence is the port's published direct-state generation stamp (see
 	// SetGeneration and generationCurrent). It is the single serialization
 	// point between a §13.4 lockdown/unlock transition and every mapping
@@ -227,16 +239,23 @@ const fenceLockedBit = uint64(1) << 63
 // SetGeneration publishes the port's direct-state generation stamp: the
 // lockdown/unlock epoch and whether the direct path is locked. It is the single
 // serialization point between a §13.4 lockdown/unlock transition and every
-// mapping mutation this port performs. It is non-blocking and never waits for
-// the state loop, so a transition is published even while the loop is inside
-// bounded router I/O; the loop's pre-write and commit-time checks observe it.
+// mapping mutation this port performs. It is non-blocking with respect to the
+// state loop's bounded router I/O (it waits only for the choke point's short,
+// I/O-free critical section), so a transition is published even while the loop
+// is inside router I/O; the loop's pre-write and commit-time checks observe it.
 // Callers must not hold a lock that the state loop can call back into.
 func (p *OnDemandPort) SetGeneration(epoch uint64, locked bool) {
 	v := epoch & (fenceLockedBit - 1)
 	if locked {
 		v |= fenceLockedBit
 	}
+	// Publishing under ackMu makes the store mutually exclusive with the
+	// success choke point's re-read-and-reply: either this store happens before
+	// the choke point (which then refuses, and no OK reply is sent) or the OK
+	// reply is already handed over and this transition is strictly after it.
+	p.ackMu.Lock()
 	p.fence.Store(v)
+	p.ackMu.Unlock()
 }
 
 // generationCurrent reports whether gen is still the port's published
@@ -265,13 +284,16 @@ func (p *OnDemandPort) OpenFor(shareID string, lease time.Duration) error {
 //
 // The state loop evaluates the stamp immediately before the mapping is created
 // or renewed — and again after the cold open's bounded port-selection router
-// I/O — and, crucially, once more immediately AFTER the mapping write. That
-// last check is the commit point: a §13.4 lockdown that publishes its
-// generation while the router write is in flight (the reviewer's
-// post-predicate/pre-write gap) makes the open fail closed with
-// ErrOpenSuperseded, removes any mapping the router already accepted, and
-// publishes no state — no transition to open, no renewal, no OK ack. The
-// caller holds no lock across the router I/O, and the port never acquires one.
+// I/O — and every success outcome (including the already-open fast path that
+// writes nothing and the autonomous renewal) then passes through one success
+// choke point (commitOpenSuccess), which re-reads the stamp under the same
+// mutex SetGeneration publishes under and only then hands over the OK reply.
+// That is the commit point: a §13.4 lockdown that publishes its generation
+// while the router write — or the operation's own reply — is in flight makes
+// the open fail closed with ErrOpenSuperseded, removes any mapping the router
+// already accepted, and publishes no state — no transition to open, no
+// renewal, no OK ack. The caller holds no lock across the router I/O, and the
+// port never acquires one there.
 func (p *OnDemandPort) OpenForIf(shareID string, lease time.Duration, gen uint64) error {
 	return p.openFor(shareID, lease, true, gen)
 }
@@ -384,6 +406,7 @@ func (p *OnDemandPort) loop() {
 		renewFailed bool
 		lease       time.Duration
 		grantedPort int       // external port the router actually granted (NAT-PMP may remap)
+		ownedDesc   string    // description of the mapping this port created and still owns
 		deadline    time.Time // lease expiry if never renewed
 		renewAt     time.Time // when to renew (while sessions are active)
 		idleAt      time.Time // inactivity close (zero until a session exists)
@@ -446,6 +469,19 @@ func (p *OnDemandPort) loop() {
 		if grantedPort != 0 {
 			port = grantedPort
 		}
+		// The delete identity is the mapping this port ACTUALLY created:
+		// ownedDesc is captured from the description handed to AddPortMapping at
+		// creation time, so it cannot be corrupted by a later p.extPort
+		// restoration (the compensating undo of a fenced cold open restores the
+		// preferred port after port selection chose a different one). Building
+		// want.Description from p.desc() here instead would make every retry
+		// after that restoration target a description that no longer names the
+		// live mapping, and DeleteOwnedMapping would refuse it as foreign —
+		// leaking the mapping until router expiry.
+		desc := ownedDesc
+		if desc == "" {
+			desc = p.desc()
+		}
 		// DeleteOwnedMapping refuses to delete a mapping this agent didn't
 		// create (spec §6), rather than deleting blindly. The want identity is
 		// exact: same description, internal port, internal client, protocol.
@@ -454,7 +490,7 @@ func (p *OnDemandPort) loop() {
 			InternalPort:   p.intPort,
 			InternalClient: p.intClient,
 			Protocol:       "TCP",
-			Description:    p.desc(),
+			Description:    desc,
 		}
 		if err := DeleteOwnedMapping(p.mapper, port, want); err != nil {
 			closeFail++
@@ -465,6 +501,7 @@ func (p *OnDemandPort) loop() {
 		closing = false
 		closeFail = 0
 		grantedPort = 0
+		ownedDesc = ""
 		p.setCloseErr(nil)
 		p.setState(StateClosed, 0)
 		return true
@@ -499,6 +536,20 @@ func (p *OnDemandPort) loop() {
 			return portReply{err: ErrDeleteRetry}
 		case closing:
 			return portReply{err: ErrDeleteRetry}
+		case grantedPort != 0:
+			// A prior close's deletion failed and its retries were exhausted
+			// (StateCloseFailed), so a mapping this port created is still live.
+			// Reclaim it on demand instead of returning a no-op: a §13.4
+			// lockdown CloseIf must not complete while leaving the agent
+			// claiming to be locked with its own mapping still on the router.
+			closing = true
+			closeFail = 0
+			p.setState(StateClosing, grantedPort)
+			if tryDelete() {
+				return portReply{}
+			}
+			rearm()
+			return portReply{err: ErrDeleteRetry}
 		default:
 			return portReply{} // idempotent: already closed
 		}
@@ -525,6 +576,34 @@ func (p *OnDemandPort) loop() {
 		tryDelete()
 		rearm()
 	}
+	// commitOpenSuccess is the ONE choke point every success outcome of an
+	// open-signal operation (and of the autonomous renewal) passes through. It
+	// re-reads the port's published generation stamp under ackMu — the same mutex
+	// SetGeneration publishes under — and, still holding it, runs publish (the
+	// path's in-memory state commit) and hands the caller its OK reply. A
+	// §13.4 transition can therefore never be ordered between the check and the
+	// reply, however late in the operation it is published: it is either already
+	// visible here (the operation is refused, returns false, and the caller
+	// performs its compensating undo without any OK reply) or it is strictly
+	// after the reply was handed over. c carries the operation's captured
+	// generation (c.fenced/c.gen); the autonomous renewal passes the mapping's
+	// owning generation, and c.reply may be nil (nothing to answer).
+	//
+	// All work under ackMu is in-memory and bounded — the stamp re-read, the
+	// state publication (whose callback must not call back into SetGeneration),
+	// and a buffered channel send. Router I/O never runs here.
+	commitOpenSuccess := func(c portCommand, wasOpen bool, publish func()) bool {
+		p.ackMu.Lock()
+		defer p.ackMu.Unlock()
+		if c.fenced && !p.generationCurrent(c.gen) {
+			return false
+		}
+		publish()
+		if c.reply != nil {
+			c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: wasOpen}
+		}
+		return true
+	}
 
 	for {
 		select {
@@ -535,9 +614,9 @@ func (p *OnDemandPort) loop() {
 				// (SetGeneration), not a caller-held lock: the §13.4 transition
 				// publishes the stamp synchronously, so the state loop can re-read it
 				// at every point of this case — including after bounded router I/O and
-				// after the mapping write itself — without either side holding a lock
-				// across the router I/O. fenced() is the same predicate at each of
-				// those points; the post-write one is the commit point.
+				// after the mapping write itself. fenced() is the shared predicate of
+				// the pre-write checks; the authoritative success check is the
+				// commitOpenSuccess choke point every success outcome passes through.
 				fenced := func() bool {
 					return c.fenced && !p.generationCurrent(c.gen)
 				}
@@ -571,47 +650,52 @@ func (p *OnDemandPort) loop() {
 					// Re-evaluate after ChooseExternalPort's bounded router I/O: a
 					// transition during port selection must not create a mapping, and
 					// the selected port must not be published as though the open had
-					// happened.
+					// happened. This is a pre-write fence, not a success path: it
+					// avoids a router write the commit choke point would only undo.
 					if fenced() {
 						p.extPort = prevExtPort
 						c.reply <- portReply{err: ErrOpenSuperseded}
 						continue
 					}
-					granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(l.Seconds()))
+					createdDesc := p.desc()
+					granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, createdDesc, int(l.Seconds()))
 					if err != nil {
 						p.extPort = prevExtPort
 						c.reply <- portReply{err: err}
 						continue
 					}
 					grantedPort = granted
-					// COMMIT POINT: the transition may have been published while the
-					// mapping write was in flight — exactly the reviewed gap between
-					// the predicate and the write. Refuse, remove the mapping the
-					// router already accepted, and restore the preferred port, so a
-					// superseded cold open leaves no mapping and no partial state.
-					if fenced() {
+					ownedDesc = createdDesc
+					// The success choke point re-reads the generation stamp with the
+					// transition ordered out, commits the open state, and hands over
+					// the OK reply. A refusal means the transition was published while
+					// the mapping write was in flight: remove the mapping the router
+					// already accepted (targeting its created identity) and restore
+					// the preferred port, so a superseded cold open leaves no mapping
+					// and no partial state.
+					if !commitOpenSuccess(c, false, func() {
+						open = true
+						openFenced = c.fenced
+						openGen = c.gen
+						epoch++ // new open epoch: hold tokens from a prior open can no longer match
+						closing = false
+						closeFail = 0
+						renewFailed = false
+						lease = l
+						deadline = now.Add(l)
+						renewAt = deadline.Add(-p.renewWindow)
+						if !renewAt.After(now) {
+							renewAt = now.Add(p.renewWindow)
+						}
+						idleAt = time.Time{}
+						p.setState(StateOpen, grantedPort)
+						rearm()
+					}) {
 						discardFencedMapping(false)
 						p.extPort = prevExtPort
 						c.reply <- portReply{err: ErrOpenSuperseded}
 						continue
 					}
-					open = true
-					openFenced = c.fenced
-					openGen = c.gen
-					epoch++ // new open epoch: hold tokens from a prior open can no longer match
-					closing = false
-					closeFail = 0
-					renewFailed = false
-					lease = l
-					deadline = now.Add(l)
-					renewAt = deadline.Add(-p.renewWindow)
-					if !renewAt.After(now) {
-						renewAt = now.Add(p.renewWindow)
-					}
-					idleAt = time.Time{}
-					p.setState(StateOpen, grantedPort)
-					rearm()
-					c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: false}
 					continue
 				}
 
@@ -626,11 +710,12 @@ func (p *OnDemandPort) loop() {
 					idleAt = time.Time{}
 				}
 				if now.Add(l).After(deadline) {
-					// Renewal is gated by the same generation fence and the same commit
-					// protocol as the cold open: a stale open must not extend a mapping
-					// it no longer observes, even when the transition is published after
-					// the top-of-case check but before or inside the renewal write.
-					granted, err := p.mapper.AddPortMapping(grantedPort, p.intPort, p.desc(), int(l.Seconds()))
+					// Renewal: the mapping write extends the lease, and the success
+					// choke point re-reads the generation stamp after it — a stale
+					// open must not extend a mapping it no longer observes, even
+					// when the transition is published inside the renewal write.
+					desc := p.desc()
+					granted, err := p.mapper.AddPortMapping(grantedPort, p.intPort, desc, int(l.Seconds()))
 					if err != nil {
 						renewFailed = true
 						renewAt = deadline
@@ -638,23 +723,45 @@ func (p *OnDemandPort) loop() {
 						continue
 					}
 					grantedPort = granted
-					if fenced() {
+					ownedDesc = desc
+					if !commitOpenSuccess(c, wasOpen, func() {
+						if c.fenced {
+							// The mapping is now owned by the caller's generation, so
+							// the autonomous renewal must be fenced against it too.
+							openFenced = true
+							openGen = c.gen
+						}
+						renewFailed = false
+						deadline = now.Add(l)
+						renewAt = deadline.Add(-p.renewWindow)
+					}) {
 						discardFencedMapping(true)
 						c.reply <- portReply{err: ErrOpenSuperseded}
 						continue
 					}
+					continue
+				}
+				// Already-open NON-renewal: this signal wrote no mapping, but it is
+				// still a success outcome that becomes an OK open_ack — so it must
+				// pass through the same choke point. Without it, a §13.4 transition
+				// published between the top-of-case fence check and this reply
+				// produced an OK ack after lockdown publication. A refusal undoes
+				// the mapping owned by the superseded generation, so the agent
+				// cannot be told OK for a mapping lockdown already owns.
+				if !commitOpenSuccess(c, wasOpen, func() {
 					if c.fenced {
-						// The mapping is now owned by the caller's generation, so the
-						// autonomous renewal must be fenced against it too.
+						// Bind the mapping's autonomous renewal to the caller's
+						// generation, exactly as the renewal path does.
 						openFenced = true
 						openGen = c.gen
 					}
-					renewFailed = false
-					deadline = now.Add(l)
-					renewAt = deadline.Add(-p.renewWindow)
+					rearm()
+				}) {
+					discardFencedMapping(true)
+					c.reply <- portReply{err: ErrOpenSuperseded}
+					continue
 				}
-				rearm()
-				c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: wasOpen}
+				continue
 
 			case opBeginSession:
 				if !open {
@@ -784,23 +891,28 @@ func (p *OnDemandPort) loop() {
 					if grantedPort != 0 {
 						port = grantedPort
 					}
-					granted, err := p.mapper.AddPortMapping(port, p.intPort, p.desc(), int(lease.Seconds()))
+					desc := p.desc()
+					granted, err := p.mapper.AddPortMapping(port, p.intPort, desc, int(lease.Seconds()))
 					if err != nil {
 						renewFailed = true
 						renewAt = deadline // stop renewing; close at lease expiry
 						rearm()
-					} else if openFenced && !p.generationCurrent(openGen) {
-						// COMMIT POINT: the transition was published while the renewal
-						// write was in flight. Undo the renewal and tear the mapping
-						// down instead of extending its lease.
-						grantedPort = granted
-						discardFencedMapping(true)
 					} else {
 						grantedPort = granted
-						renewFailed = false
-						deadline = now.Add(lease)
-						renewAt = deadline.Add(-p.renewWindow)
-						rearm()
+						ownedDesc = desc
+						// The autonomous renewal is a success outcome too, so it
+						// passes through the same success choke point (no reply to
+						// send). A refusal means the transition was published while
+						// the renewal write was in flight: undo the renewal and tear
+						// the mapping down instead of extending its lease.
+						if !commitOpenSuccess(portCommand{fenced: openFenced, gen: openGen}, true, func() {
+							renewFailed = false
+							deadline = now.Add(lease)
+							renewAt = deadline.Add(-p.renewWindow)
+							rearm()
+						}) {
+							discardFencedMapping(true)
+						}
 					}
 				default:
 					rearm()

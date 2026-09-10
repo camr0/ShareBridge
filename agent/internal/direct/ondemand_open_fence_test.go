@@ -2,6 +2,7 @@ package direct
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,125 @@ func (m *gatedAddMapper) AddPortMapping(ext, internal int, desc string, lease in
 	return m.recordingMapper.AddPortMapping(ext, internal, desc, lease)
 }
 
+// routerMapper is a listing-capable PortMapper that simulates a router's
+// mapping table, so port selection (ChooseExternalPort lists) and ownership-
+// checked deletion (DeleteOwnedMapping lists and compares identity) both see
+// the live mapping — unlike recordingMapper, whose nil table means "listing
+// unsupported" and therefore never exercises the identity comparison. delFails
+// makes the first N DeletePortMapping calls fail, so a compensating delete can
+// fail and the close-retry timer must retry with the mapping's true identity.
+type routerMapper struct {
+	mu         sync.Mutex
+	internalIP string
+	table      map[int]PortMapping
+	delFails   int
+	delCalls   int
+	addCalls   int
+	listCalls  int
+
+	addEntered chan struct{}
+	addRelease chan struct{}
+}
+
+func newRouterMapper(internalIP string, existing ...PortMapping) *routerMapper {
+	m := &routerMapper{internalIP: internalIP, table: map[int]PortMapping{}}
+	for _, e := range existing {
+		m.table[e.ExternalPort] = e
+	}
+	return m
+}
+
+// gateAdd arms AddPortMapping to signal entry on entered and block until
+// release is closed.
+func (m *routerMapper) gateAdd(entered, release chan struct{}) {
+	m.mu.Lock()
+	m.addEntered, m.addRelease = entered, release
+	m.mu.Unlock()
+}
+
+// setDelFails makes the first n DeletePortMapping calls fail.
+func (m *routerMapper) setDelFails(n int) {
+	m.mu.Lock()
+	m.delFails = n
+	m.mu.Unlock()
+}
+
+func (m *routerMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
+	m.mu.Lock()
+	entered, release := m.addEntered, m.addRelease
+	m.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+		<-release
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addCalls++
+	m.table[ext] = PortMapping{
+		ExternalPort:   ext,
+		InternalPort:   internal,
+		InternalClient: m.internalIP,
+		Protocol:       "TCP",
+		Description:    desc,
+	}
+	return ext, nil
+}
+
+func (m *routerMapper) DeletePortMapping(ext int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.delCalls++
+	if m.delCalls <= m.delFails {
+		return fmt.Errorf("delete failed (attempt %d)", m.delCalls)
+	}
+	delete(m.table, ext)
+	return nil
+}
+
+func (m *routerMapper) ExternalIP() (string, error) { return "203.0.113.7", nil }
+
+func (m *routerMapper) InternalIP() string { return m.internalIP }
+
+func (m *routerMapper) ListPortMappings() ([]PortMapping, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listCalls++
+	out := make([]PortMapping, 0, len(m.table))
+	for _, v := range m.table {
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func (m *routerMapper) mappingAt(ext int) (PortMapping, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.table[ext]
+	return v, ok
+}
+
+func (m *routerMapper) mappingCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.table)
+}
+
+func (m *routerMapper) listCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.listCalls
+}
+
+func (m *routerMapper) snapshotTable() map[int]PortMapping {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[int]PortMapping, len(m.table))
+	for k, v := range m.table {
+		out[k] = v
+	}
+	return out
+}
+
 // loopStateRecorder records the port's published state transitions.
 type loopStateRecorder struct {
 	mu     sync.Mutex
@@ -63,6 +183,18 @@ func (r *loopStateRecorder) sawOpen() bool {
 		}
 	}
 	return false
+}
+
+func (r *loopStateRecorder) openCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, s := range r.states {
+		if s == StateOpen {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *loopStateRecorder) snapshot() []PortState {
@@ -295,6 +427,223 @@ func TestOpenForIfLegitimateAfterUnlockGeneration(t *testing.T) {
 	}
 	if !p.Open() {
 		t.Fatalf("a post-unlock open under the current generation must open the port")
+	}
+}
+
+// TestOpenForIfFencesAlreadyOpenNonRenewalSuccess is the fix-round-3 bypass:
+// the already-open fast path that does NOT extend the lease performs no mapping
+// write, so at the round-2 HEAD it had no second generation check at all — it
+// rearmed and replied success. A §13.4 generation transition published between
+// its top-of-case fence check and its reply therefore produced an OK open_ack
+// after lockdown publication. The success choke point must refuse it, undo the
+// stale mapping, and reply ErrOpenSuperseded instead of success.
+//
+// The fake clock gates the first clock read after the top-of-case fence — the
+// only point in this path where a transition can be landed deterministically.
+func TestOpenForIfFencesAlreadyOpenNonRenewalSuccess(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	base := &recordingMapper{}
+	p := newTestPort(fc, base, time.Minute)
+	defer p.Close()
+	rec := &loopStateRecorder{}
+	p.SetTransitionCallback(rec.record)
+
+	// A legitimate cold open under generation 0 with a long lease.
+	if err := p.OpenForIf("share", time.Hour, 0); err != nil {
+		t.Fatalf("cold open: %v", err)
+	}
+	if !p.Open() {
+		t.Fatalf("cold open did not open the port")
+	}
+	opensAfterColdOpen, _, _, _ := base.snapshot()
+	publishedOpens := rec.openCount()
+
+	// Arm the one-shot clock gate: the next OpenForIf blocks after its
+	// top-of-case fence check and before its success reply.
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	fc.gateNextNow(entered, release)
+
+	// A 1s lease (clamped to minValidLease, 5s) does not extend the existing
+	// one-hour deadline, so this is the already-open NON-renewal fast path.
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.OpenForIf("share", time.Second, 0) }()
+	awaitEntered(t, entered, "the already-open non-renewal open reaching its success window")
+
+	// The generation transition lands after the top-of-case check and before
+	// the success reply.
+	p.SetGeneration(1, true)
+	close(release)
+
+	err := <-errCh
+	if !errors.Is(err, ErrOpenSuperseded) {
+		t.Fatalf("the already-open non-renewal path replied OK (err = %v); that reply becomes an "+
+			"open_ack after lockdown publication, want ErrOpenSuperseded", err)
+	}
+	if got := rec.openCount(); got != publishedOpens {
+		t.Fatalf("a superseded already-open success must not publish StateOpen: %v", rec.snapshot())
+	}
+	if p.Open() {
+		t.Fatalf("the port must not report open after the superseded success was refused")
+	}
+	if got := p.State(); got != StateClosed {
+		t.Fatalf("state = %v, want StateClosed (the stale mapping is undone)", got)
+	}
+	if n, _, _, _ := base.snapshot(); n != opensAfterColdOpen {
+		t.Fatalf("the non-renewal path issued %d extra AddPortMapping calls, want 0", n-opensAfterColdOpen)
+	}
+	if _, closed, _, _ := base.snapshot(); closed == 0 {
+		t.Fatalf("the stale mapping owned by the superseded generation was not removed")
+	}
+}
+
+// TestOpenForIfLegitimateAlreadyOpenNonRenewal is the no-false-fencing control
+// for the path the success choke point now covers: with an unchanged
+// generation, an already-open signal whose lease does not extend the deadline
+// replies success, issues no router write, and leaves the mapping open.
+func TestOpenForIfLegitimateAlreadyOpenNonRenewal(t *testing.T) {
+	fc := newFakeClock(time.Now())
+	base := &recordingMapper{}
+	p := newTestPort(fc, base, time.Minute)
+	defer p.Close()
+
+	if err := p.OpenForIf("share", time.Hour, 0); err != nil {
+		t.Fatalf("cold open: %v", err)
+	}
+	opened, _, closed, _ := base.snapshot()
+
+	if err := p.OpenForIf("share", time.Second, 0); err != nil {
+		t.Fatalf("already-open non-renewal: %v", err)
+	}
+	if !p.Open() {
+		t.Fatalf("the port must stay open after a legitimate non-renewal signal")
+	}
+	if o, _, c, _ := base.snapshot(); o != opened || c != closed {
+		t.Fatalf("the non-renewal path must issue no mapping write or delete: opened %d→%d closed %d→%d", opened, o, closed, c)
+	}
+	if got := p.State(); got != StateOpen {
+		t.Fatalf("state = %v, want StateOpen", got)
+	}
+}
+
+// TestOpenForIfUndoRetainsCreatedMappingIdentity is the fix-round-3 undo leak:
+// the fenced cold open's undo attempted the compensating delete and then
+// restored p.extPort to the preferred port. When port selection had chosen a
+// different port (443 occupied → 49152), a failed immediate delete left the
+// close-retry timer building its delete identity from the RESTORED p.extPort:
+// the live mapping is described "test-49152" while the retry required
+// "test-443", so DeleteOwnedMapping refused it as foreign, the retries were
+// exhausted, and the agent's mapping survived until router expiry. The undo
+// must target the mapping it actually created.
+func TestOpenForIfUndoRetainsCreatedMappingIdentity(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	foreign := PortMapping{
+		ExternalPort: 443, InternalPort: 80, InternalClient: "192.168.1.9",
+		Protocol: "TCP", Description: "other-service",
+	}
+	mapper := newRouterMapper("192.168.1.20", foreign)
+	mapper.setDelFails(1) // the undo's immediate delete fails exactly once
+	p := newOwnedTestPort(fc, mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	defer p.Close()
+	rec := &loopStateRecorder{}
+	p.SetTransitionCallback(rec.record)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	mapper.gateAdd(entered, release)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.OpenForIf("share", time.Minute, 0) }()
+	awaitEntered(t, entered, "the cold open entering AddPortMapping")
+	p.SetGeneration(1, true)
+	close(release)
+
+	if err := <-errCh; !errors.Is(err, ErrOpenSuperseded) {
+		t.Fatalf("err = %v, want ErrOpenSuperseded", err)
+	}
+	if rec.sawOpen() {
+		t.Fatalf("a fenced cold open must not publish StateOpen: %v", rec.snapshot())
+	}
+	// Port selection must have chosen the dynamic port, and the mapping the
+	// open created must carry that port's description.
+	created, ok := mapper.mappingAt(49152)
+	if !ok {
+		t.Fatalf("the cold open did not map the selected dynamic port 49152; table = %v", mapper.snapshotTable())
+	}
+	if created.Description != "test-49152" {
+		t.Fatalf("created mapping description = %q, want %q", created.Description, "test-49152")
+	}
+
+	// Drive the close-retry timer: advanced one retry at a time, waiting for the
+	// loop to re-arm, so the test is deterministic.
+	for i := 0; i < maxCloseAttempts+2; i++ {
+		if p.State() == StateCloseFailed || mapper.mappingCount() == 1 {
+			break
+		}
+		before := mapper.listCount()
+		fc.advance(closeRetryDelay + time.Millisecond)
+		waitFor(t, func() bool { return mapper.listCount() > before || p.State() == StateCloseFailed })
+	}
+
+	if _, ok := mapper.mappingAt(49152); ok {
+		t.Fatalf("the fenced open's mapping leaked: the retry did not target the created mapping; table = %v", mapper.snapshotTable())
+	}
+	if _, ok := mapper.mappingAt(443); !ok {
+		t.Fatalf("the pre-existing foreign mapping at 443 must not be deleted: %v", mapper.snapshotTable())
+	}
+	if p.Open() {
+		t.Fatalf("the port must not be open")
+	}
+	if got := p.State(); got != StateClosed {
+		t.Fatalf("state = %v, want StateClosed (no close-failed escalation)", got)
+	}
+	if err := p.CloseError(); err != nil {
+		t.Fatalf("CloseError = %v, want nil", err)
+	}
+}
+
+// TestCloseIfReclaimsMappingAfterCloseFailed proves a §13.4 lockdown CloseIf is
+// not a no-op while a mapping a failed close could not remove is still live: the
+// close lever re-attempts the delete, so the agent cannot report itself locked
+// with a mapping it created still present on the router.
+func TestCloseIfReclaimsMappingAfterCloseFailed(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	mapper := newRouterMapper("192.168.1.20")
+	mapper.setDelFails(maxCloseAttempts) // every retry of the first close fails
+	p := newOwnedTestPort(fc, mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	defer p.Close()
+
+	if err := p.OpenFor("share", time.Minute); err != nil {
+		t.Fatalf("OpenFor: %v", err)
+	}
+	if err := p.Close(); !errors.Is(err, ErrDeleteRetry) {
+		t.Fatalf("Close: want ErrDeleteRetry, got %v", err)
+	}
+	for i := 0; i < maxCloseAttempts+1 && p.State() != StateCloseFailed; i++ {
+		before := mapper.listCount()
+		fc.advance(closeRetryDelay + time.Millisecond)
+		waitFor(t, func() bool { return mapper.listCount() > before || p.State() == StateCloseFailed })
+	}
+	if p.State() != StateCloseFailed {
+		t.Fatalf("state = %v, want StateCloseFailed with the mapping still live", p.State())
+	}
+	if mapper.mappingCount() != 1 {
+		t.Fatalf("the failed close's mapping is not lingering: %v", mapper.snapshotTable())
+	}
+
+	// The lockdown lever's CloseIf must re-attempt the delete (this sixth
+	// attempt succeeds) instead of returning a no-op while the mapping lives.
+	if err := p.CloseIf(func() bool { return true }); err != nil {
+		t.Fatalf("CloseIf after close-failed: %v", err)
+	}
+	if mapper.mappingCount() != 0 {
+		t.Fatalf("CloseIf left the mapping live while the agent is locked: %v", mapper.snapshotTable())
+	}
+	if got := p.State(); got != StateClosed {
+		t.Fatalf("state = %v, want StateClosed", got)
+	}
+	if err := p.CloseError(); err != nil {
+		t.Fatalf("CloseError = %v, want nil", err)
 	}
 }
 

@@ -30,14 +30,37 @@ type fakeClock struct {
 	mu     sync.Mutex
 	now    time.Time
 	timers []*fakeTimer
+
+	// nowEntered/nowRelease are a one-shot gate: while armed, the next Now()
+	// call signals entry on nowEntered and blocks until nowRelease is closed.
+	// It lets a test publish a generation transition in the window between a
+	// state-loop operation's top-of-case fence check and its success commit —
+	// the already-open non-renewal fast path's only such window.
+	nowEntered chan struct{}
+	nowRelease chan struct{}
 }
 
 func newFakeClock(start time.Time) *fakeClock { return &fakeClock{now: start} }
 
 func (f *fakeClock) Now() time.Time {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.now
+	entered, release := f.nowEntered, f.nowRelease
+	f.nowEntered, f.nowRelease = nil, nil
+	now := f.now
+	f.mu.Unlock()
+	// Blocking happens after the unlock so the test can still read the clock.
+	if entered != nil {
+		entered <- struct{}{}
+		<-release
+	}
+	return now
+}
+
+// gateNextNow arms the one-shot Now() gate for the next clock read.
+func (f *fakeClock) gateNextNow(entered, release chan struct{}) {
+	f.mu.Lock()
+	f.nowEntered, f.nowRelease = entered, release
+	f.mu.Unlock()
 }
 
 func (f *fakeClock) NewTimer(d time.Duration) portTimer {

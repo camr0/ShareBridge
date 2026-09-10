@@ -194,6 +194,36 @@ func TestHandleOpenSignalFencedByLockdownDuringAddPortMapping(t *testing.T) {
 	}
 }
 
+// TestHandleOpenSignalLegitimateAlreadyOpenNonRenewal is the daemon-level
+// no-false-fencing control for the already-open non-renewal fast path the fix
+// round-3 choke point covers: a signal whose lease does not extend the existing
+// deadline must still be acked OK with was_already_open=true, must issue no
+// router write, and must leave the mapping open.
+func TestHandleOpenSignalLegitimateAlreadyOpenNonRenewal(t *testing.T) {
+	mapper := newFencingMapper()
+	d, sig, port := newOpenFenceDaemon(t, mapper)
+
+	d.handleOpenSignal(openSignalMessageLease(1, "nonce-cold", 600))
+	if !port.Open() {
+		t.Fatalf("legitimate cold open did not open the mapping")
+	}
+	if n := mapper.addCount(); n != 1 {
+		t.Fatalf("cold open AddPortMapping calls = %d, want 1", n)
+	}
+
+	// 30s does not extend the 600s deadline, so this is the non-renewal path.
+	d.handleOpenSignal(openSignalMessageLease(2, "nonce-nonrenew", 30))
+	if !port.Open() {
+		t.Fatalf("the mapping must stay open after a non-renewal signal")
+	}
+	if n := mapper.addCount(); n != 1 {
+		t.Fatalf("the non-renewal signal issued a router write: AddPortMapping calls = %d, want 1", n)
+	}
+	if !sig.hasSentMessage("open_ack", map[string]any{"status": "ok", "was_already_open": true}) {
+		t.Fatalf("expected an OK was_already_open open_ack, got %#v", sig.messagesSnapshot())
+	}
+}
+
 // TestHandleOpenSignalFencedByLockdownDuringRenewal is the reviewer's round-2
 // gap for the renewal fast path: the mapping is already open, the renewal
 // predicate has passed, and the generation transition lands while the renewal
