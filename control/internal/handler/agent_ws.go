@@ -308,7 +308,13 @@ func AgentWS(app core.App, h *hub.Hub, cfg *config.Config, ctrl *directctl.Contr
 					log.Printf("lockdown_status rejected (api_key_id=%s): %v", apiKeyID, err)
 					continue
 				}
-				// Advisory only: deliberately no control-side state change (§11.1).
+				// §13.4 step 6: record the current-epoch advisory state so route
+				// selection can suppress futile preparation. A stale or ambiguous
+				// generation is rejected without changing anything, and the report
+				// can never establish availability or mutate share lifecycle.
+				if !ctrl.RecordLockdownStatus(apiKeyID, conn, msg.Generation, msg.Locked) {
+					log.Printf("lockdown_status ignored as stale (api_key_id=%s generation=%d)", apiKeyID, msg.Generation)
+				}
 
 			case "stun_result":
 				// §11.1 observation echo: accepted only from the current

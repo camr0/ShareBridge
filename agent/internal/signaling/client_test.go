@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -848,4 +849,48 @@ func TestParseSTUNChallengeTolerantStrict(t *testing.T) {
 			t.Fatalf("malformed expires_at must be rejected")
 		}
 	})
+}
+
+// TestClientReconnectDuringSendIsRaceFree is the Task 30 regression for the
+// Task 28 review Minor #3 data race: the tunnel credential requester sends
+// over the CURRENT WebSocket while the reconnect loop swaps it, so the conn
+// field must be synchronized. Run with -race — the pre-fix unsynchronized
+// swap/read pair is reported as a data race here.
+func TestClientReconnectDuringSendIsRaceFree(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := New("ws"+strings.TrimPrefix(server.URL, "http"), "api", "agent")
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Concurrent send (reads the current conn) and reconnect (swaps it) is the
+	// exact production race: the credential requester's worker send against a
+	// control-WebSocket reconnect.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			_ = client.Send(ctx, map[string]any{"type": "relay_credential_request", "reason": "restart"})
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		_ = client.Connect(ctx)
+	}
+	wg.Wait()
 }

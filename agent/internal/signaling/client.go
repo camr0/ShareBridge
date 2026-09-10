@@ -87,7 +87,11 @@ type Client struct {
 	serverURL string
 	apiKey    string
 	agentID   string
+	// conn is the current WebSocket. The reconnect loop swaps it in Connect
+	// while the tunnel credential requester may Send concurrently, so every
+	// access goes through connMu (Task 28 review Minor #3, fixed here).
 	conn      *websocket.Conn
+	connMu    sync.RWMutex
 	OnMessage func(msg Message)
 	mu        sync.Mutex
 
@@ -118,7 +122,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dial signaling server: %w", err)
 	}
+	c.connMu.Lock()
 	c.conn = conn
+	c.connMu.Unlock()
 
 	// Send hello message
 	if err := c.Send(ctx, map[string]string{
@@ -499,19 +505,42 @@ func isLowercaseHex(s string) bool {
 	}) < 0
 }
 
-// Send serializes msg as JSON and writes it to the WebSocket.
+// connSnapshot returns the current WebSocket under the connection lock. The
+// reconnect loop swaps conn in Connect; every user (Send and Listen) must go
+// through this accessor so the swap is race-free.
+func (c *Client) connSnapshot() *websocket.Conn {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	return c.conn
+}
+
+// Send serializes msg as JSON and writes it to the CURRENT WebSocket. It
+// snapshots the connection once so a concurrent reconnect can only move a
+// later send to the new socket, never tear this write.
 func (c *Client) Send(ctx context.Context, msg any) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
-	return c.conn.Write(ctx, websocket.MessageText, data)
+	conn := c.connSnapshot()
+	if conn == nil {
+		return errors.New("send: signaling connection not established")
+	}
+	return conn.Write(ctx, websocket.MessageText, data)
 }
 
 // Listen reads messages in a loop and dispatches them.
 // It is the sole reader of the WebSocket connection — RegisterShare and
 // other callers must not call conn.Read concurrently.
 func (c *Client) Listen(ctx context.Context) error {
+	// Snapshot the connection for this listen epoch: the reader and the
+	// keepalive pings must both target the socket this call was started for,
+	// even if a concurrent Connect swaps c.conn.
+	conn := c.connSnapshot()
+	if conn == nil {
+		return errors.New("listen: signaling connection not established")
+	}
+
 	// Keepalive ping: sends every 30s to prevent Cloudflare's 100s WebSocket timeout
 	// from disconnecting idle agents. Any WebSocket frame resets the timeout.
 	keepaliveCtx, cancel := context.WithCancel(ctx)
@@ -522,7 +551,7 @@ func (c *Client) Listen(ctx context.Context) error {
 		for {
 			select {
 			case <-ticker.C:
-				if err := c.conn.Ping(keepaliveCtx); err != nil {
+				if err := conn.Ping(keepaliveCtx); err != nil {
 					return // Connection closed or error
 				}
 			case <-keepaliveCtx.Done():
@@ -532,7 +561,7 @@ func (c *Client) Listen(ctx context.Context) error {
 	}()
 
 	for {
-		_, data, err := c.conn.Read(ctx)
+		_, data, err := conn.Read(ctx)
 		if err != nil {
 			return err
 		}

@@ -225,6 +225,16 @@ func (c *Controller) SelectRoute(w http.ResponseWriter, r *http.Request, sess *c
 	}
 	apiKeyID := sess.GetString("api_key_id")
 	origin := sess.GetString("origin")
+
+	// §13.4 step 6 / acceptance #10: the agent's advisory locked report is a
+	// suppress-only fast path — while locked the canonical link is unavailable
+	// on BOTH routes until explicit unlock (the agent also stopped the direct
+	// mapping and the FRP tunnel). It can never make a route available: every
+	// live predicate below still has to pass once the report clears.
+	if c.AgentLocked(apiKeyID) {
+		return c.unavailable(w)
+	}
+
 	now := c.nowFn() // single clock reading for this navigation decision
 
 	facts, haveFacts := c.readRouteFacts(apiKeyID)

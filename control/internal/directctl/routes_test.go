@@ -25,7 +25,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/stretchr/testify/require"
 	"sharebridge/control/internal/relayctl"
 	"sharebridge/control/internal/stun"
 )
@@ -720,4 +722,129 @@ func TestRollbackModeDisablesRelaySelectionButKeepsNewDirectFlow(t *testing.T) {
 		t.Fatalf("rollback selection had side effects: %d %d %d %d %d %d",
 			emitOpens, probes, agentSends, stunIssues, ddns, relayDNS)
 	}
+}
+
+// TestLockdownStatusOnlySuppressesNeverCreatesAvailability pins the §11.1/
+// §13.4 advisory lockdown contract on the control plane: locked=true may
+// self-deny BOTH direct and relay availability (acceptance #10 makes the
+// canonical link unavailable until explicit unlock), while locked=false can
+// never create either route — every live predicate still has to pass — and a
+// stale or ambiguous generation is rejected (never applied).
+func TestLockdownStatusOnlySuppressesNeverCreatesAvailability(t *testing.T) {
+	t.Run("locked_suppresses_relay_only_share", func(t *testing.T) {
+		app, ctrl, _, view, _ := newSelectionController(t, true)
+		const code = "lkrelay01"
+		apiKeyID := routeSession(t, app, code, func(r *core.Record) { r.Set("relay_only", true) })
+		port := seedAgentFacts(t, app, apiKeyID, "")
+		grantPresence(t, view, agentRecordID(t, app, apiKeyID), port)
+		connectWS(t, ctrl, apiKeyID)
+
+		// Baseline: relay-only with a fresh gateway presence lease selects relay.
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusFound, routeRelayOriginFor(code))
+
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 1, true))
+		require.True(t, ctrl.AgentLocked(apiKeyID))
+		// Locked: even a fresh gateway lease cannot make the canonical link
+		// available until explicit unlock.
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusServiceUnavailable, "")
+	})
+
+	t.Run("locked_suppresses_direct_candidate", func(t *testing.T) {
+		app, ctrl, _, _, _ := newSelectionController(t, true)
+		const code = "lkdirect1"
+		apiKeyID := routeSession(t, app, code, nil)
+		seedAgentFacts(t, app, apiKeyID, routeDirectIP)
+		connectWS(t, ctrl, apiKeyID)
+		installObservation(t, ctrl, apiKeyID, netip.MustParseAddr(routeDirectIP), true)
+
+		// Baseline: a confirmed-eligible direct candidate serves the interstitial.
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusOK, "")
+
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 1, true))
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusServiceUnavailable, "")
+	})
+
+	t.Run("locked_suppresses_preparation", func(t *testing.T) {
+		app, ctrl, _, _, spy := newSelectionController(t, true)
+		const code = "lkprepare1"
+		apiKeyID := routeSession(t, app, code, nil)
+		seedAgentFacts(t, app, apiKeyID, routeDirectIP)
+		connectWS(t, ctrl, apiKeyID)
+		installObservation(t, ctrl, apiKeyID, netip.MustParseAddr(routeDirectIP), true)
+
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 1, true))
+		resp := httptest.NewRecorder()
+		require.NoError(t, ctrl.PrepareRoute(resp, httptest.NewRequest(http.MethodPost, "/prepare/"+code, nil), code))
+		require.Equal(t, http.StatusServiceUnavailable, resp.Code)
+		require.Equal(t, "no-store", resp.Header().Get("Cache-Control"))
+		emitOpens, probes, agentSends, stunIssues, ddns, relayDNS := spy.counts()
+		require.Zero(t, emitOpens+probes+agentSends+stunIssues+ddns+relayDNS,
+			"locked preparation must not open, probe, STUN, or message the agent")
+	})
+
+	t.Run("unlock_report_cannot_create_relay_availability", func(t *testing.T) {
+		app, ctrl, _, _, _ := newSelectionController(t, true)
+		const code = "lkrelay02"
+		apiKeyID := routeSession(t, app, code, func(r *core.Record) { r.Set("relay_only", true) })
+		seedAgentFacts(t, app, apiKeyID, "") // assignment facts, NO presence lease
+		connectWS(t, ctrl, apiKeyID)
+
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 1, true))
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 2, false))
+		require.False(t, ctrl.AgentLocked(apiKeyID))
+		// locked=false does not fabricate the missing presence lease.
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusServiceUnavailable, "")
+	})
+
+	t.Run("unlock_report_cannot_create_direct_availability", func(t *testing.T) {
+		app, ctrl, _, _, _ := newSelectionController(t, true)
+		const code = "lkdirect2"
+		apiKeyID := routeSession(t, app, code, nil)
+		seedAgentFacts(t, app, apiKeyID, routeDirectIP)
+		connectWS(t, ctrl, apiKeyID)
+		// Fresh but mismatched egress: hard direct-ineligible (§10.3).
+		installObservation(t, ctrl, apiKeyID, netip.MustParseAddr("198.51.100.9"), true)
+
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 1, true))
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 2, false))
+		require.False(t, ctrl.AgentLocked(apiKeyID))
+		// No relay lease and a contradicted direct route: still unavailable.
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusServiceUnavailable, "")
+	})
+
+	t.Run("unlock_restores_normal_selection", func(t *testing.T) {
+		app, ctrl, _, view, _ := newSelectionController(t, true)
+		const code = "lkrelay03"
+		apiKeyID := routeSession(t, app, code, func(r *core.Record) { r.Set("relay_only", true) })
+		port := seedAgentFacts(t, app, apiKeyID, "")
+		grantPresence(t, view, agentRecordID(t, app, apiKeyID), port)
+		connectWS(t, ctrl, apiKeyID)
+
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 1, true))
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusServiceUnavailable, "")
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 2, false))
+		require.False(t, ctrl.AgentLocked(apiKeyID))
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusFound, routeRelayOriginFor(code))
+	})
+
+	t.Run("stale_or_ambiguous_generation_is_rejected", func(t *testing.T) {
+		app, ctrl, _, view, _ := newSelectionController(t, true)
+		const code = "lkrelay04"
+		apiKeyID := routeSession(t, app, code, func(r *core.Record) { r.Set("relay_only", true) })
+		port := seedAgentFacts(t, app, apiKeyID, "")
+		grantPresence(t, view, agentRecordID(t, app, apiKeyID), port)
+		connectWS(t, ctrl, apiKeyID)
+
+		require.True(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 10, true))
+		// A lower generation is stale and must not clear the lockdown.
+		require.False(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 5, false), "stale generation must be rejected")
+		require.True(t, ctrl.AgentLocked(apiKeyID))
+		// The same generation flipping polarity is ambiguous and also rejected.
+		require.False(t, ctrl.RecordLockdownStatus(apiKeyID, nil, 10, false))
+		require.True(t, ctrl.AgentLocked(apiKeyID))
+		// A report from a superseded (non-current) socket is fenced out.
+		require.False(t, ctrl.RecordLockdownStatus(apiKeyID, &websocket.Conn{}, 11, false))
+		require.True(t, ctrl.AgentLocked(apiKeyID))
+		assertSelection(t, ctrl, code, http.StatusFound, http.StatusServiceUnavailable, "")
+	})
 }

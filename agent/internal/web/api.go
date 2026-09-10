@@ -210,6 +210,68 @@ func (ws *WebServer) revokeShareHandler(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
+// lockdownController is the optional daemon capability the §13.4 lockdown
+// endpoints require. It is asserted rather than added to daemonProvider so
+// the existing admin API surface and its test doubles stay unchanged; a
+// daemon without the capability fails closed.
+type lockdownController interface {
+	// Lockdown activates the reversible §13.4 emergency stop.
+	Lockdown() error
+	// Unlock reverses it and reacquires transport presence.
+	Unlock() error
+	// IsLocked reports the local lockdown state.
+	IsLocked() bool
+}
+
+// lockdownHandler activates the reversible §13.4 emergency stop through the
+// existing authenticated local admin API (basic auth when configured, CSRF
+// header for the state-changing POST). It is not share revocation: no session
+// is tombstoned and an explicit unlock restores availability.
+func (ws *WebServer) lockdownHandler(w http.ResponseWriter, r *http.Request) {
+	controller, ok := ws.daemon.(lockdownController)
+	if ws.daemon == nil || !ok {
+		http.Error(w, "lockdown not available", http.StatusNotImplemented)
+		return
+	}
+	if err := controller.Lockdown(); err != nil {
+		http.Error(w, fmt.Sprintf("lockdown: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeLockdownJSON(w, true)
+}
+
+// unlockHandler reverses lockdown via the same authenticated admin API.
+func (ws *WebServer) unlockHandler(w http.ResponseWriter, r *http.Request) {
+	controller, ok := ws.daemon.(lockdownController)
+	if ws.daemon == nil || !ok {
+		http.Error(w, "lockdown not available", http.StatusNotImplemented)
+		return
+	}
+	if err := controller.Unlock(); err != nil {
+		http.Error(w, fmt.Sprintf("unlock: %v", err), http.StatusInternalServerError)
+		return
+	}
+	writeLockdownJSON(w, false)
+}
+
+// lockdownStatusHandler reports the local lockdown state as JSON. It exposes
+// only the boolean availability state — never route or credential detail.
+func (ws *WebServer) lockdownStatusHandler(w http.ResponseWriter, r *http.Request) {
+	locked := false
+	if ws.daemon != nil {
+		if controller, ok := ws.daemon.(lockdownController); ok {
+			locked = controller.IsLocked()
+		}
+	}
+	writeLockdownJSON(w, locked)
+}
+
+// writeLockdownJSON writes the bounded {"locked": bool} response body.
+func writeLockdownJSON(w http.ResponseWriter, locked bool) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"locked": locked})
+}
+
 type shareFormData struct {
 	DefaultRelayOnly bool
 }

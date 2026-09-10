@@ -116,6 +116,14 @@ func (c *Controller) PrepareRoute(w http.ResponseWriter, r *http.Request, code s
 	apiKeyID := sess.GetString("api_key_id")
 	origin := sess.GetString("origin")
 
+	// §13.4 step 6: a locked agent has stopped its direct mapping and tunnel,
+	// so preparation is futile — suppress it entirely (no open_signal, no
+	// STUN, no probe) and answer unavailable. Suppress-only: an unlock report
+	// never bypasses the live predicates below.
+	if c.AgentLocked(apiKeyID) {
+		return c.unavailable(w)
+	}
+
 	// Bounded body: empty or one JSON object. Field values are deliberately
 	// NEVER consulted — no redirect/origin input is accepted.
 	if err := consumePrepareBody(w, r); err != nil {

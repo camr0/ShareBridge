@@ -166,6 +166,12 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 	// Settings
 	mux.HandleFunc("PUT /api/settings", ws.csrfMiddleware(ws.saveSettingsHandler))
 
+	// §13.4 reversible lockdown: authenticated local admin API only (the
+	// state-changing POSTs carry the CSRF header like every other mutation).
+	mux.HandleFunc("POST /api/lockdown", ws.csrfMiddleware(ws.lockdownHandler))
+	mux.HandleFunc("POST /api/unlock", ws.csrfMiddleware(ws.unlockHandler))
+	mux.HandleFunc("GET /api/lockdown-status", ws.lockdownStatusHandler)
+
 	// Relay quota endpoint
 	mux.HandleFunc("GET /api/relay-quota", ws.relayQuotaHandler)
 

@@ -169,3 +169,12 @@ func (s *DirectServer) CloseShareConns(code string) int {
 func (s *DirectServer) CloseAllConns() int {
 	return s.conns.closeAll()
 }
+
+// CloseRecipientConns closes every established recipient connection admitted
+// on EITHER route kind — the §13.4 step 5 lockdown close — and returns how
+// many were closed. Connections whose route is not yet known (no authorized
+// request served) are not matched; the lockdown listener teardown covers
+// them.
+func (s *DirectServer) CloseRecipientConns() int {
+	return s.CloseRouteConns(RouteDirect) + s.CloseRouteConns(RouteRelay)
+}

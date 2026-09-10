@@ -125,6 +125,24 @@ type Daemon struct {
 	// tests' startTunnelManager; readers need no additional synchronization.
 	tunnel *tunnel.Manager
 
+	// tunnelCtx/tunnelOptions retain the construction inputs of the tunnel
+	// manager so §13.4 unlock can build a FRESH manager after lockdown stopped
+	// the previous one (Manager.Stop is permanent: stopChannel/doneChannel are
+	// closed). Production records the process context and no options; tests
+	// record their fake process starter. Written under mu in
+	// startTunnelManager.
+	tunnelCtx     context.Context
+	tunnelOptions []tunnel.ManagerOption
+
+	// lockdownGen is the monotonic §11.1 lockdown_status generation (under
+	// mu). It increments on every lockdown/unlock transition so control can
+	// reject a stale report within the current connection epoch.
+	lockdownGen uint64
+
+	// lockdownMu serializes the §13.4 Lockdown/Unlock transitions so two
+	// concurrent admin calls cannot interleave their best-effort actions.
+	lockdownMu sync.Mutex
+
 	// STUN cross-check state (§10.1, Task 17 add-on): the exchange client, a
 	// test clock seam, and the one-slot bound that keeps at most a single
 	// challenge exchange in flight at a time.
@@ -189,6 +207,15 @@ type directState struct {
 	startGen   uint64             // increments per start attempt (under mu)
 	cancel     context.CancelFunc // cancels the direct server ctx on shutdown
 	listenAddr string             // override for tests; empty => :directIntPort
+
+	// locked is the local §13.4 lockdown state: an availability stop, NOT
+	// share revocation. While true the SignalGate refuses new opens, the
+	// on-demand mapping stays closed, the listener stays out of service, and
+	// the Binder holds no admissions — but origins/relayOrigins keep the
+	// source-verified bindings recorded so unlock can restore them without a
+	// tombstone. Local enforcement is final: control's advisory
+	// lockdown_status can suppress attempts but never override this flag.
+	locked bool
 
 	// pendingRelayBinds records relay-only shares whose single §13.3 binding
 	// could not be installed at hydration time because the binder (namespace)
@@ -270,6 +297,10 @@ type stunResultSender interface {
 // it without options.
 func (d *Daemon) startTunnelManager(ctx context.Context, options ...tunnel.ManagerOption) {
 	d.mu.Lock()
+	// Retain the construction inputs so §13.4 unlock can rebuild a fresh
+	// manager after lockdown permanently stopped the previous one.
+	d.tunnelCtx = ctx
+	d.tunnelOptions = append([]tunnel.ManagerOption(nil), options...)
 	if d.tunnel != nil {
 		d.mu.Unlock()
 		return
@@ -559,11 +590,24 @@ func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 		log.Printf("derive relay origin for share %s: %v", code, err)
 		return originPair{}, false
 	}
+	pair := originPair{directOrigin: directOrigin, relayOrigin: relayOrigin}
+	ds.mu.Lock()
+	if ds.locked {
+		// §13.4 step 4: lockdown removed the Binder admissions but retained
+		// the source/session state. A share registered while locked is
+		// recorded for unlock instead of being admitted now.
+		if ds.origins == nil {
+			ds.origins = make(map[string]originPair)
+		}
+		ds.origins[code] = pair
+		ds.mu.Unlock()
+		return pair, true
+	}
+	ds.mu.Unlock()
 	if err := binder.AllowShare(directOrigin, relayOrigin, code); err != nil {
 		log.Printf("bind origins for share %s: %v", code, err)
 		return originPair{}, false
 	}
-	pair := originPair{directOrigin: directOrigin, relayOrigin: relayOrigin}
 	ds.mu.Lock()
 	if ds.origins == nil {
 		ds.origins = make(map[string]originPair)
@@ -612,6 +656,19 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 		log.Printf("derive relay origin for share %s: %v", code, err)
 		return "", false
 	}
+	ds.mu.Lock()
+	if ds.locked {
+		// §13.4 step 4: record the relay-only binding for unlock without
+		// admitting it into the Binder while lockdown is active.
+		if ds.relayOrigins == nil {
+			ds.relayOrigins = make(map[string]string)
+		}
+		ds.relayOrigins[code] = relayOrigin
+		delete(ds.pendingRelayBinds, code)
+		ds.mu.Unlock()
+		return relayOrigin, true
+	}
+	ds.mu.Unlock()
 	if err := binder.Allow(relayOrigin, direct.RouteRelay, code); err != nil {
 		log.Printf("bind relay origin for share %s: %v", code, err)
 		return "", false
@@ -645,15 +702,22 @@ func (d *Daemon) revokeOrigin(code string) {
 		delete(ds.relayOrigins, code)
 	}
 	binder := ds.binder
+	server := ds.server
 	ds.mu.Unlock()
-	if binder == nil {
-		return
+	if binder != nil {
+		if ok {
+			binder.RevokeShare(pair.directOrigin, pair.relayOrigin)
+		}
+		if relayOnlyBound {
+			binder.Revoke(relayOrigin)
+		}
 	}
-	if ok {
-		binder.RevokeShare(pair.directOrigin, pair.relayOrigin)
-	}
-	if relayOnlyBound {
-		binder.Revoke(relayOrigin)
+	// T29 review Minor #1: an in-flight direct/relay stream on the revoked
+	// share must not keep the on-demand port held until it drains. Closing the
+	// share's connections tears them down through the normal ConnState path
+	// (EndSession + hold release).
+	if server != nil {
+		server.CloseShareConns(code)
 	}
 }
 
@@ -699,6 +763,13 @@ func (d *Daemon) syncDirectServe() {
 	}
 	if d.resolver != nil {
 		ds.server.SetResolver(d.resolver)
+	}
+	// §13.4: while locked the rebuilt binder gets NO admissions; the recorded
+	// origins stay in ds.origins/relayOrigins/pendingRelayBinds and unlock
+	// re-runs this function to restore them.
+	if ds.locked {
+		ds.serveNS = ds.namespace
+		return
 	}
 	// Re-Allow currently-bound origin pairs into the fresh binder (atomic
 	// under ds.mu): BOTH route kinds are re-admitted for every bound session
@@ -983,7 +1054,14 @@ func (d *Daemon) stopDirectServer() {
 	started := ds.started
 	ds.started = false
 	ds.startGen++
+	server := ds.server
 	ds.mu.Unlock()
+	if server != nil {
+		// Shutdown/lockdown: close every established connection explicitly so
+		// no stream outlives the listener teardown. CloseAllConns is
+		// idempotent with the srv.Close the cancelled ctx triggers below.
+		server.CloseAllConns()
+	}
 	if started && cancel != nil {
 		cancel()
 	}
@@ -1305,10 +1383,20 @@ func (d *Daemon) handleEnrollmentReady(msg signaling.Message) {
 	}
 	ds.mu.Lock()
 	ds.ready = true
+	locked := ds.locked
 	if ds.cond != nil {
 		ds.cond.Broadcast()
 	}
 	ds.mu.Unlock()
+
+	if locked {
+		// §13.4: lockdown survives a control reconnect. Re-report the
+		// advisory state for the new epoch and keep the listener/tunnel down;
+		// explicit local unlock is the only way back.
+		d.reportLockdownState()
+		log.Printf("baseline enrollment ready (locked)")
+		return
+	}
 
 	// Learn/report the public IP and start the direct HTTPS server. Both are
 	// idempotent, re-run safely on every reconnect, and are no-ops when the
@@ -1350,6 +1438,9 @@ func (d *Daemon) learnAndReportPublicIP() {
 	if ds == nil || ds.mapper == nil {
 		return
 	}
+	if d.IsLocked() {
+		return // §13.4: no direct endpoint work while locked
+	}
 	ip, err := ds.mapper.ExternalIP()
 	if err != nil || ip == "" {
 		log.Printf("direct public IP unavailable: %v", err)
@@ -1372,7 +1463,7 @@ func (d *Daemon) startDirectServer() {
 		return
 	}
 	ds.mu.Lock()
-	if ds.started {
+	if ds.locked || ds.started {
 		ds.mu.Unlock()
 		return
 	}
@@ -1962,4 +2053,210 @@ func (d *Daemon) SaveConfig(cfg *config.Config) error {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// §13.4 reversible lockdown v2 (plan Task 30)
+// ---------------------------------------------------------------------------
+
+// IsLocked reports the local §13.4 lockdown state. It is the agent-side
+// authority the advisory control-plane status can never override.
+func (d *Daemon) IsLocked() bool {
+	ds := d.direct
+	if ds == nil {
+		return false
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	return ds.locked
+}
+
+// nextLockdownGeneration returns the next monotonic §11.1 lockdown_status
+// generation. Control rejects a report whose generation is older than the one
+// it already holds for the current connection epoch.
+func (d *Daemon) nextLockdownGeneration() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.lockdownGen++
+	return int(d.lockdownGen)
+}
+
+// Lockdown activates the reversible §13.4 emergency stop. The six actions run
+// best-effort and the local SignalGate/Binder enforcement is final; nothing
+// here tombstones a share, so Unlock can restore availability. It is
+// idempotent.
+func (d *Daemon) Lockdown() error {
+	d.lockdownMu.Lock()
+	defer d.lockdownMu.Unlock()
+	ds := d.direct
+	if ds != nil {
+		ds.mu.Lock()
+		if ds.locked {
+			ds.mu.Unlock()
+			return nil
+		}
+		ds.locked = true
+		gate := ds.gate
+		port := ds.port
+		server := ds.server
+		ds.mu.Unlock()
+
+		// 1. SignalGate lockdown: new direct opens fail.
+		if gate != nil {
+			gate.SetLockdown(true)
+		}
+		// 2. Remove the UPnP/NAT-PMP mapping.
+		if port != nil {
+			if err := port.Close(); err != nil {
+				log.Printf("lockdown: close on-demand mapping: %v", err)
+			}
+		}
+		// 4. Withdraw the local Binder admissions, retaining the
+		// source/session state for unlock.
+		d.withdrawBinderAdmissions()
+		// 5. Close established direct AND relay recipient connections.
+		if server != nil {
+			server.CloseRecipientConns()
+		}
+		// §7.4: the local HTTPS listener leaves service on lockdown.
+		d.stopDirectServer()
+	}
+	// 3. Stop frpc; gateway presence then expires on its own.
+	d.stopTunnelManager()
+	// 6. Report the advisory locked state; local enforcement remains final.
+	d.sendLockdownStatus(d.nextLockdownGeneration(), true)
+	return nil
+}
+
+// Unlock reverses lockdown through explicit local action: it restores the
+// retained source-verified Binder bindings, brings the listener back, rebuilds
+// the tunnel manager and requests a FRESH credential (relay_credential_request
+// reason restart) — never reusing the pre-lockdown one-use credential. It is
+// idempotent.
+func (d *Daemon) Unlock() error {
+	d.lockdownMu.Lock()
+	defer d.lockdownMu.Unlock()
+	ds := d.direct
+	if ds == nil {
+		d.sendLockdownStatus(d.nextLockdownGeneration(), false)
+		return nil
+	}
+	ds.mu.Lock()
+	if !ds.locked {
+		ds.mu.Unlock()
+		return nil
+	}
+	ds.locked = false
+	gate := ds.gate
+	// Force syncDirectServe to rebuild the Binder/DirectServer and re-admit
+	// every recorded origin (direct pairs, relay-only bindings, and pending
+	// relay-only bindings), reusing the tested namespace-rebuild path.
+	ds.serveNS = ""
+	ds.mu.Unlock()
+
+	if gate != nil {
+		gate.SetLockdown(false)
+	}
+	d.syncDirectServe()
+	d.startDirectServer()
+	d.learnAndReportPublicIP()
+	d.restartTunnelManager()
+	d.sendLockdownStatus(d.nextLockdownGeneration(), false)
+	d.requestRelayCredential()
+	return nil
+}
+
+// withdrawBinderAdmissions removes every local Binder admission without
+// deleting the recorded source/session state (§13.4 step 4).
+func (d *Daemon) withdrawBinderAdmissions() {
+	ds := d.direct
+	if ds == nil {
+		return
+	}
+	ds.mu.Lock()
+	binder := ds.binder
+	pairs := make([]originPair, 0, len(ds.origins))
+	for _, pair := range ds.origins {
+		pairs = append(pairs, pair)
+	}
+	relayOrigins := make([]string, 0, len(ds.relayOrigins))
+	for _, relayOrigin := range ds.relayOrigins {
+		relayOrigins = append(relayOrigins, relayOrigin)
+	}
+	ds.mu.Unlock()
+	if binder == nil {
+		return
+	}
+	for _, pair := range pairs {
+		binder.RevokeShare(pair.directOrigin, pair.relayOrigin)
+	}
+	for _, relayOrigin := range relayOrigins {
+		binder.Revoke(relayOrigin)
+	}
+}
+
+// restartTunnelManager builds a FRESH tunnel manager after lockdown stopped
+// the previous one. Manager.Stop is permanent (its stop/done channels close),
+// so the daemon clears d.tunnel and reconstructs with the recorded
+// construction inputs (the process context and any test options).
+func (d *Daemon) restartTunnelManager() {
+	d.mu.Lock()
+	ctx := d.tunnelCtx
+	options := append([]tunnel.ManagerOption(nil), d.tunnelOptions...)
+	d.tunnel = nil
+	d.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.startTunnelManager(ctx, options...)
+}
+
+// requestRelayCredential asks control for a fresh relay admission credential
+// after unlock (§13.4 "reacquires fresh transport presence"; §11.1). The
+// restart reason is the closed-enum value for a restart recovery.
+func (d *Daemon) requestRelayCredential() {
+	d.mu.RLock()
+	hasManager := d.tunnel != nil
+	d.mu.RUnlock()
+	if !hasManager {
+		return // no supervision to arm: a fresh credential would be dropped
+	}
+	sender, ok := d.signaling.(relayCredentialRequestSender)
+	if !ok {
+		log.Printf("relay credential requester unavailable: signaling client lacks relay_credential_request")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sender.SendRelayCredentialRequest(ctx, tunnel.ReasonRestart); err != nil {
+		log.Printf("request relay credential on unlock: %v", err)
+	}
+}
+
+// reportLockdownState re-sends the current advisory lockdown state for a new
+// control epoch: a reconnect while locked must not look unlocked.
+func (d *Daemon) reportLockdownState() {
+	d.sendLockdownStatus(d.nextLockdownGeneration(), d.IsLocked())
+}
+
+// lockdownStatusSender is the signaling capability the §11.1 lockdown_status
+// report rides. Capability-asserted so minimal signaling fakes without it
+// simply drop the advisory telemetry instead of failing the transition.
+type lockdownStatusSender interface {
+	SendLockdownStatus(ctx context.Context, status signaling.LockdownStatus) error
+}
+
+// sendLockdownStatus forwards one advisory §11.1 lockdown_status report.
+// Absence of the capability is not an error: control's status is a fast path
+// only and the local gate/binder enforcement is final.
+func (d *Daemon) sendLockdownStatus(generation int, locked bool) {
+	sender, ok := d.signaling.(lockdownStatusSender)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sender.SendLockdownStatus(ctx, signaling.LockdownStatus{Generation: generation, Locked: locked}); err != nil {
+		log.Printf("send lockdown_status: %v", err)
+	}
 }

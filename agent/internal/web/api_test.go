@@ -344,3 +344,102 @@ func TestCreateShareForm_ReturnsBadRequestForManualImmichURLValidationError(t *t
 		t.Errorf("body = %q, want manual Immich URL validation message", rec.Body.String())
 	}
 }
+
+// lockdownDaemonMock adds the optional §13.4 lockdown capability on top of the
+// shared admin-API mock.
+type lockdownDaemonMock struct {
+	*mockDaemonV1
+	locked        bool
+	lockdownCalls int
+	unlockCalls   int
+	lockdownErr   error
+	unlockErr     error
+}
+
+func (m *lockdownDaemonMock) Lockdown() error {
+	m.lockdownCalls++
+	if m.lockdownErr != nil {
+		return m.lockdownErr
+	}
+	m.locked = true
+	return nil
+}
+
+func (m *lockdownDaemonMock) Unlock() error {
+	m.unlockCalls++
+	if m.unlockErr != nil {
+		return m.unlockErr
+	}
+	m.locked = false
+	return nil
+}
+
+func (m *lockdownDaemonMock) IsLocked() bool { return m.locked }
+
+// TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible pins the §13.4
+// admin-API surface: the routes exist on the real mux, the state-changing
+// POSTs require the CSRF header, lock/unlock toggle the daemon state, and a
+// daemon without the capability fails closed instead of silently succeeding.
+func TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible(t *testing.T) {
+	cfg := &config.Config{}
+	mock := &lockdownDaemonMock{mockDaemonV1: newMockDaemonV1(cfg)}
+	ws := &WebServer{daemon: mock}
+
+	// The endpoints are reachable through the real route table.
+	mux := http.NewServeMux()
+	ws.registerRoutes(mux)
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/lockdown-status", nil)
+	statusRec := httptest.NewRecorder()
+	mux.ServeHTTP(statusRec, statusReq)
+	if statusRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/lockdown-status status = %d, want 200: %s", statusRec.Code, statusRec.Body.String())
+	}
+	if !strings.Contains(statusRec.Body.String(), `"locked":false`) {
+		t.Fatalf("status body = %q, want {\"locked\":false}", statusRec.Body.String())
+	}
+
+	// A POST without the CSRF header is rejected before the daemon is touched.
+	noCSRF := httptest.NewRequest(http.MethodPost, "/api/lockdown", nil)
+	noCSRFRec := httptest.NewRecorder()
+	ws.csrfMiddleware(ws.lockdownHandler)(noCSRFRec, noCSRF)
+	if noCSRFRec.Code != http.StatusForbidden {
+		t.Fatalf("lockdown without CSRF = %d, want 403", noCSRFRec.Code)
+	}
+	if mock.lockdownCalls != 0 {
+		t.Fatalf("CSRF-rejected lockdown must not reach the daemon")
+	}
+
+	// A CSRF-bearing POST locks the daemon and reports the new state.
+	lockReq := httptest.NewRequest(http.MethodPost, "/api/lockdown", nil)
+	lockReq.Header.Set("HX-Request", "true")
+	lockRec := httptest.NewRecorder()
+	ws.csrfMiddleware(ws.lockdownHandler)(lockRec, lockReq)
+	if lockRec.Code != http.StatusOK || !mock.locked {
+		t.Fatalf("lockdown = %d locked=%v, want 200 locked=true: %s", lockRec.Code, mock.locked, lockRec.Body.String())
+	}
+	if !strings.Contains(lockRec.Body.String(), `"locked":true`) {
+		t.Fatalf("lockdown body = %q, want {\"locked\":true}", lockRec.Body.String())
+	}
+
+	// Unlock reverses it through the same authenticated path.
+	unlockReq := httptest.NewRequest(http.MethodPost, "/api/unlock", nil)
+	unlockReq.Header.Set("X-Requested-With", "XMLHttpRequest")
+	unlockRec := httptest.NewRecorder()
+	ws.csrfMiddleware(ws.unlockHandler)(unlockRec, unlockReq)
+	if unlockRec.Code != http.StatusOK || mock.locked {
+		t.Fatalf("unlock = %d locked=%v, want 200 locked=false: %s", unlockRec.Code, mock.locked, unlockRec.Body.String())
+	}
+	if mock.lockdownCalls != 1 || mock.unlockCalls != 1 {
+		t.Fatalf("daemon calls = lock %d unlock %d, want 1/1", mock.lockdownCalls, mock.unlockCalls)
+	}
+
+	// A daemon without the capability fails closed (501), never a silent 200.
+	plain := &WebServer{daemon: newMockDaemonV1(cfg)}
+	plainReq := httptest.NewRequest(http.MethodPost, "/api/lockdown", nil)
+	plainReq.Header.Set("HX-Request", "true")
+	plainRec := httptest.NewRecorder()
+	plain.csrfMiddleware(plain.lockdownHandler)(plainRec, plainReq)
+	if plainRec.Code != http.StatusNotImplemented {
+		t.Fatalf("unsupported lockdown = %d, want 501", plainRec.Code)
+	}
+}

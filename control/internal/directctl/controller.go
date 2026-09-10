@@ -75,6 +75,14 @@ type epochState struct {
 	relayDNSReady bool
 	ready         bool
 	stun          *epochSTUN // per-epoch STUN challenge state; guarded by stunMu
+
+	// §11.1 advisory lockdown fast path (Task 30). The latest accepted
+	// lockdown_status report for THIS epoch; epoch replacement resets it
+	// implicitly. Guarded by epochMu. locked is suppress-only: it may deny
+	// availability but can never create it.
+	lockdownReported   bool
+	lockdownGeneration int
+	locked             bool
 }
 
 // OpenAck is the control-side acknowledgement of an open_signal. It is a
@@ -339,4 +347,43 @@ func (c *Controller) RelayAvailable(agentID string, relayPort int, generation ui
 		return false
 	}
 	return c.relayPresence.Available(agentID, relayPort, generation, routeRevision, now)
+}
+
+// RecordLockdownStatus applies one §11.1 lockdown_status report from the
+// current connection epoch. It is advisory: locked=true may self-deny
+// availability, locked=false can never create it. A report from a superseded
+// socket, a lower generation than the epoch already holds, or a polarity flip
+// at the same generation is rejected (stale/ambiguous) and changes nothing.
+func (c *Controller) RecordLockdownStatus(apiKeyID string, conn *websocket.Conn, generation int, locked bool) bool {
+	if generation < 0 {
+		return false
+	}
+	c.epochMu.Lock()
+	defer c.epochMu.Unlock()
+	e := c.epochs[apiKeyID]
+	if e == nil || e.conn != conn {
+		return false
+	}
+	if e.lockdownReported {
+		if generation < e.lockdownGeneration {
+			return false
+		}
+		if generation == e.lockdownGeneration {
+			return locked == e.locked // idempotent replay accepted; flip rejected
+		}
+	}
+	e.lockdownReported = true
+	e.lockdownGeneration = generation
+	e.locked = locked
+	return true
+}
+
+// AgentLocked reports whether the current epoch's latest accepted advisory
+// lockdown report says locked. It is a suppress-only fast path: callers may
+// use it to deny availability, never to establish it.
+func (c *Controller) AgentLocked(apiKeyID string) bool {
+	c.epochMu.Lock()
+	defer c.epochMu.Unlock()
+	e := c.epochs[apiKeyID]
+	return e != nil && e.locked
 }
