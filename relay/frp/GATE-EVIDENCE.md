@@ -1,4 +1,4 @@
-# FRP v0.71.0 gate evidence — GO (§23.1, §23.2, §23.7)
+# FRP v0.71.0 gate evidence — GO (§23.1, §23.2, §23.3, §23.7)
 
 Retried Task 8 per the 2026-09-04 amendment: the probe-confirmed readiness
 predicate (§4.2/§7.3, `frp-readiness-spike-report.md`) replaces the falsified
@@ -135,6 +135,95 @@ the correlated-callback readiness requirement.
   Ping** (heartbeatTimeout=45 s), after which zero Pings were observed. True
   expiry — not early flapping — is the only offline transition.
 
+## §23.3 — fragmented ClientHello replay and content parity (Task 31)
+
+Gate §23.3 is the blocking byte-preservation proof: the browser TLS record
+stream captured **before the gateway** must be byte-identical to the stream
+captured **at the agent after FRP decapsulation** (spec §16.1), for
+fragmented TLS 1.2/1.3 with HTTP/1.1 and HTTP/2. The Task 31 hermetic suite
+(`relay/internal/integration`, env-gated `SHAREBRIDGE_FRP_INTEGRATION=1`)
+runs the real pinned `frps`/`frpc`, the real `frpplugin.Server`, the real
+`presence.Registry`, the gateway, and an agent-side HTTPS listener with a
+test CA in front of a deterministic fake Phase 3 backend.
+
+Pin (unchanged from the Task 8 entry): FRP `v0.71.0`, darwin_arm64 cache
+SHA-256 `45be02b186860d375ed49a8941ae9569628a54bf14e67fc36b29c98c99dabcc6`;
+staged `frps` SHA-256 `71a4896060db4a9290bd830f48561334a3660545a0907c29dfade42f91f57037`,
+`frpc` SHA-256 `3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48`.
+
+### Named tests
+
+- `TestRealFRPRelayEndToEndTLS12HTTP11`
+- `TestRealFRPRelayEndToEndTLS13HTTP2`
+- `TestRealFRPFragmentedClientHelloReplay`
+- `TestRealFRPExactRouting`
+- `TestRealFRPContentParity` (content / range-seeks / cancellation /
+  accounting / concurrency / revocation / tunnel-restart)
+- `TestRelayPathNeverEmitsOpenSignal`
+- `TestRealFRPRelayPresenceHeartbeatDelayAndExpiry` (§18.2 heartbeat at the
+  presence layer; the FRP-level delay/expiry cases remain in
+  `relay/internal/frptest/heartbeat_gate_test.go`)
+
+The browser-side bytes are recorded under a `crypto/tls` client whose first
+handshake record is deliberately split into N TLS records by a record-layer
+fragmenter, so the gateway's fragmented/multi-record ClientHello parser and
+its byte-for-byte replay run against a real handshake. The agent side is
+recorded by a raw listener tap in front of TLS termination.
+
+### Digest comparison table (representative `-race -count=2` run)
+
+| case | TLS / ALPN | ClientHello records | bytes | browser SHA-256 | agent SHA-256 | exact |
+| --- | --- | --- | --- | --- | --- | --- |
+| TLS 1.2 / HTTP/1.1 | TLS1.2 / http/1.1 | 2 | 551 | `82c4a298a2eeb1e979eacc41727a2d78fe4b69920e080cda6f6e0802faf7dee8` | `82c4a298a2eeb1e979eacc41727a2d78fe4b69920e080cda6f6e0802faf7dee8` | **yes** |
+| TLS 1.3 / HTTP/2 | TLS1.3 / h2 | 2 | 1819 | `0e95d6218d74d0678f9b908846a13fa63e6002df3a6b8830e51628e7456e365d` | `0e95d6218d74d0678f9b908846a13fa63e6002df3a6b8830e51628e7456e365d` | **yes** |
+| fragmented replay | TLS1.3 / http/1.1 | 5 | 1811 | `a8103fe945882136420b2475289d800b0360828858d0fe935472d040522f1359` | `a8103fe945882136420b2475289d800b0360828858d0fe935472d040522f1359` | **yes** |
+
+Digests are per-run (TLS ClientHello randoms/key shares differ every
+connection); equality/replay is the invariant, not the digest value. In every
+run `agentExtraBytes=0`.
+
+### §23.3 supporting results
+
+- `TestRealFRPExactRouting`: a valid exact origin reaches only its owning
+tunnel; random, bare, unknown, and tombstoned SNI reach no agent (gateway
+logs `no such route` / `route is inactive`).
+- `TestRealFRPContentParity`: page, items, thumb, preview, original,
+archive manifest+parts, and five `206` byte-range seeks are identical in
+status, content headers, and body between the direct origin and the relay
+origin; cancellation propagates to the agent handler; per-endpoint accounting
+is non-zero; eight concurrent relay requests succeed; revoke closes the
+established stream and blocks new connections; a graceful frpc stop
+transitions presence offline and a restart restores availability.
+- `TestRelayPathNeverEmitsOpenSignal`: the relay path issued zero `/connect`
+requests and zero port-mapper/open-signal operations, and the gateway holds
+no direct origin.
+- `TestRealFRPRelayPresenceHeartbeatDelayAndExpiry`: a 14 s freeze of the real
+frpc does not flap the 45 s presence lease; sustained absence transitions
+offline only at true lease expiry (~45 s after the last authenticated Ping).
+- Agent-side `TestParityContentParityAcrossRouteKinds` in
+`agent/internal/direct/parity_test.go` runs the Phase 3 content assertions
+unchanged against both the direct and relay base URLs.
+
+### Reproduction
+
+```text
+# RED (package did not exist):
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test ./internal/integration -v
+# FAIL — directory not found
+
+# GREEN (§23.3 byte gate, with the race detector, twice):
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test ./internal/integration \
+  -v -race -count=2 -timeout 600s
+# PASS — ok sharebridge/relay/internal/integration 121.7s
+```
+
+### Verdict
+
+§23.3: **GO**. Fragmented ClientHello replay through gateway → FRP → agent is
+byte-for-byte exact for TLS 1.2/1.3 with HTTP/1.1 and HTTP/2; no mismatch,
+truncation, or injected byte was observed in any run (any mismatch would have
+been a NO-GO).
+
 ## Superseded entry
 
 `TestPinnedFRPBandwidthCap` (first attempt): **SUPERSEDED**. Its underlying
@@ -151,10 +240,12 @@ retained under a misleading name.
 | §23.1 plugin operations / ordering / correlated readiness | **GO** — all five operations invoked with correlation-grade metadata; probe confirms only registered proxies in one attempt; failure/stale/restart cases never confirm; Pings continuing without readiness can no longer present as online |
 | §23.2 loopback / runtime port+proxy enforcement / transport TLS | **GO** — loopback-only binding proven; second-proxy and out-of-range ports rejected at runtime by the plugin and by frps allowPorts respectively; transport TLS fails closed with a pinned untrusted CA |
 | §23.7 Ping cadence / delayed-Ping tolerance / true expiry | **GO** — immediate first Ping, ~10 s cadence, one missed beat tolerated with ≥31 s lease margin, offline only at the true 45 s expiry |
+| §23.3 fragmented TLS 1.2/1.3 + HTTP/1.1/2 replay / content parity | **GO** — browser-before-gateway and agent-after-FRP streams byte-identical (SHA-256 equal, 0 extra agent bytes) for TLS 1.2/HTTP/1.1, TLS 1.3/HTTP/2, and a 5-record fragmented ClientHello; exact routing, content parity, revocation, restart, and no-open-signal all proven |
 
-Blocking Task 8 does not by itself enable `RELAY_SELECTION_ENABLED`; Tasks 24,
-25, 31, and 42 plus the Task 44 GO decision remain outstanding per the global
-constraints. Carry-forwards for Tasks 9/14 (unchanged from the spike report):
+Blocking Task 8 does not by itself enable `RELAY_SELECTION_ENABLED`; Task 31
+is now also GO (§23.3 above), and Tasks 24, 25, and 42 plus the Task 44 GO
+decision remain outstanding per the global constraints. Carry-forwards for
+Tasks 9/14 (unchanged from the spike report):
 credentials must be computed from one clock reading; the frps-restart recovery
 path needs `relay_credential_request` re-issue because replayed jti values are
 burned; TCP mux must stay disabled; the renderer must set `trustedCaFile` +

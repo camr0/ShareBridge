@@ -1208,8 +1208,8 @@ func seekableTestMP4(frames int, stride int) *seekableMP4 {
 		minf := mp4Box("minf", concat(
 			mp4FullBox("vmhd", 0, 1, func() []byte {
 				b := appendU16(nil, 0) // graphicsmode
-				b = appendU16(b, 0)   // opcolor r
-				b = appendU16(b, 0)   // opcolor g
+				b = appendU16(b, 0)    // opcolor r
+				b = appendU16(b, 0)    // opcolor g
 				return appendU16(b, 0) // opcolor b
 			}()),
 			mp4Box("dinf", mp4FullBox("dref", 0, 0, func() []byte {
@@ -1495,6 +1495,127 @@ func newRelayParityHarness(t *testing.T) (*parityHarness, string) {
 		t.Fatal(err)
 	}
 	return h, relayOrigin
+}
+
+// TestParityContentParityAcrossRouteKinds is the Task 31 proof that the Phase
+// 3 content surface is indistinguishable over the direct and relay origins
+// (§18.2, acceptance #11): the same deterministic backend is fetched through
+// both route kinds and every status, content header, and body byte must
+// match, including multiple 206 range seeks. The real-FRP byte-preservation
+// gate lives in relay/internal/integration; this is the agent-side parity
+// assertion run against both base URLs.
+func TestParityContentParityAcrossRouteKinds(t *testing.T) {
+	h := newParityHarnessWithBackend(t, &parityBackend{})
+	relayOrigin := "gallery1.relay." + h.ns + "." + h.base
+	if err := h.srv.Binder().Allow(relayOrigin, RouteRelay, h.code); err != nil {
+		t.Fatal(err)
+	}
+	relayClient := parityTLSClient(h.roots, relayOrigin, h.ts.Listener.Addr().String())
+
+	compare := func(label string, direct, relay *http.Response) {
+		t.Helper()
+		directBody := readBody(t, direct)
+		relayBody := readBody(t, relay)
+		if direct.StatusCode != relay.StatusCode {
+			t.Fatalf("%s: status direct=%d relay=%d", label, direct.StatusCode, relay.StatusCode)
+		}
+		for _, header := range []string{"Content-Type", "Content-Length", "Content-Range", "Content-Disposition", "Accept-Ranges"} {
+			if got, want := relay.Header.Get(header), direct.Header.Get(header); got != want {
+				t.Fatalf("%s: header %s direct=%q relay=%q", label, header, want, got)
+			}
+		}
+		if directBody != relayBody {
+			t.Fatalf("%s: body differs (direct %d bytes, relay %d bytes)", label, len(directBody), len(relayBody))
+		}
+	}
+
+	for _, path := range []string{
+		"/s/" + h.code,
+		"/s/" + h.code + "/items",
+		"/s/" + h.code + "/thumb/img-1",
+		"/s/" + h.code + "/preview/img-1",
+		"/s/" + h.code + "/asset/img-1",
+	} {
+		compare(path, getViaOrigin(t, h.client, h.origin, path), getViaOrigin(t, relayClient, relayOrigin, path))
+	}
+
+	// Archive manifest tokens are minted per request, so compare the manifest
+	// semantics rather than raw bytes and then compare each part fetched with
+	// its own token (§11 accounting mints one token per manifest).
+	directManifestResp := getViaOrigin(t, h.client, h.origin, "/s/"+h.code+"/archive")
+	relayManifestResp := getViaOrigin(t, relayClient, relayOrigin, "/s/"+h.code+"/archive")
+	var directManifest, relayManifest archiveManifestResponse
+	if err := json.NewDecoder(directManifestResp.Body).Decode(&directManifest); err != nil {
+		directManifestResp.Body.Close()
+		t.Fatalf("decode direct manifest: %v", err)
+	}
+	directManifestResp.Body.Close()
+	if err := json.NewDecoder(relayManifestResp.Body).Decode(&relayManifest); err != nil {
+		relayManifestResp.Body.Close()
+		t.Fatalf("decode relay manifest: %v", err)
+	}
+	relayManifestResp.Body.Close()
+	if directManifest.Token == "" || relayManifest.Token == "" {
+		t.Fatal("archive manifest produced an empty token over one of the origins")
+	}
+	if len(directManifest.Parts) != len(relayManifest.Parts) {
+		t.Fatalf("archive parts: direct %d relay %d", len(directManifest.Parts), len(relayManifest.Parts))
+	}
+	for i := range directManifest.Parts {
+		if fmt.Sprint(directManifest.Parts[i]) != fmt.Sprint(relayManifest.Parts[i]) {
+			t.Fatalf("archive part %d differs: direct %v relay %v", i, directManifest.Parts[i], relayManifest.Parts[i])
+		}
+		partPath := fmt.Sprintf("/s/%s/archive/%s/%d", h.code, directManifest.Token, directManifest.Parts[i].Index)
+		directPart := getViaOrigin(t, h.client, h.origin, partPath)
+		relayPartPath := fmt.Sprintf("/s/%s/archive/%s/%d", h.code, relayManifest.Token, relayManifest.Parts[i].Index)
+		relayPart := getViaOrigin(t, relayClient, relayOrigin, relayPartPath)
+		compare(fmt.Sprintf("archive part %d", i), directPart, relayPart)
+	}
+
+	playbackPath := "/s/" + h.code + "/asset/vid-1/playback"
+	for _, rng := range []string{"bytes=0-99", "bytes=100-199", "bytes=500-599", "bytes=1023-", "bytes=900-"} {
+		direct := getRangeViaOrigin(t, h.client, h.origin, playbackPath, rng)
+		relay := getRangeViaOrigin(t, relayClient, relayOrigin, playbackPath, rng)
+		if direct.StatusCode != http.StatusPartialContent || relay.StatusCode != http.StatusPartialContent {
+			direct.Body.Close()
+			relay.Body.Close()
+			t.Fatalf("seek %s: direct=%d relay=%d, want 206", rng, direct.StatusCode, relay.StatusCode)
+		}
+		compare(playbackPath+" "+rng, direct, relay)
+	}
+}
+
+// getViaOrigin issues GET path over an arbitrary origin using a TLS client
+// already pinned to that origin's ServerName/dial target. Callers own the
+// body.
+func getViaOrigin(t *testing.T, client *http.Client, origin, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "https://"+origin+path, nil)
+	if err != nil {
+		t.Fatalf("build GET %s%s: %v", origin, path, err)
+	}
+	req.Host = origin
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s%s: %v", origin, path, err)
+	}
+	return resp
+}
+
+// getRangeViaOrigin is getViaOrigin with a Range header.
+func getRangeViaOrigin(t *testing.T, client *http.Client, origin, path, rng string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "https://"+origin+path, nil)
+	if err != nil {
+		t.Fatalf("build range GET %s%s: %v", origin, path, err)
+	}
+	req.Host = origin
+	req.Header.Set("Range", rng)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("range GET %s%s (%s): %v", origin, path, rng, err)
+	}
+	return resp
 }
 
 // TestRelayParityBrowserGalleryLightboxVideoSeek206 proves Phase 3 content

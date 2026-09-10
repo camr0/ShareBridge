@@ -6,12 +6,22 @@ import (
 	"time"
 
 	"sharebridge/relay/internal/frpplugin"
+	"sharebridge/relay/internal/presence"
 )
+
+// The fixture's frps transport.heartbeatTimeout and the presence registry's
+// lease MUST be the same spec number (§23.7). The cadence test below asserts
+// they agree so the FRP-level proof and the presence-level integration proof
+// in relay/internal/integration can never drift apart.
+const pinnedHeartbeatTimeout = 45 * time.Second
 
 // §23.7 — the pinned release honors the explicit 10-second authenticated
 // Ping interval and sends its first Ping immediately after login, leaving
 // four nominal opportunities inside the 45-second presence lease.
 func TestPinnedFRPPingIntervalAndLeaseMargin(t *testing.T) {
+	if pinnedHeartbeatTimeout != presence.DefaultLeaseTTL {
+		t.Fatalf("presence lease %s diverged from the pinned %s heartbeat timeout", presence.DefaultLeaseTTL, pinnedHeartbeatTimeout)
+	}
 	fixture := newPinnedFRPFixture(t, gateFixtureOptions{})
 	fixture.startClient(gateClientOptions{Label: "cadence"})
 
@@ -36,14 +46,14 @@ func TestPinnedFRPPingIntervalAndLeaseMargin(t *testing.T) {
 			maxInterval = interval
 		}
 	}
-	if 4*maxInterval >= 45*time.Second {
-		t.Fatalf("Ping interval %s leaves no four-Ping margin inside the 45s lease", maxInterval)
+	if 4*maxInterval >= presence.DefaultLeaseTTL {
+		t.Fatalf("Ping interval %s leaves no four-Ping margin inside the %s lease", maxInterval, presence.DefaultLeaseTTL)
 	}
 	t.Logf("pingCadence: firstPingAfterLogin=%s intervals=%s,%s margin45s>=%s",
 		firstDelay.Round(time.Millisecond),
 		pings[1].At.Sub(pings[0].At).Round(time.Millisecond),
 		pings[2].At.Sub(pings[1].At).Round(time.Millisecond),
-		(45*time.Second - 4*maxInterval).Round(time.Millisecond))
+		(presence.DefaultLeaseTTL - 4*maxInterval).Round(time.Millisecond))
 }
 
 // §23.7 — one delayed or missed Ping must not tear the tunnel down: after a
@@ -82,7 +92,7 @@ func TestPinnedFRPDelayedPingToleratedUnderLease(t *testing.T) {
 	}
 	readProxyGreeting(t, fixture.proxyAddr())
 	t.Logf("delayedPing: gap=%s (>1 missed 10s beat) tolerated; lease margin after gap=%s",
-		gap.Round(time.Millisecond), (45*time.Second - gap).Round(time.Millisecond))
+		gap.Round(time.Millisecond), (presence.DefaultLeaseTTL - gap).Round(time.Millisecond))
 }
 
 // §23.7 — true lease expiry: with the client frozen and no Ping arriving at
