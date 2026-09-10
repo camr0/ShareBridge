@@ -378,12 +378,13 @@ func (m *lockdownDaemonMock) IsLocked() bool { return m.locked }
 
 // TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible pins the §13.4
 // admin-API surface: the routes exist on the real mux, the state-changing
-// POSTs require the CSRF header, lock/unlock toggle the daemon state, and a
-// daemon without the capability fails closed instead of silently succeeding.
+// POSTs require BOTH the configured admin credential and the CSRF header,
+// lock/unlock toggle the daemon state, and a daemon without the capability
+// fails closed instead of silently succeeding.
 func TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible(t *testing.T) {
 	cfg := &config.Config{}
 	mock := &lockdownDaemonMock{mockDaemonV1: newMockDaemonV1(cfg)}
-	ws := &WebServer{daemon: mock}
+	ws := &WebServer{daemon: mock, password: "s3cret-admin"}
 
 	// The endpoints are reachable through the real route table.
 	mux := http.NewServeMux()
@@ -398,10 +399,38 @@ func TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible(t *testing.T) 
 		t.Fatalf("status body = %q, want {\"locked\":false}", statusRec.Body.String())
 	}
 
-	// A POST without the CSRF header is rejected before the daemon is touched.
+	// A POST without the admin credential is rejected before the daemon is
+	// touched, even with a well-formed CSRF header.
+	noAuth := httptest.NewRequest(http.MethodPost, "/api/lockdown", nil)
+	noAuth.Header.Set("HX-Request", "true")
+	noAuthRec := httptest.NewRecorder()
+	mux.ServeHTTP(noAuthRec, noAuth)
+	if noAuthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("lockdown without admin credential = %d, want 401", noAuthRec.Code)
+	}
+	if mock.lockdownCalls != 0 {
+		t.Fatalf("unauthenticated lockdown must not reach the daemon")
+	}
+
+	// A wrong credential is rejected too.
+	wrongAuth := httptest.NewRequest(http.MethodPost, "/api/unlock", nil)
+	wrongAuth.Header.Set("HX-Request", "true")
+	wrongAuth.SetBasicAuth("admin", "wrong")
+	wrongRec := httptest.NewRecorder()
+	mux.ServeHTTP(wrongRec, wrongAuth)
+	if wrongRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unlock with wrong credential = %d, want 401", wrongRec.Code)
+	}
+	if mock.unlockCalls != 0 {
+		t.Fatalf("wrong-credential unlock must not reach the daemon")
+	}
+
+	// An authenticated POST without the CSRF header is still rejected before
+	// the daemon is touched.
 	noCSRF := httptest.NewRequest(http.MethodPost, "/api/lockdown", nil)
+	noCSRF.SetBasicAuth("admin", "s3cret-admin")
 	noCSRFRec := httptest.NewRecorder()
-	ws.csrfMiddleware(ws.lockdownHandler)(noCSRFRec, noCSRF)
+	mux.ServeHTTP(noCSRFRec, noCSRF)
 	if noCSRFRec.Code != http.StatusForbidden {
 		t.Fatalf("lockdown without CSRF = %d, want 403", noCSRFRec.Code)
 	}
@@ -409,11 +438,13 @@ func TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible(t *testing.T) 
 		t.Fatalf("CSRF-rejected lockdown must not reach the daemon")
 	}
 
-	// A CSRF-bearing POST locks the daemon and reports the new state.
+	// An authenticated CSRF-bearing POST locks the daemon and reports the
+	// new state.
 	lockReq := httptest.NewRequest(http.MethodPost, "/api/lockdown", nil)
 	lockReq.Header.Set("HX-Request", "true")
+	lockReq.SetBasicAuth("admin", "s3cret-admin")
 	lockRec := httptest.NewRecorder()
-	ws.csrfMiddleware(ws.lockdownHandler)(lockRec, lockReq)
+	mux.ServeHTTP(lockRec, lockReq)
 	if lockRec.Code != http.StatusOK || !mock.locked {
 		t.Fatalf("lockdown = %d locked=%v, want 200 locked=true: %s", lockRec.Code, mock.locked, lockRec.Body.String())
 	}
@@ -424,8 +455,9 @@ func TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible(t *testing.T) 
 	// Unlock reverses it through the same authenticated path.
 	unlockReq := httptest.NewRequest(http.MethodPost, "/api/unlock", nil)
 	unlockReq.Header.Set("X-Requested-With", "XMLHttpRequest")
+	unlockReq.SetBasicAuth("admin", "s3cret-admin")
 	unlockRec := httptest.NewRecorder()
-	ws.csrfMiddleware(ws.unlockHandler)(unlockRec, unlockReq)
+	mux.ServeHTTP(unlockRec, unlockReq)
 	if unlockRec.Code != http.StatusOK || mock.locked {
 		t.Fatalf("unlock = %d locked=%v, want 200 locked=false: %s", unlockRec.Code, mock.locked, unlockRec.Body.String())
 	}
@@ -434,12 +466,44 @@ func TestLockdownEndpointsAreRegisteredAuthenticatedAndReversible(t *testing.T) 
 	}
 
 	// A daemon without the capability fails closed (501), never a silent 200.
-	plain := &WebServer{daemon: newMockDaemonV1(cfg)}
+	plain := &WebServer{daemon: newMockDaemonV1(cfg), password: "s3cret-admin"}
 	plainReq := httptest.NewRequest(http.MethodPost, "/api/lockdown", nil)
 	plainReq.Header.Set("HX-Request", "true")
+	plainReq.SetBasicAuth("admin", "s3cret-admin")
 	plainRec := httptest.NewRecorder()
-	plain.csrfMiddleware(plain.lockdownHandler)(plainRec, plainReq)
+	plainMux := http.NewServeMux()
+	plain.registerRoutes(plainMux)
+	plainMux.ServeHTTP(plainRec, plainReq)
 	if plainRec.Code != http.StatusNotImplemented {
 		t.Fatalf("unsupported lockdown = %d, want 501", plainRec.Code)
+	}
+}
+
+// TestLockdownEndpointsFailClosedWithoutAdminCredential pins the security
+// contract of §13.4 in the DEFAULT deployment: the admin UI binds 0.0.0.0
+// with an empty UIPassword and no auth middleware installed, so an
+// unauthenticated network client must not be able to stop or restart the
+// agent's transports. Both state-changing endpoints reject without touching
+// daemon state, even with a forgeable CSRF header.
+func TestLockdownEndpointsFailClosedWithoutAdminCredential(t *testing.T) {
+	cfg := &config.Config{}
+	mock := &lockdownDaemonMock{mockDaemonV1: newMockDaemonV1(cfg)}
+	ws := &WebServer{daemon: mock} // password == "": the default UI deployment
+
+	mux := http.NewServeMux()
+	ws.registerRoutes(mux)
+
+	for _, path := range []string{"/api/lockdown", "/api/unlock"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Header.Set("HX-Request", "true") // a forgeable CSRF header must not be enough
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("POST %s without admin credential = %d, want 403: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+	if mock.locked || mock.lockdownCalls != 0 || mock.unlockCalls != 0 {
+		t.Fatalf("unauthenticated lockdown/unlock must not change state: locked=%v lock=%d unlock=%d",
+			mock.locked, mock.lockdownCalls, mock.unlockCalls)
 	}
 }

@@ -1301,6 +1301,34 @@ type lockdownFixture struct {
 
 func newLockdownFixture(t *testing.T) *lockdownFixture {
 	t.Helper()
+	rec := &recordingDirectMapper{ip: "203.0.113.7"}
+	return newLockdownFixtureWithPortMapper(t, rec, rec)
+}
+
+// blockingCloseMapper stalls DeletePortMapping until release. The OnDemandPort
+// Close path performs the router delete synchronously on its state loop, so
+// this makes the mapping-close lever (port.Close) block on a channel exactly
+// like a wedged router. It backs the same recording accounting as the base
+// mapper so the existing delete-count assertions keep working.
+type blockingCloseMapper struct {
+	*recordingDirectMapper
+	deleteStarted chan struct{}
+	release       chan struct{}
+	deleteOnce    sync.Once
+}
+
+func (m *blockingCloseMapper) DeletePortMapping(ext int) error {
+	m.deleteOnce.Do(func() { close(m.deleteStarted) })
+	<-m.release
+	return m.recordingDirectMapper.DeletePortMapping(ext)
+}
+
+// newLockdownFixtureWithPortMapper builds the same §13.4 fixture but lets the
+// caller substitute the OnDemandPort's PortMapper (rec still backs fx.mapper
+// and its delete accounting). Used by the bounded fan-out test to stall the
+// mapping-close lever.
+func newLockdownFixtureWithPortMapper(t *testing.T, rec *recordingDirectMapper, portMapper direct.PortMapper) *lockdownFixture {
+	t.Helper()
 	cfg := tunnelTestConfig(t)
 	st := newMockStore()
 	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
@@ -1314,8 +1342,8 @@ func newLockdownFixture(t *testing.T) *lockdownFixture {
 	if err := cm.Install([]byte(chainPEM)); err != nil {
 		t.Fatalf("install cert: %v", err)
 	}
-	mapper := &recordingDirectMapper{ip: "203.0.113.7"}
-	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", mapper.InternalIP())
+	mapper := rec
+	port := direct.NewOnDemandPortOwned(portMapper, 443, 8443, time.Minute, "test", mapper.InternalIP())
 	gate := direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true })
 	ds := &directState{
 		namespace: testDirectNS, baseDomain: testDirectBase,
@@ -1494,6 +1522,86 @@ func TestLockdownSetsGateDeletesMappingStopsTunnelRevokesBinderAndClosesBothRout
 	waitForCond(t, func() bool {
 		return fx.sig.hasSentMessage("lockdown_status", map[string]any{"locked": true})
 	})
+}
+
+// TestLockdownGateIsFinalAndLeversFanOutBounded pins the §13.4 concurrency
+// contract: the local locked gate is set FIRST and is final, the remaining
+// best-effort levers run independently and concurrently, and a stalled lever
+// (a blocking router delete here) can neither prevent another lever from
+// running nor make Lockdown hang unboundedly.
+func TestLockdownGateIsFinalAndLeversFanOutBounded(t *testing.T) {
+	bm := &blockingCloseMapper{
+		recordingDirectMapper: &recordingDirectMapper{ip: "203.0.113.7"},
+		deleteStarted:         make(chan struct{}),
+		release:               make(chan struct{}),
+	}
+	fx := newLockdownFixtureWithPortMapper(t, bm.recordingDirectMapper, bm)
+	// The mapping-close lever is deliberately held open; every other lever
+	// must still run and Lockdown must still return at its bound.
+	fx.d.lockdownLeverTimeout = 200 * time.Millisecond
+	// Guarantee the stalled lever is released before the fixture's port.Close
+	// cleanup runs (defers run before t.Cleanup).
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(bm.release) }) }
+	defer release()
+
+	// Pre-lockdown: healthy tunnel, open mapping, live listener, one
+	// established direct connection (so every lever has observable work).
+	fx.d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-bounded"))
+	waitForCond(t, func() bool { return fx.starter.startCount() == 1 })
+	require.NoError(t, fx.ds.port.OpenFor(fx.code, time.Minute))
+	if !fx.ds.port.Open() {
+		t.Fatalf("mapping must be open before lockdown")
+	}
+	fx.d.startDirectServer()
+	waitDialable(t, fx.ds.listenAddr)
+	conn := openRouteConn(t, fx.ds, fx.origin, fx.code)
+
+	start := time.Now()
+	lockDone := make(chan error, 1)
+	go func() { lockDone <- fx.d.Lockdown() }()
+
+	// The stalled lever actually started (the router delete is in flight).
+	select {
+	case <-bm.deleteStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mapping-close lever never reached the router delete")
+	}
+
+	// (c) Lockdown returns within its bound while the lever is still blocked.
+	select {
+	case err := <-lockDone:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Lockdown did not return within its bound while the mapping-close lever was blocked")
+	}
+	if elapsed := time.Since(start); elapsed >= 3*time.Second {
+		t.Fatalf("Lockdown took %s, want bounded return while the slowest lever is stalled", elapsed)
+	}
+
+	// (a) The local gate is already set and final while the slowest lever is
+	// still blocked: no new direct open is admitted.
+	require.True(t, fx.d.IsLocked(), "gate must be locked once Lockdown returns")
+	if err := fx.ds.gate.Admit(validOpenSignal("test-agent-id", fx.code, "nonce-bounded")); !errors.Is(err, direct.ErrSignalLockdown) {
+		t.Fatalf("gate admit while the mapping-close lever is blocked = %v, want ErrSignalLockdown", err)
+	}
+
+	// (b) The other levers still executed despite the stall.
+	if _, err := fx.ds.binder.AdmitSNI(fx.origin); err == nil {
+		t.Fatalf("binder admission not withdrawn while mapping close was stalled")
+	}
+	assertConnClosed(t, conn)
+	assertListenerClosed(t, fx.ds.listenAddr)
+	child := fx.starter.recordAt(0).child
+	waitForCond(t, func() bool { return child.gracefulStopCount() == 1 })
+	waitForCond(t, func() bool {
+		return fx.sig.hasSentMessage("lockdown_status", map[string]any{"locked": true})
+	})
+
+	// The stalled lever completes once the router recovers; it never blocked
+	// the others or the return above.
+	release()
+	waitForCond(t, func() bool { return fx.mapper.deleteCount() > 0 })
 }
 
 // TestUnlockRestoresSourceVerifiedBindingsAndUsesFreshCredential pins the

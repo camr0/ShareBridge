@@ -143,6 +143,11 @@ type Daemon struct {
 	// concurrent admin calls cannot interleave their best-effort actions.
 	lockdownMu sync.Mutex
 
+	// lockdownLeverTimeout bounds how long Lockdown waits for its concurrent
+	// best-effort levers; zero means defaultLockdownLeverTimeout. Tests shorten
+	// it to prove the bound without waiting the production value.
+	lockdownLeverTimeout time.Duration
+
 	// STUN cross-check state (§10.1, Task 17 add-on): the exchange client, a
 	// test clock seam, and the one-slot bound that keeps at most a single
 	// challenge exchange in flight at a time.
@@ -167,6 +172,13 @@ const (
 	directIntPort         = 8443
 	directExtPort         = 443
 	directPortIdle        = 5 * time.Minute
+
+	// defaultLockdownLeverTimeout bounds how long Lockdown waits for its
+	// best-effort levers. The local locked gate is final before the wait
+	// starts, so a stalled lever (a blocking router delete, an frpc kill
+	// grace) can delay only its own completion — never the others, and never
+	// the return.
+	defaultLockdownLeverTimeout = 10 * time.Second
 )
 
 // originPair is one content session's §6 origin pair: the control-allocated
@@ -2081,51 +2093,137 @@ func (d *Daemon) nextLockdownGeneration() int {
 	return int(d.lockdownGen)
 }
 
-// Lockdown activates the reversible §13.4 emergency stop. The six actions run
-// best-effort and the local SignalGate/Binder enforcement is final; nothing
-// here tombstones a share, so Unlock can restore availability. It is
-// idempotent.
+// lockdownLever is one best-effort §13.4 action executed during Lockdown. The
+// name is used only for per-lever diagnostics; a lever's error is logged and
+// never aborts the others.
+type lockdownLever struct {
+	name string
+	run  func() error
+}
+
+// Lockdown activates the reversible §13.4 emergency stop. The local locked
+// flag and SignalGate are set FIRST and are final; the remaining levers then
+// fan out independently and concurrently with a bounded wait, so no stalled
+// lever (blocking router delete, frpc kill grace) can prevent another lever
+// from running or make Lockdown hang. Nothing here tombstones a share, so
+// Unlock can restore availability. It is idempotent.
 func (d *Daemon) Lockdown() error {
 	d.lockdownMu.Lock()
 	defer d.lockdownMu.Unlock()
-	ds := d.direct
-	if ds != nil {
-		ds.mu.Lock()
-		if ds.locked {
-			ds.mu.Unlock()
-			return nil
-		}
-		ds.locked = true
-		gate := ds.gate
-		port := ds.port
-		server := ds.server
-		ds.mu.Unlock()
 
-		// 1. SignalGate lockdown: new direct opens fail.
-		if gate != nil {
-			gate.SetLockdown(true)
-		}
+	ds := d.direct
+	if ds == nil {
+		return nil
+	}
+
+	ds.mu.Lock()
+	if ds.locked {
+		ds.mu.Unlock()
+		return nil
+	}
+	// 1. SignalGate lockdown: new direct opens fail. This is the local
+	// enforcement and it is final — set before any best-effort lever runs so
+	// a stalled lever can never leave the agent admitting traffic.
+	ds.locked = true
+	gate := ds.gate
+	port := ds.port
+	server := ds.server
+	ds.mu.Unlock()
+
+	if gate != nil {
+		gate.SetLockdown(true)
+	}
+
+	// Snapshot the tunnel manager so a late stop lever can only stop the
+	// pre-lockdown manager, never a fresh one built by Unlock.
+	d.mu.RLock()
+	manager := d.tunnel
+	d.mu.RUnlock()
+
+	// 6. Report the advisory locked state; the generation is assigned here so
+	// a delayed report still loses to a later Unlock's higher generation.
+	generation := d.nextLockdownGeneration()
+
+	levers := []lockdownLever{
 		// 2. Remove the UPnP/NAT-PMP mapping.
-		if port != nil {
-			if err := port.Close(); err != nil {
-				log.Printf("lockdown: close on-demand mapping: %v", err)
+		{name: "close on-demand mapping", run: func() error {
+			if port == nil {
+				return nil
 			}
-		}
+			return port.Close()
+		}},
 		// 4. Withdraw the local Binder admissions, retaining the
 		// source/session state for unlock.
-		d.withdrawBinderAdmissions()
+		{name: "withdraw binder admissions", run: func() error {
+			d.withdrawBinderAdmissions()
+			return nil
+		}},
 		// 5. Close established direct AND relay recipient connections.
-		if server != nil {
-			server.CloseRecipientConns()
-		}
+		{name: "close recipient connections", run: func() error {
+			if server != nil {
+				server.CloseRecipientConns()
+			}
+			return nil
+		}},
 		// §7.4: the local HTTPS listener leaves service on lockdown.
-		d.stopDirectServer()
+		{name: "stop direct listener", run: func() error {
+			d.stopDirectServer()
+			return nil
+		}},
+		// 3. Stop frpc; gateway presence then expires on its own.
+		{name: "stop tunnel manager", run: func() error {
+			if manager != nil {
+				manager.Stop()
+			}
+			return nil
+		}},
+		{name: "report lockdown status", run: func() error {
+			d.sendLockdownStatus(generation, true)
+			return nil
+		}},
 	}
-	// 3. Stop frpc; gateway presence then expires on its own.
-	d.stopTunnelManager()
-	// 6. Report the advisory locked state; local enforcement remains final.
-	d.sendLockdownStatus(d.nextLockdownGeneration(), true)
+	d.runLockdownLevers(levers)
 	return nil
+}
+
+// runLockdownLevers starts every best-effort lever concurrently and waits at
+// most lockdownLeverTimeout (default defaultLockdownLeverTimeout) for them.
+// Local enforcement is already final, so a lever that outlives the bound is
+// logged and left to finish in the background instead of blocking the return.
+// Per-lever errors are logged with the lever name and never abort the others.
+func (d *Daemon) runLockdownLevers(levers []lockdownLever) {
+	var wg sync.WaitGroup
+	for _, lever := range levers {
+		wg.Add(1)
+		go func(l lockdownLever) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("lockdown lever %q panicked: %v", l.name, r)
+				}
+			}()
+			if err := l.run(); err != nil {
+				log.Printf("lockdown lever %q: %v", l.name, err)
+			}
+		}(lever)
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	timeout := d.lockdownLeverTimeout
+	if timeout <= 0 {
+		timeout = defaultLockdownLeverTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		log.Printf("lockdown: best-effort levers still running after %s; local enforcement is final", timeout)
+	}
 }
 
 // Unlock reverses lockdown through explicit local action: it restores the

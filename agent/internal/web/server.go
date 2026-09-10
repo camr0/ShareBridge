@@ -166,10 +166,13 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 	// Settings
 	mux.HandleFunc("PUT /api/settings", ws.csrfMiddleware(ws.saveSettingsHandler))
 
-	// §13.4 reversible lockdown: authenticated local admin API only (the
-	// state-changing POSTs carry the CSRF header like every other mutation).
-	mux.HandleFunc("POST /api/lockdown", ws.csrfMiddleware(ws.lockdownHandler))
-	mux.HandleFunc("POST /api/unlock", ws.csrfMiddleware(ws.unlockHandler))
+	// §13.4 reversible lockdown: authenticated local admin API only. These
+	// endpoints change transport availability, so they fail CLOSED when no
+	// admin credential is configured (the default UI deployment) and require
+	// the configured credential when one is; the state-changing POSTs also
+	// carry the CSRF header like every other mutation.
+	mux.HandleFunc("POST /api/lockdown", ws.adminAuthMiddleware(ws.csrfMiddleware(ws.lockdownHandler)))
+	mux.HandleFunc("POST /api/unlock", ws.adminAuthMiddleware(ws.csrfMiddleware(ws.unlockHandler)))
 	mux.HandleFunc("GET /api/lockdown-status", ws.lockdownStatusHandler)
 
 	// Relay quota endpoint
@@ -232,6 +235,29 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 		// Password validated - username ignored
 		next.ServeHTTP(w, r)
 	})
+}
+
+// adminAuthMiddleware enforces the configured admin credential on a handler.
+// §13.4 lockdown/unlock change transport availability, so they fail CLOSED:
+// with no admin password configured (the default UI deployment binds 0.0.0.0
+// with an empty UIPassword and installs no auth middleware) the request is
+// refused outright — the endpoint is never reachable unauthenticated. With a
+// password configured, the same constant-time basic-auth check as
+// authMiddleware applies.
+func (ws *WebServer) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if ws.password == "" {
+			http.Error(w, "Forbidden - admin credential not configured", http.StatusForbidden)
+			return
+		}
+		_, password, ok := r.BasicAuth()
+		if !ok || subtle.ConstantTimeCompare([]byte(password), []byte(ws.password)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="ShareBridge Agent"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // corsMiddleware sets CORS headers for /api/v1/ endpoints.
