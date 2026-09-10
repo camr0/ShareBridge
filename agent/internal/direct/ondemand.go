@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -103,9 +104,13 @@ type portCommand struct {
 	callback  func(old, new PortState, grantedPort int)
 	reply     chan portReply
 
-	// stillCurrent is the optional generation fence of opCloseIf/opOpenFor
-	// (see CloseIf and OpenForIf).
+	// stillCurrent is the optional generation fence of opCloseIf (see CloseIf).
 	stillCurrent func() bool
+
+	// fenced/gen are the generation fence of opOpenFor (see OpenForIf).
+	// fenced is false for OpenFor, which is unconditional.
+	fenced bool
+	gen    uint64
 }
 
 // OnDemandPort manages a public port that is closed by default and opened only
@@ -144,6 +149,14 @@ type OnDemandPort struct {
 
 	closeMu  sync.RWMutex
 	closeErr error
+
+	// fence is the port's published direct-state generation stamp (see
+	// SetGeneration and generationCurrent). It is the single serialization
+	// point between a §13.4 lockdown/unlock transition and every mapping
+	// mutation this port performs, so a transition can never be ordered
+	// between an open's fence check and its mapping write without the
+	// commit-time re-check below observing it.
+	fence atomic.Uint64
 }
 
 func NewOnDemandPort(mapper PortMapper, extPort int) *OnDemandPort {
@@ -204,27 +217,68 @@ func (p *OnDemandPort) SetTransitionCallback(cb func(old, new PortState, granted
 	p.send(portCommand{op: opSetCallback, callback: cb, reply: ch})
 }
 
+// Generation stamp packing. The direct-state generation (the daemon's
+// lockdownEpoch) and the locked flag share ONE atomically published word, so a
+// reader can never observe a torn (locked, epoch) pair. Bit 63 is the locked
+// flag; the low 63 bits are the epoch (a human-paced transition counter, so
+// 2^63 transitions is unreachable in any deployment lifetime).
+const fenceLockedBit = uint64(1) << 63
+
+// SetGeneration publishes the port's direct-state generation stamp: the
+// lockdown/unlock epoch and whether the direct path is locked. It is the single
+// serialization point between a §13.4 lockdown/unlock transition and every
+// mapping mutation this port performs. It is non-blocking and never waits for
+// the state loop, so a transition is published even while the loop is inside
+// bounded router I/O; the loop's pre-write and commit-time checks observe it.
+// Callers must not hold a lock that the state loop can call back into.
+func (p *OnDemandPort) SetGeneration(epoch uint64, locked bool) {
+	v := epoch & (fenceLockedBit - 1)
+	if locked {
+		v |= fenceLockedBit
+	}
+	p.fence.Store(v)
+}
+
+// generationCurrent reports whether gen is still the port's published
+// generation. gen is an unlocked epoch (bit 63 clear) as captured by the
+// caller; a locked stamp never equals it, so a locked transition always fences.
+func (p *OnDemandPort) generationCurrent(gen uint64) bool {
+	return p.fence.Load() == gen
+}
+
 // OpenFor maps (or re-maps/renews) the port for shareID with the given lease.
 // Leases below minValidLease are clamped up. Only shares the agent has
 // independently registered and source-verified may be passed here; the signal
 // handler enforces that (see opensignal.go), not this type.
+//
+// OpenFor does not consult the generation stamp: it is for callers that have no
+// direct-state generation to observe (the standalone spike and port unit
+// tests). The daemon's serving path always uses OpenForIf.
 func (p *OnDemandPort) OpenFor(shareID string, lease time.Duration) error {
-	return p.OpenForIf(shareID, lease, nil)
+	return p.openFor(shareID, lease, false, 0)
 }
 
 // OpenForIf maps (or re-maps/renews) the port exactly like OpenFor, but only
-// while stillCurrent reports that the caller's admission generation is still
-// current. stillCurrent is evaluated ON THE STATE LOOP immediately before the
-// mapping is created or renewed — and again after the cold open's port
-// selection router I/O — so it is atomic with respect to the mapping mutation
-// and with respect to any concurrent CloseIf. A stale caller (an open signal
-// admitted before a §13.4 lockdown that then advanced the generation) fails
-// closed with ErrOpenSuperseded: no mapping is created, no renewal is issued,
-// and the port's state is left untouched. A nil stillCurrent is equivalent to
-// OpenFor. The caller holds no lock across the router I/O.
-func (p *OnDemandPort) OpenForIf(shareID string, lease time.Duration, stillCurrent func() bool) error {
+// while the port's published generation stamp still equals gen — the direct
+// state's lockdown/unlock epoch that the caller captured when it admitted the
+// operation (see SetGeneration).
+//
+// The state loop evaluates the stamp immediately before the mapping is created
+// or renewed — and again after the cold open's bounded port-selection router
+// I/O — and, crucially, once more immediately AFTER the mapping write. That
+// last check is the commit point: a §13.4 lockdown that publishes its
+// generation while the router write is in flight (the reviewer's
+// post-predicate/pre-write gap) makes the open fail closed with
+// ErrOpenSuperseded, removes any mapping the router already accepted, and
+// publishes no state — no transition to open, no renewal, no OK ack. The
+// caller holds no lock across the router I/O, and the port never acquires one.
+func (p *OnDemandPort) OpenForIf(shareID string, lease time.Duration, gen uint64) error {
+	return p.openFor(shareID, lease, true, gen)
+}
+
+func (p *OnDemandPort) openFor(shareID string, lease time.Duration, fenced bool, gen uint64) error {
 	ch := make(chan portReply, 1)
-	return p.send(portCommand{op: opOpenFor, shareID: shareID, lease: lease, stillCurrent: stillCurrent, reply: ch}).err
+	return p.send(portCommand{op: opOpenFor, shareID: shareID, lease: lease, fenced: fenced, gen: gen, reply: ch}).err
 }
 
 // BeginSession records a new recipient session for shareID and returns an
@@ -335,6 +389,8 @@ func (p *OnDemandPort) loop() {
 		idleAt      time.Time // inactivity close (zero until a session exists)
 		sessions    = map[string]time.Time{}
 		inFlight    int    // active streaming holds; pause the idle close while > 0
+		openFenced  bool   // mapping was opened by a generation-fenced OpenForIf
+		openGen     uint64 // the generation stamp that opened the current mapping
 		epoch       uint64 // bumped on each open; hold tokens bind to this epoch
 		seq         uint64
 		timer       portTimer
@@ -447,18 +503,45 @@ func (p *OnDemandPort) loop() {
 			return portReply{} // idempotent: already closed
 		}
 	}
+	// discardFencedMapping removes a mapping that a fenced open or renewal has
+	// just written to the router but must not publish. It is the compensating
+	// half of the check-before/commit-after protocol of opOpenFor and the timerC
+	// renewal: the port never publishes StateOpen, never renews a lease, and
+	// never acks success for a superseded generation, but the router write
+	// itself is not transactional — so it is undone here before the caller is
+	// answered. wasOpen is true when StateOpen had already been published (the
+	// renewal paths). The delete is attempted immediately; a failure hands the
+	// mapping to the existing close-retry timer, which escalates via CloseError.
+	discardFencedMapping := func(wasOpen bool) {
+		open = false
+		closing = true
+		closeFail = 0
+		sessions = map[string]time.Time{} // drop stale sessions so a reopen can't renew from them
+		idleAt = time.Time{}
+		inFlight = 0
+		if wasOpen {
+			p.setState(StateClosing, grantedPort)
+		}
+		tryDelete()
+		rearm()
+	}
 
 	for {
 		select {
 		case c := <-p.cmds:
 			switch c.op {
 			case opOpenFor:
-				// Generation fence, evaluated here on the state loop: an open
-				// signal admitted before a lockdown must not create or renew a
-				// mapping after the lockdown advanced the generation. This
-				// check and the mapping mutation below run in one loop step, so
-				// no CloseIf can interleave between them.
-				if c.stillCurrent != nil && !c.stillCurrent() {
+				// Generation fence against the port's OWN published generation stamp
+				// (SetGeneration), not a caller-held lock: the §13.4 transition
+				// publishes the stamp synchronously, so the state loop can re-read it
+				// at every point of this case — including after bounded router I/O and
+				// after the mapping write itself — without either side holding a lock
+				// across the router I/O. fenced() is the same predicate at each of
+				// those points; the post-write one is the commit point.
+				fenced := func() bool {
+					return c.fenced && !p.generationCurrent(c.gen)
+				}
+				if fenced() {
 					c.reply <- portReply{err: ErrOpenSuperseded}
 					continue
 				}
@@ -478,26 +561,43 @@ func (p *OnDemandPort) loop() {
 							continue
 						}
 					}
+					prevExtPort := p.extPort
 					requested, err := ChooseExternalPort(p.mapper, p.extPort)
 					if err != nil {
 						c.reply <- portReply{err: err}
 						continue
 					}
 					p.extPort = requested
-					// Re-evaluate as the last thing before the mapping is created:
-					// ChooseExternalPort above performs bounded router I/O during
-					// which a lockdown may have advanced the generation.
-					if c.stillCurrent != nil && !c.stillCurrent() {
+					// Re-evaluate after ChooseExternalPort's bounded router I/O: a
+					// transition during port selection must not create a mapping, and
+					// the selected port must not be published as though the open had
+					// happened.
+					if fenced() {
+						p.extPort = prevExtPort
 						c.reply <- portReply{err: ErrOpenSuperseded}
 						continue
 					}
 					granted, err := p.mapper.AddPortMapping(p.extPort, p.intPort, p.desc(), int(l.Seconds()))
 					if err != nil {
+						p.extPort = prevExtPort
 						c.reply <- portReply{err: err}
 						continue
 					}
 					grantedPort = granted
+					// COMMIT POINT: the transition may have been published while the
+					// mapping write was in flight — exactly the reviewed gap between
+					// the predicate and the write. Refuse, remove the mapping the
+					// router already accepted, and restore the preferred port, so a
+					// superseded cold open leaves no mapping and no partial state.
+					if fenced() {
+						discardFencedMapping(false)
+						p.extPort = prevExtPort
+						c.reply <- portReply{err: ErrOpenSuperseded}
+						continue
+					}
 					open = true
+					openFenced = c.fenced
+					openGen = c.gen
 					epoch++ // new open epoch: hold tokens from a prior open can no longer match
 					closing = false
 					closeFail = 0
@@ -526,10 +626,10 @@ func (p *OnDemandPort) loop() {
 					idleAt = time.Time{}
 				}
 				if now.Add(l).After(deadline) {
-					// Renewal is gated by the same generation fence: a stale open
-					// must not extend a mapping it no longer observes. The fence
-					// was evaluated at the top of this case, immediately before
-					// this renewal (no router I/O in between).
+					// Renewal is gated by the same generation fence and the same commit
+					// protocol as the cold open: a stale open must not extend a mapping
+					// it no longer observes, even when the transition is published after
+					// the top-of-case check but before or inside the renewal write.
 					granted, err := p.mapper.AddPortMapping(grantedPort, p.intPort, p.desc(), int(l.Seconds()))
 					if err != nil {
 						renewFailed = true
@@ -538,6 +638,17 @@ func (p *OnDemandPort) loop() {
 						continue
 					}
 					grantedPort = granted
+					if fenced() {
+						discardFencedMapping(true)
+						c.reply <- portReply{err: ErrOpenSuperseded}
+						continue
+					}
+					if c.fenced {
+						// The mapping is now owned by the caller's generation, so the
+						// autonomous renewal must be fenced against it too.
+						openFenced = true
+						openGen = c.gen
+					}
 					renewFailed = false
 					deadline = now.Add(l)
 					renewAt = deadline.Add(-p.renewWindow)
@@ -663,6 +774,12 @@ func (p *OnDemandPort) loop() {
 						rearm()
 					}
 				case !now.Before(renewAt):
+					// The autonomous renewal is generation-fenced too: no path may
+					// renew a mapping whose owning generation has been superseded.
+					if openFenced && !p.generationCurrent(openGen) {
+						discardFencedMapping(true)
+						break
+					}
 					port := p.extPort
 					if grantedPort != 0 {
 						port = grantedPort
@@ -672,6 +789,12 @@ func (p *OnDemandPort) loop() {
 						renewFailed = true
 						renewAt = deadline // stop renewing; close at lease expiry
 						rearm()
+					} else if openFenced && !p.generationCurrent(openGen) {
+						// COMMIT POINT: the transition was published while the renewal
+						// write was in flight. Undo the renewal and tear the mapping
+						// down instead of extending its lease.
+						grantedPort = granted
+						discardFencedMapping(true)
 					} else {
 						grantedPort = granted
 						renewFailed = false

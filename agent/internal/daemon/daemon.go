@@ -1753,8 +1753,9 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	// slow ExternalIP lookup. A §13.4 lockdown (or lockdown+unlock) that advances
 	// the generation while we wait must fence this open: it may not create or
 	// renew a mapping after lockdown's CloseIf already ran. The OnDemandPort
-	// state loop re-checks this fence atomically with the mapping mutation (see
-	// OpenForIf), so the capture here is what makes the re-check decisive.
+	// publishes that generation as a stamp the state loop re-checks immediately
+	// before AND immediately after every mapping write (see OpenForIf), so this
+	// capture is what makes the commit-time re-check decisive.
 	openEpoch, openCurrent := d.snapshotDirectOpenGeneration()
 	if !openCurrent {
 		log.Printf("open_signal %s refused: direct path is locked", msg.ShareID)
@@ -1777,9 +1778,7 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 		ds.reporter.SetIP(ip) // keep subsequent transition reports fresh
 	}
 	wasOpen := ds.port.Open()
-	if err := ds.port.OpenForIf(msg.ShareID, sig.Lease, func() bool {
-		return d.directOpenGenerationCurrent(openEpoch)
-	}); err != nil {
+	if err := ds.port.OpenForIf(msg.ShareID, sig.Lease, openEpoch); err != nil {
 		if errors.Is(err, direct.ErrOpenSuperseded) {
 			log.Printf("open_signal %s refused: superseded by a lockdown transition", msg.ShareID)
 			_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
@@ -2364,6 +2363,17 @@ func (d *Daemon) Lockdown() error {
 	binder := ds.binder
 	ds.mu.Unlock()
 
+	// Publish the transition to the on-demand port BEFORE any lever runs (and
+	// therefore before the mapping-close lever enqueues its CloseIf). The stamp
+	// is the port's single serialization point for this transition: every
+	// open/renewal, including one already inside the state loop, re-reads it
+	// after its mapping write and refuses when it no longer matches. Publishing
+	// here — before the gate closes and before the close is queued — is what
+	// makes an open ordered after this fence command provably unable to create
+	// or renew a mapping or ack it OK.
+	if port != nil {
+		port.SetGeneration(epoch, true)
+	}
 	if gate != nil {
 		gate.SetLockdown(true)
 	}
@@ -2449,6 +2459,8 @@ func (d *Daemon) lockdownEpochCurrent(epoch uint64) bool {
 // work so an open that waits there can be refused once lockdown supersedes it.
 // ok is false when the daemon is already locked at admission: there is no
 // generation to observe, so the open must fail closed without any mapping work.
+// The returned epoch is handed to OnDemandPort.OpenForIf, which re-checks it
+// against the port's own published stamp before and after every mapping write.
 func (d *Daemon) snapshotDirectOpenGeneration() (epoch uint64, ok bool) {
 	ds := d.direct
 	if ds == nil {
@@ -2460,23 +2472,6 @@ func (d *Daemon) snapshotDirectOpenGeneration() (epoch uint64, ok bool) {
 		return ds.lockdownEpoch, false
 	}
 	return ds.lockdownEpoch, true
-}
-
-// directOpenGenerationCurrent reports whether epoch still owns the direct state
-// and the daemon is unlocked. It is safe to call from the OnDemandPort state
-// loop: no goroutine holding ds.mu ever calls into that loop, so the lock
-// cannot form a cycle (see lockdownEpochCurrent). A lockdown bumps
-// lockdownEpoch, so an open admitted under an older epoch is refused; an
-// Unlock bumps it again, so an open that never observed the locked generation
-// is refused too.
-func (d *Daemon) directOpenGenerationCurrent(epoch uint64) bool {
-	ds := d.direct
-	if ds == nil {
-		return false
-	}
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	return !ds.locked && ds.lockdownEpoch == epoch
 }
 
 // runLockdownLevers starts every best-effort lever concurrently and waits at
@@ -2565,6 +2560,7 @@ func (d *Daemon) Unlock() error {
 		return nil
 	}
 	wasLocked := ds.locked
+	var epoch uint64
 	if wasLocked {
 		ds.locked = false
 		// Supersede every in-flight lockdown lever BEFORE the gate re-opens: a
@@ -2572,6 +2568,7 @@ func (d *Daemon) Unlock() error {
 		// listener stop must not tear down the listener restored below. Bumping
 		// under ds.mu makes the bump atomic with the fenced levers' checks.
 		ds.lockdownEpoch++
+		epoch = ds.lockdownEpoch
 		// Force syncDirectServe to rebuild the Binder/DirectServer and re-admit
 		// every recorded origin (direct pairs, relay-only bindings, and pending
 		// relay-only bindings), reusing the tested namespace-rebuild path. The
@@ -2581,8 +2578,17 @@ func (d *Daemon) Unlock() error {
 		ds.serveNS = ""
 	}
 	gate := ds.gate
+	port := ds.port
 	ds.mu.Unlock()
 
+	// Publish the unlock generation to the on-demand port BEFORE the gate
+	// re-opens, so no open admitted after Unlock is fenced against the stale
+	// locked stamp; the new stamp both clears the locked bit and advances the
+	// epoch, so an open admitted under the pre-lockdown generation is still
+	// refused.
+	if port != nil && wasLocked {
+		port.SetGeneration(epoch, false)
+	}
 	if gate != nil {
 		gate.SetLockdown(false)
 	}

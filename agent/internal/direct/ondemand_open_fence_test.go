@@ -8,8 +8,8 @@ import (
 )
 
 // gatedListMapper blocks ListPortMappings (the port-selection router I/O of a
-// cold open) behind a channel, so a test can advance the caller's generation
-// while OpenForIf is inside ChooseExternalPort. It otherwise behaves like
+// cold open) behind a channel, so a test can publish a new generation while
+// OpenForIf is inside ChooseExternalPort. It otherwise behaves like
 // recordingMapper (no enumerated mappings → the preferred port is chosen).
 type gatedListMapper struct {
 	*recordingMapper
@@ -25,10 +25,66 @@ func (m *gatedListMapper) ListPortMappings() ([]PortMapping, error) {
 	return m.recordingMapper.ListPortMappings()
 }
 
+// gatedAddMapper blocks AddPortMapping (the mapping write itself) behind a
+// channel, so a test can land the generation transition in the reviewer's
+// round-2 gap: after the predicate passed and while the write is in flight.
+type gatedAddMapper struct {
+	*recordingMapper
+	addEntered chan struct{}
+	addRelease chan struct{}
+}
+
+func (m *gatedAddMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
+	if m.addEntered != nil {
+		m.addEntered <- struct{}{}
+		<-m.addRelease
+	}
+	return m.recordingMapper.AddPortMapping(ext, internal, desc, lease)
+}
+
+// loopStateRecorder records the port's published state transitions.
+type loopStateRecorder struct {
+	mu     sync.Mutex
+	states []PortState
+}
+
+func (r *loopStateRecorder) record(_, next PortState, _ int) {
+	r.mu.Lock()
+	r.states = append(r.states, next)
+	r.mu.Unlock()
+}
+
+func (r *loopStateRecorder) sawOpen() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.states {
+		if s == StateOpen {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *loopStateRecorder) snapshot() []PortState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]PortState(nil), r.states...)
+}
+
+func awaitEntered(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s never arrived", what)
+	}
+}
+
 // TestOpenForIfFencesColdOpenAfterPortSelection proves the fence is
-// re-evaluated on the state loop as the last thing before the cold-open mapping
-// is created: a generation that advances during ChooseExternalPort's router I/O
-// must still prevent the mapping.
+// re-evaluated on the state loop after the cold open's port-selection router
+// I/O but before the mapping write: a generation published during
+// ChooseExternalPort must prevent the mapping and must not publish the
+// selected preferred port.
 func TestOpenForIfFencesColdOpenAfterPortSelection(t *testing.T) {
 	fc := newFakeClock(time.Now())
 	base := &recordingMapper{}
@@ -40,26 +96,12 @@ func TestOpenForIfFencesColdOpenAfterPortSelection(t *testing.T) {
 	p := newTestPort(fc, mapper, time.Minute)
 	defer p.Close()
 
-	var mu sync.Mutex
-	current := true
-	fence := func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return current
-	}
-
 	errCh := make(chan error, 1)
-	go func() { errCh <- p.OpenForIf("share", time.Minute, fence) }()
+	go func() { errCh <- p.OpenForIf("share", time.Minute, 0) }()
 
-	select {
-	case <-mapper.listEntered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("OpenForIf never reached port selection")
-	}
+	awaitEntered(t, mapper.listEntered, "OpenForIf reaching port selection")
 	// The generation advances while the state loop is inside router I/O.
-	mu.Lock()
-	current = false
-	mu.Unlock()
+	p.SetGeneration(1, true)
 	close(mapper.listRelease)
 
 	if err := <-errCh; !errors.Is(err, ErrOpenSuperseded) {
@@ -76,69 +118,157 @@ func TestOpenForIfFencesColdOpenAfterPortSelection(t *testing.T) {
 	}
 }
 
-// TestOpenForIfFencesRenewal proves a stale caller cannot extend the lease of
-// an already-open mapping: the top-of-handler fence refuses the renewal before
-// any AddPortMapping, and the existing mapping is left for lockdown's CloseIf to
-// remove.
-func TestOpenForIfFencesRenewal(t *testing.T) {
+// TestOpenForIfFencesColdOpenDuringAddPortMapping is the cold-open half of the
+// reviewer's round-2 gap: the predicate has passed and the state loop is inside
+// the mapping write when the generation is published. The open must fail
+// closed, must never publish StateOpen, and must not leave a mapping behind —
+// the port undoes the router write it can no longer authorize.
+func TestOpenForIfFencesColdOpenDuringAddPortMapping(t *testing.T) {
 	fc := newFakeClock(time.Now())
 	base := &recordingMapper{}
-	p := newTestPort(fc, base, time.Minute)
+	mapper := &gatedAddMapper{
+		recordingMapper: base,
+		addEntered:      make(chan struct{}, 1),
+		addRelease:      make(chan struct{}),
+	}
+	p := newTestPort(fc, mapper, time.Minute)
 	defer p.Close()
+	rec := &loopStateRecorder{}
+	p.SetTransitionCallback(rec.record)
 
-	var mu sync.Mutex
-	current := true
-	fence := func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return current
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.OpenForIf("share", time.Minute, 0) }()
+	awaitEntered(t, mapper.addEntered, "OpenForIf entering AddPortMapping")
+
+	// The generation transition lands in the predicate-to-write gap.
+	p.SetGeneration(1, true)
+	close(mapper.addRelease)
+
+	if err := <-errCh; !errors.Is(err, ErrOpenSuperseded) {
+		t.Fatalf("err = %v, want ErrOpenSuperseded", err)
+	}
+	if rec.sawOpen() {
+		t.Fatalf("port transitioned open for a fenced cold open: %v", rec.snapshot())
+	}
+	if p.Open() {
+		t.Fatalf("port must not be open after a fenced cold open")
+	}
+	if got := p.State(); got != StateClosed {
+		t.Fatalf("state = %v, want StateClosed", got)
+	}
+	if _, closed, _, _ := base.snapshot(); closed == 0 {
+		t.Fatalf("the mapping written by the fenced open was not removed")
 	}
 
-	if err := p.OpenForIf("share", time.Minute, fence); err != nil {
-		t.Fatalf("legitimate open: %v", err)
+	// A later legitimate open (after a lockdown→unlock cycle that published a
+	// newer, unlocked stamp) must still work: no wedged loop, no leftover
+	// preferred-port state.
+	mapper.addEntered = nil
+	p.SetGeneration(2, false)
+	if err := p.OpenForIf("share", time.Minute, 2); err != nil {
+		t.Fatalf("post-fence legitimate open: %v", err)
 	}
-	if opened, _, _, _ := base.snapshot(); opened != 1 {
-		t.Fatalf("open calls = %d, want 1", opened)
-	}
-	// Move past the renewal decision point so a stale OpenForIf would renew.
-	fc.advance(3 * time.Second)
-
-	mu.Lock()
-	current = false
-	mu.Unlock()
-	if err := p.OpenForIf("share", 5*time.Minute, fence); !errors.Is(err, ErrOpenSuperseded) {
-		t.Fatalf("renewal err = %v, want ErrOpenSuperseded", err)
-	}
-	if opened, _, _, _ := base.snapshot(); opened != 1 {
-		t.Fatalf("fenced renewal issued %d AddPortMapping calls total, want 1", opened)
+	if started, _, _, _ := base.snapshot(); started != 2 {
+		t.Fatalf("post-fence open AddPortMapping calls = %d, want 2", started)
 	}
 	if !p.Open() {
-		t.Fatalf("the pre-existing mapping must stay until lockdown's CloseIf removes it")
-	}
-
-	// A fenced open must not wedge the loop: a later legitimate renewal works.
-	if err := p.OpenForIf("share", 5*time.Minute, func() bool { return true }); err != nil {
-		t.Fatalf("post-fence legitimate renewal: %v", err)
-	}
-	if opened, _, _, _ := base.snapshot(); opened != 2 {
-		t.Fatalf("post-fence renewal open calls = %d, want 2", opened)
+		t.Fatalf("post-fence legitimate open must open the port")
 	}
 }
 
-// TestOpenForIfLegitimateOpenAndRenewal is the no-false-fencing control: with a
-// fence that stays true, a cold open and a renewal both issue mappings.
-func TestOpenForIfLegitimateOpenAndRenewal(t *testing.T) {
+// TestOpenForIfFencesRenewalDuringAddPortMapping is the renewal half of the
+// reviewer's round-2 gap: an already-open mapping, the renewal predicate
+// passed, and the generation published while the renewal write is in flight.
+// The renewal must not be published and the mapping must not survive.
+func TestOpenForIfFencesRenewalDuringAddPortMapping(t *testing.T) {
+	fc := newFakeClock(time.Now())
+	base := &recordingMapper{}
+	mapper := &gatedAddMapper{recordingMapper: base}
+	p := newTestPort(fc, mapper, time.Minute)
+	defer p.Close()
+
+	if err := p.OpenForIf("share", time.Minute, 0); err != nil {
+		t.Fatalf("legitimate open: %v", err)
+	}
+	// Move past the renewal decision point so the second call renews.
+	fc.advance(3 * time.Second)
+
+	mapper.addEntered = make(chan struct{}, 1)
+	mapper.addRelease = make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.OpenForIf("share", 5*time.Minute, 0) }()
+	awaitEntered(t, mapper.addEntered, "renewal entering AddPortMapping")
+
+	p.SetGeneration(1, true)
+	close(mapper.addRelease)
+
+	if err := <-errCh; !errors.Is(err, ErrOpenSuperseded) {
+		t.Fatalf("renewal err = %v, want ErrOpenSuperseded", err)
+	}
+	if p.Open() {
+		t.Fatalf("a fenced renewal must not leave the mapping open")
+	}
+	if got := p.State(); got != StateClosed {
+		t.Fatalf("state = %v, want StateClosed", got)
+	}
+}
+
+// TestOnDemandPortFencesTimerRenewal proves the autonomous timer-driven
+// renewal (the `timerC` branch) consults the generation stamp. The timer is
+// driven deterministically by the fake clock; the renewal write is gated so
+// the generation can be published while it is in flight.
+func TestOnDemandPortFencesTimerRenewal(t *testing.T) {
+	fc := newFakeClock(time.Unix(1_700_000_000, 0))
+	base := &recordingMapper{}
+	mapper := &gatedAddMapper{recordingMapper: base}
+	p := newTestPort(fc, mapper, time.Minute)
+	defer p.Close()
+	rec := &loopStateRecorder{}
+	p.SetTransitionCallback(rec.record)
+
+	// minValidLease is 5s and renewWindow is 2s → renewAt is 3s out.
+	if err := p.OpenForIf("share", 5*time.Second, 0); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := p.BeginSession("share"); err != nil {
+		t.Fatalf("BeginSession: %v", err)
+	}
+
+	// Arm the gate for the scheduled renewal only, then drive the clock to it.
+	mapper.addEntered = make(chan struct{}, 1)
+	mapper.addRelease = make(chan struct{})
+
+	// The scheduled renewal fires and blocks inside AddPortMapping. The clock
+	// advance is the timer's own schedule, not a synchronization sleep.
+	fc.advance(3 * time.Second)
+	awaitEntered(t, mapper.addEntered, "the timer renewal entering AddPortMapping")
+
+	p.SetGeneration(1, true)
+	close(mapper.addRelease)
+
+	waitFor(t, func() bool { return !p.Open() })
+	if got := p.State(); got != StateClosed {
+		t.Fatalf("state = %v, want StateClosed", got)
+	}
+	if _, closed, _, _ := base.snapshot(); closed == 0 {
+		t.Fatalf("the timer-renewed mapping was not removed")
+	}
+}
+
+// TestOpenForIfLegitimateOpenAndRenewalUnfenced is the no-false-fencing
+// control: with an unchanged generation, a cold open and a renewal both issue
+// mappings and stay open.
+func TestOpenForIfLegitimateOpenAndRenewalUnfenced(t *testing.T) {
 	fc := newFakeClock(time.Now())
 	base := &recordingMapper{}
 	p := newTestPort(fc, base, time.Minute)
 	defer p.Close()
 
-	fence := func() bool { return true }
-	if err := p.OpenForIf("share", time.Minute, fence); err != nil {
+	if err := p.OpenForIf("share", time.Minute, 0); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	fc.advance(3 * time.Second)
-	if err := p.OpenForIf("share", 5*time.Minute, fence); err != nil {
+	if err := p.OpenForIf("share", 5*time.Minute, 0); err != nil {
 		t.Fatalf("renewal: %v", err)
 	}
 	if opened, _, _, _ := base.snapshot(); opened != 2 {
@@ -149,18 +279,43 @@ func TestOpenForIfLegitimateOpenAndRenewal(t *testing.T) {
 	}
 }
 
-// TestOpenForIfNilFenceIsUnconditional pins that a nil fence (i.e. plain
-// OpenFor) is never refused.
-func TestOpenForIfNilFenceIsUnconditional(t *testing.T) {
+// TestOpenForIfLegitimateAfterUnlockGeneration proves an open admitted under
+// the CURRENT generation still works after a lockdown/unlock cycle published a
+// newer stamp.
+func TestOpenForIfLegitimateAfterUnlockGeneration(t *testing.T) {
 	fc := newFakeClock(time.Now())
 	base := &recordingMapper{}
 	p := newTestPort(fc, base, time.Minute)
 	defer p.Close()
 
-	if err := p.OpenForIf("share", time.Minute, nil); err != nil {
-		t.Fatalf("nil-fence open: %v", err)
+	p.SetGeneration(1, true)
+	p.SetGeneration(2, false)
+	if err := p.OpenForIf("share", time.Minute, 2); err != nil {
+		t.Fatalf("post-unlock open: %v", err)
 	}
-	if opened, _, _, _ := base.snapshot(); opened != 1 {
-		t.Fatalf("open calls = %d, want 1", opened)
+	if !p.Open() {
+		t.Fatalf("a post-unlock open under the current generation must open the port")
+	}
+}
+
+// TestOpenForIsUnfenced pins that the unconditional OpenFor does not consult
+// the generation stamp (the standalone spike/test callers), while OpenForIf
+// does.
+func TestOpenForIsUnfenced(t *testing.T) {
+	fc := newFakeClock(time.Now())
+	base := &recordingMapper{}
+	p := newTestPort(fc, base, time.Minute)
+	defer p.Close()
+
+	p.SetGeneration(7, true)
+	if err := p.OpenFor("share", time.Minute); err != nil {
+		t.Fatalf("unfenced OpenFor: %v", err)
+	}
+	if !p.Open() {
+		t.Fatalf("unfenced OpenFor must open the port")
+	}
+	// A fenced call under the same (locked) stamp must still be refused.
+	if err := p.OpenForIf("share", time.Minute, 7); !errors.Is(err, ErrOpenSuperseded) {
+		t.Fatalf("fenced open while locked err = %v, want ErrOpenSuperseded", err)
 	}
 }
