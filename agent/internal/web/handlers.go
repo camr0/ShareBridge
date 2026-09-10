@@ -20,6 +20,21 @@ type pageData struct {
 	EnvManaged envManagedData
 }
 
+// maskedSecret is the placeholder rendered in place of a stored secret. The
+// real value is only returned by the admin-authenticated
+// GET /api/settings/secrets endpoint on explicit user action, so the page HTML
+// (and any unauthenticated response) never carries the raw key.
+const maskedSecret = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+
+// maskSecret maps a stored secret to its non-disclosing placeholder. An unset
+// secret renders as empty so the form still shows "not configured".
+func maskSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	return maskedSecret
+}
+
 // configData holds configuration data for templates.
 type configData struct {
 	SignalingURL        string
@@ -107,10 +122,10 @@ func (ws *WebServer) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		c := ws.daemon.GetConfig()
 		cfg = configData{
 			SignalingURL:        c.SignalingURL,
-			APIKey:              c.APIKey,
+			APIKey:              maskSecret(c.APIKey),
 			AllowedHost:         c.AllowedHost,
 			NCAllowedHost:       c.NCAllowedHost,
-			AgentAPIKey:         c.AgentAPIKey,
+			AgentAPIKey:         maskSecret(c.AgentAPIKey),
 			DefaultExpiry:       c.DefaultExpiry,
 			DefaultMaxDownloads: c.DefaultMaxDownloads,
 			DefaultRelayOnly:    c.DefaultRelayOnly,

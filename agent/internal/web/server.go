@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -52,6 +53,14 @@ type WebServer struct {
 // The daemon reference may be nil initially and set later via SetDaemon.
 // addr is the bind address (e.g. "127.0.0.1" or "0.0.0.0").
 func NewWebServer(d daemonProvider, addr string, port int, password string) (*WebServer, error) {
+	// Secure by default: an empty address means loopback, never all
+	// interfaces. A non-loopback bind without a credential is refused here so
+	// no admin surface can be constructed, let alone started.
+	addr = config.NormalizeUIAddr(addr)
+	if err := config.ValidateAdminBind(addr, password); err != nil {
+		return nil, err
+	}
+
 	// Parse the layout template
 	layoutTmpl, err := template.ParseFS(embeddedFS, "templates/layout.html")
 	if err != nil {
@@ -84,19 +93,19 @@ func (ws *WebServer) SetDaemon(d *daemon.Daemon) {
 // Start registers routes and starts the HTTP server.
 // The server runs until the context is cancelled or Stop is called.
 func (ws *WebServer) Start(ctx context.Context) error {
-	// Create HTTP server with auth middleware if password is set
-	mux := http.NewServeMux()
-
-	// Register routes
-	ws.registerRoutes(mux)
-
-	// Apply auth middleware if password configured
-	var handler http.Handler = mux
-	if ws.password != "" {
-		handler = ws.authMiddleware(handler)
+	// Fail closed before any listener exists: a non-loopback bind without a
+	// configured credential must never start. This also covers a WebServer
+	// assembled directly (bypassing NewWebServer) and normalizes an empty
+	// address to loopback rather than the all-interfaces ":port" form.
+	addr := config.NormalizeUIAddr(ws.addr)
+	if err := config.ValidateAdminBind(addr, ws.password); err != nil {
+		return err
 	}
+	ws.addr = addr
 
-	listenAddr := fmt.Sprintf("%s:%d", ws.addr, ws.port)
+	handler := ws.handler()
+
+	listenAddr := fmt.Sprintf("%s:%d", addr, ws.port)
 	ws.server = &http.Server{
 		Addr:         listenAddr,
 		Handler:      handler,
@@ -140,6 +149,15 @@ func (ws *WebServer) Stop() error {
 	return nil
 }
 
+// handler assembles the production request chain: the full route table wrapped
+// in the admin-auth middleware. Start uses it, and tests drive it so they
+// exercise the real wiring rather than a mock chain.
+func (ws *WebServer) handler() http.Handler {
+	mux := http.NewServeMux()
+	ws.registerRoutes(mux)
+	return ws.adminAuthMiddleware(mux)
+}
+
 // registerRoutes sets up all HTTP routes for the web server.
 func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 	// Static files - no CSRF needed
@@ -165,14 +183,17 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 
 	// Settings
 	mux.HandleFunc("PUT /api/settings", ws.csrfMiddleware(ws.saveSettingsHandler))
+	// Secret reveal: the settings page renders masks only; the raw keys are
+	// fetched on explicit user action through this admin-authenticated route.
+	mux.HandleFunc("GET /api/settings/secrets", ws.settingsSecretsHandler)
 
 	// §13.4 reversible lockdown: authenticated local admin API only. These
 	// endpoints change transport availability, so they fail CLOSED when no
 	// admin credential is configured (the default UI deployment) and require
 	// the configured credential when one is; the state-changing POSTs also
 	// carry the CSRF header like every other mutation.
-	mux.HandleFunc("POST /api/lockdown", ws.adminAuthMiddleware(ws.csrfMiddleware(ws.lockdownHandler)))
-	mux.HandleFunc("POST /api/unlock", ws.adminAuthMiddleware(ws.csrfMiddleware(ws.unlockHandler)))
+	mux.HandleFunc("POST /api/lockdown", ws.requireAdminCredential(ws.csrfMiddleware(ws.lockdownHandler)))
+	mux.HandleFunc("POST /api/unlock", ws.requireAdminCredential(ws.csrfMiddleware(ws.unlockHandler)))
 	mux.HandleFunc("GET /api/lockdown-status", ws.lockdownStatusHandler)
 
 	// Relay quota endpoint
@@ -198,16 +219,21 @@ func (ws *WebServer) registerRoutes(mux *http.ServeMux) {
 	}))
 }
 
-// csrfMiddleware verifies a browser-set request header on non-GET requests.
-// Accepts HX-Request (sent by HTMX) or X-Requested-With (sent by XHR/jQuery/CLI client).
-// Either header proves the request came from JS, not a cross-origin form POST.
+// csrfMiddleware protects state-changing admin requests. It requires BOTH:
+//
+//  1. same-origin enforcement: an Origin header, when present, must name the
+//     same host as the request (a web page cannot forge Origin), and
+//  2. a browser-set JS header (HX-Request or X-Requested-With), which also
+//     covers non-browser clients that send no Origin.
+//
+// The JS header alone is not authentication and is treated as defense in
+// depth: a cross-origin request is rejected on the Origin/Host check no matter
+// which headers it forges.
 func (ws *WebServer) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" && r.Method != "HEAD" {
-			htmxRequest := r.Header.Get("HX-Request") == "true"
-			xhrRequest := r.Header.Get("X-Requested-With") == "XMLHttpRequest"
-			if !htmxRequest && !xhrRequest {
-				http.Error(w, "Forbidden - CSRF check failed", http.StatusForbidden)
+			if !sameOriginOrCSRFHeader(r) {
+				http.Error(w, "Forbidden - cross-origin or CSRF check failed", http.StatusForbidden)
 				return
 			}
 		}
@@ -215,12 +241,43 @@ func (ws *WebServer) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// authMiddleware provides optional basic auth protection.
-// If a password is configured, all requests require authentication.
-func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
+// sameOriginOrCSRFHeader reports whether a state-changing request is
+// same-origin (when it declares an Origin header) and carries a JS-set request
+// header. Host comparison is scheme-agnostic so the agent keeps working behind
+// a TLS-terminating reverse proxy, while any different host is rejected.
+func sameOriginOrCSRFHeader(r *http.Request) bool {
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+			return false
+		}
+	}
+	htmxRequest := r.Header.Get("HX-Request") == "true"
+	xhrRequest := r.Header.Get("X-Requested-With") == "XMLHttpRequest"
+	return htmxRequest || xhrRequest
+}
+
+// adminAuthMiddleware enforces authentication on every dynamic admin surface
+// (pages, HTML fragments, JSON APIs and mutations); static assets are exempt
+// because they carry no data. It fails closed:
+//
+//   - a configured password is always required (constant-time comparison);
+//   - with no password, loopback callers are trusted (local UX), while a
+//     non-loopback bind without a credential is refused at
+//     construction/startup and refused again here for defense in depth.
+func (ws *WebServer) adminAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip auth for static files (they contain no sensitive data)
 		if strings.HasPrefix(r.URL.Path, "/static/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if ws.password == "" {
+			if !config.IsLoopbackAddr(ws.addr) {
+				http.Error(w, "Forbidden - admin credential not configured", http.StatusForbidden)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -237,14 +294,13 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// adminAuthMiddleware enforces the configured admin credential on a handler.
-// §13.4 lockdown/unlock change transport availability, so they fail CLOSED:
-// with no admin password configured (the default UI deployment binds 0.0.0.0
-// with an empty UIPassword and installs no auth middleware) the request is
-// refused outright — the endpoint is never reachable unauthenticated. With a
-// password configured, the same constant-time basic-auth check as
-// authMiddleware applies.
-func (ws *WebServer) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+// requireAdminCredential is the stricter credential gate used by the §13.4
+// lockdown endpoints, which change transport availability. Unlike
+// adminAuthMiddleware it fails CLOSED even on loopback when no password is
+// configured, so a default deployment can never be stopped by an
+// unauthenticated caller. With a password configured, the same constant-time
+// basic-auth check applies.
+func (ws *WebServer) requireAdminCredential(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if ws.password == "" {
 			http.Error(w, "Forbidden - admin credential not configured", http.StatusForbidden)

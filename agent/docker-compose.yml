@@ -6,7 +6,7 @@ services:
       - SHAREBRIDGE_API_KEY=${SHAREBRIDGE_API_KEY}
       - SIGNALING_SERVER=${SIGNALING_SERVER:-wss://sharebridge.app}
       - UI_PORT=${UI_PORT:-7878}
-      - UI_ADDR=${UI_ADDR:-0.0.0.0}
+      - UI_ADDR=${UI_ADDR:-127.0.0.1}
       - UI_PASSWORD=${UI_PASSWORD:-}
       - IMMICH_URL=${IMMICH_URL:-}
       - IMMICH_ALLOWED_HOST=${IMMICH_ALLOWED_HOST:-}

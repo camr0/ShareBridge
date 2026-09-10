@@ -30,7 +30,8 @@
                             {{if .EnvManaged.APIKey}}disabled aria-describedby="api-key-managed"{{end}}>
                         <button type="button"
                             {{if .EnvManaged.APIKey}}disabled{{end}}
-                            onclick="var inp=document.getElementById('api-key'); inp.type=inp.type==='password'?'text':'password'; this.textContent=inp.type==='password'?'Show':'Hide'">
+                            data-target="api-key" data-secret="api_key" data-mask="{{.Config.APIKey}}"
+                            onclick="sbToggleSecret(this)">
                             Show
                         </button>
                     </div>
@@ -145,7 +146,13 @@
                 <td>
                     <span id="ext-api-key">{{.Config.AgentAPIKey}}</span>
                     <button type="button"
-                        onclick="navigator.clipboard.writeText(document.getElementById('ext-api-key').textContent).then(() => { this.textContent='Copied!'; setTimeout(() => this.textContent='Copy', 2000); })">
+                        data-target="ext-api-key" data-secret="agent_api_key" data-mask="{{.Config.AgentAPIKey}}"
+                        onclick="sbToggleSecret(this)">
+                        Show
+                    </button>
+                    <button type="button"
+                        data-secret="agent_api_key"
+                        onclick="sbCopySecret(this)">
                         Copy
                     </button>
                 </td>
@@ -153,4 +160,39 @@
         </tbody>
     </table>
 </article>
+
+<script>
+// Secrets are never embedded in the page HTML; they are fetched from the
+// admin-authenticated reveal endpoint only when the user explicitly asks.
+function sbToggleSecret(btn) {
+    var el = document.getElementById(btn.dataset.target);
+    if (btn.dataset.shown === '1') {
+        if (el.tagName === 'INPUT') { el.value = btn.dataset.mask; el.type = 'password'; }
+        else { el.textContent = btn.dataset.mask; }
+        btn.dataset.shown = '0';
+        btn.textContent = 'Show';
+        return;
+    }
+    fetch('/api/settings/secrets', { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+        .then(function (data) {
+            var v = data[btn.dataset.secret] || '';
+            if (el.tagName === 'INPUT') { el.value = v; el.type = 'text'; }
+            else { el.textContent = v; }
+            btn.dataset.shown = '1';
+            btn.textContent = 'Hide';
+        })
+        .catch(function () { btn.textContent = 'Show'; });
+}
+function sbCopySecret(btn) {
+    fetch('/api/settings/secrets', { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+        .then(function (data) { return navigator.clipboard.writeText(data[btn.dataset.secret] || ''); })
+        .then(function () {
+            btn.textContent = 'Copied!';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 2000);
+        })
+        .catch(function () { btn.textContent = 'Copy'; });
+}
+</script>
 {{end}}

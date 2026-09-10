@@ -171,7 +171,18 @@ The home server runs the agent from Docker via `agent/redeploy.sh`
    SIGNALING_SERVER=ws://<vps-host>:8080
    SHAREBRIDGE_API_KEY=<from the --bootstrap env file>
    CONNECT_ALLOWED_ORIGIN=http://<vps-host>:8080
+   UI_ADDR=127.0.0.1
+   # UI_PASSWORD=<admin UI password — required iff UI_ADDR is non-loopback>
    ```
+
+   The agent admin UI is **loopback-only by default** (`UI_ADDR` defaults to
+   `127.0.0.1`). Because `agent/docker-compose.yml` uses
+   `network_mode: host`, that means the UI is reachable only from the home
+   server itself. Binding it to a non-loopback address (`0.0.0.0`, a LAN IP,
+   a hostname) requires `UI_PASSWORD`: without it the agent **refuses to
+   start**. See `docs/operations/agent-admin-ui-security.md` for the full
+   posture, the breaking-change note and the TLS/tunnel guidance before
+   exposing the UI beyond the host.
 
    `CONNECT_ALLOWED_ORIGIN` must be the **exact** interstitial origin of the
    test deployment (`http://<vps-host>:8080`): the agent’s `/connect` CORS

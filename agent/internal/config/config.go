@@ -33,7 +33,7 @@ type Config struct {
 	DefaultMaxDownloads int    `json:"default_max_downloads"` // 0 = unlimited, default: 10
 	DefaultRelayOnly    bool   `json:"default_relay_only"`
 	UIPort              int    `json:"ui_port"`           // default: 7878
-	UIAddr              string `json:"ui_addr,omitempty"` // default: 0.0.0.0
+	UIAddr              string `json:"ui_addr,omitempty"` // default: 127.0.0.1 (loopback only)
 	UIPassword          string `json:"ui_password,omitempty"`
 	BaseDomain          string `json:"base_domain,omitempty"` // content base domain for direct/relay origins
 
@@ -240,7 +240,10 @@ func (m *Manager) load() (*Config, error) {
 		cfg.ImmichPollInterval = 30
 	}
 	if cfg.UIAddr == "" {
-		cfg.UIAddr = "0.0.0.0"
+		// Secure by default: an unset address binds loopback only. Any
+		// non-loopback bind is an explicit opt-in and requires UI_PASSWORD
+		// (enforced by ValidateAdminBind at startup).
+		cfg.UIAddr = defaultUIAddr
 	}
 	if cfg.TunnelDataDir == "" {
 		cfg.TunnelDataDir = filepath.Join(filepath.Dir(m.filePath), "tunnel")
@@ -267,6 +270,69 @@ func (m *Manager) load() (*Config, error) {
 	// bundle, and the direct path never depends on it.
 
 	return cfg, nil
+}
+
+// defaultUIAddr is the secure default bind for the admin UI: loopback only,
+// so a fresh deployment is never reachable off-host.
+const defaultUIAddr = "127.0.0.1"
+
+// NormalizeUIAddr returns addr with the secure default applied when it is
+// empty, so an unset address never means "all interfaces" (which is what a
+// bare ":port" listen address would do).
+func NormalizeUIAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return defaultUIAddr
+	}
+	return addr
+}
+
+// IsLoopbackAddr reports whether addr refers only to the local host. It treats
+// 127.0.0.0/8, ::1 and localhost (with or without a port) as loopback; an
+// empty address normalizes to the loopback default. Anything else — including
+// 0.0.0.0 and :: — is not loopback.
+func IsLoopbackAddr(addr string) bool {
+	a := NormalizeUIAddr(addr)
+	if host, _, err := net.SplitHostPort(a); err == nil {
+		a = host
+	}
+	a = strings.Trim(strings.TrimSpace(a), "[]")
+	if a == "" {
+		return false
+	}
+	if strings.EqualFold(a, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(a)
+	return ip != nil && ip.IsLoopback()
+}
+
+// ValidateAdminBind enforces the fail-closed startup rule for the admin UI: a
+// non-loopback bind with no configured password is refused, because it would
+// expose an unauthenticated admin surface (settings, share create/revoke,
+// secret rendering) to the network. Loopback binds stay passwordless (local
+// trust), and any bind is allowed once a password is set. The error names both
+// settings so the fix is actionable.
+func ValidateAdminBind(addr, password string) error {
+	if password != "" {
+		return nil
+	}
+	if IsLoopbackAddr(addr) {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to start: UI_ADDR=%q binds a non-loopback interface but UI_PASSWORD is empty; "+
+			"set UI_PASSWORD to require authentication or set UI_ADDR=%s to serve the admin UI on loopback only",
+		NormalizeUIAddr(addr), defaultUIAddr)
+}
+
+// ValidateAdminBind applies ValidateAdminBind to the configuration's admin
+// bind address and password.
+func (c *Config) ValidateAdminBind() error {
+	if c == nil {
+		return nil
+	}
+	return ValidateAdminBind(c.UIAddr, c.UIPassword)
 }
 
 // defaultConnectAllowedOrigin is the production interstitial origin (§9.3);
@@ -406,6 +472,7 @@ func Load() *Config {
 			APIKey:       getEnv("SHAREBRIDGE_API_KEY", ""),
 			AllowedHost:  getEnv("ALLOWED_SHAREBRIDGE_HOST", ""),
 			UIPort:       getEnvInt("UI_PORT", 7878),
+			UIAddr:       getEnv("UI_ADDR", defaultUIAddr),
 			UIPassword:   getEnv("UI_PASSWORD", ""),
 		}
 	}

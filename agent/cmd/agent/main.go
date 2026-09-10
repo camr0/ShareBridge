@@ -56,6 +56,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("API key required — set in config.json or SHAREBRIDGE_API_KEY env var")
 	}
 
+	// Fail closed before anything starts: an explicit non-loopback admin bind
+	// without a credential would expose the admin surface unauthenticated.
+	uiAddr := cfg.UIAddr
+	uiPassword := cfg.UIPassword
+	if uiPassword == "" {
+		uiPassword = password // Allow CLI override
+	}
+	if err := config.ValidateAdminBind(uiAddr, uiPassword); err != nil {
+		return err
+	}
+
 	// Create store
 	st, err := store.New()
 	if err != nil {
@@ -69,12 +80,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create web server
-	uiAddr := cfg.UIAddr
 	uiPort := cfg.UIPort
-	uiPassword := cfg.UIPassword
-	if uiPassword == "" {
-		uiPassword = password // Allow CLI override
-	}
 
 	webServer, err := web.NewWebServer(nil, uiAddr, uiPort, uiPassword)
 	if err != nil {

@@ -353,7 +353,13 @@ func (ws *WebServer) saveSettingsHandler(w http.ResponseWriter, r *http.Request)
 		currentCfg.SignalingURL = r.FormValue("signaling_url")
 	}
 	if os.Getenv("SHAREBRIDGE_API_KEY") == "" {
-		currentCfg.APIKey = r.FormValue("api_key")
+		// The form renders the masked placeholder for an unchanged key; only a
+		// real (user-supplied) value may overwrite it. An explicitly cleared
+		// field (empty string) still clears the key, preserving the prior
+		// behavior.
+		if v := r.FormValue("api_key"); v != maskedSecret {
+			currentCfg.APIKey = v
+		}
 	}
 	if os.Getenv("ALLOWED_SHAREBRIDGE_HOST") == "" {
 		currentCfg.AllowedHost = r.FormValue("allowed_host")
@@ -388,6 +394,25 @@ func (ws *WebServer) saveSettingsHandler(w http.ResponseWriter, r *http.Request)
 	// Return success message as HTML
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(`<div class="success"><p>Settings saved successfully!</p></div>`))
+}
+
+// settingsSecretsHandler returns the configured API keys so the settings page
+// can reveal them on explicit user action instead of embedding raw secrets in
+// the page HTML. It is registered behind the same admin-auth middleware as
+// every other admin surface (and never cached).
+func (ws *WebServer) settingsSecretsHandler(w http.ResponseWriter, r *http.Request) {
+	response := map[string]string{"api_key": "", "agent_api_key": ""}
+	if ws.daemon != nil {
+		if c := ws.daemon.GetConfig(); c != nil {
+			response["api_key"] = c.APIKey
+			response["agent_api_key"] = c.AgentAPIKey
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, fmt.Sprintf("encode JSON: %v", err), http.StatusInternalServerError)
+	}
 }
 
 // formatExpiry returns a human-readable expiry string.
