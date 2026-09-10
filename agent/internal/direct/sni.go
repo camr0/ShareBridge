@@ -59,10 +59,14 @@ type Binder struct {
 	directSuffix string
 	relaySuffix  string
 	active       map[string]Binding
-	// gen is the monotonic Binder generation counter. Every Allow/AllowShare/
-	// Revoke/RevokeShare advances it and every installed entry stamps the new
-	// value, so Revalidate can tell an unchanged entry from one that was
-	// withdrawn and re-installed (even with identical origin/route/code).
+	// gen is the monotonic Binder generation counter. Allow and AllowShare
+	// advance it only when they actually change an admission, and
+	// Revoke/RevokeShare always do; every installed entry stamps the new value,
+	// so Revalidate can tell an unchanged entry from one that was withdrawn and
+	// re-installed (even with identical origin/route/code). An identical,
+	// already-active admission is a no-op that PRESERVES its generation —
+	// re-registering a share on a routine reconnect must not invalidate the
+	// requests already admitted from it.
 	gen uint64
 
 	// testHookBeforeAllow is a one-shot test seam: when set, the first Allow or
@@ -93,9 +97,24 @@ func (b *Binder) routeKindFor(host string) (RouteKind, bool) {
 	}
 }
 
+// sameAdmission reports whether two Binder entries authorize the IDENTICAL
+// admission: same origin, same route kind, same share code. The generation
+// (epoch) is deliberately NOT part of the comparison — preserving it for an
+// unchanged admission is the whole point: a routine re-registration must not
+// invalidate in-flight requests that were admitted from the entry.
+func sameAdmission(a, b Binding) bool {
+	return a.Origin == b.Origin && a.RouteKind == b.RouteKind && a.ShareCode == b.ShareCode
+}
+
 // Allow registers an origin→share binding. It refuses origins outside the
 // agent's two namespaces and refuses a route kind that does not match the
 // origin's namespace (belt-and-suspenders; the request path re-checks too).
+//
+// Allow is IDEMPOTENT for an unchanged active admission: re-allowing the exact
+// same origin/route/code is a no-op that preserves the generation, so an
+// in-flight request admitted from the entry keeps revalidating. The generation
+// advances only when the admission actually changes (a different code — or a
+// changed origin, which lands on a different entry) and on every revocation.
 func (b *Binder) Allow(origin string, kind RouteKind, shareCode string) error {
 	host := normalizeHost(origin)
 	if !validHostname(host) {
@@ -110,9 +129,18 @@ func (b *Binder) Allow(origin string, kind RouteKind, shareCode string) error {
 	}
 	b.runBeforeAllowHook()
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	candidate := Binding{Origin: host, RouteKind: kind, ShareCode: shareCode}
+	if cur, ok := b.active[host]; ok && sameAdmission(cur, candidate) {
+		// Unchanged re-registration (e.g. the WS-reconnect path): keep the
+		// entry and its generation. Advancing the epoch here would fail every
+		// in-flight request admitted from this entry (Revalidate compares the
+		// entry, epoch included) and tear down live connections.
+		return nil
+	}
 	b.gen++
-	b.active[host] = Binding{Origin: host, RouteKind: kind, ShareCode: shareCode, epoch: b.gen}
-	b.mu.Unlock()
+	candidate.epoch = b.gen
+	b.active[host] = candidate
 	return nil
 }
 
@@ -152,6 +180,13 @@ func (b *Binder) RelayOriginFor(directOrigin string) (string, error) {
 // origin (malformed, foreign namespace, or mismatched route kind) leaves the
 // binder state completely untouched. The request path independently
 // re-authorizes Host + route kind + code per connection (§6).
+//
+// Like Allow, AllowShare is IDEMPOTENT for an unchanged active PAIR: when both
+// §6 entries already exist with the identical origin/route/code (the pair the
+// caller would install), the call is a no-op that preserves the generation, so
+// a routine re-registration cannot invalidate the pair's in-flight requests.
+// An incomplete or differing pair is a genuine change: the generation advances
+// once and BOTH entries are restamped with it.
 func (b *Binder) AllowShare(directOrigin, relayOrigin, shareCode string) error {
 	directHost := normalizeHost(directOrigin)
 	relayHost := normalizeHost(relayOrigin)
@@ -169,10 +204,21 @@ func (b *Binder) AllowShare(directOrigin, relayOrigin, shareCode string) error {
 	}
 	b.runBeforeAllowHook()
 	b.mu.Lock()
+	defer b.mu.Unlock()
+	direct := Binding{Origin: directHost, RouteKind: RouteDirect, ShareCode: shareCode}
+	relay := Binding{Origin: relayHost, RouteKind: RouteRelay, ShareCode: shareCode}
+	curDirect, okDirect := b.active[directHost]
+	curRelay, okRelay := b.active[relayHost]
+	if okDirect && okRelay && sameAdmission(curDirect, direct) && sameAdmission(curRelay, relay) {
+		// Unchanged re-registration of the pair: keep both entries and their
+		// generation (see Allow).
+		return nil
+	}
 	b.gen++
-	b.active[directHost] = Binding{Origin: directHost, RouteKind: RouteDirect, ShareCode: shareCode, epoch: b.gen}
-	b.active[relayHost] = Binding{Origin: relayHost, RouteKind: RouteRelay, ShareCode: shareCode, epoch: b.gen}
-	b.mu.Unlock()
+	direct.epoch = b.gen
+	relay.epoch = b.gen
+	b.active[directHost] = direct
+	b.active[relayHost] = relay
 	return nil
 }
 

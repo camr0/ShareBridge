@@ -82,8 +82,10 @@ type DirectServer struct {
 	// Handler runs it after Binder authorization and before the admitted
 	// binding is committed to the connection. Tests use it to land a
 	// revocation exactly in the authorization→registration window (audit
-	// Critical #3) deterministically, without sleeping.
+	// Critical #3) deterministically, without sleeping. It is claimed (and
+	// cleared) by the first authorized request, so it is genuinely one-shot.
 	testHookAfterAuthorize func()
+	testHookMu             sync.Mutex
 
 	// conns is the connection registry: each raw net.Conn mapped to its
 	// per-connection *connState carrying the Binder-admitted route/origin/share
@@ -117,11 +119,28 @@ func NewDirectServerWithBinder(namespace, baseDomain string, port SessionTracker
 
 func (s *DirectServer) Binder() *Binder { return s.binder }
 
-// SetTestHookAfterAuthorize installs a one-shot test seam invoked after Binder
+// SetTestHookAfterAuthorize installs a ONE-SHOT test seam invoked after Binder
 // authorization and before the connection's binding is recorded. It exists so
 // cross-package tests can land a revocation in the authorization→registration
-// window; production never sets it.
-func (s *DirectServer) SetTestHookAfterAuthorize(fn func()) { s.testHookAfterAuthorize = fn }
+// window; production never sets it. The first authorized request claims and
+// clears the seam (see claimTestHookAfterAuthorize), so later requests do not
+// run it.
+func (s *DirectServer) SetTestHookAfterAuthorize(fn func()) {
+	s.testHookMu.Lock()
+	s.testHookAfterAuthorize = fn
+	s.testHookMu.Unlock()
+}
+
+// claimTestHookAfterAuthorize returns the installed seam and clears it in one
+// step, making the seam genuinely one-shot: only the request that claims it
+// runs it, even when several requests are in flight.
+func (s *DirectServer) claimTestHookAfterAuthorize() func() {
+	s.testHookMu.Lock()
+	fn := s.testHookAfterAuthorize
+	s.testHookAfterAuthorize = nil
+	s.testHookMu.Unlock()
+	return fn
+}
 
 // SetConnectAllowedOrigin overrides the construction-time resolved allowed
 // origin. The daemon calls it when building the server so the resolved
@@ -211,8 +230,8 @@ func (s *DirectServer) Handler() http.Handler {
 			return
 		}
 		cs := connStateFromContext(r.Context())
-		if s.testHookAfterAuthorize != nil {
-			s.testHookAfterAuthorize()
+		if fn := s.claimTestHookAfterAuthorize(); fn != nil {
+			fn()
 		}
 		// Commit the admitted binding to the connection FIRST, so the T29
 		// close-by-share scan can find a connection whose request passed

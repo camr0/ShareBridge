@@ -644,6 +644,13 @@ func (d *Daemon) directShareAuthorized(shareID string, kind direct.RouteKind) bo
 // It reports the installed pair and whether the binding succeeded; it is a
 // no-op (ok=false) until the binder exists (namespace known) or the direct
 // origin is empty/undervivable.
+//
+// Re-binding an UNCHANGED pair is idempotent: the Binder keeps the pair's
+// generation, so in-flight requests admitted from it survive the routine
+// reconnect path that re-registers every persisted share. A pair that
+// actually changes (a different origin, or a route-kind change) supersedes the
+// recorded binding, which is withdrawn first so the superseded admission fails
+// closed.
 func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 	ds := d.direct
 	if ds == nil || directOrigin == "" {
@@ -680,6 +687,24 @@ func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 		ds.origins[code] = pair
 		return pair, true
 	}
+	// A re-bind that CHANGES the admission for this code supersedes the recorded
+	// one: withdraw the old pair (and any relay-only binding the code used to
+	// have) before installing the replacement, so an in-flight request admitted
+	// from the superseded entry fails Revalidate and the recorded state always
+	// matches what the Binder admits. An UNCHANGED re-bind falls through to the
+	// Binder's own idempotency check, which preserves the generation — a routine
+	// WS reconnect re-registers every persisted share and must not tear down
+	// live transfers (M4 B2b fix round).
+	if prev, ok := ds.origins[code]; ok && prev != pair {
+		binder.RevokeShare(prev.directOrigin, prev.relayOrigin)
+		delete(ds.origins, code)
+	}
+	if prevRelay, ok := ds.relayOrigins[code]; ok {
+		// The code was relay-only and is now a direct pair: a route-kind change,
+		// so the single relay binding must not survive alongside the pair.
+		binder.Revoke(prevRelay)
+		delete(ds.relayOrigins, code)
+	}
 	if err := binder.AllowShare(directOrigin, relayOrigin, code); err != nil {
 		log.Printf("bind origins for share %s: %v", code, err)
 		return originPair{}, false
@@ -708,6 +733,11 @@ func (d *Daemon) bindOrigin(code, directOrigin string) (originPair, bool) {
 // reports the installed relay origin and whether the binding succeeded; it
 // is a no-op (ok=false) until the binder exists or the direct origin is
 // empty/undervivable.
+//
+// Like bindOrigin, re-binding the UNCHANGED relay origin is idempotent (the
+// Binder preserves the generation, so a routine reconnect does not invalidate
+// in-flight requests), while a changed relay origin — or a route-kind change
+// from a direct pair — withdraws the superseded binding first.
 func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 	ds := d.direct
 	if ds == nil || directOrigin == "" {
@@ -746,6 +776,20 @@ func (d *Daemon) bindRelayOnlyOrigin(code, directOrigin string) (string, bool) {
 		ds.relayOrigins[code] = relayOrigin
 		delete(ds.pendingRelayBinds, code)
 		return relayOrigin, true
+	}
+	// See bindOrigin: a changed relay-only binding (or a route-kind change from
+	// a recorded direct pair) supersedes the previous admission, which is
+	// withdrawn first. An identical re-bind is left to the Binder's idempotency
+	// check and keeps the generation.
+	if prev, ok := ds.relayOrigins[code]; ok && prev != relayOrigin {
+		binder.Revoke(prev)
+		delete(ds.relayOrigins, code)
+	}
+	if prevPair, ok := ds.origins[code]; ok {
+		// The code was a direct pair and is now relay-only: a route-kind change,
+		// so the §6 pair must not survive.
+		binder.RevokeShare(prevPair.directOrigin, prevPair.relayOrigin)
+		delete(ds.origins, code)
 	}
 	if err := binder.Allow(relayOrigin, direct.RouteRelay, code); err != nil {
 		log.Printf("bind relay origin for share %s: %v", code, err)
