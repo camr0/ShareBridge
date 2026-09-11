@@ -32,8 +32,7 @@ const (
 const (
 	contentTypeHandshake = 0x16
 
-	maxRecordBody            = 1 << 14                                                   // TLSPlaintext length MUST NOT exceed 2^14
-	maxMessageBytes          = MaxBufferedBytes - recordHeaderSize + handshakeHeaderSize // declared length + handshake header
+	maxRecordBody            = 1 << 14 // TLSPlaintext length MUST NOT exceed 2^14
 	recordHeaderSize         = 5
 	handshakeTypeClientHello = 0x01
 	handshakeHeaderSize      = 4
@@ -57,6 +56,12 @@ var (
 	ErrTooLarge = errors.New("clienthello: ClientHello exceeds 64 KiB inspection budget")
 	// ErrTimeout covers the 5-second read deadline expiring.
 	ErrTimeout = errors.New("clienthello: ClientHello read timed out")
+	// ErrInvalidBound covers a PeekWithBounds request whose byte budget lies
+	// outside the parser's supported 1..MaxBufferedBytes range, or whose read
+	// deadline is not positive. The §14 limits configuration rejects such
+	// values at startup; the parser refuses them too rather than silently
+	// falling back to a default (defense in depth).
+	ErrInvalidBound = errors.New("clienthello: invalid inspection bound")
 )
 
 // Hello is a parsed ClientHello peek. Prefix is an owned copy of every byte
@@ -78,7 +83,7 @@ var scratchPool = sync.Pool{
 	},
 }
 
-// Peek reads the ClientHello from conn within the spec §14 bounds (64 KiB
+// Peek reads the ClientHello from conn within the spec §14 defaults (64 KiB
 // inspected, 5 seconds overall) and returns the normalized exact SNI plus
 // the inspected prefix.
 //
@@ -90,7 +95,31 @@ func Peek(conn net.Conn) (*Hello, error) {
 	return peek(conn, ReadTimeout)
 }
 
+// PeekWithBounds is Peek with operator-selected §14 bounds: it inspects at
+// most maxBytes (1..MaxBufferedBytes) within at most readTimeout. The
+// configured §14 limits drive the gateway through this entry point, so a
+// lowered hello byte budget or read deadline is a real, enforced bound rather
+// than an inert configuration field. A non-positive or over-budget value
+// fails closed with ErrInvalidBound instead of silently using the default.
+func PeekWithBounds(conn net.Conn, maxBytes int, readTimeout time.Duration) (*Hello, error) {
+	if maxBytes <= 0 || maxBytes > MaxBufferedBytes {
+		return nil, fmt.Errorf("clienthello: inspection budget %d outside 1..%d: %w", maxBytes, MaxBufferedBytes, ErrInvalidBound)
+	}
+	if readTimeout <= 0 {
+		return nil, fmt.Errorf("clienthello: read deadline %v is not positive: %w", readTimeout, ErrInvalidBound)
+	}
+	return peekWithBounds(conn, maxBytes, readTimeout)
+}
+
+// peek runs the parser at the default §14 budget.
 func peek(conn net.Conn, readTimeout time.Duration) (*Hello, error) {
+	return peekWithBounds(conn, MaxBufferedBytes, readTimeout)
+}
+
+// peekWithBounds is the shared parse body. maxBytes is the inspected-prefix
+// ceiling and drives the message budget proportionally, so a smaller operator
+// budget cannot be circumvented by a large declared handshake length.
+func peekWithBounds(conn net.Conn, maxBytes int, readTimeout time.Duration) (*Hello, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 		return nil, fmt.Errorf("clienthello: set read deadline: %w", err)
 	}
@@ -99,9 +128,10 @@ func peek(conn net.Conn, readTimeout time.Duration) (*Hello, error) {
 	}()
 
 	scratch := scratchPool.Get().(*[2 * MaxBufferedBytes]byte)
-	prefix := scratch[:0:MaxBufferedBytes]
+	prefix := scratch[:0:maxBytes]
 	message := scratch[MaxBufferedBytes : MaxBufferedBytes : 2*MaxBufferedBytes]
-	inspected, reassembled, err := readClientHello(conn, prefix, message)
+	maxMessage := maxBytes - recordHeaderSize + handshakeHeaderSize
+	inspected, reassembled, err := readClientHello(conn, prefix, message, maxBytes, maxMessage)
 	var hello *Hello
 	if err == nil {
 		hello, err = assembleHello(inspected, reassembled)
@@ -128,13 +158,15 @@ func assembleHello(inspected, message []byte) (*Hello, error) {
 // appended to prefix verbatim (headers included) so the caller can replay the
 // exact stream; the message fragments are reassembled in order into message,
 // stripping the per-record framing. The handshake header travels with the
-// first record; later records contribute their full body.
-func readClientHello(conn io.Reader, prefix, message []byte) ([]byte, []byte, error) {
+// first record; later records contribute their full body. maxBytes bounds the
+// inspected prefix and maxMessage the reassembled message, so the configured
+// §14 budget is enforced at the read, before any large allocation.
+func readClientHello(conn io.Reader, prefix, message []byte, maxBytes, maxMessage int) ([]byte, []byte, error) {
 	messageLength := -1 // handshake message length from the header, once seen
 	messageBytes := 0   // handshake message bytes received so far
 	for {
 		var err error
-		prefix, err = readInto(conn, prefix, recordHeaderSize)
+		prefix, err = readInto(conn, prefix, recordHeaderSize, maxBytes)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -150,7 +182,7 @@ func readClientHello(conn io.Reader, prefix, message []byte) ([]byte, []byte, er
 			return nil, nil, fmt.Errorf("clienthello: record body of %d bytes exceeds the TLS maximum of %d: %w", recordLength, maxRecordBody, ErrMalformed)
 		}
 		bodyStart := len(prefix)
-		prefix, err = readInto(conn, prefix, recordLength)
+		prefix, err = readInto(conn, prefix, recordLength, maxBytes)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -168,14 +200,14 @@ func readClientHello(conn io.Reader, prefix, message []byte) ([]byte, []byte, er
 			}
 			// Reject oversized declarations before reading toward them so a
 			// hostile length can never drive allocation (spec §14).
-			if messageLength > maxMessageBytes-handshakeHeaderSize {
-				return nil, nil, fmt.Errorf("clienthello: handshake message of %d bytes exceeds the %d byte inspection budget: %w", messageLength, maxMessageBytes-handshakeHeaderSize, ErrTooLarge)
+			if messageLength > maxMessage-handshakeHeaderSize {
+				return nil, nil, fmt.Errorf("clienthello: handshake message of %d bytes exceeds the %d byte inspection budget: %w", messageLength, maxMessage-handshakeHeaderSize, ErrTooLarge)
 			}
 			messageBytes = len(body) - handshakeHeaderSize
 		} else {
 			messageBytes += len(body)
 		}
-		if message, err = appendMessage(message, body); err != nil {
+		if message, err = appendMessage(message, body, maxMessage); err != nil {
 			return nil, nil, err
 		}
 		if messageBytes == messageLength {
@@ -192,21 +224,21 @@ func readClientHello(conn io.Reader, prefix, message []byte) ([]byte, []byte, er
 // appendMessage appends reassembled message bytes, refusing to grow past the
 // fixed message budget. The capacity check keeps the pooled scratch array
 // from ever being reallocated.
-func appendMessage(message []byte, fragment []byte) ([]byte, error) {
-	if len(message)+len(fragment) > maxMessageBytes || len(message)+len(fragment) > cap(message) {
+func appendMessage(message []byte, fragment []byte, maxMessage int) ([]byte, error) {
+	if len(message)+len(fragment) > maxMessage || len(message)+len(fragment) > cap(message) {
 		return nil, ErrTooLarge
 	}
 	return append(message, fragment...), nil
 }
 
 // readInto appends want more bytes from conn to inspected, refusing to grow
-// past the fixed inspection budget. The capacity check keeps a pooled buffer
-// from ever being reallocated.
-func readInto(conn io.Reader, inspected []byte, want int) ([]byte, error) {
+// past the configured inspection budget. The capacity check keeps a pooled
+// buffer from ever being reallocated.
+func readInto(conn io.Reader, inspected []byte, want, maxBytes int) ([]byte, error) {
 	if want == 0 {
 		return inspected, nil
 	}
-	if len(inspected)+want > MaxBufferedBytes || len(inspected)+want > cap(inspected) {
+	if len(inspected)+want > maxBytes || len(inspected)+want > cap(inspected) {
 		return nil, ErrTooLarge
 	}
 	target := inspected[:len(inspected)+want]

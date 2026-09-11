@@ -26,6 +26,7 @@ import (
 
 	"sharebridge/relay/internal/frpplugin"
 	"sharebridge/relay/internal/gateway"
+	"sharebridge/relay/internal/limits"
 	"sharebridge/relay/internal/routes"
 )
 
@@ -54,6 +55,16 @@ const (
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
+	// Resolve every §14 operator bound before anything binds a socket: an
+	// invalid or over-ceiling value refuses startup instead of running with a
+	// silently wrong limit. The configuration drives both the resource
+	// limiter and the ClientHello parser bounds.
+	limitsConfig, err := configuredLimits()
+	if err != nil {
+		logger.Error("gateway: §14 limits configuration rejected", "error", err)
+		os.Exit(1)
+	}
+
 	pluginServer, pluginListenAddress, err := configuredPluginServer()
 	if err != nil {
 		logger.Error("gateway: FRP authorization plugin configuration rejected", "error", err)
@@ -80,7 +91,8 @@ func main() {
 	// until it exists a nil presence fails every public lookup closed. The
 	// plugin already emits credential-free facts through its injected seam.
 	routeTable := routes.NewTable(nil)
-	server := gateway.NewServer(routeTable, gateway.NewStreams(), gateway.WithLogger(logger))
+	server := gateway.NewServer(routeTable, gateway.NewStreams(),
+		gateway.WithLogger(logger), gateway.WithLimitsConfig(limitsConfig))
 	httpPluginServer := &http.Server{
 		Handler:           pluginServer,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -124,6 +136,14 @@ func main() {
 		logger.Error("gateway: FRP authorization plugin shutdown failed", "error", err)
 	}
 	logger.Info("gateway: stopped")
+}
+
+// configuredLimits resolves the §14 operator bounds from the process
+// environment. It is the gateway binary's single production configuration
+// entry point; an invalid or over-ceiling value is returned as an error so
+// main can refuse to start.
+func configuredLimits() (limits.Config, error) {
+	return limits.ConfigFromEnvironment(os.LookupEnv)
 }
 
 func configuredPluginServer() (*frpplugin.Server, string, error) {

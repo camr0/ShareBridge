@@ -3,6 +3,7 @@ package routes
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -433,6 +434,100 @@ func TestRouteTableCapsEntriesUnderFlood(t *testing.T) {
 	}
 	if err := table.Apply(testRoute("flood-next.relay.ns1.sharebridgeusercontent.com", 1)); !errors.Is(err, ErrRouteCapacity) {
 		t.Fatalf("Apply(new hostname after a tombstone) error = %v, want %v (tombstones retain their map slot)", err, ErrRouteCapacity)
+	}
+}
+
+// TestRouteTableSnapshotBoundsAllocationBeforeCap is the audit-I7 proof that
+// ReplaceSnapshot enforces the entry ceiling BEFORE building any
+// O(len(incoming)) map or slice: an oversized snapshot must not transiently
+// grow gateway memory while it is being discarded. The test compares the
+// bytes allocated for a 100k-entry snapshot against the bytes allocated for a
+// ceiling-sized snapshot on the same machine (self-calibrating against the
+// runtime and -race overhead). A pre-allocation bound keeps the ratio near 1;
+// the pre-fix code allocates the whole oversized map first and scales with the
+// input (≈18x at 100k, ~30 MiB vs ~1.6 MiB). Retention is checked too: the
+// cap still holds the lexicographically smallest ceiling-sized set, so the fix
+// changes only WHEN the cap applies, never the R4 snapshot semantics.
+func TestRouteTableSnapshotBoundsAllocationBeforeCap(t *testing.T) {
+	const ceiling = 4096
+
+	buildIncoming := func(count int) []Route {
+		incoming := make([]Route, count)
+		for i := range incoming {
+			incoming[i] = testRoute(fmt.Sprintf("snap-%06d.relay.ns1.sharebridgeusercontent.com", i), 1)
+		}
+		return incoming
+	}
+
+	measure := func(count int) (allocated uint64, table *Table, dropped []string) {
+		incoming := buildIncoming(count)
+		table = NewTable(newStubPresence(), WithMaxRoutes(ceiling))
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		dropped = table.ReplaceSnapshot(incoming)
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc, table, dropped
+	}
+
+	baselineBytes, baselineTable, _ := measure(ceiling)
+	if got := baselineTable.Len(); got != ceiling {
+		t.Fatalf("ceiling-sized snapshot retained %d entries, want %d", got, ceiling)
+	}
+
+	oversizeBytes, table, dropped := measure(100_000)
+	if got := table.Len(); got != ceiling {
+		t.Fatalf("oversized snapshot retained %d entries, want the independent table ceiling %d", got, ceiling)
+	}
+	// A freshly seeded table has no previously-live entries, so truncating an
+	// oversized incoming snapshot drops nothing; the omitted entries were
+	// simply never admitted.
+	if len(dropped) != 0 {
+		t.Fatalf("oversized snapshot on an empty table dropped %d hostnames, want none", len(dropped))
+	}
+	if oversizeBytes > 3*baselineBytes {
+		t.Fatalf("oversized snapshot allocated %d bytes vs %d for a ceiling-sized snapshot: the cap must be applied before any O(len(incoming)) allocation",
+			oversizeBytes, baselineBytes)
+	}
+
+	for i := 0; i < ceiling; i++ {
+		hostname := fmt.Sprintf("snap-%06d.relay.ns1.sharebridgeusercontent.com", i)
+		if _, ok := table.Peek(hostname); !ok {
+			t.Fatalf("snapshot entry %q missing; the first %d lexicographic hostnames must be retained", hostname, ceiling)
+		}
+	}
+	for _, index := range []int{ceiling, 50_000, 99_999} {
+		hostname := fmt.Sprintf("snap-%06d.relay.ns1.sharebridgeusercontent.com", index)
+		if _, ok := table.Peek(hostname); ok {
+			t.Fatalf("snapshot entry %q was admitted past the %d-entry ceiling", hostname, ceiling)
+		}
+	}
+}
+
+// TestRouteTableSnapshotUnderCapIsUnchanged pins the other half of the
+// pre-allocation bound: a snapshot at or below the ceiling keeps every entry
+// and its exact route value, so tightening when the cap applies did not change
+// the R4 snapshot contract for the normal (under-cap) case.
+func TestRouteTableSnapshotUnderCapIsUnchanged(t *testing.T) {
+	const ceiling = 16
+	table := NewTable(newStubPresence(), WithMaxRoutes(ceiling))
+
+	incoming := make([]Route, 0, ceiling)
+	for i := 0; i < ceiling; i++ {
+		incoming = append(incoming, testRoute(fmt.Sprintf("under-%02d.relay.ns1.sharebridgeusercontent.com", i), uint64(i+1)))
+	}
+	if dropped := table.ReplaceSnapshot(incoming); len(dropped) != 0 {
+		t.Fatalf("under-cap snapshot dropped %v, want none", dropped)
+	}
+	if got := table.Len(); got != ceiling {
+		t.Fatalf("under-cap snapshot retained %d entries, want all %d", got, ceiling)
+	}
+	for _, route := range incoming {
+		stored, ok := table.Peek(route.Hostname)
+		if !ok {
+			t.Fatalf("under-cap snapshot lost %q", route.Hostname)
+		}
+		assertRouteEqual(t, stored, route)
 	}
 }
 

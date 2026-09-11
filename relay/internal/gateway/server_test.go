@@ -821,6 +821,67 @@ func TestGatewayLimitsReleaseOnEveryRejectionPath(t *testing.T) {
 	})
 }
 
+// TestGatewayHelloParserUsesConfiguredHelloBounds is the audit-A2 behavioural
+// proof that the configured §14 limits actually drive the ClientHello parser.
+// The production default parser must enforce the limiter's MaxHelloBytes and
+// HelloTimeout; a parser pinned at 64 KiB/5 s would let an operator believe a
+// lowered hello budget was deployed when it was not enforced.
+func TestGatewayHelloParserUsesConfiguredHelloBounds(t *testing.T) {
+	hello := clientHelloRecord(relayRouteAlpha)
+
+	t.Run("lowered byte ceiling is enforced", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.MaxHelloBytes = len(hello) - 1
+		server := NewServer(routes.NewTable(nil), NewStreams(),
+			WithLogger(slog.New(slog.DiscardHandler)), WithLimiter(limits.NewLimiter(config)))
+		if got := server.limits.Config().MaxHelloBytes; got != len(hello)-1 {
+			t.Fatalf("limiter MaxHelloBytes = %d, want the configured %d", got, len(hello)-1)
+		}
+
+		gatewaySide, clientSide := net.Pipe()
+		t.Cleanup(func() { gatewaySide.Close(); clientSide.Close() })
+		go func() { _, _ = clientSide.Write(hello) }()
+		if _, err := server.parseHello(gatewaySide); !errors.Is(err, clienthello.ErrTooLarge) {
+			t.Fatalf("parseHello with a %d-byte ceiling error = %v, want %v", config.MaxHelloBytes, err, clienthello.ErrTooLarge)
+		}
+	})
+
+	t.Run("a sufficient byte ceiling still parses", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.MaxHelloBytes = len(hello)
+		server := NewServer(routes.NewTable(nil), NewStreams(),
+			WithLogger(slog.New(slog.DiscardHandler)), WithLimiter(limits.NewLimiter(config)))
+
+		gatewaySide, clientSide := net.Pipe()
+		t.Cleanup(func() { gatewaySide.Close(); clientSide.Close() })
+		go func() { _, _ = clientSide.Write(hello) }()
+		parsed, err := server.parseHello(gatewaySide)
+		if err != nil {
+			t.Fatalf("parseHello with a sufficient ceiling = %v, want nil", err)
+		}
+		if parsed.SNI != relayRouteAlpha {
+			t.Fatalf("parsed SNI = %q, want %q", parsed.SNI, relayRouteAlpha)
+		}
+	})
+
+	t.Run("lowered read deadline is enforced", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.HelloTimeout = 50 * time.Millisecond
+		server := NewServer(routes.NewTable(nil), NewStreams(),
+			WithLogger(slog.New(slog.DiscardHandler)), WithLimiter(limits.NewLimiter(config)))
+
+		gatewaySide, clientSide := net.Pipe()
+		t.Cleanup(func() { gatewaySide.Close(); clientSide.Close() })
+		started := time.Now()
+		if _, err := server.parseHello(gatewaySide); !errors.Is(err, clienthello.ErrTimeout) {
+			t.Fatalf("parseHello with a %v deadline error = %v, want %v", config.HelloTimeout, err, clienthello.ErrTimeout)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("parseHello waited %v, ignoring the configured %v hello deadline", elapsed, config.HelloTimeout)
+		}
+	})
+}
+
 // TestGatewayLimitsAdmitBeforeHelloParseAndBoundPreParseWork is the audit I7
 // proof: a connection is admitted against the global and per-source-IP
 // ceilings BEFORE any handler goroutine is spawned and before the 128 KiB

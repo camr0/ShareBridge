@@ -296,23 +296,24 @@ func (table *Table) ReplaceSnapshotFromNewEpoch(incoming []Route) (dropped []str
 // replaceSnapshot is the shared atomic-replacement body. Caller chooses
 // whether stored revisions survive (same-epoch re-push) or not (new-epoch
 // wholesale authority). Caller holds no locks.
+//
+// The entry ceiling is applied BEFORE any per-entry allocation (audit I7):
+// normalizedSnapshotHosts streams the incoming snapshot against the ceiling,
+// so an oversized snapshot can never transiently grow gateway memory
+// O(len(incoming)). The retained set is exactly the lexicographically
+// smallest maxRoutes hostnames — the same set the previous "build every
+// entry, then sort and truncate" code committed — so the R4 snapshot
+// semantics are unchanged; only WHEN the cap applies moved earlier.
 func (table *Table) replaceSnapshot(incoming []Route, fromNewEpoch bool) (dropped []string) {
-	nextHost := make(map[string]Route, len(incoming))
-	nextLeases := make(map[string]time.Time, len(incoming))
-	for _, route := range incoming {
-		hostname, err := normalizeHostname(route.Hostname)
-		if err != nil {
-			continue
-		}
-		route.Hostname = hostname
-		nextHost[hostname] = route
-	}
+	nextHost := table.normalizedSnapshotHosts(incoming)
 
 	table.mu.Lock()
 	now := table.now()
 	// Resolve stale entries against the stored state before anything is
 	// committed: a superseded incoming entry keeps the stored route — within
-	// the same epoch only (a newer epoch's snapshot replaces wholesale).
+	// the same epoch only (a newer epoch's snapshot replaces wholesale). The
+	// merge only substitutes values for keys already retained, so it can never
+	// push nextHost past the ceiling.
 	if !fromNewEpoch {
 		for hostname, stored := range table.byHost {
 			arrival, ok := nextHost[hostname]
@@ -320,27 +321,9 @@ func (table *Table) replaceSnapshot(incoming []Route, fromNewEpoch bool) (droppe
 				continue
 			}
 			nextHost[hostname] = stored
-			if stored.Active {
-				nextLeases[hostname] = now.Add(RouteLeaseTTL) // the snapshot re-affirmed it
-			}
 		}
 	}
-	// Enforce the entry ceiling before the snapshot commits (audit I7).
-	// Control's Task 11 validator already bounds a snapshot at 4096; this is
-	// independent defense in depth. Entries beyond the ceiling are omitted
-	// deterministically by lexicographic hostname order — a fail-closed drop
-	// (the omitted routes stop routing and are reported in the dropped set),
-	// never a random partial subset.
-	if len(nextHost) > table.maxRoutes {
-		allHostnames := make([]string, 0, len(nextHost))
-		for hostname := range nextHost {
-			allHostnames = append(allHostnames, hostname)
-		}
-		sort.Strings(allHostnames)
-		for _, hostname := range allHostnames[table.maxRoutes:] {
-			delete(nextHost, hostname)
-		}
-	}
+	nextLeases := make(map[string]time.Time, len(nextHost))
 	for hostname, route := range nextHost {
 		if route.Active {
 			nextLeases[hostname] = now.Add(RouteLeaseTTL)
@@ -361,6 +344,96 @@ func (table *Table) replaceSnapshot(incoming []Route, fromNewEpoch bool) (droppe
 	table.mu.Unlock()
 	sort.Strings(dropped)
 	return dropped
+}
+
+// normalizedSnapshotHosts normalizes and deduplicates an incoming snapshot,
+// retaining at most table.maxRoutes distinct hostnames: the lexicographically
+// smallest ones, with the last route seen winning for a duplicate. It is the
+// pre-allocation form of the audit-I7 ceiling: the route map, the retained
+// hostname heap, and every intermediate structure are bounded by maxRoutes
+// regardless of len(incoming), so a snapshot of any size cannot grow memory in
+// proportion to its length before truncation. The fast path (snapshot already
+// within the ceiling) is the plain bounded map; the bounded path never
+// allocates per discarded entry.
+func (table *Table) normalizedSnapshotHosts(incoming []Route) map[string]Route {
+	limit := table.maxRoutes
+	if len(incoming) <= limit {
+		nextHost := make(map[string]Route, len(incoming))
+		for _, route := range incoming {
+			hostname, err := normalizeHostname(route.Hostname)
+			if err != nil {
+				continue
+			}
+			route.Hostname = hostname
+			nextHost[hostname] = route
+		}
+		return nextHost
+	}
+
+	nextHost := make(map[string]Route, limit)
+	// retained is a max-heap over the retained hostnames, so evicting the
+	// current lexicographic maximum is O(log limit) and memory stays at the
+	// ceiling.
+	retained := make([]string, 0, limit)
+	for _, route := range incoming {
+		hostname, err := normalizeHostname(route.Hostname)
+		if err != nil {
+			continue
+		}
+		route.Hostname = hostname
+		if _, ok := nextHost[hostname]; ok {
+			nextHost[hostname] = route
+			continue
+		}
+		if len(retained) < limit {
+			nextHost[hostname] = route
+			retained = append(retained, hostname)
+			heapSiftUp(retained, len(retained)-1)
+			continue
+		}
+		if hostname >= retained[0] {
+			// Sorts at or after the largest retained hostname, so it can never
+			// belong to the smallest-limit set: drop it without allocating.
+			continue
+		}
+		delete(nextHost, retained[0])
+		retained[0] = hostname
+		nextHost[hostname] = route
+		heapSiftDown(retained, 0)
+	}
+	return nextHost
+}
+
+// heapSiftUp restores the max-heap invariant after a value is appended at
+// index.
+func heapSiftUp(heap []string, index int) {
+	for index > 0 {
+		parent := (index - 1) / 2
+		if heap[parent] >= heap[index] {
+			return
+		}
+		heap[parent], heap[index] = heap[index], heap[parent]
+		index = parent
+	}
+}
+
+// heapSiftDown restores the max-heap invariant after the root is replaced.
+func heapSiftDown(heap []string, index int) {
+	for {
+		left := 2*index + 1
+		if left >= len(heap) {
+			return
+		}
+		largest := left
+		if right := left + 1; right < len(heap) && heap[right] > heap[largest] {
+			largest = right
+		}
+		if heap[index] >= heap[largest] {
+			return
+		}
+		heap[index], heap[largest] = heap[largest], heap[index]
+		index = largest
+	}
 }
 
 // Lookup resolves an exact relay hostname — already normalized by the
@@ -430,10 +503,16 @@ func normalizeHostname(hostname string) (string, error) {
 	if len(normalized) > maxHostnameBytes {
 		return "", fmt.Errorf("routes: relay hostname %q exceeds %d bytes: %w", hostname, maxHostnameBytes, ErrInvalidHostname)
 	}
-	for _, label := range strings.Split(normalized, ".") {
+	labelStart := 0
+	for index := 0; index <= len(normalized); index++ {
+		if index != len(normalized) && normalized[index] != '.' {
+			continue
+		}
+		label := normalized[labelStart:index]
 		if err := validateLabel(label); err != nil {
 			return "", fmt.Errorf("routes: relay hostname %q has an invalid label %q: %w", hostname, label, err)
 		}
+		labelStart = index + 1
 	}
 	return normalized, nil
 }

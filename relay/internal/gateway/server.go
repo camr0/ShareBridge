@@ -70,12 +70,13 @@ type dialFunc func(ctx context.Context, network, address string) (net.Conn, erro
 // takes one, Close stops it, and Wait drains the accepted connections. Safe
 // for concurrent use.
 type Server struct {
-	routes     *routes.Table
-	streams    *Streams
-	limits     *limits.Limiter
-	parseHello helloParseFunc
-	dial       dialFunc
-	logger     *slog.Logger
+	routes       *routes.Table
+	streams      *Streams
+	limits       *limits.Limiter
+	limitsConfig *limits.Config
+	parseHello   helloParseFunc
+	dial         dialFunc
+	logger       *slog.Logger
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -90,8 +91,9 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(server *Server) { server.logger = logger }
 }
 
-// WithHelloParser overrides ClientHello extraction (default clienthello.Peek).
-// Tests use it to shorten the read budget; production code should not.
+// WithHelloParser overrides ClientHello extraction (default: the configured
+// §14 bounds via clienthello.PeekWithBounds). Tests use it to substitute
+// shorter budgets; production code should not.
 func WithHelloParser(parse helloParseFunc) Option {
 	return func(server *Server) { server.parseHello = parse }
 }
@@ -104,8 +106,8 @@ func WithDialer(dial dialFunc) Option {
 
 // WithLimiter installs the §14 resource limiter (default: DefaultConfig with
 // a logger-backed saturation alert). Tests install small ceilings to prove
-// enforcement deterministically; production code may pass operator-tuned
-// bounds.
+// enforcement deterministically; an explicit limiter wins over
+// WithLimitsConfig.
 func WithLimiter(limiter *limits.Limiter) Option {
 	return func(server *Server) {
 		if limiter != nil {
@@ -114,23 +116,35 @@ func WithLimiter(limiter *limits.Limiter) Option {
 	}
 }
 
+// WithLimitsConfig installs the §14 resource bounds from the operator's
+// production configuration (env and/or flags, resolved by the caller).
+// NewServer builds the limiter and the ClientHello parser bounds from this
+// single config, so a configured hello byte ceiling or read deadline actually
+// drives clienthello.PeekWithBounds and a lowered global/FD-budget ceiling is
+// enforced. An explicit WithLimiter takes precedence.
+func WithLimitsConfig(config limits.Config) Option {
+	return func(server *Server) { server.limitsConfig = &config }
+}
+
 // NewServer wires the public acceptor to the in-memory route and stream
 // state. The server touches only those two synchronized structures plus the
 // limits budget on a public connection — never a database (spec §8).
 func NewServer(routeTable *routes.Table, streams *Streams, options ...Option) *Server {
 	dialer := &net.Dialer{}
 	server := &Server{
-		routes:     routeTable,
-		streams:    streams,
-		parseHello: clienthello.Peek,
-		dial:       dialer.DialContext,
-		logger:     slog.Default(),
+		routes:  routeTable,
+		streams: streams,
+		dial:    dialer.DialContext,
+		logger:  slog.Default(),
 	}
 	for _, option := range options {
 		option(server)
 	}
 	if server.limits == nil {
 		config := limits.DefaultConfig()
+		if server.limitsConfig != nil {
+			config = *server.limitsConfig
+		}
 		config.OnSaturation = func(saturation limits.Saturation) {
 			server.logger.Warn("gateway: resource saturation",
 				"kind", saturation.Kind,
@@ -141,6 +155,17 @@ func NewServer(routeTable *routes.Table, streams *Streams, options ...Option) *S
 				"threshold", saturation.Threshold)
 		}
 		server.limits = limits.NewLimiter(config)
+	}
+	// The default parser is bound to the limiter's effective §14 hello limits,
+	// never the compile-time constants: lowering the configured hello budget
+	// must actually tighten the parser (audit A2). The closure reads the
+	// installed limiter's effective config at parse time, so it stays correct
+	// for a limiter supplied via WithLimitsConfig or an explicit WithLimiter.
+	if server.parseHello == nil {
+		server.parseHello = func(conn net.Conn) (*clienthello.Hello, error) {
+			bounds := server.limits.Config()
+			return clienthello.PeekWithBounds(conn, bounds.MaxHelloBytes, bounds.HelloTimeout)
+		}
 	}
 	return server
 }

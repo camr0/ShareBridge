@@ -26,9 +26,12 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"sharebridge/relay/internal/clienthello"
 )
 
 // §14 MVP defaults. Every one is configuration: tests override them through
@@ -52,6 +55,40 @@ const (
 	// admitting every agent a healthy deployment can hold.
 	DefaultMaxTrackedAgents = 4096
 )
+
+// §14 operator configuration variable names. Every documented tunable bound
+// has one production input; an unset variable keeps its documented default.
+// main.go resolves them at startup and fails closed on an invalid value
+// rather than running with a silently wrong bound.
+const (
+	// EnvMaxStreamsPerSourceIP caps concurrent connections from one source IP.
+	EnvMaxStreamsPerSourceIP = "SHAREBRIDGE_GATEWAY_MAX_STREAMS_PER_SOURCE_IP"
+	// EnvMaxStreamsPerOrigin caps concurrent streams on one exact origin.
+	EnvMaxStreamsPerOrigin = "SHAREBRIDGE_GATEWAY_MAX_STREAMS_PER_ORIGIN"
+	// EnvMaxStreamsPerAgent caps concurrent streams across one agent's routes.
+	EnvMaxStreamsPerAgent = "SHAREBRIDGE_GATEWAY_MAX_STREAMS_PER_AGENT"
+	// EnvMaxStreamsGlobal caps concurrent streams for the whole process; an
+	// operator sets it to the host file-descriptor budget when that is lower
+	// than the §14 ceiling.
+	EnvMaxStreamsGlobal = "SHAREBRIDGE_GATEWAY_MAX_STREAMS_GLOBAL"
+	// EnvMaxHelloBytes caps the inspected ClientHello prefix.
+	EnvMaxHelloBytes = "SHAREBRIDGE_GATEWAY_MAX_HELLO_BYTES"
+	// EnvHelloTimeout is the ClientHello read deadline.
+	EnvHelloTimeout = "SHAREBRIDGE_GATEWAY_HELLO_TIMEOUT"
+	// EnvDialTimeout is the loopback connect budget.
+	EnvDialTimeout = "SHAREBRIDGE_GATEWAY_DIAL_TIMEOUT"
+	// EnvIdleTimeout is the no-byte stream idle timeout.
+	EnvIdleTimeout = "SHAREBRIDGE_GATEWAY_IDLE_TIMEOUT"
+	// EnvAbsoluteLifetime is the hard connection lifetime.
+	EnvAbsoluteLifetime = "SHAREBRIDGE_GATEWAY_ABSOLUTE_LIFETIME"
+	// EnvMaxTrackedAgents bounds the persistent per-agent byte map.
+	EnvMaxTrackedAgents = "SHAREBRIDGE_GATEWAY_MAX_TRACKED_AGENTS"
+)
+
+// EnvironmentLookup resolves one configuration variable and reports whether
+// it was set. os.LookupEnv is the production implementation; tests supply a
+// deterministic map.
+type EnvironmentLookup func(name string) (string, bool)
 
 // Saturation alert kinds. Operators alert on these; the gateway logs them
 // with metadata only (never a credential, share code, header, or body).
@@ -144,6 +181,90 @@ func DefaultConfig() Config {
 		AbsoluteLifetime:      DefaultAbsoluteLifetime,
 		MaxTrackedAgents:      DefaultMaxTrackedAgents,
 	}
+}
+
+// ConfigFromEnvironment builds the production §14 configuration from an
+// environment lookup. An unset (or empty) variable keeps its documented
+// default; a set variable must be a positive integer or Go duration, and the
+// two hard ceilings are enforced: MaxHelloBytes may not exceed the parser's
+// inspection budget and MaxStreamsGlobal may not exceed the §14 global
+// ceiling (the documentation defines it as 8,192 or a LOWER host
+// file-descriptor budget). Any invalid value fails closed: the zero Config is
+// returned with a descriptive error so main.go refuses startup instead of
+// silently using a wrong bound.
+func ConfigFromEnvironment(lookup EnvironmentLookup) (Config, error) {
+	config := DefaultConfig()
+	integerBounds := []struct {
+		name   string
+		target *int
+	}{
+		{EnvMaxStreamsPerSourceIP, &config.MaxStreamsPerSourceIP},
+		{EnvMaxStreamsPerOrigin, &config.MaxStreamsPerOrigin},
+		{EnvMaxStreamsPerAgent, &config.MaxStreamsPerAgent},
+		{EnvMaxStreamsGlobal, &config.MaxStreamsGlobal},
+		{EnvMaxHelloBytes, &config.MaxHelloBytes},
+		{EnvMaxTrackedAgents, &config.MaxTrackedAgents},
+	}
+	for _, bound := range integerBounds {
+		if err := applyIntegerEnvironment(bound.target, lookup, bound.name); err != nil {
+			return Config{}, err
+		}
+	}
+	durationBounds := []struct {
+		name   string
+		target *time.Duration
+	}{
+		{EnvHelloTimeout, &config.HelloTimeout},
+		{EnvDialTimeout, &config.DialTimeout},
+		{EnvIdleTimeout, &config.IdleTimeout},
+		{EnvAbsoluteLifetime, &config.AbsoluteLifetime},
+	}
+	for _, bound := range durationBounds {
+		if err := applyDurationEnvironment(bound.target, lookup, bound.name); err != nil {
+			return Config{}, err
+		}
+	}
+	if config.MaxHelloBytes > clienthello.MaxBufferedBytes {
+		return Config{}, fmt.Errorf("limits: %s = %d exceeds the ClientHello inspection budget %d",
+			EnvMaxHelloBytes, config.MaxHelloBytes, clienthello.MaxBufferedBytes)
+	}
+	if config.MaxStreamsGlobal > DefaultMaxStreamsGlobal {
+		return Config{}, fmt.Errorf("limits: %s = %d exceeds the §14 global ceiling %d",
+			EnvMaxStreamsGlobal, config.MaxStreamsGlobal, DefaultMaxStreamsGlobal)
+	}
+	return config, nil
+}
+
+// applyIntegerEnvironment overrides target from one environment variable. An
+// unset or empty variable is left at its default; a set value must be a
+// positive integer or the whole configuration is rejected.
+func applyIntegerEnvironment(target *int, lookup EnvironmentLookup, name string) error {
+	raw, ok := lookup(name)
+	if !ok || raw == "" {
+		return nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return fmt.Errorf("limits: %s must be a positive integer, got %q", name, raw)
+	}
+	*target = value
+	return nil
+}
+
+// applyDurationEnvironment overrides target from one environment variable. An
+// unset or empty variable is left at its default; a set value must be a
+// positive Go duration or the whole configuration is rejected.
+func applyDurationEnvironment(target *time.Duration, lookup EnvironmentLookup, name string) error {
+	raw, ok := lookup(name)
+	if !ok || raw == "" {
+		return nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value <= 0 {
+		return fmt.Errorf("limits: %s must be a positive duration, got %q", name, raw)
+	}
+	*target = value
+	return nil
 }
 
 // withDefaults replaces any unset (zero or negative) bound with its §14
