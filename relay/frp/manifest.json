@@ -1,19 +1,22 @@
 {
-  "note": "Pinned FRP release for the ShareBridge relay module. The fetch script downloads exactly these URLs over HTTPS, verifies the SHA-256 digests, and stages frps/frpc into a version+digest-keyed cache. FRP binaries are never committed; release packaging bundles executables verified through this manifest. Pin approved by the user after official upstream checksum verification.",
+  "note": "Pinned FRP release for the ShareBridge relay module. The fetch script downloads exactly these URLs over HTTPS, verifies the SHA-256 digests of both the release tarball and the frps executable it contains, and stages frps/frpc into a version+digest-keyed cache. The frps_sha256 fields pin the extracted server executable itself: they are the reference the installer compares every candidate and every installed copy against, so a poisoned cache marker or a tampered staged binary can never be accepted. FRP binaries are never committed; release packaging bundles executables verified through this manifest. Pin approved by the user after official upstream checksum verification.",
   "version": "0.71.0",
   "pin_status": "approved",
   "artifacts": {
     "darwin_arm64": {
       "url": "https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_darwin_arm64.tar.gz",
-      "sha256": "45be02b186860d375ed49a8941ae9569628a54bf14e67fc36b29c98c99dabcc6"
+      "sha256": "45be02b186860d375ed49a8941ae9569628a54bf14e67fc36b29c98c99dabcc6",
+      "frps_sha256": "71a4896060db4a9290bd830f48561334a3660545a0907c29dfade42f91f57037"
     },
     "linux_amd64": {
       "url": "https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_linux_amd64.tar.gz",
-      "sha256": "84f27e39f11169f7adcef8e8b70c9329de17747b1f14dad9fb95eef5682ea716"
+      "sha256": "84f27e39f11169f7adcef8e8b70c9329de17747b1f14dad9fb95eef5682ea716",
+      "frps_sha256": "b95dee2bf29a021c562565cdf2116376b9fa7590361bd36ef57041a04d0e6654"
     },
     "linux_arm64": {
       "url": "https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_linux_arm64.tar.gz",
-      "sha256": "f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227eae82266"
+      "sha256": "f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227eae82266",
+      "frps_sha256": "68263b9cab7d9a570593fd8e0593c5a4bafdd35f0dc386e9814ade063ffa6120"
     }
   }
 }

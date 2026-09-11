@@ -78,11 +78,14 @@ audit commands, §14/§17 environment reference, and known open items — is
 
 - Public TCP is exactly `443` (gateway) and the FRP transport port; proxy,
   plugin, metrics and admin surfaces are loopback/private only.
-- Every `frps` binary is SHA-256-checked before install: an explicit
-  `--frps-sha256`, or the manifest-pinned digest (`relay/frp/manifest.json`
-  via the checksum-verifying `scripts/fetch-frp.sh`). A caller-supplied
-  `--frps-binary` is never trusted on its own; `--verify-frps` runs the check
-  standalone.
+- Every `frps` binary is SHA-256-checked before install against a digest
+  that is never host state: the per-platform `frps_sha256` pin in
+  `relay/frp/manifest.json` (read, with the tarball digest, by the
+  checksum-verifying `scripts/fetch-frp.sh`), or an explicit `--frps-sha256`
+  for a deliberate arbitrary build. A caller-supplied `--frps-binary` must
+  carry an explicit `--frps-sha256`; the installed copy is re-hashed after the
+  copy, because the installed artifact is what runs. `--verify-frps` runs the
+  check standalone and `--copy-frps` exercises the verified install.
 - The relay VM holds a dedicated FRP transport certificate and the gateway
   control-sync client certificate. It never holds an agent content
   certificate/key, a DNS/ACME credential, or any share secret.

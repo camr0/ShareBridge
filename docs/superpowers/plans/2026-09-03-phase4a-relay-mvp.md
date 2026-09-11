@@ -653,7 +653,7 @@ agent–control disconnect.
 
 - [ ] **Step 1 — Test first:** create `relay/deploy/deploy_test.sh` to assert distinct unprivileged users, root-owned 0600 secrets/config, read-only filesystems except explicit run/state dirs, `LimitNOFILE`, `MemoryMax`, restart/log-rate policy, only 443/tcp + transport port public, and no public proxy/plugin/metrics/admin ports.
 - [ ] **Step 2 — Verify RED:** run `bash relay/deploy/deploy_test.sh`; expect missing units/config.
-- [ ] **Step 3 — Implement:** package gateway and pinned frps; provision dedicated transport certificate/key only; configure private mTLS; document restart ordering; add DNS audit commands proving relay wildcard and tunnel host are DNS-only and the zone publishes no HTTPS/SVCB/ECH records.
+- [ ] **Step 3 — Implement:** package gateway and pinned frps; provision dedicated transport certificate/key only; configure private mTLS; document restart ordering; add DNS audit commands proving the relay wildcard family (including a random child label) and the tunnel host are DNS-only and publish no HTTPS/SVCB/ECH record — a per-name query claim, **not a zone-wide** AXFR/zone-dump proof.
 - [ ] **Step 4 — Verify GREEN:** run deploy test and `systemd-analyze verify` in a Linux container/VM; inspect firewall and service users; run secret-safe dry run.
 - [ ] **Step 5 — Commit:** `git commit -m "ops(relay): add hardened separate-VM deployment"`.
 

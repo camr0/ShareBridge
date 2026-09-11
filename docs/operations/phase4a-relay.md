@@ -67,10 +67,13 @@ code, or any cookie/path/header. The dedicated FRP transport certificate is a
 transport credential only; it is not a content origin certificate. Remote
 proof of this is part of the Task 37 dark-topology gate.
 
-`install.sh` uses the committed checksum pin (`relay/frp/manifest.json` via
-`relay/scripts/fetch-frp.sh`); it never downloads `latest` and fails closed on
-a digest mismatch. The published transport certificate is copied to agents as
-their `SHAREBRIDGE_RELAY_CA_FILE` before enrollment.
+`install.sh` uses the committed checksum pins (`relay/frp/manifest.json` via
+`relay/scripts/fetch-frp.sh`): the release tarball digest and the extracted
+`frps` executable digest (`frps_sha256`). It never downloads `latest`, never
+trusts a cache marker as proof, and fails closed on a digest mismatch; the
+installed copy is re-hashed after the copy. The published transport
+certificate is copied to agents as their `SHAREBRIDGE_RELAY_CA_FILE` before
+enrollment.
 
 ---
 
@@ -95,7 +98,7 @@ and after any change to the units, firewall, installer, or this document.
 | Firewall public allowlist is exactly `443` + transport | nftables input `policy drop`; `elements = { 443, 7000 }`; loopback accepted (A9) |
 | No public proxy/plugin/metrics/admin port | forbidden ports (`9001`, `9101`, `9102`, `7500`, the proxy range) cannot appear in an accept rule; plugin/metrics binds are pinned loopback in the unit (A10) |
 | Transport certificate only, no ACME/content material | `install.sh` provisions only `tunnel-server.{crt,key}`; no `fullchain`/`privkey`/`ACME_*`/`CLOUDFLARE_TOKEN`; `transport.tls.force = true` (A11) |
-| Pinned, checksum-verified frps | `install.sh` calls `fetch-frp.sh` against `frp/manifest.json` and verifies SHA-256; `auth.method = "token"` with a mandatory plugin (A12) |
+| Pinned, checksum-verified frps | `install.sh` checks every `frps` against the per-platform `frps_sha256` in `frp/manifest.json` (or an explicit `--frps-sha256`) and re-hashes the installed copy; `fetch-frp.sh` re-verifies staged binaries against the pinned tarball (never the `.verified` marker); `auth.method = "token"` with a mandatory plugin (A12) |
 | DNS-only relay names, no HTTPS/SVCB/ECH for them | `install.sh --audit-dns` proves random-child wildcard synthesis and per-name HTTPS/SVCB/ECH absence; §5 below (A13). This is **not** a zone-wide AXFR proof |
 | Deferred operator surface documented | §6–§8 of this runbook (A14) |
 

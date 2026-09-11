@@ -33,17 +33,23 @@
 #   install.sh --audit-dns --namespace <sbXXXXXXXX> --tunnel-host <fqdn> \
 #              [--expect-ipv4 <ipv4>] [--expect-ipv6 <ipv6>]
 #   install.sh --verify-frps <file> [--frps-sha256 <64-hex>]
+#   install.sh --copy-frps <file> --frps-dest <path> [--frps-sha256 <64-hex>]
 #   install.sh --help
 #
-# A caller-supplied --frps-binary is integrity-checked before it is installed:
-# its SHA-256 must equal --frps-sha256 when given, otherwise the SHA-256 of the
-# manifest-pinned frps (relay/frp/manifest.json, resolved through the
-# checksum-verifying relay/scripts/fetch-frp.sh). A mismatch or a missing pin
-# fails closed.
+# A caller-supplied --frps-binary must carry an explicit --frps-sha256 and is
+# integrity-checked before install. A binary fetched from the committed pin is
+# checked against the frps_sha256 pinned for this platform in
+# relay/frp/manifest.json (resolved through the checksum-verifying
+# relay/scripts/fetch-frp.sh, whose --print-frps-sha256 mode reads the
+# committed pin without touching any cache). In every case the installed copy
+# at /usr/local/lib/sharebridge/relay/frps is re-hashed after the copy, because
+# the installed artifact is what runs. A mismatch, a missing pin, or a
+# caller-supplied binary without an explicit checksum fails closed.
 #
 # The DNS audit proves wildcard synthesis for the relay family and the absence
 # of HTTPS/SVCB/ECH records for the queried relay names; it is not an
-# authoritative zone-transfer proof (see the audit_dns comment).
+# authoritative zone-transfer proof (see the audit_dns comment). Every AAAA
+# answer is validated with a real IPv6 parser, not a hex-and-colon pattern.
 #
 # Required environment (never echoed):
 #   SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET   hex secret shared by frps and gateway
@@ -82,6 +88,8 @@ GATEWAY_BINARY=""
 FRPS_BINARY=""
 FRPS_SHA256=""
 VERIFY_FRPS=""
+FRPS_COPY_SRC=""
+FRPS_DEST=""
 EXPECT_IPV4=""
 EXPECT_IPV6=""
 FRP_STAGE=""
@@ -123,38 +131,97 @@ sha256_of() {
   fi
 }
 
-# pinned_frps_digest — SHA-256 of the manifest-pinned frps executable. The
-# manifest records the release tarball digest, so the pinned frps is resolved
-# through fetch-frp.sh, which verifies the tarball against relay/frp/
-# manifest.json and fails closed on a mismatch or a missing entry; the
-# extracted executable's own digest is then the reference a caller-supplied
-# binary must match.
+# pinned_frps_digest — the SHA-256 pinned for the frps executable in
+# relay/frp/manifest.json, resolved through fetch-frp.sh's hermetic
+# --print-frps-sha256 mode. The committed manifest pin is the only reference;
+# a cache marker, a staged file, or any other host state is never proof.
 pinned_frps_digest() {
-  local stage="${FRP_STAGE:-}"
-  if [[ -z "$stage" ]]; then
-    stage="$("$FRP_FETCH")" || fail "could not stage the manifest-pinned frps (pin missing or verification failed)"
-  fi
-  [[ -f "${stage}/frps" ]] || fail "manifest-pinned frps is missing at ${stage}/frps"
-  sha256_of "${stage}/frps"
+  local pinned
+  pinned="$("$FRP_FETCH" --print-frps-sha256)" \
+    || fail "could not resolve the manifest-pinned frps digest (pin missing or malformed)"
+  [[ "$pinned" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "manifest-pinned frps digest '${pinned}' is not 64 lowercase hex characters"
+  printf '%s\n' "$pinned"
 }
 
-# verify_frps_binary <path> — fail closed unless <path> is the pinned frps.
-# An explicit --frps-sha256 wins (for a deliberate arbitrary build); otherwise
-# the manifest-pinned digest is the reference.
-verify_frps_binary() {
-  local candidate="$1" expected actual
-  [[ -f "$candidate" ]] || fail "frps binary not found: $candidate"
+# frps_expected_digest — the digest a candidate frps must match: an explicit
+# --frps-sha256, otherwise the committed manifest pin.
+frps_expected_digest() {
   if [[ -n "$FRPS_SHA256" ]]; then
     [[ "$FRPS_SHA256" =~ ^[0-9a-f]{64}$ ]] \
       || fail "--frps-sha256 must be 64 lowercase hex characters"
-    expected="$FRPS_SHA256"
+    printf '%s\n' "$FRPS_SHA256"
   else
-    expected="$(pinned_frps_digest)"
+    pinned_frps_digest
   fi
+}
+
+# verify_frps_binary <path> — fail closed unless <path> matches the expected
+# digest. An explicit --frps-sha256 wins (for a deliberate arbitrary build);
+# otherwise the committed manifest pin is the reference.
+verify_frps_binary() {
+  local candidate="$1" expected actual
+  [[ -f "$candidate" ]] || fail "frps binary not found: $candidate"
+  expected="$(frps_expected_digest)"
   actual="$(sha256_of "$candidate")"
   [[ "$actual" == "$expected" ]] \
     || fail "refusing frps binary ${candidate}: SHA-256 ${actual} does not match the pinned ${expected}"
   log "verified frps binary ${candidate} (sha256 ${actual})"
+}
+
+# install_binary_verified <src> <dst> <expected-sha256> — install the verified
+# source and then re-hash the installed copy. The installed artifact is what
+# runs, so a copy that diverges from the verified source (a compromised
+# install(1), a partial write, a later mutation) fails closed.
+install_binary_verified() {
+  local src="$1" dst="$2" expected="$3" installed
+  if [[ "$(id -u)" == "0" ]]; then
+    install -o root -g root -m 0755 -- "$src" "$dst"
+  else
+    install -m 0755 -- "$src" "$dst"
+  fi
+  installed="$(sha256_of "$dst")"
+  [[ "$installed" == "$expected" ]] \
+    || fail "installed artifact ${dst} has SHA-256 ${installed}, expected ${expected} (post-copy verification failed)"
+}
+
+# is_ipv6_literal <addr> — strict IPv6 validation: 1-4 hex digits per group, at
+# most one `::`, exactly 8 groups unless compressed, no zone id, no whitespace,
+# no dotted-quad tail, no junk. `::::`, `:`, `1:2:3` and `1:2:3:4:5:6:7:8:9`
+# are all rejected, so a garbage `dig` answer fails the audit.
+is_ipv6_literal() {
+  local addr="$1" head tail group count=0
+  local -a groups=()
+  [[ -n "$addr" ]] || return 1
+  [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$addr" == *%* ]] && return 1
+  [[ "$addr" == *"::"*"::"* ]] && return 1
+  if [[ "$addr" == *"::"* ]]; then
+    head="${addr%%::*}"
+    tail="${addr##*::}"
+  else
+    head="$addr"
+    tail=""
+  fi
+  if [[ -n "$head" ]]; then
+    IFS=':' read -r -a groups <<< "$head"
+    for group in "${groups[@]}"; do
+      [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      count=$((count + 1))
+    done
+  fi
+  if [[ -n "$tail" ]]; then
+    IFS=':' read -r -a groups <<< "$tail"
+    for group in "${groups[@]}"; do
+      [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      count=$((count + 1))
+    done
+  fi
+  if [[ "$addr" == *"::"* ]]; then
+    (( count < 8 ))
+  else
+    (( count == 8 ))
+  fi
 }
 
 # render_frps_config <dst> — render the committed pinned frps template. The
@@ -247,7 +314,7 @@ audit_dns() {
     label="${addr%%:*}"; value="${addr#*:}"
     while IFS= read -r ipv6; do
       [[ -z "$ipv6" ]] && continue
-      if [[ ! "$ipv6" =~ ^[0-9A-Fa-f:]+$ || "$ipv6" != *:* ]]; then
+      if ! is_ipv6_literal "$ipv6"; then
         log "FAIL: ${label} AAAA answer '${ipv6}' is not an IPv6 literal"; status=1
       fi
       if [[ -n "$expected_ipv6" && "$ipv6" != "$expected_ipv6" ]]; then
@@ -302,6 +369,8 @@ while [[ $# -gt 0 ]]; do
     --frps-binary) FRPS_BINARY="${2:?}"; shift 2 ;;
     --frps-sha256) FRPS_SHA256="${2:?}"; shift 2 ;;
     --verify-frps) MODE="verify-frps"; VERIFY_FRPS="${2:?}"; shift 2 ;;
+    --frps-dest) FRPS_DEST="${2:?}"; shift 2 ;;
+    --copy-frps) MODE="copy-frps"; FRPS_COPY_SRC="${2:?}"; shift 2 ;;
     --expect-ipv4) EXPECT_IPV4="${2:?}"; shift 2 ;;
     --expect-ipv6) EXPECT_IPV6="${2:?}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -324,11 +393,25 @@ case "$MODE" in
     log "frps binary verified: ${VERIFY_FRPS}"
     exit 0
     ;;
+  copy-frps)
+    [[ -n "$FRPS_COPY_SRC" && -n "$FRPS_DEST" ]] \
+      || fail "--copy-frps requires a source binary and --frps-dest <path>"
+    verify_frps_binary "$FRPS_COPY_SRC"
+    install_binary_verified "$FRPS_COPY_SRC" "$FRPS_DEST" "$(frps_expected_digest)"
+    log "installed and re-verified frps at ${FRPS_DEST}"
+    exit 0
+    ;;
   generate-transport-cert)
     generate_transport_cert "$TUNNEL_HOST" "$TRANSPORT_OUT"
     exit 0
     ;;
 esac
+
+# A caller-supplied binary is never trusted on the manifest pin alone: the
+# operator must state the exact digest they intend to install.
+if [[ -n "$FRPS_BINARY" && -z "$FRPS_SHA256" ]]; then
+  fail "--frps-binary requires an explicit --frps-sha256"
+fi
 
 # ---- install-mode prerequisites ----------------------------------------------
 [[ -n "$TUNNEL_HOST" ]] || fail "--tunnel-host is required"
@@ -387,12 +470,12 @@ if [[ -z "$FRPS_BINARY" ]]; then
   FRP_STAGE="$("$FRP_FETCH")"
   FRPS_BINARY="${FRP_STAGE}/frps"
 fi
-# Integrity-check every frps binary before installing it: an explicit
-# --frps-sha256, or the manifest-pinned digest, must match. A caller-supplied
-# binary is never trusted on its own.
+# Integrity-check every frps binary before installing it (an explicit
+# --frps-sha256, or the committed manifest pin), then re-hash the installed
+# copy so the artifact that runs is the one that was verified.
 verify_frps_binary "$FRPS_BINARY"
 [[ -x "$FRPS_BINARY" ]] || fail "frps binary is not executable: $FRPS_BINARY"
-install -o root -g root -m 0755 -- "$FRPS_BINARY" "${LIB_DIR}/frps"
+install_binary_verified "$FRPS_BINARY" "${LIB_DIR}/frps" "$(frps_expected_digest)"
 
 if [[ -z "$GATEWAY_BINARY" ]]; then
   log "building the gateway from ${REPO_ROOT}/relay"

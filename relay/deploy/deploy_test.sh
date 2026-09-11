@@ -12,8 +12,12 @@
 # Usage:  bash relay/deploy/deploy_test.sh
 # Exit:   0 = every assertion passed (GREEN); 1 = at least one failed (RED).
 #
-# The assertion IDs (A1…A14) are referenced by the Task 35 report so each
-# published hardening claim maps to the check that enforces it.
+# The assertion IDs (A1…A15) are referenced by the Task 35 report so each
+# published hardening claim maps to the check that enforces it. A3/A4/A6/A15
+# are strict-parsing assertions: a duplicate, redefined or extra directive is a
+# failure, never silently ignored, and A12/A13 prove their properties by
+# executing the installer (a poisoned cache, a tampered installed artifact, a
+# wrong checksum and a garbage AAAA answer must all fail closed).
 
 set -u
 
@@ -28,6 +32,9 @@ gateway_unit="${deploy_dir}/sharebridge-relay-gateway.service"
 frps_unit="${deploy_dir}/sharebridge-relay-frps.service"
 firewall="${deploy_dir}/firewall.nft"
 install_sh="${deploy_dir}/install.sh"
+fetch_sh="${repo_root}/relay/scripts/fetch-frp.sh"
+frp_manifest="${repo_root}/relay/frp/manifest.json"
+plan_doc="${repo_root}/docs/superpowers/plans/2026-09-03-phase4a-relay-mvp.md"
 
 failures=0
 checks=0
@@ -106,6 +113,179 @@ is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 ))
 }
 
+# unit_key_lines <file> <Key> — every non-comment `Key=` assignment line, in
+# order, whether or not the value is empty.
+unit_key_lines() {
+  awk -v want="$2" '
+    { line = $0 }
+    line ~ /^[[:space:]]*\[/ { next }
+    {
+      sub(/[[:space:]]*#.*$/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) { next }
+      key = substr(line, 1, eq - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key == want) { print line }
+    }
+  ' "$1"
+}
+
+# unit_key_count <file> <Key> — the number of `Key=` assignments in a unit.
+unit_key_count() {
+  unit_key_lines "$1" "$2" | grep -c . || true
+}
+
+# unit_duplicate_keys <file> — every non-comment unit key assigned more than once.
+unit_duplicate_keys() {
+  awk '
+    { line = $0 }
+    line ~ /^[[:space:]]*\[/ { next }
+    {
+      sub(/[[:space:]]*#.*$/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) { next }
+      key = substr(line, 1, eq - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key != "") { print key }
+    }
+  ' "$1" | sort | uniq -d
+}
+
+# unit_environment_var_duplicates <file> — `Environment=` variable names
+# assigned more than once in a unit. The later assignment would win in systemd
+# and could silently override a checked listener bind.
+unit_environment_var_duplicates() {
+  awk '
+    { line = $0 }
+    line ~ /^[[:space:]]*\[/ { next }
+    {
+      sub(/[[:space:]]*#.*$/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) { next }
+      key = substr(line, 1, eq - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key != "Environment") { next }
+      val = substr(line, eq + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      veq = index(val, "=")
+      if (veq == 0) { next }
+      name = substr(val, 1, veq - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name != "") { print name }
+    }
+  ' "$1" | sort | uniq -d
+}
+
+# unit_credential_id_duplicates <file> — `LoadCredential=` ids declared more
+# than once in a unit (a duplicate id can redirect a credential read).
+unit_credential_id_duplicates() {
+  awk '
+    { line = $0 }
+    line ~ /^[[:space:]]*\[/ { next }
+    {
+      sub(/[[:space:]]*#.*$/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) { next }
+      key = substr(line, 1, eq - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key != "LoadCredential") { next }
+      val = substr(line, eq + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+      cidx = index(val, ":")
+      if (cidx == 0) { next }
+      name = substr(val, 1, cidx - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name != "") { print name }
+    }
+  ' "$1" | sort | uniq -d
+}
+
+# require_unit_scalar <file> <Key> <expected> <description> — the key must be
+# assigned EXACTLY once and carry exactly the expected value. A duplicate (a
+# later/countermanding definition) is a failure, never "any one of them is fine".
+require_unit_scalar() {
+  local count value
+  count="$(unit_key_count "$1" "$2")"
+  value="$(unit_field_one "$1" "$2")"
+  if [[ "$count" != "1" ]]; then
+    fail "$4 ($1 assigns $2 ${count}x; exactly one is required)"
+  elif [[ "$value" != "$3" ]]; then
+    fail "$4 ($1 has $2='$value', want '$3')"
+  else
+    pass
+  fi
+}
+
+# function_def_count <file> <name> — the number of shell function definitions,
+# covering both `name() {` and `function name {`/`function name() {` forms.
+function_def_count() {
+  grep -cE "^[[:space:]]*(function[[:space:]]+)?$2[[:space:]]*(\(\))?[[:space:]]*\{" "$1" || true
+}
+
+# require_unique_function_def <file> <name> <description> — a redefined
+# security-critical function must fail the gate, not silently shadow the first.
+require_unique_function_def() {
+  local count
+  count="$(function_def_count "$1" "$2")"
+  if [[ "$count" == "1" ]]; then
+    pass
+  else
+    fail "$3 (found ${count:-0} definitions of $2 in $1; exactly one is required)"
+  fi
+}
+
+# function_body <file> <name> — the non-comment, non-blank body lines.
+function_body() {
+  awk -v want="$2" '
+    $0 ~ "^[[:space:]]*(function[[:space:]]+)?" want "[[:space:]]*(\\(\\))?[[:space:]]*\\{" { inc=1; next }
+    inc && $0 ~ /^\}/ { inc=0; next }
+    inc {
+      sub(/[[:space:]]*#.*$/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 != "") { print }
+    }
+  ' "$1"
+}
+
+# is_ipv6_literal <addr> — strict IPv6 validation: 1-4 hex digits per group, at
+# most one `::`, exactly 8 groups otherwise, no zone id, no whitespace, no
+# dotted-quad tail, no junk. `::::`, `:`, `1:2:3` and `1:2:3:4:5:6:7:8:9` are
+# all rejected; a `dig` answer that is not a real IPv6 literal fails the audit.
+is_ipv6_literal() {
+  local addr="$1" head tail group count=0
+  local -a groups=()
+  [[ -n "$addr" ]] || return 1
+  [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$addr" == *%* ]] && return 1
+  [[ "$addr" == *"::"*"::"* ]] && return 1
+  if [[ "$addr" == *"::"* ]]; then
+    head="${addr%%::*}"
+    tail="${addr##*::}"
+  else
+    head="$addr"
+    tail=""
+  fi
+  if [[ -n "$head" ]]; then
+    IFS=':' read -r -a groups <<< "$head"
+    for group in "${groups[@]}"; do
+      [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      count=$((count + 1))
+    done
+  fi
+  if [[ -n "$tail" ]]; then
+    IFS=':' read -r -a groups <<< "$tail"
+    for group in "${groups[@]}"; do
+      [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      count=$((count + 1))
+    done
+  fi
+  if [[ "$addr" == *"::"* ]]; then
+    (( count < 8 ))
+  else
+    (( count == 8 ))
+  fi
+}
+
 # parsed_lines <file> — the file with comments removed (a `#` starts a comment).
 # The deployment artifacts contain no literal `#` inside a quoted value, so
 # this is the shell/nft/unit directive stream. A commented-out directive or a
@@ -181,6 +361,9 @@ require_file "$install_sh" "installer"
 require_file "$readme" "relay README"
 require_file "$ops_doc" "relay operations runbook"
 require_file "$frps_config" "pinned frps config template"
+require_file "$fetch_sh" "pinned-FRP fetch script"
+require_file "$frp_manifest" "pinned FRP manifest"
+require_file "$plan_doc" "phase-4a relay plan"
 
 # Nothing below can be meaningful when the units are absent (the RED state).
 if [[ ! -f "$gateway_unit" || ! -f "$frps_unit" || ! -f "$firewall" || ! -f "$install_sh" ]]; then
@@ -218,6 +401,22 @@ require_parsed_contains "$install_sh" 'install[[:space:]]+-o[[:space:]]+root[[:s
 # The exact set of files installed through the 0600 root helper, derived from
 # the parsed (non-comment) directives. A commented-out call or a mention in
 # prose cannot satisfy this.
+# The secret installer must have exactly one definition and its body must be
+# exactly the 0600 root:root helper — a later redefinition/shadowing anywhere
+# in the file is a failure, not a silently-used implementation.
+require_unique_function_def "$install_sh" install_root_secret \
+  "the root-secret installer must be defined exactly once"
+require_eq "$(function_body "$install_sh" install_root_secret)" \
+  'install -o root -g root -m 0600 -- "$1" "$2"' \
+  "install_root_secret must install root:root mode 0600 and nothing else"
+require_not_contains "$install_sh" '^[[:space:]]*install_root_secret=' \
+  "installer must not shadow install_root_secret with a variable assignment"
+require_not_contains "$install_sh" '^[[:space:]]*alias[[:space:]]+install_root_secret=' \
+  "installer must not alias install_root_secret"
+# Exactly the eight expected calls, no more and no fewer.
+secret_call_count="$(parsed_lines "$install_sh" | grep -cE '^[[:space:]]*install_root_secret[[:space:]]+"')"
+require_eq "$secret_call_count" "8" \
+  "installer must call install_root_secret exactly 8 times (one per config/secret)"
 secret_dests="$(parsed_lines "$install_sh" \
   | sed -n 's|.*install_root_secret[[:space:]].*/\([^"/]*\)"[[:space:]]*$|\1|p' | sort -u)"
 expected_secret_dests="$(printf '%s\n' \
@@ -237,10 +436,10 @@ done
 
 printf -- '-- A4: read-only filesystem except explicit run/state dirs\n'
 for unit in "$gateway_unit" "$frps_unit"; do
-  require_eq "$(unit_field_one "$unit" ProtectSystem)" "strict" "ProtectSystem=strict in $unit"
-  require_eq "$(unit_field_one "$unit" NoNewPrivileges)" "true" "NoNewPrivileges=true in $unit"
-  require_eq "$(unit_field_one "$unit" PrivateTmp)" "true" "PrivateTmp=true in $unit"
-  require_eq "$(unit_field_one "$unit" ProtectHome)" "true" "ProtectHome=true in $unit"
+  require_unit_scalar "$unit" ProtectSystem "strict" "$unit must set ProtectSystem=strict exactly once"
+  require_unit_scalar "$unit" NoNewPrivileges "true" "$unit must set NoNewPrivileges=true exactly once"
+  require_unit_scalar "$unit" PrivateTmp "true" "$unit must set PrivateTmp=true exactly once"
+  require_unit_scalar "$unit" ProtectHome "true" "$unit must set ProtectHome=true exactly once"
   require_contains "$unit" '^ProtectKernelTunables=true$' "ProtectKernelTunables in $unit"
   require_contains "$unit" '^ProtectKernelModules=true$' "ProtectKernelModules in $unit"
   require_contains "$unit" '^ProtectControlGroups=true$' "ProtectControlGroups in $unit"
@@ -279,17 +478,19 @@ for unit in "$gateway_unit" "$frps_unit"; do
 done
 # Each unit must declare its own exact state AND runtime directory; the two
 # directives are not interchangeable.
-require_eq "$(unit_field_one "$gateway_unit" StateDirectory)" "sharebridge-relay-gateway" \
-  "gateway unit must declare StateDirectory=sharebridge-relay-gateway"
-require_eq "$(unit_field_one "$gateway_unit" RuntimeDirectory)" "sharebridge-relay-gateway" \
-  "gateway unit must declare RuntimeDirectory=sharebridge-relay-gateway"
-require_eq "$(unit_field_one "$frps_unit" StateDirectory)" "sharebridge-relay-frps" \
-  "frps unit must declare StateDirectory=sharebridge-relay-frps"
-require_eq "$(unit_field_one "$frps_unit" RuntimeDirectory)" "sharebridge-relay-frps" \
-  "frps unit must declare RuntimeDirectory=sharebridge-relay-frps"
+require_unit_scalar "$gateway_unit" StateDirectory "sharebridge-relay-gateway" \
+  "gateway unit must declare exactly one StateDirectory=sharebridge-relay-gateway"
+require_unit_scalar "$gateway_unit" RuntimeDirectory "sharebridge-relay-gateway" \
+  "gateway unit must declare exactly one RuntimeDirectory=sharebridge-relay-gateway"
+require_unit_scalar "$frps_unit" StateDirectory "sharebridge-relay-frps" \
+  "frps unit must declare exactly one StateDirectory=sharebridge-relay-frps"
+require_unit_scalar "$frps_unit" RuntimeDirectory "sharebridge-relay-frps" \
+  "frps unit must declare exactly one RuntimeDirectory=sharebridge-relay-frps"
 
 printf -- '-- A5: LimitNOFILE and MemoryMax\n'
 for unit in "$gateway_unit" "$frps_unit"; do
+  require_eq "$(unit_key_count "$unit" LimitNOFILE)" "1" "$unit must assign LimitNOFILE exactly once"
+  require_eq "$(unit_key_count "$unit" MemoryMax)" "1" "$unit must assign MemoryMax exactly once"
   nofile="$(unit_field_one "$unit" LimitNOFILE)"
   nofile="${nofile%%:*}"
   if is_positive_int "$nofile" && (( nofile >= 8192 )); then
@@ -305,16 +506,13 @@ for unit in "$gateway_unit" "$frps_unit"; do
   fi
 done
 
-printf -- '-- A6: restart and log-rate policy\n'
+printf -- '-- A6: restart and log-rate policy (exactly one instance each)\n'
 for unit in "$gateway_unit" "$frps_unit"; do
+  require_eq "$(unit_key_count "$unit" Restart)" "1" "$unit must assign Restart= exactly once"
   require_contains "$unit" '^Restart=(always|on-failure)$' "$unit bounded Restart= policy"
-  restart_sec="$(unit_field_one "$unit" RestartSec)"
-  if is_positive_int "$restart_sec" && (( restart_sec <= 30 )); then
-    pass
-  else
-    fail "$unit RestartSec must be a small positive integer (got '$restart_sec')"
-  fi
-  for key in StartLimitIntervalSec StartLimitBurst LogRateLimitIntervalSec LogRateLimitBurst; do
+  for key in RestartSec StartLimitIntervalSec StartLimitBurst LogRateLimitIntervalSec LogRateLimitBurst; do
+    require_eq "$(unit_key_count "$unit" "$key")" "1" \
+      "$unit must assign $key exactly once (a later duplicate/countermanding value must fail)"
     rate_value="$(unit_field_one "$unit" "$key")"
     if is_positive_int "$rate_value"; then
       pass
@@ -322,6 +520,12 @@ for unit in "$gateway_unit" "$frps_unit"; do
       fail "$unit $key must be an effective positive integer, not '$rate_value' (0 disables the bound)"
     fi
   done
+  restart_sec="$(unit_field_one "$unit" RestartSec)"
+  if is_positive_int "$restart_sec" && (( restart_sec <= 30 )); then
+    pass
+  else
+    fail "$unit RestartSec must be a small positive integer (got '$restart_sec')"
+  fi
   # The LogRateLimit* pair must actually be in force.
   log_interval="$(unit_field_one "$unit" LogRateLimitIntervalSec)"
   log_burst="$(unit_field_one "$unit" LogRateLimitBurst)"
@@ -330,6 +534,27 @@ for unit in "$gateway_unit" "$frps_unit"; do
   else
     fail "$unit must bound its journal write rate (LogRateLimitIntervalSec/Burst > 0)"
   fi
+done
+
+printf -- '-- A15: no duplicate/redefined unit directives (class-level strictness)\n'
+repeatable_unit_keys=" Environment LoadCredential "
+for unit in "$gateway_unit" "$frps_unit"; do
+  unit_duplicates="$(unit_duplicate_keys "$unit")"
+  if [[ -z "$unit_duplicates" ]]; then
+    pass
+  else
+    while IFS= read -r duplicate_key; do
+      [[ -z "$duplicate_key" ]] && continue
+      case "$repeatable_unit_keys" in
+        *" ${duplicate_key} "*) pass ;;
+        *) fail "$unit assigns ${duplicate_key} more than once; a duplicate directive can silently override a checked value" ;;
+      esac
+    done <<< "$unit_duplicates"
+  fi
+  require_eq "$(unit_environment_var_duplicates "$unit" | tr '\n' ' ')" "" \
+    "$unit must not assign the same Environment= variable twice"
+  require_eq "$(unit_credential_id_duplicates "$unit" | tr '\n' ' ')" "" \
+    "$unit must not declare the same LoadCredential= id twice"
 done
 
 printf -- '-- A7: frps started after the gateway (restart ordering)\n'
@@ -456,19 +681,53 @@ require_contains "$frps_config" '^transport\.tls\.force = true$' "FRP transport 
 require_contains "$frps_config" '^transport\.tls\.certFile = ' "frps must use the dedicated transport certificate"
 require_contains "$frps_config" '^transport\.tls\.keyFile = ' "frps must use the dedicated transport key"
 
-printf -- '-- A12: pinned, checksum-verified frps packaging and binary verification\n'
+printf -- '-- A12: pinned, checksum-verified frps packaging and cache-independent verification\n'
 require_parsed_contains "$install_sh" 'fetch-frp\.sh' "installer must use the committed pinned-FRP fetch path"
 require_parsed_contains "$install_sh" 'FRP_MANIFEST=' "installer must resolve the pinned manifest"
 require_parsed_contains "$install_sh" 'verify_frps_binary' "installer must verify a caller-supplied frps binary"
 require_parsed_contains "$install_sh" 'frps-sha256' "installer must offer an explicit checksum for arbitrary frps binaries"
 require_contains "$frps_config" 'auth\.method = "token"' "frps must require authenticated clients"
+# The reference digest is the committed manifest pin and never a staged file,
+# cache marker or label: fetch-frp.sh prints it without touching the cache.
+require_parsed_contains "$fetch_sh" 'frps_sha256' "fetch script must read the manifest-pinned frps digest"
+require_parsed_contains "$fetch_sh" '\-\-print-frps-sha256' "fetch script must expose the manifest pin without trusting the cache"
+require_parsed_contains "$install_sh" 'print-frps-sha256' "installer must resolve the frps reference from the committed manifest pin"
+require_unique_function_def "$install_sh" pinned_frps_digest "the pinned-digest resolver must be defined exactly once"
+require_unique_function_def "$install_sh" verify_frps_binary "the frps verifier must be defined exactly once"
+require_unique_function_def "$install_sh" install_binary_verified "the verified-copy helper must be defined exactly once"
+require_parsed_contains "$fetch_sh" 'verify_staged_binaries' "fetch script must re-verify staged binaries against the pinned tarball"
+require_parsed_contains "$fetch_sh" '\-\-print-pins' "fetch script must expose its hermetic manifest pins"
+require_parsed_contains "$install_sh" 'install_binary_verified[[:space:]]+"\$FRPS_BINARY"[[:space:]]+"\$\{LIB_DIR\}/frps"' \
+  "installer must re-verify the frps binary at its install location after the copy"
+require_eq "$(grep -c '"frps_sha256":' "$frp_manifest")" "3" \
+  "manifest must pin the frps executable digest for all three platforms"
+printed_frps_pin="$(bash "$fetch_sh" --print-frps-sha256 2>/dev/null | tail -n 1)"
+if [[ "$printed_frps_pin" =~ ^[0-9a-f]{64}$ ]]; then
+  pass
+else
+  fail "fetch script --print-frps-sha256 must print a 64-hex digest (got '${printed_frps_pin}')"
+fi
+if [[ -f "$frp_manifest" ]] && grep -q "\"frps_sha256\": \"${printed_frps_pin}\"" "$frp_manifest"; then
+  pass
+else
+  fail "the printed frps digest is not a committed manifest pin"
+fi
+read -r frp_version_pin platform_key_pin tarball_pin frps_pin <<< "$(bash "$fetch_sh" --print-pins 2>/dev/null | tail -n 1)"
+require_eq "$frps_pin" "$printed_frps_pin" "fetch --print-pins must agree with --print-frps-sha256"
+if [[ "$tarball_pin" =~ ^[0-9a-f]{64}$ && "$frp_version_pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$platform_key_pin" =~ ^[a-z0-9_]+$ ]]; then
+  pass
+else
+  fail "fetch --print-pins must print '<version> <platform> <tarball-sha256> <frps-sha256>' (got '${frp_version_pin} ${platform_key_pin} ${tarball_pin} ${frps_pin}')"
+fi
 
 # Behavioural proof that a mismatched binary or an altered checksum FAILS: run
 # the installer's own verifier on a throwaway binary with the matching digest
 # (must accept) and with a wrong digest (must reject). This is the property a
 # prose-only grep could not enforce.
 frps_probe_dir="$(mktemp -d)"
-trap 'rm -rf "$frps_probe_dir"' EXIT
+dig_shim_dir="$(mktemp -d)"
+install_shim_dir="$(mktemp -d)"
+trap 'rm -rf "$frps_probe_dir" "$dig_shim_dir" "$install_shim_dir"' EXIT
 printf '#!/bin/sh\nexit 0\n' > "${frps_probe_dir}/frps-probe"
 chmod 0755 "${frps_probe_dir}/frps-probe"
 probe_digest="$(sha256_of "${frps_probe_dir}/frps-probe")"
@@ -479,6 +738,85 @@ else
 fi
 if bash "$install_sh" --verify-frps "${frps_probe_dir}/frps-probe" --frps-sha256 "0000000000000000000000000000000000000000000000000000000000000000" >/dev/null 2>&1; then
   fail "installer accepted a frps binary whose SHA-256 does not match --frps-sha256"
+else
+  pass
+fi
+# A poisoned cache can no longer become the reference, and the fetch path can
+# no longer trust the `.verified` marker. Both are exercised hermetically: the
+# committed pins are read from the manifest, so no network or host cache state
+# is involved.
+poison_fetch_root="${frps_probe_dir}/poison-fetch-cache"
+poison_key_dir="${poison_fetch_root}/v${frp_version_pin}-sha256-${tarball_pin}"
+mkdir -p "$poison_key_dir" "${poison_fetch_root}/downloads"
+printf '#!/bin/sh\nexit 0\n' > "${poison_key_dir}/frps"
+printf '#!/bin/sh\nexit 0\n' > "${poison_key_dir}/frpc"
+chmod 0755 "${poison_key_dir}/frps" "${poison_key_dir}/frpc"
+printf '%s\n' "$tarball_pin" > "${poison_key_dir}/.verified"
+printf 'this is not the pinned tarball\n' > "${poison_fetch_root}/downloads/frp_${frp_version_pin}_${platform_key_pin}.tar.gz"
+# The reference must not depend on cache state.
+poisoned_pin="$(SHAREBRIDGE_FRP_CACHE="$poison_fetch_root" bash "$fetch_sh" --print-frps-sha256 2>/dev/null | tail -n 1)"
+require_eq "$poisoned_pin" "$printed_frps_pin" "the frps reference must not depend on cache state"
+# A `.verified` marker plus a poisoned staged binary must not be accepted as a
+# cache hit when the tarball cannot vouch for it.
+if SHAREBRIDGE_FRP_CACHE="$poison_fetch_root" bash "$fetch_sh" >/dev/null 2>&1; then
+  fail "fetch script accepted a poisoned cache marker over a corrupt tarball (must fail closed)"
+else
+  pass
+fi
+# Without an explicit checksum the candidate is compared against the committed
+# manifest pin, so the poisoned staged binary is rejected.
+if SHAREBRIDGE_FRP_CACHE="$poison_fetch_root" bash "$install_sh" --verify-frps "${poison_key_dir}/frps" >/dev/null 2>&1; then
+  fail "installer accepted a poisoned cache marker plus poisoned frps as the pinned binary"
+else
+  pass
+fi
+# A caller-supplied --frps-binary must carry an explicit checksum. Both probes
+# pass a fully valid dry-run so the only difference is the missing checksum.
+# The dry-run credential values are format-valid but deliberately all-zero
+# placeholders (never real secrets); they are kept in variables so a
+# NAME=<hex> secret scan cannot mistake the test fixture for a committed key.
+probe_plugin_secret="0000000000000000"
+probe_control_pubkey="0000000000000000000000000000000000000000000000000000000000000000"
+relay_probe_args=(
+  --dry-run --tunnel-host relay-tunnel.example.test --namespace sb0123abcd
+  --sync-url https://control.example.test --sync-san control.example.test
+  --sync-ca /tmp/sb-ca --sync-cert /tmp/sb-cert --sync-key /tmp/sb-key
+  --transport-cert /tmp/sb-transport-crt --transport-key /tmp/sb-transport-key
+)
+if env SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET="$probe_plugin_secret" \
+      SHAREBRIDGE_CONTROL_RELAY_PUBLIC_KEY="$probe_control_pubkey" \
+      bash "$install_sh" "${relay_probe_args[@]}" --frps-binary "${frps_probe_dir}/frps-probe" >/dev/null 2>&1; then
+  fail "installer accepted --frps-binary without an explicit --frps-sha256"
+else
+  pass
+fi
+if env SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET="$probe_plugin_secret" \
+      SHAREBRIDGE_CONTROL_RELAY_PUBLIC_KEY="$probe_control_pubkey" \
+      bash "$install_sh" "${relay_probe_args[@]}" --frps-binary "${frps_probe_dir}/frps-probe" --frps-sha256 "$probe_digest" >/dev/null 2>&1; then
+  pass
+else
+  fail "installer rejected --frps-binary with a matching explicit --frps-sha256"
+fi
+# Post-copy verification: the installed artifact is what runs, so a copy that
+# diverges from the verified source must fail closed.
+copy_dst="${frps_probe_dir}/installed-frps"
+if bash "$install_sh" --copy-frps "${frps_probe_dir}/frps-probe" --frps-dest "$copy_dst" --frps-sha256 "$probe_digest" >/dev/null 2>&1 \
+   && [[ "$(sha256_of "$copy_dst")" == "$probe_digest" ]]; then
+  pass
+else
+  fail "installer rejected (or mis-copied) a faithful copy of a verified frps binary"
+fi
+real_install_path="$(command -v install)"
+cat > "${install_shim_dir}/install" <<SHIM
+#!/bin/sh
+last=""
+for last_arg in "\$@"; do last="\$last_arg"; done
+"${real_install_path}" "\$@" || exit \$?
+printf 'tampered' >> "\$last"
+SHIM
+chmod 0755 "${install_shim_dir}/install"
+if PATH="${install_shim_dir}:${PATH}" bash "$install_sh" --copy-frps "${frps_probe_dir}/frps-probe" --frps-dest "${frps_probe_dir}/tamper-dst" --frps-sha256 "$probe_digest" >/dev/null 2>&1; then
+  fail "installer accepted a tampered post-copy frps artifact at the install location"
 else
   pass
 fi
@@ -498,11 +836,57 @@ done
 require_parsed_contains "$install_sh" 'dig[[:space:]][[:space:]]*\+short[[:space:]][[:space:]]*A[[:space:]][[:space:]]*"\$\{probe_label\}"' \
   "installer audit must resolve A for a random relay child label (wildcard synthesis)"
 require_contains "$ops_doc" 'probe-' "runbook must show the random-child-label query"
+# AAAA answers are validated with a real IPv6 parser, not a hex-and-colon
+# pattern that accepts `::::`.
+require_unique_function_def "$install_sh" is_ipv6_literal "the IPv6 validator must be defined exactly once"
+require_parsed_contains "$install_sh" 'is_ipv6_literal[[:space:]]+"\$ipv6"' \
+  "the DNS audit must validate every AAAA answer with is_ipv6_literal"
 # The claim must be scoped to the queried names: a zone-wide absence claim is
-# not provable by these queries and must not be published.
+# not provable by these queries and must not be published in ANY document.
 require_not_contains "$ops_doc" 'no HTTPS/SVCB records at all' "runbook must not overclaim zone-wide HTTPS/SVCB absence"
+require_not_contains "$ops_doc" 'zone publishes no HTTPS/SVCB' "runbook must not claim the zone publishes no HTTPS/SVCB records"
 require_contains "$ops_doc" 'AXFR|zone transfer|zone-wide' "runbook must state the DNS-audit scope honestly"
 require_contains "$ops_doc" '[Ee][Cc][Hh]' "runbook must call out the ECH invariant"
+require_not_contains "$plan_doc" 'zone publishes no HTTPS/SVCB' "plan must not overclaim zone-wide HTTPS/SVCB/ECH absence"
+require_contains "$plan_doc" 'no HTTPS/SVCB/ECH record' "plan must state the narrowed per-name HTTPS/SVCB/ECH claim"
+require_contains "$plan_doc" 'not a zone-wide' "plan must state the DNS-audit scope honestly"
+
+# Behavioural proof of the AAAA validator: a fake `dig` controls the answers, so
+# a garbage AAAA must make the audit fail closed and a real IPv6 literal must
+# pass.
+cat > "${dig_shim_dir}/dig" <<'SHIM'
+#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "AAAA" ]; then
+    printf '%s\n' "${FAKE_AAAA:-}"
+    exit 0
+  fi
+done
+for arg in "$@"; do
+  if [ "$arg" = "A" ]; then
+    printf '203.0.113.10\n'
+    exit 0
+  fi
+done
+exit 0
+SHIM
+chmod 0755 "${dig_shim_dir}/dig"
+run_fake_dns_audit() {
+  PATH="${dig_shim_dir}:${PATH}" FAKE_AAAA="$1" bash "$install_sh" --audit-dns \
+    --namespace sb0123abcd --tunnel-host relay-tunnel.example.test >/dev/null 2>&1
+}
+if run_fake_dns_audit "2001:db8::1"; then
+  pass
+else
+  fail "DNS audit rejected a valid IPv6 AAAA literal"
+fi
+for bad_aaaa in "::::" "2001:db8::1%eth0" "1:2:3" "1:2:3:4:5:6:7:8:9" "not-an-ip" ":"; do
+  if run_fake_dns_audit "$bad_aaaa"; then
+    fail "DNS audit accepted the invalid IPv6 answer '${bad_aaaa}'"
+  else
+    pass
+  fi
+done
 
 printf -- '-- A14: operator runbook carries the deferred operator surface\n'
 for name in \
