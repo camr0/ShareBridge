@@ -54,6 +54,36 @@ func TestReportEndpointPersistsCloseFailedEscalation(t *testing.T) {
 		"a later report must clear the close_failed escalation")
 }
 
+// TestEndpointCloseFailureSupersededByClosedStillPersistsFailure is the
+// control-side half of the A2 contract. The reporter must deliver the genuine
+// close failure even when a newer successful close supersedes the queued
+// failure, so control receives and persists the escalation before the healthy
+// reports clear it. The final state stays healthy and no stale transition is
+// applied (the failure precedes the close and the open).
+func TestEndpointCloseFailureSupersededByClosedStillPersistsFailure(t *testing.T) {
+	apiKeyID, ctrl := closeFailedEscalationFixture(t, "cf14")
+
+	// The failure control is told about must be persisted durably, not dropped.
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, routeDirectIP, 8443, "close_failed")
+	rec, _, err := LoadOrCreateAgent(ctrl.app, apiKeyID)
+	require.NoError(t, err)
+	require.Equal(t, "close_failed", rec.GetString("endpoint_status"),
+		"control must persist the genuine failure it was told about")
+
+	// The superseding successful close and the new open: the final state must be
+	// healthy with no stale failure left applied.
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, routeDirectIP, 0, "")
+	ctrl.HandleReportEndpoint(context.Background(), nil, apiKeyID, routeDirectIP, 8443, "")
+
+	rec, _, err = LoadOrCreateAgent(ctrl.app, apiKeyID)
+	require.NoError(t, err)
+	require.Equal(t, "", rec.GetString("endpoint_status"),
+		"the superseding close/open must clear the persisted failure")
+	require.Equal(t, 8443, rec.GetInt("endpoint_port"),
+		"the final state must be the healthy open, not a stale port 0")
+	require.Equal(t, routeDirectIP, rec.GetString("endpoint_ip"))
+}
+
 // TestEndpointReportOrderYieldsHealthyFinalState is the control-side half of
 // the M4 closeout batch 1b A2 ordering contract. HandleReportEndpoint applies
 // reports in arrival order and the LAST report wins, so the agent's reporter

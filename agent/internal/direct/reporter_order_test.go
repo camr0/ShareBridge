@@ -18,6 +18,82 @@ import (
 	"time"
 )
 
+// TestReporterDeliversCloseFailureBeforeSupersedingClosed is the finding-A2
+// proof. The previous per-endpoint coalescing replaced ANY queued advisory with
+// a newer one, so a queued `close_failed` followed by a newer `closed` before
+// the drain dequeued it was silently swallowed: control never received (and so
+// never persisted or logged) the genuine close failure. Coalescing must only
+// drop a transition that is safely superseded, and a failure may only be
+// superseded by a newer failure — never by a progress state.
+//
+// The drain is held busy so the failure and its superseding close are both
+// queued before either is dequeued (the exact reported sequence). A confirmed
+// open report is enqueued afterwards and used as the ordered barrier: when
+// ReportOpen returns, every advisory queued before it has been delivered. At
+// the base revision the failure is coalesced away and this fails.
+func TestReporterDeliversCloseFailureBeforeSupersedingClosed(t *testing.T) {
+	var mu sync.Mutex
+	var got []endpointReport
+
+	blockerEntered := make(chan struct{})
+	releaseBlocker := make(chan struct{})
+
+	r := NewReporter(func(ctx context.Context, ip string, port int, status string) error {
+		mu.Lock()
+		got = append(got, endpointReport{ip, port, status})
+		n := len(got)
+		mu.Unlock()
+		if n == 1 {
+			close(blockerEntered)
+			<-releaseBlocker
+		}
+		return nil
+	})
+	defer r.Close()
+	r.SetIP("203.0.113.7")
+
+	// A prior advisory occupies the drain, so the failure/close pair is queued
+	// before either is dequeued.
+	r.OnTransition(StateOpen, StateClosed, 0)
+	awaitSignal(t, blockerEntered, "the drain-blocking advisory entered")
+
+	// The exact A2 sequence: an unresolved close failure is queued, then a newer
+	// successful close supersedes it before the drain can dequeue the failure.
+	r.OnTransition(StateOpen, StateCloseFailed, 443)
+	r.OnTransition(StateCloseFailed, StateClosed, 0)
+
+	close(releaseBlocker)
+	// The confirmed open report is the ordered barrier: its completion proves the
+	// queued advisories ahead of it were delivered (or swallowed).
+	if err := r.ReportOpen(context.Background(), 52017); err != nil {
+		t.Fatalf("ReportOpen: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	failureIdx := -1
+	for i, e := range got {
+		if e.status == "close_failed" {
+			failureIdx = i
+			break
+		}
+	}
+	if failureIdx < 0 {
+		t.Fatalf("the close_failed advisory was swallowed by coalescing: %+v", got)
+	}
+	if failureIdx != 1 {
+		t.Fatalf("close_failed delivered at index %d, want 1 (before the superseding closed): %+v", failureIdx, got)
+	}
+	// No stale transition after a newer one: the failure precedes its
+	// superseding close, and the healthy open is last (control's final state).
+	if got[2].port != 0 || got[2].status != "" {
+		t.Fatalf("the superseding closed advisory must follow the failure: %+v", got)
+	}
+	if got[len(got)-1].port != 52017 || got[len(got)-1].status != "" {
+		t.Fatalf("the healthy open must be the last delivered report: %+v", got)
+	}
+}
+
 // TestReporterPreservesTransitionOrderAcrossOpen reproduces the exact A2 stale
 // sequence deterministically: a close_failed advisory is in flight, the next
 // open deletes the lingering mapping (enqueuing the closed advisory) and then

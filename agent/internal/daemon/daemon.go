@@ -227,14 +227,46 @@ type originPair struct {
 // directState is the daemon's direct-TCP transport state. It is nil when direct
 // transport is not configured (e.g. in tests using NewWithSignaling).
 type directState struct {
-	// syncMu serializes syncDirectServe rebuilds AND startDirectServer, so a
-	// listener cannot be started on the old server while a rebuild is between
-	// its drain/cancel and its single publication point (which would race the
-	// old socket or revive the discarded server). The handoff releases ds.mu
-	// across the bounded listener-exit wait; syncMu is acquired before ds.mu on
-	// every path and is never held while blocking on another lock, so it cannot
-	// form a lock cycle.
+	// syncMu serializes syncDirectServe rebuilds with each other, so a listener
+	// cannot be rebuilt on the old server while another rebuild is between its
+	// drain/cancel and its single publication point. It is held across a
+	// rebuild's bounded listener-exit wait, so it is deliberately NOT taken by
+	// startDirectServer: holding it across the listener start's bind-confirmation
+	// wait would serialize every rebuild (and the Unlock/enrollment paths that
+	// drive one) behind that wait (finding A1). The start and the rebuild
+	// coordinate through the rebuildInProgress/startInProgress single-flight
+	// state below instead. The handoff releases ds.mu across the waiter, and
+	// syncMu is acquired before ds.mu on every path and is never held while
+	// blocking on another lock, so it cannot form a lock cycle.
 	syncMu sync.Mutex
+
+	// rebuildInProgress is set (under mu) for the duration of an ordered
+	// rebuild's transition window: from the moment the old listener is marked
+	// non-serving until the replacement is published or the handoff fails
+	// closed. startDirectServer observes it and waits instead of starting the
+	// old server being drained. It is a state flag, not the syncMu lock, because
+	// the rebuild must not hold a lock that a concurrent start (or successor
+	// rebuild) waits on while the rebuild performs its bounded listener-exit
+	// wait.
+	rebuildInProgress bool
+
+	// startInProgress is set (under mu) from a start's transition until its bind
+	// result is known, so a concurrent start waits for it and then re-evaluates
+	// (never two live listeners, never a false success behind an unresolved
+	// attempt). Like rebuildInProgress it is state, not a lock: the bind wait is
+	// performed holding no lock, and a rebuild is free to supersede an in-flight
+	// start.
+	startInProgress bool
+
+	// stopped is set by stopDirectServer (daemon shutdown). A start superseded by
+	// shutdown must not loop and re-bind the listener.
+	stopped bool
+
+	// flowCh is the single-flight wake-up for startDirectServer's waiters: it is
+	// closed and replaced (under mu) whenever rebuildInProgress or
+	// startInProgress changes, so a waiter can block outside ds.mu without a
+	// per-waiter channel. Lazily created (some tests build a directState literal).
+	flowCh chan struct{}
 
 	mu        sync.Mutex
 	namespace string
@@ -907,8 +939,12 @@ func (d *Daemon) revokeOrigin(code string) {
 // through its own registry, cancelled, and waited on (bounded) for its socket
 // to be released before the replacement binder/server is published. The wait
 // is never performed while holding ds.mu, so the listener goroutine — which
-// takes ds.mu to clear its start guard — can always exit; ds.syncMu serializes
-// concurrent rebuilds so two handoffs cannot both publish a live server.
+// takes ds.mu to clear its start guard — can always exit. ds.syncMu serializes
+// concurrent rebuilds so two handoffs cannot both publish a live server; the
+// rebuild also raises ds.rebuildInProgress so a concurrent startDirectServer
+// waits for the handoff instead of starting the server being drained. The
+// rebuild never waits on an in-flight start: it cancels it and proceeds to its
+// own bounded listener-exit wait (finding A1).
 //
 // It RETURNS the fail-closed handoff error instead of stashing it: the caller
 // (Unlock, the signaling-loop enrolled/start paths, startup) must decide what
@@ -934,14 +970,25 @@ func (d *Daemon) syncDirectServe() error {
 	}
 	// 1. Mark the old listener non-serving under ds.mu (no new start may latch
 	// it), but KEEP ds.server pointing at the old object: its route-aware
-	// registry must remain reachable to the T29 closers while it drains.
+	// registry must remain reachable to the T29 closers while it drains. The
+	// rebuildInProgress flag is the single-flight gate startDirectServer
+	// observes; it is cleared (deferred) once the replacement is published or
+	// the handoff fails closed.
 	oldServer := ds.server
 	cancel := ds.cancel
 	done := ds.listenerDone
 	listenAddr := ds.listenAddr
 	ds.started = false
 	ds.startGen++
+	ds.rebuildInProgress = true
+	ds.flowSignalLocked()
 	ds.mu.Unlock()
+	defer func() {
+		ds.mu.Lock()
+		ds.rebuildInProgress = false
+		ds.flowSignalLocked()
+		ds.mu.Unlock()
+	}()
 
 	// 2. Drain the old server's active connections through its own registry,
 	// then cancel/close its listener.
@@ -1314,6 +1361,9 @@ func (d *Daemon) stopDirectServer() {
 	started := ds.started
 	ds.started = false
 	ds.startGen++
+	// A start superseded by shutdown must not loop and re-bind the listener.
+	ds.stopped = true
+	ds.flowSignalLocked()
 	server := ds.server
 	ds.mu.Unlock()
 	if server != nil {
@@ -1740,118 +1790,154 @@ func (d *Daemon) learnAndReportPublicIP() {
 //
 // It CONFIRMS the listener's bind before returning success (audit A1): the
 // start goroutine reports the net.Listen result on a listen-result channel and
-// this function waits (bounded, holding no lock) for it. A bind failure is
-// returned to the caller, so Unlock and the signaling-loop handlers never
-// report the daemon in service while the listener could not bind. A prior
-// handoff that failed closed latches the start guard and is reported just the
-// same. After a bind failure the start guard is reset (generation-checked) so a
-// later retry can bind once the socket is free.
+// this function waits (bounded) for it. A bind failure is returned to the
+// caller, so Unlock and the signaling-loop handlers never report the daemon in
+// service while the listener could not bind. A prior handoff that failed closed
+// latches the start guard and is reported just the same. After a bind failure
+// the start guard is reset (generation-checked) so a later retry can bind once
+// the socket is free.
+//
+// The bind wait holds NO lock (finding A1): the start and the ordered rebuild
+// coordinate through the single-flight rebuildInProgress/startInProgress state
+// observed under ds.mu, so a rebuild can cancel an in-flight start and proceed
+// to its own bounded listener-exit wait instead of serializing behind the bind
+// wait. A concurrent start waits for the in-flight one and re-evaluates, so two
+// starts never both bind; a start superseded by a rebuild loops and starts the
+// server the rebuild published (or observes the rebuild's fail-closed latch).
 func (d *Daemon) startDirectServer() error {
 	ds := d.direct
 	if ds == nil {
 		return nil
 	}
-	// Serialize with a rebuild handoff: while a rebuild is draining/waiting,
-	// ds.server still points at the old object, and starting it here would race
-	// the socket the handoff is releasing. Once the handoff publishes, this
-	// starts the fresh server exactly once.
-	ds.syncMu.Lock()
-	defer ds.syncMu.Unlock()
-	ds.mu.Lock()
-	// Fail closed FIRST: a prior handoff could not prove the old socket was
-	// released, and the guard it latched (ds.started) describes the old
-	// listener that may still be serving, so the ordinary not-started checks
-	// must not turn this into a silent no-op success. Binding here would race
-	// that socket; a successful rebuild clears the error first.
-	if ds.handoffErr != nil {
-		err := ds.handoffErr
-		ds.mu.Unlock()
-		log.Printf("direct server: refusing to start while the listener handoff is fail-closed: %v", err)
-		return err
-	}
-	if ds.server == nil || ds.locked || ds.started {
-		ds.mu.Unlock()
-		return nil
-	}
-	server := ds.server
-	startFn := ds.startListenerFn
-	listenTimeout := ds.listenStartTimeoutResolved()
-	ds.started = true
-	ds.startGen++
-	gen := ds.startGen
-	ctx, cancel := context.WithCancel(context.Background())
-	ds.cancel = cancel
-	done := make(chan struct{})
-	ds.listenerDone = done
-	listenAddr := ds.listenAddr
-	ds.mu.Unlock()
-	if listenAddr == "" {
-		listenAddr = fmt.Sprintf(":%d", directIntPort)
-	}
-
-	// resetStartGuard is the generation-checked rollback used by both the
-	// synchronous bind-failure path and the goroutine when Start returns an
-	// error: a stale failure must not clobber a newer start attempt (or a
-	// disconnect that already reset the epoch).
-	resetStartGuard := func() {
+	for {
 		ds.mu.Lock()
-		if ds.startGen == gen {
+		// A rebuild's transition window leaves ds.server pointing at the server
+		// being drained; starting it would race the socket the handoff is
+		// releasing. The wait releases ds.mu (a rebuild takes it to publish) and
+		// holds no other lock, so it can never block the rebuild's own bounded
+		// listener-exit wait.
+		for ds.rebuildInProgress || ds.startInProgress {
+			ch := ds.flowWaitLocked()
+			ds.mu.Unlock()
+			<-ch
+			ds.mu.Lock()
+		}
+		// Fail closed FIRST: a prior handoff could not prove the old socket was
+		// released, and the guard it latched (ds.started) describes the old
+		// listener that may still be serving, so the ordinary not-started checks
+		// must not turn this into a silent no-op success. Binding here would race
+		// that socket; a successful rebuild clears the error first.
+		if ds.handoffErr != nil {
+			err := ds.handoffErr
+			ds.mu.Unlock()
+			log.Printf("direct server: refusing to start while the listener handoff is fail-closed: %v", err)
+			return err
+		}
+		if ds.server == nil || ds.locked || ds.started || ds.stopped {
+			ds.mu.Unlock()
+			return nil
+		}
+		server := ds.server
+		startFn := ds.startListenerFn
+		listenTimeout := ds.listenStartTimeoutResolved()
+		ds.started = true
+		ds.startInProgress = true
+		ds.startGen++
+		gen := ds.startGen
+		ctx, cancel := context.WithCancel(context.Background())
+		ds.cancel = cancel
+		done := make(chan struct{})
+		ds.listenerDone = done
+		listenAddr := ds.listenAddr
+		ds.mu.Unlock()
+		if listenAddr == "" {
+			listenAddr = fmt.Sprintf(":%d", directIntPort)
+		}
+
+		// listenResult carries the bind outcome exactly once; the buffered channel
+		// keeps the reporting goroutine from blocking if the caller already gave up
+		// on the bound. boundOK records whether that first report was a successful
+		// bind, so the goroutine can reset the guard generation-checked when the
+		// serve loop fails AFTER a confirmed bind (base behaviour).
+		listenResult := make(chan error, 1)
+		var reportReady sync.Once
+		boundOK := false
+		ready := func(err error) {
+			reportReady.Do(func() {
+				boundOK = err == nil
+				listenResult <- err
+			})
+		}
+
+		go func() {
+			// Closing done (after Start has returned and the socket is released)
+			// is what a listener rebuild waits on before binding the replacement.
+			defer close(done)
+			start := func(ctx context.Context, addr string, r func(error)) error {
+				return server.StartWithReady(ctx, addr, r)
+			}
+			if startFn != nil {
+				start = func(ctx context.Context, addr string, r func(error)) error {
+					return startFn(ctx, server, addr, r)
+				}
+			}
+			err := start(ctx, listenAddr, ready)
+			// A start seam that returned without reporting the bind must not leave
+			// the caller waiting: report whatever it returned (nil only if it bound).
+			ready(err)
+			if err != nil {
+				log.Printf("direct server: %v", err)
+				cancel() // release the epoch ctx
+			}
+			// A serve loop that failed after a confirmed bind leaves the outer wait
+			// already returned; reset the start guard (generation-checked, so a
+			// stale failure cannot clobber a newer attempt) so a later start can
+			// retry, exactly as before. A failed bind is rolled back by the outer
+			// wait instead, which owns clearing startInProgress.
+			if err != nil && boundOK {
+				ds.mu.Lock()
+				if ds.startGen == gen {
+					ds.cancel = nil
+					ds.started = false
+					ds.listenerDone = nil
+				}
+				ds.mu.Unlock()
+			}
+		}()
+
+		// Wait (holding no lock) for the bind confirmation. The listener goroutine
+		// runs net.Listen synchronously, so this is a scheduling bound, not a
+		// network one; a miss is a failed start (fail closed).
+		var err error
+		timer := time.NewTimer(listenTimeout)
+		select {
+		case err = <-listenResult:
+		case <-timer.C:
+			err = fmt.Errorf("direct server: listener bind did not confirm within %s", listenTimeout)
+		}
+		timer.Stop()
+
+		ds.mu.Lock()
+		// A rebuild (or shutdown) that took over while we waited bumped the
+		// generation. Do NOT clobber its state — the server this attempt was
+		// binding was discarded — and re-evaluate instead: the replacement the
+		// rebuild published still needs starting.
+		superseded := ds.startGen != gen
+		ds.startInProgress = false
+		if !superseded && err != nil {
+			// Generation-checked rollback: a stale failure must not clobber a
+			// newer start attempt (or a disconnect that already reset the epoch).
+			cancel()
 			ds.cancel = nil
 			ds.started = false
 			ds.listenerDone = nil
 		}
+		ds.flowSignalLocked()
 		ds.mu.Unlock()
-	}
-
-	// listenResult carries the bind outcome exactly once; the buffered channel
-	// keeps the reporting goroutine from blocking if the caller already gave up
-	// on the bound.
-	listenResult := make(chan error, 1)
-	var reportReady sync.Once
-	ready := func(err error) {
-		reportReady.Do(func() { listenResult <- err })
-	}
-
-	go func() {
-		// Closing done (after Start has returned and the socket is released)
-		// is what a listener rebuild waits on before binding the replacement.
-		defer close(done)
-		start := func(ctx context.Context, addr string, r func(error)) error {
-			return server.StartWithReady(ctx, addr, r)
+		if superseded {
+			continue
 		}
-		if startFn != nil {
-			start = func(ctx context.Context, addr string, r func(error)) error {
-				return startFn(ctx, server, addr, r)
-			}
-		}
-		err := start(ctx, listenAddr, ready)
-		// A start seam that returned without reporting the bind must not leave
-		// the caller waiting: report whatever it returned (nil only if it bound).
-		ready(err)
-		if err != nil {
-			log.Printf("direct server: %v", err)
-			cancel() // release the epoch ctx
-			resetStartGuard()
-		}
-	}()
-
-	// Wait (holding no lock) for the bind confirmation. The listener goroutine
-	// runs net.Listen synchronously, so this is a scheduling bound, not a
-	// network one; a miss is a failed start (fail closed).
-	timer := time.NewTimer(listenTimeout)
-	defer timer.Stop()
-	select {
-	case err := <-listenResult:
-		if err != nil {
-			cancel()
-			resetStartGuard()
-			return err
-		}
-		return nil
-	case <-timer.C:
-		cancel()
-		resetStartGuard()
-		return fmt.Errorf("direct server: listener bind did not confirm within %s", listenTimeout)
+		return err
 	}
 }
 
@@ -1896,6 +1982,25 @@ func waitChanClosed(ch <-chan struct{}, bound time.Duration) bool {
 		return true
 	case <-timer.C:
 		return false
+	}
+}
+
+// flowWaitLocked returns the current single-flight wake-up channel, lazily
+// creating it. The caller holds ds.mu, releases it, and waits on the returned
+// channel; flowSignalLocked closes and replaces the channel on any change to
+// rebuildInProgress/startInProgress. Caller must hold ds.mu.
+func (ds *directState) flowWaitLocked() chan struct{} {
+	if ds.flowCh == nil {
+		ds.flowCh = make(chan struct{})
+	}
+	return ds.flowCh
+}
+
+// flowSignalLocked wakes every startDirectServer waiter. Caller must hold ds.mu.
+func (ds *directState) flowSignalLocked() {
+	if ds.flowCh != nil {
+		close(ds.flowCh)
+		ds.flowCh = nil
 	}
 }
 

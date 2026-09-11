@@ -16,19 +16,21 @@ const defaultEndpointSendTimeout = 5 * time.Second
 // advisorySendTimeout bounds ONE advisory (closed / close-failed) send. The
 // drain serializes sends, so an advisory already in flight delays a confirmed
 // open report queued behind it — and the daemon's open confirmation deadline
-// (defaultOpenReportTimeout, 3s) is SHORTER than the 5s transport bound, so an
-// unmodified advisory could occupy the drain past the open's deadline and fail
-// the open closed for no reason (remediation finding 4). Bounding advisories
-// well below that deadline keeps the residual in-flight delay harmless. It is
-// only a backstop against the in-flight case; queued advisories are handled by
-// per-endpoint coalescing, which caps the queued backlog at one advisory.
-const advisorySendTimeout = time.Second
+// (defaultOpenReportTimeout, 3s) must absorb the worst-case backlog. A failure
+// and its superseding progress transition are both queued (coalescing never
+// drops a failure for a success), so the backlog is at most three advisory
+// sends: one in flight plus one queued close_failed plus one queued closed. The
+// bound is therefore 750ms and not a full second: 3 x 750ms = 2.25s, leaving
+// 750ms of the 3s deadline for the open report's own confirmation. It is only a
+// backstop against the queued/in-flight case; same-class coalescing bounds the
+// queue to one advisory per class.
+const advisorySendTimeout = 750 * time.Millisecond
 
 // reporterQueueCap bounds the number of pending events. A single FIFO carries
 // both advisories and confirmed opens so per-endpoint transition order is
-// preserved; advisories are coalesced (at most one pending per endpoint, the
-// newest), so only concurrent open reports can grow the queue and the cap is a
-// defensive safety net.
+// preserved; advisories are coalesced per class (at most one pending failure
+// and one pending progress advisory), so only concurrent open reports can grow
+// the queue and the cap is a defensive safety net.
 const reporterQueueCap = 64
 
 // ErrReporterClosed is returned by ReportOpen once the reporter has been
@@ -48,11 +50,15 @@ var errReporterQueueFull = errors.New("direct: endpoint reporter queue is full")
 // can never overtake an advisory that was enqueued before it (audit A2 — the
 // previous dedicated priority channel let a stale close_failed/closed land
 // after a healthy open and mark the endpoint port-zero). Advisory transitions
-// (close and close-failed) are coalesced per endpoint — the newest queued
-// advisory supersedes any earlier queued one — which bounds the queued backlog
-// to a single advisory so a stalled advisory cannot delay a confirmed open past
-// its deadline (finding 4). A dropped advisory is always superseded by a newer
-// one for the same endpoint, never reordered relative to it.
+// (close and close-failed) are coalesced WITHIN their class — a newer queued
+// close_failed supersedes an older queued close_failed, a newer queued closed
+// supersedes an older queued closed — which bounds the queued backlog to one
+// advisory per class so a stalled advisory cannot delay a confirmed open past
+// its deadline (finding 4), while a failure is NEVER dropped in favour of a
+// later success (finding A2: control must still receive and persist the
+// failure). Only a queued advisory is dropped, never one the drain already
+// dequeued, and the replacement is always newer, so no transition is ever
+// reordered relative to another.
 //
 // The OPEN transition is delivered exclusively by ReportOpen, which confirms
 // delivery before returning and reports a full queue, a send error, or a
@@ -86,6 +92,19 @@ type endpointEvent struct {
 // confirmed open report). Confirmed opens are the only events that carry a
 // per-caller confirmation channel.
 func (e endpointEvent) isAdvisory() bool { return e.done == nil }
+
+// advisoryClass names the control-relevant class of an advisory transition.
+// Coalescing is confined to one class: a close_failed (failure) is never
+// dropped in favour of a closed (progress), because control persists the
+// failure and suppresses direct until it is told the mapping was released; a
+// newer failure safely supersedes an older failure, and a newer closed safely
+// supersedes an older closed.
+func (e endpointEvent) advisoryClass() string {
+	if e.status == "close_failed" {
+		return "close_failed"
+	}
+	return "closed"
+}
 
 func NewReporter(send func(ctx context.Context, ip string, port int, status string) error) *Reporter {
 	r := &Reporter{
@@ -195,15 +214,23 @@ func (r *Reporter) OnTransition(old, new PortState, grantedPort int) {
 		return
 	}
 	e.ip = r.ip
-	// Coalesce per endpoint: a queued advisory immediately superseded by this
-	// newer one is dropped, so the queued advisory backlog is at most one and
-	// cannot delay a later confirmed open past its deadline. Only the TAIL is
-	// coalesced, so an advisory is never dropped across an intervening open
-	// report (which would reorder an endpoint's transitions); each dropped
-	// advisory is strictly older than the one that replaced it.
-	if n := len(r.queue); n > 0 && r.queue[n-1].isAdvisory() {
-		r.queue[n-1] = e
-	} else if len(r.queue) < reporterQueueCap {
+	// Coalesce WITHIN the advisory's own class: a queued advisory of the same
+	// class immediately superseded by this newer one is dropped, so the queued
+	// backlog is at most one failure plus one progress advisory and cannot delay
+	// a later confirmed open past its deadline. A failure is NEVER dropped in
+	// favour of a progress transition (finding A2): control must receive and
+	// persist a close_failed even when a later closed supersedes it, so the two
+	// classes queue independently. Any queued advisory of the same class is
+	// removed (not only the tail), and the newer one is appended at the tail, so
+	// the delivered sequence stays a subsequence of the production order: a
+	// transition is never delivered after a newer one.
+	for i := 0; i < len(r.queue); i++ {
+		if r.queue[i].isAdvisory() && r.queue[i].advisoryClass() == e.advisoryClass() {
+			r.queue = append(r.queue[:i], r.queue[i+1:]...)
+			break
+		}
+	}
+	if len(r.queue) < reporterQueueCap {
 		r.queue = append(r.queue, e)
 	}
 	// A full queue drops the advisory (advisory reports may be lost; the next
