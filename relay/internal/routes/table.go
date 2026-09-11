@@ -87,7 +87,19 @@ var (
 	// only (§15.4): it never closes or drains established streams — only an
 	// explicit revoke or lockdown does that (§15.6).
 	ErrRouteLeaseExpired = errors.New("routes: route lease expired")
+	// ErrRouteCapacity covers a NEW hostname arriving when the table already
+	// holds its documented maximum entry count. The table fails closed with
+	// no eviction: an admitted route is never silently displaced, and every
+	// entry — active or tombstone — retains its map slot (audit I7).
+	ErrRouteCapacity = errors.New("routes: route table capacity reached")
 )
+
+// DefaultMaxRoutes bounds the in-memory route map. It matches control's
+// Task 11 snapshot validator (controlsync.MaxRoutesPerSnapshot = 4096), so a
+// healthy deployment cannot reach the ceiling through a snapshot; the table
+// enforces it independently as defense in depth against unbounded map growth
+// from the delta path (audit I7).
+const DefaultMaxRoutes = 4096
 
 // RouteLeaseTTL is the §14 gateway route lease: a route's new-connection
 // eligibility expires this long after its last applied route update. Control
@@ -111,11 +123,12 @@ const (
 // beside the route entry, never inside Route, so route values stay plain
 // comparable state.
 type Table struct {
-	mu       sync.RWMutex
-	byHost   map[string]Route
-	leases   map[string]time.Time
-	presence Presence
-	now      func() time.Time
+	mu        sync.RWMutex
+	byHost    map[string]Route
+	leases    map[string]time.Time
+	presence  Presence
+	now       func() time.Time
+	maxRoutes int
 }
 
 // Option configures an optional Table collaborator.
@@ -131,14 +144,26 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
+// WithMaxRoutes overrides the route-map entry ceiling (default
+// DefaultMaxRoutes). A non-positive value keeps the default; tests use it to
+// prove the cap under a small ceiling.
+func WithMaxRoutes(maxRoutes int) Option {
+	return func(table *Table) {
+		if maxRoutes > 0 {
+			table.maxRoutes = maxRoutes
+		}
+	}
+}
+
 // NewTable returns a route table that joins lookups against presence. A nil
 // presence fails every lookup closed.
 func NewTable(presence Presence, options ...Option) *Table {
 	table := &Table{
-		byHost:   make(map[string]Route),
-		leases:   make(map[string]time.Time),
-		presence: presence,
-		now:      time.Now,
+		byHost:    make(map[string]Route),
+		leases:    make(map[string]time.Time),
+		presence:  presence,
+		now:       time.Now,
+		maxRoutes: DefaultMaxRoutes,
 	}
 	for _, option := range options {
 		option(table)
@@ -164,6 +189,11 @@ func (table *Table) Apply(route Route) error {
 	if existing, ok := table.byHost[hostname]; ok && route.Revision <= existing.Revision {
 		return fmt.Errorf("routes: revision %d does not supersede %d for %q: %w",
 			route.Revision, existing.Revision, hostname, ErrStaleRevision)
+	} else if !ok && len(table.byHost) >= table.maxRoutes {
+		// Fail closed, never evict: a new hostname beyond the ceiling is
+		// refused and every admitted route keeps routing (audit I7).
+		return fmt.Errorf("routes: cannot add %q: %d entries reach the ceiling %d: %w",
+			hostname, len(table.byHost), table.maxRoutes, ErrRouteCapacity)
 	}
 	route.Hostname = hostname
 	table.byHost[hostname] = route
@@ -196,6 +226,15 @@ func (table *Table) Revoke(hostname string, revision uint64) error {
 	table.byHost[normalized] = existing
 	delete(table.leases, normalized) // a tombstone never needs a lease
 	return nil
+}
+
+// Len reports how many route entries the table currently holds, counting
+// active routes and tombstones alike. It exists for bounds tests and
+// operator introspection, never on the routing hot path.
+func (table *Table) Len() int {
+	table.mu.RLock()
+	defer table.mu.RUnlock()
+	return len(table.byHost)
 }
 
 // Peek returns the stored route entry for hostname — normalized exactly as
@@ -284,6 +323,22 @@ func (table *Table) replaceSnapshot(incoming []Route, fromNewEpoch bool) (droppe
 			if stored.Active {
 				nextLeases[hostname] = now.Add(RouteLeaseTTL) // the snapshot re-affirmed it
 			}
+		}
+	}
+	// Enforce the entry ceiling before the snapshot commits (audit I7).
+	// Control's Task 11 validator already bounds a snapshot at 4096; this is
+	// independent defense in depth. Entries beyond the ceiling are omitted
+	// deterministically by lexicographic hostname order — a fail-closed drop
+	// (the omitted routes stop routing and are reported in the dropped set),
+	// never a random partial subset.
+	if len(nextHost) > table.maxRoutes {
+		allHostnames := make([]string, 0, len(nextHost))
+		for hostname := range nextHost {
+			allHostnames = append(allHostnames, hostname)
+		}
+		sort.Strings(allHostnames)
+		for _, hostname := range allHostnames[table.maxRoutes:] {
+			delete(nextHost, hostname)
 		}
 	}
 	for hostname, route := range nextHost {

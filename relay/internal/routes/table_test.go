@@ -377,3 +377,93 @@ func TestReplaceSnapshotFromNewEpochReplacesStoredRevisions(t *testing.T) {
 		t.Fatalf("Lookup after new-epoch omission = %v, want %v", err, ErrRouteNotFound)
 	}
 }
+
+// TestRouteTableCapsEntriesUnderFlood proves the in-memory route map cannot
+// grow without bound (audit I7). The documented policy is FAIL CLOSED with
+// no eviction: once the ceiling is reached a NEW hostname is refused with
+// ErrRouteCapacity and every already-admitted route stays present and
+// routable. The ceiling counts active routes and tombstones alike, because a
+// tombstone is retained state (spec §8) that still occupies the map.
+func TestRouteTableCapsEntriesUnderFlood(t *testing.T) {
+	const cap = 8
+	presence := newStubPresence(presenceKey{
+		agentRecordID: testAgentRecordID,
+		relayPort:     testRelayPort,
+		generation:    testGeneration,
+	})
+	table := NewTable(presence, WithMaxRoutes(cap))
+
+	admitted := 0
+	for i := 0; i < 100; i++ {
+		hostname := fmt.Sprintf("flood-%03d.relay.ns1.sharebridgeusercontent.com", i)
+		err := table.Apply(testRoute(hostname, 1))
+		switch {
+		case err == nil:
+			admitted++
+		case errors.Is(err, ErrRouteCapacity):
+			// The documented fail-closed refusal for a new hostname.
+		default:
+			t.Fatalf("Apply(%q) error = %v, want nil or %v", hostname, err, ErrRouteCapacity)
+		}
+	}
+	if admitted != cap {
+		t.Fatalf("admitted %d routes under flood, want exactly the ceiling %d", admitted, cap)
+	}
+	if got := table.Len(); got != cap {
+		t.Fatalf("table.Len() = %d, want the ceiling %d", got, cap)
+	}
+
+	// Fail closed means no eviction: every admitted route is still present.
+	for i := 0; i < cap; i++ {
+		hostname := fmt.Sprintf("flood-%03d.relay.ns1.sharebridgeusercontent.com", i)
+		if _, ok := table.Peek(hostname); !ok {
+			t.Fatalf("admitted route %q was evicted by the capacity refusal", hostname)
+		}
+	}
+
+	// Updating an existing entry never trips the capacity check.
+	if err := table.Apply(testRoute("flood-000.relay.ns1.sharebridgeusercontent.com", 2)); err != nil {
+		t.Fatalf("Apply(update at the ceiling) = %v, want nil", err)
+	}
+
+	// A revoke tombstones in place (no growth) and does not free capacity,
+	// because the tombstone is retained fence state.
+	if err := table.Revoke("flood-001.relay.ns1.sharebridgeusercontent.com", 3); err != nil {
+		t.Fatalf("Revoke(at the ceiling) = %v, want nil", err)
+	}
+	if err := table.Apply(testRoute("flood-next.relay.ns1.sharebridgeusercontent.com", 1)); !errors.Is(err, ErrRouteCapacity) {
+		t.Fatalf("Apply(new hostname after a tombstone) error = %v, want %v (tombstones retain their map slot)", err, ErrRouteCapacity)
+	}
+}
+
+// TestRouteTableSnapshotCapIsFailClosedAndDeterministic proves the snapshot
+// path obeys the same ceiling. Control's Task 11 validator already bounds a
+// snapshot at 4096 routes; this is the table's independent defense in depth.
+// Entries beyond the ceiling are omitted deterministically (lexicographic
+// hostname order) so an overflow can never admit a random partial subset.
+func TestRouteTableSnapshotCapIsFailClosedAndDeterministic(t *testing.T) {
+	const cap = 4
+	table := NewTable(newStubPresence(), WithMaxRoutes(cap))
+
+	incoming := make([]Route, 0, 10)
+	for i := 0; i < 10; i++ {
+		incoming = append(incoming, testRoute(fmt.Sprintf("snap-%02d.relay.ns1.sharebridgeusercontent.com", i), 1))
+	}
+	table.ReplaceSnapshot(incoming)
+
+	if got := table.Len(); got != cap {
+		t.Fatalf("table.Len() after an oversize snapshot = %d, want the ceiling %d", got, cap)
+	}
+	for i := 0; i < cap; i++ {
+		hostname := fmt.Sprintf("snap-%02d.relay.ns1.sharebridgeusercontent.com", i)
+		if _, ok := table.Peek(hostname); !ok {
+			t.Fatalf("snapshot entry %q missing; the first %d lexicographic hostnames must be admitted", hostname, cap)
+		}
+	}
+	for i := cap; i < 10; i++ {
+		hostname := fmt.Sprintf("snap-%02d.relay.ns1.sharebridgeusercontent.com", i)
+		if _, ok := table.Peek(hostname); ok {
+			t.Fatalf("snapshot entry %q was admitted past the %d-entry ceiling", hostname, cap)
+		}
+	}
+}

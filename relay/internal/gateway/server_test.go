@@ -9,13 +9,16 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"sharebridge/relay/internal/clienthello"
+	"sharebridge/relay/internal/limits"
 	"sharebridge/relay/internal/routes"
 )
 
@@ -295,6 +298,33 @@ func assertPeerClosed(t *testing.T, label string, conn net.Conn) {
 	}
 	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("%s: peer connection is still open", label)
+	}
+}
+
+// assertRejectedWithoutBytes is assertClosedWithNoBytes for rejection paths
+// that close the peer while its ClientHello is still unread. Closing a socket
+// with unread data in the receive buffer makes the kernel send RST, which is
+// still a generic close that returns zero bytes to the browser; the strict
+// helper above is kept for the fully-read paths.
+func assertRejectedWithoutBytes(t *testing.T, label string, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("%s: arming the read deadline: %v", label, err)
+	}
+	received := 0
+	buffer := make([]byte, 1024)
+	for {
+		count, readErr := conn.Read(buffer)
+		received += count
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) || errors.Is(readErr, net.ErrClosed) || errors.Is(readErr, syscall.ECONNRESET) {
+				break
+			}
+			t.Fatalf("%s: unexpected read error: %v", label, readErr)
+		}
+	}
+	if received != 0 {
+		t.Fatalf("%s: browser received %d bytes; a generic close must return none", label, received)
 	}
 }
 
@@ -600,4 +630,393 @@ func TestGatewayStreamRegisteredDuringRevokeIsClosed(t *testing.T) {
 		assertPeerClosed(t, "browser after revoke", browser)
 		awaitStreamsDrained(t, harness.streams)
 	})
+}
+
+// relayRouteBeta is a second exact route on the same agent as alpha, used to
+// separate per-origin ceilings (different hostname) from per-agent ceilings
+// (same agent record).
+const relayRouteBeta = "beta.relay.ns1.sharebridgeusercontent.com"
+
+// waitForCondition polls a predicate until it holds or the deadline expires.
+// It is a deadline-bounded eventual assertion, never a sleep standing in for
+// synchronization.
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, description string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %v waiting for %s", timeout, description)
+}
+
+func awaitLimiterIdle(t *testing.T, limiter *limits.Limiter) {
+	t.Helper()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return limiter.ActiveConnections() == 0 && limiter.ActiveStreams() == 0
+	}, "every connection and stream lease to be released")
+}
+
+// openStream connects a browser, delivers a complete ClientHello for the
+// route, and returns both ends of a fully registered live stream.
+func openStream(t *testing.T, harness *gatewayHarness, hostname string) (net.Conn, net.Conn) {
+	t.Helper()
+	browser := connectBrowser(t, harness.publicAddr)
+	hello := clientHelloRecord(hostname)
+	if _, err := browser.Write(hello); err != nil {
+		t.Fatalf("writing the ClientHello for %s: %v", hostname, err)
+	}
+	agentConn := acceptOne(t, harness.agentListener)
+	if got := readFull(t, agentConn, len(hello)); !bytes.Equal(got, hello) {
+		t.Fatalf("agent received bytes that differ from the %s ClientHello", hostname)
+	}
+	return browser, agentConn
+}
+
+func TestGatewayLimitsRejectExcessPerSourceIP(t *testing.T) {
+	config := limits.DefaultConfig()
+	config.MaxStreamsPerSourceIP = 2
+	config.MaxStreamsGlobal = 100
+	limiter := limits.NewLimiter(config)
+	harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+	applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+	firstBrowser, _ := openStream(t, harness, relayRouteAlpha)
+	openStream(t, harness, relayRouteAlpha)
+	if got := limiter.ActiveStreams(); got != 2 {
+		t.Fatalf("ActiveStreams() = %d, want the two admitted streams", got)
+	}
+
+	// Every test connection shares 127.0.0.1, so the third is over the
+	// per-source-IP ceiling and must close without a dial.
+	third := connectBrowser(t, harness.publicAddr)
+	_, _ = third.Write(clientHelloRecord(relayRouteAlpha))
+	assertRejectedWithoutBytes(t, "per-source-IP over-limit connection", third)
+	if observations := harness.dialer.recorded(); len(observations) != 2 {
+		t.Fatalf("gateway dialed the agent %d times, want 2 (the over-limit connection must never dial)", len(observations))
+	}
+	if got := limiter.ActiveStreams(); got != 2 {
+		t.Fatalf("ActiveStreams() = %d after the rejection, want 2", got)
+	}
+
+	// Releasing one stream frees exactly one slot.
+	firstBrowser.Close()
+	waitForCondition(t, 2*time.Second, func() bool { return limiter.ActiveStreams() == 1 }, "the per-IP slot to be released")
+	openStream(t, harness, relayRouteAlpha)
+	if got := limiter.ActiveStreams(); got != 2 {
+		t.Fatalf("ActiveStreams() = %d after re-admission, want 2", got)
+	}
+}
+
+func TestGatewayLimitsEnforcePerOriginAndPerAgent(t *testing.T) {
+	t.Run("per exact origin", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.MaxStreamsPerOrigin = 1
+		config.MaxStreamsPerAgent = 100
+		config.MaxStreamsGlobal = 100
+		limiter := limits.NewLimiter(config)
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+		applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+		applyRoute(t, harness.table, relayRouteBeta, harness.agentPort)
+
+		openStream(t, harness, relayRouteAlpha)
+		openStream(t, harness, relayRouteBeta) // a different exact origin still admits
+
+		third := connectBrowser(t, harness.publicAddr)
+		_, _ = third.Write(clientHelloRecord(relayRouteAlpha))
+		assertRejectedWithoutBytes(t, "per-origin over-limit connection", third)
+		if got := limiter.ActiveStreams(); got != 2 {
+			t.Fatalf("ActiveStreams() = %d after the per-origin rejection, want 2", got)
+		}
+	})
+
+	t.Run("per agent across distinct origins", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.MaxStreamsPerOrigin = 100
+		config.MaxStreamsPerAgent = 1
+		config.MaxStreamsGlobal = 100
+		limiter := limits.NewLimiter(config)
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+		applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+		applyRoute(t, harness.table, relayRouteBeta, harness.agentPort)
+
+		openStream(t, harness, relayRouteAlpha)
+
+		second := connectBrowser(t, harness.publicAddr)
+		_, _ = second.Write(clientHelloRecord(relayRouteBeta))
+		assertRejectedWithoutBytes(t, "per-agent over-limit connection", second)
+		if got := limiter.ActiveStreamsForAgent(relayAgentRecord); got != 1 {
+			t.Fatalf("ActiveStreamsForAgent() = %d after the per-agent rejection, want 1", got)
+		}
+	})
+}
+
+// TestGatewayLimitsReleaseOnEveryRejectionPath walks every pre-pump exit
+// path and asserts the held global/IP/agent/origin counters return to zero.
+// The dispatch requires the release to be provably absent of leaks on error
+// and close paths, not merely on the happy path.
+func TestGatewayLimitsReleaseOnEveryRejectionPath(t *testing.T) {
+	t.Run("clienthello failure", func(t *testing.T) {
+		limiter := limits.NewLimiter(limits.DefaultConfig())
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter),
+			WithHelloParser(func(net.Conn) (*clienthello.Hello, error) {
+				return nil, clienthello.ErrMalformed
+			}))
+		applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+		browser := connectBrowser(t, harness.publicAddr)
+		_, _ = browser.Write(clientHelloRecord(relayRouteAlpha))
+		assertRejectedWithoutBytes(t, "clienthello failure", browser)
+		awaitLimiterIdle(t, limiter)
+	})
+
+	t.Run("unknown route", func(t *testing.T) {
+		limiter := limits.NewLimiter(limits.DefaultConfig())
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+		applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+		browser := connectBrowser(t, harness.publicAddr)
+		_, _ = browser.Write(clientHelloRecord(relayRouteUnknown))
+		assertClosedWithNoBytes(t, "unknown route", browser)
+		awaitLimiterIdle(t, limiter)
+	})
+
+	t.Run("absent tunnel presence", func(t *testing.T) {
+		limiter := limits.NewLimiter(limits.DefaultConfig())
+		harness := newGatewayHarness(t, staticPresence{online: false}, WithLimiter(limiter))
+		applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+		browser := connectBrowser(t, harness.publicAddr)
+		_, _ = browser.Write(clientHelloRecord(relayRouteAlpha))
+		assertClosedWithNoBytes(t, "absent tunnel presence", browser)
+		awaitLimiterIdle(t, limiter)
+	})
+
+	t.Run("loopback dial failure", func(t *testing.T) {
+		limiter := limits.NewLimiter(limits.DefaultConfig())
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+		harness.dialer.holdUntilDeadline.Store(true)
+		applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+		browser := connectBrowser(t, harness.publicAddr)
+		_, _ = browser.Write(clientHelloRecord(relayRouteAlpha))
+		assertClosedWithNoBytes(t, "loopback dial failure", browser)
+		awaitLimiterIdle(t, limiter)
+	})
+
+	t.Run("admission re-check rejection", func(t *testing.T) {
+		presence := newGatedPresence()
+		presence.releaseAdmission()
+		limiter := limits.NewLimiter(limits.DefaultConfig())
+		harness := newGatewayHarness(t, presence, WithLimiter(limiter))
+		applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+		browser := connectBrowser(t, harness.publicAddr)
+		_, _ = browser.Write(clientHelloRecord(relayRouteAlpha))
+		_ = acceptOne(t, harness.agentListener)
+		assertClosedWithNoBytes(t, "admission re-check rejection", browser)
+		awaitLimiterIdle(t, limiter)
+	})
+}
+
+// TestGatewayLimitsAdmitBeforeHelloParseAndBoundPreParseWork is the audit I7
+// proof: a connection is admitted against the global and per-source-IP
+// ceilings BEFORE any handler goroutine is spawned and before the 128 KiB
+// ClientHello scratch buffer is allocated. Two admitted connections park
+// inside the parser; every later connection is refused in the accept loop
+// with no goroutine, no parse invocation, and no large allocation.
+func TestGatewayLimitsAdmitBeforeHelloParseAndBoundPreParseWork(t *testing.T) {
+	config := limits.DefaultConfig()
+	config.MaxStreamsGlobal = 2
+	config.MaxStreamsPerSourceIP = 1000
+	limiter := limits.NewLimiter(config)
+
+	var parseCalls atomic.Int32
+	release := make(chan struct{})
+	blockingParser := func(net.Conn) (*clienthello.Hello, error) {
+		parseCalls.Add(1)
+		<-release
+		return nil, errors.New("test: ClientHello parser released")
+	}
+
+	preHarness := runtime.NumGoroutine()
+	harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter), WithHelloParser(blockingParser))
+	applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+	held := make([]net.Conn, 0, 2)
+	for i := 0; i < 2; i++ {
+		held = append(held, connectBrowser(t, harness.publicAddr))
+	}
+	waitForCondition(t, 3*time.Second, func() bool { return parseCalls.Load() == 2 }, "two admitted connections to reach the ClientHello parser")
+	if got := limiter.ActiveConnections(); got != 2 {
+		t.Fatalf("ActiveConnections() = %d, want the 2 admitted connections", got)
+	}
+
+	blockedBaseline := runtime.NumGoroutine()
+	extra := make([]net.Conn, 0, 20)
+	for i := 0; i < 20; i++ {
+		extra = append(extra, connectBrowser(t, harness.publicAddr))
+	}
+	for _, conn := range extra {
+		assertClosedWithNoBytes(t, "over-limit connection", conn)
+	}
+
+	if got := parseCalls.Load(); got != 2 {
+		t.Fatalf("ClientHello parser invoked %d times; the %d unadmitted connections must never reach the parse or allocate its scratch buffer", got, len(extra))
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return runtime.NumGoroutine() <= blockedBaseline+2 },
+		"unadmitted connections to spawn no handler goroutines")
+
+	close(release)
+	for _, conn := range held {
+		conn.Close()
+	}
+	waitForCondition(t, 3*time.Second, func() bool { return runtime.NumGoroutine() <= blockedBaseline },
+		"the admitted handler goroutines to drain after release")
+	awaitLimiterIdle(t, limiter)
+	if got := runtime.NumGoroutine(); got > preHarness+8 {
+		t.Fatalf("goroutines = %d after the flood drain, want no more than the pre-harness baseline %d plus slack", got, preHarness)
+	}
+}
+
+// TestGatewayStreamRegistryBoundedByGlobalLimit proves the stream registry
+// cannot grow past the global ceiling under a flood (audit I7 registry-state
+// cap): the limiter refuses the extra connections before they can register.
+func TestGatewayStreamRegistryBoundedByGlobalLimit(t *testing.T) {
+	config := limits.DefaultConfig()
+	config.MaxStreamsGlobal = 3
+	config.MaxStreamsPerSourceIP = 1000
+	limiter := limits.NewLimiter(config)
+	harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+	applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+	held := make([]net.Conn, 0, 3)
+	for i := 0; i < 3; i++ {
+		browser, _ := openStream(t, harness, relayRouteAlpha)
+		held = append(held, browser)
+	}
+	if got := harness.streams.Len(); got != 3 {
+		t.Fatalf("stream registry length = %d, want the 3 admitted streams", got)
+	}
+
+	for i := 0; i < 5; i++ {
+		conn := connectBrowser(t, harness.publicAddr)
+		_, _ = conn.Write(clientHelloRecord(relayRouteAlpha))
+		assertRejectedWithoutBytes(t, "over-global connection", conn)
+	}
+	waitForCondition(t, 2*time.Second, func() bool { return harness.streams.Len() <= 3 },
+		"the stream registry to stay bounded by the global ceiling")
+	if got := harness.streams.Len(); got > 3 {
+		t.Fatalf("stream registry length = %d after the flood, want <= the global ceiling 3", got)
+	}
+	for _, conn := range held {
+		conn.Close()
+	}
+	awaitStreamsDrained(t, harness.streams)
+	awaitLimiterIdle(t, limiter)
+}
+
+// TestGatewayNoByteIdleTimeoutClosesStream proves the §14 five-minute no-byte
+// idle timeout closes a live stream with no payload activity, and releases
+// every counter on the close path.
+func TestGatewayNoByteIdleTimeoutClosesStream(t *testing.T) {
+	config := limits.DefaultConfig()
+	config.IdleTimeout = 150 * time.Millisecond
+	config.AbsoluteLifetime = 10 * time.Second
+	limiter := limits.NewLimiter(config)
+	harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+	applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+	browser, agentConn := openStream(t, harness, relayRouteAlpha)
+	started := time.Now()
+	assertPeerClosed(t, "no-byte idle browser", browser)
+	assertPeerClosed(t, "no-byte idle agent", agentConn)
+	elapsed := time.Since(started)
+	if elapsed < config.IdleTimeout || elapsed > 3*time.Second {
+		t.Fatalf("idle timeout closed the stream after %v, want about %v", elapsed, config.IdleTimeout)
+	}
+	awaitLimiterIdle(t, limiter)
+}
+
+// TestGatewayAbsoluteLifetimeHardClosesActiveStream proves the §14 24-hour
+// absolute lifetime is a hard close that continuous payload activity cannot
+// reset (the idle timeout is deliberately long here).
+func TestGatewayAbsoluteLifetimeHardClosesActiveStream(t *testing.T) {
+	config := limits.DefaultConfig()
+	config.IdleTimeout = 10 * time.Second
+	config.AbsoluteLifetime = 250 * time.Millisecond
+	limiter := limits.NewLimiter(config)
+	harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+	applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+	browser, agentConn := openStream(t, harness, relayRouteAlpha)
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		ticker := time.NewTicker(30 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				_, _ = browser.Write([]byte{0x11})
+			}
+		}
+	}()
+
+	started := time.Now()
+	assertPeerClosed(t, "absolute-lifetime browser", browser)
+	elapsed := time.Since(started)
+	if elapsed < 200*time.Millisecond {
+		t.Fatalf("absolute lifetime closed the stream after %v, before the %v hard deadline", elapsed, config.AbsoluteLifetime)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("absolute lifetime closed the stream after %v, want about %v", elapsed, config.AbsoluteLifetime)
+	}
+	_ = agentConn
+	awaitLimiterIdle(t, limiter)
+}
+
+// TestGatewayCountsPerAgentRelayedBytes proves the per-agent byte counter
+// accounts for both relay directions (and the replayed ClientHello prefix)
+// without the product-tier throttle (deferred to Phase 4b per §14).
+func TestGatewayCountsPerAgentRelayedBytes(t *testing.T) {
+	limiter := limits.NewLimiter(limits.DefaultConfig())
+	harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+	applyRoute(t, harness.table, relayRouteAlpha, harness.agentPort)
+
+	hello := clientHelloRecord(relayRouteAlpha)
+	browser := connectBrowser(t, harness.publicAddr)
+	if _, err := browser.Write(hello); err != nil {
+		t.Fatalf("writing the ClientHello: %v", err)
+	}
+	agentConn := acceptOne(t, harness.agentListener)
+	if got := readFull(t, agentConn, len(hello)); !bytes.Equal(got, hello) {
+		t.Fatalf("agent received bytes that differ from the ClientHello")
+	}
+
+	toAgent := bytes.Repeat([]byte{0x5A}, 256)
+	if _, err := browser.Write(toAgent); err != nil {
+		t.Fatalf("writing browser payload: %v", err)
+	}
+	if got := readFull(t, agentConn, len(toAgent)); !bytes.Equal(got, toAgent) {
+		t.Fatalf("agent received browser payload that differs")
+	}
+
+	toBrowser := bytes.Repeat([]byte{0xA5}, 128)
+	if _, err := agentConn.Write(toBrowser); err != nil {
+		t.Fatalf("writing agent payload: %v", err)
+	}
+	if got := readFull(t, browser, len(toBrowser)); !bytes.Equal(got, toBrowser) {
+		t.Fatalf("browser received agent payload that differs")
+	}
+
+	wantBytes := uint64(len(hello) + len(toAgent) + len(toBrowser))
+	waitForCondition(t, 2*time.Second, func() bool {
+		return limiter.BytesForAgent(relayAgentRecord) == wantBytes
+	}, "the per-agent byte counter to reach the relayed total")
 }

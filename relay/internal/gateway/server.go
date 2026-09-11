@@ -13,26 +13,41 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sharebridge/relay/internal/clienthello"
+	"sharebridge/relay/internal/limits"
 	"sharebridge/relay/internal/routes"
 )
 
 // ConnectTimeout is the spec §14 budget for connecting to the agent's
-// loopback FRP proxy port.
-const ConnectTimeout = 2 * time.Second
+// loopback FRP proxy port. It is the same value the limiter carries as its
+// configurable default.
+const ConnectTimeout = limits.DefaultDialTimeout
 
 // loopbackDialHost is the only host the gateway ever dials (spec §8, §16.2):
 // frps binds agent proxy ports on 127.0.0.1 and they are unreachable from
 // the public network. The dial target is built from this literal and the
 // route's assigned port — never from any other route or agent state.
 const loopbackDialHost = "127.0.0.1"
+
+// streamCopyBufferSize bounds the payload buffer each copy direction holds
+// while splicing a stream. Buffers are pooled; the gateway never buffers a
+// complete response or file (spec §14).
+const streamCopyBufferSize = 32 << 10
+
+var streamCopyBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, streamCopyBufferSize)
+		return &buffer
+	},
+}
 
 // errRouteSuperseded reports that the exact route changed between the
 // initial lookup and stream registration — revoked, dropped, or re-pointed
@@ -51,50 +66,13 @@ type helloParseFunc func(conn net.Conn) (*clienthello.Hello, error)
 // recorder to observe the exact loopback target and budget.
 type dialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
-// StreamLimiter is the §14 concurrency-admission seam. Task 32 replaces the
-// placeholder below with the enforcing limiter — global → source IP → agent
-// → origin, acquired before the agent dial and released on every exit. The
-// interface fixes the server's call sites today so enforcement lands without
-// touching the data plane again.
-type StreamLimiter interface {
-	AcquireStream(admission StreamAdmission) (*StreamLease, error)
-}
-
-// StreamAdmission describes one connection asking for a stream slot.
-type StreamAdmission struct {
-	// Hostname is the exact route hostname the connection resolved to.
-	Hostname string
-	// AgentRecordID is the agent record serving the route.
-	AgentRecordID string
-	// RemoteAddr is the public peer address, for the future per-source-IP
-	// ceiling (spec §14).
-	RemoteAddr net.Addr
-}
-
-// StreamLease is one held stream slot. Release must run on every exit path
-// (spec §14: counters are decremented on all close/error paths).
-type StreamLease struct{}
-
-// Release releases the slot. The Task 4 placeholder holds nothing; the
-// enforcing Task 32 limiter returns leases that decrement real counters.
-func (lease *StreamLease) Release() {}
-
-// unboundedLimiter is the Task 4 placeholder limiter: every stream is
-// admitted and no counter is held. Task 32 swaps in the enforcing
-// implementation through WithStreamLimiter.
-type unboundedLimiter struct{}
-
-func (unboundedLimiter) AcquireStream(admission StreamAdmission) (*StreamLease, error) {
-	return &StreamLease{}, nil
-}
-
 // Server is the public L4 acceptor. It owns no listener of its own: Serve
 // takes one, Close stops it, and Wait drains the accepted connections. Safe
 // for concurrent use.
 type Server struct {
 	routes     *routes.Table
 	streams    *Streams
-	limits     StreamLimiter
+	limits     *limits.Limiter
 	parseHello helloParseFunc
 	dial       dialFunc
 	logger     *slog.Logger
@@ -124,21 +102,26 @@ func WithDialer(dial dialFunc) Option {
 	return func(server *Server) { server.dial = dial }
 }
 
-// WithStreamLimiter overrides the §14 admission seam (default: the
-// unbounded placeholder). Task 32 installs the enforcing limiter here.
-func WithStreamLimiter(limiter StreamLimiter) Option {
-	return func(server *Server) { server.limits = limiter }
+// WithLimiter installs the §14 resource limiter (default: DefaultConfig with
+// a logger-backed saturation alert). Tests install small ceilings to prove
+// enforcement deterministically; production code may pass operator-tuned
+// bounds.
+func WithLimiter(limiter *limits.Limiter) Option {
+	return func(server *Server) {
+		if limiter != nil {
+			server.limits = limiter
+		}
+	}
 }
 
 // NewServer wires the public acceptor to the in-memory route and stream
 // state. The server touches only those two synchronized structures plus the
-// limits seam on a public connection — never a database (spec §8).
+// limits budget on a public connection — never a database (spec §8).
 func NewServer(routeTable *routes.Table, streams *Streams, options ...Option) *Server {
 	dialer := &net.Dialer{}
 	server := &Server{
 		routes:     routeTable,
 		streams:    streams,
-		limits:     unboundedLimiter{},
 		parseHello: clienthello.Peek,
 		dial:       dialer.DialContext,
 		logger:     slog.Default(),
@@ -146,12 +129,28 @@ func NewServer(routeTable *routes.Table, streams *Streams, options ...Option) *S
 	for _, option := range options {
 		option(server)
 	}
+	if server.limits == nil {
+		config := limits.DefaultConfig()
+		config.OnSaturation = func(saturation limits.Saturation) {
+			server.logger.Warn("gateway: resource saturation",
+				"kind", saturation.Kind,
+				"key", saturation.Key,
+				"active", saturation.Active,
+				"limit", saturation.Limit,
+				"bytes", saturation.Bytes,
+				"threshold", saturation.Threshold)
+		}
+		server.limits = limits.NewLimiter(config)
+	}
 	return server
 }
 
 // Serve accepts public connections on listener until it closes, handling
-// each on its own goroutine. It returns nil after Close (or any direct
-// listener close) and the acceptance error otherwise.
+// each on its own goroutine. The §14 global and per-source-IP slots are
+// acquired in the accept loop BEFORE the handler goroutine is spawned and
+// before the 64 KiB ClientHello parse runs (audit I7), so an over-limit peer
+// costs one generic close and nothing else. It returns nil after Close (or
+// any direct listener close) and the acceptance error otherwise.
 func (server *Server) Serve(listener net.Listener) error {
 	server.mu.Lock()
 	if server.listener != nil {
@@ -169,10 +168,16 @@ func (server *Server) Serve(listener net.Listener) error {
 			}
 			return fmt.Errorf("gateway: accept: %w", acceptErr)
 		}
+		connLease, admitErr := server.limits.AdmitConnection(publicConn.RemoteAddr())
+		if admitErr != nil {
+			server.logRejection(publicConn, "limits", admitErr, "")
+			publicConn.Close()
+			continue
+		}
 		server.handlers.Add(1)
 		go func() {
 			defer server.handlers.Done()
-			server.handleConnection(publicConn)
+			server.handleConnection(publicConn, connLease)
 		}()
 	}
 }
@@ -197,9 +202,11 @@ func (server *Server) Wait() {
 // handleConnection runs the §8 forwarding conditions for one public
 // connection. Every exit path closes the browser connection generically —
 // the browser never receives a byte on rejection — and releases every
-// counter and registration taken along the way.
-func (server *Server) handleConnection(publicConn net.Conn) {
+// counter and registration taken along the way, in reverse acquisition order
+// (origin, agent, source IP, global).
+func (server *Server) handleConnection(publicConn net.Conn, connLease *limits.ConnectionLease) {
 	defer publicConn.Close()
+	defer connLease.Release()
 
 	hello, err := server.parseHello(publicConn)
 	if err != nil {
@@ -213,16 +220,18 @@ func (server *Server) handleConnection(publicConn net.Conn) {
 		return
 	}
 
-	lease, err := server.limits.AcquireStream(StreamAdmission{
-		Hostname:      hello.SNI,
-		AgentRecordID: route.AgentRecordID,
-		RemoteAddr:    publicConn.RemoteAddr(),
+	// Acquire the agent and exact-origin slots before the dial, atomically.
+	streamLease, err := server.limits.AdmitStream(connLease, limits.StreamRequest{
+		Hostname:            route.Hostname,
+		AgentRecordID:       route.AgentRecordID,
+		MaxStreamsPerOrigin: route.Limits.MaxStreamsPerOrigin,
+		MaxStreamsPerAgent:  route.Limits.MaxStreamsPerAgent,
 	})
 	if err != nil {
 		server.logRejection(publicConn, "limits", err, hello.SNI)
 		return
 	}
-	defer lease.Release()
+	defer streamLease.Release()
 
 	agentConn, err := server.dialAgent(route)
 	if err != nil {
@@ -248,8 +257,9 @@ func (server *Server) handleConnection(publicConn net.Conn) {
 		server.logRejection(publicConn, "replay", err, hello.SNI)
 		return
 	}
+	streamLease.AddBytes(len(hello.Prefix))
 
-	server.pump(publicConn, agentConn)
+	server.pump(publicConn, agentConn, streamLease)
 }
 
 // admitStream re-verifies — at registration time, under the stream
@@ -286,7 +296,7 @@ func (server *Server) admitStream(dialed routes.Route) func() error {
 // budget.
 func (server *Server) dialAgent(route routes.Route) (net.Conn, error) {
 	address := net.JoinHostPort(loopbackDialHost, strconv.Itoa(route.RelayPort))
-	dialContext, cancel := context.WithTimeout(context.Background(), ConnectTimeout)
+	dialContext, cancel := context.WithTimeout(context.Background(), server.limits.DialTimeout())
 	defer cancel()
 	agentConn, err := server.dial(dialContext, "tcp", address)
 	if err != nil {
@@ -300,22 +310,108 @@ func (server *Server) dialAgent(route routes.Route) (net.Conn, error) {
 // other direction unblocks immediately: a TLS session ends as a unit and
 // the MVP data plane has no TCP half-close. Neither side's bytes are
 // interpreted, buffered beyond the copy window, or transformed.
-func (server *Server) pump(publicConn, agentConn net.Conn) {
+func (server *Server) pump(publicConn, agentConn net.Conn, streamLease *limits.StreamLease) {
+	clock := newStreamClock(server.limits.IdleTimeout(), server.limits.AbsoluteLifetime())
 	var waitGroup sync.WaitGroup
 	waitGroup.Add(2)
 	go func() {
 		defer waitGroup.Done()
-		_, _ = io.Copy(agentConn, publicConn)
+		server.copyStream(agentConn, publicConn, clock, streamLease)
 		agentConn.Close()
 		publicConn.Close()
 	}()
 	go func() {
 		defer waitGroup.Done()
-		_, _ = io.Copy(publicConn, agentConn)
+		server.copyStream(publicConn, agentConn, clock, streamLease)
 		agentConn.Close()
 		publicConn.Close()
 	}()
 	waitGroup.Wait()
+}
+
+// streamClock tracks one stream's shared activity across both copy
+// directions. The no-byte idle timeout resets on a byte in either direction;
+// the absolute lifetime never resets. Methods are safe for the two copy
+// goroutines to share.
+type streamClock struct {
+	lastActivity atomic.Int64
+	absolute     time.Time
+	idle         time.Duration
+}
+
+func newStreamClock(idle, lifetime time.Duration) *streamClock {
+	clock := &streamClock{absolute: time.Now().Add(lifetime), idle: idle}
+	clock.touch()
+	return clock
+}
+
+func (clock *streamClock) touch() {
+	clock.lastActivity.Store(time.Now().UnixNano())
+}
+
+func (clock *streamClock) lastTime() time.Time {
+	return time.Unix(0, clock.lastActivity.Load())
+}
+
+// readDeadline returns the next read deadline: the earlier of the idle
+// deadline (activity + idle) and the absolute lifetime. A false second
+// result means the idle deadline already passed.
+func (clock *streamClock) readDeadline(now time.Time) (time.Time, bool) {
+	idleDeadline := clock.lastTime().Add(clock.idle)
+	if !now.Before(idleDeadline) {
+		return time.Time{}, false
+	}
+	if clock.absolute.Before(idleDeadline) {
+		return clock.absolute, true
+	}
+	return idleDeadline, true
+}
+
+// expired reports whether a read timeout means the stream must close: either
+// the hard absolute lifetime elapsed or no byte moved for the whole idle
+// timeout. Activity in the other direction after this direction's deadline
+// was set is what makes the second check necessary.
+func (clock *streamClock) expired(now time.Time) bool {
+	return !now.Before(clock.absolute) || !now.Before(clock.lastTime().Add(clock.idle))
+}
+
+// copyStream copies one direction with bounded pooled buffers and enforces
+// the shared idle/lifetime clock (spec §14: activity is tracked without
+// buffering payload; the gateway never buffers a complete response or file).
+func (server *Server) copyStream(dst, src net.Conn, clock *streamClock, streamLease *limits.StreamLease) {
+	bufferPointer := streamCopyBufferPool.Get().(*[]byte)
+	defer streamCopyBufferPool.Put(bufferPointer)
+	buffer := *bufferPointer
+
+	for {
+		deadline, withinBounds := clock.readDeadline(time.Now())
+		if !withinBounds {
+			return
+		}
+		if err := src.SetReadDeadline(deadline); err != nil {
+			return
+		}
+		read, readErr := src.Read(buffer)
+		if read > 0 {
+			clock.touch()
+			if _, writeErr := dst.Write(buffer[:read]); writeErr != nil {
+				return
+			}
+			streamLease.AddBytes(read)
+		}
+		if readErr == nil {
+			continue
+		}
+		if !errors.Is(readErr, os.ErrDeadlineExceeded) {
+			return
+		}
+		// The deadline covers both bounds; re-check which one tripped before
+		// closing, because the other direction may have moved the activity
+		// clock while this read was blocked.
+		if clock.expired(time.Now()) {
+			return
+		}
+	}
 }
 
 // logRejection records why a public connection was closed generically. The
