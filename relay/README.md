@@ -78,6 +78,11 @@ audit commands, §14/§17 environment reference, and known open items — is
 
 - Public TCP is exactly `443` (gateway) and the FRP transport port; proxy,
   plugin, metrics and admin surfaces are loopback/private only.
+- Every `frps` binary is SHA-256-checked before install: an explicit
+  `--frps-sha256`, or the manifest-pinned digest (`relay/frp/manifest.json`
+  via the checksum-verifying `scripts/fetch-frp.sh`). A caller-supplied
+  `--frps-binary` is never trusted on its own; `--verify-frps` runs the check
+  standalone.
 - The relay VM holds a dedicated FRP transport certificate and the gateway
   control-sync client certificate. It never holds an agent content
   certificate/key, a DNS/ACME credential, or any share secret.
@@ -85,5 +90,7 @@ audit commands, §14/§17 environment reference, and known open items — is
   with explicit state/run directories, bounded `LimitNOFILE`/`MemoryMax`, and
   a bounded journal rate.
 - The `sharebridgeusercontent.com` zone must never publish HTTPS/SVCB (ECH)
-  records: hidden SNI would silently break exact routing. `install.sh
-  --audit-dns` proves the invariant.
+  records for the relay names: hidden SNI would silently break exact routing.
+  `install.sh --audit-dns` proves this (including random-child wildcard
+  synthesis) for the relay wildcard family and the tunnel host; it is not a
+  zone-wide AXFR proof.

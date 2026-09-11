@@ -106,6 +106,72 @@ is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 ))
 }
 
+# parsed_lines <file> — the file with comments removed (a `#` starts a comment).
+# The deployment artifacts contain no literal `#` inside a quoted value, so
+# this is the shell/nft/unit directive stream. A commented-out directive or a
+# value that only appears in prose can no longer satisfy an assertion.
+parsed_lines() {
+  awk '{ sub(/[[:space:]]*#.*/, ""); print }' "$1"
+}
+
+# require_parsed_contains <file> <extended-regex> <description>
+require_parsed_contains() {
+  if [[ -f "$1" ]] && parsed_lines "$1" | grep -Eq -- "$2"; then
+    pass
+  else
+    fail "$3 (expected /$2/ in the parsed directives of $1)"
+  fi
+}
+
+# sha256_of <file> — the lowercase-hex SHA-256, via sha256sum or shasum.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# nft_chain <file> <chain> — print the body of one nftables chain.
+nft_chain() {
+  awk -v want="$2" '
+    $0 ~ "^[[:space:]]*chain[[:space:]]+" want "[[:space:]]*\\{" { inc=1; next }
+    inc && $0 ~ /^[[:space:]]*\}/ { inc=0; next }
+    inc { print }
+  ' "$1"
+}
+
+# nft_set_elements <file> <set> — print every element of one nftables set, one
+# per line, across a multi-line `elements = { ... }` block.
+nft_set_elements() {
+  awk -v want="$2" '
+    {
+      line=$0
+      sub(/[[:space:]]*#.*/, "", line)
+      if (inel) {
+        buf = buf " " line
+        if (line ~ /}/) { emit(); inel=0; buf="" }
+        next
+      }
+      if (cur != "" && line ~ /^[[:space:]]*elements[[:space:]]*=/) {
+        inel=1; buf=line
+        if (line ~ /}/) { emit(); inel=0; buf="" }
+        next
+      }
+      if (line ~ /^[[:space:]]*set[[:space:]]+/) {
+        t=line; sub(/^[[:space:]]*set[[:space:]]+/, "", t); sub(/[[:space:]].*$/, "", t); cur=t; next
+      }
+      if (line ~ /^[[:space:]]*\}/) { cur=""; next }
+    }
+    function emit(   n, i, arr) {
+      if (cur != want) return
+      sub(/^[^{]*\{/, "", buf); sub(/\}.*$/, "", buf)
+      n=split(buf, arr, ",")
+      for (i=1; i<=n; i++) { gsub(/[[:space:]]/, "", arr[i]); if (arr[i] != "") print arr[i] }
+    }
+  ' "$1"
+}
+
 printf '== Task 35 relay deployment gate ==\n'
 printf -- '-- A1: deployment artifacts present\n'
 require_file "$gateway_unit" "gateway systemd unit"
@@ -140,18 +206,25 @@ else
 fi
 require_eq "$([[ "$gateway_user" != "$frps_user" ]] && echo distinct)" "distinct" \
   "gateway and frps must run as distinct users"
-# install.sh creates both accounts as system (loginless) users.
-require_contains "$install_sh" 'useradd[^#]*--system|--system[[:space:]]' "installer must create system accounts"
-require_contains "$install_sh" "$gateway_user" "installer must create the gateway user"
-require_contains "$install_sh" "$frps_user" "installer must create the frps user"
+# install.sh creates both accounts as system (loginless) users and must
+# actually invoke the creation helper for each configured account name.
+require_parsed_contains "$install_sh" 'useradd[[:space:]]+--system' "installer must create system accounts"
+require_parsed_contains "$install_sh" 'create_service_user[[:space:]]+"\$GATEWAY_USER"' "installer must create the gateway user"
+require_parsed_contains "$install_sh" 'create_service_user[[:space:]]+"\$FRPS_USER"' "installer must create the frps user"
 
 printf -- '-- A3: root-owned 0600 secrets and root config\n'
-require_contains "$install_sh" 'install[[:space:]]+-o[[:space:]]+root[[:space:]]+-g[[:space:]]+root[[:space:]]+-m[[:space:]]+0?600' \
+require_parsed_contains "$install_sh" 'install[[:space:]]+-o[[:space:]]+root[[:space:]]+-g[[:space:]]+root[[:space:]]+-m[[:space:]]+0?600' \
   "installer must install secrets 0600 root:root"
-for secret in 'frps\.toml' 'gateway\.env' 'frps\.env' 'tunnel-server\.key' 'gateway-sync\.key' 'control-ca\.crt'; do
-  require_contains "$install_sh" "install_root_secret[^\n]*${secret}" \
-    "installer must install ${secret} as a 0600 root secret"
-done
+# The exact set of files installed through the 0600 root helper, derived from
+# the parsed (non-comment) directives. A commented-out call or a mention in
+# prose cannot satisfy this.
+secret_dests="$(parsed_lines "$install_sh" \
+  | sed -n 's|.*install_root_secret[[:space:]].*/\([^"/]*\)"[[:space:]]*$|\1|p' | sort -u)"
+expected_secret_dests="$(printf '%s\n' \
+  control-ca.crt frps.env frps.toml gateway.env \
+  gateway-sync.crt gateway-sync.key tunnel-server.crt tunnel-server.key | sort -u)"
+require_eq "$secret_dests" "$expected_secret_dests" \
+  "installer must install exactly the expected config/secrets via install_root_secret as 0600 root"
 # Units must never carry a plaintext secret value or an inline cacert/token.
 require_not_contains "$gateway_unit" 'SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET=|SHAREBRIDGE_CONTROL_RELAY_PUBLIC_KEY=|CLOUDFLARE_TOKEN|ACME_' \
   "gateway unit must not carry plaintext secrets or ACME credentials"
@@ -203,9 +276,17 @@ for unit in "$gateway_unit" "$frps_unit"; do
       esac
     done
   fi
-  require_contains "$unit" '^(StateDirectory|RuntimeDirectory)=sharebridge-relay-' \
-    "$unit must declare an explicit state/run directory"
 done
+# Each unit must declare its own exact state AND runtime directory; the two
+# directives are not interchangeable.
+require_eq "$(unit_field_one "$gateway_unit" StateDirectory)" "sharebridge-relay-gateway" \
+  "gateway unit must declare StateDirectory=sharebridge-relay-gateway"
+require_eq "$(unit_field_one "$gateway_unit" RuntimeDirectory)" "sharebridge-relay-gateway" \
+  "gateway unit must declare RuntimeDirectory=sharebridge-relay-gateway"
+require_eq "$(unit_field_one "$frps_unit" StateDirectory)" "sharebridge-relay-frps" \
+  "frps unit must declare StateDirectory=sharebridge-relay-frps"
+require_eq "$(unit_field_one "$frps_unit" RuntimeDirectory)" "sharebridge-relay-frps" \
+  "frps unit must declare RuntimeDirectory=sharebridge-relay-frps"
 
 printf -- '-- A5: LimitNOFILE and MemoryMax\n'
 for unit in "$gateway_unit" "$frps_unit"; do
@@ -233,10 +314,22 @@ for unit in "$gateway_unit" "$frps_unit"; do
   else
     fail "$unit RestartSec must be a small positive integer (got '$restart_sec')"
   fi
-  require_contains "$unit" '^StartLimitIntervalSec=[0-9]+' "$unit restart-storm interval"
-  require_contains "$unit" '^StartLimitBurst=[0-9]+' "$unit restart-storm burst"
-  require_contains "$unit" '^LogRateLimitIntervalSec=[0-9]+' "$unit bound log rate"
-  require_contains "$unit" '^LogRateLimitBurst=[0-9]+' "$unit bound log burst"
+  for key in StartLimitIntervalSec StartLimitBurst LogRateLimitIntervalSec LogRateLimitBurst; do
+    rate_value="$(unit_field_one "$unit" "$key")"
+    if is_positive_int "$rate_value"; then
+      pass
+    else
+      fail "$unit $key must be an effective positive integer, not '$rate_value' (0 disables the bound)"
+    fi
+  done
+  # The LogRateLimit* pair must actually be in force.
+  log_interval="$(unit_field_one "$unit" LogRateLimitIntervalSec)"
+  log_burst="$(unit_field_one "$unit" LogRateLimitBurst)"
+  if is_positive_int "$log_interval" && is_positive_int "$log_burst"; then
+    pass
+  else
+    fail "$unit must bound its journal write rate (LogRateLimitIntervalSec/Burst > 0)"
+  fi
 done
 
 printf -- '-- A7: frps started after the gateway (restart ordering)\n'
@@ -267,21 +360,62 @@ require_contains "$gateway_unit" '^LoadCredential=[^:]*:/etc/sharebridge/relay/c
 require_contains "$gateway_unit" 'Environment=SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE=%d/' \
   "gateway sync key path must point at its credential directory"
 
-printf -- '-- A9: firewall allowlist is exactly 443/tcp + the pinned transport port\n'
-require_contains "$firewall" 'type filter hook input priority [^;]*;[[:space:]]*policy drop' \
-  "nftables input policy must default to drop"
+printf -- '-- A9/A10: firewall public TCP allowlist is exactly 443 + the pinned transport port\n'
+input_policy="$(nft_chain "$firewall" input | sed -n 's/.*policy[[:space:]][[:space:]]*\([a-z][a-z]*\).*/\1/p' | head -n 1)"
+require_eq "$input_policy" "drop" "nftables input policy must default to drop"
+forward_policy="$(nft_chain "$firewall" forward | sed -n 's/.*policy[[:space:]][[:space:]]*\([a-z][a-z]*\).*/\1/p' | head -n 1)"
+require_eq "$forward_policy" "drop" "nftables forward policy must default to drop"
 transport_port="$(awk -F'=' '/^[[:space:]]*bindPort[[:space:]]*=/ {gsub(/[^0-9]/, "", $2); print $2; exit}' "$frps_config")"
 if is_positive_int "$transport_port"; then
   pass
 else
   fail "could not read the pinned transport port from $frps_config"
 fi
-allowlist="$(grep -E '^[[:space:]]*elements[[:space:]]*=' "$firewall" | head -n 1 | sed 's/.*{//; s/}.*//' | tr ',' '\n' | tr -d ' ' | sort -n | tr '\n' ' ')"
-require_eq "$allowlist" "443 ${transport_port} " \
-  "public tcp allowlist must be exactly 443 and the pinned transport port"
-require_contains "$firewall" 'iifname "lo" accept' "loopback traffic must be accepted"
 
-printf -- '-- A10: no public proxy, plugin, metrics, or admin ports\n'
+# Parse the WHOLE ruleset, not just the first elements= line: every accept rule
+# must be one of the known-safe forms, and the only TCP port rule must
+# reference an allowlist set whose elements are exactly 443 + the transport
+# port. Any additional public accept (SSH, admin, metrics, proxy/plugin,
+# arbitrary) fails here, including one added as a new set element.
+public_sets=""
+while IFS= read -r raw_accept; do
+  norm="$(printf '%s' "$raw_accept" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [[ -z "$norm" ]] && continue
+  case "$norm" in
+    'iifname "lo" accept') : ;;
+    'ct state established,related accept') : ;;
+    'ct state related,established accept') : ;;
+    'ip protocol icmp accept') : ;;
+    'ip6 nexthdr ipv6-icmp accept') : ;;
+    'meta l4proto icmp accept') : ;;
+    'meta l4proto ipv6-icmp accept') : ;;
+    'tcp dport @'*' accept')
+      setname="${norm#tcp dport @}"; setname="${setname% accept}"
+      public_sets="${public_sets} ${setname}" ;;
+    *)
+      fail "unexpected accept rule exposes an unproven public surface: ${norm}" ;;
+  esac
+done < <(parsed_lines "$firewall" | grep -E 'accept' | grep -Ev 'policy[[:space:]]*accept')
+
+allow_ports=""
+if [[ -z "${public_sets// /}" ]]; then
+  fail "input chain has no public TCP allowlist rule (tcp dport @<set> accept)"
+else
+  for setname in $public_sets; do
+    set_elements="$(nft_set_elements "$firewall" "$setname")"
+    if [[ -z "$set_elements" ]]; then
+      fail "public allowlist set '$setname' has no elements"
+    fi
+    allow_ports="${allow_ports} ${set_elements}"
+  done
+  allow_sorted="$(printf '%s\n' $allow_ports | sort -n -u | tr '\n' ' ')"
+  require_eq "$allow_sorted" "443 ${transport_port} " \
+    "public tcp allowlist must be exactly 443 and the pinned transport port ${transport_port}"
+fi
+require_parsed_contains "$firewall" 'iifname "lo" accept' "loopback traffic must be accepted"
+require_parsed_contains "$firewall" 'ct state established,related accept' "established/related traffic must be accepted"
+
+printf -- '-- A10: no public proxy, plugin, metrics, or admin port\n'
 # The FRP proxy range comes from the pinned frps config; the plugin, gateway
 # metrics, control metrics and the frps dashboard are the private surfaces.
 proxy_start="$(grep -E '^[[:space:]]*allowPorts' "$frps_config" | grep -oE '[0-9]+' | head -n 1)"
@@ -292,22 +426,19 @@ if is_positive_int "$proxy_start"; then
 else
   fail "could not read the proxy port range from $frps_config"
 fi
-# No accept line anywhere may expose a forbidden dport literal.
-forbidden_hit=0
-while IFS= read -r accept_line; do
-  [[ -z "$accept_line" ]] && continue
-  for port in $forbidden; do
-    if printf '%s' "$accept_line" | grep -Eq "(^|[^0-9])${port}([^0-9]|$)"; then
-      fail "forbidden public port ${port} appears in an accept rule: ${accept_line}"
-      forbidden_hit=1
-    fi
-  done
-done < <(grep -E 'accept' "$firewall")
-if [[ $forbidden_hit -eq 0 ]]; then pass; fi
+# The exact allowlist above already forbids every extra port; assert each
+# forbidden surface explicitly too so a regression names the port.
+for port in $forbidden; do
+  if printf '%s\n' $allow_ports | grep -qx "$port"; then
+    fail "forbidden public port ${port} is in the resolved public allowlist"
+  else
+    pass
+  fi
+done
 # The private plugin/metrics/admin surfaces must be bound to loopback by the
 # binaries that own them; assert install.sh never opens them and that config
 # pins the loopback binds.
-require_contains "$install_sh" '127\.0\.0\.1:9001|127\.0\.0\.1:9101' \
+require_parsed_contains "$install_sh" '127\.0\.0\.1:9001|127\.0\.0\.1:9101' \
   "private plugin/metrics listeners must be loopback-only"
 require_contains "$gateway_unit" 'SHAREBRIDGE_GATEWAY_METRICS_ADDR=127\.0\.0\.1:9101' \
   "gateway metrics must bind loopback 9101"
@@ -325,20 +456,52 @@ require_contains "$frps_config" '^transport\.tls\.force = true$' "FRP transport 
 require_contains "$frps_config" '^transport\.tls\.certFile = ' "frps must use the dedicated transport certificate"
 require_contains "$frps_config" '^transport\.tls\.keyFile = ' "frps must use the dedicated transport key"
 
-printf -- '-- A12: pinned, checksum-verified frps packaging\n'
-require_contains "$install_sh" 'fetch-frp\.sh' "installer must use the committed pinned-FRP fetch path"
-require_contains "$install_sh" 'frp/manifest\.json|manifest' "installer must resolve the pinned manifest"
-require_contains "$install_sh" 'sha256|SHA-256|checksum' "installer must verify the pinned checksum"
+printf -- '-- A12: pinned, checksum-verified frps packaging and binary verification\n'
+require_parsed_contains "$install_sh" 'fetch-frp\.sh' "installer must use the committed pinned-FRP fetch path"
+require_parsed_contains "$install_sh" 'FRP_MANIFEST=' "installer must resolve the pinned manifest"
+require_parsed_contains "$install_sh" 'verify_frps_binary' "installer must verify a caller-supplied frps binary"
+require_parsed_contains "$install_sh" 'frps-sha256' "installer must offer an explicit checksum for arbitrary frps binaries"
 require_contains "$frps_config" 'auth\.method = "token"' "frps must require authenticated clients"
 
-printf -- '-- A13: DNS audit commands prove DNS-only and no HTTPS/SVCB/ECH records\n'
+# Behavioural proof that a mismatched binary or an altered checksum FAILS: run
+# the installer's own verifier on a throwaway binary with the matching digest
+# (must accept) and with a wrong digest (must reject). This is the property a
+# prose-only grep could not enforce.
+frps_probe_dir="$(mktemp -d)"
+trap 'rm -rf "$frps_probe_dir"' EXIT
+printf '#!/bin/sh\nexit 0\n' > "${frps_probe_dir}/frps-probe"
+chmod 0755 "${frps_probe_dir}/frps-probe"
+probe_digest="$(sha256_of "${frps_probe_dir}/frps-probe")"
+if bash "$install_sh" --verify-frps "${frps_probe_dir}/frps-probe" --frps-sha256 "$probe_digest" >/dev/null 2>&1; then
+  pass
+else
+  fail "installer rejected a frps binary whose SHA-256 matches its explicit --frps-sha256"
+fi
+if bash "$install_sh" --verify-frps "${frps_probe_dir}/frps-probe" --frps-sha256 "0000000000000000000000000000000000000000000000000000000000000000" >/dev/null 2>&1; then
+  fail "installer accepted a frps binary whose SHA-256 does not match --frps-sha256"
+else
+  pass
+fi
+
+printf -- '-- A13: DNS audit proves wildcard synthesis and per-name HTTPS/SVCB/ECH absence\n'
 for audit_file in "$install_sh" "$ops_doc"; do
   require_contains "$audit_file" 'dig ' "DNS audit uses dig ($audit_file)"
   require_contains "$audit_file" '\bHTTPS\b' "DNS audit checks the HTTPS RR type ($audit_file)"
   require_contains "$audit_file" '\bSVCB\b' "DNS audit checks the SVCB RR type ($audit_file)"
+  require_contains "$audit_file" '\bAAAA\b' "DNS audit validates AAAA ($audit_file)"
   require_contains "$audit_file" 'relay\.' "DNS audit names the relay wildcard ($audit_file)"
   require_contains "$audit_file" 'tunnel' "DNS audit names the tunnel host ($audit_file)"
 done
+# Wildcard synthesis is only proven by querying a random child label; a literal
+# `*` query alone would pass even if browsers resolving arbitrary labels got
+# nothing.
+require_parsed_contains "$install_sh" 'dig[[:space:]][[:space:]]*\+short[[:space:]][[:space:]]*A[[:space:]][[:space:]]*"\$\{probe_label\}"' \
+  "installer audit must resolve A for a random relay child label (wildcard synthesis)"
+require_contains "$ops_doc" 'probe-' "runbook must show the random-child-label query"
+# The claim must be scoped to the queried names: a zone-wide absence claim is
+# not provable by these queries and must not be published.
+require_not_contains "$ops_doc" 'no HTTPS/SVCB records at all' "runbook must not overclaim zone-wide HTTPS/SVCB absence"
+require_contains "$ops_doc" 'AXFR|zone transfer|zone-wide' "runbook must state the DNS-audit scope honestly"
 require_contains "$ops_doc" '[Ee][Cc][Hh]' "runbook must call out the ECH invariant"
 
 printf -- '-- A14: operator runbook carries the deferred operator surface\n'

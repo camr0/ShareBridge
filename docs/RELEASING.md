@@ -75,9 +75,10 @@ relay/deploy/install.sh --tunnel-host <relay-tunnel-host> \
 Before enabling relay selection, confirm:
 
 - `deploy_test.sh` is GREEN and `systemd-analyze verify` accepts both units;
-- the §6 DNS audit passes (`install.sh --audit-dns`): the relay wildcard and
-  the tunnel host are DNS-only and the zone publishes no HTTPS/SVCB/ECH
-  records;
+- the §6 DNS audit passes (`install.sh --audit-dns`): the relay wildcard
+  family (proven with a random child label) and the tunnel host are DNS-only
+  and publish no HTTPS/SVCB/ECH records (for those queried names — the audit
+  is not a zone-wide AXFR proof);
 - the relay VM holds no content certificate/key and no DNS/ACME credential;
 - restart ordering is intact (gateway before frps; frps process-up is never
   presence, and a dead frps is reported unhealthy within the 30-second

@@ -96,7 +96,7 @@ and after any change to the units, firewall, installer, or this document.
 | No public proxy/plugin/metrics/admin port | forbidden ports (`9001`, `9101`, `9102`, `7500`, the proxy range) cannot appear in an accept rule; plugin/metrics binds are pinned loopback in the unit (A10) |
 | Transport certificate only, no ACME/content material | `install.sh` provisions only `tunnel-server.{crt,key}`; no `fullchain`/`privkey`/`ACME_*`/`CLOUDFLARE_TOKEN`; `transport.tls.force = true` (A11) |
 | Pinned, checksum-verified frps | `install.sh` calls `fetch-frp.sh` against `frp/manifest.json` and verifies SHA-256; `auth.method = "token"` with a mandatory plugin (A12) |
-| DNS-only, no HTTPS/SVCB/ECH | audit commands in `install.sh --audit-dns` and §5 below (A13) |
+| DNS-only relay names, no HTTPS/SVCB/ECH for them | `install.sh --audit-dns` proves random-child wildcard synthesis and per-name HTTPS/SVCB/ECH absence; §5 below (A13). This is **not** a zone-wide AXFR proof |
 | Deferred operator surface documented | §6–§8 of this runbook (A14) |
 
 The gateway's own journal write rate is additionally bounded in-process
@@ -130,38 +130,54 @@ installer runs it.
 ## 5. DNS audit (spec §6 invariant)
 
 An HTTPS or SVCB resource record (in particular one carrying an `ech=`
-parameter) would publish an **ECH** key for these origins. A browser that uses
+parameter) would publish an **ECH** key for a relay name. A browser that uses
 ECH hides the SNI from both the gateway and the agent Binder, and exact relay
 routing silently breaks. The `sharebridgeusercontent.com` zone must therefore
-publish **DNS-only** records: the relay wildcard and the tunnel host are A/AAAA
-records and nothing else, and the zone publishes **no HTTPS/SVCB/ECH**
-records.
+publish the relay wildcard family and the tunnel host as **DNS-only A/AAAA
+names with no HTTPS/SVCB/ECH record**.
 
-Run the built-in audit (it exits nonzero when the invariant is violated):
+Run the built-in audit (it exits nonzero when the invariant is violated for a
+queried name):
 
 ```bash
 relay/deploy/install.sh --audit-dns \
-  --namespace sb0123abcd --tunnel-host <relay-tunnel-host>
+  --namespace sb0123abcd --tunnel-host <relay-tunnel-host> \
+  [--expect-ipv4 <relay-ipv4>] [--expect-ipv6 <relay-ipv6>]
 ```
+
+The audit proves, **for the names it queries**:
+
+1. **Wildcard synthesis** — a random child label
+   (`probe-<time>-<pid>-<rand>.relay.<ns>.sharebridgeusercontent.com`) resolves
+   to an A record. A bare `dig A '*.relay.…'` query alone would not prove that
+   browsers resolving arbitrary labels reach the relay.
+2. **DNS-only A/AAAA** — the relay wildcard, the random child label and the
+   tunnel host resolve as A records; any AAAA answer that is present must be a
+   valid IPv6 literal (and match `--expect-ipv6` when supplied).
+3. **No HTTPS/SVCB/ECH** — the relay wildcard, the random child label and the
+   tunnel host publish no HTTPS or SVCB record and no `ech=` parameter.
 
 Equivalent manual commands — every one of these must return the documented
 result:
 
 ```bash
-# 1. The relay wildcard is DNS-only and points at the relay VM.
-dig +short A '*.relay.sb0123abcd.sharebridgeusercontent.com'      # -> relay VM IPv4
-dig +short AAAA '*.relay.sb0123abcd.sharebridgeusercontent.com'   # -> empty (or expected v6)
+# 1. The relay wildcard synthesizes a record for a random child label.
+dig +short A "probe-$RANDOM.relay.sb0123abcd.sharebridgeusercontent.com"  # -> relay VM IPv4
 
-# 2. The non-browser FRP tunnel host is DNS-only and points at the relay VM.
-dig +short A '<relay-tunnel-host>'                                # -> relay VM IPv4
+# 2. The relay wildcard and tunnel host are DNS-only.
+dig +short A    '*.relay.sb0123abcd.sharebridgeusercontent.com'   # -> relay VM IPv4
+dig +short AAAA '*.relay.sb0123abcd.sharebridgeusercontent.com'   # -> empty or a valid IPv6
+dig +short A    '<relay-tunnel-host>'                             # -> relay VM IPv4
+dig +short AAAA '<relay-tunnel-host>'                             # -> empty or a valid IPv6
 
-# 3. No HTTPS/SVCB records for either origin (an ech= key here hides SNI).
+# 3. No HTTPS/SVCB records for a queried relay name (an ech= key here hides SNI).
 dig +short HTTPS '*.relay.sb0123abcd.sharebridgeusercontent.com'  # -> EMPTY
 dig +short HTTPS '<relay-tunnel-host>'                            # -> EMPTY
 dig +short SVCB  '*.relay.sb0123abcd.sharebridgeusercontent.com'  # -> EMPTY
 dig +short SVCB  '<relay-tunnel-host>'                            # -> EMPTY
+dig +short HTTPS "probe-$RANDOM.relay.sb0123abcd.sharebridgeusercontent.com"  # -> EMPTY
 
-# 4. Belt-and-braces: no ech= parameter anywhere in the zone's HTTPS answers.
+# 4. Belt-and-braces: no ech= parameter in the HTTPS answers queried above.
 dig +short HTTPS '*.relay.sb0123abcd.sharebridgeusercontent.com' '<relay-tunnel-host>' | grep -i 'ech=' || echo 'no ECH (correct)'
 
 # 5. Diagnostic context only — CT/CAA monitoring is a separate release
@@ -169,11 +185,14 @@ dig +short HTTPS '*.relay.sb0123abcd.sharebridgeusercontent.com' '<relay-tunnel-
 dig +short CAA sharebridgeusercontent.com
 ```
 
-**What each proves:** (1) and (2) prove the relay wildcard and tunnel host are
-ordinary DNS-only A/AAAA names; (3) proves the zone publishes no HTTPS/SVCB
-records at all; (4) proves no ECH key (`ech=`) is reachable for these origins;
-(5) records the CAA posture for the separate CT review. The deployment audit
-re-checks all of this, and Task 37 repeats it on the live dark topology.
+**Scope of the claim.** The audit queries the relay wildcard, a random child
+label and the tunnel host; it does **not** perform an authoritative zone
+transfer (AXFR) or a DNS-API dump. It therefore proves **no HTTPS/SVCB/ECH
+record for those relay names** — it does not prove zone-wide absence for
+unrelated names. A zone-wide claim would need the authoritative provider's
+transfer/API access and its own credential handling, which is out of scope for
+this DNS-only gate. The deployment audit re-checks the three properties above,
+and Task 37 repeats it on the live dark topology.
 
 ---
 
