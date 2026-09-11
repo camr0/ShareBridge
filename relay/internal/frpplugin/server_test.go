@@ -560,6 +560,64 @@ func TestPluginStaleSessionReplayEmitsResetFact(t *testing.T) {
 	}
 }
 
+// TestPluginSessionResetSurvivesDispatcherSaturation pins the §15.2
+// immediacy-by-construction requirement: the session-reset fact is the only
+// fact whose loss would leave a dead tunnel advertising presence for up to the
+// 45-second lease, so it must never be dropped under bounded-dispatcher
+// pressure. Every other fact keeps the existing fail-closed reservation; the
+// reset is back-pressured instead — it waits for dispatcher capacity rather
+// than being discarded — so a saturated queue delays it but can never lose it.
+func TestPluginSessionResetSurvivesDispatcherSaturation(t *testing.T) {
+	recorder := &blockingEventRecorder{entered: make(chan struct{}), release: make(chan struct{})}
+	defer recorder.unblock()
+	fixture := newPluginFixture(t, func(config *Config) {
+		config.PresenceEvents = recorder
+		// One queued fact occupies the whole dispatcher: the first Login's
+		// fact sits in the sink while its slot is still reserved.
+		config.MaxPendingEvents = 1
+	})
+
+	loginFixture(t, fixture)
+	select {
+	case <-recorder.entered:
+	case <-time.After(time.Second):
+		t.Fatal("the Login fact never reached the presence callback")
+	}
+
+	// Replay the burned credential while the dispatcher is saturated. The
+	// reset must be back-pressured, not dropped.
+	fixture.runID = "run-replay"
+	replay := make(chan testPluginResponse, 1)
+	go func() {
+		replay <- fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims))
+	}()
+	select {
+	case response := <-replay:
+		recorder.unblock()
+		requireRejected(t, response)
+		t.Fatal("the reset path completed while the dispatcher was full: the §15.2 reset was dropped instead of back-pressured")
+	case <-time.After(250 * time.Millisecond):
+		// Still waiting for capacity, as required.
+	}
+
+	recorder.unblock()
+	select {
+	case response := <-replay:
+		requireRejected(t, response)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the back-pressured replay never completed after the dispatcher drained")
+	}
+
+	events := recorder.waitForCount(t, 2)
+	if events[0].Operation != OperationLogin || events[1].Operation != OperationSessionReset {
+		t.Fatalf("events under saturation = %+v, want the ordered Login then SessionReset facts", events)
+	}
+	if events[1].AgentRecordID != fixture.claims.AgentRecordID || events[1].RelayPort != fixture.claims.RelayPort ||
+		events[1].Generation != fixture.claims.Generation {
+		t.Fatalf("back-pressured reset identity = %+v, want the rejected credential's agent/port/generation", events[1])
+	}
+}
+
 func TestPluginRejectsSupersededCredential(t *testing.T) {
 	fixture := newPluginFixture(t)
 	loginFixture(t, fixture)

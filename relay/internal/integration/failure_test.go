@@ -15,18 +15,21 @@ package integration
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"sharebridge/relay/internal/frpplugin"
 	"sharebridge/relay/internal/gateway"
 	"sharebridge/relay/internal/presence"
 	"sharebridge/relay/internal/routes"
@@ -381,21 +384,22 @@ func TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams(t *test
 	_ = readResponseBytes(t, resp)
 }
 
-// TestRealFRPAgentRestartDuringIdleAndActiveTransfers proves §15.3 for both
-// the idle and active cases. The integration harness has no agent daemon (the
-// agent side is the fake Phase 3 HTTPS server plus the real frpc child), so a
-// true in-process daemon restart is infeasible here. The closest faithful
-// equivalent is exercised: the agent's HTTPS server is stopped and rebound
-// (terminating the in-flight transfer and cancelling its handler), the frpc
-// tunnel is restarted with a fresh one-use credential, and the route — which
-// is control state and must survive — is NOT reapplied. The daemon-level
-// guarantees the harness cannot reach are covered by
-// agent/internal/daemon TestAgentRestartHydratesBeforeContentReady (persisted
-// sessions reloaded and hydrated before re-registration),
+// TestRealFRPAgentHTTPSReplacementAndFRPCRestartDuringIdleAndActiveTransfers
+// proves §15.3 for both the idle and active cases as far as the relay-only
+// harness faithfully can. This harness has NO agent daemon (the agent side is
+// the fake Phase 3 HTTPS server plus the real frpc child), so a true in-process
+// daemon restart is not representable here. What is exercised is precisely:
+// the agent's HTTPS listener is stopped and rebound (terminating the in-flight
+// transfer and cancelling its handler), and the frpc child is restarted with a
+// fresh one-use credential; the route — which is control state and must
+// survive — is NOT reapplied. No claim is made that a daemon restarted. The
+// daemon-level guarantees the harness cannot reach are covered in
+// agent/internal/daemon by TestAgentRestartHydratesBeforeContentReady
+// (persisted sessions reloaded and hydrated before re-registration),
 // TestDaemonShutdownStopsHTTPSAndFRPC (HTTPS + frpc child stop together), and
 // TestFRPCRestartObtainsFreshCredentialAfterReplayRejection (fresh credential
 // after a replay rejection).
-func TestRealFRPAgentRestartDuringIdleAndActiveTransfers(t *testing.T) {
+func TestRealFRPAgentHTTPSReplacementAndFRPCRestartDuringIdleAndActiveTransfers(t *testing.T) {
 	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, spec := startPrimaryStack(t)
@@ -404,16 +408,16 @@ func TestRealFRPAgentRestartDuringIdleAndActiveTransfers(t *testing.T) {
 		baseline := runtime.NumGoroutine()
 		established, slowClient := openSlowRelayRequest(t, s)
 
-		// Real agent restart, server first (as Daemon.Stop does): the HTTPS
-		// server stops, terminating the in-flight response.
+		// The agent's HTTPS listener is stopped first (as Daemon.Stop does),
+		// terminating the in-flight response.
 		s.restartAgentHTTPServer(t)
-		requireStreamClosed(t, "agent HTTPS restart", established, 15*time.Second)
+		requireStreamClosed(t, "agent HTTPS replacement", established, 15*time.Second)
 		waitSlowCancelled(t, s, 15*time.Second)
 
 		// The tunnel child stops with the agent.
 		s.stopTunnel(spec.label)
 		slowClient.CloseIdleConnections()
-		requireGoroutinesReturn(t, baseline, 8, "agent restart", 5*time.Second)
+		requireGoroutinesReturn(t, baseline, 8, "agent HTTPS replacement", 5*time.Second)
 
 		// The gateway must fail closed while the tunnel is down: a fresh relay
 		// request cannot silently reuse the old tunnel state.
@@ -450,18 +454,28 @@ func TestRealFRPAgentRestartDuringIdleAndActiveTransfers(t *testing.T) {
 	})
 }
 
-// TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink
-// covers §15.6's "failure after navigation" case as far as a browserless
+// TestRealFRPDirectOriginFailureMidTransferRecoversThroughCanonicalRelayLink
+// covers §15.6's "failure after navigation" case as far as this browserless
 // harness faithfully can: Phase 4a never splices an in-flight response across
 // origins, so a direct transfer that dies after the recipient has already
 // navigated cannot be continued; the recipient returns through the canonical
 // link. The harness models the already-navigated direct transfer as an
-// established direct response that fails mid-body, then proves the recipient's
-// return through the canonical RELAY link is a fresh, complete transaction
-// that carries the same content — not a continuation or splice of the failed
-// direct response. It does not claim to exercise browser or interstitial
-// behaviour (those live in control/agent and are covered there).
-func TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink(t *testing.T) {
+// established direct response, and then makes the direct ORIGIN unreachable
+// mid-body (the agent's HTTPS listener is closed, so the transfer fails from
+// the origin side — not because the test client cancelled its own request).
+// The recipient's return through the canonical RELAY link must be a fresh and
+// complete transaction carrying the same content — not a continuation or
+// splice of the failed direct response — and the frpc tunnel was never
+// restarted, so the route/lease state that serves it survived.
+//
+// Scope, stated precisely: this harness has one agent origin, so the relay
+// path is down during the same window in which the direct origin is; the
+// recovery is exercised once the origin is serving again. Browser and
+// interstitial behaviour is NOT exercised here (it lives in control/agent and
+// is covered by TestInterstitialNeverEmbedsContentIframe and
+// TestRelayPathNeverEmitsOpenSignal, which remain separate architectural
+// guards).
+func TestRealFRPDirectOriginFailureMidTransferRecoversThroughCanonicalRelayLink(t *testing.T) {
 	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, spec := startPrimaryStack(t)
@@ -470,31 +484,28 @@ func TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink(t 
 	direct := s.newDirectClient()
 	baseline := readResponseBytes(t, doGet(t, direct, s.directURL("/s/"+fixtureCode+"/items"), nil))
 
-	// An in-flight direct transfer that fails after navigation: establish the
-	// response, then abort it (the direct connection dies).
-	ctx, cancel := context.WithCancel(context.Background())
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.directURL("/s/"+fixtureCode+"/slow"), nil)
-	if err != nil {
-		cancel()
-		t.Fatalf("build direct request: %v", err)
-	}
-	directResponse, err := direct.Do(request)
-	if err != nil {
-		cancel()
-		t.Fatalf("start in-flight direct transfer: %v", err)
-	}
+	// An in-flight direct transfer: establish the response, then make the direct
+	// origin unreachable mid-body. The failure is origin-side (the agent's HTTPS
+	// listener closes), never a client cancellation.
+	directResponse := doGet(t, direct, s.directURL("/s/"+fixtureCode+"/slow"), nil)
 	if directResponse.StatusCode != http.StatusOK {
 		directResponse.Body.Close()
-		cancel()
 		t.Fatalf("in-flight direct transfer status = %d, want 200", directResponse.StatusCode)
 	}
-	cancel()
+	// Close the direct origin mid-transfer and bring it back serving again.
+	// The frpc tunnel itself is never stopped, so no re-registration is involved.
+	s.restartAgentHTTPServer(t)
 	if _, readErr := io.ReadAll(directResponse.Body); readErr == nil {
-		t.Fatal("the aborted direct transfer completed; post-navigation direct failure was not simulated")
+		t.Fatal("the direct transfer completed after its origin became unreachable; post-navigation direct failure was not simulated")
 	}
 	directResponse.Body.Close()
 	waitSlowCancelled(t, s, 15*time.Second)
 
+	// The canonical link recovers without the tunnel being restarted.
+	if !s.presence.Online(spec.agentID, spec.proxyPort, uint64(spec.generation)) {
+		t.Fatal("the tunnel went offline across the direct-origin failure; the recovery must ride the surviving relay tunnel")
+	}
+	s.waitRouteReady(s.relayHost, setupTimeout)
 	// The recipient returns through the canonical relay link: a fresh and
 	// COMPLETE transaction, byte-identical to the direct baseline.
 	relay := s.newRelayClient(tls.VersionTLS12, tls.VersionTLS13, []string{"http/1.1"}, 2).client
@@ -508,6 +519,166 @@ func TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink(t 
 	if err := checkDialTargets(s.dialTargetsSnapshot(), spec.proxyPort); err != nil {
 		t.Fatalf("relay recovery dial audit failed: %v", err)
 	}
+}
+
+// replayLoginCredential re-presents a credential to the real plugin endpoint
+// exactly as a reconnecting frpc does: the same Login op and credential
+// metadata. The plugin must reject it (its jti is already burned) and, per
+// §15.2, emit the session-reset fact for the session that credential belonged
+// to.
+func (s *relayStack) replayLoginCredential(t *testing.T, token string, spec tunnelSpec, runID string) {
+	t.Helper()
+	envelope := map[string]any{
+		"version": frpplugin.FRPPluginAPIVersion,
+		"op":      "Login",
+		"content": map[string]any{
+			"version":        "0.71.0",
+			"hostname":       "sharebridge-agent",
+			"os":             "linux",
+			"arch":           "amd64",
+			"user":           "",
+			"timestamp":      time.Now().Unix(),
+			"run_id":         runID,
+			"pool_count":     0,
+			"client_address": "127.0.0.1:1",
+			"metas": map[string]string{
+				frpplugin.CredentialMetadataKey: token,
+				frpplugin.GenerationMetadataKey: strconv.Itoa(spec.generation),
+			},
+		},
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal replayed Login: %v", err)
+	}
+	url := fmt.Sprintf("http://%s:%s@%s%s?version=%s&op=Login",
+		frpplugin.PluginAuthUsername, pluginSharedSecret, s.pluginLn.Addr(), frpplugin.APIPath, frpplugin.FRPPluginAPIVersion)
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build replayed Login: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("replay Login against the plugin: %v", err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read replayed Login response: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("replayed Login status = %d, want 200 (plugin reject), body=%s", response.StatusCode, raw)
+	}
+	var decoded struct {
+		Reject bool `json:"reject"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode replayed Login response: %v; body=%s", err, raw)
+	}
+	if !decoded.Reject {
+		t.Fatalf("a replayed one-use credential was admitted: %s", raw)
+	}
+}
+
+// tunnelToken returns the exact one-use credential an already-started tunnel
+// was given, so a test can re-present it byte-for-byte.
+func (s *relayStack) tunnelToken(t *testing.T, label string) string {
+	t.Helper()
+	s.mu.Lock()
+	tun := s.tunnels[label]
+	s.mu.Unlock()
+	if tun == nil || tun.token == "" {
+		t.Fatalf("tunnel %q has no credential to replay", label)
+	}
+	return tun.token
+}
+
+// waitRelayPortReleased waits for frps to stop listening on a relay port after
+// its frpc died, so a replacement session can re-register the same port.
+func waitRelayPortReleased(t *testing.T, port int, timeout time.Duration) {
+	t.Helper()
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", address, 200*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("frps still held relay port %d after its frpc stopped", port)
+}
+
+// TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel pins the
+// PRECISION of the §15.2 production trigger on the real data plane. A replayed
+// one-use credential is evidence that the session that credential belonged to
+// is dead — not that the agent's presence is stale — so a replay of a
+// credential that a healthy replacement generation has already superseded must
+// clear nothing: the live generation-2 tunnel, its established stream, and its
+// public path all survive. The reset still fires for the session it names.
+func TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel(t *testing.T) {
+	defer beginGateCase(t)()
+	requireIntegration(t)
+	s, spec := startPrimaryStack(t)
+
+	// Capture the exact burned generation-1 credential before its frpc stops,
+	// then supersede it with a fresh generation-2 credential for the same
+	// agent and relay port (the normal post-exit re-credential path).
+	staleToken := s.tunnelToken(t, spec.label)
+	s.stopTunnel(spec.label)
+	waitRelayPortReleased(t, spec.proxyPort, 10*time.Second)
+	replacement := spec
+	replacement.label = "replacement"
+	replacement.generation = 2
+	s.startTunnel(replacement)
+	s.applyRoute(s.relayHost, replacement, 2)
+	s.waitOnline(replacement, setupTimeout)
+	s.waitRouteReady(s.relayHost, setupTimeout)
+
+	baseline := runtime.NumGoroutine()
+	established, slowClient := openSlowRelayRequest(t, s)
+	if s.streams.Len() != 1 {
+		t.Fatalf("gateway stream registry holds %d streams, want the established 1", s.streams.Len())
+	}
+
+	// The stale generation-1 credential is replayed while generation 2 is
+	// healthy. The reset names the dead generation-1 session only.
+	s.replayLoginCredential(t, staleToken, spec, "run-stale-replay")
+
+	// Bounded observation: the healthy replacement tunnel must remain online.
+	// The old behaviour cleared every tunnel of the agent, so this fails as
+	// soon as the imprecise reset is dispatched.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !s.presence.Online(replacement.agentID, replacement.proxyPort, uint64(replacement.generation)) {
+			t.Fatalf("a stale generation-1 credential replay cleared the healthy generation-2 tunnel")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The established stream and the public path both survive the replay.
+	requireStreamStaysOpen(t, "stale-credential replay", established, 1500*time.Millisecond)
+	if s.streams.Len() != 1 {
+		t.Fatalf("gateway stream registry holds %d streams after the stale replay, want the established 1 preserved", s.streams.Len())
+	}
+	client := s.newRelayClient(tls.VersionTLS12, tls.VersionTLS13, []string{"http/1.1"}, 2).client
+	resp := doGet(t, client, s.relayURL("/s/"+fixtureCode+"/items"), nil)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("relay status after the stale replay = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	established.Body.Close()
+	slowClient.CloseIdleConnections()
+	requireGoroutinesReturn(t, baseline, 8, "stale-session replay precision", 5*time.Second)
+
+	// The same trigger still clears the session it actually names: replaying
+	// the live generation-2 credential takes the healthy tunnel offline.
+	s.replayLoginCredential(t, s.tunnelToken(t, replacement.label), replacement, "run-live-replay")
+	waitOffline(t, s, replacement, 10*time.Second)
 }
 
 // TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream proves §15.4:

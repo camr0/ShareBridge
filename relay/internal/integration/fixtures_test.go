@@ -720,6 +720,9 @@ type tunnel struct {
 	cmd        *exec.Cmd
 	out        *syncBuffer
 	configPath string
+	// token is the exact one-use credential handed to this frpc. Kept so a
+	// test can re-present the very same credential (a faithful replay).
+	token string
 }
 
 type presenceEventRecorder struct {
@@ -1083,7 +1086,7 @@ transport.useCompression = false
 	if err := cmd.Start(); err != nil {
 		s.t.Fatalf("start real frpc %s: %v", spec.label, err)
 	}
-	tun := &tunnel{spec: spec, cmd: cmd, out: out, configPath: configPath}
+	tun := &tunnel{spec: spec, cmd: cmd, out: out, configPath: configPath, token: token}
 	s.mu.Lock()
 	s.tunnels[spec.label] = tun
 	s.mu.Unlock()

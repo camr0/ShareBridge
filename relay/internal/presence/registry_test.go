@@ -585,6 +585,47 @@ func TestStaleSessionResetClearsOnlyTheNamedAgentAndDrains(t *testing.T) {
 	}
 }
 
+// TestStaleSessionResetDoesNotClearAHealthyReplacementSession pins the
+// PRECISION of the §15.2 production reset. A replayed one-use credential is
+// evidence that the session that credential belonged to is dead — not that the
+// agent's whole presence is stale — so the reset must name exactly the
+// (agent record, relay port, generation) session the credential belonged to.
+// A replay of a credential that a healthy replacement generation has already
+// superseded must therefore clear nothing: it must not take the replacement
+// tunnel offline and it must not drain the agent's established streams.
+func TestStaleSessionResetDoesNotClearAHealthyReplacementSession(t *testing.T) {
+	drains := 0
+	fixture := newRegistryFixture(t, func(config *Config) {
+		config.Drainer = drainerFunc(func(string) int { drains++; return 1 })
+	})
+	fixture.probe.source = "127.0.0.1:55555"
+
+	// Generation 1 comes online, then is superseded by generation 2 for the
+	// same agent and the same relay port (the normal re-credential path).
+	fixture.registerOnline(1, "run-1", "127.0.0.1:55555")
+	fixture.registerOnline(2, "run-2", "127.0.0.1:55555")
+	fixture.requireOnline(2)
+
+	// The superseded generation-1 credential is replayed (frpc re-presenting a
+	// burned credential). The named session no longer exists, so the reset is a
+	// no-op: the live generation-2 session is untouched.
+	reset := testFact(frpplugin.OperationSessionReset, 1, "run-replay")
+	fixture.observe(reset)
+
+	fixture.requireOnline(2)
+	if drains != 0 {
+		t.Fatalf("a stale-credential replay drained the agent %d time(s); a superseded session's replay must not touch the healthy replacement", drains)
+	}
+
+	// The reset still clears the session it actually names: replaying the live
+	// generation-2 credential takes that session offline and drains the agent.
+	fixture.observe(testFact(frpplugin.OperationSessionReset, 2, "run-replay"))
+	fixture.requireOffline(2)
+	if drains != 1 {
+		t.Fatalf("reset of the live session drained the agent %d time(s), want exactly 1", drains)
+	}
+}
+
 func TestReplacementGenerationFencesOldTunnel(t *testing.T) {
 	fixture := newRegistryFixture(t)
 	fixture.probe.source = "127.0.0.1:55555"

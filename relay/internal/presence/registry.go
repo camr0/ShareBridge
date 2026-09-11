@@ -8,8 +8,8 @@
 //	online
 //	  ├─ current Ping renews 45s lease (from the last authenticated Ping) ─► online
 //	  ├─ CloseProxy / logout / lease expiry ─► absent
-//	  ├─ frps reset (ClearAll, or the plugin's SessionReset fact for one
-//	  │  agent whose burned one-use credential was re-presented) ─► absent
+//	  ├─ frps reset (ClearAll, or the plugin's SessionReset fact for the
+//	  │  exact session whose burned one-use credential was re-presented) ─► absent
 //	  └─ replacement Login (equal or higher generation) ─► offline, then new online
 //
 // Every plugin-accepted Login is an authoritative session replacement: a
@@ -117,8 +117,8 @@ type ProbeFunc func(ctx context.Context, relayPort int) (sourceAddress string, e
 
 // AgentDrainer drains established public streams by agent record (satisfied
 // by gateway.Streams). Only the §15.2 frps-reset paths (ClearAll, and the
-// plugin's per-agent SessionReset trigger) drain: the tunnel's data plane dies
-// with frps itself there, and §15.4 keeps other presence transitions from
+// plugin's exact-session SessionReset trigger) drain: the tunnel's data plane
+// dies with frps itself there, and §15.4 keeps other presence transitions from
 // closing established streams.
 type AgentDrainer interface {
 	CloseAgent(agentRecordID string) int
@@ -313,12 +313,11 @@ func (registry *Registry) ObserveFRPEvent(fact frpplugin.PresenceFact) {
 	}
 	// §15.2 production trigger: the plugin observed a Login re-presenting an
 	// already-burned one-use credential — the agent's frpc reconnecting after
-	// its FRP session was reset — so that agent's presence is cleared
-	// immediately and its established streams drain. This is handled before
-	// the tunnel switch because it is agent-scoped, not tunnel-keyed, and the
-	// drain runs outside the registry lock (see clearAgent).
+	// its FRP session was reset. That credential is evidence about the exact
+	// session it belonged to, not about the agent's whole presence, so only
+	// that session's join key is cleared (see clearSession).
 	if fact.Operation == frpplugin.OperationSessionReset {
-		registry.clearAgent(fact.AgentRecordID)
+		registry.clearSession(fact)
 		return
 	}
 	key := tunnelKey{
@@ -608,27 +607,45 @@ func (registry *Registry) ClearAll() {
 	registry.drainAgents(agents)
 }
 
-// clearAgent implements the §15.2 per-agent production trigger invoked by the
-// FRP plugin's SessionReset fact. The named agent's presence is cleared
-// immediately, and its established streams are drained AFTER the presence
-// mutation commits (the same mutate-before-drain ordering as ClearAll, and
-// the same lock release before CloseAgent). A reset for an agent with no
-// presence is a no-op. Other agents are never touched, so a single frpc
-// reconnect can never clear an unrelated healthy tunnel (§15.4).
-func (registry *Registry) clearAgent(agentRecordID string) {
+// clearSession implements the §15.2 per-session production trigger invoked by
+// the FRP plugin's SessionReset fact. The re-presented one-use credential is
+// evidence that the session that credential belonged to is dead — NOT that the
+// agent's whole presence is stale — so exactly the named
+// (agent record, relay port, generation) join key is cleared. Every other key
+// of the agent is untouched: in particular a healthy newer-generation tunnel
+// that already superseded the replayed credential is a different join key and
+// can never be torn down by a stale replay.
+//
+// The agent's established streams are drained only when the clear leaves no
+// live session for that agent at all, after the presence mutation has
+// committed (the same mutate-before-drain ordering and lock discipline as
+// ClearAll, so CloseAgent is never called under registry.mu). A reset naming a
+// session that is not present — already fenced, replaced, or never confirmed —
+// is a no-op and drains nothing.
+func (registry *Registry) clearSession(fact frpplugin.PresenceFact) {
+	key := tunnelKey{
+		agentRecordID: fact.AgentRecordID,
+		relayPort:     fact.RelayPort,
+		generation:    uint64(fact.Generation),
+	}
 	registry.mu.Lock()
-	cleared := false
-	for key, tunnel := range registry.tunnels {
-		if key.agentRecordID != agentRecordID {
-			continue
+	tunnel := registry.tunnels[key]
+	if tunnel == nil {
+		registry.mu.Unlock()
+		return
+	}
+	registry.absentLocked(key, tunnel)
+	delete(registry.tunnels, key)
+	remaining := false
+	for otherKey := range registry.tunnels {
+		if otherKey.agentRecordID == key.agentRecordID {
+			remaining = true
+			break
 		}
-		registry.absentLocked(key, tunnel)
-		delete(registry.tunnels, key)
-		cleared = true
 	}
 	registry.mu.Unlock()
-	if cleared {
-		registry.drainAgents([]string{agentRecordID})
+	if !remaining {
+		registry.drainAgents([]string{key.agentRecordID})
 	}
 }
 

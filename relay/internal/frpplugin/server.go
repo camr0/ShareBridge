@@ -36,11 +36,14 @@ const (
 	OperationNewUserConn = "NewUserConn"
 	// OperationSessionReset is the §15.2 frps session-reset lifecycle signal:
 	// a Login re-presented an already-burned one-use credential. Because the
-	// credential is one-use, that re-presentation means the FRP session it
-	// created is gone (frps restarted and the agent's frpc reconnected), so
-	// the presence registry clears that agent immediately instead of waiting
-	// out the 45-second lease. It is not an authorization op and carries only
-	// the rejected credential's bounded identity.
+	// credential is one-use, that re-presentation means the FRP session this
+	// exact credential created is gone (frps restarted and the agent's frpc
+	// reconnected), so the presence registry clears that session's join key
+	// immediately instead of waiting out the 45-second lease. It is scoped to
+	// the credential's own agent/port/generation identity — never to the whole
+	// agent — so a stale replay can never tear down a healthy newer-generation
+	// tunnel. It is not an authorization op and carries only the rejected
+	// credential's bounded identity.
 	OperationSessionReset = "SessionReset"
 
 	// APIPath is configured as the HTTP server-plugin path in frps.
@@ -85,9 +88,11 @@ const (
 
 // PresenceFact is the credential-free fact stream consumed by Task 14's
 // presence registry. Login/NewProxy/CloseProxy/Ping facts confirm only that
-// the FRP plugin authorized those calls. SessionReset is the §15.2
-// lifecycle fact emitted when a Login re-presents an already-burned one-use
-// credential (an frps session reset). NewUserConn is the readiness-only
+// the FRP plugin authorized those calls. SessionReset is the §15.2 lifecycle
+// fact emitted when a Login re-presents an already-burned one-use credential:
+// it names exactly the (agent record, relay port, generation) session that
+// credential belonged to, never the whole agent, so only that session is
+// cleared. NewUserConn is the readiness-only
 // correlation fact (Task 7 amendment): frps fires it from the accept loop of
 // a listener it actually bound, and the registry confirms readiness only when
 // its four correlation fields (proxy name, server-assigned run id, generation
@@ -467,32 +472,49 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 		return false
 	}
 
+	accepted, reset := server.admitLogin(credential, content.RunID)
+	if reset != nil {
+		// Emitted after server.mu is released: the §15.2 session reset is
+		// back-pressured (it waits for dispatcher capacity instead of being
+		// dropped), and it must not hold the admission mutex while it waits.
+		server.emitSessionReset(*reset)
+		return false
+	}
+	return accepted
+}
+
+// admitLogin is the locked admission decision for one verified Login. It
+// reports whether the Login was admitted and, when the credential's jti was
+// already burned, the §15.2 session-reset fact the caller must deliver. The
+// fact is returned rather than emitted so the un-droppable, potentially
+// blocking delivery happens outside the admission mutex.
+func (server *Server) admitLogin(credential verifiedCredential, runID string) (bool, *PresenceFact) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	now := server.now().UTC()
 	if !credential.claims.ExpiresAt.After(now) {
-		return false
+		return false, nil
 	}
 	server.pruneExpiredReplayLocked(now)
 	if _, replayed := server.replayedJTI[credential.claims.JTI]; replayed {
 		// §15.2 production trigger. The credential is one-use, so a replay is
 		// the agent's frpc reconnecting after the FRP session that consumed it
 		// was reset (an frps-only restart leaves this plugin and its memory
-		// untouched). The plugin only accepts loopback callers holding the
+		// untouched). The credential names the exact session it belonged to
+		// (agent record, relay port, generation), so the registry clears only
+		// that session and a healthy newer-generation tunnel is never
+		// disturbed. The plugin only accepts loopback callers holding the
 		// operator shared secret, so the replay cannot be forged from outside
-		// the frps boundary. Emit the session-reset fact BEFORE rejecting so
-		// the gateway clears this agent's presence and drains its established
-		// streams immediately rather than at lease expiry.
-		if server.reserveEventLocked() {
-			server.emitReservedLocked(OperationSessionReset, credential.claims, content.RunID)
-		}
-		return false
+		// the frps boundary. The reset is returned for back-pressured delivery
+		// BEFORE the Login is rejected.
+		fact := presenceFactFor(OperationSessionReset, credential.claims, runID)
+		return false, &fact
 	}
 	current, exists := server.agentSessions[credential.claims.AgentRecordID]
 	if exists && (current.claims.Generation > credential.claims.Generation ||
 		(current.claims.Generation == credential.claims.Generation &&
 			!credential.claims.IssuedAt.After(current.claims.IssuedAt))) {
-		return false
+		return false, nil
 	}
 	// The persisted high-water mirrors the live session's fence while a
 	// session exists and covers the post-restart window where agentSessions
@@ -501,20 +523,20 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 	if mark, fenced := server.admissionHighWater[credential.claims.AgentRecordID]; fenced &&
 		(mark.generation > credential.claims.Generation ||
 			(mark.generation == credential.claims.Generation && !credential.claims.IssuedAt.After(mark.issuedAt))) {
-		return false
+		return false, nil
 	}
 	if !exists && len(server.agentSessions) >= server.maxSessions {
-		return false
+		return false, nil
 	}
 	// Keep the persisted high-water cardinality inside its hard cap: a brand
 	// new agent is admitted only while a high-water slot is free (fail
 	// closed; horizon pruning frees slots within the credential window).
 	if _, marked := server.admissionHighWater[credential.claims.AgentRecordID]; !marked && !exists &&
 		len(server.admissionHighWater) >= server.maxSessions {
-		return false
+		return false, nil
 	}
 	if len(server.replayedJTI) >= server.maxReplayEntries || !server.reserveEventLocked() {
-		return false
+		return false, nil
 	}
 
 	// Persist BEFORE mutating memory: a persistence failure rejects the
@@ -522,7 +544,7 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 	if server.statePath != "" {
 		if err := server.writeAdmissionStateLocked(credential.claims, now); err != nil {
 			server.releaseEventSlotLocked()
-			return false
+			return false, nil
 		}
 	}
 
@@ -537,12 +559,12 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 	session := &sessionState{
 		claims:    credential.claims,
 		tokenHash: credential.tokenHash,
-		runID:     content.RunID,
+		runID:     runID,
 	}
 	server.agentSessions[credential.claims.AgentRecordID] = session
 	server.sessionsByToken[credential.tokenHash] = session
-	server.emitReservedLocked(OperationLogin, credential.claims, content.RunID)
-	return true
+	server.emitReservedLocked(OperationLogin, credential.claims, runID)
+	return true, nil
 }
 
 func (server *Server) handleNewProxy(rawContent json.RawMessage) bool {
@@ -894,7 +916,13 @@ func (server *Server) releaseEventSlotLocked() {
 }
 
 func (server *Server) emitReservedLocked(operation string, claims CredentialClaims, runID string) {
-	server.eventQueue <- PresenceFact{
+	server.eventQueue <- presenceFactFor(operation, claims, runID)
+}
+
+// presenceFactFor builds one credential-free presence fact from a credential's
+// bounded, already-validated identity.
+func presenceFactFor(operation string, claims CredentialClaims, runID string) PresenceFact {
+	return PresenceFact{
 		Operation:     operation,
 		AgentRecordID: claims.AgentRecordID,
 		Namespace:     claims.Namespace,
@@ -903,6 +931,22 @@ func (server *Server) emitReservedLocked(operation string, claims CredentialClai
 		Generation:    claims.Generation,
 		RunID:         runID,
 	}
+}
+
+// emitSessionReset delivers the §15.2 session-reset fact. Every other fact
+// takes the fail-closed reservation (dropped, or the operation rejected, when
+// the bounded dispatcher is full); the reset is the one fact whose loss would
+// leave a dead tunnel advertising presence until the 45-second lease, so it is
+// back-pressured instead — the caller waits for dispatcher capacity rather
+// than discarding it. It still enters the single bounded, ordered queue, so it
+// is delivered strictly after every fact already enqueued for the dead session
+// (a stale queued fact can never re-create presence behind the reset) and the
+// sink is still invoked only by the one dispatcher goroutine. The wait is
+// outside server.mu and the dispatcher never blocks on the plugin, so the wait
+// is bounded by dispatcher progress.
+func (server *Server) emitSessionReset(fact PresenceFact) {
+	server.eventSlots <- struct{}{}
+	server.eventQueue <- fact
 }
 
 func (server *Server) dispatchPresenceEvents() {
