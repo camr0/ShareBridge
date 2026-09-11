@@ -195,6 +195,15 @@ const (
 	// routine timeout.
 	defaultDirectHandoffTimeout = 2 * time.Second
 
+	// defaultDirectListenStartTimeout bounds how long startDirectServer waits
+	// for the listener's bind confirmation before failing the start closed. The
+	// bind itself is synchronous (net.Listen on the start goroutine), so the
+	// wait only covers goroutine scheduling; the bound is a safety net that
+	// keeps Unlock — which must not open admission until the listener is
+	// confirmed serving — from blocking indefinitely. The wait holds no
+	// daemon lock, so the listener goroutine can always run.
+	defaultDirectListenStartTimeout = 2 * time.Second
+
 	// defaultOpenReportTimeout bounds the open path's endpoint-report
 	// confirmation: the report carrying the router-granted external port must
 	// be sent AND confirmed inside this window before the OK open_ack. The
@@ -285,9 +294,17 @@ type directState struct {
 	// It is read without ds.mu (it is set before any open-signal runs).
 	reportTimeout time.Duration
 
-	// startListenerFn overrides (*direct.DirectServer).Start in tests so a
-	// listener's bind/exit can be delayed deterministically. Owned under mu.
-	startListenerFn func(ctx context.Context, server *direct.DirectServer, addr string) error
+	// startListenerFn overrides the listener's confirmed start
+	// ((*direct.DirectServer).StartWithReady) in tests so a listener's bind/exit
+	// can be delayed deterministically. ready reports the bind result (nil on
+	// success) and must be called exactly once by the seam. Owned under mu.
+	startListenerFn func(ctx context.Context, server *direct.DirectServer, addr string, ready func(error)) error
+
+	// listenStartTimeout overrides defaultDirectListenStartTimeout in tests
+	// (zero uses the default). It bounds how long startDirectServer waits for
+	// the listener's bind confirmation; the wait holds no ds.mu. Owned under
+	// mu.
+	listenStartTimeout time.Duration
 
 	// locked is the local §13.4 lockdown state: an availability stop, NOT
 	// share revocation. While true the SignalGate refuses new opens, the
@@ -1721,11 +1738,14 @@ func (d *Daemon) learnAndReportPublicIP() {
 // address. It is idempotent (guarded by ds.started under ds.mu); the server is
 // closed when the context is cancelled on disconnect (onSignalingDisconnect).
 //
-// It RETURNS an error when the listener could not be brought into service: a
-// prior handoff that failed closed latches the start guard, and reporting that
-// to the caller is what stops Unlock / the signaling loop from claiming the
-// daemon is in service. Starting is otherwise asynchronous, so a later bind
-// failure is logged and unlatches the guard for a retry, as before.
+// It CONFIRMS the listener's bind before returning success (audit A1): the
+// start goroutine reports the net.Listen result on a listen-result channel and
+// this function waits (bounded, holding no lock) for it. A bind failure is
+// returned to the caller, so Unlock and the signaling-loop handlers never
+// report the daemon in service while the listener could not bind. A prior
+// handoff that failed closed latches the start guard and is reported just the
+// same. After a bind failure the start guard is reset (generation-checked) so a
+// later retry can bind once the socket is free.
 func (d *Daemon) startDirectServer() error {
 	ds := d.direct
 	if ds == nil {
@@ -1755,6 +1775,7 @@ func (d *Daemon) startDirectServer() error {
 	}
 	server := ds.server
 	startFn := ds.startListenerFn
+	listenTimeout := ds.listenStartTimeoutResolved()
 	ds.started = true
 	ds.startGen++
 	gen := ds.startGen
@@ -1768,31 +1789,70 @@ func (d *Daemon) startDirectServer() error {
 		listenAddr = fmt.Sprintf(":%d", directIntPort)
 	}
 
+	// resetStartGuard is the generation-checked rollback used by both the
+	// synchronous bind-failure path and the goroutine when Start returns an
+	// error: a stale failure must not clobber a newer start attempt (or a
+	// disconnect that already reset the epoch).
+	resetStartGuard := func() {
+		ds.mu.Lock()
+		if ds.startGen == gen {
+			ds.cancel = nil
+			ds.started = false
+			ds.listenerDone = nil
+		}
+		ds.mu.Unlock()
+	}
+
+	// listenResult carries the bind outcome exactly once; the buffered channel
+	// keeps the reporting goroutine from blocking if the caller already gave up
+	// on the bound.
+	listenResult := make(chan error, 1)
+	var reportReady sync.Once
+	ready := func(err error) {
+		reportReady.Do(func() { listenResult <- err })
+	}
+
 	go func() {
 		// Closing done (after Start has returned and the socket is released)
 		// is what a listener rebuild waits on before binding the replacement.
 		defer close(done)
-		start := server.Start
-		if startFn != nil {
-			start = func(ctx context.Context, addr string) error { return startFn(ctx, server, addr) }
+		start := func(ctx context.Context, addr string, r func(error)) error {
+			return server.StartWithReady(ctx, addr, r)
 		}
-		if err := start(ctx, listenAddr); err != nil {
+		if startFn != nil {
+			start = func(ctx context.Context, addr string, r func(error)) error {
+				return startFn(ctx, server, addr, r)
+			}
+		}
+		err := start(ctx, listenAddr, ready)
+		// A start seam that returned without reporting the bind must not leave
+		// the caller waiting: report whatever it returned (nil only if it bound).
+		ready(err)
+		if err != nil {
 			log.Printf("direct server: %v", err)
 			cancel() // release the epoch ctx
-			// A bind/start failure must not latch the epoch as started: reset
-			// the guard so a later enrollment_ready retries. The generation
-			// check ensures a stale failure cannot clobber a newer start
-			// attempt (or a disconnect that already reset the epoch).
-			ds.mu.Lock()
-			if ds.startGen == gen {
-				ds.cancel = nil
-				ds.started = false
-				ds.listenerDone = nil
-			}
-			ds.mu.Unlock()
+			resetStartGuard()
 		}
 	}()
-	return nil
+
+	// Wait (holding no lock) for the bind confirmation. The listener goroutine
+	// runs net.Listen synchronously, so this is a scheduling bound, not a
+	// network one; a miss is a failed start (fail closed).
+	timer := time.NewTimer(listenTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-listenResult:
+		if err != nil {
+			cancel()
+			resetStartGuard()
+			return err
+		}
+		return nil
+	case <-timer.C:
+		cancel()
+		resetStartGuard()
+		return fmt.Errorf("direct server: listener bind did not confirm within %s", listenTimeout)
+	}
 }
 
 // listenerHandoffTimeout resolves the bounded wait for the previous listener's
@@ -1803,6 +1863,16 @@ func (ds *directState) listenerHandoffTimeout() time.Duration {
 		return ds.handoffTimeout
 	}
 	return defaultDirectHandoffTimeout
+}
+
+// listenStartTimeoutResolved resolves the bounded wait for a listener bind
+// confirmation, honoring the test override. Like listenerHandoffTimeout it is
+// read without ds.mu (it is set before any listener starts).
+func (ds *directState) listenStartTimeoutResolved() time.Duration {
+	if ds.listenStartTimeout > 0 {
+		return ds.listenStartTimeout
+	}
+	return defaultDirectListenStartTimeout
 }
 
 // openReportTimeout resolves the bounded wait for the open path's endpoint

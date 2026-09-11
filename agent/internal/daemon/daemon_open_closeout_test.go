@@ -19,6 +19,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,6 +126,97 @@ func TestUnlockHandoffFailureFencesDirectOpen(t *testing.T) {
 	}
 	if !ds.port.Open() {
 		t.Fatalf("the recovered open must leave the mapping open")
+	}
+	if got := mappingCount(fx.mapper); got != 1 {
+		t.Fatalf("router mappings after the recovered open = %d, want 1", got)
+	}
+}
+
+// TestUnlockBindFailureFencesDirectOpenUntilConfirmed is the finding-A1 proof:
+// Unlock must not open direct admission or fire any unlocked-success lifecycle
+// action until the replacement listener is CONFIRMED serving. The ordered
+// handoff succeeds here, but the socket has been reoccupied, so the
+// replacement's net.Listen fails. Unlock must return that error, the fence must
+// stay (no mapping, no OK ack, no lifecycle actions), and a retried Unlock after
+// the socket is released must bind and restore normal operation.
+//
+// It uses the REAL listener (no start seam) and reoccupies the freed socket, so
+// it is behavioural at the base revision: the base's asynchronous
+// startDirectServer returns nil before net.Listen runs and Unlock claims
+// success while the listener is not in service.
+func TestUnlockBindFailureFencesDirectOpenUntilConfirmed(t *testing.T) {
+	fx := newLockdownFixture(t)
+	ds := fx.ds
+	wireOpenPath(t, fx)
+
+	fx.d.mu.RLock()
+	managerBefore := fx.d.tunnel
+	fx.d.mu.RUnlock()
+
+	require.NoError(t, fx.d.startDirectServer())
+	waitDialable(t, ds.listenAddr)
+
+	require.NoError(t, fx.d.Lockdown())
+	require.True(t, fx.d.IsLocked())
+	// Lockdown stops the listener; wait until its socket is actually released so
+	// the test can reoccupy the exact address.
+	assertListenerClosed(t, ds.listenAddr)
+
+	blocker, err := net.Listen("tcp", ds.listenAddr)
+	require.NoError(t, err, "reoccupy the freed listen address")
+	defer blocker.Close()
+
+	// (a) The ordered handoff succeeds but the replacement bind fails: Unlock
+	// must report the failure instead of claiming the daemon is in service.
+	err = fx.d.Unlock()
+	require.Error(t, err, "Unlock must report the replacement-listener bind failure, not success")
+
+	// (b) The fence remains: the port stamp keeps its locked bit and no open can
+	// map or ack OK through the fenced window.
+	if _, locked := ds.port.Generation(); !locked {
+		t.Fatalf("the port generation stamp lost its locked bit after a failed bind")
+	}
+	fx.d.handleOpenSignal(openSignalMessage())
+	if fx.sig.hasSentMessage("open_ack", map[string]any{"status": "ok"}) {
+		t.Fatalf("an OK open_ack was sent although the listener was never confirmed serving: %#v", fx.sig.messagesSnapshot())
+	}
+	if !fx.sig.hasSentMessage("open_ack", map[string]any{"status": "error", "error": "rejected"}) {
+		t.Fatalf("expected a rejected error open_ack while fenced, got %#v", fx.sig.messagesSnapshot())
+	}
+	if ds.port.Open() {
+		t.Fatalf("a fenced open must not leave the mapping open")
+	}
+	if got := mappingCount(fx.mapper); got != 0 {
+		t.Fatalf("router mappings after a failed-bind unlock = %d, want 0", got)
+	}
+
+	// (c) No unlocked-success lifecycle action ran: the tunnel manager identity
+	// is the deterministic signal (the success path replaces the stopped
+	// manager), and no fresh credential / unlocked status was emitted.
+	fx.d.mu.RLock()
+	managerAfterFailure := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	if managerAfterFailure != managerBefore {
+		t.Error("failed unlock rebuilt the tunnel manager")
+	}
+	if fx.sig.hasSentMessage("relay_credential_request", map[string]any{"reason": "restart"}) {
+		t.Error("failed unlock requested a fresh relay credential")
+	}
+	if got := countSentMessages(fx.sig, "lockdown_status", map[string]any{"locked": false}); got != 0 {
+		t.Errorf("failed unlock reported an unlocked status: %d report(s), want 0", got)
+	}
+
+	// (d) Recovery: release the socket; the retried Unlock must actually bind the
+	// replacement and restore normal operation (no false fencing).
+	blocker.Close()
+	require.NoError(t, fx.d.Unlock(), "the retried unlock must bind the replacement listener")
+	require.False(t, fx.d.IsLocked())
+	if _, locked := ds.port.Generation(); locked {
+		t.Fatalf("the port generation stamp must be unlocked after a confirmed start")
+	}
+	fx.d.handleOpenSignal(openSignalMessageAt(2, "nonce-after-bind-recovery"))
+	if !fx.sig.hasSentMessage("open_ack", map[string]any{"status": "ok"}) {
+		t.Fatalf("a normal open after a confirmed start must succeed, got %#v", fx.sig.messagesSnapshot())
 	}
 	if got := mappingCount(fx.mapper); got != 1 {
 		t.Fatalf("router mappings after the recovered open = %d, want 1", got)

@@ -651,11 +651,23 @@ func (s *DirectServer) newHTTPServer() *http.Server {
 // cancelled. The certificate is supplied per-handshake by TLSConfig's
 // GetConfigForClient, so no cert/key files are passed to ServeTLS.
 func (s *DirectServer) Start(ctx context.Context, listenAddr string) error {
+	return s.StartWithReady(ctx, listenAddr, func(error) {})
+}
+
+// StartWithReady is Start with an explicit bind-outcome confirmation: ready is
+// called EXACTLY ONCE with the net.Listen result (nil on success) after the
+// bind attempt and before serving begins. The callback runs on the caller's
+// goroutine, so a caller that must not claim the listener is in service until
+// the bind actually succeeded (the §13.4 Unlock handoff) can wait for it and
+// propagate the bind error. Serving still blocks until ctx is cancelled.
+func (s *DirectServer) StartWithReady(ctx context.Context, listenAddr string, ready func(error)) error {
 	srv := s.newHTTPServer()
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		ready(err)
 		return err
 	}
+	ready(nil)
 	go func() { <-ctx.Done(); _ = srv.Close() }()
 	return srv.ServeTLS(ln, "", "")
 }

@@ -21,31 +21,48 @@ const defaultEndpointSendTimeout = 5 * time.Second
 // the open closed for no reason (remediation finding 4). Bounding advisories
 // well below that deadline keeps the residual in-flight delay harmless. It is
 // only a backstop against the in-flight case; queued advisories are handled by
-// the drain's open-priority selection, which is what makes an arbitrary
-// advisory backlog harmless.
+// per-endpoint coalescing, which caps the queued backlog at one advisory.
 const advisorySendTimeout = time.Second
+
+// reporterQueueCap bounds the number of pending events. A single FIFO carries
+// both advisories and confirmed opens so per-endpoint transition order is
+// preserved; advisories are coalesced (at most one pending per endpoint, the
+// newest), so only concurrent open reports can grow the queue and the cap is a
+// defensive safety net.
+const reporterQueueCap = 64
 
 // ErrReporterClosed is returned by ReportOpen once the reporter has been
 // closed: a closed reporter cannot confirm an open report, so the open must be
 // treated as unsuccessful by the caller.
 var ErrReporterClosed = errors.New("direct: endpoint reporter is closed")
 
+// errReporterQueueFull is returned by ReportOpen when the FIFO is at
+// reporterQueueCap (only reachable with many outstanding open reports; the
+// advisory side is coalesced). The open must be treated as unsuccessful.
+var errReporterQueueFull = errors.New("direct: endpoint reporter queue is full")
+
 // Reporter maps on-demand port state transitions to report_endpoint messages.
 //
-// Advisory transitions (close and close-failed) are queued and may be dropped
-// when the queue is full: they never gate a control-plane decision, and the
-// next transition re-reports. The OPEN transition is different — the control
-// needs the mapped external port before it can provision DDNS and hand a
-// direct origin to a recipient — so it is delivered exclusively by ReportOpen,
-// which confirms delivery before returning and reports a full queue, a send
-// error, or a timeout as an error instead of silently dropping.
+// ALL transitions share ONE FIFO (queue) so an endpoint's reports reach control
+// in the order the port state machine produced them: a confirmed open report
+// can never overtake an advisory that was enqueued before it (audit A2 — the
+// previous dedicated priority channel let a stale close_failed/closed land
+// after a healthy open and mark the endpoint port-zero). Advisory transitions
+// (close and close-failed) are coalesced per endpoint — the newest queued
+// advisory supersedes any earlier queued one — which bounds the queued backlog
+// to a single advisory so a stalled advisory cannot delay a confirmed open past
+// its deadline (finding 4). A dropped advisory is always superseded by a newer
+// one for the same endpoint, never reordered relative to it.
+//
+// The OPEN transition is delivered exclusively by ReportOpen, which confirms
+// delivery before returning and reports a full queue, a send error, or a
+// timeout as an error instead of silently dropping.
 type Reporter struct {
 	mu     sync.Mutex
 	ip     string
 	send   func(ctx context.Context, ip string, port int, status string) error
-	ch     chan endpointEvent // queued advisory transitions: never blocks the state loop
-	openCh chan endpointEvent // confirmed open reports: prioritized by the drain
-	done   chan struct{}      // closed by Close to stop the drain goroutine
+	queue  []endpointEvent // the single FIFO: advisories and confirmed opens
+	notify chan struct{}   // buffered (cap 1) wake-up for the drain
 	closed bool
 }
 
@@ -65,43 +82,48 @@ type endpointEvent struct {
 	done chan error
 }
 
+// isAdvisory reports whether the event is an advisory transition (rather than a
+// confirmed open report). Confirmed opens are the only events that carry a
+// per-caller confirmation channel.
+func (e endpointEvent) isAdvisory() bool { return e.done == nil }
+
 func NewReporter(send func(ctx context.Context, ip string, port int, status string) error) *Reporter {
 	r := &Reporter{
 		send:   send,
-		ch:     make(chan endpointEvent, 64),
-		openCh: make(chan endpointEvent, 1),
-		done:   make(chan struct{}),
+		notify: make(chan struct{}, 1),
 	}
 	go r.drain()
 	return r
 }
 
-// drain is the reporter's single send goroutine. It serializes advisory and
-// confirmed sends, so a confirmed open report can never be overtaken by a later
-// close report within the same connection.
-//
-// Confirmed open events are PRIORITIZED over queued advisory events: the drain
-// first drains openCh non-blockingly, then falls into a blocking select that
-// prefers openCh again. A backlog of advisory transitions (which the state loop
-// enqueues drop-on-full) therefore cannot delay an open confirmation behind
-// it. Combined with the advisory send bound in deliver, the residual is at most
-// one advisory already in flight when the open is enqueued.
+// signalLocked wakes the drain without blocking. Caller must hold r.mu.
+func (r *Reporter) signalLocked() {
+	select {
+	case r.notify <- struct{}{}:
+	default:
+	}
+}
+
+// drain is the reporter's single send goroutine. It pops events from the FIFO
+// in order, so a confirmed open report is never sent before an advisory (or
+// another open) that was enqueued earlier, and a later transition never
+// overtakes an earlier one.
 func (r *Reporter) drain() {
 	for {
-		select {
-		case e := <-r.openCh:
+		r.mu.Lock()
+		if len(r.queue) > 0 {
+			e := r.queue[0]
+			r.queue = r.queue[1:]
+			r.mu.Unlock()
 			r.deliver(e)
 			continue
-		default:
 		}
-		select {
-		case e := <-r.openCh:
-			r.deliver(e)
-		case e := <-r.ch:
-			r.deliver(e)
-		case <-r.done:
+		if r.closed {
+			r.mu.Unlock()
 			return
 		}
+		r.mu.Unlock()
+		<-r.notify
 	}
 }
 
@@ -128,12 +150,19 @@ func (r *Reporter) deliver(e endpointEvent) {
 
 // Close stops the reporter's drain goroutine. It is idempotent and safe to call
 // multiple times. After Close, both OnTransition and ReportOpen drop/refuse
-// events, so nothing is ever sent on a torn-down reporter.
+// events; a confirmed open still waiting on its result is answered with
+// ErrReporterClosed so it cannot hang on a torn-down reporter.
 func (r *Reporter) Close() {
 	r.mu.Lock()
 	if !r.closed {
 		r.closed = true
-		close(r.done)
+		for _, e := range r.queue {
+			if e.done != nil {
+				e.done <- ErrReporterClosed
+			}
+		}
+		r.queue = nil
+		r.signalLocked()
 	}
 	r.mu.Unlock()
 }
@@ -147,7 +176,7 @@ func (r *Reporter) SetIP(ip string) {
 // OnTransition publishes the ADVISORY transition reports: closing/close-failed
 // and closed. StateOpen is deliberately not reported here — the open report is
 // control-critical and is delivered by ReportOpen so it can be confirmed before
-// the OK open_ack rather than racing it through this drop-on-full queue.
+// the OK open_ack rather than racing it through this queue.
 func (r *Reporter) OnTransition(old, new PortState, grantedPort int) {
 	var e endpointEvent
 	switch new {
@@ -166,46 +195,49 @@ func (r *Reporter) OnTransition(old, new PortState, grantedPort int) {
 		return
 	}
 	e.ip = r.ip
-	// Non-blocking enqueue: advisory reports may be dropped when the buffer is
-	// full. This guarantees OnTransition never blocks the state loop even if
-	// the send consumer stalls.
-	select {
-	case r.ch <- e:
-	default:
+	// Coalesce per endpoint: a queued advisory immediately superseded by this
+	// newer one is dropped, so the queued advisory backlog is at most one and
+	// cannot delay a later confirmed open past its deadline. Only the TAIL is
+	// coalesced, so an advisory is never dropped across an intervening open
+	// report (which would reorder an endpoint's transitions); each dropped
+	// advisory is strictly older than the one that replaced it.
+	if n := len(r.queue); n > 0 && r.queue[n-1].isAdvisory() {
+		r.queue[n-1] = e
+	} else if len(r.queue) < reporterQueueCap {
+		r.queue = append(r.queue, e)
 	}
+	// A full queue drops the advisory (advisory reports may be lost; the next
+	// transition re-reports) and OnTransition never blocks the state loop.
+	r.signalLocked()
 	r.mu.Unlock()
 }
 
 // ReportOpen sends the open transition's endpoint report for grantedPort — the
 // external port the router actually granted — and confirms delivery before
 // returning. It is the open path's dedicated synchronous report: unlike the
-// advisory transitions it is never silently dropped. A full queue (the enqueue
-// cannot complete inside ctx), a send failure, or a confirmation that misses
-// ctx's deadline is returned as an error, and the caller MUST treat the open as
-// unsuccessful.
+// advisory transitions it is never silently dropped. A full queue, a send
+// failure, or a confirmation that misses ctx's deadline is returned as an
+// error, and the caller MUST treat the open as unsuccessful.
 //
 // ReportOpen is called after OnDemandPort.OpenForIf has returned, so it holds
-// no state-loop lock, no ackMu, and no router I/O while it waits. The only
-// block is the bounded enqueue/confirmation select on ctx.
+// no state-loop lock, no ackMu, and no router I/O while it waits. The event is
+// appended to the SAME FIFO advisories use, so it cannot overtake any advisory
+// enqueued before it; the only block is the bounded confirmation select on ctx.
 func (r *Reporter) ReportOpen(ctx context.Context, grantedPort int) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		return ErrReporterClosed
 	}
-	ip := r.ip
-	r.mu.Unlock()
-
-	done := make(chan error, 1)
-	e := endpointEvent{ip: ip, port: grantedPort, ctx: ctx, done: done}
-
-	// Confirmed open reports ride their own prioritized queue: a backlog of
-	// advisory events can never sit in front of them in the drain.
-	select {
-	case r.openCh <- e:
-	case <-ctx.Done():
-		return fmt.Errorf("endpoint open report enqueue: %w", ctx.Err())
+	if len(r.queue) >= reporterQueueCap {
+		r.mu.Unlock()
+		return fmt.Errorf("endpoint open report enqueue: %w", errReporterQueueFull)
 	}
+	done := make(chan error, 1)
+	e := endpointEvent{ip: r.ip, port: grantedPort, ctx: ctx, done: done}
+	r.queue = append(r.queue, e)
+	r.signalLocked()
+	r.mu.Unlock()
 
 	select {
 	case err := <-done:

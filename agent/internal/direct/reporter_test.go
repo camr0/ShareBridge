@@ -17,14 +17,20 @@ type endpointReport struct {
 func TestReporterMapsTransitions(t *testing.T) {
 	var mu sync.Mutex
 	var got []endpointReport
-	done := make(chan struct{})
+	openDelivered := make(chan struct{})
+	closeFailedDelivered := make(chan struct{})
+	closedDelivered := make(chan struct{})
 	r := NewReporter(func(ctx context.Context, ip string, port int, status string) error {
 		mu.Lock()
 		got = append(got, endpointReport{ip, port, status})
-		n := len(got)
 		mu.Unlock()
-		if n == 3 {
-			close(done)
+		switch {
+		case status == "close_failed":
+			close(closeFailedDelivered)
+		case port == 0:
+			close(closedDelivered)
+		default:
+			close(openDelivered)
 		}
 		return nil
 	})
@@ -37,12 +43,21 @@ func TestReporterMapsTransitions(t *testing.T) {
 	if err := r.ReportOpen(context.Background(), 443); err != nil {
 		t.Fatalf("ReportOpen: %v", err)
 	}
-	// Advisory close transitions still flow through OnTransition.
+	awaitSignal(t, openDelivered, "open report delivery")
+	// Advisory close transitions still flow through OnTransition. Each delivery
+	// is awaited before the next is enqueued so the per-endpoint coalescing
+	// (which only drops an advisory superseded by a newer queued one) cannot
+	// collapse the distinct states this test pins.
 	r.OnTransition(StateOpen, StateCloseFailed, 443) // close-failed: nonzero port
+	awaitSignal(t, closeFailedDelivered, "close_failed report delivery")
 	r.OnTransition(StateCloseFailed, StateClosed, 0) // closed: port 0
-	<-done
+	awaitSignal(t, closedDelivered, "closed report delivery")
+
 	mu.Lock()
 	defer mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("delivered reports = %d (%+v), want 3", len(got), got)
+	}
 	if got[0].port != 443 || got[0].status != "" {
 		t.Fatalf("open report: %+v", got[0])
 	}
@@ -101,15 +116,16 @@ func TestReporterOnTransitionNeverBlocksWhenFull(t *testing.T) {
 		r.Close()
 	}()
 
-	// The drain goroutine stalls on the first send (blocked on release), so the
-	// 64-slot buffer fills: 1 event is consumed by drain, the remaining 64 sit
-	// in the buffer. Close transitions are the advisory report kind.
+	// The drain goroutine stalls on the first send (blocked on release). The
+	// identical close advisories coalesce per endpoint into a single pending
+	// advisory, so the queue never grows; OnTransition must still never block
+	// the caller when the drain is wedged.
 	for i := 0; i < 65; i++ {
 		r.OnTransition(StateOpen, StateClosed, 0)
 	}
 
-	// The buffer is now full. A plain `ch <-` send would block the caller here;
-	// the drop-on-full enqueue must return promptly instead.
+	// A plain blocking enqueue would hang the caller while the drain is wedged;
+	// the non-blocking enqueue must return promptly instead.
 	done := make(chan struct{})
 	go func() {
 		r.OnTransition(StateOpen, StateClosed, 0)
@@ -178,9 +194,11 @@ func TestReporterReportOpenSendError(t *testing.T) {
 	}
 }
 
-// TestReporterReportOpenQueueFullIsBounded proves a full advisory queue blocks
-// the open report only until its deadline and then errors, rather than
-// dropping the report silently.
+// TestReporterReportOpenQueueFullIsBounded proves a stalled drain blocks the
+// open report only until its deadline and then errors, rather than dropping the
+// report silently. Per-endpoint coalescing keeps the advisory side of the FIFO
+// at (at most) one pending advisory, so this exercises the bounded open
+// confirmation rather than a literally full advisory queue.
 func TestReporterReportOpenQueueFullIsBounded(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -196,7 +214,7 @@ func TestReporterReportOpenQueueFullIsBounded(t *testing.T) {
 	defer r.Close()
 	r.SetIP("203.0.113.7")
 
-	// Wedge the drain, then fill all 64 advisory slots.
+	// Wedge the drain; the repeated advisories coalesce to one pending advisory.
 	r.OnTransition(StateOpen, StateClosed, 0)
 	<-entered
 	for i := 0; i < 64; i++ {

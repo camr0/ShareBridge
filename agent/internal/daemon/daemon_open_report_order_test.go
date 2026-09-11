@@ -355,9 +355,10 @@ func TestOpenSignalAlreadyOpenReportFailureTearsDownMapping(t *testing.T) {
 }
 
 // TestOpenSignalReportQueueFullFailsOpen covers failure (b): the reporter's
-// advisory queue is full (the drain is wedged in a send), so the open report
-// cannot be enqueued. The open must fail closed rather than silently dropping
-// the report and acking OK.
+// drain is wedged in a send and the advisory side of its FIFO is saturated
+// (per-endpoint coalescing holds at most one pending advisory), so the open
+// report cannot be confirmed inside its deadline. The open must fail closed
+// rather than silently dropping the report and acking OK.
 func TestOpenSignalReportQueueFullFailsOpen(t *testing.T) {
 	f := newReportOrderFixture(t, newRemapDirectMapper(52019))
 	f.daemon.direct.reportTimeout = 200 * time.Millisecond
@@ -378,7 +379,8 @@ func TestOpenSignalReportQueueFullFailsOpen(t *testing.T) {
 	f.reporter.OnTransition(direct.StateOpen, direct.StateClosed, 0)
 	awaitRecv(t, entered, "drain entering the wedged send")
 
-	// Fill the 64-slot queue so the next enqueue (the open report) cannot fit.
+	// Saturate the advisory side (coalesced to one) so the open report can only
+	// be confirmed after the wedged send, which never completes.
 	for i := 0; i < 64; i++ {
 		f.reporter.OnTransition(direct.StateOpen, direct.StateClosed, 0)
 	}

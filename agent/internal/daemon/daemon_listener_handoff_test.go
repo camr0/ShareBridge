@@ -62,20 +62,20 @@ func (g *listenerGates) callCount() int {
 }
 
 // start is the injected startListenerFn.
-func (g *listenerGates) start(ctx context.Context, server *direct.DirectServer, addr string) error {
+func (g *listenerGates) start(ctx context.Context, server *direct.DirectServer, addr string, ready func(error)) error {
 	if g.next() > 1 {
 		select {
 		case <-g.replacementEntered:
 		default:
 			close(g.replacementEntered)
 		}
-		return server.Start(ctx, addr)
+		return server.StartWithReady(ctx, addr, ready)
 	}
 	if g.serveRealFirst {
 		innerCtx, innerCancel := context.WithCancel(context.Background())
 		defer innerCancel()
 		errCh := make(chan error, 1)
-		go func() { errCh <- server.Start(innerCtx, addr) }()
+		go func() { errCh <- server.StartWithReady(innerCtx, addr, ready) }()
 		close(g.firstBound)
 		<-ctx.Done()
 		close(g.cancelSeen)
@@ -85,8 +85,10 @@ func (g *listenerGates) start(ctx context.Context, server *direct.DirectServer, 
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		ready(err)
 		return err
 	}
+	ready(nil)
 	close(g.firstBound)
 	<-ctx.Done()
 	close(g.cancelSeen)
@@ -119,7 +121,7 @@ func TestListenerHandoffWaitsForOldSocketRelease(t *testing.T) {
 	g := newListenerGates()
 	orderViolated := make(chan struct{})
 	var violationOnce sync.Once
-	ds.startListenerFn = func(ctx context.Context, server *direct.DirectServer, addr string) error {
+	ds.startListenerFn = func(ctx context.Context, server *direct.DirectServer, addr string, ready func(error)) error {
 		if g.callCount() >= 1 { // the old listener already bound: this is the replacement
 			select {
 			case <-g.oldExited:
@@ -127,7 +129,7 @@ func TestListenerHandoffWaitsForOldSocketRelease(t *testing.T) {
 				violationOnce.Do(func() { close(orderViolated) })
 			}
 		}
-		return g.start(ctx, server, addr)
+		return g.start(ctx, server, addr, ready)
 	}
 
 	fx.d.startDirectServer()
