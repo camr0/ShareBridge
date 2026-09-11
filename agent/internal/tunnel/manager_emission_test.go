@@ -397,9 +397,11 @@ func TestManagerBlockedCallbackLeavesNoGoroutineLeak(t *testing.T) {
 }
 
 // TestManagerStopBoundsWedgedGracefulStop pins that a child/OS GracefulStop
-// call that never returns is bounded by a Manager-owned timer: the stop still
-// escalates to the kill, the wedged call is surfaced, and Stop returns
-// promptly.
+// call that never returns is bounded by a Manager-owned timer, and that
+// single-flight keeps it from accumulating: the wedged call holds the
+// manager's one signal slot, so the kill escalation is refused without
+// spawning a second goroutine, and Stop still returns promptly with
+// ErrChildSignalTimeout. Releasing the wedged call frees the slot.
 func TestManagerStopBoundsWedgedGracefulStop(t *testing.T) {
 	const signalTimeout = 30 * time.Millisecond
 	baseline := runtime.NumGoroutine()
@@ -421,22 +423,40 @@ func TestManagerStopBoundsWedgedGracefulStop(t *testing.T) {
 	waitForCondition(t, "child started", time.Second, func() bool { return starter.startCount() == 1 })
 
 	stopErr, elapsed := stopWithin(t, manager, manager.stopBound()+time.Second)
-	if stopErr != nil {
-		t.Fatalf("Stop() error = %v, want nil: the wedged graceful call is bounded and the kill reaps the child", stopErr)
+	if stopErr == nil {
+		t.Fatal("Stop() = nil; a wedged graceful call must surface an explicit error")
+	}
+	if !errors.Is(stopErr, ErrChildSignalTimeout) {
+		t.Fatalf("Stop() error = %q, want it to wrap ErrChildSignalTimeout", stopErr)
 	}
 	if elapsed > manager.stopBound() {
 		t.Fatalf("Stop() returned after %v; its own bound is %v", elapsed, manager.stopBound())
 	}
 	child := starter.recordAt(0).child
-	if child.gracefulStopCount() != 1 || child.killCount() != 1 {
-		t.Fatalf("stop escalation = graceful %d / kill %d, want 1/1 (the kill must not wait for the wedged graceful call)",
-			child.gracefulStopCount(), child.killCount())
+	if child.gracefulStopCount() != 1 {
+		t.Fatalf("graceful stop attempts = %d, want exactly 1", child.gracefulStopCount())
+	}
+	// Single-flight: the wedged graceful call still occupies the manager's one
+	// signal slot, so the kill escalation is refused rather than spawning a
+	// second abandoned goroutine.
+	if child.killCount() != 0 {
+		t.Fatalf("kill attempts = %d, want 0 while the wedged graceful call is outstanding", child.killCount())
+	}
+	if got := manager.outstandingSignalCalls.Load(); got != 1 {
+		t.Fatalf("outstanding signal goroutines = %d, want exactly 1 (the wedged graceful call)", got)
 	}
 	if !collector.hasStatus(StatusError) {
 		t.Error("the wedged graceful stop must be surfaced as an error status")
 	}
 
 	releaseSignal()
+	waitForCondition(t, "wedged signal call exits after release", 2*time.Second, func() bool {
+		return manager.outstandingSignalCalls.Load() == 0
+	})
+	// The child was never reaped by this stop path; reap it explicitly so the
+	// watcher goroutine can finish, then the goroutine count returns to
+	// baseline.
+	child.signalExit(errors.New("signal: killed"))
 	waitForCondition(t, "manager goroutines return to baseline after release", 2*time.Second, func() bool {
 		return runtime.NumGoroutine() <= baseline
 	})

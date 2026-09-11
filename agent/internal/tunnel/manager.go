@@ -226,6 +226,26 @@ type childProcess interface {
 	Kill() error
 }
 
+// childSignalCall is the single-flight record of the manager's one allowed
+// outstanding child signal call. Go cannot cancel a blocking syscall, so a
+// signal call that ignores its bound is abandoned on its goroutine; the
+// manager keeps at most ONE such goroutine alive at a time, so repeated
+// Stop/replacement calls cannot accumulate them (Round D fix-round 2, audit
+// A).
+type childSignalCall struct {
+	name string
+	// returned receives the call's own result exactly once. It is buffered so
+	// the goroutine always finishes its send and exits, even when the waiter
+	// has already given up on the bound.
+	returned chan error
+	// timeoutErr is the bound error recorded when the waiter gave up. It is
+	// written and read only under Manager.signalMu.
+	timeoutErr error
+	// finishOnce makes the slot release idempotent between the returning
+	// goroutine and a waiter that observed the result.
+	finishOnce sync.Once
+}
+
 // execChildProcess adapts an os/exec command. Wait is safe to call from
 // multiple goroutines (the exit watcher and a concurrent stop escalation).
 type execChildProcess struct {
@@ -377,6 +397,21 @@ type Manager struct {
 	// bounded drain expired with reports still queued. Every drop is also
 	// logged, so a loss is never silent.
 	droppedStatus atomic.Uint64
+	// signalMu guards the single-flight signal slot: outstandingSignal and the
+	// bound error recorded on it. It is only ever held for the slot
+	// check/install/clear and the recorded-error read — never across a wait —
+	// so it cannot deadlock shutdown.
+	signalMu sync.Mutex
+	// outstandingSignal is the single-flight slot: non-nil from the instant the
+	// manager's one allowed signal-call goroutine is spawned until that
+	// goroutine returns and releases it. While it is set every further child
+	// signal request is refused without spawning, so a wedged GracefulStop/Kill
+	// can never accumulate abandoned goroutines. A rebuilt manager gets its own
+	// slot; one manager instance never exceeds one outstanding call.
+	outstandingSignal *childSignalCall
+	// outstandingSignalCalls counts the manager's live signal-call goroutines.
+	// It is a test seam and the asserted invariant: it never exceeds one.
+	outstandingSignalCalls atomic.Int64
 	// publishedGeneration mirrors the armed generation for callers: -1 until
 	// a first configuration is armed, otherwise the current generation. It
 	// lets ApplyConfig reject stale generations synchronously.
@@ -860,12 +895,17 @@ func (manager *Manager) notifyRunningAfterStability(child childProcess) {
 // stopChildGracefullyOrKill stops the current child: graceful first, then a
 // kill after the grace period, then a BOUNDED wait for the exit. Every step is
 // bounded by a Manager-owned timer, including the two signal calls themselves
-// (a child/OS call that never returns must not strand shutdown): a graceful
-// call that did not return is surfaced and escalates straight to the kill
-// rather than burning the grace window. If the child still has not exited, it
-// is left tracked (its watcher owns the eventual exit) and an explicit error
-// is returned so callers can surface it and keep shutdown moving. It is called
-// from the run goroutine only, and holds no lock across any wait.
+// (a child/OS call that never returns must not strand shutdown). Signal calls
+// are single-flighted (signalChild): a graceful call that did not return is
+// surfaced, and the kill escalation is then refused while the wedged call
+// occupies the manager's one signal slot — so a pathological child/OS call can
+// never accumulate goroutines across the repeated stop/replacement calls the
+// run loop makes. A graceful call that RETURNED but did not stop the child
+// keeps the normal kill escalation after the grace window. If the child still
+// has not exited, it is left tracked (its watcher owns the eventual exit) and
+// an explicit error is returned so callers can surface it and keep shutdown
+// moving. It is called from the run goroutine only, and holds no lock across
+// any wait.
 func (manager *Manager) stopChildGracefullyOrKill() error {
 	child := manager.child
 	if child == nil {
@@ -905,22 +945,75 @@ func (manager *Manager) stopChildGracefullyOrKill() error {
 	}
 }
 
-// signalChild invokes one child signal call under a Manager-owned bound. The
-// call runs on its own goroutine; if the bound expires the goroutine is
-// abandoned and completes whenever the call does (it is bounded by the call's
-// own return, holds no lock, and is never waited on), while the caller gets an
-// explicit ErrChildSignalTimeout.
+// signalChild invokes one child signal call under a Manager-owned bound, with
+// single-flight semantics: the manager allows at most ONE outstanding signal
+// call. The call runs on its own goroutine (Go cannot cancel a blocking
+// syscall, so abandoning it is inherent); if the bound expires the caller gets
+// an explicit ErrChildSignalTimeout while that goroutine is abandoned until
+// the call returns. While the slot is occupied every further signal request is
+// refused with the recorded bound error WITHOUT spawning, so a wedged
+// GracefulStop/Kill can never accumulate goroutines across the repeated
+// stop/replacement calls the supervision loop makes (Round D fix-round 2,
+// audit A). When the abandoned call eventually returns, its slot is released
+// and a later, legitimate call (e.g. a subsequent kill escalation) can proceed
+// — still never more than one outstanding at any instant.
 func (manager *Manager) signalChild(name string, signal func() error) error {
-	returned := make(chan error, 1)
-	go func() { returned <- signal() }()
+	manager.signalMu.Lock()
+	if outstanding := manager.outstandingSignal; outstanding != nil {
+		err := outstanding.timeoutErr
+		manager.signalMu.Unlock()
+		if err == nil {
+			// Defensive: an outstanding call without a recorded bound (cannot
+			// happen from the run goroutine, the only caller) still yields the
+			// correct failure class.
+			err = fmt.Errorf("%w: %s did not return within %s",
+				ErrChildSignalTimeout, outstanding.name, manager.childSignalTimeout)
+		}
+		return fmt.Errorf("%w: %s skipped while %s is still outstanding", err, name, outstanding.name)
+	}
+	call := &childSignalCall{name: name, returned: make(chan error, 1)}
+	manager.outstandingSignal = call
+	manager.signalMu.Unlock()
+
+	manager.outstandingSignalCalls.Add(1)
+	go func() {
+		defer manager.finishSignalCall(call)
+		call.returned <- signal()
+	}()
+
 	timer := time.NewTimer(manager.childSignalTimeout)
 	defer timer.Stop()
 	select {
-	case err := <-returned:
+	case err := <-call.returned:
+		// Release eagerly so the same run goroutine's next signal call never
+		// observes a stale slot for a call that already returned.
+		manager.finishSignalCall(call)
 		return err
 	case <-timer.C:
-		return fmt.Errorf("%w: %s did not return within %s", ErrChildSignalTimeout, name, manager.childSignalTimeout)
+		manager.signalMu.Lock()
+		if call.timeoutErr == nil {
+			call.timeoutErr = fmt.Errorf("%w: %s did not return within %s",
+				ErrChildSignalTimeout, name, manager.childSignalTimeout)
+		}
+		err := call.timeoutErr
+		manager.signalMu.Unlock()
+		return err
 	}
+}
+
+// finishSignalCall releases the single-flight slot exactly once: it decrements
+// the live-signal counter BEFORE clearing the slot, so a spawn that observes
+// the free slot can never overlap it with the finishing call (the counter
+// therefore never exceeds one).
+func (manager *Manager) finishSignalCall(call *childSignalCall) {
+	call.finishOnce.Do(func() {
+		manager.outstandingSignalCalls.Add(-1)
+		manager.signalMu.Lock()
+		if manager.outstandingSignal == call {
+			manager.outstandingSignal = nil
+		}
+		manager.signalMu.Unlock()
+	})
 }
 
 // emitLoop is the single status emission worker. It delivers reports strictly

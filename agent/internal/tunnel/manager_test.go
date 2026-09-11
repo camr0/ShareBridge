@@ -205,6 +205,15 @@ func (collector *statusCollector) hasStatus(status StatusKind) bool {
 	return false
 }
 
+// reportCount returns how many reports the collector has received; tests gate
+// on it to prove the supervision loop processed a whole event queue without
+// sleeping.
+func (collector *statusCollector) reportCount() int {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	return len(collector.reports)
+}
+
 // assertReportsNeverContainCredential scans every collected status report for
 // credential material (Task 9 review carry-forward): diagnostics must never
 // carry tunnel credential values (§7.2 log policy, §16.6). Callers pass every
