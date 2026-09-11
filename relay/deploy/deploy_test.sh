@@ -247,44 +247,10 @@ function_body() {
   ' "$1"
 }
 
-# is_ipv6_literal <addr> — strict IPv6 validation: 1-4 hex digits per group, at
-# most one `::`, exactly 8 groups otherwise, no zone id, no whitespace, no
-# dotted-quad tail, no junk. `::::`, `:`, `1:2:3` and `1:2:3:4:5:6:7:8:9` are
-# all rejected; a `dig` answer that is not a real IPv6 literal fails the audit.
-is_ipv6_literal() {
-  local addr="$1" head tail group count=0
-  local -a groups=()
-  [[ -n "$addr" ]] || return 1
-  [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
-  [[ "$addr" == *%* ]] && return 1
-  [[ "$addr" == *"::"*"::"* ]] && return 1
-  if [[ "$addr" == *"::"* ]]; then
-    head="${addr%%::*}"
-    tail="${addr##*::}"
-  else
-    head="$addr"
-    tail=""
-  fi
-  if [[ -n "$head" ]]; then
-    IFS=':' read -r -a groups <<< "$head"
-    for group in "${groups[@]}"; do
-      [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
-      count=$((count + 1))
-    done
-  fi
-  if [[ -n "$tail" ]]; then
-    IFS=':' read -r -a groups <<< "$tail"
-    for group in "${groups[@]}"; do
-      [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
-      count=$((count + 1))
-    done
-  fi
-  if [[ "$addr" == *"::"* ]]; then
-    (( count < 8 ))
-  else
-    (( count == 8 ))
-  fi
-}
+# The strict IPv6 validator under test lives in install.sh (is_ipv6_literal).
+# deploy_test.sh deliberately does NOT keep a second copy: a duplicate, dead
+# copy can drift and, as an unexercised parser, would silently hide a regression
+# in the executed one. A13 proves the installer's validator behaviourally.
 
 # parsed_lines <file> — the file with comments removed (a `#` starts a comment).
 # The deployment artifacts contain no literal `#` inside a quoted value, so
@@ -536,7 +502,7 @@ for unit in "$gateway_unit" "$frps_unit"; do
   fi
 done
 
-printf -- '-- A15: no duplicate/redefined unit directives (class-level strictness)\n'
+printf -- '-- A15: no duplicate directives and exact multi-valued directive sets\n'
 repeatable_unit_keys=" Environment LoadCredential "
 for unit in "$gateway_unit" "$frps_unit"; do
   unit_duplicates="$(unit_duplicate_keys "$unit")"
@@ -555,6 +521,58 @@ for unit in "$gateway_unit" "$frps_unit"; do
     "$unit must not assign the same Environment= variable twice"
   require_eq "$(unit_credential_id_duplicates "$unit" | tr '\n' ' ')" "" \
     "$unit must not declare the same LoadCredential= id twice"
+done
+# A15 is an EXACT-SET check, not merely a duplicate check. The repeatable
+# directives in these units are design-fixed, so an added but DISTINCT entry
+# (an extra credential id, a different source path, an extra or overridden
+# Environment= variable) must fail: a single extra directive can grant the
+# service an unasserted host credential or override a checked bind. Both id
+# and source are pinned for LoadCredential=; both name and value for
+# Environment=. Directives that are not in the repeatable allowlist are already
+# rejected above when repeated, so no multi-valued directive is left
+# open-ended (ReadWritePaths/ExecStart/etc. are single-valued here, and every
+# ReadWritePaths value is separately allowlisted in A4).
+exact_gateway_credentials="$(printf '%s\n' \
+  'control-ca:/etc/sharebridge/relay/control-ca.crt' \
+  'sync-client-cert:/etc/sharebridge/relay/gateway-sync.crt' \
+  'sync-client-key:/etc/sharebridge/relay/gateway-sync.key' | sort | tr '\n' '|')"
+require_eq "$(unit_field "$gateway_unit" LoadCredential | sort | tr '\n' '|')" \
+  "$exact_gateway_credentials" \
+  "gateway LoadCredential set must be exactly the three design-fixed id:source credentials"
+require_eq "$(unit_key_count "$gateway_unit" LoadCredential)" "3" \
+  "gateway must declare exactly 3 LoadCredential= directives"
+exact_frps_credentials="$(printf '%s\n' \
+  'frps-config:/etc/sharebridge/relay/frps.toml' \
+  'transport-cert:/etc/sharebridge/relay/tunnel-server.crt' \
+  'transport-key:/etc/sharebridge/relay/tunnel-server.key' | sort | tr '\n' '|')"
+require_eq "$(unit_field "$frps_unit" LoadCredential | sort | tr '\n' '|')" \
+  "$exact_frps_credentials" \
+  "frps LoadCredential set must be exactly the three design-fixed id:source credentials"
+require_eq "$(unit_key_count "$frps_unit" LoadCredential)" "3" \
+  "frps must declare exactly 3 LoadCredential= directives"
+exact_gateway_environment="$(printf '%s\n' \
+  'SHAREBRIDGE_CONTROL_SYNC_CA_FILE=%d/control-ca' \
+  'SHAREBRIDGE_FRP_PLUGIN_LISTEN_ADDR=127.0.0.1:9001' \
+  'SHAREBRIDGE_GATEWAY_LISTEN_ADDR=:443' \
+  'SHAREBRIDGE_GATEWAY_METRICS_ADDR=127.0.0.1:9101' \
+  'SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE=%d/sync-client-cert' \
+  'SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE=%d/sync-client-key' \
+  'SHAREBRIDGE_RELAY_PORT_MAX=10099' \
+  'SHAREBRIDGE_RELAY_PORT_MIN=10000' | sort | tr '\n' '|')"
+require_eq "$(unit_field "$gateway_unit" Environment | sort | tr '\n' '|')" \
+  "$exact_gateway_environment" \
+  "gateway Environment= set must be exactly the eight design-fixed name=value variables"
+require_eq "$(unit_key_count "$gateway_unit" Environment)" "8" \
+  "gateway must declare exactly 8 Environment= directives"
+require_eq "$(unit_key_count "$frps_unit" Environment)" "0" \
+  "frps must declare no unit-level Environment= directives (it uses EnvironmentFile=)"
+# The only credential mechanism is the exact LoadCredential= set above. Other
+# single-valued credential/environment-injection directives would evade the
+# duplicate and exact-set checks (a new key, seen once), so forbid them
+# explicitly: an unasserted host credential must not be able to ship.
+for unit in "$gateway_unit" "$frps_unit"; do
+  require_not_contains "$unit" '^[[:space:]]*(SetCredential|SetCredentialEncrypted|LoadCredentialEncrypted|PassEnvironment)=' \
+    "$unit must not use an unasserted credential/environment-injection directive"
 done
 
 printf -- '-- A7: frps started after the gateway (restart ordering)\n'
@@ -836,8 +854,9 @@ done
 require_parsed_contains "$install_sh" 'dig[[:space:]][[:space:]]*\+short[[:space:]][[:space:]]*A[[:space:]][[:space:]]*"\$\{probe_label\}"' \
   "installer audit must resolve A for a random relay child label (wildcard synthesis)"
 require_contains "$ops_doc" 'probe-' "runbook must show the random-child-label query"
-# AAAA answers are validated with a real IPv6 parser, not a hex-and-colon
-# pattern that accepts `::::`.
+# AAAA answers are validated with install.sh's strict explicit IPv6 parser
+# (not a hex-and-colon pattern that accepts `::::` or overlapping `::` such as
+# `:::`), so every malformed answer fails the audit closed.
 require_unique_function_def "$install_sh" is_ipv6_literal "the IPv6 validator must be defined exactly once"
 require_parsed_contains "$install_sh" 'is_ipv6_literal[[:space:]]+"\$ipv6"' \
   "the DNS audit must validate every AAAA answer with is_ipv6_literal"
@@ -880,7 +899,37 @@ if run_fake_dns_audit "2001:db8::1"; then
 else
   fail "DNS audit rejected a valid IPv6 AAAA literal"
 fi
-for bad_aaaa in "::::" "2001:db8::1%eth0" "1:2:3" "1:2:3:4:5:6:7:8:9" "not-an-ip" ":"; do
+# Valid forms that must be accepted: `::` as the whole address, `::` at either
+# edge, a full uncompressed address, and uppercase hex.
+for good_aaaa in "::" "::1" "1::" "1:2:3:4:5:6:7:8" "FE80::1" "2001:DB8:0:0:0:0:0:1"; do
+  if run_fake_dns_audit "$good_aaaa"; then
+    pass
+  else
+    fail "DNS audit rejected the valid IPv6 answer '${good_aaaa}'"
+  fi
+done
+# Malformed forms that must fail closed. The `:::` family is the overlapping-`::`
+# class the old `%%::`/`##::` split wrongly accepted; the rest cover a
+# leading/trailing single colon, duplicate compression, wrong group counts and
+# non-hex junk.
+for bad_aaaa in \
+  "::::" \
+  ":::" \
+  "1:::2" \
+  ":::1" \
+  "1:::" \
+  "1::2::3" \
+  "::1:2:3:4:5:6:7:8" \
+  "1:2:3:4:5:6:7:8::" \
+  "12345::" \
+  "1:2:3:4:5:6:7" \
+  "1:2:3:4:5:6:7:8:9" \
+  "2001:db8::1%eth0" \
+  "1:2:3" \
+  "::ffff:192.0.2.1" \
+  "not-an-ip" \
+  " 2001:db8::1" \
+  "2001:db8::1 "; do
   if run_fake_dns_audit "$bad_aaaa"; then
     fail "DNS audit accepted the invalid IPv6 answer '${bad_aaaa}'"
   else

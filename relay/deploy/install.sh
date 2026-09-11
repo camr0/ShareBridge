@@ -49,7 +49,8 @@
 # The DNS audit proves wildcard synthesis for the relay family and the absence
 # of HTTPS/SVCB/ECH records for the queried relay names; it is not an
 # authoritative zone-transfer proof (see the audit_dns comment). Every AAAA
-# answer is validated with a real IPv6 parser, not a hex-and-colon pattern.
+# answer is validated with a strict explicit IPv6 parser (not an ad-hoc split
+# that collapses `:::`), so it cannot accept overlapping `::` compression.
 #
 # Required environment (never echoed):
 #   SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET   hex secret shared by frps and gateway
@@ -185,40 +186,57 @@ install_binary_verified() {
     || fail "installed artifact ${dst} has SHA-256 ${installed}, expected ${expected} (post-copy verification failed)"
 }
 
-# is_ipv6_literal <addr> — strict IPv6 validation: 1-4 hex digits per group, at
-# most one `::`, exactly 8 groups unless compressed, no zone id, no whitespace,
-# no dotted-quad tail, no junk. `::::`, `:`, `1:2:3` and `1:2:3:4:5:6:7:8:9`
-# are all rejected, so a garbage `dig` answer fails the audit.
+# is_ipv6_literal <addr> — strict IPv6 literal validation. An explicit parser
+# (not an ad-hoc `%%::`/`##::` split, which collapses overlapping colons and
+# accepts `:::`): only 1-4 hex-digit groups separated by single colons, with at
+# most one `::` compression standing for at least one group (so at most seven
+# explicit groups). Rejects `:::`, `1:::2`, a leading/trailing single colon,
+# zero/one/duplicate `::` misuse, the wrong group count, whitespace, a zone id,
+# a dotted-quad tail and any non-hex junk, so a garbage `dig` answer fails the
+# audit. IPv4 (and IPv4-embedded dotted-quad) forms are not IPv6 literals.
 is_ipv6_literal() {
-  local addr="$1" head tail group count=0
+  local addr="$1" ncolon nremoved doubled prefix suffix group count=0
   local -a groups=()
   [[ -n "$addr" ]] || return 1
   [[ "$addr" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
-  [[ "$addr" == *%* ]] && return 1
-  [[ "$addr" == *"::"*"::"* ]] && return 1
-  if [[ "$addr" == *"::"* ]]; then
-    head="${addr%%::*}"
-    tail="${addr##*::}"
+  # Three or more consecutive colons are never valid: `::` cannot overlap a
+  # further colon. Reject before any prefix/suffix split, which would collapse
+  # `:::` to two empty halves and wrongly accept it.
+  [[ "$addr" != *":::"* ]] || return 1
+  # A single leading/trailing colon is invalid; a `::` at either edge is fine.
+  [[ "$addr" != :* || "$addr" == ::* ]] || return 1
+  [[ "$addr" != *: || "$addr" == *:: ]] || return 1
+  # Count `::` exactly: replacing every non-overlapping `::` removes two colons
+  # each, so (colons - colons-after) / 2 is the number of `::` occurrences.
+  ncolon="${addr//[^:]/}"; ncolon="${#ncolon}"
+  nremoved="${addr//::/}"; nremoved="${nremoved//[^:]/}"; nremoved="${#nremoved}"
+  doubled=$(( (ncolon - nremoved) / 2 ))
+  (( doubled <= 1 )) || return 1
+  if (( doubled == 1 )); then
+    prefix="${addr%%::*}"
+    suffix="${addr#*::}"
   else
-    head="$addr"
-    tail=""
+    prefix="$addr"
+    suffix=""
   fi
-  if [[ -n "$head" ]]; then
-    IFS=':' read -r -a groups <<< "$head"
+  if [[ -n "$prefix" ]]; then
+    IFS=':' read -r -a groups <<< "$prefix"
     for group in "${groups[@]}"; do
       [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
       count=$((count + 1))
     done
   fi
-  if [[ -n "$tail" ]]; then
-    IFS=':' read -r -a groups <<< "$tail"
+  if [[ -n "$suffix" ]]; then
+    IFS=':' read -r -a groups <<< "$suffix"
     for group in "${groups[@]}"; do
       [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
       count=$((count + 1))
     done
   fi
-  if [[ "$addr" == *"::"* ]]; then
-    (( count < 8 ))
+  # `::` stands for at least one all-zero group, so a compressed address has at
+  # most seven explicit groups; an uncompressed address has exactly eight.
+  if (( doubled == 1 )); then
+    (( count <= 7 ))
   else
     (( count == 8 ))
   fi
