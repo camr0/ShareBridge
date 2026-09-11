@@ -230,6 +230,7 @@ func (c *Controller) stunTimerFired(apiKeyID string, epoch stun.Epoch) {
 		// The in-flight challenge produced no observation in its TTL: one
 		// bounded failure, then a backoff retry (§10.2).
 		if es.inFlightID != "" {
+			recordSTUN(metricSTUNTimeout)
 			c.stunFailLocked(apiKeyID, e, es, now)
 		}
 	case stunTimerRetry, stunTimerRechallenge:
@@ -384,15 +385,18 @@ func (c *Controller) HandleSTUNResult(conn *websocket.Conn, apiKeyID, challenge,
 	// Wire validation first (Task 17 goldens: ID-only echo, 24-char
 	// lowercase-hex txn, hex receipt within the bounded size).
 	if len(challenge) != stunChallengeEchoHexLen || !isLowerHex(challenge) {
+		recordSTUN(metricSTUNMismatch)
 		log.Printf("stun_result rejected for %s: malformed challenge echo length/case", apiKeyID)
 		return
 	}
 	if len(txnID) != stunTxnHexLen || !isLowerHex(txnID) {
+		recordSTUN(metricSTUNMismatch)
 		log.Printf("stun_result rejected for %s: malformed transaction id length/case", apiKeyID)
 		return
 	}
 	receipt, err := hex.DecodeString(receiptHex)
 	if err != nil || len(receipt) == 0 || len(receipt) > stunMaxReceiptBytes {
+		recordSTUN(metricSTUNMismatch)
 		log.Printf("stun_result rejected for %s: malformed receipt size/hex", apiKeyID)
 		return
 	}
@@ -401,6 +405,7 @@ func (c *Controller) HandleSTUNResult(conn *websocket.Conn, apiKeyID, challenge,
 	e := c.epochs[apiKeyID]
 	if e == nil || e.conn != conn {
 		c.epochMu.Unlock()
+		recordSTUN(metricSTUNMismatch)
 		log.Printf("stun_result rejected for %s: not the current epoch socket", apiKeyID)
 		return
 	}
@@ -415,6 +420,7 @@ func (c *Controller) HandleSTUNResult(conn *websocket.Conn, apiKeyID, challenge,
 		c.epochMu.Unlock()
 		// Unknown challenge/txn/receipt, replay (single use), wrong epoch or
 		// expired claim window; error text is static (no material).
+		recordSTUN(metricSTUNMismatch)
 		log.Printf("stun_result rejected for %s: %v", apiKeyID, err)
 		return
 	}
@@ -428,6 +434,7 @@ func (c *Controller) HandleSTUNResult(conn *websocket.Conn, apiKeyID, challenge,
 	es.attempt = 0
 	es.inFlightID = ""
 	es.rechallengeAt = obs.AcceptedAt.Add(stunRechallengeDelay(c.randFn()))
+	recordSTUN(metricSTUNMatch)
 	log.Printf("stun observation accepted for %s (source observed; details in direct posture, not logged)", apiKeyID)
 	c.armTimerLocked(apiKeyID, e, es, stunTimerRechallenge, es.rechallengeAt)
 	c.notifyWaitersLocked(es, *es.obs, true)

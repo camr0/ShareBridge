@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -114,6 +115,34 @@ func main() {
 	publisherCtx, stopPublisher := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopPublisher()
 	go routePublisher.Run(publisherCtx)
+
+	// Task 34 §17.3: the control-owned direct-preparation, browser-fallback and
+	// STUN counters are exposed on a separate LOOPBACK-ONLY listener. The main
+	// control HTTP listener is public and must never serve monitoring state;
+	// BindMetricsLoopback refuses a non-loopback bind at startup, and the
+	// handler independently rejects a public peer or Host.
+	controlMetricsAddress := os.Getenv("CONTROL_METRICS_ADDR")
+	if controlMetricsAddress == "" {
+		controlMetricsAddress = "127.0.0.1:9102"
+	}
+	boundControlMetricsAddress, err := directctl.BindMetricsLoopback(controlMetricsAddress)
+	if err != nil {
+		log.Fatalf("control metrics: %v", err)
+	}
+	controlMetricsListener, err := net.Listen("tcp", boundControlMetricsAddress)
+	if err != nil {
+		log.Fatalf("control metrics listen: %v", err)
+	}
+	go func() {
+		controlMetricsServer := &http.Server{
+			Handler:           directctl.RelayMetricsHandler(),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		if err := controlMetricsServer.Serve(controlMetricsListener); err != nil && err != http.ErrServerClosed {
+			log.Printf("control metrics server stopped: %v", err)
+		}
+	}()
+	log.Printf("control metrics listening on %s (loopback only)", boundControlMetricsAddress)
 
 	// Task 16: authenticated STUN observation listener (§10.1, §16.4). UDP
 	// 3478 is the only new public control listener; a misconfigured bind

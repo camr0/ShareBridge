@@ -23,6 +23,7 @@ import (
 
 	"sharebridge/relay/internal/clienthello"
 	"sharebridge/relay/internal/limits"
+	"sharebridge/relay/internal/metrics"
 	"sharebridge/relay/internal/routes"
 )
 
@@ -77,6 +78,7 @@ type Server struct {
 	parseHello   helloParseFunc
 	dial         dialFunc
 	logger       *slog.Logger
+	metrics      *metrics.Registry
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -126,6 +128,76 @@ func WithLimitsConfig(config limits.Config) Option {
 	return func(server *Server) { server.limitsConfig = &config }
 }
 
+// WithMetrics installs the §17.3 metadata-only registry. The default is a
+// fresh relay registry, so every gateway exposes the bounded signal set; tests
+// install their own to assert emissions.
+func WithMetrics(registry *metrics.Registry) Option {
+	return func(server *Server) {
+		if registry != nil {
+			server.metrics = registry
+		}
+	}
+}
+
+// Health is the truthful gateway health surface (spec §17.1). It tracks two
+// INDEPENDENT truths that must never be conflated:
+//
+//   - RouteReady is true only after a route snapshot has been applied AND the
+//     control sync is healthy. A gateway that has not synchronized has no
+//     routes and must not pass health, even when its frps process is up.
+//   - FRPSProcessHealthy reflects the FRP transport process only. A healthy
+//     frps is not a routable gateway, and a routable gateway can outlive an
+//     frps restart (its routes stay leased) — neither implies the other.
+//
+// Safe for concurrent use; the datapath setters are called from the sync loop
+// and the process supervisor.
+type Health struct {
+	mu            sync.Mutex
+	snapshotReady bool
+	controlSynced bool
+	frpsHealthy   bool
+}
+
+// NewHealth returns a health surface that reports not-ready until each truth
+// is explicitly established. Unknown is reported as not-ready (fail closed).
+func NewHealth() *Health { return &Health{} }
+
+// SetSnapshotReady records that a full route snapshot has been applied.
+func (health *Health) SetSnapshotReady(ready bool) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	health.snapshotReady = ready
+}
+
+// SetControlSynced records the control-sync liveness truth.
+func (health *Health) SetControlSynced(synced bool) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	health.controlSynced = synced
+}
+
+// SetFRPSHealthy records the separate frps process truth.
+func (health *Health) SetFRPSHealthy(healthy bool) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	health.frpsHealthy = healthy
+}
+
+// RouteReady reports the gateway's ability to route: snapshot AND control
+// sync, never frps process health.
+func (health *Health) RouteReady() bool {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	return health.snapshotReady && health.controlSynced
+}
+
+// FRPSProcessHealthy reports the independent frps process truth.
+func (health *Health) FRPSProcessHealthy() bool {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	return health.frpsHealthy
+}
+
 // NewServer wires the public acceptor to the in-memory route and stream
 // state. The server touches only those two synchronized structures plus the
 // limits budget on a public connection — never a database (spec §8).
@@ -167,6 +239,20 @@ func NewServer(routeTable *routes.Table, streams *Streams, options ...Option) *S
 			return clienthello.PeekWithBounds(conn, bounds.MaxHelloBytes, bounds.HelloTimeout)
 		}
 	}
+	if server.metrics == nil {
+		server.metrics = metrics.NewRegistry(metrics.Relay)
+	}
+	// Concurrent-connection scopes are scraped from the limiter at render
+	// time. They are bounded aggregate dimensions, never per-IP/per-hostname
+	// label values (spec §17.3; cardinality and end-user privacy).
+	server.metrics.SetFunc("sharebridge_relay_concurrent_connections",
+		func() int64 { return int64(server.limits.ActiveConnections()) }, metrics.ScopeGlobal)
+	server.metrics.SetFunc("sharebridge_relay_concurrent_connections",
+		func() int64 { return int64(server.limits.TrackedSourceIPs()) }, metrics.ScopeSourceIP)
+	server.metrics.SetFunc("sharebridge_relay_concurrent_connections",
+		func() int64 { return int64(server.limits.TrackedOrigins()) }, metrics.ScopeOrigin)
+	server.metrics.SetFunc("sharebridge_relay_concurrent_connections",
+		func() int64 { return int64(server.limits.TrackedAgents()) }, metrics.ScopeAgent)
 	return server
 }
 
@@ -195,6 +281,7 @@ func (server *Server) Serve(listener net.Listener) error {
 		}
 		connLease, admitErr := server.limits.AdmitConnection(publicConn.RemoteAddr())
 		if admitErr != nil {
+			server.recordRejection(metrics.ReasonLimits)
 			server.logRejection(publicConn, "limits", admitErr, "")
 			publicConn.Close()
 			continue
@@ -235,12 +322,15 @@ func (server *Server) handleConnection(publicConn net.Conn, connLease *limits.Co
 
 	hello, err := server.parseHello(publicConn)
 	if err != nil {
+		server.recordClientHello(err)
+		server.recordRejection(metrics.ReasonClientHello)
 		server.logRejection(publicConn, "clienthello", err, "")
 		return
 	}
 
 	route, err := server.routes.Lookup(hello.SNI)
 	if err != nil {
+		server.recordRejection(metrics.ReasonRoute)
 		server.logRejection(publicConn, "route-lookup", err, hello.SNI)
 		return
 	}
@@ -253,6 +343,7 @@ func (server *Server) handleConnection(publicConn net.Conn, connLease *limits.Co
 		MaxStreamsPerAgent:  route.Limits.MaxStreamsPerAgent,
 	})
 	if err != nil {
+		server.recordRejection(metrics.ReasonLimits)
 		server.logRejection(publicConn, "limits", err, hello.SNI)
 		return
 	}
@@ -260,6 +351,8 @@ func (server *Server) handleConnection(publicConn net.Conn, connLease *limits.Co
 
 	agentConn, err := server.dialAgent(route)
 	if err != nil {
+		server.metrics.Inc("sharebridge_relay_frp_connect_failures_total")
+		server.recordRejection(metrics.ReasonDial)
 		server.logRejection(publicConn, "dial", err, hello.SNI)
 		return
 	}
@@ -269,6 +362,7 @@ func (server *Server) handleConnection(publicConn net.Conn, connLease *limits.Co
 	if stream == nil {
 		// The route was revoked or superseded inside the lookup→register
 		// window; the stream is fenced and never indexed.
+		server.recordRejection(metrics.ReasonAdmission)
 		server.logRejection(publicConn, "admission", admitErr, hello.SNI)
 		return
 	}
@@ -279,10 +373,18 @@ func (server *Server) handleConnection(publicConn net.Conn, connLease *limits.Co
 	// delivered to the agent's TLS listener are identical to the browser
 	// TLS stream).
 	if _, err := agentConn.Write(hello.Prefix); err != nil {
+		server.recordRejection(metrics.ReasonReplay)
 		server.logRejection(publicConn, "replay", err, hello.SNI)
 		return
 	}
 	streamLease.AddBytes(len(hello.Prefix))
+	server.recordBytes(len(hello.Prefix))
+
+	// The connection is fully admitted to the relay at this point: the
+	// ClientHello was parsed, the exact route resolved, every §14 slot
+	// acquired, the agent dialed, and the inspected prefix replayed. Only now
+	// is it "accepted"; every earlier generic close is a rejection.
+	server.metrics.Inc("sharebridge_relay_public_connections_total", metrics.OutcomeAccepted)
 
 	server.pump(publicConn, agentConn, streamLease)
 }
@@ -318,16 +420,51 @@ func (server *Server) admitStream(dialed routes.Route) func() error {
 // dialAgent connects to the agent's assigned FRP proxy port. The target is
 // always loopback with the route's assigned relay port — never any other
 // address from route or agent state — under the spec §14 two-second connect
-// budget.
+// budget. The connect latency and failure are §17.3 signals.
 func (server *Server) dialAgent(route routes.Route) (net.Conn, error) {
 	address := net.JoinHostPort(loopbackDialHost, strconv.Itoa(route.RelayPort))
 	dialContext, cancel := context.WithTimeout(context.Background(), server.limits.DialTimeout())
 	defer cancel()
+	started := time.Now()
 	agentConn, err := server.dial(dialContext, "tcp", address)
+	server.metrics.Observe("sharebridge_relay_frp_connect_seconds", time.Since(started).Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("gateway: dial agent loopback proxy %s: %w", address, err)
 	}
 	return agentConn, nil
+}
+
+// recordRejection counts one generic public-connection close under a bounded
+// reason class. The browser learns nothing (spec §8); the class is metadata
+// only.
+func (server *Server) recordRejection(reason string) {
+	server.metrics.Inc("sharebridge_relay_public_connections_total", metrics.OutcomeRejected)
+	server.metrics.Inc("sharebridge_relay_public_connection_rejections_total", reason)
+}
+
+// recordClientHello counts a ClientHello parse failure under the bounded
+// timeout/oversize/malformed class.
+func (server *Server) recordClientHello(err error) {
+	switch {
+	case errors.Is(err, clienthello.ErrTimeout):
+		server.metrics.Inc("sharebridge_relay_clienthello_total", metrics.HelloTimeout)
+	case errors.Is(err, clienthello.ErrTooLarge):
+		server.metrics.Inc("sharebridge_relay_clienthello_total", metrics.HelloOversize)
+	default:
+		server.metrics.Inc("sharebridge_relay_clienthello_total", metrics.HelloMalformed)
+	}
+}
+
+// recordBytes counts relayed payload bytes under the bounded global/agent/
+// origin scopes. The scopes are aggregation dimensions, not identifiers: the
+// gateway never labels a metric with a hostname or agent record (spec §17.3).
+func (server *Server) recordBytes(count int) {
+	if count <= 0 {
+		return
+	}
+	server.metrics.Add("sharebridge_relay_relayed_bytes_total", int64(count), metrics.ScopeGlobal)
+	server.metrics.Add("sharebridge_relay_relayed_bytes_total", int64(count), metrics.ScopeAgent)
+	server.metrics.Add("sharebridge_relay_relayed_bytes_total", int64(count), metrics.ScopeOrigin)
 }
 
 // pump splices the two connections until either direction ends. The first
@@ -423,6 +560,7 @@ func (server *Server) copyStream(dst, src net.Conn, clock *streamClock, streamLe
 				return
 			}
 			streamLease.AddBytes(read)
+			server.recordBytes(read)
 		}
 		if readErr == nil {
 			continue

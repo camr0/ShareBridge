@@ -17,6 +17,7 @@ import (
 	"sharebridge/relay/internal/frpplugin"
 	"sharebridge/relay/internal/gateway"
 	"sharebridge/relay/internal/limits"
+	"sharebridge/relay/internal/metrics"
 )
 
 // TestConfiguredLimitsReadsProductionEnvironment proves the gateway binary's
@@ -61,7 +62,7 @@ func TestConfiguredLimitsFailsClosedOnInvalidEnvironment(t *testing.T) {
 // construct its production presence registry (fresh boot identity plus the
 // streams drain seam) without operator configuration.
 func TestNewPresenceRegistryBuildsWithoutError(t *testing.T) {
-	registry, err := newPresenceRegistry(gateway.NewStreams())
+	registry, err := newPresenceRegistry(gateway.NewStreams(), metrics.NewRegistry(metrics.Relay))
 	if err != nil {
 		t.Fatalf("newPresenceRegistry() error = %v, want nil", err)
 	}
@@ -88,7 +89,7 @@ func TestConfiguredPluginServerWiresPresenceEvents(t *testing.T) {
 	t.Setenv(envRelayDataDir, t.TempDir())
 
 	recorder := &wiringPresenceRecorder{}
-	plugin, _, err := configuredPluginServer(recorder)
+	plugin, _, err := configuredPluginServer(recorder, metrics.NewRegistry(metrics.Relay))
 	if err != nil {
 		t.Fatalf("configuredPluginServer() error = %v, want nil", err)
 	}

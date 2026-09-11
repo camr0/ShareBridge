@@ -22,12 +22,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"sharebridge/relay/internal/frpplugin"
 	"sharebridge/relay/internal/gateway"
 	"sharebridge/relay/internal/limits"
+	"sharebridge/relay/internal/metrics"
 	"sharebridge/relay/internal/presence"
 	"sharebridge/relay/internal/routes"
 )
@@ -40,11 +42,21 @@ const (
 	envRelayPortMin        = "SHAREBRIDGE_RELAY_PORT_MIN"
 	envRelayPortMax        = "SHAREBRIDGE_RELAY_PORT_MAX"
 	envRelayDataDir        = "SHAREBRIDGE_RELAY_DATA_DIR"
+	// envMetricsAddress is the private-only operator endpoint (health +
+	// §17.3 metrics). It must be a numeric loopback host:port; startup
+	// refuses anything else (spec §17.1: metrics/health are private).
+	envMetricsAddress = "SHAREBRIDGE_GATEWAY_METRICS_ADDR"
 
 	defaultPluginListenAddress = "127.0.0.1:9001"
 	defaultRelayPortMin        = 10000
 	defaultRelayPortMax        = 10099
 	defaultDataDirName         = ".sharebridge-relay"
+	defaultMetricsAddress      = "127.0.0.1:9101"
+	// logRatePerSecond / logRateBurst bound the gateway's own journal write
+	// rate (§17.1 bounded log-rate expectation). Retention itself is the
+	// deployment's journald SystemMaxUse/MaxRetentionSec policy (Task 35).
+	logRatePerSecond = 200
+	logRateBurst     = 100
 
 	// admissionStateFilename is the FRP plugin's persisted admission replay
 	// state inside the relay data directory: the burned replay-JTI set and
@@ -55,7 +67,16 @@ const (
 )
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// The gateway's own log rate is bounded so a public-connection flood
+	// cannot fill the journal; journald retention is bounded separately by
+	// the Task 35 unit policy. The handler is generic and carries no
+	// credential material.
+	logger := slog.New(metrics.NewRateLimitedHandler(slog.NewTextHandler(os.Stderr, nil), logRatePerSecond, logRateBurst))
+
+	// §17.3 registry and the §17.1 two-truth health surface are built before
+	// any socket binds so every process exposes the same bounded signal set.
+	registry := metrics.NewRegistry(metrics.Relay)
+	health := gateway.NewHealth()
 
 	// Resolve every §14 operator bound before anything binds a socket: an
 	// invalid or over-ceiling value refuses startup instead of running with a
@@ -72,13 +93,13 @@ func main() {
 	// an frps session reset clears presence and then closes the affected
 	// agent's established streams through it.
 	streams := gateway.NewStreams()
-	presenceRegistry, err := newPresenceRegistry(streams)
+	presenceRegistry, err := newPresenceRegistry(streams, registry)
 	if err != nil {
 		logger.Error("gateway: presence registry configuration rejected", "error", err)
 		os.Exit(1)
 	}
 
-	pluginServer, pluginListenAddress, err := configuredPluginServer(presenceRegistry)
+	pluginServer, pluginListenAddress, err := configuredPluginServer(presenceRegistry, registry)
 	if err != nil {
 		logger.Error("gateway: FRP authorization plugin configuration rejected", "error", err)
 		os.Exit(1)
@@ -106,9 +127,34 @@ func main() {
 	// every public lookup still fails closed.
 	routeTable := routes.NewTable(presenceRegistry)
 	server := gateway.NewServer(routeTable, streams,
-		gateway.WithLogger(logger), gateway.WithLimitsConfig(limitsConfig))
+		gateway.WithLogger(logger), gateway.WithLimitsConfig(limitsConfig), gateway.WithMetrics(registry))
 	httpPluginServer := &http.Server{
 		Handler:           pluginServer,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+
+	// Private-only operator endpoint (§17.1): loopback bind (validated) plus
+	// the handler's independent loopback peer/Host guard. A public bind is
+	// refused at startup rather than silently exposed.
+	metricsAddress, err := metrics.BindLoopback(environmentDefault(envMetricsAddress, defaultMetricsAddress))
+	if err != nil {
+		_ = pluginListener.Close()
+		_ = listener.Close()
+		logger.Error("gateway: metrics/health address rejected", "error", err)
+		os.Exit(1)
+	}
+	metricsListener, err := net.Listen("tcp", metricsAddress)
+	if err != nil {
+		_ = pluginListener.Close()
+		_ = listener.Close()
+		logger.Error("gateway: metrics/health listen failed", "addr", metricsAddress, "error", err)
+		os.Exit(1)
+	}
+	metricsServer := &http.Server{
+		Handler:           registry.Handler(health),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -126,9 +172,14 @@ func main() {
 	go func() {
 		pluginErrors <- httpPluginServer.Serve(pluginListener)
 	}()
+	metricsErrors := make(chan error, 1)
+	go func() {
+		metricsErrors <- metricsServer.Serve(metricsListener)
+	}()
 
 	logger.Info("gateway: listening", "addr", listenAddress)
 	logger.Info("gateway: FRP authorization plugin listening", "addr", pluginListenAddress)
+	logger.Info("gateway: private health/metrics listening", "addr", metricsAddress)
 	select {
 	case serveErr := <-gatewayErrors:
 		if serveErr != nil {
@@ -137,6 +188,10 @@ func main() {
 	case pluginErr := <-pluginErrors:
 		if pluginErr != nil && !errors.Is(pluginErr, http.ErrServerClosed) {
 			logger.Error("gateway: FRP authorization plugin failed", "error", pluginErr)
+		}
+	case metricsErr := <-metricsErrors:
+		if metricsErr != nil && !errors.Is(metricsErr, http.ErrServerClosed) {
+			logger.Error("gateway: health/metrics server failed", "error", metricsErr)
 		}
 	case <-serveContext.Done():
 		logger.Info("gateway: shutting down")
@@ -148,6 +203,9 @@ func main() {
 	defer cancelShutdown()
 	if err := httpPluginServer.Shutdown(shutdownContext); err != nil {
 		logger.Error("gateway: FRP authorization plugin shutdown failed", "error", err)
+	}
+	if err := metricsServer.Shutdown(shutdownContext); err != nil {
+		logger.Error("gateway: health/metrics shutdown failed", "error", err)
 	}
 	logger.Info("gateway: stopped")
 }
@@ -164,10 +222,12 @@ func configuredLimits() (limits.Config, error) {
 // feeds and the route table joins against. The boot identity is a fresh
 // 128-bit hex value per process: §15.1 requires a gateway restart to change
 // the boot ID so control discards stale presence events. The streams registry
-// is the §15.2 drain seam. The control-sync Sink is not wired yet, so presence
-// events are currently process-local; route snapshots are likewise not yet
-// wired, so the route table stays empty and the gateway fails closed.
-func newPresenceRegistry(drainer presence.AgentDrainer) (*presence.Registry, error) {
+// is the §15.2 drain seam, and the §17.3 metrics sink observes the presence
+// transitions (online/offline counts and lease expirations). The control-sync
+// Sink is not wired yet, so presence events are currently process-local; route
+// snapshots are likewise not yet wired, so the route table stays empty and the
+// gateway fails closed.
+func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Registry) (*presence.Registry, error) {
 	var bootID [16]byte
 	if _, err := rand.Read(bootID[:]); err != nil {
 		return nil, fmt.Errorf("generate gateway boot id: %w", err)
@@ -175,10 +235,58 @@ func newPresenceRegistry(drainer presence.AgentDrainer) (*presence.Registry, err
 	return presence.NewRegistry(presence.Config{
 		BootID:  hex.EncodeToString(bootID[:]),
 		Drainer: drainer,
+		Sink:    &presenceMetricsSink{registry: registry},
 	})
 }
 
-func configuredPluginServer(presenceEvents frpplugin.PresenceEvents) (*frpplugin.Server, string, error) {
+// presenceMetricsSink projects presence transitions onto the bounded §17.3
+// tunnel signals. It runs on the presence registry's emission path (which
+// holds its state lock), so it MUST NOT block: every operation is an atomic
+// counter/gauge update.
+type presenceMetricsSink struct {
+	registry *metrics.Registry
+	mu       sync.Mutex
+	online   int64
+	offline  int64
+}
+
+func (sink *presenceMetricsSink) ObservePresenceEvent(event presence.Event) {
+	sink.mu.Lock()
+	switch event.State {
+	case presence.StateOnline:
+		sink.online++
+		if sink.offline > 0 {
+			sink.offline--
+		}
+	case presence.StateOffline:
+		if sink.online > 0 {
+			sink.online--
+		}
+		sink.offline++
+	}
+	online, offline := sink.online, sink.offline
+	sink.mu.Unlock()
+	sink.registry.Set("sharebridge_relay_tunnel_state", online, metrics.StateOnline)
+	sink.registry.Set("sharebridge_relay_tunnel_state", offline, metrics.StateOffline)
+	// A lease expiry is an offline transition whose lease boundary has already
+	// passed; an explicit CloseProxy carries a future lease. The presence
+	// registry emits synchronously with the transition, so this is the
+	// truthful classification available without coupling the metric to the
+	// registry internals.
+	if event.State == presence.StateOffline && !time.Now().Before(event.LeaseExpiresAt) {
+		sink.registry.Inc("sharebridge_relay_presence_lease_expirations_total")
+	}
+}
+
+// tunnelMetricsAdapter projects the frpplugin's reconnect signal onto the
+// bounded §17.3 counter.
+type tunnelMetricsAdapter struct{ registry *metrics.Registry }
+
+func (adapter tunnelMetricsAdapter) TunnelLoginReconnect() {
+	adapter.registry.Inc("sharebridge_relay_tunnel_reconnects_total")
+}
+
+func configuredPluginServer(presenceEvents frpplugin.PresenceEvents, registry *metrics.Registry) (*frpplugin.Server, string, error) {
 	pluginListenAddress := os.Getenv(envPluginListenAddress)
 	if pluginListenAddress == "" {
 		pluginListenAddress = defaultPluginListenAddress
@@ -220,6 +328,7 @@ func configuredPluginServer(presenceEvents frpplugin.PresenceEvents) (*frpplugin
 		RelayPortMax:       relayPortMax,
 		StatePath:          statePath,
 		PresenceEvents:     presenceEvents,
+		Metrics:            tunnelMetricsAdapter{registry: registry},
 	})
 	if err != nil {
 		return nil, "", err
@@ -259,4 +368,13 @@ func environmentPort(name string, defaultValue int) (int, error) {
 		return 0, errors.New(name + " must be a decimal TCP port")
 	}
 	return port, nil
+}
+
+// environmentDefault returns the environment value or fallback (mirrors the
+// other operator knobs; empty means "use the default").
+func environmentDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }

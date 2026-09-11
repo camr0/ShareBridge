@@ -145,6 +145,20 @@ type discardPresenceEvents struct{}
 
 func (discardPresenceEvents) ObserveFRPEvent(PresenceFact) {}
 
+// TunnelMetrics observes bounded, non-identifying §17.3 tunnel lifecycle
+// signals from the plugin. Optional. Implementations MUST NOT block: the
+// callback runs while the admission mutex is held (a counter increment is the
+// intended implementation).
+type TunnelMetrics interface {
+	// TunnelLoginReconnect fires when an admitted Login replaces an existing
+	// session for the same agent record (the normal reconnect path).
+	TunnelLoginReconnect()
+}
+
+type discardTunnelMetrics struct{}
+
+func (discardTunnelMetrics) TunnelLoginReconnect() {}
+
 // Config is the complete authorization boundary configuration. The relay gets
 // only ControlPublicKey, never control's signing seed or browser TLS material.
 type Config struct {
@@ -157,6 +171,9 @@ type Config struct {
 	MaxPendingEvents   int
 	Now                func() time.Time
 	PresenceEvents     PresenceEvents
+	// Metrics observes bounded tunnel lifecycle signals (§17.3). Optional;
+	// discards when nil.
+	Metrics TunnelMetrics
 	// StatePath persists the admission replay state — the burned replay-JTI
 	// set and the per-agent issued-at/generation high-water — across gateway
 	// restarts for the ten-minute credential horizon (spec §7.2: any
@@ -187,6 +204,7 @@ type Server struct {
 	maxSessions        int
 	now                func() time.Time
 	presenceEvents     PresenceEvents
+	tunnelMetrics      TunnelMetrics
 	eventQueue         chan PresenceFact
 	eventSlots         chan struct{}
 
@@ -358,6 +376,9 @@ func NewServer(config Config) (*Server, error) {
 	if config.PresenceEvents == nil {
 		config.PresenceEvents = discardPresenceEvents{}
 	}
+	if config.Metrics == nil {
+		config.Metrics = discardTunnelMetrics{}
+	}
 
 	server := &Server{
 		controlPublicKey:   append(ed25519.PublicKey(nil), config.ControlPublicKey...),
@@ -368,6 +389,7 @@ func NewServer(config Config) (*Server, error) {
 		maxSessions:        config.MaxSessions,
 		now:                config.Now,
 		presenceEvents:     config.PresenceEvents,
+		tunnelMetrics:      config.Metrics,
 		eventQueue:         make(chan PresenceFact, config.MaxPendingEvents),
 		eventSlots:         make(chan struct{}, config.MaxPendingEvents),
 		replayedJTI:        make(map[string]time.Time),
@@ -572,6 +594,10 @@ func (server *Server) admitLogin(credential verifiedCredential, runID string) (b
 	server.replayedJTI[credential.claims.JTI] = credential.claims.ExpiresAt
 	if exists {
 		delete(server.sessionsByToken, current.tokenHash)
+		// An admitted Login that supersedes a live session is the §17.3
+		// "reconnecting" signal. It is a bounded counter increment with no
+		// identifying label, so it is safe under the admission mutex.
+		server.tunnelMetrics.TunnelLoginReconnect()
 	}
 	server.admissionHighWater[credential.claims.AgentRecordID] = admissionMark{
 		generation: credential.claims.Generation,

@@ -42,9 +42,151 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"time"
 )
+
+// ---------------------------------------------------------------------------
+// §17.3 control-side signals (direct preparation, browser fallback, STUN)
+// ---------------------------------------------------------------------------
+//
+// Control is a separate Go module and cannot import relay/internal/metrics.
+// The three control-owned §17.3 signals are therefore defined here with the
+// SAME names and the same bounded label values as the relay inventory. Every
+// label value is a compile-time constant below; nothing derived from a share
+// code, hostname, IP, credential, JTI, or issued-at is ever a label, so the
+// label space cannot grow with traffic (spec §16.6, §17.3).
+const (
+	metricPreparationDirect      = "direct"
+	metricPreparationRelay       = "relay"
+	metricPreparationUnavailable = "unavailable"
+
+	metricSTUNMatch    = "match"
+	metricSTUNMismatch = "mismatch"
+	metricSTUNTimeout  = "timeout"
+)
+
+type controlRelayMetrics struct {
+	preparationDirect      atomic.Int64
+	preparationRelay       atomic.Int64
+	preparationUnavailable atomic.Int64
+	browserFallback        atomic.Int64
+	stunMatch              atomic.Int64
+	stunMismatch           atomic.Int64
+	stunTimeout            atomic.Int64
+}
+
+var controlSignals controlRelayMetrics
+
+func recordPreparation(outcome string) {
+	switch outcome {
+	case metricPreparationDirect:
+		controlSignals.preparationDirect.Add(1)
+	case metricPreparationRelay:
+		controlSignals.preparationRelay.Add(1)
+		controlSignals.browserFallback.Add(1)
+	case metricPreparationUnavailable:
+		controlSignals.preparationUnavailable.Add(1)
+	}
+}
+
+func recordSTUN(outcome string) {
+	switch outcome {
+	case metricSTUNMatch:
+		controlSignals.stunMatch.Add(1)
+	case metricSTUNMismatch:
+		controlSignals.stunMismatch.Add(1)
+	case metricSTUNTimeout:
+		controlSignals.stunTimeout.Add(1)
+	}
+}
+
+// RelayMetricsText renders the control-owned §17.3 signals in Prometheus text
+// format. The values are bounded counters only; no route list, source IP, or
+// credential material is ever emitted.
+func RelayMetricsText() string {
+	var builder strings.Builder
+	builder.WriteString("# HELP sharebridge_relay_direct_preparation_total Direct-preparation outcomes by bounded result class.\n")
+	builder.WriteString("# TYPE sharebridge_relay_direct_preparation_total counter\n")
+	fmt.Fprintf(&builder, "sharebridge_relay_direct_preparation_total{outcome=%q} %d\n", metricPreparationDirect, controlSignals.preparationDirect.Load())
+	fmt.Fprintf(&builder, "sharebridge_relay_direct_preparation_total{outcome=%q} %d\n", metricPreparationRelay, controlSignals.preparationRelay.Load())
+	fmt.Fprintf(&builder, "sharebridge_relay_direct_preparation_total{outcome=%q} %d\n", metricPreparationUnavailable, controlSignals.preparationUnavailable.Load())
+	builder.WriteString("# HELP sharebridge_relay_browser_fallback_total Preparations that resolved to the relay origin.\n")
+	builder.WriteString("# TYPE sharebridge_relay_browser_fallback_total counter\n")
+	fmt.Fprintf(&builder, "sharebridge_relay_browser_fallback_total %d\n", controlSignals.browserFallback.Load())
+	builder.WriteString("# HELP sharebridge_relay_stun_total STUN observation outcomes by bounded class.\n")
+	builder.WriteString("# TYPE sharebridge_relay_stun_total counter\n")
+	fmt.Fprintf(&builder, "sharebridge_relay_stun_total{outcome=%q} %d\n", metricSTUNMatch, controlSignals.stunMatch.Load())
+	fmt.Fprintf(&builder, "sharebridge_relay_stun_total{outcome=%q} %d\n", metricSTUNMismatch, controlSignals.stunMismatch.Load())
+	fmt.Fprintf(&builder, "sharebridge_relay_stun_total{outcome=%q} %d\n", metricSTUNTimeout, controlSignals.stunTimeout.Load())
+	return builder.String()
+}
+
+// RelayMetricsHandler serves the control-owned §17.3 signals at /metrics. It
+// is private monitoring only: the caller must be a loopback peer presenting a
+// loopback Host. Public interfaces are rejected with a generic 403 that leaks
+// nothing. BindLoopback must additionally be used by the process so the
+// listener itself is loopback-only.
+func RelayMetricsHandler() http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			writer.Header().Set("Allow", http.MethodGet)
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isLoopbackPeer(request.RemoteAddr) || !isLoopbackHost(request.Host) {
+			writer.Header().Set("Cache-Control", "no-store")
+			http.Error(writer, "forbidden", http.StatusForbidden)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writer.Header().Set("X-Content-Type-Options", "nosniff")
+		writer.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = io.WriteString(writer, RelayMetricsText())
+	})
+}
+
+// BindMetricsLoopback validates a numeric loopback host:port for the private
+// metrics listener; startup fails closed on anything else.
+func BindMetricsLoopback(address string) (string, error) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("metrics: address must be host:port: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", fmt.Errorf("metrics: address %q is not a numeric loopback address", address)
+	}
+	return address, nil
+}
+
+func isLoopbackPeer(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func isLoopbackHost(hostport string) bool {
+	if hostport == "" {
+		return false
+	}
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 const (
 	// prepareRouteBudget is the §4.4 ONE overall control-preparation budget:
@@ -121,6 +263,7 @@ func (c *Controller) PrepareRoute(w http.ResponseWriter, r *http.Request, code s
 	// STUN, no probe) and answer unavailable. Suppress-only: an unlock report
 	// never bypasses the live predicates below.
 	if c.AgentLocked(apiKeyID) {
+		recordPreparation(metricPreparationUnavailable)
 		return c.unavailable(w)
 	}
 
@@ -136,6 +279,7 @@ func (c *Controller) PrepareRoute(w http.ResponseWriter, r *http.Request, code s
 		return c.prepareRelayFallback(w, apiKeyID, origin, code)
 	}
 	if origin == "" {
+		recordPreparation(metricPreparationUnavailable)
 		return c.unavailable(w)
 	}
 
@@ -232,6 +376,7 @@ func (c *Controller) PrepareRoute(w http.ResponseWriter, r *http.Request, code s
 		DirectTimeoutMs: prepareDirectTimeoutMs,
 		DirectURL:       directURL(origin, opened.ack.GrantedPort, code),
 	}
+	recordPreparation(metricPreparationDirect)
 	// The optional relay URL rides along only when selection is enabled and
 	// the presence lease currently backs it (§9.3 "optional relay URL").
 	if c.cfg.RelaySelectionEnabled {
@@ -262,9 +407,11 @@ func (c *Controller) relaySelectableFor(apiKeyID string) bool {
 func (c *Controller) prepareRelayFallback(w http.ResponseWriter, apiKeyID, origin, code string) error {
 	if c.cfg.RelaySelectionEnabled {
 		if loc, err := relayURL(origin, code); err == nil && c.relaySelectableFor(apiKeyID) {
+			recordPreparation(metricPreparationRelay)
 			return writePrepareJSON(w, http.StatusOK, prepareResponse{Status: "relay", RelayURL: loc})
 		}
 	}
+	recordPreparation(metricPreparationUnavailable)
 	return c.unavailable(w)
 }
 

@@ -30,6 +30,8 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+
+	"sharebridge/relay/internal/metrics"
 )
 
 // Protocol version, bounds, endpoint paths, enums, and error classes mirror
@@ -199,6 +201,9 @@ type ClientConfig struct {
 	MaxRequestBytes  int
 	// RequestTimeout bounds every HTTP round trip. Zero selects the default.
 	RequestTimeout time.Duration
+	// Metrics receives the bounded §17.3 route revision gauges. Optional; the
+	// client is a library and never registers a global registry itself.
+	Metrics *metrics.Registry
 }
 
 // Client is the gateway's controlsync client. Safe for concurrent use.
@@ -207,6 +212,7 @@ type Client struct {
 	httpClient       *http.Client
 	maxResponseBytes int
 	maxRequestBytes  int
+	metrics          *metrics.Registry
 }
 
 // NewClient validates the fail-closed configuration and returns the client.
@@ -261,6 +267,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		httpClient:       &http.Client{Transport: transport, Timeout: requestTimeout},
 		maxResponseBytes: maxResponseBytes,
 		maxRequestBytes:  maxRequestBytes,
+		metrics:          config.Metrics,
 	}, nil
 }
 
@@ -277,6 +284,9 @@ func (client *Client) FetchSnapshot(ctx context.Context) (Snapshot, error) {
 	}
 	if err := ValidateSnapshot(snapshot, MaxRoutesPerSnapshot); err != nil {
 		return Snapshot{}, err
+	}
+	if client.metrics != nil {
+		client.metrics.Set("sharebridge_relay_route_snapshot_revision", int64(snapshot.Revision))
 	}
 	return snapshot, nil
 }
@@ -304,6 +314,9 @@ func (client *Client) FetchDeltas(ctx context.Context, since uint64) (DeltaPage,
 		// no deltas in (since, latest] and the gateway must reconcile from a
 		// fresh snapshot instead of believing it is caught up (§11.3, §15.7).
 		return DeltaPage{}, fmt.Errorf("%w: gap at revision %d", ErrBadRevision, page.LatestRevision)
+	}
+	if client.metrics != nil {
+		client.metrics.Set("sharebridge_relay_route_delta_revision", int64(page.LatestRevision))
 	}
 	return page, nil
 }
