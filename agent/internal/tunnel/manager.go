@@ -22,6 +22,14 @@ const (
 	defaultBackoffBase           = 1 * time.Second
 	defaultKillGracePeriod       = 5 * time.Second
 	defaultCredentialWaitTimeout = 30 * time.Second
+	// defaultKillWaitTimeout bounds the post-kill wait: after SIGKILL has been
+	// delivered the manager waits at most this long for the child to exit
+	// before returning an explicit error. SIGKILL cannot be ignored, so this
+	// covers only an unkillable process (e.g. blocked in uninterruptible
+	// kernel I/O); without the bound such a child would block shutdown forever
+	// (audit I4) and, because shutdown stopped the tunnel before the HTTPS
+	// listener, leave the listener serving indefinitely.
+	defaultKillWaitTimeout = 2 * time.Second
 	// RunningStabilityWindow: a child that stays up this long is reported as
 	// "running". This is process-liveness telemetry only (§7.4): control
 	// never treats it as relay availability — the gateway presence view
@@ -37,6 +45,11 @@ const (
 
 // errManagerStopped is returned by ApplyConfig after Stop has been called.
 var errManagerStopped = errors.New("tunnel manager stopped")
+
+// ErrChildKillTimeout is returned (wrapped) by Manager.Stop when the child has
+// not exited within the bounded post-kill wait. Callers distinguish an
+// unkillable child from other shutdown failures with errors.Is (audit I4).
+var ErrChildKillTimeout = errors.New("tunnel child kill timed out")
 
 // StatusKind is the closed telemetry status set of the §11.1
 // relay_client_state message: "starting", "running", "stopped", "error".
@@ -295,6 +308,7 @@ type Manager struct {
 	startChild             processStarter
 	backoffBase            time.Duration
 	killGrace              time.Duration
+	killWait               time.Duration
 	credentialWaitTimeout  time.Duration
 	runningStabilityWindow time.Duration
 
@@ -306,18 +320,35 @@ type Manager struct {
 	doneChannel chan struct{}
 	stopOnce    sync.Once
 	stopped     bool // set under stopOnce before stopChannel closes
+	// stopErr records the outcome of the shutdown stop so every Stop caller
+	// observes the SAME explicit error. Written by the run goroutine before
+	// doneChannel closes and read only after <-doneChannel, so the channel
+	// close provides the happens-before edge (no extra lock).
+	stopErr error
 	// publishedGeneration mirrors the armed generation for callers: -1 until
 	// a first configuration is armed, otherwise the current generation. It
 	// lets ApplyConfig reject stale generations synchronously.
 	publishedGeneration atomic.Int64
+	// childLive is the process-liveness bookkeeping: true from the moment a
+	// child is started until its Wait returns (cleared by the watcher
+	// goroutine, even after the supervision loop has exited). Atomic because
+	// the watcher goroutine writes it outside the run goroutine's ownership;
+	// it lets a late reap clear the "running" state instead of leaving it
+	// permanently set (audit I4).
+	childLive atomic.Bool
 
 	// State below is owned by the run goroutine.
-	armedConfig             Config
-	hasArmedConfig          bool
-	armedConsumed           bool // the armed credential was already used for one Login
-	currentGeneration       int
-	child                   childProcess
-	childStartedAt          time.Time
+	armedConfig       Config
+	hasArmedConfig    bool
+	armedConsumed     bool // the armed credential was already used for one Login
+	currentGeneration int
+	child             childProcess
+	childStartedAt    time.Time
+	// childExited is closed when the current child's Wait returns; the run
+	// goroutine waits on it instead of spawning a second Wait helper, so a
+	// bounded post-kill wait leaks no goroutine. Owned by the run goroutine
+	// (closed by the child's watcher goroutine).
+	childExited             chan struct{}
 	restartAttempt          int
 	restartTimer            *time.Timer
 	pendingTimer            timerKind
@@ -357,6 +388,13 @@ func WithKillGracePeriod(grace time.Duration) ManagerOption {
 	return withKillGracePeriod(grace)
 }
 
+// WithKillWaitTimeout is the exported form of withKillWaitTimeout: the bound
+// on the post-kill wait before Stop returns an explicit error (Round D, audit
+// I4).
+func WithKillWaitTimeout(timeout time.Duration) ManagerOption {
+	return withKillWaitTimeout(timeout)
+}
+
 // WithCredentialWaitTimeout is the exported form of withCredentialWaitTimeout
 // (how long the manager waits for control's relay_config before re-requesting).
 func WithCredentialWaitTimeout(timeout time.Duration) ManagerOption {
@@ -381,6 +419,10 @@ func withKillGracePeriod(grace time.Duration) ManagerOption {
 	return func(manager *Manager) { manager.killGrace = grace }
 }
 
+func withKillWaitTimeout(timeout time.Duration) ManagerOption {
+	return func(manager *Manager) { manager.killWait = timeout }
+}
+
 func withCredentialWaitTimeout(timeout time.Duration) ManagerOption {
 	return func(manager *Manager) { manager.credentialWaitTimeout = timeout }
 }
@@ -403,6 +445,7 @@ func NewManager(settings Settings, requester CredentialRequester, onStatus func(
 		startChild:             startFRPCProcess,
 		backoffBase:            defaultBackoffBase,
 		killGrace:              defaultKillGracePeriod,
+		killWait:               defaultKillWaitTimeout,
 		credentialWaitTimeout:  defaultCredentialWaitTimeout,
 		runningStabilityWindow: defaultRunningStabilityWindow,
 		events:                 make(chan managerEvent, 32),
@@ -448,14 +491,19 @@ func (manager *Manager) ApplyConfig(config Config) error {
 }
 
 // Stop shuts the tunnel down: the child is stopped gracefully and killed if
-// it ignores the graceful stop. Stop is idempotent and blocks until the
-// supervision loop has exited. Daemon shutdown and lockdown both call this.
-func (manager *Manager) Stop() {
+// it ignores the graceful stop. The post-kill wait is BOUNDED (killWait): if
+// the child has still not exited, Stop returns an explicit error instead of
+// blocking shutdown forever (audit I4) — the daemon treats the failure as
+// best-effort and runs its remaining teardown levers regardless. Stop is
+// idempotent (every call returns the same recorded outcome) and blocks until
+// the supervision loop has exited.
+func (manager *Manager) Stop() error {
 	manager.stopOnce.Do(func() {
 		manager.stopped = true
 		close(manager.stopChannel)
 	})
 	<-manager.doneChannel
+	return manager.stopErr
 }
 
 func (manager *Manager) isStopped() bool {
@@ -478,7 +526,9 @@ func (manager *Manager) run() {
 	for {
 		select {
 		case <-manager.stopChannel:
-			manager.shutdownChild()
+			// Record the outcome before the deferred close(doneChannel) makes it
+			// visible to every Stop caller.
+			manager.stopErr = manager.shutdownChild()
 			return
 		case event := <-manager.events:
 			switch event.kind {
@@ -537,7 +587,15 @@ func (manager *Manager) handleApplyConfig(config Config) {
 		return // diagnostic already emitted; the start retry path re-renders
 	}
 	if manager.child != nil {
-		manager.stopChildGracefullyOrKill()
+		if err := manager.stopChildGracefullyOrKill(); err != nil {
+			// The old child could not be reaped within the bound: keep tracking
+			// it and refuse to start a second child on top of it. Its watcher
+			// still owns the exit event, so a later reap clears the bookkeeping
+			// and the armed (newer) configuration restarts then.
+			manager.emit(manager.currentGeneration, StatusError,
+				fmt.Sprintf("replacing frpc child: %v", err))
+			return
+		}
 	}
 	manager.startChildNow()
 }
@@ -548,6 +606,7 @@ func (manager *Manager) handleChildExited(event managerEvent) {
 	}
 	uptime := time.Since(manager.childStartedAt)
 	manager.child = nil
+	manager.childExited = nil
 	if uptime >= stableUptimeResetThreshold {
 		manager.restartAttempt = 0
 	}
@@ -602,8 +661,13 @@ func (manager *Manager) startChildNow() {
 	manager.child = child
 	manager.childStartedAt = time.Now()
 	manager.armedConsumed = true
+	// The exit channel is owned by this child's watcher: the stop path waits
+	// on it instead of spawning a second Wait helper goroutine (Round D).
+	exited := make(chan struct{})
+	manager.childExited = exited
+	manager.childLive.Store(true)
 	manager.emit(manager.currentGeneration, StatusStarting, "frpc started")
-	go manager.watchChild(child)
+	go manager.watchChild(child, exited)
 	if manager.runningStabilityWindow > 0 {
 		go manager.notifyRunningAfterStability(child)
 	}
@@ -636,9 +700,16 @@ func (manager *Manager) requestCredentialAndScheduleRestart() {
 	manager.scheduleTimer(timerCredentialWaitExpiry, manager.credentialWaitTimeout)
 }
 
-// watchChild relays the child's exit into the event loop.
-func (manager *Manager) watchChild(child childProcess) {
+// watchChild relays the child's exit into the event loop. It clears the
+// liveness bookkeeping and closes the per-child exit channel BEFORE the event
+// send: clearing first means a replacement child started right after this
+// exit can never be marked not-live by a late store, and it guarantees a
+// reaped child is never left permanently "running" — even after the
+// supervision loop exited.
+func (manager *Manager) watchChild(child childProcess, exited chan struct{}) {
 	waitError := child.Wait()
+	manager.childLive.Store(false)
+	close(exited)
 	select {
 	case manager.events <- managerEvent{kind: eventChildExited, child: child, waitError: waitError}:
 	case <-manager.doneChannel:
@@ -662,32 +733,45 @@ func (manager *Manager) notifyRunningAfterStability(child childProcess) {
 }
 
 // stopChildGracefullyOrKill stops the current child: graceful first, then a
-// kill after the grace period. It is called from the run goroutine only.
-func (manager *Manager) stopChildGracefullyOrKill() {
+// kill after the grace period, then a BOUNDED wait for the exit. If the child
+// still has not exited, it is left tracked (its watcher owns the eventual
+// exit) and an explicit error is returned so callers can surface it and keep
+// shutdown moving. It is called from the run goroutine only, and holds no lock
+// across any wait.
+func (manager *Manager) stopChildGracefullyOrKill() error {
 	child := manager.child
 	if child == nil {
-		return
+		return nil
 	}
+	exited := manager.childExited
 	_ = child.GracefulStop()
-	exited := make(chan struct{})
-	go func() {
-		_ = child.Wait()
-		close(exited)
-	}()
 	select {
 	case <-exited:
 	case <-time.After(manager.killGrace):
 		_ = child.Kill()
-		<-exited
+		select {
+		case <-exited:
+		case <-time.After(manager.killWait):
+			return fmt.Errorf("%w: did not exit within %s after kill", ErrChildKillTimeout, manager.killWait)
+		}
 	}
 	manager.child = nil
+	manager.childExited = nil
+	return nil
 }
 
 // shutdownChild is the Stop path: stop the child and report final telemetry.
-func (manager *Manager) shutdownChild() {
-	manager.stopChildGracefullyOrKill()
+// The child-stop error (an unkillable process) is returned rather than
+// swallowed, and the final stopped telemetry is always emitted.
+func (manager *Manager) shutdownChild() error {
+	stopErr := manager.stopChildGracefullyOrKill()
 	manager.clearRestartTimer()
+	if stopErr != nil {
+		manager.emit(manager.currentGeneration, StatusError,
+			fmt.Sprintf("tunnel child did not stop: %v", stopErr))
+	}
 	manager.emit(manager.currentGeneration, StatusStopped, "tunnel manager stopped")
+	return stopErr
 }
 
 // writeArmedConfig renders the armed configuration and installs it

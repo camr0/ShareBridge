@@ -1996,9 +1996,12 @@ type fakeTunnelChild struct {
 	gracefulStops   int
 	kills           int
 	stopsOnGraceful bool
-	exitSignal      chan struct{}
-	exitOnce        sync.Once
-	waitError       error
+	// ignoresKill models a child that survives Kill (Round D): the kill is
+	// recorded but the exit signal is only raised explicitly by the test.
+	ignoresKill bool
+	exitSignal  chan struct{}
+	exitOnce    sync.Once
+	waitError   error
 }
 
 func newFakeTunnelChild(stopsOnGraceful bool) *fakeTunnelChild {
@@ -2026,8 +2029,11 @@ func (child *fakeTunnelChild) GracefulStop() error {
 func (child *fakeTunnelChild) Kill() error {
 	child.mu.Lock()
 	child.kills++
+	ignores := child.ignoresKill
 	child.mu.Unlock()
-	child.signalExit(fmt.Errorf("signal: killed"))
+	if !ignores {
+		child.signalExit(fmt.Errorf("signal: killed"))
+	}
 	return nil
 }
 
@@ -2063,12 +2069,15 @@ type recordingTunnelStarter struct {
 	mu              sync.Mutex
 	records         []tunnelStartRecord
 	stopsOnGraceful bool
+	// ignoresKill makes every child it starts ignore graceful stop and kill.
+	ignoresKill bool
 }
 
 func (starter *recordingTunnelStarter) start(ctx context.Context, binaryPath string, arguments []string) (tunnel.ChildProcess, error) {
 	starter.mu.Lock()
 	defer starter.mu.Unlock()
 	child := newFakeTunnelChild(starter.stopsOnGraceful)
+	child.ignoresKill = starter.ignoresKill
 	starter.records = append(starter.records, tunnelStartRecord{binaryPath: binaryPath, arguments: arguments, child: child})
 	return child, nil
 }

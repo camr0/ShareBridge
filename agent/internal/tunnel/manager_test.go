@@ -20,8 +20,13 @@ type fakeChildProcess struct {
 	killCalls         int
 	waitError         error
 	stopsOnGraceful   bool
-	exitSignal        chan struct{}
-	exitOnce          sync.Once
+	// ignoresKill models a child that does not exit even after Kill (an
+	// unkillable process, e.g. blocked in uninterruptible kernel I/O): Kill
+	// records the attempt but the exit signal is only raised explicitly by
+	// the test. Round D uses it to prove the post-kill wait is bounded.
+	ignoresKill bool
+	exitSignal  chan struct{}
+	exitOnce    sync.Once
 }
 
 func newFakeChildProcess(stopsOnGraceful bool) *fakeChildProcess {
@@ -52,8 +57,11 @@ func (fake *fakeChildProcess) GracefulStop() error {
 func (fake *fakeChildProcess) Kill() error {
 	fake.mu.Lock()
 	fake.killCalls++
+	ignores := fake.ignoresKill
 	fake.mu.Unlock()
-	fake.signalExit(errors.New("signal: killed"))
+	if !ignores {
+		fake.signalExit(errors.New("signal: killed"))
+	}
 	return nil
 }
 
@@ -90,6 +98,9 @@ type recordingStarter struct {
 	records         []startRecord
 	startError      error
 	stopsOnGraceful bool
+	// ignoresKill makes every child it starts ignore graceful stop and kill,
+	// so a test can drive the manager's bounded post-kill wait.
+	ignoresKill bool
 }
 
 func (starter *recordingStarter) startProcess(ctx context.Context, binaryPath string, arguments []string) (childProcess, error) {
@@ -99,6 +110,7 @@ func (starter *recordingStarter) startProcess(ctx context.Context, binaryPath st
 		return nil, starter.startError
 	}
 	child := newFakeChildProcess(starter.stopsOnGraceful)
+	child.ignoresKill = starter.ignoresKill
 	starter.records = append(starter.records, startRecord{binaryPath: binaryPath, arguments: arguments, child: child})
 	return child, nil
 }
@@ -217,7 +229,7 @@ func newTestManager(t *testing.T, settings Settings, starter *recordingStarter, 
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
-	t.Cleanup(manager.Stop)
+	t.Cleanup(func() { _ = manager.Stop() })
 	return manager
 }
 
@@ -477,7 +489,9 @@ func TestManagerStopsAndKillsChild(t *testing.T) {
 		waitForCondition(t, "child start", time.Second, func() bool { return starter.startCount() == 1 })
 		child := starter.recordAt(0).child
 
-		manager.Stop()
+		if err := manager.Stop(); err != nil {
+			t.Fatalf("Stop() error = %v, want nil for a child that honors the graceful stop", err)
+		}
 
 		if child.gracefulStopCount() != 1 {
 			t.Errorf("graceful stop calls = %d, want 1", child.gracefulStopCount())
@@ -506,7 +520,9 @@ func TestManagerStopsAndKillsChild(t *testing.T) {
 		waitForCondition(t, "child start", time.Second, func() bool { return starter.startCount() == 1 })
 		child := starter.recordAt(0).child
 
-		manager.Stop()
+		if err := manager.Stop(); err != nil {
+			t.Fatalf("Stop() error = %v, want nil for a child that exits on kill", err)
+		}
 
 		if child.gracefulStopCount() != 1 {
 			t.Errorf("graceful stop calls = %d, want 1", child.gracefulStopCount())

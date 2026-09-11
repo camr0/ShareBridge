@@ -149,6 +149,14 @@ type Daemon struct {
 	// it to prove the bound without waiting the production value.
 	lockdownLeverTimeout time.Duration
 
+	// shutdownLeverTimeout bounds how long Stop waits for the tunnel-stop
+	// lever before running the remaining teardown anyway; zero means
+	// defaultShutdownLeverTimeout. The tunnel manager bounds its own post-kill
+	// wait; this is an INDEPENDENT safety net so an unkillable frpc child can
+	// never strand the HTTPS listener, connections, or web surface (audit I4).
+	// Tests shorten it to prove the bound.
+	shutdownLeverTimeout time.Duration
+
 	// lockdownLeverGate is a TEST-ONLY seam: when non-nil it is called with a
 	// best-effort lever's name immediately before that lever starts its work.
 	// It lets the lockdown tests hold a named lever past the aggregation bound
@@ -186,6 +194,14 @@ const (
 	// grace) can delay only its own completion — never the others, and never
 	// the return.
 	defaultLockdownLeverTimeout = 10 * time.Second
+
+	// defaultShutdownLeverTimeout bounds how long Daemon.Stop waits for the
+	// tunnel-stop lever before tearing down the remaining surfaces anyway. It
+	// is an independent safety net above the tunnel manager's own bounded
+	// post-kill wait (kill grace + kill wait, 7s by default): even a manager
+	// that somehow never returns must not leave the HTTPS listener serving
+	// during shutdown (audit I4).
+	defaultShutdownLeverTimeout = 10 * time.Second
 
 	// defaultDirectHandoffTimeout bounds how long a listener rebuild waits for
 	// the previous listener goroutine to exit (releasing its socket) before it
@@ -483,15 +499,18 @@ func (d *Daemon) startTunnelManager(ctx context.Context, options ...tunnel.Manag
 }
 
 // stopTunnelManager stops the frpc child and the supervision loop (§7.4
-// step 6: lockdown and daemon shutdown are the only legitimate stops).
-// Idempotent.
-func (d *Daemon) stopTunnelManager() {
+// step 6: lockdown and daemon shutdown are the only legitimate stops). The
+// manager's Stop is bounded and returns an explicit error when an unkillable
+// child does not exit, so callers surface it and keep shutdown moving rather
+// than swallowing it (audit I4). Idempotent.
+func (d *Daemon) stopTunnelManager() error {
 	d.mu.RLock()
 	manager := d.tunnel
 	d.mu.RUnlock()
-	if manager != nil {
-		manager.Stop()
+	if manager == nil {
+		return nil
 	}
+	return manager.Stop()
 }
 
 // applyRelayConfig routes one control relay_config message into the tunnel
@@ -1428,6 +1447,14 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // Stop gracefully shuts down the daemon.
+//
+// Teardown ordering (§7.4 step 6): the relay tunnel is stopped first, but the
+// wait is BOUNDED and best-effort — an unkillable frpc child must never strand
+// the remaining shutdown (audit I4). The tunnel stop runs on its own goroutine
+// and Stop waits at most shutdownLeverTimeout for it; whether it completed or
+// timed out, the HTTPS listener, established connections, signaling epoch, and
+// web/admin surface are always torn down. The tunnel failure is returned to
+// the caller (and logged), never swallowed.
 func (d *Daemon) Stop() error {
 	d.mu.RLock()
 	sessions := make([]*Session, 0, len(d.sessions))
@@ -1442,13 +1469,33 @@ func (d *Daemon) Stop() error {
 
 	// Stop the relay tunnel first (§7.4 step 6): the frpc child is stopped
 	// gracefully (killed if it ignores the graceful stop), gateway presence
-	// then expires on its own.
-	d.stopTunnelManager()
+	// then expires on its own. The manager bounds its own post-kill wait; the
+	// outer timer below is an independent safety net in the spirit of T30's
+	// bounded lockdown levers, so this lever can never delay the teardown that
+	// follows it indefinitely. The result channel is buffered: a late manager
+	// return after the timeout never blocks its goroutine.
+	tunnelResult := make(chan error, 1)
+	go func() { tunnelResult <- d.stopTunnelManager() }()
+
+	timeout := d.shutdownLeverTimeout
+	if timeout <= 0 {
+		timeout = defaultShutdownLeverTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	var tunnelErr error
+	select {
+	case tunnelErr = <-tunnelResult:
+	case <-timer.C:
+		tunnelErr = fmt.Errorf("tunnel stop did not complete within %s", timeout)
+		log.Printf("daemon shutdown: %v; tearing down the remaining surfaces", tunnelErr)
+	}
 
 	// Tear down the direct serving path: the HTTPS listener leaves service
 	// only on daemon shutdown (§7.4) — never on a control-WebSocket
 	// disconnect — and the gate/readiness epoch state is reset for a clean
-	// shutdown.
+	// shutdown. This runs REGARDLESS of the tunnel lever's outcome.
 	d.stopDirectServer()
 	d.onSignalingDisconnect()
 
@@ -1463,7 +1510,7 @@ func (d *Daemon) Stop() error {
 	// Note: signaling.Client doesn't have a Close method, but Listen will
 	// return when context is cancelled
 
-	return nil
+	return tunnelErr
 }
 
 // CreateSession creates a new share session and registers it with the
@@ -2869,12 +2916,15 @@ func (d *Daemon) Lockdown() error {
 			return nil
 		}},
 		// 3. Stop frpc; gateway presence then expires on its own. The lever acts
-		// on the snapshotted manager, never a manager Unlock built.
+		// on the snapshotted manager, never a manager Unlock built. The
+		// manager's Stop is itself bounded, so this lever cannot outlive the
+		// aggregation bound waiting on an unkillable child; its explicit error
+		// is logged by the lever runner like any other best-effort failure.
 		{name: "stop tunnel manager", run: func() error {
-			if manager != nil {
-				manager.Stop()
+			if manager == nil {
+				return nil
 			}
-			return nil
+			return manager.Stop()
 		}},
 		{name: "report lockdown status", run: func() error {
 			d.sendLockdownStatus(generation, true)
