@@ -55,6 +55,42 @@ cd control
 ./redeploy.sh
 ```
 
+### Relay VM (Phase 4a)
+
+The relay runs on its own VM (spec §4.6) and is deployed independently of the
+control plane with the hardened installer:
+
+```bash
+# Verify the committed deployment artifacts first (no root/systemd needed).
+bash relay/deploy/deploy_test.sh
+
+# Then install/upgrade the two hardened services on the relay VM.
+relay/deploy/install.sh --tunnel-host <relay-tunnel-host> \
+  --sync-url <https://control-sync-endpoint> --sync-san <control-sync-san> \
+  --namespace <sbXXXXXXXX> \
+  --sync-ca control-ca.crt --sync-cert gateway-sync.crt --sync-key gateway-sync.key \
+  --transport-cert tunnel-server.crt --transport-key tunnel-server.key
+```
+
+Before enabling relay selection, confirm:
+
+- `deploy_test.sh` is GREEN and `systemd-analyze verify` accepts both units;
+- the §6 DNS audit passes (`install.sh --audit-dns`): the relay wildcard and
+  the tunnel host are DNS-only and the zone publishes no HTTPS/SVCB/ECH
+  records;
+- the relay VM holds no content certificate/key and no DNS/ACME credential;
+- restart ordering is intact (gateway before frps; frps process-up is never
+  presence, and a dead frps is reported unhealthy within the 30-second
+  freshness window).
+
+Full runbook: [`docs/operations/phase4a-relay.md`](operations/phase4a-relay.md).
+
+**Relay rollback:** set `RELAY_SELECTION_ENABLED=false` in the control
+environment (relay is never selected; direct candidates still get the
+interstitial), then stop `sharebridge-relay-frps` and
+`sharebridge-relay-gateway` on the relay VM. The v2 production/all-account
+deployment keeps the flag false until the release gate (Task 44) records GO.
+
 Deploy the `sharebridge-agent` container using the operator's established self-hosting platform, then monitor the deployment through completion. Never store deployment credentials or other secrets in this repository.
 
 Verify all of the following:

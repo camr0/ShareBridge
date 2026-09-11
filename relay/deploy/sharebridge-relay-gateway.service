@@ -1,0 +1,88 @@
+# ShareBridge relay gateway (spec §4.6, §17.1) — harden the public L4 process.
+#
+# Public surface: :443/tcp only (SNI passthrough; browser TLS is never
+# terminated here). Private surfaces: the FRP authorization plugin (:9001) and
+# the metrics/health endpoint (:9101) are loopback-only. The service runs as a
+# dedicated unprivileged user with a read-only filesystem except its explicit
+# state directories, and reads every secret through systemd credentials or a
+# root-only EnvironmentFile (never a world/group-readable path).
+[Unit]
+Description=ShareBridge Relay Gateway (SNI :443 + FRP authorization plugin)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sharebridge-relay-gateway
+Group=sharebridge-relay-gateway
+WorkingDirectory=/var/lib/sharebridge-relay-gateway
+EnvironmentFile=/etc/sharebridge/relay/gateway.env
+# Listener binds are pinned in the unit so they cannot drift into a public
+# address. The metrics/health address must stay numeric loopback: the binary
+# refuses anything else at startup (spec §17.1).
+Environment=SHAREBRIDGE_GATEWAY_LISTEN_ADDR=:443
+Environment=SHAREBRIDGE_FRP_PLUGIN_LISTEN_ADDR=127.0.0.1:9001
+Environment=SHAREBRIDGE_GATEWAY_METRICS_ADDR=127.0.0.1:9101
+Environment=SHAREBRIDGE_RELAY_PORT_MIN=10000
+Environment=SHAREBRIDGE_RELAY_PORT_MAX=10099
+# Control↔gateway sync mTLS material is loaded as systemd credentials; the
+# sync key/cert/CA stay root:root 0600 on disk and are readable only through
+# %d (the service's credential directory). All six sync variables must be set
+# together or the gateway refuses startup (fail-closed, Task 34).
+Environment=SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE=%d/sync-client-cert
+Environment=SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE=%d/sync-client-key
+Environment=SHAREBRIDGE_CONTROL_SYNC_CA_FILE=%d/control-ca
+LoadCredential=sync-client-cert:/etc/sharebridge/relay/gateway-sync.crt
+LoadCredential=sync-client-key:/etc/sharebridge/relay/gateway-sync.key
+LoadCredential=control-ca:/etc/sharebridge/relay/control-ca.crt
+ExecStart=/usr/local/lib/sharebridge/relay/gateway
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+
+# Explicit writable state/run directories; everything else is read-only.
+StateDirectory=sharebridge-relay-gateway
+RuntimeDirectory=sharebridge-relay-gateway
+ReadWritePaths=/var/lib/sharebridge-relay-gateway /run/sharebridge-relay-gateway
+
+# Binding :443 as an unprivileged user needs exactly one capability.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Filesystem and kernel sandbox.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RemoveIPC=true
+UMask=0077
+
+# Bounded resources (spec §14/§17.1): file descriptors above the §14 global
+# stream ceiling, a hard memory ceiling, and a bounded journal write rate.
+LimitNOFILE=65536
+MemoryMax=512M
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target

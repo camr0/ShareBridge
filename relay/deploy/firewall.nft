@@ -1,0 +1,51 @@
+#!/usr/sbin/nft -f
+#
+# ShareBridge relay VM firewall (spec §17.1). Apply with:
+#
+#   nft -f relay/deploy/firewall.nft
+#
+# Public TCP surfaces — the complete allowlist:
+#   443/tcp   sharebridge-relay-gateway  (SNI L4 gateway, browser TLS passthrough)
+#   7000/tcp  sharebridge-relay-frps     (FRP transport TLS; the pinned config's bindPort)
+#
+# Everything else is dropped, including the private surfaces that are bound to
+# loopback by the processes themselves:
+#   9001        FRP authorization plugin (gateway, 127.0.0.1 only)
+#   9101        gateway metrics/health   (gateway, 127.0.0.1 only)
+#   9102        (control metrics; not on this VM)
+#   7500        FRP dashboard/admin — disabled; frps has no webServer block
+#   10000-10099 agent FRP proxy ports    (frps proxyBindAddr = 127.0.0.1)
+#
+# The relay VM runs no UDP listener. Applying this file manages only the
+# sharebridge_relay table; it never flushes rules owned by other tables.
+
+table inet sharebridge_relay {}
+delete table inet sharebridge_relay
+
+table inet sharebridge_relay {
+    set relay_public_tcp {
+        type inet_service
+        flags interval
+        elements = { 443, 7000 }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iifname "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+
+        tcp dport @relay_public_tcp accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

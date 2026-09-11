@@ -11,6 +11,13 @@
 #   ./deploy-testing.sh <user@host> --bootstrap   # also create a test user + API key, print agent env
 #   ./deploy-testing.sh <user@host> --teardown    # stop + disable the service
 #
+# This script deploys the CONTROL plane only. The phase-4a production relay
+# runs on its own VM (§4.6) and is provisioned with `relay/deploy/install.sh`;
+# see docs/operations/phase4a-relay.md. Relay-only material (the FRP transport
+# certificate, the gateway control-sync client certificate) never belongs on
+# the control box, and no content certificate/ACME credential belongs on the
+# relay VM.
+#
 # Secrets: reads CLOUDFLARE_TOKEN from .env.testing (gitignored). The token is
 # forwarded to the box but NEVER echoed to stdout.
 #
@@ -74,6 +81,9 @@ ACME_CA_DIR=${ACME_CA}
 RELAY_JWT_SECRET=${RELAY_SECRET}
 PORT=${PORT}
 DATA_DIR=${REMOTE_DIR}/pb_data
+# Private monitoring listener (Task 34/35): loopback-only by design, never
+# firewalled, never scraped over the public interface.
+CONTROL_METRICS_ADDR=127.0.0.1:9102
 EOF
 
 # ---- systemd unit (idempotent) ----

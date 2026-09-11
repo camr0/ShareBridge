@@ -1,0 +1,78 @@
+# ShareBridge pinned frps (spec §4.5, §17.1) — the FRP server that terminates
+# the agent transport TLS and owns the loopback-only agent proxy ports.
+#
+# The gateway's loopback authorization plugin (sharebridge-relay-gateway) is
+# the admission authority, so frps starts after it. Restarting the gateway
+# does NOT restart frps (no BindsTo=/PartOf=): frps process-up is never
+# presence, and the gateway reports frps unhealthy within 30 seconds of the
+# newest authenticated plugin fact (DefaultFRPSFreshnessWindow). frps reads
+# its config and transport key through systemd credentials; both stay
+# root:root 0600 on disk. No FRP dashboard/metrics/admin listener is enabled.
+[Unit]
+Description=ShareBridge pinned frps (FRP transport for the relay gateway)
+After=network-online.target sharebridge-relay-gateway.service
+Wants=network-online.target sharebridge-relay-gateway.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sharebridge-relay-frps
+Group=sharebridge-relay-frps
+WorkingDirectory=/var/lib/sharebridge-relay-frps
+# systemd (root) reads the plugin secret from the root-only env file and
+# injects it into the service environment; it never lands in the config file.
+EnvironmentFile=/etc/sharebridge/relay/frps.env
+LoadCredential=frps-config:/etc/sharebridge/relay/frps.toml
+LoadCredential=transport-cert:/etc/sharebridge/relay/tunnel-server.crt
+LoadCredential=transport-key:/etc/sharebridge/relay/tunnel-server.key
+ExecStart=/usr/local/lib/sharebridge/relay/frps -c ${CREDENTIALS_DIRECTORY}/frps-config
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+
+# frps keeps no persistent state; only its runtime directory is writable.
+StateDirectory=sharebridge-relay-frps
+RuntimeDirectory=sharebridge-relay-frps
+ReadWritePaths=/run/sharebridge-relay-frps
+
+# frps binds only unprivileged ports (:7000 transport, loopback proxy range),
+# so it holds no capabilities at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+# Filesystem and kernel sandbox.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RemoveIPC=true
+UMask=0077
+
+# Bounded resources: file descriptors for the proxy range, a hard memory
+# ceiling, and a bounded journal write rate that cannot be flooded by agents.
+LimitNOFILE=65536
+MemoryMax=256M
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target
