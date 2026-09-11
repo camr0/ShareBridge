@@ -34,6 +34,14 @@ const (
 	// §7.3): it never rejects and never authorizes, it only records the
 	// readiness correlation tuple for the presence registry.
 	OperationNewUserConn = "NewUserConn"
+	// OperationSessionReset is the §15.2 frps session-reset lifecycle signal:
+	// a Login re-presented an already-burned one-use credential. Because the
+	// credential is one-use, that re-presentation means the FRP session it
+	// created is gone (frps restarted and the agent's frpc reconnected), so
+	// the presence registry clears that agent immediately instead of waiting
+	// out the 45-second lease. It is not an authorization op and carries only
+	// the rejected credential's bounded identity.
+	OperationSessionReset = "SessionReset"
 
 	// APIPath is configured as the HTTP server-plugin path in frps.
 	APIPath = "/frp/authorize"
@@ -77,7 +85,9 @@ const (
 
 // PresenceFact is the credential-free fact stream consumed by Task 14's
 // presence registry. Login/NewProxy/CloseProxy/Ping facts confirm only that
-// the FRP plugin authorized those calls. NewUserConn is the readiness-only
+// the FRP plugin authorized those calls. SessionReset is the §15.2
+// lifecycle fact emitted when a Login re-presents an already-burned one-use
+// credential (an frps session reset). NewUserConn is the readiness-only
 // correlation fact (Task 7 amendment): frps fires it from the accept loop of
 // a listener it actually bound, and the registry confirms readiness only when
 // its four correlation fields (proxy name, server-assigned run id, generation
@@ -465,6 +475,17 @@ func (server *Server) handleLogin(rawContent json.RawMessage) bool {
 	}
 	server.pruneExpiredReplayLocked(now)
 	if _, replayed := server.replayedJTI[credential.claims.JTI]; replayed {
+		// §15.2 production trigger. The credential is one-use, so a replay is
+		// the agent's frpc reconnecting after the FRP session that consumed it
+		// was reset (an frps-only restart leaves this plugin and its memory
+		// untouched). The plugin only accepts loopback callers holding the
+		// operator shared secret, so the replay cannot be forged from outside
+		// the frps boundary. Emit the session-reset fact BEFORE rejecting so
+		// the gateway clears this agent's presence and drains its established
+		// streams immediately rather than at lease expiry.
+		if server.reserveEventLocked() {
+			server.emitReservedLocked(OperationSessionReset, credential.claims, content.RunID)
+		}
 		return false
 	}
 	current, exists := server.agentSessions[credential.claims.AgentRecordID]

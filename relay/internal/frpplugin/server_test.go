@@ -516,6 +516,50 @@ func TestPluginRejectsReplayedCredential(t *testing.T) {
 	requireRejected(t, fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims)))
 }
 
+// TestPluginStaleSessionReplayEmitsResetFact pins the §15.2 production
+// trigger: a Login that re-presents an already-burned one-use credential is
+// the frps session-reset lifecycle signal (the agent's frpc reconnected after
+// an frps restart), so the plugin emits exactly one OperationSessionReset fact
+// for the rejecting credential's agent identity. An ordinary rejection — an
+// expired or malformed credential — is NOT a session-reset signal and emits
+// nothing.
+func TestPluginStaleSessionReplayEmitsResetFact(t *testing.T) {
+	fixture := newPluginFixture(t)
+	loginFixture(t, fixture)
+	// Wait for the Login fact to be dispatched before replaying, so the
+	// SessionReset fact is observed after it rather than racing it.
+	loginEvents := fixture.recorder.waitForCount(t, 1)
+	before := len(loginEvents)
+
+	fixture.runID = "run-replay"
+	requireRejected(t, fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims)))
+
+	events := fixture.recorder.waitForCount(t, before+1)
+	if len(events) != before+1 {
+		t.Fatalf("replay emitted %d fact(s), want exactly one reset fact: %+v", len(events)-before, events)
+	}
+	reset := events[before]
+	if reset.Operation != OperationSessionReset {
+		t.Fatalf("replay fact operation = %q, want %q", reset.Operation, OperationSessionReset)
+	}
+	if reset.AgentRecordID != fixture.claims.AgentRecordID || reset.RelayPort != fixture.claims.RelayPort ||
+		reset.Generation != fixture.claims.Generation || reset.ProxyName != fixture.claims.ProxyName {
+		t.Fatalf("reset fact identity = %+v, want the rejected credential's agent/port/generation/proxy", reset)
+	}
+
+	// A non-replay rejection (expired credential) must not emit a reset: it is
+	// not evidence that a live FRP session was reset.
+	count := len(fixture.recorder.snapshot())
+	expired := validTestClaims(1, "expired-jti")
+	expired.IssuedAt = testNow.Add(-20 * time.Minute)
+	expired.ExpiresAt = testNow.Add(-time.Minute)
+	requireRejected(t, fixture.request(OperationLogin, fixture.loginContent(signTestCredential(t, fixture.privateKey, expired), expired)))
+	time.Sleep(50 * time.Millisecond)
+	if got := len(fixture.recorder.snapshot()); got != count {
+		t.Fatalf("an expired-credential rejection emitted %d unexpected fact(s)", got-count)
+	}
+}
+
 func TestPluginRejectsSupersededCredential(t *testing.T) {
 	fixture := newPluginFixture(t)
 	loginFixture(t, fixture)

@@ -1,26 +1,32 @@
 // failure_test.go is the §18.5 relay failure/recovery suite (plan Task 33):
-// independent gateway and frps restarts, agent restarts while idle and while
-// a transfer is active, control-sync loss past the finite route lease,
-// presence expiry without CloseProxy, and revoke during a long transfer.
+// independent gateway and frps restarts, a real agent restart (HTTPS server +
+// tunnel) while idle and while a transfer is active, a post-navigation direct
+// failure recovering through the canonical relay link, control-sync loss past
+// the finite route lease, presence expiry without CloseProxy, and revoke
+// during a long transfer.
 //
 // Every case composes the REAL data plane (pinned frps/frpc + real plugin,
 // presence registry, route table and gateway) over loopback, exactly like the
-// §23.3 gate. These cases are NOT §23.3 gate cases: they do not call
-// beginGateCase, so required gate mode neither requires nor waits on them.
+// §23.3 gate. Every case is ALSO registered with the §23.3 required-mode gate
+// registry (`defer beginGateCase(t)()` plus a requiredGateCases entry), so an
+// unset environment or a dropped case can never be cited as green evidence;
+// see TestFailureSuiteCasesAreGateRegistered.
 package integration
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
-	"sharebridge/relay/internal/frpplugin"
 	"sharebridge/relay/internal/gateway"
 	"sharebridge/relay/internal/presence"
 	"sharebridge/relay/internal/routes"
@@ -51,8 +57,8 @@ func (c *failureClock) Advance(d time.Duration) {
 }
 
 // restartFrps kills the running frps and starts a fresh one from the same
-// on-disk config, modelling an frps-only restart (§15.2). The gateway process
-// and its in-memory state are untouched.
+// on-disk config, modelling an frps-only restart (§15.2). The gateway process,
+// its plugin and the agent's frpc are untouched.
 func (s *relayStack) restartFrps(t *testing.T) {
 	t.Helper()
 	if s.frpsCmd != nil && s.frpsCmd.Process != nil {
@@ -77,13 +83,59 @@ func (s *relayStack) restartGatewayEmpty(t *testing.T) {
 	}
 	s.presence.ClearAll()
 
-	s.streams = gateway.NewStreams()
+	// The streams registry is reused, not replaced: the presence registry's
+	// §15.2 drain seam is fixed to it, and no pre-restart stream survives the
+	// tunnel stop this helper is always called after.
 	s.routesTable = routes.NewTable(s.presence)
 	s.gatewaySrv = gateway.NewServer(s.routesTable, s.streams, gateway.WithDialer(s.recordDial))
 	ln := listenLoopback(t)
 	s.gatewayLn = ln
 	s.gatewayAddr = ln.Addr().String()
 	go func() { _ = s.gatewaySrv.Serve(ln) }()
+}
+
+// restartAgentHTTPServer restarts the agent's HTTPS listener and server the
+// way an agent process restart does: the old server is closed (terminating
+// in-flight responses and cancelling their handler contexts) and a fresh
+// server is bound at the same loopback address with the same certificate,
+// content handler and byte tap. The frpc tunnel is restarted separately; the
+// agent daemon's persisted-state reload is covered at the daemon level by
+// agent/internal/daemon's restart tests (see the case comment).
+func (s *relayStack) restartAgentHTTPServer(t *testing.T) {
+	t.Helper()
+	address := s.agentAddr
+	if s.agentSrv != nil {
+		_ = s.agentSrv.Close()
+	}
+	var (
+		listener net.Listener
+		err      error
+	)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		listener, err = net.Listen("tcp", address)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("rebind agent HTTPS listener at %s: %v", address, err)
+	}
+	s.agentTap = &byteRecorder{}
+	s.agentLn = listener
+	s.agentAddr = listener.Addr().String()
+	s.agentSrv = &http.Server{
+		Handler: s.content,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{s.pki.cert},
+			NextProtos:   []string{"h2", "http/1.1"},
+			MinVersion:   tls.VersionTLS12,
+		},
+	}
+	go func() {
+		_ = s.agentSrv.ServeTLS(&tapListener{Listener: listener, rec: s.agentTap}, "", "")
+	}()
 }
 
 // useClockDrivenRoutes replaces the public acceptor and route table with a
@@ -95,7 +147,8 @@ func (s *relayStack) useClockDrivenRoutes(t *testing.T, now func() time.Time) {
 		s.gatewaySrv.Close()
 		s.gatewaySrv.Wait()
 	}
-	s.streams = gateway.NewStreams()
+	// Reuse the streams registry so the presence registry's drain seam keeps
+	// pointing at the live registry.
 	s.routesTable = routes.NewTable(s.presence, routes.WithClock(now))
 	s.gatewaySrv = gateway.NewServer(s.routesTable, s.streams, gateway.WithDialer(s.recordDial))
 	ln := listenLoopback(t)
@@ -215,6 +268,7 @@ func waitSlowCancelled(t *testing.T, s *relayStack, deadline time.Duration) {
 // nothing until a full route snapshot has been loaded, and only serves again
 // after fresh Login + authorized NewProxy + probe-confirmed NewUserConn.
 func TestRealFRPGatewayRestartServesNothingUntilSnapshotAndPresence(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, spec := startPrimaryStack(t)
 
@@ -265,11 +319,17 @@ func TestRealFRPGatewayRestartServesNothingUntilSnapshotAndPresence(t *testing.T
 }
 
 // TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams proves
-// §15.2: an frps-only restart clears all tunnel presence immediately and
-// terminates established relayed streams; the route state remains but is
-// unroutable until fresh Login/NewProxy/probe-confirmed NewUserConn, which
-// requires a freshly issued one-use credential.
+// §15.2 on the REAL data plane: an frps-only restart (the gateway and its
+// plugin stay up, and the agent's frpc keeps running exactly as in
+// production) clears the tunnel's presence IMMEDIATELY through the production
+// trigger — frpc's reconnect re-presents its already-burned one-use
+// credential, the plugin's replay rejection is the frps session-reset
+// lifecycle signal, and the presence registry clears the agent and drains its
+// established streams. The test never calls ClearAll. The route state remains
+// but is unroutable until fresh Login/NewProxy/probe-confirmed NewUserConn
+// re-registers with a newly issued one-use credential.
 func TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, spec := startPrimaryStack(t)
 	baseline := runtime.NumGoroutine()
@@ -280,24 +340,19 @@ func TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams(t *test
 		t.Fatalf("gateway stream registry holds %d streams, want 1 before the restart", s.streams.Len())
 	}
 
-	// frps-only restart: the gateway process stays up.
-	s.stopTunnel(spec.label)
+	// frps-only restart: the gateway process and its plugin stay up, and the
+	// agent's frpc is NOT stopped (a production frps restart does not kill
+	// frpc; it reconnects and re-presents its burned credential).
 	s.restartFrps(t)
 
 	// The data plane died with frps: the established stream terminates.
-	requireStreamClosed(t, "frps restart", established, 10*time.Second)
+	requireStreamClosed(t, "frps restart", established, 15*time.Second)
 	slowClient.CloseIdleConnections()
-	requireGoroutinesReturn(t, baseline, 8, "frps restart", 5*time.Second)
 
-	// Presence may linger until the reset signal/lease in a deployment that has
-	// not yet cleared it, but the data plane is still fail-closed: frps holds
-	// no proxy listener, so the gateway's loopback dial cannot reach a stale
-	// tunnel and the connection is closed generically (no stale proxy survives).
-	expectRelayRequestFails(t, s, "/s/"+fixtureCode)
-
-	// §15.2 immediate presence clear: the registry mutation is synchronous and
-	// observable with no lease wait.
-	s.presence.ClearAll()
+	// §15.2 immediate presence clear, driven by the production trigger: no
+	// test-side ClearAll and no 45-second lease wait. waitOffline is bounded
+	// well inside the lease, so a lingering online presence is a real failure.
+	waitOffline(t, s, spec, 15*time.Second)
 	if s.presence.Online(spec.agentID, spec.proxyPort, uint64(spec.generation)) {
 		t.Fatal("presence survived the frps reset; §15.2 requires an immediate clear")
 	}
@@ -307,9 +362,12 @@ func TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams(t *test
 		t.Fatalf("lookup after frps reset error = %v, want ErrPresenceAbsent", err)
 	}
 	expectRelayRequestFails(t, s, "/s/"+fixtureCode)
+	requireGoroutinesReturn(t, baseline, 8, "frps restart", 5*time.Second)
 
-	// Re-establishment: a fresh one-use credential (the agent's post-restart
-	// relay_credential_request path, §11.1/§15.2) brings the tunnel online.
+	// Re-establishment: stop the stale-credential retry loop and re-register
+	// with a fresh one-use credential (the agent's post-restart
+	// relay_credential_request path, §11.1/§15.2).
+	s.stopTunnel(spec.label)
 	s.startTunnel(spec)
 	s.waitOnline(spec, setupTimeout)
 	s.waitRouteReady(s.relayHost, setupTimeout)
@@ -324,23 +382,46 @@ func TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams(t *test
 }
 
 // TestRealFRPAgentRestartDuringIdleAndActiveTransfers proves §15.3 for both
-// the idle and active cases: an agent tunnel restart drops the tunnel and
-// closes active streams, while a restart from idle re-hydrates and serves
-// again once a fresh credential re-registers the proxy.
+// the idle and active cases. The integration harness has no agent daemon (the
+// agent side is the fake Phase 3 HTTPS server plus the real frpc child), so a
+// true in-process daemon restart is infeasible here. The closest faithful
+// equivalent is exercised: the agent's HTTPS server is stopped and rebound
+// (terminating the in-flight transfer and cancelling its handler), the frpc
+// tunnel is restarted with a fresh one-use credential, and the route — which
+// is control state and must survive — is NOT reapplied. The daemon-level
+// guarantees the harness cannot reach are covered by
+// agent/internal/daemon TestAgentRestartHydratesBeforeContentReady (persisted
+// sessions reloaded and hydrated before re-registration),
+// TestDaemonShutdownStopsHTTPSAndFRPC (HTTPS + frpc child stop together), and
+// TestFRPCRestartObtainsFreshCredentialAfterReplayRejection (fresh credential
+// after a replay rejection).
 func TestRealFRPAgentRestartDuringIdleAndActiveTransfers(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, spec := startPrimaryStack(t)
 
 	t.Run("active transfer", func(t *testing.T) {
 		baseline := runtime.NumGoroutine()
 		established, slowClient := openSlowRelayRequest(t, s)
+
+		// Real agent restart, server first (as Daemon.Stop does): the HTTPS
+		// server stops, terminating the in-flight response.
+		s.restartAgentHTTPServer(t)
+		requireStreamClosed(t, "agent HTTPS restart", established, 15*time.Second)
+		waitSlowCancelled(t, s, 15*time.Second)
+
+		// The tunnel child stops with the agent.
 		s.stopTunnel(spec.label)
-		requireStreamClosed(t, "agent restart", established, 10*time.Second)
-		waitSlowCancelled(t, s, 10*time.Second)
 		slowClient.CloseIdleConnections()
 		requireGoroutinesReturn(t, baseline, 8, "agent restart", 5*time.Second)
 
-		// A restarted agent re-registers with a fresh credential and serves.
+		// The gateway must fail closed while the tunnel is down: a fresh relay
+		// request cannot silently reuse the old tunnel state.
+		expectRelayRequestFails(t, s, "/s/"+fixtureCode)
+
+		// Recovery: the restarted agent re-registers with a fresh credential;
+		// the route is NOT reapplied, proving route/lease state survived the
+		// agent restart.
 		s.startTunnel(spec)
 		s.waitOnline(spec, setupTimeout)
 		s.waitRouteReady(s.relayHost, setupTimeout)
@@ -354,6 +435,7 @@ func TestRealFRPAgentRestartDuringIdleAndActiveTransfers(t *testing.T) {
 	})
 
 	t.Run("idle restart", func(t *testing.T) {
+		s.restartAgentHTTPServer(t)
 		s.stopTunnel(spec.label)
 		s.startTunnel(spec)
 		s.waitOnline(spec, setupTimeout)
@@ -368,12 +450,73 @@ func TestRealFRPAgentRestartDuringIdleAndActiveTransfers(t *testing.T) {
 	})
 }
 
+// TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink
+// covers §15.6's "failure after navigation" case as far as a browserless
+// harness faithfully can: Phase 4a never splices an in-flight response across
+// origins, so a direct transfer that dies after the recipient has already
+// navigated cannot be continued; the recipient returns through the canonical
+// link. The harness models the already-navigated direct transfer as an
+// established direct response that fails mid-body, then proves the recipient's
+// return through the canonical RELAY link is a fresh, complete transaction
+// that carries the same content — not a continuation or splice of the failed
+// direct response. It does not claim to exercise browser or interstitial
+// behaviour (those live in control/agent and are covered there).
+func TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink(t *testing.T) {
+	defer beginGateCase(t)()
+	requireIntegration(t)
+	s, spec := startPrimaryStack(t)
+
+	// Baseline: the content the already-navigated recipient had (direct origin).
+	direct := s.newDirectClient()
+	baseline := readResponseBytes(t, doGet(t, direct, s.directURL("/s/"+fixtureCode+"/items"), nil))
+
+	// An in-flight direct transfer that fails after navigation: establish the
+	// response, then abort it (the direct connection dies).
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.directURL("/s/"+fixtureCode+"/slow"), nil)
+	if err != nil {
+		cancel()
+		t.Fatalf("build direct request: %v", err)
+	}
+	directResponse, err := direct.Do(request)
+	if err != nil {
+		cancel()
+		t.Fatalf("start in-flight direct transfer: %v", err)
+	}
+	if directResponse.StatusCode != http.StatusOK {
+		directResponse.Body.Close()
+		cancel()
+		t.Fatalf("in-flight direct transfer status = %d, want 200", directResponse.StatusCode)
+	}
+	cancel()
+	if _, readErr := io.ReadAll(directResponse.Body); readErr == nil {
+		t.Fatal("the aborted direct transfer completed; post-navigation direct failure was not simulated")
+	}
+	directResponse.Body.Close()
+	waitSlowCancelled(t, s, 15*time.Second)
+
+	// The recipient returns through the canonical relay link: a fresh and
+	// COMPLETE transaction, byte-identical to the direct baseline.
+	relay := s.newRelayClient(tls.VersionTLS12, tls.VersionTLS13, []string{"http/1.1"}, 2).client
+	recovered := readResponseBytes(t, doGet(t, relay, s.relayURL("/s/"+fixtureCode+"/items"), nil))
+	if !bytes.Equal(recovered, baseline) {
+		t.Fatalf("relay recovery body differs from the direct baseline (got %d bytes, want %d); the post-navigation recovery must be a complete canonical transaction",
+			len(recovered), len(baseline))
+	}
+	// The recovery rode the relay data plane exactly: dials target only the
+	// resolved route's loopback FRP port.
+	if err := checkDialTargets(s.dialTargetsSnapshot(), spec.proxyPort); err != nil {
+		t.Fatalf("relay recovery dial audit failed: %v", err)
+	}
+}
+
 // TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream proves §15.4:
 // when control cannot renew route state, the finite 120-second route lease
 // expiry blocks only NEW connections; established streams keep running under
 // their own idle and absolute-lifetime limits until an explicit revoke or
 // lockdown.
 func TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s := newRelayStack(t)
 	clock := newFailureClock()
@@ -419,6 +562,7 @@ func TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream(t *testing.T
 // active long relay transfer and blocks new connections, while a missing
 // control refresh (lease expiry, the previous case) does not.
 func TestRealFRPRevokeDuringLongTransferClosesEstablishedStream(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 	s, _ := startPrimaryStack(t)
 	baseline := runtime.NumGoroutine()
@@ -450,152 +594,77 @@ func TestRealFRPRevokeDuringLongTransferClosesEstablishedStream(t *testing.T) {
 }
 
 // TestRealFRPPresenceExpiryWithoutCloseProxy proves §18.5's bounded offline
-// detection: with the tunnel's Pings gone but no CloseProxy ever delivered,
-// the 45-second presence lease expires on its own at the exact boundary and
-// the route join fails closed, while the established stream (which the
-// gateway never re-checks) is preserved — only ClearAll, revoke, or lockdown
-// drain established streams. The registry runs on an injected clock so the
-// boundary is deterministic (the real-time equivalent is
-// TestRealFRPRelayPresenceHeartbeatDelayAndExpiry, which also proves the
-// delayed-Ping anti-flap margin).
+// detection on the REAL data plane: the real frpc is frozen (SIGSTOP) so its
+// Pings stop while its control connection stays open — frps therefore never
+// delivers CloseProxy — and the 45-second presence lease expires on its own at
+// the exact boundary. The registry runs on an injected clock so the boundary
+// is deterministic, but the tunnel, route, stream registry and content plane
+// are all the real stack. The established stream (which the gateway never
+// re-checks on expiry) is preserved; only the frps-reset clear path or an
+// explicit revoke drains established streams.
 func TestRealFRPPresenceExpiryWithoutCloseProxy(t *testing.T) {
+	defer beginGateCase(t)()
 	requireIntegration(t)
 
-	const (
-		bootID     = "failure-boot-1"
-		agentID    = "agent-expiry"
-		proxyName  = "sb-sbdeadbeef"
-		relayPort  = 20099
-		generation = 1
-		probeSrc   = "127.0.0.1:55555"
-	)
-
 	clock := newFailureClock()
-	sink := &failurePresenceSink{}
-	streams := gateway.NewStreams()
-	var registry *presence.Registry
-	var err error
-	registry, err = presence.NewRegistry(presence.Config{
-		BootID:  bootID,
-		Now:     clock.Now,
-		Sink:    sink,
-		Drainer: streams, // the frps-reset drain seam must stay idle here
-		Probe: func(context.Context, int) (string, error) {
-			return probeSrc, nil
-		},
-	})
-	if err != nil {
-		t.Fatalf("new presence registry: %v", err)
+	s := newRelayStackWithClock(t, clock.Now)
+	spec := tunnelSpec{
+		label:      "primary",
+		agentID:    "agent-expiry",
+		namespace:  fixtureNamespace,
+		generation: 1,
+		proxyPort:  s.allocPort(t),
+		localPort:  portOf(t, s.agentAddr),
 	}
-	table := routes.NewTable(registry, routes.WithClock(clock.Now))
+	s.startTunnel(spec)
+	s.applyRoute(s.relayHost, spec, 1)
+	s.waitOnline(spec, setupTimeout)
+	s.waitRouteReady(s.relayHost, setupTimeout)
 
-	// Bring the tunnel online through the real four-fact readiness predicate.
-	registry.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationLogin, AgentRecordID: agentID, Namespace: "sbdeadbeef", ProxyName: proxyName, RelayPort: relayPort, Generation: generation, RunID: "run-1"})
-	registry.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationNewProxy, AgentRecordID: agentID, Namespace: "sbdeadbeef", ProxyName: proxyName, RelayPort: relayPort, Generation: generation, RunID: "run-1"})
-	registry.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationNewUserConn, AgentRecordID: agentID, Namespace: "sbdeadbeef", ProxyName: proxyName, RelayPort: relayPort, Generation: generation, RunID: "run-1", RemoteAddr: probeSrc})
-	// The readiness probe runs on its own bounded goroutine; wait for the
-	// asynchronous confirmation rather than assuming it completed inline.
-	deadline := time.Now().Add(2 * time.Second)
-	for !registry.Online(agentID, relayPort, generation) {
-		if time.Now().After(deadline) {
-			t.Fatal("tunnel did not reach online after the readiness facts")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if err := table.Apply(routes.Route{
-		Hostname:      "expiry.relay.sbdeadbeef.example.com",
-		AgentRecordID: agentID,
-		RelayPort:     relayPort,
-		Generation:    generation,
-		Revision:      1,
-		Active:        true,
-	}); err != nil {
-		t.Fatalf("apply route: %v", err)
-	}
-	if _, err := table.Lookup("expiry.relay.sbdeadbeef.example.com"); err != nil {
-		t.Fatalf("lookup with fresh presence: %v", err)
+	baseline := runtime.NumGoroutine()
+	established, slowClient := openSlowRelayRequest(t, s)
+	if s.streams.Len() != 1 {
+		t.Fatalf("gateway stream registry holds %d streams, want the established 1", s.streams.Len())
 	}
 
-	// A healthy stream is established (in production this is a spliced public
-	// connection; here the registry alone is enough to prove drain behaviour).
-	streams.Register("expiry.relay.sbdeadbeef.example.com", agentID, &failureCountingConn{})
+	// Freeze the real frpc: Pings stop, the control connection stays open, and
+	// no CloseProxy can arrive.
+	s.signalTunnel(t, spec.label, syscall.SIGSTOP)
+	t.Cleanup(func() { s.signalTunnelQuiet(spec.label, syscall.SIGCONT) })
+	time.Sleep(200 * time.Millisecond)
 
 	// One missed Ping window is tolerated, then the exact lease boundary ends
 	// authority with no CloseProxy.
 	clock.Advance(presence.DefaultLeaseTTL - time.Second)
-	if !registry.Online(agentID, relayPort, generation) {
+	if !s.presence.Online(spec.agentID, spec.proxyPort, uint64(spec.generation)) {
 		t.Fatal("presence flapped before the 45s lease boundary")
 	}
 	clock.Advance(time.Second)
-	if registry.Online(agentID, relayPort, generation) {
+	if s.presence.Online(spec.agentID, spec.proxyPort, uint64(spec.generation)) {
 		t.Fatal("presence survived the exact lease boundary without a Ping or CloseProxy")
 	}
-	if _, err := table.Lookup("expiry.relay.sbdeadbeef.example.com"); !errors.Is(err, routes.ErrPresenceAbsent) {
+	if _, err := s.routesTable.Lookup(s.relayHost); !errors.Is(err, routes.ErrPresenceAbsent) {
 		t.Fatalf("lookup after lease expiry error = %v, want ErrPresenceAbsent", err)
 	}
 
-	// Expiry must not drain established streams (§15.4); only ClearAll does.
-	if streams.Len() != 1 {
-		t.Fatalf("gateway stream registry holds %d streams after lease expiry, want the established 1 preserved", streams.Len())
+	// Expiry must not drain established streams (§15.4); only the frps-reset
+	// clear path does.
+	requireStreamStaysOpen(t, "presence lease expiry", established, 1500*time.Millisecond)
+	if s.streams.Len() != 1 {
+		t.Fatalf("gateway stream registry holds %d streams after lease expiry, want the established 1 preserved", s.streams.Len())
 	}
 
-	// Bounded offline detection: exactly one offline transition carrying the
-	// current boot ID and a monotonic revision.
-	events := sink.snapshot()
+	// Bounded offline detection: exactly one online transition then one
+	// offline transition carrying the current boot ID and a fresh revision.
+	events := s.presenceEvents.snapshot()
 	if len(events) != 2 || events[1].State != presence.StateOffline {
 		t.Fatalf("presence events = %+v, want one online then one offline", events)
 	}
-	if events[1].BootID != bootID || events[1].Revision <= events[0].Revision {
-		t.Fatalf("offline event = %+v, want boot %q and a fresh revision", events[1], bootID)
+	if events[1].BootID != "integration-boot" || events[1].Revision <= events[0].Revision {
+		t.Fatalf("offline event = %+v, want boot %q and a fresh revision", events[1], "integration-boot")
 	}
+
+	established.Body.Close()
+	slowClient.CloseIdleConnections()
+	requireGoroutinesReturn(t, baseline, 8, "presence lease expiry", 5*time.Second)
 }
-
-// failurePresenceSink records presence transitions for the expiry case.
-type failurePresenceSink struct {
-	mu     sync.Mutex
-	events []presence.Event
-}
-
-func (s *failurePresenceSink) ObservePresenceEvent(event presence.Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.events = append(s.events, event)
-}
-
-func (s *failurePresenceSink) snapshot() []presence.Event {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]presence.Event(nil), s.events...)
-}
-
-// failureCountingConn lets the expiry case register a stream and observe
-// whether a drain closed it.
-type failureCountingConn struct {
-	mu     sync.Mutex
-	closes int
-}
-
-func (c *failureCountingConn) Read([]byte) (int, error)    { select {} }
-func (c *failureCountingConn) Write(p []byte) (int, error) { return len(p), nil }
-func (c *failureCountingConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.closes++
-	return nil
-}
-func (c *failureCountingConn) LocalAddr() net.Addr              { return failureAddr("local") }
-func (c *failureCountingConn) RemoteAddr() net.Addr             { return failureAddr("remote") }
-func (c *failureCountingConn) SetDeadline(time.Time) error      { return nil }
-func (c *failureCountingConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *failureCountingConn) SetWriteDeadline(time.Time) error { return nil }
-
-func (c *failureCountingConn) closeCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closes
-}
-
-type failureAddr string
-
-func (a failureAddr) Network() string { return "tcp" }
-func (a failureAddr) String() string  { return string(a) }

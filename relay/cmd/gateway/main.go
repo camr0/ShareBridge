@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"sharebridge/relay/internal/frpplugin"
 	"sharebridge/relay/internal/gateway"
 	"sharebridge/relay/internal/limits"
+	"sharebridge/relay/internal/presence"
 	"sharebridge/relay/internal/routes"
 )
 
@@ -65,7 +67,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	pluginServer, pluginListenAddress, err := configuredPluginServer()
+	// The gateway streams registry is both the connection accounting used by
+	// the resource limiter and the §15.2 drain seam for the presence registry:
+	// an frps session reset clears presence and then closes the affected
+	// agent's established streams through it.
+	streams := gateway.NewStreams()
+	presenceRegistry, err := newPresenceRegistry(streams)
+	if err != nil {
+		logger.Error("gateway: presence registry configuration rejected", "error", err)
+		os.Exit(1)
+	}
+
+	pluginServer, pluginListenAddress, err := configuredPluginServer(presenceRegistry)
 	if err != nil {
 		logger.Error("gateway: FRP authorization plugin configuration rejected", "error", err)
 		os.Exit(1)
@@ -87,11 +100,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The route table joins tunnel presence through the Task 14 registry;
-	// until it exists a nil presence fails every public lookup closed. The
-	// plugin already emits credential-free facts through its injected seam.
-	routeTable := routes.NewTable(nil)
-	server := gateway.NewServer(routeTable, gateway.NewStreams(),
+	// The route table joins tunnel presence through the registry the plugin
+	// feeds: a route with no probe-confirmed online presence fails closed, and
+	// a control snapshot has not yet been wired, so the table stays empty and
+	// every public lookup still fails closed.
+	routeTable := routes.NewTable(presenceRegistry)
+	server := gateway.NewServer(routeTable, streams,
 		gateway.WithLogger(logger), gateway.WithLimitsConfig(limitsConfig))
 	httpPluginServer := &http.Server{
 		Handler:           pluginServer,
@@ -146,7 +160,25 @@ func configuredLimits() (limits.Config, error) {
 	return limits.ConfigFromEnvironment(os.LookupEnv)
 }
 
-func configuredPluginServer() (*frpplugin.Server, string, error) {
+// newPresenceRegistry builds the production presence registry the FRP plugin
+// feeds and the route table joins against. The boot identity is a fresh
+// 128-bit hex value per process: §15.1 requires a gateway restart to change
+// the boot ID so control discards stale presence events. The streams registry
+// is the §15.2 drain seam. The control-sync Sink is not wired yet, so presence
+// events are currently process-local; route snapshots are likewise not yet
+// wired, so the route table stays empty and the gateway fails closed.
+func newPresenceRegistry(drainer presence.AgentDrainer) (*presence.Registry, error) {
+	var bootID [16]byte
+	if _, err := rand.Read(bootID[:]); err != nil {
+		return nil, fmt.Errorf("generate gateway boot id: %w", err)
+	}
+	return presence.NewRegistry(presence.Config{
+		BootID:  hex.EncodeToString(bootID[:]),
+		Drainer: drainer,
+	})
+}
+
+func configuredPluginServer(presenceEvents frpplugin.PresenceEvents) (*frpplugin.Server, string, error) {
 	pluginListenAddress := os.Getenv(envPluginListenAddress)
 	if pluginListenAddress == "" {
 		pluginListenAddress = defaultPluginListenAddress
@@ -187,6 +219,7 @@ func configuredPluginServer() (*frpplugin.Server, string, error) {
 		RelayPortMin:       relayPortMin,
 		RelayPortMax:       relayPortMax,
 		StatePath:          statePath,
+		PresenceEvents:     presenceEvents,
 	})
 	if err != nil {
 		return nil, "", err

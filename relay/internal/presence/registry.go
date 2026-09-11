@@ -8,7 +8,8 @@
 //	online
 //	  ├─ current Ping renews 45s lease (from the last authenticated Ping) ─► online
 //	  ├─ CloseProxy / logout / lease expiry ─► absent
-//	  ├─ frps reset (ClearAll) ─► absent
+//	  ├─ frps reset (ClearAll, or the plugin's SessionReset fact for one
+//	  │  agent whose burned one-use credential was re-presented) ─► absent
 //	  └─ replacement Login (equal or higher generation) ─► offline, then new online
 //
 // Every plugin-accepted Login is an authoritative session replacement: a
@@ -115,9 +116,10 @@ type Sink interface {
 type ProbeFunc func(ctx context.Context, relayPort int) (sourceAddress string, err error)
 
 // AgentDrainer drains established public streams by agent record (satisfied
-// by gateway.Streams). Only the §15.2 frps-reset path (ClearAll) drains: the
-// tunnel's data plane dies with frps itself there, and §15.4 keeps other
-// presence transitions from closing established streams.
+// by gateway.Streams). Only the §15.2 frps-reset paths (ClearAll, and the
+// plugin's per-agent SessionReset trigger) drain: the tunnel's data plane dies
+// with frps itself there, and §15.4 keeps other presence transitions from
+// closing established streams.
 type AgentDrainer interface {
 	CloseAgent(agentRecordID string) int
 }
@@ -307,6 +309,16 @@ func (registry *Registry) ObserveFRPEvent(fact frpplugin.PresenceFact) {
 		return
 	}
 	if fact.ProxyName == "" || len(fact.ProxyName) > maxFactFieldBytes || len(fact.RunID) > maxFactFieldBytes {
+		return
+	}
+	// §15.2 production trigger: the plugin observed a Login re-presenting an
+	// already-burned one-use credential — the agent's frpc reconnecting after
+	// its FRP session was reset — so that agent's presence is cleared
+	// immediately and its established streams drain. This is handled before
+	// the tunnel switch because it is agent-scoped, not tunnel-keyed, and the
+	// drain runs outside the registry lock (see clearAgent).
+	if fact.Operation == frpplugin.OperationSessionReset {
+		registry.clearAgent(fact.AgentRecordID)
 		return
 	}
 	key := tunnelKey{
@@ -586,23 +598,53 @@ func (registry *Registry) Online(agentRecordID string, relayPort int, generation
 // would deadlock.
 func (registry *Registry) ClearAll() {
 	registry.mu.Lock()
-	agents := make(map[string]struct{}, len(registry.tunnels))
+	agents := make([]string, 0, len(registry.tunnels))
 	for key, tunnel := range registry.tunnels {
 		registry.absentLocked(key, tunnel)
-		agents[key.agentRecordID] = struct{}{}
+		agents = append(agents, key.agentRecordID)
 		delete(registry.tunnels, key)
 	}
 	registry.mu.Unlock()
+	registry.drainAgents(agents)
+}
 
-	if registry.drainer == nil {
+// clearAgent implements the §15.2 per-agent production trigger invoked by the
+// FRP plugin's SessionReset fact. The named agent's presence is cleared
+// immediately, and its established streams are drained AFTER the presence
+// mutation commits (the same mutate-before-drain ordering as ClearAll, and
+// the same lock release before CloseAgent). A reset for an agent with no
+// presence is a no-op. Other agents are never touched, so a single frpc
+// reconnect can never clear an unrelated healthy tunnel (§15.4).
+func (registry *Registry) clearAgent(agentRecordID string) {
+	registry.mu.Lock()
+	cleared := false
+	for key, tunnel := range registry.tunnels {
+		if key.agentRecordID != agentRecordID {
+			continue
+		}
+		registry.absentLocked(key, tunnel)
+		delete(registry.tunnels, key)
+		cleared = true
+	}
+	registry.mu.Unlock()
+	if cleared {
+		registry.drainAgents([]string{agentRecordID})
+	}
+}
+
+// drainAgents closes established streams for the given agents in a stable
+// order, once per agent. It is called with the registry lock released.
+func (registry *Registry) drainAgents(agents []string) {
+	if registry.drainer == nil || len(agents) == 0 {
 		return
 	}
-	ordered := make([]string, 0, len(agents))
-	for agent := range agents {
-		ordered = append(ordered, agent)
-	}
-	sort.Strings(ordered)
-	for _, agent := range ordered {
+	sort.Strings(agents)
+	previous := ""
+	for _, agent := range agents {
+		if agent == previous {
+			continue
+		}
+		previous = agent
 		registry.drainer.CloseAgent(agent)
 	}
 }

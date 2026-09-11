@@ -784,6 +784,11 @@ type relayStack struct {
 	dialMu      sync.Mutex
 	dialTargets []string
 
+	// probeMu guards the harness readiness-probe diagnostics.
+	probeMu      sync.Mutex
+	probeDials   int
+	probeLastErr string
+
 	relayHost  string
 	directHost string
 	relayHostB string
@@ -793,6 +798,15 @@ type relayStack struct {
 
 // newRelayStack builds the hermetic stack. Callers start tunnels explicitly.
 func newRelayStack(t *testing.T) *relayStack {
+	return newRelayStackWithClock(t, nil)
+}
+
+// newRelayStackWithClock builds the hermetic stack with an injected clock for
+// the presence registry (and the route table, so both leases read the same
+// time base). A nil clock selects real time, exactly like newRelayStack. The
+// injection exists so a 45-second presence lease can be crossed deterministically
+// on the REAL frps/frpc data plane without waiting in real time.
+func newRelayStackWithClock(t *testing.T, now func() time.Time) *relayStack {
 	t.Helper()
 	requireIntegration(t)
 	frpsPath, frpcPath := pinnedFRPBinaries(t)
@@ -824,12 +838,29 @@ func newRelayStack(t *testing.T) *relayStack {
 	}
 	s.key = controlPriv
 
-	// Presence registry fed by the real plugin fact stream.
+	// Presence registry fed by the real plugin fact stream. The gateway
+	// streams registry is the §15.2 drain seam, so the frps-reset clear drains
+	// established streams exactly as production does; the expiry path must NOT
+	// drain.
+	s.streams = gateway.NewStreams()
 	s.presenceEvents = &presenceEventRecorder{}
-	registry, err := presence.NewRegistry(presence.Config{
-		BootID: "integration-boot",
-		Sink:   s.presenceEvents,
-	})
+	registryConfig := presence.Config{
+		BootID:  "integration-boot",
+		Sink:    s.presenceEvents,
+		Drainer: s.streams,
+		// The harness probe is the production probe shape (zero-byte loopback
+		// connects) with a test-only generous deadline: under a heavily loaded
+		// `-race -count=N` run, frps can be slow to bind the proxy listener
+		// after the plugin returns allow, and the strict production budget
+		// (§4.4: 2.5 s) then flakes readiness. The production bounds stay
+		// pinned by the presence package's TestLoopbackProbeRespectsBudget.
+		Probe:             s.fixtureReadinessProbe,
+		ProbeHardDeadline: 30 * time.Second,
+	}
+	if now != nil {
+		registryConfig.Now = now
+	}
+	registry, err := presence.NewRegistry(registryConfig)
 	if err != nil {
 		t.Fatalf("new presence registry: %v", err)
 	}
@@ -901,8 +932,11 @@ func newRelayStack(t *testing.T) *relayStack {
 	s.certPath, s.keyPath = writeTransportCert(t, s.dir)
 
 	// Route table joined against the presence registry.
-	s.routesTable = routes.NewTable(registry)
-	s.streams = gateway.NewStreams()
+	if now != nil {
+		s.routesTable = routes.NewTable(registry, routes.WithClock(now))
+	} else {
+		s.routesTable = routes.NewTable(registry)
+	}
 	s.gatewaySrv = gateway.NewServer(s.routesTable, s.streams, gateway.WithDialer(s.recordDial))
 	s.gatewayLn = listenLoopback(t)
 	s.gatewayAddr = s.gatewayLn.Addr().String()
@@ -915,6 +949,41 @@ func newRelayStack(t *testing.T) *relayStack {
 
 	t.Cleanup(s.close)
 	return s
+}
+
+// fixtureReadinessProbe is the integration harness's readiness probe. It
+// performs the production probe's zero-byte loopback TCP connect, retrying
+// until the registry's (test-only, generous) hard deadline. It records dial
+// attempts and the last error so a readiness failure can be diagnosed.
+func (s *relayStack) fixtureReadinessProbe(ctx context.Context, relayPort int) (string, error) {
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(relayPort))
+	var lastErr error
+	for {
+		s.probeMu.Lock()
+		s.probeDials++
+		s.probeMu.Unlock()
+		conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
+		if err == nil {
+			sourceAddress := conn.LocalAddr().String()
+			_ = conn.Close()
+			return sourceAddress, nil
+		}
+		lastErr = err
+		s.probeMu.Lock()
+		s.probeLastErr = err.Error()
+		s.probeMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("fixture readiness probe for %s: %w (last dial error: %v)", address, ctx.Err(), lastErr)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func (s *relayStack) probeDiagnostics() (int, string) {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	return s.probeDials, s.probeLastErr
 }
 
 // recordDial is the real gateway dial seam (gateway.WithDialer). It records
@@ -1049,7 +1118,9 @@ func (s *relayStack) waitOnline(spec tunnelSpec, timeout time.Duration) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	s.t.Fatalf("tunnel %s never became online; frps log:\n%s", spec.label, s.logs.String())
+	dials, lastProbeErr := s.probeDiagnostics()
+	s.t.Fatalf("tunnel %s never became online; probe dials=%d lastProbeErr=%q; presence events: %+v; frps log:\n%s",
+		spec.label, dials, lastProbeErr, s.presenceEvents.snapshot(), s.logs.String())
 }
 
 // waitRouteReady blocks until the gateway route table resolves the hostname.

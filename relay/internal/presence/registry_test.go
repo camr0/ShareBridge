@@ -497,6 +497,94 @@ func TestCloseLogoutAndExpiryBecomeAbsent(t *testing.T) {
 	// Pings stop, so the same lease expiry path makes the tunnel absent.
 }
 
+// TestStaleSessionResetClearsOnlyTheNamedAgentAndDrains pins the registry half
+// of the §15.2 production trigger: an OperationSessionReset fact (emitted by
+// the plugin when a Login re-presents an already-burned one-use credential)
+// makes exactly the named agent absent immediately, drains that agent's
+// established streams AFTER the presence mutation commits, and never disturbs
+// another agent's healthy tunnel (§15.4).
+func TestStaleSessionResetClearsOnlyTheNamedAgentAndDrains(t *testing.T) {
+	const otherAgent = "agent-record-2"
+	clock := newFakeClock()
+	sink := &eventSink{}
+	probe := &probeSpy{source: "127.0.0.1:55555"}
+	var (
+		registry      *Registry
+		drained       []string
+		onlineAtDrain bool
+	)
+	var err error
+	registry, err = NewRegistry(Config{
+		BootID: testBootID,
+		Now:    clock.Now,
+		Sink:   sink,
+		Probe:  probe.probe,
+		Drainer: drainerFunc(func(agentRecordID string) int {
+			drained = append(drained, agentRecordID)
+			onlineAtDrain = registry.Online(testAgent, testPort, 1)
+			return 1
+		}),
+	})
+	if err != nil {
+		t.Fatalf("new presence registry: %v", err)
+	}
+
+	agentFact := func(agentRecordID, operation, runID string) frpplugin.PresenceFact {
+		return frpplugin.PresenceFact{
+			Operation:     operation,
+			AgentRecordID: agentRecordID,
+			Namespace:     testNamespace,
+			ProxyName:     testProxy,
+			RelayPort:     testPort,
+			Generation:    1,
+			RunID:         runID,
+		}
+	}
+	confirm := func(agentRecordID, runID string) {
+		registry.ObserveFRPEvent(agentFact(agentRecordID, frpplugin.OperationLogin, runID))
+		registry.ObserveFRPEvent(agentFact(agentRecordID, frpplugin.OperationNewProxy, runID))
+		registry.waitIdle()
+		fact := agentFact(agentRecordID, frpplugin.OperationNewUserConn, runID)
+		fact.RemoteAddr = "127.0.0.1:55555"
+		registry.ObserveFRPEvent(fact)
+	}
+
+	confirm(testAgent, "run-1")
+	confirm(otherAgent, "run-2")
+	if !registry.Online(testAgent, testPort, 1) || !registry.Online(otherAgent, testPort, 1) {
+		t.Fatal("both agents must be online before the stale-session reset")
+	}
+
+	registry.ObserveFRPEvent(frpplugin.PresenceFact{
+		Operation:     frpplugin.OperationSessionReset,
+		AgentRecordID: testAgent,
+		Namespace:     testNamespace,
+		ProxyName:     testProxy,
+		RelayPort:     testPort,
+		Generation:    1,
+	})
+
+	if registry.Online(testAgent, testPort, 1) {
+		t.Fatal("presence survived the stale-session reset")
+	}
+	if !registry.Online(otherAgent, testPort, 1) {
+		t.Fatal("a stale-session reset for one agent cleared another agent's healthy tunnel")
+	}
+	if strings.Join(drained, ",") != testAgent {
+		t.Fatalf("drained agents = %v, want [%s] only", drained, testAgent)
+	}
+	// Mutate-before-drain (Streams ordering invariant): the presence mutation
+	// must already be visible when the drain runs.
+	if onlineAtDrain {
+		t.Fatal("drain ran before the presence mutation committed")
+	}
+	// One online transition per agent plus the one offline transition for the
+	// reset agent; the untouched agent emits nothing.
+	if len(sink.snapshot()) != 3 {
+		t.Fatalf("presence events = %+v, want two online and one offline", sink.snapshot())
+	}
+}
+
 func TestReplacementGenerationFencesOldTunnel(t *testing.T) {
 	fixture := newRegistryFixture(t)
 	fixture.probe.source = "127.0.0.1:55555"

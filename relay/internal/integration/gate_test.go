@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"os/exec"
@@ -356,6 +359,10 @@ func (e *gateFRPEvidence) emit(w io.Writer) {
 
 // requiredGateCases are the named §23.3 gate cases that MUST execute in
 // required mode. Absence, a skip, or an incomplete run is a gate failure.
+// Every real-FRP case in failure_test.go and relay_test.go is listed here; an
+// unregistered case would run (or silently skip) without the required-mode gate
+// noticing, so TestFailureSuiteCasesAreGateRegistered guards this list against
+// omission.
 var requiredGateCases = []string{
 	"TestRealFRPRelayEndToEndTLS12HTTP11",
 	"TestRealFRPRelayEndToEndTLS13HTTP2",
@@ -364,6 +371,13 @@ var requiredGateCases = []string{
 	"TestRealFRPContentParity",
 	"TestRelayPathNeverEmitsOpenSignal",
 	"TestRealFRPRelayPresenceHeartbeatDelayAndExpiry",
+	"TestRealFRPGatewayRestartServesNothingUntilSnapshotAndPresence",
+	"TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams",
+	"TestRealFRPAgentRestartDuringIdleAndActiveTransfers",
+	"TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink",
+	"TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream",
+	"TestRealFRPRevokeDuringLongTransferClosesEstablishedStream",
+	"TestRealFRPPresenceExpiryWithoutCloseProxy",
 }
 
 type gateCaseRecord struct {
@@ -407,12 +421,20 @@ func (r *gateCaseRegistry) finish(name string, skipped, failed bool) {
 	record.failed = record.failed || failed
 }
 
-// violations reports every required gate case that did not execute cleanly.
+// violations reports every named required gate case that did not execute
+// cleanly against the package's declared required set.
 func (r *gateCaseRegistry) violations() []string {
+	return r.violationsFor(requiredGateCases)
+}
+
+// violationsFor is the parameterized form of violations; it exists so the
+// required-mode registry's missing/skipped/failed enforcement can be unit
+// tested without mutating the package's declared required set.
+func (r *gateCaseRegistry) violationsFor(required []string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var violations []string
-	for _, name := range requiredGateCases {
+	for _, name := range required {
 		record := r.records[name]
 		switch {
 		case record == nil || !record.started:
@@ -598,6 +620,120 @@ func TestGateRequiredModeFailsClosedWithoutIntegrationEnv(t *testing.T) {
 				gateModeEnv, gateModeEnv, gateModeRequired, sample.output)
 		}
 	})
+}
+
+// task33GateCases are the failure/recovery cases this task added. They must be
+// un-citable as green evidence without the integration env, exactly like the
+// original §23.3 cases.
+var task33GateCases = []string{
+	"TestRealFRPGatewayRestartServesNothingUntilSnapshotAndPresence",
+	"TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams",
+	"TestRealFRPAgentRestartDuringIdleAndActiveTransfers",
+	"TestRealFRPDirectFailureAfterNavigationRecoversThroughCanonicalRelayLink",
+	"TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream",
+	"TestRealFRPRevokeDuringLongTransferClosesEstablishedStream",
+	"TestRealFRPPresenceExpiryWithoutCloseProxy",
+}
+
+// TestGateRequiredModeCoversTask33Cases is the negative control for the
+// reviewed defect that the Task-33 cases were skippable-as-pass: with no
+// integration env, required mode must fail closed BEFORE running any of them,
+// so a green/skipped package result can never be cited as their evidence.
+func TestGateRequiredModeCoversTask33Cases(t *testing.T) {
+	sample := runIntegrationGoTest(t,
+		[]string{"-run", "^(" + strings.Join(task33GateCases, "|") + ")$", "-count=1", "-v"},
+		[]string{integrationEnv}, map[string]string{gateModeEnv: gateModeRequired})
+	if sample.exitCode == 0 {
+		t.Fatalf("required gate mode exited 0 with %s unset for the Task-33 cases; they could be cited as evidence without running.\noutput:\n%s",
+			integrationEnv, sample.output)
+	}
+	if strings.Contains(sample.output, "=== RUN") {
+		t.Errorf("required-mode failure still started Task-33 cases:\n%s", sample.output)
+	}
+	if !strings.Contains(sample.output, integrationEnv) {
+		t.Errorf("required-mode failure does not name the missing %s:\n%s", integrationEnv, sample.output)
+	}
+}
+
+// TestFailureSuiteCasesAreGateRegistered is the anti-omission guard: every
+// real-FRP case defined in failure_test.go and relay_test.go must call
+// beginGateCase and appear in requiredGateCases. Without this, a new case (or
+// a dropped registration) could run or skip outside the required-mode gate and
+// still be reported as evidence.
+func TestFailureSuiteCasesAreGateRegistered(t *testing.T) {
+	required := make(map[string]bool, len(requiredGateCases))
+	for _, name := range requiredGateCases {
+		required[name] = true
+	}
+	parsed := 0
+	for _, path := range []string{"failure_test.go", "relay_test.go"} {
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Recv != nil || !strings.HasPrefix(function.Name.Name, "Test") {
+				continue
+			}
+			parsed++
+			if !required[function.Name.Name] {
+				t.Errorf("%s: %s is not registered in requiredGateCases; an unset env or a dropped case could be cited as evidence", path, function.Name.Name)
+			}
+			if !callsBeginGateCase(function) {
+				t.Errorf("%s: %s does not call beginGateCase; a skip or early exit would be invisible at gate exit", path, function.Name.Name)
+			}
+		}
+	}
+	if parsed != len(requiredGateCases) {
+		t.Fatalf("parsed %d real-FRP test functions but requiredGateCases lists %d", parsed, len(requiredGateCases))
+	}
+}
+
+// callsBeginGateCase reports whether the function body contains a
+// beginGateCase call (deferred or otherwise).
+func callsBeginGateCase(function *ast.FuncDecl) bool {
+	found := false
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if identifier, ok := call.Fun.(*ast.Ident); ok && identifier.Name == "beginGateCase" {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// TestGateCaseRegistryFailsClosedOnMissingSkippedAndFailedCases is the
+// in-process negative control for the required-mode registry: a case that
+// never started, a skipped case, and a failed case are all violations, while a
+// cleanly completed case is not.
+func TestGateCaseRegistryFailsClosedOnMissingSkippedAndFailedCases(t *testing.T) {
+	registry := &gateCaseRegistry{records: make(map[string]*gateCaseRecord)}
+	registry.start("TestClean")
+	registry.finish("TestClean", false, false)
+	registry.start("TestSkipped")
+	registry.finish("TestSkipped", true, false)
+	registry.start("TestFailed")
+	registry.finish("TestFailed", false, true)
+	// TestMissing never starts.
+
+	violations := registry.violationsFor([]string{"TestClean", "TestSkipped", "TestFailed", "TestMissing"})
+	joined := strings.Join(violations, "\n")
+	if len(violations) != 3 {
+		t.Fatalf("violations = %v, want exactly 3 (skipped, failed, missing)", violations)
+	}
+	for _, want := range []string{"TestSkipped: skipped", "TestFailed: failed", "TestMissing: did not execute"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("violations %v missing %q", violations, want)
+		}
+	}
+	if strings.Contains(joined, "TestClean") {
+		t.Errorf("a cleanly completed case was reported as a violation: %v", violations)
+	}
 }
 
 // poisonedFRPCache builds a cache directory that satisfies the fetch script's
