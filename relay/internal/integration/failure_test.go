@@ -681,6 +681,87 @@ func TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel(t *testi
 	waitOffline(t, s, replacement, 10*time.Second)
 }
 
+// TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay pins
+// CREDENTIAL precision — not merely generation precision — of the §15.2
+// production trigger on the real data plane. A same-generation re-credential
+// (fresh one-use credential, strictly newer issued-at) is admitted as an
+// authoritative replacement of the previous session at the SAME (agent, relay
+// port, generation) join key; this is the normal post-exit recovery path. A
+// delayed replay of the SUPERSEDED credential therefore names a dead session
+// whose join key is now held by a healthy replacement, so it must be a no-op:
+// the replacement's presence, its established stream and its public path all
+// survive and nothing is drained. Only a replay of the credential that IS the
+// current recorded identity clears the session. Without credential identity
+// the replay clears the identical join key and tears the healthy replacement
+// down, which is exactly the A1/A2 defect this case guards.
+func TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay(t *testing.T) {
+	defer beginGateCase(t)()
+	requireIntegration(t)
+	s, spec := startPrimaryStack(t)
+
+	// Capture the exact burned credential of the first session, then replace it
+	// with a fresh credential for the SAME (agent, port, generation).
+	staleToken := s.tunnelToken(t, spec.label)
+	s.stopTunnelGraceful(spec.label)
+	waitRelayPortReleased(t, spec.proxyPort, 10*time.Second)
+	// The dead session's presence must be absent before the replacement is
+	// admitted at the SAME join key. Otherwise "online" could still describe
+	// the dead session rather than the replacement, and the established-stream
+	// assertion would race the new tunnel's registration.
+	waitOffline(t, s, spec, 15*time.Second)
+	replacement := spec
+	replacement.label = "same-generation-replacement"
+	// replacement.generation is deliberately left equal to spec.generation.
+	s.startTunnel(replacement)
+	s.applyRoute(s.relayHost, replacement, 2)
+	s.waitOnline(replacement, setupTimeout)
+	s.waitRouteReady(s.relayHost, setupTimeout)
+
+	baseline := runtime.NumGoroutine()
+	established, slowClient := openSlowRelayRequest(t, s)
+	if s.streams.Len() != 1 {
+		t.Fatalf("gateway stream registry holds %d streams, want the established 1", s.streams.Len())
+	}
+
+	// The superseded same-generation credential is replayed while its
+	// replacement is healthy. The reset names the same join key, so only
+	// credential precision can keep the healthy session alive.
+	s.replayLoginCredential(t, staleToken, spec, "run-stale-same-generation-replay")
+
+	// Bounded observation: the healthy same-generation replacement must remain
+	// online. The old join-key-only reset cleared it immediately, so this fails
+	// as soon as the imprecise reset is dispatched.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !s.presence.Online(replacement.agentID, replacement.proxyPort, uint64(replacement.generation)) {
+			t.Fatalf("a delayed replay of the superseded same-generation credential cleared the healthy replacement session")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The established stream and the public path both survive the replay.
+	requireStreamStaysOpen(t, "same-generation stale-credential replay", established, 1500*time.Millisecond)
+	if s.streams.Len() != 1 {
+		t.Fatalf("gateway stream registry holds %d streams after the stale same-generation replay, want the established 1 preserved", s.streams.Len())
+	}
+	client := s.newRelayClient(tls.VersionTLS12, tls.VersionTLS13, []string{"http/1.1"}, 2).client
+	resp := doGet(t, client, s.relayURL("/s/"+fixtureCode+"/items"), nil)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("relay status after the stale same-generation replay = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	established.Body.Close()
+	slowClient.CloseIdleConnections()
+	requireGoroutinesReturn(t, baseline, 8, "same-generation replay precision", 5*time.Second)
+
+	// A genuine reset still works: replaying the credential that IS the current
+	// recorded identity clears the session it names.
+	s.replayLoginCredential(t, s.tunnelToken(t, replacement.label), replacement, "run-live-same-generation-replay")
+	waitOffline(t, s, replacement, 10*time.Second)
+}
+
 // TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream proves §15.4:
 // when control cannot renew route state, the finite 120-second route lease
 // expiry blocks only NEW connections; established streams keep running under

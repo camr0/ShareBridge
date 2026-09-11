@@ -750,6 +750,9 @@ type relayStack struct {
 	jti  int
 	mu   sync.Mutex
 	logs *syncBuffer
+	// issuedAtBase is the deterministic strictly-increasing issued-at base for
+	// credentials this stack signs (see startTunnel).
+	issuedAtBase time.Time
 
 	frpsPath string
 	frpcPath string
@@ -820,6 +823,12 @@ func newRelayStackWithClock(t *testing.T, now func() time.Time) *relayStack {
 		frpsPath: frpsPath,
 		frpcPath: frpcPath,
 		tunnels:  make(map[string]*tunnel),
+		// Deterministic strictly-increasing credential issued-at base: every
+		// credential this stack signs is newer than the one before it, so a
+		// same-generation re-credential always clears the plugin's
+		// strictly-newer admission fence (production control issues a fresh
+		// credential on the same clock for the normal post-exit recovery path).
+		issuedAtBase: time.Now().Add(-4 * time.Minute),
 	}
 	s.relayHost = fmt.Sprintf("%s.relay.%s.%s", fixtureCode, fixtureNamespace, fixtureBase)
 	s.directHost = fmt.Sprintf("%s.%s.%s", fixtureCode, fixtureNamespace, fixtureBase)
@@ -1047,10 +1056,11 @@ func (s *relayStack) startTunnel(spec tunnelSpec) *tunnel {
 	s.t.Helper()
 	s.mu.Lock()
 	s.jti++
+	issuedAt := s.issuedAtBase.Add(time.Duration(s.jti) * time.Second)
 	jti := fmt.Sprintf("%s-%d", spec.label, s.jti)
 	s.mu.Unlock()
 
-	token := s.signCredential(spec.proxyPort, spec.agentID, spec.namespace, spec.generation, jti)
+	token := s.signCredential(spec.proxyPort, spec.agentID, spec.namespace, spec.generation, jti, issuedAt)
 	adminPort := s.allocPort(s.t)
 	configPath := filepath.Join(s.dir, "frpc-"+spec.label+".toml")
 	config := fmt.Sprintf(`serverAddr = "127.0.0.1"
@@ -1142,9 +1152,8 @@ func (s *relayStack) waitRouteReady(hostname string, timeout time.Duration) {
 	s.t.Fatalf("route %s never became routable: %v", hostname, lastErr)
 }
 
-func (s *relayStack) signCredential(port int, agentID, namespace string, generation int, jti string) string {
+func (s *relayStack) signCredential(port int, agentID, namespace string, generation int, jti string, issuedAt time.Time) string {
 	s.t.Helper()
-	now := time.Now()
 	claims := map[string]any{
 		"iss":             "sharebridge-control",
 		"aud":             "sharebridge-relay",
@@ -1154,8 +1163,8 @@ func (s *relayStack) signCredential(port int, agentID, namespace string, generat
 		"proxy_name":      "sb-" + namespace,
 		"relay_port":      port,
 		"generation":      generation,
-		"issued_at":       now.Add(-time.Minute).UTC(),
-		"expires_at":      now.Add(9 * time.Minute).UTC(),
+		"issued_at":       issuedAt.UTC(),
+		"expires_at":      issuedAt.Add(9 * time.Minute).UTC(),
 		"jti":             jti,
 	}
 	payload, err := json.Marshal(claims)

@@ -181,6 +181,16 @@ type tunnelState struct {
 	proxyAuthorized bool
 	online          bool
 	leaseExpiresAt  time.Time
+	// credentialJTI and credentialIssuedAt are the identity of the credential
+	// whose accepted Login created this session. The credential — not the
+	// (agent, relay port, generation) join key — is the identity of an FRP
+	// session: a same-generation re-credential replaces the session at the
+	// same key, so a SessionReset fact clears this entry only when its
+	// credential identity matches the currently recorded one. A replay of a
+	// superseded credential (same generation or not) therefore matches
+	// nothing and is a no-op.
+	credentialJTI      string
+	credentialIssuedAt time.Time
 	// lastPingAt anchors the lease at the last authenticated Ping of the
 	// exact current session (matching run id, proxy-authorized): the 45-second
 	// lease expires from that timestamp, never from confirmation, so the ≤2.5
@@ -314,8 +324,9 @@ func (registry *Registry) ObserveFRPEvent(fact frpplugin.PresenceFact) {
 	// §15.2 production trigger: the plugin observed a Login re-presenting an
 	// already-burned one-use credential — the agent's frpc reconnecting after
 	// its FRP session was reset. That credential is evidence about the exact
-	// session it belonged to, not about the agent's whole presence, so only
-	// that session's join key is cleared (see clearSession).
+	// session it created, not about the agent's whole presence, so only that
+	// session — matched by its recorded credential identity — is cleared (see
+	// clearSession).
 	if fact.Operation == frpplugin.OperationSessionReset {
 		registry.clearSession(fact)
 		return
@@ -382,9 +393,11 @@ func (registry *Registry) observeLogin(key tunnelKey, fact frpplugin.PresenceFac
 		registry.agentHighWater[key.agentRecordID] = key.generation
 	}
 	registry.tunnels[key] = &tunnelState{
-		proxyName: fact.ProxyName,
-		runID:     fact.RunID,
-		loginSeen: true,
+		proxyName:          fact.ProxyName,
+		runID:              fact.RunID,
+		loginSeen:          true,
+		credentialJTI:      fact.CredentialJTI,
+		credentialIssuedAt: fact.CredentialIssuedAt,
 	}
 }
 
@@ -609,19 +622,32 @@ func (registry *Registry) ClearAll() {
 
 // clearSession implements the §15.2 per-session production trigger invoked by
 // the FRP plugin's SessionReset fact. The re-presented one-use credential is
-// evidence that the session that credential belonged to is dead — NOT that the
-// agent's whole presence is stale — so exactly the named
-// (agent record, relay port, generation) join key is cleared. Every other key
-// of the agent is untouched: in particular a healthy newer-generation tunnel
-// that already superseded the replayed credential is a different join key and
-// can never be torn down by a stale replay.
+// evidence that the session that credential created is dead — NOT that the
+// agent's whole presence is stale — so the reset clears exactly the session
+// whose recorded credential identity matches the replayed credential. Two
+// guards are required because a session can be replaced without changing its
+// join key:
 //
-// The agent's established streams are drained only when the clear leaves no
-// live session for that agent at all, after the presence mutation has
-// committed (the same mutate-before-drain ordering and lock discipline as
-// ClearAll, so CloseAgent is never called under registry.mu). A reset naming a
-// session that is not present — already fenced, replaced, or never confirmed —
-// is a no-op and drains nothing.
+//  1. The (agent record, relay port, generation) join key must exist. A
+//     credential a healthy replacement GENERATION superseded names a key that
+//     is gone (every accepted Login deletes all of the agent's entries before
+//     recording the new session, and the agent-level high-water fence ignores
+//     lower generations), so that replay is a no-op.
+//  2. The entry's recorded credential identity (JTI and issued-at) must equal
+//     the replayed credential's identity. A same-generation re-credential —
+//     the normal post-exit recovery path — REPLACES the session at the same
+//     join key, so without this check a delayed replay of the superseded
+//     credential would clear the healthy replacement. The identity makes the
+//     reset credential-precise: an older credential matches nothing and is a
+//     no-op, while a replay of the credential that IS the current recorded
+//     identity still clears the dead session.
+//
+// Every other key of the agent is untouched. The agent's established streams
+// are drained only when the clear leaves no live session for that agent at
+// all, after the presence mutation has committed (the same mutate-before-drain
+// ordering and lock discipline as ClearAll, so CloseAgent is never called
+// under registry.mu). A reset naming a session that is not present — already
+// fenced, replaced, or never confirmed — is a no-op and drains nothing.
 func (registry *Registry) clearSession(fact frpplugin.PresenceFact) {
 	key := tunnelKey{
 		agentRecordID: fact.AgentRecordID,
@@ -631,6 +657,14 @@ func (registry *Registry) clearSession(fact frpplugin.PresenceFact) {
 	registry.mu.Lock()
 	tunnel := registry.tunnels[key]
 	if tunnel == nil {
+		registry.mu.Unlock()
+		return
+	}
+	// Fail closed on an identityless reset: production always carries the
+	// replayed credential's identity, so a reset without one clears nothing
+	// rather than risk clearing a healthy replacement at the same join key.
+	if tunnel.credentialJTI == "" || tunnel.credentialJTI != fact.CredentialJTI ||
+		!tunnel.credentialIssuedAt.Equal(fact.CredentialIssuedAt) {
 		registry.mu.Unlock()
 		return
 	}

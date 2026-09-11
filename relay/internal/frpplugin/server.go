@@ -40,10 +40,12 @@ const (
 	// exact credential created is gone (frps restarted and the agent's frpc
 	// reconnected), so the presence registry clears that session's join key
 	// immediately instead of waiting out the 45-second lease. It is scoped to
-	// the credential's own agent/port/generation identity — never to the whole
-	// agent — so a stale replay can never tear down a healthy newer-generation
-	// tunnel. It is not an authorization op and carries only the rejected
-	// credential's bounded identity.
+	// the credential's own identity — the credential's JTI and issued-at, and
+	// its agent/port/generation join key — never to the whole agent, so a stale
+	// replay can never tear down a healthy newer-generation tunnel OR a healthy
+	// same-generation replacement that superseded the replayed credential. It
+	// is not an authorization op and carries only the rejected credential's
+	// bounded identity.
 	OperationSessionReset = "SessionReset"
 
 	// APIPath is configured as the HTTP server-plugin path in frps.
@@ -90,16 +92,19 @@ const (
 // presence registry. Login/NewProxy/CloseProxy/Ping facts confirm only that
 // the FRP plugin authorized those calls. SessionReset is the §15.2 lifecycle
 // fact emitted when a Login re-presents an already-burned one-use credential:
-// it names exactly the (agent record, relay port, generation) session that
-// credential belonged to, never the whole agent, so only that session is
-// cleared. NewUserConn is the readiness-only
+// it names exactly the credential that belonged to the dead session (its JTI
+// and issued-at) plus that session's (agent record, relay port, generation)
+// join key, never the whole agent, so only that session is cleared and a
+// healthy replacement — even one that re-credentialed at the same generation —
+// is preserved. NewUserConn is the readiness-only
 // correlation fact (Task 7 amendment): frps fires it from the accept loop of
 // a listener it actually bound, and the registry confirms readiness only when
 // its four correlation fields (proxy name, server-assigned run id, generation
 // metadata, and remote_addr — the gateway probe socket's source address as
 // seen by frps) match the exact current generation. Each fact contains only
 // bounded routing identity and lifecycle data validated at the FRP boundary;
-// never credential material.
+// never credential material (the JTI is an opaque one-use identifier, not a
+// token, and is the same value the admission state file persists).
 type PresenceFact struct {
 	Operation     string `json:"operation"`
 	AgentRecordID string `json:"agent_record_id"`
@@ -111,6 +116,22 @@ type PresenceFact struct {
 	// RemoteAddr is the NewUserConn correlation address ("ip:port" as seen
 	// by frps); empty for all other operations.
 	RemoteAddr string `json:"remote_addr,omitempty"`
+	// CredentialJTI is the opaque one-use identifier of the credential this
+	// fact was derived from. It is a bounded identifier, never credential
+	// material (the admission state file persists the same identifiers). The
+	// credential — not the (agent, relay port, generation) join key — is the
+	// identity of an FRP session, so the SessionReset fact carries the
+	// REPLAYED credential's JTI: the presence registry records the JTI of the
+	// credential whose Login was admitted and clears the session only when the
+	// replayed credential's identity matches it. A delayed replay of a
+	// superseded same-generation credential therefore matches nothing and is a
+	// no-op, while a replay of the session's own (now dead) credential still
+	// clears it.
+	CredentialJTI string `json:"credential_jti,omitempty"`
+	// CredentialIssuedAt is the credential's issued-at ordering stamp, carried
+	// with the JTI so the recorded identity is complete. Empty for facts built
+	// before a credential is verified (never in production).
+	CredentialIssuedAt time.Time `json:"credential_issued_at,omitempty"`
 }
 
 // PresenceEvents is deliberately small so Task 14 can attach the leased
@@ -669,14 +690,16 @@ func (server *Server) handleNewUserConn(rawContent json.RawMessage) {
 	}
 	server.userConnSeen[sum] = struct{}{}
 	server.eventQueue <- PresenceFact{
-		Operation:     OperationNewUserConn,
-		AgentRecordID: session.claims.AgentRecordID,
-		Namespace:     session.claims.Namespace,
-		ProxyName:     content.ProxyName,
-		RelayPort:     session.claims.RelayPort,
-		Generation:    session.claims.Generation,
-		RunID:         content.User.RunID,
-		RemoteAddr:    content.RemoteAddr,
+		Operation:          OperationNewUserConn,
+		AgentRecordID:      session.claims.AgentRecordID,
+		Namespace:          session.claims.Namespace,
+		ProxyName:          content.ProxyName,
+		RelayPort:          session.claims.RelayPort,
+		Generation:         session.claims.Generation,
+		RunID:              content.User.RunID,
+		RemoteAddr:         content.RemoteAddr,
+		CredentialJTI:      session.claims.JTI,
+		CredentialIssuedAt: session.claims.IssuedAt,
 	}
 }
 
@@ -923,13 +946,15 @@ func (server *Server) emitReservedLocked(operation string, claims CredentialClai
 // bounded, already-validated identity.
 func presenceFactFor(operation string, claims CredentialClaims, runID string) PresenceFact {
 	return PresenceFact{
-		Operation:     operation,
-		AgentRecordID: claims.AgentRecordID,
-		Namespace:     claims.Namespace,
-		ProxyName:     claims.ProxyName,
-		RelayPort:     claims.RelayPort,
-		Generation:    claims.Generation,
-		RunID:         runID,
+		Operation:          operation,
+		AgentRecordID:      claims.AgentRecordID,
+		Namespace:          claims.Namespace,
+		ProxyName:          claims.ProxyName,
+		RelayPort:          claims.RelayPort,
+		Generation:         claims.Generation,
+		RunID:              runID,
+		CredentialJTI:      claims.JTI,
+		CredentialIssuedAt: claims.IssuedAt,
 	}
 }
 

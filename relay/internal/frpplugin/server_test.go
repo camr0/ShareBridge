@@ -546,6 +546,14 @@ func TestPluginStaleSessionReplayEmitsResetFact(t *testing.T) {
 		reset.Generation != fixture.claims.Generation || reset.ProxyName != fixture.claims.ProxyName {
 		t.Fatalf("reset fact identity = %+v, want the rejected credential's agent/port/generation/proxy", reset)
 	}
+	// The reset must carry the REPLAYED credential's identity — not merely its
+	// agent/port/generation join key — so the presence registry can tell "the
+	// session this credential created is dead" apart from "a healthy
+	// same-generation replacement now holds this join key".
+	if reset.CredentialJTI != fixture.claims.JTI || !reset.CredentialIssuedAt.Equal(fixture.claims.IssuedAt) {
+		t.Fatalf("reset credential identity = jti %q issuedAt %v, want the replayed credential's jti %q issuedAt %v",
+			reset.CredentialJTI, reset.CredentialIssuedAt, fixture.claims.JTI, fixture.claims.IssuedAt)
+	}
 
 	// A non-replay rejection (expired credential) must not emit a reset: it is
 	// not evidence that a live FRP session was reset.
@@ -615,6 +623,42 @@ func TestPluginSessionResetSurvivesDispatcherSaturation(t *testing.T) {
 	if events[1].AgentRecordID != fixture.claims.AgentRecordID || events[1].RelayPort != fixture.claims.RelayPort ||
 		events[1].Generation != fixture.claims.Generation {
 		t.Fatalf("back-pressured reset identity = %+v, want the rejected credential's agent/port/generation", events[1])
+	}
+}
+
+// TestPluginSessionResetNamesTheReplayedCredentialAtSameGeneration pins that
+// the §15.2 reset fact carries the identity of the credential that was
+// actually replayed, even after a fresh one-use credential has replaced it at
+// the same generation. Two sessions can share the (agent, relay port,
+// generation) join key, so the registry needs the credential identity to
+// distinguish the dead session from its healthy same-generation replacement.
+func TestPluginSessionResetNamesTheReplayedCredentialAtSameGeneration(t *testing.T) {
+	fixture := newPluginFixture(t)
+	loginFixture(t, fixture) // generation 1, jti-one
+	fixture.recorder.waitForCount(t, 1)
+
+	// A strictly newer same-generation credential replaces jti-one.
+	newer := validTestClaims(1, "jti-newer")
+	newer.IssuedAt = fixture.claims.IssuedAt.Add(time.Second)
+	newer.ExpiresAt = newer.IssuedAt.Add(10 * time.Minute)
+	newerToken := signTestCredential(t, fixture.privateKey, newer)
+	fixture.runID = "run-newer"
+	requireAllowed(t, fixture.request(OperationLogin, fixture.loginContent(newerToken, newer)))
+	fixture.recorder.waitForCount(t, 2)
+
+	// Replay the superseded first credential: the reset must name IT, not the
+	// replacement that currently holds the join key.
+	fixture.runID = "run-replay"
+	requireRejected(t, fixture.request(OperationLogin, fixture.loginContent(fixture.token, fixture.claims)))
+
+	events := fixture.recorder.waitForCount(t, 3)
+	reset := events[2]
+	if reset.Operation != OperationSessionReset {
+		t.Fatalf("replay fact operation = %q, want %q", reset.Operation, OperationSessionReset)
+	}
+	if reset.CredentialJTI != "jti-one" || !reset.CredentialIssuedAt.Equal(fixture.claims.IssuedAt) {
+		t.Fatalf("reset credential identity = jti %q issuedAt %v, want the REPLAYED credential jti-one issuedAt %v",
+			reset.CredentialJTI, reset.CredentialIssuedAt, fixture.claims.IssuedAt)
 	}
 }
 

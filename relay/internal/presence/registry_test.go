@@ -125,15 +125,25 @@ func newRegistryFixture(t *testing.T, mutate ...func(*Config)) *registryFixture 
 	return fixture
 }
 
+// testFact builds a fact whose credential identity is derived from its run id,
+// so a Login and a later SessionReset for the same run id carry the same
+// credential identity (the registry records the identity at Login and matches
+// it at reset).
 func testFact(operation string, generation int, runID string) frpplugin.PresenceFact {
+	return testFactCredential(operation, generation, runID, "jti-"+runID, testNow.Add(-time.Minute))
+}
+
+func testFactCredential(operation string, generation int, runID, jti string, issuedAt time.Time) frpplugin.PresenceFact {
 	return frpplugin.PresenceFact{
-		Operation:     operation,
-		AgentRecordID: testAgent,
-		Namespace:     testNamespace,
-		ProxyName:     testProxy,
-		RelayPort:     testPort,
-		Generation:    generation,
-		RunID:         runID,
+		Operation:          operation,
+		AgentRecordID:      testAgent,
+		Namespace:          testNamespace,
+		ProxyName:          testProxy,
+		RelayPort:          testPort,
+		Generation:         generation,
+		RunID:              runID,
+		CredentialJTI:      jti,
+		CredentialIssuedAt: issuedAt,
 	}
 }
 
@@ -531,13 +541,15 @@ func TestStaleSessionResetClearsOnlyTheNamedAgentAndDrains(t *testing.T) {
 
 	agentFact := func(agentRecordID, operation, runID string) frpplugin.PresenceFact {
 		return frpplugin.PresenceFact{
-			Operation:     operation,
-			AgentRecordID: agentRecordID,
-			Namespace:     testNamespace,
-			ProxyName:     testProxy,
-			RelayPort:     testPort,
-			Generation:    1,
-			RunID:         runID,
+			Operation:          operation,
+			AgentRecordID:      agentRecordID,
+			Namespace:          testNamespace,
+			ProxyName:          testProxy,
+			RelayPort:          testPort,
+			Generation:         1,
+			RunID:              runID,
+			CredentialJTI:      "jti-" + runID,
+			CredentialIssuedAt: testNow.Add(-time.Minute),
 		}
 	}
 	confirm := func(agentRecordID, runID string) {
@@ -555,14 +567,7 @@ func TestStaleSessionResetClearsOnlyTheNamedAgentAndDrains(t *testing.T) {
 		t.Fatal("both agents must be online before the stale-session reset")
 	}
 
-	registry.ObserveFRPEvent(frpplugin.PresenceFact{
-		Operation:     frpplugin.OperationSessionReset,
-		AgentRecordID: testAgent,
-		Namespace:     testNamespace,
-		ProxyName:     testProxy,
-		RelayPort:     testPort,
-		Generation:    1,
-	})
+	registry.ObserveFRPEvent(agentFact(testAgent, frpplugin.OperationSessionReset, "run-1"))
 
 	if registry.Online(testAgent, testPort, 1) {
 		t.Fatal("presence survived the stale-session reset")
@@ -619,10 +624,50 @@ func TestStaleSessionResetDoesNotClearAHealthyReplacementSession(t *testing.T) {
 
 	// The reset still clears the session it actually names: replaying the live
 	// generation-2 credential takes that session offline and drains the agent.
-	fixture.observe(testFact(frpplugin.OperationSessionReset, 2, "run-replay"))
+	fixture.observe(testFactCredential(frpplugin.OperationSessionReset, 2, "run-replay", "jti-run-2", testNow.Add(-time.Minute)))
 	fixture.requireOffline(2)
 	if drains != 1 {
 		t.Fatalf("reset of the live session drained the agent %d time(s), want exactly 1", drains)
+	}
+}
+
+// TestSameGenerationRecredentialResetIsCredentialPrecise pins CREDENTIAL
+// precision (not merely generation precision) of the §15.2 production reset. A
+// same-generation re-credential is the normal post-exit recovery path: a fresh
+// one-use credential replaces the previous session at the SAME (agent record,
+// relay port, generation) join key. Because the credential — not the
+// generation — is the identity of a session, a delayed replay of the
+// superseded same-generation credential names a dead session whose join key is
+// now held by a healthy replacement. That replay must therefore be a no-op:
+// the replacement stays online and nothing is drained. Only a replay of the
+// credential that IS the currently recorded identity clears the session.
+func TestSameGenerationRecredentialResetIsCredentialPrecise(t *testing.T) {
+	drains := 0
+	fixture := newRegistryFixture(t, func(config *Config) {
+		config.Drainer = drainerFunc(func(string) int { drains++; return 1 })
+	})
+	fixture.probe.source = "127.0.0.1:55555"
+
+	// Credential A comes online, then credential B replaces it at the SAME
+	// (agent, port, generation) join key.
+	fixture.registerOnline(1, "run-a", "127.0.0.1:55555")
+	fixture.registerOnline(1, "run-b", "127.0.0.1:55555")
+	fixture.requireOnline(1)
+
+	// A delayed replay of A's (burned, superseded) credential names the same
+	// join key. Only credential precision can keep B alive.
+	fixture.observe(testFactCredential(frpplugin.OperationSessionReset, 1, "run-replay", "jti-run-a", testNow.Add(-time.Minute)))
+	fixture.requireOnline(1)
+	if drains != 0 {
+		t.Fatalf("a superseded same-generation credential replay drained the agent %d time(s); the healthy replacement must survive", drains)
+	}
+
+	// A replay of B's credential — the current recorded identity — is a genuine
+	// reset and clears the session.
+	fixture.observe(testFactCredential(frpplugin.OperationSessionReset, 1, "run-replay", "jti-run-b", testNow.Add(-time.Minute)))
+	fixture.requireOffline(1)
+	if drains != 1 {
+		t.Fatalf("reset of the current same-generation credential drained the agent %d time(s), want exactly 1", drains)
 	}
 }
 

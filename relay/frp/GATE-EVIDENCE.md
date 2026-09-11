@@ -166,19 +166,27 @@ cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
 
 `TestMain` in required mode fails closed (non-zero exit, no case started) when
 `SHAREBRIDGE_FRP_INTEGRATION=1` is unset or the pinned artifacts are missing,
-unpinned, corrupt, or poisoned, and fails after the run when any of the fifteen
+unpinned, corrupt, or poisoned, and fails after the run when any of the sixteen
 named cases did not start and complete — a SKIP is a failure, not a pass.
-Observed (fix round 2): `-short` (which skips the heartbeat case) exits 1 with
-`FAIL: required gate mode: 1 of 15 named §23.3 gate case(s) did not execute
+The authoritative count is `len(requiredGateCases)` in
+`relay/internal/integration/gate_test.go`: **16** (7 original §23.3 cases +
+9 Task-33 failure/recovery cases). Count history: 7 → 14 in Task-33 fix
+round 1 (the failure harness), 14 → 15 in fix round 2
+(`TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel`, the
+generation-precision case), and 15 → 16 in fix round 3
+(`TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay`, the
+credential-precision case). See `task-33-report.md` "Fix round 3".
+Observed (fix round 3): `-short` (which skips the heartbeat case) exits 1 with
+`FAIL: required gate mode: 1 of 16 named §23.3 gate case(s) did not execute
 cleanly: - TestRealFRPRelayPresenceHeartbeatDelayAndExpiry: skipped`, and a
-`-run` subset exits 1 listing the 14 cases that never started. Required mode also
+`-run` subset exits 1 listing the 15 cases that never started. Required mode also
 re-hashes the pinned artifacts at gate time: the verified tarball against
 `manifest.json`, the `frps`/`frpc` extracted from that tarball against the
 staged cache executables, and `frps --version`/`frpc --version` against the
 manifest version.
 
 Default `go test ./...` remains skippable (`SHAREBRIDGE_FRP_INTEGRATION`
-unset ⇒ 15 × SKIP, exit 0). Regression tests prove both directions:
+unset ⇒ 16 × SKIP, exit 0). Regression tests prove both directions:
 `TestGateRequiredModeFailsClosedWithoutIntegrationEnv` (required-without-env
 exits non-zero with a clear message; default-without-env exits 0 with SKIP),
 `TestGateRequiredModeWithoutPinnedCacheFailsClosed` (poisoned cache fails
@@ -197,19 +205,19 @@ GATE(EVIDENCE) tarball.path=…/relay/.cache/frp/downloads/frp_0.71.0_darwin_arm
 GATE(EVIDENCE) frps.path=…/relay/.cache/frp/v0.71.0-sha256-45be02b1…/frps frps.sha256=71a4896060db4a9290bd830f48561334a3660545a0907c29dfade42f91f57037 frps.version=0.71.0
 GATE(EVIDENCE) frpc.path=…/relay/.cache/frp/v0.71.0-sha256-45be02b1…/frpc frpc.sha256=3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48 frpc.version=0.71.0
 GATE(EVIDENCE) cache_artifact_digest_sum=9cb1c154ff8e3e44d7add45e9d06282e460ac04435811f6dc548ba8123266a42
-GATE(EVIDENCE) all 15 named §23.3 gate cases executed to completion
+GATE(EVIDENCE) all 16 named §23.3 gate cases executed to completion
 ```
 
 The run also emitted the three §23.3 byte-parity lines (`-v` prefix
 `relay_test.go:<line>: ` shown exactly as emitted):
 
 ```text
-    relay_test.go:70: §23.3 evidence case=TestRealFRPRelayEndToEndTLS12HTTP11 tlsRecords=2 browserBytes=551 agentBytes=551 extraAtAgent=0 browserSHA256=5bb036fb6f5d0af39c8d898aeb98268247571ed40b3c737a13ed8b9935982402 agentSHA256=5bb036fb6f5d0af39c8d898aeb98268247571ed40b3c737a13ed8b9935982402
-    relay_test.go:108: §23.3 evidence case=TestRealFRPRelayEndToEndTLS13HTTP2 tlsRecords=2 browserBytes=1819 agentBytes=1819 extraAtAgent=0 browserSHA256=82c42fa045314882c84f0be3dfe4b6112ba6ffbe6208865447d6684020c70afd agentSHA256=82c42fa045314882c84f0be3dfe4b6112ba6ffbe6208865447d6684020c70afd
-    relay_test.go:136: §23.3 evidence case=TestRealFRPFragmentedClientHelloReplay tlsRecords=5 browserBytes=1811 agentBytes=1811 extraAtAgent=0 browserSHA256=778377208cc631ddf0ad817cd2352cae7fcd25bc688aae7daa6b0c790ab80622 agentSHA256=778377208cc631ddf0ad817cd2352cae7fcd25bc688aae7daa6b0c790ab80622
+    relay_test.go:70: §23.3 evidence case=TestRealFRPRelayEndToEndTLS12HTTP11 tlsRecords=2 browserBytes=551 agentBytes=551 extraAtAgent=0 browserSHA256=06f844741ef9fe553b8205d9cfd3c42e3271db800fa9a78ea52259b259532650 agentSHA256=06f844741ef9fe553b8205d9cfd3c42e3271db800fa9a78ea52259b259532650
+    relay_test.go:108: §23.3 evidence case=TestRealFRPRelayEndToEndTLS13HTTP2 tlsRecords=2 browserBytes=1819 agentBytes=1819 extraAtAgent=0 browserSHA256=d2e73b5233d1ff5f058fdeba48b1f8b2d33e6f3b4e0e426ecd2a1f0b67eab0e4 agentSHA256=d2e73b5233d1ff5f058fdeba48b1f8b2d33e6f3b4e0e426ecd2a1f0b67eab0e4
+    relay_test.go:136: §23.3 evidence case=TestRealFRPFragmentedClientHelloReplay tlsRecords=5 browserBytes=1811 agentBytes=1811 extraAtAgent=0 browserSHA256=499462c9116371c1b1ff0dc68eeed0d5c709c92bc0e28e77f8ca7fa4c612c42f agentSHA256=499462c9116371c1b1ff0dc68eeed0d5c709c92bc0e28e77f8ca7fa4c612c42f
 ```
 
-`ok  sharebridge/relay/internal/integration  79.521s` (exit 0).
+`ok  sharebridge/relay/internal/integration  85.188s` (exit 0).
 
 (Pin: FRP `v0.71.0`, darwin_arm64; long cache paths shortened to the module
 form for readability — the run prints absolute paths. Every value above is
@@ -237,6 +245,10 @@ emitted by the gate itself; `frps`/`frpc` are staged only by
 - `TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel` (fix
   round 2: a replayed burned credential clears only the session it names, so a
   healthy newer-generation tunnel keeps its presence, streams and public path)
+- `TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay` (fix
+  round 3: the reset is credential-precise, so a delayed replay of a
+  superseded SAME-generation credential does not clear the healthy replacement
+  that re-credentialed at the same agent/port/generation join key)
 - `TestRealFRPDirectOriginFailureMidTransferRecoversThroughCanonicalRelayLink`
   (the direct origin becomes unreachable mid-transfer; recovery through the
   canonical relay link is a fresh, complete, byte-identical transaction)
@@ -244,7 +256,7 @@ emitted by the gate itself; `frps`/`frpc` are staged only by
 - `TestRealFRPRevokeDuringLongTransferClosesEstablishedStream`
 - `TestRealFRPPresenceExpiryWithoutCloseProxy`
 
-The last eight are the Task-33 §18.5 failure/recovery cases; all fifteen are
+The last nine are the Task-33 §18.5 failure/recovery cases; all sixteen are
 listed in `requiredGateCases` and guarded against omission by
 `TestFailureSuiteCasesAreGateRegistered` (it parses `failure_test.go` and
 `relay_test.go`, requires every `Test*` to be registered and to call
@@ -268,13 +280,13 @@ anywhere**. The substantive claim is that the ClientHello spans five real TLS
 records and the gateway replays those records byte-for-byte into a completing
 handshake.
 
-### Digest comparison table (fix round 2, from the required-mode `-race -count=1` run)
+### Digest comparison table (fix round 3, from the required-mode `-race -count=1` run)
 
 | case | TLS / ALPN | ClientHello records | bytes | browser SHA-256 | agent SHA-256 | extraAtAgent |
 | --- | --- | --- | --- | --- | --- | --- |
-| TLS 1.2 / HTTP/1.1 | TLS1.2 / http/1.1 | 2 | 551 | `5bb036fb6f5d0af39c8d898aeb98268247571ed40b3c737a13ed8b9935982402` | `5bb036fb6f5d0af39c8d898aeb98268247571ed40b3c737a13ed8b9935982402` | **0** |
-| TLS 1.3 / HTTP/2 | TLS1.3 / h2 | 2 | 1819 | `82c42fa045314882c84f0be3dfe4b6112ba6ffbe6208865447d6684020c70afd` | `82c42fa045314882c84f0be3dfe4b6112ba6ffbe6208865447d6684020c70afd` | **0** |
-| fragmented replay | TLS1.3 / http/1.1 | 5 | 1811 | `778377208cc631ddf0ad817cd2352cae7fcd25bc688aae7daa6b0c790ab80622` | `778377208cc631ddf0ad817cd2352cae7fcd25bc688aae7daa6b0c790ab80622` | **0** |
+| TLS 1.2 / HTTP/1.1 | TLS1.2 / http/1.1 | 2 | 551 | `06f844741ef9fe553b8205d9cfd3c42e3271db800fa9a78ea52259b259532650` | `06f844741ef9fe553b8205d9cfd3c42e3271db800fa9a78ea52259b259532650` | **0** |
+| TLS 1.3 / HTTP/2 | TLS1.3 / h2 | 2 | 1819 | `d2e73b5233d1ff5f058fdeba48b1f8b2d33e6f3b4e0e426ecd2a1f0b67eab0e4` | `d2e73b5233d1ff5f058fdeba48b1f8b2d33e6f3b4e0e426ecd2a1f0b67eab0e4` | **0** |
+| fragmented replay | TLS1.3 / http/1.1 | 5 | 1811 | `499462c9116371c1b1ff0dc68eeed0d5c709c92bc0e28e77f8ca7fa4c612c42f` | `499462c9116371c1b1ff0dc68eeed0d5c709c92bc0e28e77f8ca7fa4c612c42f` | **0** |
 
 The table is the three `§23.3 evidence case=…` lines quoted verbatim above.
 Digests are per-run (TLS ClientHello randoms/key shares differ every
@@ -331,22 +343,31 @@ cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=1 -timeout 300s \
   -run TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel ./internal/integration
 # FAIL — exit 1: failure_test.go:654: a stale generation-1 credential replay cleared the healthy generation-2 tunnel
 
-# GREEN (§23.3 non-skippable gate, race detector, this revision):
+# RED (fix round 3, tests first) — the reset was not CREDENTIAL-precise:
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=1 -timeout 300s \
+  -run TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay ./internal/integration
+# FAIL — exit 1: failure_test.go:737: a delayed replay of the superseded same-generation credential cleared the healthy replacement session
+# (compile-only RED at the same revision for the new CredentialJTI/CredentialIssuedAt
+#  assertions in internal/presence and internal/frpplugin: the fields did not exist)
+
+# GREEN (§23.3 non-skippable gate, race detector, fix round 3 revision):
 cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
   go test -v -race -count=1 -timeout 900s ./internal/integration
-# PASS — exit 0; "all 15 named §23.3 gate cases executed to completion"; ok 79.521s
+# PASS — exit 0; "all 16 named §23.3 gate cases executed to completion"; ok 85.188s
 
-# GREEN (mandated repetition):
-cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=10 -timeout 2000s ./internal/integration
-# PASS — exit 0; ok 771.515s
+# GREEN (mandated repetition, fix round 3 revision):
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=10 -timeout 30m ./internal/integration
+# PASS — exit 0; ok 818.131s
 
 # Negative controls (proven by the subprocess regression tests, reproducible):
 cd relay && SHAREBRIDGE_FRP_GATE=required go test ./internal/integration -v -count=1
 # FAIL — exit 1: "required gate mode ... needs SHAREBRIDGE_FRP_INTEGRATION=1"
 cd relay && SHAREBRIDGE_FRP_GATE=1 go test ./internal/integration -v -count=1
 # FAIL — exit 1: SHAREBRIDGE_FRP_GATE="1" is not supported; the only gate mode is SHAREBRIDGE_FRP_GATE=required
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required go test -short ./internal/integration -count=1
+# FAIL — exit 1: "1 of 16 named §23.3 gate case(s) did not execute cleanly: - TestRealFRPRelayPresenceHeartbeatDelayAndExpiry: skipped"
 cd relay && go test ./internal/integration -v -count=1
-# PASS — exit 0, 15 × SKIP
+# PASS — exit 0, 16 × SKIP
 ```
 
 ### Verdict
@@ -375,7 +396,7 @@ retained under a misleading name.
 | §23.1 plugin operations / ordering / correlated readiness | **GO** — all five operations invoked with correlation-grade metadata; probe confirms only registered proxies in one attempt; failure/stale/restart cases never confirm; Pings continuing without readiness can no longer present as online |
 | §23.2 loopback / runtime port+proxy enforcement / transport TLS | **GO** — loopback-only binding proven; second-proxy and out-of-range ports rejected at runtime by the plugin and by frps allowPorts respectively; transport TLS fails closed with a pinned untrusted CA |
 | §23.7 Ping cadence / delayed-Ping tolerance / true expiry | **GO** — immediate first Ping, ~10 s cadence, one missed beat tolerated with ≥31 s lease margin, offline only at the true 45 s expiry |
-| §23.3 fragmented TLS 1.2/1.3 + HTTP/1.1/2 replay / content parity | **GO** — required-mode gate over **15** named cases (non-skippable: missing env, a non-`required` gate mode, poisoned pins, skips, and incomplete cases all fail), gate-emitted version + binary SHA-256, non-empty captures with exact length equality and `extraAtAgent=0` for TLS 1.2/HTTP/1.1, TLS 1.3/HTTP/2, and a 5-record record-level fragmented ClientHello; exact routing, content parity, revocation, restart, presence expiry, the frps-reset session-precise clear, and a wired relay-path dial/`/connect` audit. Verified at this revision: `-race -count=1` required gate exit 0 in 79.521s and `-race -count=10` exit 0 in 771.515s |
+| §23.3 fragmented TLS 1.2/1.3 + HTTP/1.1/2 replay / content parity | **GO** — required-mode gate over **16** named cases (non-skippable: missing env, a non-`required` gate mode, poisoned pins, skips, and incomplete cases all fail), gate-emitted version + binary SHA-256, non-empty captures with exact length equality and `extraAtAgent=0` for TLS 1.2/HTTP/1.1, TLS 1.3/HTTP/2, and a 5-record record-level fragmented ClientHello; exact routing, content parity, revocation, restart, presence expiry, the frps-reset session-precise and credential-precise clears, and a wired relay-path dial/`/connect` audit. Verified at this revision: `-race -count=1` required gate exit 0 in 85.188s and `-race -count=10` exit 0 in 818.131s |
 
 Blocking Task 8 does not by itself enable `RELAY_SELECTION_ENABLED`; Task 31
 is now also GO (§23.3 above), and Tasks 24, 25, and 42 plus the Task 44 GO

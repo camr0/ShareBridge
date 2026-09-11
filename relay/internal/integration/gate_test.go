@@ -362,7 +362,12 @@ func (e *gateFRPEvidence) emit(w io.Writer) {
 // Every real-FRP case in failure_test.go and relay_test.go is listed here; an
 // unregistered case would run (or silently skip) without the required-mode gate
 // noticing, so TestFailureSuiteCasesAreGateRegistered guards this list against
-// omission.
+// omission. THIS SLICE IS THE AUTHORITATIVE GATE CASE COUNT: the current count
+// is 16 (7 original §23.3 cases + 9 Task-33 failure/recovery cases). History:
+// 7 -> 14 in fix round 1 (Task-33 harness), 14 -> 15 in fix round 2 (the
+// generation-precision case), 15 -> 16 in fix round 3 (the credential-precision
+// same-generation case). See task-33-report.md "Fix round 3" for the
+// reconciliation.
 var requiredGateCases = []string{
 	"TestRealFRPRelayEndToEndTLS12HTTP11",
 	"TestRealFRPRelayEndToEndTLS13HTTP2",
@@ -375,6 +380,7 @@ var requiredGateCases = []string{
 	"TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams",
 	"TestRealFRPAgentHTTPSReplacementAndFRPCRestartDuringIdleAndActiveTransfers",
 	"TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel",
+	"TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay",
 	"TestRealFRPDirectOriginFailureMidTransferRecoversThroughCanonicalRelayLink",
 	"TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream",
 	"TestRealFRPRevokeDuringLongTransferClosesEstablishedStream",
@@ -574,7 +580,7 @@ func runIntegrationGoTest(t *testing.T, args []string, clear []string, set map[s
 
 // TestGateRequiredModeFailsClosedWithoutIntegrationEnv is the regression for
 // the reviewed defect: before the gate existed, an unset
-// SHAREBRIDGE_FRP_INTEGRATION made all seven named gate tests SKIP and the
+// SHAREBRIDGE_FRP_INTEGRATION made all named gate tests SKIP and the
 // package exit 0, so §23.3 could be cited as GO without a single assertion
 // running. Required mode must exit non-zero with a clear message; default mode
 // must still skip (so plain `go test ./...` stays usable).
@@ -631,6 +637,7 @@ var task33GateCases = []string{
 	"TestRealFRPFRPSRestartClearsPresenceAndTerminatesEstablishedStreams",
 	"TestRealFRPAgentHTTPSReplacementAndFRPCRestartDuringIdleAndActiveTransfers",
 	"TestRealFRPStaleSessionReplayDoesNotClearAHealthyReplacementTunnel",
+	"TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay",
 	"TestRealFRPDirectOriginFailureMidTransferRecoversThroughCanonicalRelayLink",
 	"TestRealFRPControlSyncLossPastRouteLeaseKeepsEstablishedStream",
 	"TestRealFRPRevokeDuringLongTransferClosesEstablishedStream",
