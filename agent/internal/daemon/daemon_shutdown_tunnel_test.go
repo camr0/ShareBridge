@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,4 +136,75 @@ func assertShutdownConnClosed(t *testing.T, conn net.Conn) {
 	if errors.As(readErr, &netErr) && netErr.Timeout() {
 		t.Fatal("established direct connection was not closed within the shutdown deadline")
 	}
+}
+
+// TestDaemonShutdownNotBlockedByWedgedRelayStateSender is the fix-round
+// regression for the audit's exact trigger: an unkillable tunnel child AND a
+// relay_client_state send that ignores its (cooperative) context timeout.
+// Round D bounded the wait for the child, but shutdownChild still emitted the
+// final statuses synchronously, so the wedged send parked the manager run
+// goroutine: Manager.Stop never returned and Daemon.Stop only got past its
+// tunnel lever once the outer lever bound fired — with the wrong error.
+func TestDaemonShutdownNotBlockedByWedgedRelayStateSender(t *testing.T) {
+	const leverBound = 3 * time.Second
+	addr := reserveLoopbackAddr(t)
+	cfg := tunnelTestConfig(t)
+	st := newMockStore()
+	sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+	relayBlock := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSender := func() { releaseOnce.Do(func() { close(relayBlock) }) }
+	sig.relayStateBlock = relayBlock
+	t.Cleanup(releaseSender)
+
+	gate := direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true })
+	d := &Daemon{config: cfg, configMgr: &mockConfigManager{cfg: cfg}, store: st, signaling: sig}
+	d.direct = &directState{
+		ready:      true,
+		gate:       gate,
+		baseDomain: testDirectBase,
+		namespace:  testDirectNS,
+		server:     direct.NewDirectServer(testDirectNS, testDirectBase, nil, nil, gate, 1<<20),
+		origins:    map[string]originPair{},
+		listenAddr: addr,
+	}
+	// Smaller than the killeable-child bound so the assertion is about the
+	// manager's own bound, not the daemon's independent safety net.
+	d.shutdownLeverTimeout = leverBound
+
+	starter := &recordingTunnelStarter{stopsOnGraceful: false, ignoresKill: true}
+	d.startTunnelManager(context.Background(),
+		tunnel.WithProcessStarter(starter.start),
+		tunnel.WithBackoffBase(time.Millisecond),
+		tunnel.WithKillGracePeriod(10*time.Millisecond),
+		tunnel.WithKillWaitTimeout(60*time.Millisecond),
+		tunnel.WithStatusDrainTimeout(50*time.Millisecond),
+		tunnel.WithCredentialWaitTimeout(time.Hour),
+		tunnel.WithRunningStabilityWindow(time.Hour),
+	)
+	t.Cleanup(func() { _ = d.stopTunnelManager() })
+
+	d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-generation-one"))
+	waitForCond(t, func() bool { return starter.startCount() == 1 })
+	d.handleSignalingMessage(signaling.Message{Type: "enrollment_ready"})
+	waitDialable(t, addr)
+
+	started := time.Now()
+	err := d.Stop()
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("Daemon.Stop() = nil; the tunnel stop failure must be surfaced")
+	}
+	if !errors.Is(err, tunnel.ErrChildKillTimeout) {
+		t.Fatalf("Daemon.Stop() error = %q, want the manager's precise ErrChildKillTimeout", err)
+	}
+	if elapsed >= leverBound {
+		t.Fatalf("Daemon.Stop() waited %v; a wedged relay_client_state send must not push it to the %v lever bound", elapsed, leverBound)
+	}
+
+	// The remaining levers still ran while the sender stayed wedged.
+	assertShutdownListenerClosed(t, addr)
+
+	releaseSender()
+	starter.recordAt(0).child.signalExit(nil)
 }

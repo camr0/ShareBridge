@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os/exec"
 	"strings"
@@ -30,6 +31,27 @@ const (
 	// (audit I4) and, because shutdown stopped the tunnel before the HTTPS
 	// listener, leave the listener serving indefinitely.
 	defaultKillWaitTimeout = 2 * time.Second
+	// defaultChildSignalTimeout bounds each child signal CALL (graceful stop,
+	// kill). The calls are process/OS interactions and return promptly in
+	// practice; the bound exists so a call that never returns cannot strand
+	// shutdown (Round D fix-round, audit A: "GracefulStop, Kill ... remain
+	// unbounded by Manager-owned timers").
+	defaultChildSignalTimeout = 1 * time.Second
+	// defaultStatusDrainTimeout bounds how long shutdown waits for the status
+	// emission worker to deliver the reports already queued. A control-facing
+	// status callback that blocks (production: a relay_client_state send whose
+	// context timeout is cooperative) is abandoned at the bound instead of
+	// parking the supervision loop (Round D fix-round, audit A).
+	defaultStatusDrainTimeout = 1 * time.Second
+	// defaultStatusQueueSize is the bounded emission queue: enough headroom
+	// for the manager's low-rate transitions with a responsive callback, small
+	// enough that a wedged callback cannot accumulate unbounded reports.
+	defaultStatusQueueSize = 64
+	// defaultStopMargin is the slack Stop allows the supervision loop beyond
+	// its own worst-case bounded shutdown before Stop stops waiting and reports
+	// the failure itself. It only absorbs scheduling latency: the loop's bound
+	// is derived from the same knobs.
+	defaultStopMargin = 250 * time.Millisecond
 	// RunningStabilityWindow: a child that stays up this long is reported as
 	// "running". This is process-liveness telemetry only (§7.4): control
 	// never treats it as relay availability — the gateway presence view
@@ -50,6 +72,12 @@ var errManagerStopped = errors.New("tunnel manager stopped")
 // not exited within the bounded post-kill wait. Callers distinguish an
 // unkillable child from other shutdown failures with errors.Is (audit I4).
 var ErrChildKillTimeout = errors.New("tunnel child kill timed out")
+
+// ErrChildSignalTimeout is returned (wrapped) by Manager.Stop when a child
+// signal call (graceful stop or kill) did not return within the
+// Manager-owned bound: the process/OS interaction itself is wedged, so the
+// child's stop could not be driven to completion (Round D fix-round).
+var ErrChildSignalTimeout = errors.New("tunnel child signal timed out")
 
 // StatusKind is the closed telemetry status set of the §11.1
 // relay_client_state message: "starting", "running", "stopped", "error".
@@ -309,6 +337,8 @@ type Manager struct {
 	backoffBase            time.Duration
 	killGrace              time.Duration
 	killWait               time.Duration
+	childSignalTimeout     time.Duration
+	statusDrainTimeout     time.Duration
 	credentialWaitTimeout  time.Duration
 	runningStabilityWindow time.Duration
 
@@ -321,10 +351,32 @@ type Manager struct {
 	stopOnce    sync.Once
 	stopped     bool // set under stopOnce before stopChannel closes
 	// stopErr records the outcome of the shutdown stop so every Stop caller
-	// observes the SAME explicit error. Written by the run goroutine before
-	// doneChannel closes and read only after <-doneChannel, so the channel
-	// close provides the happens-before edge (no extra lock).
+	// that observes doneChannel observes the SAME explicit error. Written by
+	// the run goroutine before doneChannel closes and read only after
+	// <-doneChannel, so the channel close provides the happens-before edge (no
+	// extra lock). A Stop caller whose own bound expires never reads it.
 	stopErr error
+	// statusQueue carries status reports to the single emission worker, which
+	// invokes onStatus strictly in FIFO order. Emission is asynchronous so a
+	// blocking callback can never wedge the supervision loop or shutdown
+	// (Round D fix-round, audit A).
+	statusQueue chan StatusReport
+	// emitStop asks the worker to drain what is queued and exit; emitDone
+	// closes when it has. Both are closed/written only through
+	// finalizeStatus/emitStopOnce.
+	emitStop     chan struct{}
+	emitDone     chan struct{}
+	emitStopOnce sync.Once
+	// emitMu guards emissionOpen. It is only ever held for the flag check and
+	// a non-blocking channel send — never across a wait — so it cannot
+	// deadlock shutdown or the direct-serve handoff.
+	emitMu       sync.Mutex
+	emissionOpen bool
+	// droppedStatus counts status reports that were never delivered: either
+	// the bounded queue was full (the callback cannot keep up) or shutdown's
+	// bounded drain expired with reports still queued. Every drop is also
+	// logged, so a loss is never silent.
+	droppedStatus atomic.Uint64
 	// publishedGeneration mirrors the armed generation for callers: -1 until
 	// a first configuration is armed, otherwise the current generation. It
 	// lets ApplyConfig reject stale generations synchronously.
@@ -395,6 +447,20 @@ func WithKillWaitTimeout(timeout time.Duration) ManagerOption {
 	return withKillWaitTimeout(timeout)
 }
 
+// WithChildSignalTimeout is the exported form of withChildSignalTimeout: the
+// bound on each child signal call (graceful stop, kill) before Stop surfaces
+// ErrChildSignalTimeout (Round D fix-round, audit A).
+func WithChildSignalTimeout(timeout time.Duration) ManagerOption {
+	return withChildSignalTimeout(timeout)
+}
+
+// WithStatusDrainTimeout is the exported form of withStatusDrainTimeout: the
+// bound on delivering the status reports queued at shutdown before the wedged
+// callback is abandoned (Round D fix-round, audit A).
+func WithStatusDrainTimeout(timeout time.Duration) ManagerOption {
+	return withStatusDrainTimeout(timeout)
+}
+
 // WithCredentialWaitTimeout is the exported form of withCredentialWaitTimeout
 // (how long the manager waits for control's relay_config before re-requesting).
 func WithCredentialWaitTimeout(timeout time.Duration) ManagerOption {
@@ -423,6 +489,20 @@ func withKillWaitTimeout(timeout time.Duration) ManagerOption {
 	return func(manager *Manager) { manager.killWait = timeout }
 }
 
+func withChildSignalTimeout(timeout time.Duration) ManagerOption {
+	return func(manager *Manager) { manager.childSignalTimeout = timeout }
+}
+
+func withStatusDrainTimeout(timeout time.Duration) ManagerOption {
+	return func(manager *Manager) { manager.statusDrainTimeout = timeout }
+}
+
+// withStatusQueueSize shrinks the bounded emission queue (test seam for the
+// overflow/drop path).
+func withStatusQueueSize(size int) ManagerOption {
+	return func(manager *Manager) { manager.statusQueue = make(chan StatusReport, size) }
+}
+
 func withCredentialWaitTimeout(timeout time.Duration) ManagerOption {
 	return func(manager *Manager) { manager.credentialWaitTimeout = timeout }
 }
@@ -432,8 +512,10 @@ func withRunningStabilityWindow(window time.Duration) ManagerOption {
 }
 
 // NewManager validates the fixed settings and starts the supervision loop.
-// The status callback is invoked from the manager goroutine and must not
-// block; reasons never contain credential material.
+// The status callback is invoked from a dedicated emission worker (FIFO, one
+// report at a time) so a slow or blocking callback can neither reorder
+// transitions nor wedge supervision or shutdown; reasons never contain
+// credential material.
 func NewManager(settings Settings, requester CredentialRequester, onStatus func(StatusReport), options ...ManagerOption) (*Manager, error) {
 	if err := settings.validate(); err != nil {
 		return nil, err
@@ -446,11 +528,17 @@ func NewManager(settings Settings, requester CredentialRequester, onStatus func(
 		backoffBase:            defaultBackoffBase,
 		killGrace:              defaultKillGracePeriod,
 		killWait:               defaultKillWaitTimeout,
+		childSignalTimeout:     defaultChildSignalTimeout,
+		statusDrainTimeout:     defaultStatusDrainTimeout,
 		credentialWaitTimeout:  defaultCredentialWaitTimeout,
 		runningStabilityWindow: defaultRunningStabilityWindow,
 		events:                 make(chan managerEvent, 32),
 		stopChannel:            make(chan struct{}),
 		doneChannel:            make(chan struct{}),
+		statusQueue:            make(chan StatusReport, defaultStatusQueueSize),
+		emitStop:               make(chan struct{}),
+		emitDone:               make(chan struct{}),
+		emissionOpen:           true,
 	}
 	for _, option := range options {
 		option(manager)
@@ -459,6 +547,7 @@ func NewManager(settings Settings, requester CredentialRequester, onStatus func(
 		manager.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 	manager.publishedGeneration.Store(-1)
+	go manager.emitLoop()
 	go manager.run()
 	return manager, nil
 }
@@ -491,19 +580,52 @@ func (manager *Manager) ApplyConfig(config Config) error {
 }
 
 // Stop shuts the tunnel down: the child is stopped gracefully and killed if
-// it ignores the graceful stop. The post-kill wait is BOUNDED (killWait): if
-// the child has still not exited, Stop returns an explicit error instead of
-// blocking shutdown forever (audit I4) — the daemon treats the failure as
-// best-effort and runs its remaining teardown levers regardless. Stop is
-// idempotent (every call returns the same recorded outcome) and blocks until
-// the supervision loop has exited.
+// it ignores the graceful stop. Every wait is BOUNDED by a Manager-owned
+// timer: the graceful/kill signal calls, the post-kill wait, the delivery of
+// the queued status reports, and — here — the wait for the supervision loop
+// itself. If the child has still not exited, Stop returns ErrChildKillTimeout
+// (wrapped); a signal call that never returns returns ErrChildSignalTimeout. A
+// status callback that blocks is never waited on: emission is asynchronous,
+// and Stop stops waiting for the loop at stopBound regardless (Round D
+// fix-round, audit A). The daemon treats the failure as best-effort and runs
+// its remaining teardown levers regardless. Stop is idempotent: as long as the
+// loop exits within the bound every call returns the same recorded outcome.
 func (manager *Manager) Stop() error {
 	manager.stopOnce.Do(func() {
 		manager.stopped = true
 		close(manager.stopChannel)
 	})
-	<-manager.doneChannel
-	return manager.stopErr
+	if manager.waitForSupervision(manager.stopBound()) {
+		return manager.stopErr
+	}
+	// The supervision loop did not exit within its own worst-case bound. Do not
+	// park the caller on a goroutine that may be wedged (e.g. inside a status
+	// callback): report the same failure class a bounded child stop reports.
+	return fmt.Errorf("%w: tunnel manager shutdown did not complete within %s",
+		ErrChildKillTimeout, manager.stopBound())
+}
+
+// stopBound is the Manager-owned upper bound on a whole shutdown: both signal
+// calls, the grace window, the post-kill wait, the bounded delivery of the
+// queued status reports, and a scheduling margin. It is derived from the same
+// knobs the run loop uses, so the timer can never win against a loop that is
+// merely finishing on time.
+func (manager *Manager) stopBound() time.Duration {
+	return 2*manager.childSignalTimeout + manager.killGrace + manager.killWait +
+		manager.statusDrainTimeout + defaultStopMargin
+}
+
+// waitForSupervision reports whether the supervision loop exited within the
+// bound, without ever waiting longer than it.
+func (manager *Manager) waitForSupervision(bound time.Duration) bool {
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-manager.doneChannel:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (manager *Manager) isStopped() bool {
@@ -527,8 +649,11 @@ func (manager *Manager) run() {
 		select {
 		case <-manager.stopChannel:
 			// Record the outcome before the deferred close(doneChannel) makes it
-			// visible to every Stop caller.
+			// visible to every Stop caller. Everything below is bounded: the child
+			// stop, the drain of the queued status reports (a wedged callback is
+			// abandoned, never waited on), and the emission worker's exit.
 			manager.stopErr = manager.shutdownChild()
+			manager.finalizeStatus()
 			return
 		case event := <-manager.events:
 			switch event.kind {
@@ -733,36 +858,125 @@ func (manager *Manager) notifyRunningAfterStability(child childProcess) {
 }
 
 // stopChildGracefullyOrKill stops the current child: graceful first, then a
-// kill after the grace period, then a BOUNDED wait for the exit. If the child
-// still has not exited, it is left tracked (its watcher owns the eventual
-// exit) and an explicit error is returned so callers can surface it and keep
-// shutdown moving. It is called from the run goroutine only, and holds no lock
-// across any wait.
+// kill after the grace period, then a BOUNDED wait for the exit. Every step is
+// bounded by a Manager-owned timer, including the two signal calls themselves
+// (a child/OS call that never returns must not strand shutdown): a graceful
+// call that did not return is surfaced and escalates straight to the kill
+// rather than burning the grace window. If the child still has not exited, it
+// is left tracked (its watcher owns the eventual exit) and an explicit error
+// is returned so callers can surface it and keep shutdown moving. It is called
+// from the run goroutine only, and holds no lock across any wait.
 func (manager *Manager) stopChildGracefullyOrKill() error {
 	child := manager.child
 	if child == nil {
 		return nil
 	}
 	exited := manager.childExited
-	_ = child.GracefulStop()
-	select {
-	case <-exited:
-	case <-time.After(manager.killGrace):
-		_ = child.Kill()
+
+	gracefulTimedOut := false
+	if err := manager.signalChild("graceful stop", child.GracefulStop); err != nil {
+		if errors.Is(err, ErrChildSignalTimeout) {
+			gracefulTimedOut = true
+			manager.emit(manager.currentGeneration, StatusError, fmt.Sprintf("frpc %v", err))
+		}
+		// A returned signal error (e.g. the process already exited) is not a
+		// shutdown failure here: the exit channel decides.
+	}
+	if !gracefulTimedOut {
 		select {
 		case <-exited:
-		case <-time.After(manager.killWait):
-			return fmt.Errorf("%w: did not exit within %s after kill", ErrChildKillTimeout, manager.killWait)
+			manager.child = nil
+			manager.childExited = nil
+			return nil
+		case <-time.After(manager.killGrace):
 		}
 	}
-	manager.child = nil
-	manager.childExited = nil
-	return nil
+
+	if err := manager.signalChild("kill", child.Kill); err != nil && errors.Is(err, ErrChildSignalTimeout) {
+		return err
+	}
+	select {
+	case <-exited:
+		manager.child = nil
+		manager.childExited = nil
+		return nil
+	case <-time.After(manager.killWait):
+		return fmt.Errorf("%w: did not exit within %s after kill", ErrChildKillTimeout, manager.killWait)
+	}
+}
+
+// signalChild invokes one child signal call under a Manager-owned bound. The
+// call runs on its own goroutine; if the bound expires the goroutine is
+// abandoned and completes whenever the call does (it is bounded by the call's
+// own return, holds no lock, and is never waited on), while the caller gets an
+// explicit ErrChildSignalTimeout.
+func (manager *Manager) signalChild(name string, signal func() error) error {
+	returned := make(chan error, 1)
+	go func() { returned <- signal() }()
+	timer := time.NewTimer(manager.childSignalTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-returned:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("%w: %s did not return within %s", ErrChildSignalTimeout, name, manager.childSignalTimeout)
+	}
+}
+
+// emitLoop is the single status emission worker. It delivers reports strictly
+// in FIFO order, so control sees the lifecycle transitions in the order the
+// manager produced them, and it never runs on the run goroutine: a callback
+// that blocks therefore cannot wedge supervision or shutdown. On shutdown it
+// drains what is already queued and exits.
+func (manager *Manager) emitLoop() {
+	defer close(manager.emitDone)
+	for {
+		select {
+		case report := <-manager.statusQueue:
+			manager.onStatus(report)
+		case <-manager.emitStop:
+			for {
+				select {
+				case report := <-manager.statusQueue:
+					manager.onStatus(report)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// finalizeStatus stops accepting new reports and waits, bounded, for the
+// emission worker to deliver what is already queued. A callback still blocked
+// at the bound is abandoned: the worker exits as soon as the callback returns
+// (so nothing leaks permanently), and the reports it did not deliver are
+// counted and logged rather than silently lost or waited on forever.
+func (manager *Manager) finalizeStatus() {
+	manager.emitMu.Lock()
+	manager.emissionOpen = false
+	manager.emitMu.Unlock()
+	manager.emitStopOnce.Do(func() { close(manager.emitStop) })
+
+	timer := time.NewTimer(manager.statusDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-manager.emitDone:
+		return
+	case <-timer.C:
+	}
+	pending := len(manager.statusQueue)
+	if pending > 0 {
+		manager.droppedStatus.Add(uint64(pending))
+	}
+	log.Printf("tunnel status emission: callback still blocked after %s; %d queued report(s) undelivered at the bound (dropped so far %d)",
+		manager.statusDrainTimeout, pending, manager.droppedStatus.Load())
 }
 
 // shutdownChild is the Stop path: stop the child and report final telemetry.
-// The child-stop error (an unkillable process) is returned rather than
-// swallowed, and the final stopped telemetry is always emitted.
+// The child-stop error (an unkillable process or a wedged signal call) is
+// returned rather than swallowed, and the final stopped telemetry is always
+// emitted (asynchronously: a wedged callback cannot delay the return).
 func (manager *Manager) shutdownChild() error {
 	stopErr := manager.stopChildGracefullyOrKill()
 	manager.clearRestartTimer()
@@ -827,7 +1041,31 @@ func (manager *Manager) emit(generation int, status StatusKind, reason string) {
 	if manager.onStatus == nil {
 		return
 	}
-	manager.onStatus(StatusReport{Generation: generation, Status: status, Reason: reason})
+	report := StatusReport{Generation: generation, Status: status, Reason: reason}
+	manager.emitMu.Lock()
+	if !manager.emissionOpen {
+		manager.emitMu.Unlock()
+		manager.dropStatus(report, "manager stopping")
+		return
+	}
+	select {
+	case manager.statusQueue <- report:
+		manager.emitMu.Unlock()
+		return
+	default:
+	}
+	manager.emitMu.Unlock()
+	manager.dropStatus(report, "status queue full")
+}
+
+// dropStatus records a report that will never be delivered. Drops are counted
+// and logged — never silent — because a lost transition (e.g. the final
+// stopped state) is operational information even though relay telemetry is
+// best-effort.
+func (manager *Manager) dropStatus(report StatusReport, cause string) {
+	dropped := manager.droppedStatus.Add(1)
+	log.Printf("tunnel status %s (generation %d) dropped (%s): %s; %d report(s) dropped in total",
+		report.Status, report.Generation, cause, report.Reason, dropped)
 }
 
 // backoffDelay computes one restart delay: the ceiling doubles per attempt

@@ -120,6 +120,12 @@ func newBaselineCertFixture(t *testing.T, dir string) (*cert.Manager, string) {
 // on the wire). Defining it on the mock (same package, separate file) lets the
 // daemon's relayStateSender capability assertion observe telemetry in tests.
 func (m *mockSignalingClient) SendRelayClientState(ctx context.Context, state signaling.RelayClientState) error {
+	m.mu.Lock()
+	block := m.relayStateBlock
+	m.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	msg := map[string]any{
 		"type":       "relay_client_state",
 		"generation": state.Generation,

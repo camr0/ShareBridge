@@ -130,6 +130,10 @@ type mockSignalingClient struct {
 	registered    []signaling.RegisterShareOptions
 	unregistered  []string
 	unregisterErr error
+	// relayStateBlock models a control-facing relay_client_state send that
+	// ignores its (cooperative) context timeout: when non-nil the send blocks
+	// until the channel is closed (Round D fix-round).
+	relayStateBlock <-chan struct{}
 }
 
 func newMockSignalingClient(serverURL, apiKey, agentID string) *mockSignalingClient {

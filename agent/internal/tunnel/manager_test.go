@@ -25,8 +25,14 @@ type fakeChildProcess struct {
 	// records the attempt but the exit signal is only raised explicitly by
 	// the test. Round D uses it to prove the post-kill wait is bounded.
 	ignoresKill bool
-	exitSignal  chan struct{}
-	exitOnce    sync.Once
+	// gracefulStopBlock/killBlock model a child/OS call that never returns
+	// (Round D fix-round): when non-nil the call records the attempt (so the
+	// escalation stays observable) and then blocks until the channel is
+	// closed. No lock is held while blocked.
+	gracefulStopBlock <-chan struct{}
+	killBlock         <-chan struct{}
+	exitSignal        chan struct{}
+	exitOnce          sync.Once
 }
 
 func newFakeChildProcess(stopsOnGraceful bool) *fakeChildProcess {
@@ -47,9 +53,13 @@ func (fake *fakeChildProcess) GracefulStop() error {
 	fake.mu.Lock()
 	fake.gracefulStopCalls++
 	stops := fake.stopsOnGraceful
+	block := fake.gracefulStopBlock
 	fake.mu.Unlock()
 	if stops {
 		fake.signalExit(nil)
+	}
+	if block != nil {
+		<-block
 	}
 	return nil
 }
@@ -58,9 +68,13 @@ func (fake *fakeChildProcess) Kill() error {
 	fake.mu.Lock()
 	fake.killCalls++
 	ignores := fake.ignoresKill
+	block := fake.killBlock
 	fake.mu.Unlock()
 	if !ignores {
 		fake.signalExit(errors.New("signal: killed"))
+	}
+	if block != nil {
+		<-block
 	}
 	return nil
 }
@@ -101,6 +115,11 @@ type recordingStarter struct {
 	// ignoresKill makes every child it starts ignore graceful stop and kill,
 	// so a test can drive the manager's bounded post-kill wait.
 	ignoresKill bool
+	// gracefulStopBlock/killBlock make every child it starts block inside the
+	// named signal call until the channel is closed (Round D fix-round: a
+	// child/OS call that never returns must not strand shutdown).
+	gracefulStopBlock <-chan struct{}
+	killBlock         <-chan struct{}
 }
 
 func (starter *recordingStarter) startProcess(ctx context.Context, binaryPath string, arguments []string) (childProcess, error) {
@@ -111,6 +130,8 @@ func (starter *recordingStarter) startProcess(ctx context.Context, binaryPath st
 	}
 	child := newFakeChildProcess(starter.stopsOnGraceful)
 	child.ignoresKill = starter.ignoresKill
+	child.gracefulStopBlock = starter.gracefulStopBlock
+	child.killBlock = starter.killBlock
 	starter.records = append(starter.records, startRecord{binaryPath: binaryPath, arguments: arguments, child: child})
 	return child, nil
 }
