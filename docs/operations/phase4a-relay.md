@@ -228,7 +228,9 @@ cap is deferred to Phase 4b.
 
 Set `LimitNOFILE` above `MAX_STREAMS_GLOBAL` plus overhead (the shipped unit
 uses `65536`); when the host FD budget is below `8192`, lower the global bound
-instead of raising the unit's limit.
+instead of raising the unit's limit. The §12 capacity baseline validates this
+budget on real load; `scripts/relay-capacity-gate.sh` derives the safe default
+from the host's descriptor limit.
 
 ---
 
@@ -349,3 +351,111 @@ audit passes.
   the MVP safety tools.
 - CT/CAA monitoring remains a separate user-owned release prerequisite
   (spec §3.2); the DNS audit records CAA context but does not gate on it.
+
+---
+
+## 12. Capacity and safety baseline (Task 36, spec §23.8)
+
+Task 36 establishes the §23.8 capacity/safety baseline and validates the §14
+defaults without implementing Phase 4b selection. **The results below do not
+alter route selection**: no selection input, preference, or automatic fallback
+is added or changed by this task. They are also **not a substitute for the
+Phase 4b bandwidth-bounded packet-impairment work** (§18.5: RTT/loss-only
+loopback tests previously produced a false SCTP conclusion). The §14
+product-tier bandwidth throttle stays **DISABLED** in Phase 4a; the pinned FRP
+release exposes no approved server-side cap, so un-throttled operation gathers
+honest relay throughput data for Phase 4b. Per-agent byte counters and
+saturation alerts remain the operator's emergency tools.
+
+Reproduce the whole local baseline (it prints the values in this table):
+
+```bash
+bash scripts/relay-capacity-gate.sh
+```
+
+The gate runs the hermetic real-FRP suite
+(`relay/internal/integration/load_test.go`) over loopback:
+
+```bash
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 \
+  go test -race -count=5 -timeout 45m ./internal/integration \
+  -run 'Load|Capacity|Plateau|Starvation|Lifetime|Idle|Cancel' -v
+```
+
+### 12.1 What was measured here vs what is pending
+
+Measured on this development host (darwin/arm64, Go 1.26.1, loopback only,
+`-race -count=5`). Every value is machine-emitted as a
+`CAPACITY(EVIDENCE)` line; nothing below is extrapolated. The target relay VM
+is a **separate host provisioned by Task 37** and is not available in Phase 4a,
+so every hardware-dependent cell is explicitly **PENDING HARDWARE (Task 37)**.
+
+| Cell | Local loopback (measured, this host) | Target relay VM |
+|---|---|---|
+| One-agent throughput | 616–763 req/s, 227–282 KiB/s (48 requests/run, 0 errors) | **PENDING HARDWARE (Task 37)** |
+| Multi-agent throughput | 897–1058 req/s, 331–390 KiB/s (64 requests/run over 2 agents, 0 errors) | **PENDING HARDWARE (Task 37)** |
+| Per-agent byte accounting | both agents' counters advance; the `relayed_bytes_total` global/agent/origin scopes agree (229 KiB single-agent run) | **PENDING HARDWARE (Task 37)** |
+| CPU | not a loopback-meaningful number | **PENDING HARDWARE (Task 37)** |
+| RSS | not a loopback-meaningful number | **PENDING HARDWARE (Task 37)** |
+| Open FDs | process baseline 14–15, peak 47 at concurrency 8, returns to 14–15; every admission slot released | **PENDING HARDWARE (Task 37)** |
+| NIC saturation | not a loopback-meaningful number | **PENDING HARDWARE (Task 37)** |
+| Global stream default | `8192` (host FD budget 1,048,575 ≫ 2×8192+reserve) | **PENDING HARDWARE (Task 37)**: confirm on the VM size |
+
+Safety cases (all GREEN, `-race -count=5`):
+
+| Property | Result |
+|---|---|
+| §14 per-agent saturation without cross-agent starvation | Agent A saturated at its ceiling (`agent_a_limit=2`), new A streams generically closed, agent B admitted and served content meanwhile, 2 bounded `reason=limits` rejections recorded, all slots released and A readmitted afterwards |
+| Active stream beyond the idle window | configured idle 2 s; stream stayed alive 5.44–5.45 s while bytes flowed, then closed 1.55 s after the last byte |
+| No-byte idle close | configured idle 2 s; closed 2.001 s after the handshake |
+| Absolute lifetime (hard close) | configured lifetime 2 s with idle 300 s; continuously active stream closed at 1.994–2.001 s (activity never extended it) |
+| Cancellation | 3 concurrent streams cancelled; agent observed cancellation, registry and every admission slot returned to 0, capacity reused afterwards |
+| Goroutine / FD / buffer plateau | after 64 served requests across 4 rounds at concurrency 8: goroutines returned to the run baseline (final = baseline ±1), FDs baseline 14–15 → final 15, heap growth ≤ ~0.4 MiB, peak live streams 8 (bound), so copy-buffer memory is bounded by ≤ (8+1)×2×32 KiB ≈ 576 KiB regardless of cumulative requests |
+
+Interpretation limits (stated so the numbers are not over-read):
+
+- The plateau figures are **process-wide** measurements of the hermetic test
+  process. Under `-count=5` the absolute pre-load goroutine baseline drifts as
+  more hermetic stacks are created in one process (a test-harness lifecycle
+  effect); the asserted property is the **within-run** delta — resources return
+  to the run's own baseline and do not scale with cumulative requests.
+- Loopback throughput includes real pinned `frps`/`frpc` processes, real TLS
+  and real L4 passthrough, but no WAN RTT, no packet loss and no target-VM
+  CPU/NIC ceiling; it is a safety baseline, not a capacity promise.
+- The `absolute-lifetime` and idle cases use short configured windows to fit a
+  bounded test; the defaults themselves (`5m` idle, `24h` lifetime) are
+  unchanged and unit-tested in `relay/internal/limits`.
+
+### 12.2 Safe defaults and the host FD budget
+
+The §14 global ceiling is `8192`; the deployed `MAX_STREAMS_GLOBAL` may only be
+lowered to the host file-descriptor budget, never raised. Each admitted public
+stream costs the gateway one accepted socket plus one loopback dial to the
+agent's FRP proxy port (2 FDs), so the required descriptor budget is
+approximately `2 × MAX_STREAMS_GLOBAL + 256` (listeners, plugin, metrics,
+control-sync TLS, runtime). The shipped unit sets `LimitNOFILE=65536`, which
+covers the `8192` default (≈16.6 k descriptors) with margin.
+
+`scripts/relay-capacity-gate.sh` computes
+`safe_global = min(8192, (ulimit -n − 256) / 2)` and prints it. On hosts whose
+FD budget is below ≈16.6 k, lower `SHAREBRIDGE_GATEWAY_MAX_STREAMS_GLOBAL`
+accordingly instead of raising the unit's `LimitNOFILE`. The chosen default for
+the documented deployment is therefore **8192**, which is ≤ the host FD budget
+on every supported host, and Task 37 records the measured gateway FD count at
+saturation to confirm it.
+
+### 12.3 Target-VM procedure (Task 37)
+
+On the provisioned relay VM, with both services running, run:
+
+```bash
+bash scripts/relay-capacity-gate.sh --target
+```
+
+It samples the gateway's open FDs (`/proc/<pid>/fd`), RSS (`VmRSS`), CPU
+(`/proc/<pid>/stat` delta), NIC saturation (`/proc/net/dev` against
+`SHAREBRIDGE_GATEWAY_NIC_CAPACITY_BYTES_PER_SEC`), the private §17.3 counters
+from `127.0.0.1:9101/metrics`, and, when `SHAREBRIDGE_CAPACITY_RELAY_URL` is
+set, a bounded request sample against the live relay origin. Any input it
+cannot read is printed as **PENDING HARDWARE (Task 37)** — the gate never
+prints a number it did not measure.
