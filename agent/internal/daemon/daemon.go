@@ -1895,12 +1895,28 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	// report is sent from the reporter's drain goroutine, so no port lock,
 	// ackMu, or router I/O is held while we wait. A failed, dropped, or
 	// unconfirmed report is an unsuccessful open: tear the mapping back down
-	// (reusing the ordinary close path, so no half-open mapping survives) and
-	// answer with an error ack instead of advertising an unreported endpoint.
-	grantedPort := ds.port.GrantedPort()
-	if reportErr := d.confirmOpenEndpoint(ds, grantedPort); reportErr != nil {
+	// (targeting the created mapping's identity, so no half-open or foreign
+	// mapping is touched) and answer with an error ack instead of advertising
+	// an unreported endpoint.
+	//
+	// A §13.4 lockdown may publish its generation and close the mapping at any
+	// point between OpenForIf returning and the ack — in particular during the
+	// bounded report confirmation below. The generation is therefore re-checked
+	// TWICE: here, before the report is issued (so no DDNS record is provisioned
+	// for an already-superseded open), and again inside the sole OK-ack writer
+	// ackOpenSuccess, AFTER the report has been confirmed. The post-report check
+	// is the load-bearing one: a superseded open must not be acked OK merely
+	// because its report (which may even have provisioned DDNS) completed.
+	preCommit, current := ds.port.CommitOpenAck(openEpoch)
+	if !current {
+		log.Printf("open_signal %s refused before reporting: superseded by a lockdown transition", msg.ShareID)
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "superseded"})
+		return
+	}
+	if reportErr := d.confirmOpenEndpoint(ds, preCommit.GrantedPort()); reportErr != nil {
 		log.Printf("open_signal %s: endpoint report before open_ack failed: %v", msg.ShareID, reportErr)
-		if closeErr := ds.port.Close(); closeErr != nil {
+		if closeErr := ds.port.DiscardOpenMapping(openEpoch); closeErr != nil {
 			// The mapping delete is retried by the port's own close timer and
 			// escalated via CloseError; the open is already unsuccessful.
 			log.Printf("open_signal %s: mapping teardown after report failure: %v", msg.ShareID, closeErr)
@@ -1909,10 +1925,42 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
 		return
 	}
+	if !d.ackOpenSuccess(msg, ds, openEpoch, ip, wasOpen) {
+		log.Printf("open_signal %s refused after reporting: superseded by a lockdown transition", msg.ShareID)
+		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "superseded"})
+		return
+	}
+}
+
+// ackOpenSuccess is the ONE code path in the daemon that emits a successful
+// (status "ok") open_ack, and it re-validates the open's §13.4 generation
+// INSIDE itself, immediately before it constructs the ack.
+//
+// It calls OnDemandPort.CommitOpenAck, which re-reads the published generation
+// stamp under the same mutex SetGeneration publishes under, refuses and discards
+// the created mapping once a lockdown has superseded gen (the
+// discovered-identity discard, so no half-open mapping survives), and hands back
+// the commit token the ack's granted port is read from. The token is produced
+// HERE rather than accepted as a parameter, so no caller can validate early and
+// then ack after the endpoint-report wait — the A1 bypass. It returns false on
+// refusal, and the caller emits the error ack.
+//
+// Do NOT add another OK open_ack anywhere: the structural guard
+// TestOpenAckOKOnlyInsideTheValidatedChokePoint parses daemon.go and fails if a
+// second status-"ok" signaling.OpenAck literal appears outside this function, or
+// if this function stops calling CommitOpenAck (see
+// daemon_open_ack_choke_test.go).
+func (d *Daemon) ackOpenSuccess(msg signaling.Message, ds *directState, gen uint64, ip string, wasOpen bool) bool {
+	commit, current := ds.port.CommitOpenAck(gen)
+	if !current {
+		return false
+	}
 	_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
-		GrantedPort: grantedPort, PublicIP: ip,
+		GrantedPort: commit.GrantedPort(), PublicIP: ip,
 		WasAlreadyOpen: wasOpen, Status: "ok"})
+	return true
 }
 
 // confirmOpenEndpoint sends the open-path endpoint report carrying the

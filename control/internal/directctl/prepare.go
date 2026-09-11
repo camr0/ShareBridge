@@ -191,19 +191,29 @@ func (c *Controller) PrepareRoute(w http.ResponseWriter, r *http.Request, code s
 		return c.prepareRelayFallback(w, apiKeyID, origin, code)
 	}
 
-	// Defense in depth (audit Important #3): the agent orders the endpoint
-	// report carrying the MAPPED external port BEFORE its OK open_ack, so the
-	// report is already persisted when EmitOpen returns (the agent WebSocket
-	// read loop handles report_endpoint and open_ack in order). If the
-	// persisted report does not carry the granted port — a dropped or
-	// out-of-order report, or a stale report from a previous open — fail
-	// closed to relay rather than hand a recipient a direct origin whose DDNS
-	// record was never provisioned for this port. This is belt-and-suspenders:
-	// the agent-side ordering makes the report the precondition of the ack,
-	// and this gate makes the ack's direct origin the precondition of the
-	// report. It never creates availability (still requires the live predicate
-	// and the probe below).
-	if reportFacts, ok := c.readRouteFacts(apiKeyID); !ok || reportFacts.endpointPort != opened.ack.GrantedPort {
+	// Defense in depth (audit Important #3, round C finding A2): the agent
+	// orders the endpoint report carrying the MAPPED external port BEFORE its OK
+	// open_ack, so the report is already persisted when EmitOpen returns (the
+	// agent WebSocket read loop handles report_endpoint and open_ack in order).
+	// If the persisted report does not correspond to THIS open — port OR
+	// public IP — fail closed to relay rather than hand a recipient a direct
+	// origin whose DDNS record was never provisioned for this open.
+	//
+	// The port alone is not enough: a failed DDNS update for a CHANGED public IP
+	// leaves the previous row intact (endpoint_ip is saved only after DDNS
+	// succeeds, so a failed update is retried), and the granted port can
+	// coincide with that previous row. The port would then match while the
+	// persisted endpoint_ip still resolves (via DNS) to the old address — the
+	// agent is reachable at the ack's public IP, so the raw-IP probe succeeds,
+	// but the recipient's DDNS hostname points at an address that cannot serve.
+	// Requiring endpoint_ip == ack.PublicIP binds the report to this open's
+	// public address. This is belt-and-suspenders: the agent-side ordering makes
+	// the report the precondition of the ack, and this gate makes the ack's
+	// direct origin the precondition of a matching report. It never creates
+	// availability (still requires the live predicate and the probe below).
+	if reportFacts, ok := c.readRouteFacts(apiKeyID); !ok ||
+		reportFacts.endpointPort != opened.ack.GrantedPort ||
+		reportFacts.endpointIP != opened.ack.PublicIP {
 		return c.prepareRelayFallback(w, apiKeyID, origin, code)
 	}
 

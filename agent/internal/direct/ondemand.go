@@ -83,6 +83,12 @@ const (
 	opGrantedPort
 	opState
 	opSetCallback
+	// opCommitOpenAck and opDiscardOpen are the post-open success/rollback
+	// primitives of the daemon's direct-open flow (see CommitOpenAck and
+	// DiscardOpenMapping). Both are generation-guarded and both act only on a
+	// mapping the OPEN's own generation still owns.
+	opCommitOpenAck
+	opDiscardOpen
 )
 
 type portReply struct {
@@ -313,6 +319,68 @@ func (p *OnDemandPort) OpenForIf(shareID string, lease time.Duration, gen uint64
 func (p *OnDemandPort) openFor(shareID string, lease time.Duration, fenced bool, gen uint64) error {
 	ch := make(chan portReply, 1)
 	return p.send(portCommand{op: opOpenFor, shareID: shareID, lease: lease, fenced: fenced, gen: gen, reply: ch}).err
+}
+
+// OpenAckCommit is the port's authorization to emit a successful (status "ok")
+// open_ack for one open. It is produced ONLY by OnDemandPort.CommitOpenAck,
+// which re-validates on the port's single state loop that the mapping this open
+// created is still open and still owned by the operation's generation. Its
+// fields are unexported and it has no other constructor, so a caller cannot
+// fabricate one: an OK open_ack can only be emitted for an open the port has
+// just confirmed. The granted port is captured at re-validation time, so the
+// ack can never carry a port the port has not re-confirmed.
+type OpenAckCommit struct {
+	grantedPort int
+}
+
+// GrantedPort is the external port the router granted for the committed open
+// (NAT-PMP may remap), captured when CommitOpenAck re-validated it.
+func (c OpenAckCommit) GrantedPort() int { return c.grantedPort }
+
+// CommitOpenAck is the post-open success re-validation — the choke point a
+// successful open must pass AFTER its endpoint report has been confirmed.
+//
+// It runs on the port's single state loop, re-reads the published generation
+// stamp under ackMu — the same mutex SetGeneration publishes under, exactly like
+// the internal commitOpenSuccess choke point of OpenForIf — and hands the OK
+// reply over while still holding ackMu, so the authorization is atomic with the
+// stamp read. It authorizes the open (returning a commit token) only while the
+// stamp still equals gen AND the mapping is still open AND it is still owned by
+// gen's generation.
+//
+// On refusal it removes the mapping IF gen's generation still owns it — the
+// exported form of the internal discardFencedMapping, targeting the created
+// mapping's discovered identity, so a superseded open never leaves a mapping on
+// the router. A mapping a NEWER generation opened is never touched (its
+// openGen differs), so a superseded caller can never tear down a post-unlock
+// reopen. The discard is router I/O and therefore runs with ackMu released (the
+// deadlock rule commitOpenSuccess documents: the ownership/lock work under
+// ackMu is in-memory and bounded, router I/O never runs under it).
+//
+// Callers MUST NOT emit an OK open_ack without a commit token from this method:
+// it is the only success authorization the port hands out after OpenForIf, and
+// it is the check that makes the daemon's single OK-ack writer
+// (Daemon.ackOpenSuccess) safe to reach after a bounded report wait.
+func (p *OnDemandPort) CommitOpenAck(gen uint64) (OpenAckCommit, bool) {
+	ch := make(chan portReply, 1)
+	r := p.send(portCommand{op: opCommitOpenAck, gen: gen, reply: ch})
+	if !r.open {
+		return OpenAckCommit{}, false
+	}
+	return OpenAckCommit{grantedPort: r.granted}, true
+}
+
+// DiscardOpenMapping tears down the mapping this port holds for gen, using the
+// created mapping's discovered identity (never a stale preferred port). It is a
+// no-op when a newer generation already owns the mapping, so a superseded
+// caller can never close a post-unlock reopen; and it is a no-op when the
+// mapping is already gone (for example a §13.4 CloseIf closed it). The
+// direct-open path uses it when the endpoint report fails: the open is
+// unsuccessful, so the mapping must not survive — but only the mapping this
+// open created may be removed.
+func (p *OnDemandPort) DiscardOpenMapping(gen uint64) error {
+	ch := make(chan portReply, 1)
+	return p.send(portCommand{op: opDiscardOpen, gen: gen, reply: ch}).err
 }
 
 // BeginSession records a new recipient session for shareID and returns an
@@ -853,6 +921,37 @@ func (p *OnDemandPort) loop() {
 
 			case opIsOpen:
 				c.reply <- portReply{open: open}
+
+			case opCommitOpenAck:
+				// Post-open success re-validation (the commit token). The stamp read
+				// and the hand-over of the OK reply run under ackMu, exactly like
+				// commitOpenSuccess: SetGeneration either happens before this (the
+				// reply is refused) or strictly after the acknowledgment was handed
+				// to the caller. Ownership (open/openGen) is loop-local and cannot
+				// change while this case runs.
+				//
+				// The refusal path must NOT hold ackMu: discarding the mapping is
+				// router I/O (the same rule commitOpenSuccess documents). It runs
+				// after the unlock, and only while gen's generation still owns the
+				// mapping — a newer generation's mapping is never touched.
+				p.ackMu.Lock()
+				if p.generationCurrent(c.gen) && open && openGen == c.gen {
+					c.reply <- portReply{open: true, granted: grantedPort}
+					p.ackMu.Unlock()
+					continue
+				}
+				p.ackMu.Unlock()
+				if open && openGen == c.gen {
+					discardFencedMapping(true)
+				}
+				c.reply <- portReply{open: false}
+
+			case opDiscardOpen:
+				// Roll back only the mapping this open's generation still owns.
+				if open && openGen == c.gen {
+					discardFencedMapping(true)
+				}
+				c.reply <- portReply{}
 
 			case opGrantedPort:
 				c.reply <- portReply{granted: grantedPort}

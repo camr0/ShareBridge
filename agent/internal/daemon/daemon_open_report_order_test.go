@@ -465,3 +465,54 @@ func TestOpenSignalReportFailureLeavesNoGateBooking(t *testing.T) {
 		t.Fatalf("a fresh signal after a failed-report open must be admissible and succeed, got %#v", f.client.messagesSnapshot())
 	}
 }
+
+// TestOpenSignalFencedByLockdownDuringReportConfirm is the round-C A1 proof:
+// the endpoint report carrying the mapped port has been handed to the drain and
+// its confirmation is still pending when a §13.4 lockdown publishes its
+// generation and closes the mapping. The report confirmation returning is NOT
+// an authorization to ack — the open must be re-validated after it, and a
+// superseded open must surface as an error ack with no surviving mapping.
+//
+// On the pre-fix agent the handler acked OK as soon as the (successful) report
+// confirmation returned, so a superseded open reported AND acked OK — exactly
+// the finding. This test compiles against the pre-fix source (it uses only
+// pre-existing APIs) and fails behaviourally there.
+func TestOpenSignalFencedByLockdownDuringReportConfirm(t *testing.T) {
+	f := newReportOrderFixture(t, newRemapDirectMapper(52023))
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	f.blockingReportHook(entered, release)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.daemon.handleOpenSignal(openSignalMessage())
+	}()
+
+	awaitRecv(t, entered, "endpoint report send entering")
+
+	// Land the lockdown inside the confirmation window: generation publish,
+	// then the mapping close. The report send is still held open, so on the
+	// pre-fix agent the handler resumes after the release and acks OK.
+	if err := f.daemon.Lockdown(); err != nil {
+		t.Fatalf("lockdown: %v", err)
+	}
+
+	close(release)
+	awaitClosed(t, done, "handleOpenSignal after the lockdown released the report send")
+
+	assertNoOKAckForFailedReport(t, f.client)
+	if !f.client.hasSentMessage("open_ack", map[string]any{"status": "error", "error": "superseded"}) {
+		t.Fatalf("expected a superseded error open_ack, got %#v", f.client.messagesSnapshot())
+	}
+	if f.port.Open() {
+		t.Fatalf("a superseded open must not leave the mapping open")
+	}
+	if got := f.port.GrantedPort(); got != 0 {
+		t.Fatalf("granted port = %d, want 0 after a superseded open", got)
+	}
+	if listing, err := f.mapper.ListPortMappings(); err != nil || len(listing) != 0 {
+		t.Fatalf("mappings after a superseded open = %#v (err %v), want none", listing, err)
+	}
+}

@@ -788,18 +788,33 @@ func TestDirectURLOmitsDefaultPort(t *testing.T) {
 }
 
 // TestPrepareRouteRequiresCurrentEndpointReport proves the defense-in-depth
-// gate for audit Important #3: a successful open_ack alone is NOT enough to
-// produce a direct origin. The agent's persisted endpoint report must carry the
-// granted port, so a missing, dropped, or stale report can never yield a direct
-// URL. The live predicate and STUN observation are fully satisfied in both
-// subtests, and the probe would succeed — only the endpoint report is wrong.
+// gate for audit Important #3 (round C, finding A2): a successful open_ack
+// alone is NOT enough to produce a direct origin. The agent's PERSISTED
+// endpoint report must correspond to THIS open — at minimum the granted port
+// AND the ack's public IP — so a missing, dropped, out-of-order, or stale
+// report can never yield a direct URL. The live predicate and STUN observation
+// are fully satisfied in every failure subtest, and the probe would succeed:
+// only the persisted report is wrong.
+//
+// The IP case is the reviewer's scenario: a failed DDNS update for a changed
+// public IP leaves the previous row (old endpoint_ip) intact while the ack
+// carries the fresh public IP. The port may coincide, so a port-only gate
+// passes and the raw-IP probe of the ack's public IP succeeds — yet the
+// recipient's DDNS hostname still resolves to the OLD IP, a direct URL that
+// cannot serve. The matching-report subtest is the no-false-rejection control.
 func TestPrepareRouteRequiresCurrentEndpointReport(t *testing.T) {
 	cases := []struct {
 		name         string
 		reportedPort int
+		reportedIP   string
+		ackIP        string
+		wantDirect   bool
 	}{
-		{name: "stale previous-open port", reportedPort: 9999},
-		{name: "missing report (port 0)", reportedPort: 0},
+		{name: "stale previous-open port", reportedPort: 9999, reportedIP: routeDirectIP, ackIP: routeDirectIP},
+		{name: "missing report (port 0)", reportedPort: 0, reportedIP: routeDirectIP, ackIP: routeDirectIP},
+		{name: "stale previous-open IP (same port)", reportedPort: 8443, reportedIP: routeDirectIP, ackIP: "198.51.100.9"},
+		{name: "missing report (empty IP)", reportedPort: 8443, reportedIP: "", ackIP: routeDirectIP},
+		{name: "current report (matching port and IP)", reportedPort: 8443, reportedIP: routeDirectIP, ackIP: routeDirectIP, wantDirect: true},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -815,15 +830,20 @@ func TestPrepareRouteRequiresCurrentEndpointReport(t *testing.T) {
 			installObservation(t, ctrl, key, netip.MustParseAddr(routeDirectIP), true)
 
 			// Overwrite the seeded report with the stale/missing value: the
-			// endpoint report no longer matches the port the ack will grant.
+			// persisted endpoint report no longer corresponds to the ack. The
+			// observation still matches the persisted endpoint, so the LIVE
+			// selection term is preparable — only the prepare gate can reject.
 			rec := agentRow(t, app, key)
 			rec.Set("endpoint_port", tc.reportedPort)
+			rec.Set("endpoint_ip", tc.reportedIP)
 			if err := app.Save(rec); err != nil {
 				t.Fatalf("save agent row: %v", err)
 			}
 
 			ctrl.emitOpenFn = func(ctx context.Context, apiKeyID, shareID, origin string, lease time.Duration) (OpenAck, error) {
-				return prepareOKAck(), nil // grants 8443
+				ack := prepareOKAck() // grants 8443 at routeDirectIP
+				ack.PublicIP = tc.ackIP
+				return ack, nil
 			}
 			probes := 0
 			ctrl.probeFn = func(ctx context.Context, origin, code, apiKeyID string, ack OpenAck) error {
@@ -832,6 +852,20 @@ func TestPrepareRouteRequiresCurrentEndpointReport(t *testing.T) {
 			}
 
 			resp := prepareCall(t, ctrl, code, "", nil)
+			if tc.wantDirect {
+				requireNoStore(t, resp)
+				if resp.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200 (body %q)", resp.Code, resp.Body.String())
+				}
+				out := decodePrepareBody(t, resp)
+				if out.Status != "direct" {
+					t.Fatalf("status = %q, want %q: a report matching the ack port AND IP must yield direct", out.Status, "direct")
+				}
+				if probes != 1 {
+					t.Fatalf("the probe ran %d time(s), want exactly 1 for the matching report", probes)
+				}
+				return
+			}
 			assertRelayFallback(t, app, resp, code, key)
 			if probes != 0 {
 				t.Fatalf("the probe ran %d time(s) without a current endpoint report", probes)
