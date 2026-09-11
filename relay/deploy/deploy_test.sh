@@ -247,6 +247,204 @@ function_body() {
   ' "$1"
 }
 
+# ---------------------------------------------------------------------------
+# Hardening-directive discipline (A4).
+#
+# Presence is NOT proof. In systemd an emptied/reset sandbox directive is a
+# no-op (`SystemCallFilter=`, `CapabilityBoundingSet=`, `RestrictNamespaces=`,
+# `RestrictAddressFamilies=`, … all disable the restriction when emptied), so a
+# gate that only asks "is the key present?" lets a real hardening violation
+# ship while reporting GREEN. The rule this gate applies to every hardening
+# directive is:
+#
+#   (1) every directive pinned in HARDENING_TABLE_<unit> is assigned EXACTLY
+#       once with the exact expected value — an empty, reset, weakened,
+#       duplicated or countermanding definition is a failure. Empty is the
+#       expected value only where the table deliberately expects empty (the
+#       frps capability-free set);
+#   (2) every directive the unit actually carries whose name is in
+#       HARDENING_VOCABULARY (the systemd sandboxing vocabulary) MUST be pinned
+#       in that unit's table, so a newly added hardening directive cannot ship
+#       unasserted; and
+#   (3) no carried hardening directive may be empty unless it is explicitly
+#       allowlisted in HARDENING_EMPTY_OK.
+#
+# How a NEW hardening directive gets covered: add its `Key=expected` row to the
+# unit table, and if its name is not already in HARDENING_VOCABULARY add it
+# there too. Forgetting either fails the gate — a carried-but-unpinned
+# directive fails (2), a pinned-but-missing/emptied/duplicated directive fails
+# (1), and a table row whose name is absent from the vocabulary fails the
+# consistency check. The table is therefore both the assertion set and the
+# allowlist of hardening directives the units may carry.
+HARDENING_VOCABULARY='NoNewPrivileges SecureBits CapabilityBoundingSet AmbientCapabilities PrivateTmp PrivateDevices PrivateNetwork PrivateUsers PrivateMounts PrivateIPC ProtectSystem ProtectHome ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups ProtectClock ProtectHostname ProtectProc ProcSubset RestrictAddressFamilies RestrictNamespaces RestrictRealtime RestrictSUIDSGID LockPersonality MemoryDenyWriteExecute SystemCallArchitectures SystemCallFilter SystemCallErrorNumber SystemCallLog RemoveIPC UMask KeyringMode NoExecPaths DevicePolicy DeviceAllow DeviceDeny IPAddressAllow IPAddressDeny SocketBindAllow SocketBindDeny MountFlags ReadWritePaths ReadOnlyPaths InaccessiblePaths BindPaths BindReadOnlyPaths TemporaryFileSystem RootDirectory RootImage StateDirectory RuntimeDirectory CacheDirectory LogsDirectory ConfigurationDirectory MemoryMax LimitNOFILE TasksMax LimitNPROC LogRateLimitIntervalSec LogRateLimitBurst'
+
+# Directives whose EXPECTED hardened value is the empty string: these units are
+# intentionally capability-free, so an empty value here is the assertion ("no
+# capabilities"), not a neutering. Any other empty hardening value fails (3).
+HARDENING_EMPTY_OK=' CapabilityBoundingSet AmbientCapabilities '
+
+# One `Key=expected value` per hardening directive, per unit. The expected
+# value is everything after the first '=' (so multi-word sets such as
+# ReadWritePaths= and RestrictAddressFamilies= are compared verbatim).
+HARDENING_TABLE_GATEWAY='ProtectSystem=strict
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RemoveIPC=true
+UMask=0077
+StateDirectory=sharebridge-relay-gateway
+RuntimeDirectory=sharebridge-relay-gateway
+ReadWritePaths=/var/lib/sharebridge-relay-gateway /run/sharebridge-relay-gateway
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=65536
+MemoryMax=512M
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200'
+
+HARDENING_TABLE_FRPS='ProtectSystem=strict
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RemoveIPC=true
+UMask=0077
+StateDirectory=sharebridge-relay-frps
+RuntimeDirectory=sharebridge-relay-frps
+ReadWritePaths=/run/sharebridge-relay-frps
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=65536
+MemoryMax=256M
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=200'
+
+# check_hardening_table <unit> <table> — every pinned directive exactly once,
+# exactly the expected value (rule 1).
+check_hardening_table() {
+  local unit="$1" table="$2" entry key expected
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    key="${entry%%=*}"
+    expected="${entry#*=}"
+    require_unit_scalar "$unit" "$key" "$expected" \
+      "$unit hardening directive must be exactly ${key}=${expected}"
+  done <<< "$table"
+}
+
+# hardening_pinned_keys <table> — the space-separated keys pinned by a table.
+hardening_pinned_keys() {
+  local table="$1" entry out=""
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    out="${out} ${entry%%=*}"
+  done <<< "$table"
+  printf '%s\n' "$out"
+}
+
+# hardening_keys_in_unit <unit> — every directive key the unit carries whose
+# name belongs to the systemd hardening vocabulary, sorted and unique.
+hardening_keys_in_unit() {
+  awk -v vocab="$HARDENING_VOCABULARY" '
+    BEGIN { n = split(vocab, v, " "); for (i = 1; i <= n; i++) hard[v[i]] = 1 }
+    { line = $0 }
+    line ~ /^[[:space:]]*\[/ { next }
+    {
+      sub(/[[:space:]]*#.*$/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) { next }
+      key = substr(line, 1, eq - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key in hard) { print key }
+    }
+  ' "$1" | sort -u
+}
+
+# require_table_in_vocabulary <unit> <table> — a table row for a name that is
+# not in the hardening vocabulary is a maintenance error (the vocabulary and
+# the table must stay in sync).
+require_table_in_vocabulary() {
+  local unit="$1" table="$2" entry key
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    key="${entry%%=*}"
+    case " $HARDENING_VOCABULARY " in
+      *" $key "*) pass ;;
+      *) fail "$unit hardening table pins '${key}' which is absent from HARDENING_VOCABULARY" ;;
+    esac
+  done <<< "$table"
+}
+
+# require_pinned_hardening <unit> <pinned keys> — rule (2): a carried hardening
+# directive that is not pinned fails (an unasserted hardening directive must not
+# be able to ship).
+require_pinned_hardening() {
+  local unit="$1" pinned=" $2 " key
+  while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+    case "$pinned" in
+      *" $key "*) pass ;;
+      *) fail "$unit carries hardening directive ${key}= that is not pinned in the gate's hardening table" ;;
+    esac
+  done < <(hardening_keys_in_unit "$unit")
+}
+
+# require_no_empty_hardening <unit> — rule (3): no carried hardening directive
+# may be empty unless it is explicitly allowlisted as intentionally empty. This
+# is the direct anti-neutering invariant: emptying ANY hardening directive (a
+# known one, or a future one already listed in the vocabulary) fails here even
+# if it were somehow missed by the exact-value table.
+require_no_empty_hardening() {
+  local unit="$1" key value
+  while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+    case "$HARDENING_EMPTY_OK" in
+      *" $key "*) pass ; continue ;;
+    esac
+    value="$(unit_field_one "$unit" "$key")"
+    if [[ -z "$value" ]]; then
+      fail "$unit has an empty/reset hardening directive ${key}= (neutered)"
+    else
+      pass
+    fi
+  done < <(hardening_keys_in_unit "$unit")
+}
+
 # The strict IPv6 validator under test lives in install.sh (is_ipv6_literal).
 # deploy_test.sh deliberately does NOT keep a second copy: a duplicate, dead
 # copy can drift and, as an unexercised parser, would silently hide a regression
@@ -402,30 +600,24 @@ done
 
 printf -- '-- A4: read-only filesystem except explicit run/state dirs\n'
 for unit in "$gateway_unit" "$frps_unit"; do
-  require_unit_scalar "$unit" ProtectSystem "strict" "$unit must set ProtectSystem=strict exactly once"
-  require_unit_scalar "$unit" NoNewPrivileges "true" "$unit must set NoNewPrivileges=true exactly once"
-  require_unit_scalar "$unit" PrivateTmp "true" "$unit must set PrivateTmp=true exactly once"
-  require_unit_scalar "$unit" ProtectHome "true" "$unit must set ProtectHome=true exactly once"
-  require_contains "$unit" '^ProtectKernelTunables=true$' "ProtectKernelTunables in $unit"
-  require_contains "$unit" '^ProtectKernelModules=true$' "ProtectKernelModules in $unit"
-  require_contains "$unit" '^ProtectControlGroups=true$' "ProtectControlGroups in $unit"
-  require_contains "$unit" '^RestrictAddressFamilies=' "RestrictAddressFamilies in $unit"
-  require_contains "$unit" '^RestrictNamespaces=true$' "RestrictNamespaces in $unit"
-  require_contains "$unit" '^LockPersonality=true$' "LockPersonality in $unit"
-  require_contains "$unit" '^MemoryDenyWriteExecute=true$' "MemoryDenyWriteExecute in $unit"
-  require_contains "$unit" '^SystemCallFilter=' "SystemCallFilter in $unit"
-  require_contains "$unit" '^CapabilityBoundingSet=' "CapabilityBoundingSet in $unit"
+  if [[ "$unit" == "$gateway_unit" ]]; then
+    hardening_table="$HARDENING_TABLE_GATEWAY"
+  else
+    hardening_table="$HARDENING_TABLE_FRPS"
+  fi
+  check_hardening_table "$unit" "$hardening_table"
+  require_table_in_vocabulary "$unit" "$hardening_table"
+  require_pinned_hardening "$unit" "$(hardening_pinned_keys "$hardening_table")"
+  require_no_empty_hardening "$unit"
 done
 require_not_contains "$gateway_unit" 'CapabilityBoundingSet=[^\n]*CAP_SYS_ADMIN|CapabilityBoundingSet=[^\n]*CAP_NET_ADMIN' \
   "gateway must not hold CAP_SYS_ADMIN/CAP_NET_ADMIN"
 require_not_contains "$frps_unit" 'CapabilityBoundingSet=[^\n]*CAP_SYS_ADMIN|CapabilityBoundingSet=[^\n]*CAP_NET_ADMIN' \
   "frps must not hold CAP_SYS_ADMIN/CAP_NET_ADMIN"
-# The gateway owns public 443; it gets exactly one capability for it.
-require_contains "$gateway_unit" '^AmbientCapabilities=CAP_NET_BIND_SERVICE$' \
-  "gateway needs CAP_NET_BIND_SERVICE for :443"
-require_contains "$gateway_unit" '^CapabilityBoundingSet=CAP_NET_BIND_SERVICE$' \
-  "gateway capability set is exactly CAP_NET_BIND_SERVICE"
-# Every writable path is an explicit allowlisted state/run directory.
+# Every writable path is an explicit allowlisted state/run directory. The exact
+# ReadWritePaths= set is additionally pinned in the hardening table above; this
+# per-path loop names a non-allowlisted addition readably and still fails closed
+# if the table is ever loosened.
 for unit in "$gateway_unit" "$frps_unit"; do
   writable="$(unit_field "$unit" ReadWritePaths)"
   if [[ -z "$writable" ]]; then
@@ -442,16 +634,6 @@ for unit in "$gateway_unit" "$frps_unit"; do
     done
   fi
 done
-# Each unit must declare its own exact state AND runtime directory; the two
-# directives are not interchangeable.
-require_unit_scalar "$gateway_unit" StateDirectory "sharebridge-relay-gateway" \
-  "gateway unit must declare exactly one StateDirectory=sharebridge-relay-gateway"
-require_unit_scalar "$gateway_unit" RuntimeDirectory "sharebridge-relay-gateway" \
-  "gateway unit must declare exactly one RuntimeDirectory=sharebridge-relay-gateway"
-require_unit_scalar "$frps_unit" StateDirectory "sharebridge-relay-frps" \
-  "frps unit must declare exactly one StateDirectory=sharebridge-relay-frps"
-require_unit_scalar "$frps_unit" RuntimeDirectory "sharebridge-relay-frps" \
-  "frps unit must declare exactly one RuntimeDirectory=sharebridge-relay-frps"
 
 printf -- '-- A5: LimitNOFILE and MemoryMax\n'
 for unit in "$gateway_unit" "$frps_unit"; do
