@@ -27,6 +27,7 @@ package metrics_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -225,6 +226,20 @@ func TestMetricsEndpointIsPrivateOnly(t *testing.T) {
 		}
 		if strings.Contains(body, "uptime") || strings.Contains(body, "routes") {
 			t.Fatalf("health body exposes extra detail: %q", body)
+		}
+		// The §17.1 endpoint carries exactly the two truths: the frps freshness
+		// mechanism must never leak an observation timestamp or window.
+		var fields map[string]bool
+		if err := json.Unmarshal([]byte(body), &fields); err != nil {
+			t.Fatalf("health body is not the two-truth JSON object: %v (%q)", err, body)
+		}
+		if len(fields) != 2 {
+			t.Fatalf("health body must expose exactly two truths, got %v", fields)
+		}
+		for _, forbidden := range []string{"observed", "timestamp", "freshness", "window", "age"} {
+			if strings.Contains(strings.ToLower(body), forbidden) {
+				t.Fatalf("health body exposes freshness internals %q: %q", forbidden, body)
+			}
 		}
 	})
 }

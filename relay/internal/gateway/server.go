@@ -156,11 +156,68 @@ type Health struct {
 	snapshotReady bool
 	controlSynced bool
 	frpsHealthy   bool
+	// frpsObservedAt is the clock time of the newest authenticated frps/plugin
+	// fact. frpsHealthFreshness is the bounded window that observation proves
+	// frps alive for. The frps↔gateway plugin channel is per-operation HTTP
+	// (frps POSTs one request per Login/NewProxy/CloseProxy/Ping/NewUserConn),
+	// so there is no persistent link to watch: liveness can only be proven by
+	// fresh authenticated traffic, and the truth is read as unhealthy once the
+	// newest observation is older than the window.
+	frpsObservedAt      time.Time
+	frpsHealthFreshness time.Duration
+	// now is the clock seam; production uses time.Now and tests inject a
+	// deterministic clock to exercise the window without sleeping.
+	now func() time.Time
 }
 
+// DefaultFRPSFreshnessWindow is the maximum age of the newest authenticated
+// frps/plugin observation before the independent frps process truth is
+// considered unproven and rendered unhealthy (never stale-true).
+//
+// The frps↔gateway plugin channel is per-operation HTTP: frps makes one
+// request per operation and holds no persistent link for the gateway to
+// watch, so there is no direct "link lost" event. Liveness is therefore
+// proven by fresh authenticated traffic. Every active agent's frpc sends an
+// application heartbeat every 10 seconds (`transport.heartbeatInterval = 10`
+// in the generated frpc config, the cadence the §14 45-second presence lease
+// is built on) and frps forwards each as an authenticated plugin Ping, so
+// while frps is alive and any tunnel exists the plugin observes a fact at
+// least every ~10 seconds. A 30-second window is three nominal heartbeats: it
+// tolerates two consecutive delayed or lost heartbeats without flapping,
+// while an frps death (after which every agent's heartbeats stop) renders
+// unhealthy within 30 seconds instead of staying stale-true indefinitely.
+// With no authenticated traffic at all — a never-seen or idle frps — the
+// truth is unproven and reads unhealthy (fail closed).
+const DefaultFRPSFreshnessWindow = 30 * time.Second
+
 // NewHealth returns a health surface that reports not-ready until each truth
-// is explicitly established. Unknown is reported as not-ready (fail closed).
-func NewHealth() *Health { return &Health{} }
+// is explicitly established. Unknown is reported as not-ready (fail closed),
+// and the frps process truth additionally expires with the production
+// freshness window so a dead frps can never stay stale-true.
+func NewHealth() *Health {
+	return NewHealthWithFRPSFreshness(DefaultFRPSFreshnessWindow, time.Now)
+}
+
+// NewHealthWithFRPSFreshness builds a health surface with an explicit frps
+// freshness window and clock. It is the deterministic seam for the window
+// expiry tests; production uses NewHealth. A nil clock defaults to time.Now;
+// a non-positive window disables expiry (used only where a caller models a
+// truth that is pushed explicitly rather than observed).
+func NewHealthWithFRPSFreshness(window time.Duration, now func() time.Time) *Health {
+	if now == nil {
+		now = time.Now
+	}
+	return &Health{frpsHealthFreshness: window, now: now}
+}
+
+// clock reads the injected clock, defaulting to time.Now for a zero-value
+// Health (which never carries a freshness window).
+func (health *Health) clock() time.Time {
+	if health.now == nil {
+		return time.Now()
+	}
+	return health.now()
+}
 
 // SetSnapshotReady records that a full route snapshot has been applied.
 func (health *Health) SetSnapshotReady(ready bool) {
@@ -176,11 +233,19 @@ func (health *Health) SetControlSynced(synced bool) {
 	health.controlSynced = synced
 }
 
-// SetFRPSHealthy records the separate frps process truth.
+// SetFRPSHealthy records the separate frps process truth. A true observation
+// stamps the freshness window (the production fact path calls it on every
+// authenticated frps fact); an explicit false is an immediate supervisor down
+// transition and clears the observation.
 func (health *Health) SetFRPSHealthy(healthy bool) {
 	health.mu.Lock()
 	defer health.mu.Unlock()
 	health.frpsHealthy = healthy
+	if healthy {
+		health.frpsObservedAt = health.clock()
+	} else {
+		health.frpsObservedAt = time.Time{}
+	}
 }
 
 // RouteReady reports the gateway's ability to route: snapshot AND control
@@ -191,11 +256,19 @@ func (health *Health) RouteReady() bool {
 	return health.snapshotReady && health.controlSynced
 }
 
-// FRPSProcessHealthy reports the independent frps process truth.
+// FRPSProcessHealthy reports the independent frps process truth: the newest
+// authenticated frps observation is still inside the freshness window. An
+// expired window reads unhealthy (fail closed), never stale-true.
 func (health *Health) FRPSProcessHealthy() bool {
 	health.mu.Lock()
 	defer health.mu.Unlock()
-	return health.frpsHealthy
+	if !health.frpsHealthy {
+		return false
+	}
+	if health.frpsHealthFreshness <= 0 {
+		return true
+	}
+	return health.clock().Sub(health.frpsObservedAt) <= health.frpsHealthFreshness
 }
 
 // NewServer wires the public acceptor to the in-memory route and stream

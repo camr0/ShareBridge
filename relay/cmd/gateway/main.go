@@ -442,10 +442,15 @@ func (tracker *tunnelRestorationTracker) takeElapsed(agentRecordID string) (floa
 
 // frpsLifecycleEvents is the production frps/plugin lifecycle view. Any
 // authenticated plugin fact proves frps is driving the plugin boundary, so it
-// marks the independent §17.1 frps process truth healthy; a §15.2 SessionReset
-// (a burned one-use credential re-presented) additionally proves frps
-// restarted and anchors the §17.3 restoration latency. It never touches route
-// readiness.
+// marks the independent §17.1 frps process truth healthy and stamps the
+// bounded freshness window; a §15.2 SessionReset (a burned one-use credential
+// re-presented) additionally proves frps restarted and anchors the §17.3
+// restoration latency. Because the frps↔gateway plugin channel is per-operation
+// HTTP with no persistent link to watch, the down transition is observed by
+// the window expiring rather than by an explicit event: once the newest fact is
+// older than gateway.DefaultFRPSFreshnessWindow (three 10-second frpc
+// heartbeats), /healthz renders frps unhealthy instead of stale-true. It never
+// touches route readiness.
 type frpsLifecycleEvents struct {
 	next        frpplugin.PresenceEvents
 	health      *gateway.Health

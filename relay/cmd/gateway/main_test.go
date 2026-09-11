@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -163,6 +164,121 @@ func TestGatewayHealthReflectsRealFRPSPluginLifecycle(t *testing.T) {
 	if health.RouteReady() {
 		t.Fatal("frps health must never imply route readiness (snapshot/control sync are separate truths)")
 	}
+}
+
+// TestGatewayFRPSHealthDownTransitionAndRecovery drives the real frps/plugin
+// authorization boundary and the real private §17.1 /healthz endpoint: an
+// authenticated frps fact marks frps healthy, the bounded freshness window
+// expiring renders it unhealthy (the down transition an frps death produces),
+// and a new authenticated fact restores healthy. The frps↔gateway plugin
+// channel is per-operation HTTP with no persistent link to observe, so
+// liveness is proven only by fresh authenticated traffic — an expired window
+// must never stay stale-true.
+func TestGatewayFRPSHealthDownTransitionAndRecovery(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate control key: %v", err)
+	}
+	const sharedSecret = "gateway-frps-freshness-secret"
+	t.Setenv(envPluginSharedSecret, sharedSecret)
+	t.Setenv(envControlPublicKey, hex.EncodeToString(publicKey))
+	t.Setenv(envRelayPortMin, "22000")
+	t.Setenv(envRelayPortMax, "22100")
+	t.Setenv(envRelayDataDir, t.TempDir())
+
+	// The health clock is deterministic and independent of the plugin's real
+	// credential clock: only the freshness window is exercised here. It is
+	// guarded because the plugin's dispatcher goroutine stamps it.
+	const window = 30 * time.Second
+	var clockMu sync.Mutex
+	current := time.Date(2026, 9, 4, 9, 30, 0, 0, time.UTC)
+	clock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return current
+	}
+	advanceClock := func(delta time.Duration) {
+		clockMu.Lock()
+		current = current.Add(delta)
+		clockMu.Unlock()
+	}
+
+	health := gateway.NewHealthWithFRPSFreshness(window, clock)
+	registry := metrics.NewRegistry(metrics.Relay)
+	recorder := &wiringPresenceRecorder{}
+	events := frpsLifecycleEvents{next: recorder, health: health, restoration: newTunnelRestorationTracker(time.Now)}
+	plugin, _, err := configuredPluginServer(events, registry)
+	if err != nil {
+		t.Fatalf("configuredPluginServer() error = %v, want nil", err)
+	}
+
+	// Fail closed: a never-seen frps reads unhealthy through the real
+	// endpoint, and the endpoint exposes only the two §17.1 truths.
+	body, raw := healthzSnapshot(t, registry, health)
+	if body.FRPSHealthy {
+		t.Fatal("a never-seen frps must read unhealthy (fail closed), never true")
+	}
+	if body.RouteReady {
+		t.Fatal("route readiness must stay false without a snapshot and healthy sync")
+	}
+	assertHealthzExposesOnlyTwoTruths(t, raw)
+
+	realNow := time.Now().UTC()
+	claims := wiringClaims{
+		Issuer:        "sharebridge-control",
+		Audience:      "sharebridge-relay",
+		APIKeyID:      "api-freshness",
+		AgentRecordID: "agent-freshness",
+		Namespace:     "sbdeadbeef",
+		ProxyName:     "sb-sbdeadbeef",
+		RelayPort:     22042,
+		Generation:    1,
+		IssuedAt:      realNow.Add(-time.Minute),
+		ExpiresAt:     realNow.Add(9 * time.Minute),
+		JTI:           "jti-freshness-one",
+	}
+	token := signWiringCredential(t, privateKey, claims)
+	if wiringRequest(t, plugin, sharedSecret, frpplugin.OperationLogin, wiringLoginContent(token, claims)).Reject {
+		t.Fatal("the Login was rejected; the plugin was not wired for the credential")
+	}
+	waitForFRPSHealthy(t, health)
+	body, raw = healthzSnapshot(t, registry, health)
+	if !body.FRPSHealthy {
+		t.Fatalf("a real authenticated frps fact must render frps healthy at /healthz (body %s)", raw)
+	}
+	if body.RouteReady {
+		t.Fatal("frps health must never imply route readiness")
+	}
+
+	// The freshness window expiring is the production down transition: an frps
+	// death stops all authenticated traffic, so /healthz must report false
+	// rather than a stale true.
+	advanceClock(window + time.Second)
+	body, raw = healthzSnapshot(t, registry, health)
+	if body.FRPSHealthy {
+		t.Fatalf("an expired frps freshness window must render unhealthy, never stale-true (body %s)", raw)
+	}
+
+	// A new authenticated frps fact restores healthy on the same real path.
+	if wiringRequest(t, plugin, sharedSecret, frpplugin.OperationPing, wiringPingContent(token, claims.Generation)).Reject {
+		t.Fatal("the Ping was rejected; recovery could not be driven")
+	}
+	waitForFRPSHealthy(t, health)
+	body, raw = healthzSnapshot(t, registry, health)
+	if !body.FRPSHealthy {
+		t.Fatalf("a new authenticated frps fact must restore frps health (body %s)", raw)
+	}
+
+	// Bounds re-assertion: observing authenticated facts spawns no goroutine
+	// per observation (the down transition is a timestamp comparison on the
+	// already-wired event path).
+	baseline := runtime.NumGoroutine()
+	for i := 0; i < 64; i++ {
+		if wiringRequest(t, plugin, sharedSecret, frpplugin.OperationPing, wiringPingContent(token, claims.Generation)).Reject {
+			t.Fatalf("Ping %d was rejected", i)
+		}
+	}
+	requireGoroutinesBounded(t, baseline, 1, "authenticated frps fact observations", time.Second)
 }
 
 // TestTunnelRestorationMetricFromRealPresenceRestart drives the real presence
@@ -389,4 +505,100 @@ func wiringRequest(t *testing.T, plugin http.Handler, sharedSecret, operation st
 		t.Fatalf("decode plugin response: %v", err)
 	}
 	return response
+}
+
+// wiringPingContent is an authenticated application Ping on an existing
+// session; the plugin forwards it as a presence fact and (with the freshness
+// mechanism) refreshes the frps process truth.
+func wiringPingContent(token string, generation int) map[string]any {
+	return map[string]any{
+		"user": map[string]any{
+			"user":   "",
+			"run_id": "run-wiring",
+			"metas": map[string]string{
+				frpplugin.CredentialMetadataKey: token,
+				frpplugin.GenerationMetadataKey: strconv.Itoa(generation),
+			},
+		},
+		"timestamp": time.Now().Unix(),
+	}
+}
+
+// healthzBody is the exact §17.1 /healthz payload: two independent booleans.
+type healthzBody struct {
+	RouteReady  bool `json:"route_ready"`
+	FRPSHealthy bool `json:"frps_process_healthy"`
+}
+
+// healthzSnapshot renders the real private health endpoint (the same
+// registry.Handler(health) the gateway binary serves) and returns the decoded
+// body plus the raw JSON for privacy assertions.
+func healthzSnapshot(t *testing.T, registry *metrics.Registry, health *gateway.Health) (healthzBody, string) {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9101/healthz", nil)
+	request.RemoteAddr = "127.0.0.1:5555"
+	request.Host = "127.0.0.1:9101"
+	recorder := httptest.NewRecorder()
+	registry.Handler(health).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("/healthz status = %d, want 200", recorder.Code)
+	}
+	var body healthzBody
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode /healthz body %q: %v", recorder.Body.String(), err)
+	}
+	return body, recorder.Body.String()
+}
+
+// assertHealthzExposesOnlyTwoTruths re-asserts the private surface's bounds:
+// the freshness mechanism adds no field, label, or timestamp to the endpoint.
+func assertHealthzExposesOnlyTwoTruths(t *testing.T, raw string) {
+	t.Helper()
+	var fields map[string]bool
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		t.Fatalf("decode /healthz: %v", err)
+	}
+	if len(fields) != 2 {
+		t.Fatalf("/healthz must expose exactly the two §17.1 truths, got %v", fields)
+	}
+	for _, key := range []string{"route_ready", "frps_process_healthy"} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("/healthz missing %q: %v", key, fields)
+		}
+	}
+	lowered := strings.ToLower(raw)
+	for _, forbidden := range []string{"observed", "expires", "window", "timestamp", "freshness", "age"} {
+		if strings.Contains(lowered, forbidden) {
+			t.Fatalf("/healthz exposes freshness internals %q: %s", forbidden, raw)
+		}
+	}
+}
+
+// waitForFRPSHealthy waits for the plugin's bounded dispatcher to deliver an
+// authenticated fact to the health surface.
+func waitForFRPSHealthy(t *testing.T, health *gateway.Health) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !health.FRPSProcessHealthy() {
+		time.Sleep(time.Millisecond)
+	}
+	if !health.FRPSProcessHealthy() {
+		t.Fatal("frps health never became healthy after an authenticated fact")
+	}
+}
+
+// requireGoroutinesBounded polls until the goroutine count settles within the
+// baseline plus slack, so a bounded mechanism can be distinguished from one
+// that leaks a goroutine per observation.
+func requireGoroutinesBounded(t *testing.T, baseline, slack int, label string, deadline time.Duration) {
+	t.Helper()
+	limit := time.Now().Add(deadline)
+	for time.Now().Before(limit) {
+		runtime.Gosched()
+		if runtime.NumGoroutine() <= baseline+slack {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s spawned goroutines: %d > baseline %d (+%d slack)", label, runtime.NumGoroutine(), baseline, slack)
 }
