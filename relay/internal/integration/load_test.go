@@ -62,7 +62,20 @@ const (
 	// requests served.
 	capacityGoroutineSlack = 24
 	capacityFDSlack        = 24
-	capacityHeapSlack      = 64 << 20
+
+	// capacityRetainedHeapSlack bounds the MEASURED live-heap growth across
+	// the plateau load (see retainedHeapStats). It is deliberately far below
+	// the retained footprint of even one leaked copy buffer per served
+	// stream: the case serves 64 requests, and each direction holds a 32 KiB
+	// pooled buffer, so a single buffer retained per connection is 64×(32
+	// KiB) = 2 MiB and the two-direction case is 4 MiB. A 1 MiB bound
+	// therefore fails on a realistic per-connection buffer retention while
+	// leaving the measured process-wide overhead (≤ ~0.3 MiB across 20
+	// -race runs at this request count, dominated by the harness's per-
+	// connection TLS byte tap rather than gateway buffers) several times of
+	// headroom. See the fix-round notes in the task report for the measured
+	// distribution the number was chosen from.
+	capacityRetainedHeapSlack = 1 << 20
 )
 
 // capacityHarness is the hermetic stack with a deterministic §14 limiter and
@@ -248,15 +261,30 @@ func openFDCount() (int, bool) {
 	return 0, false
 }
 
-// heapInUseBytes returns HeapInuse after a forced collection, the coarse
-// witness for copy-buffer plateau. The tight bound is the live-stream count
-// (see TestRelayCapacityResourcePlateauUnderLoad); this is the supporting
-// measurement that no cumulative buffering survives.
-func heapInUseBytes() uint64 {
+// retainedHeapStats forces two collections and returns the live heap bytes
+// (HeapAlloc) and live object count (HeapObjects) that survive them. This is
+// the MEASURED witness for the copy-buffer plateau: it counts memory that is
+// still reachable after the load settles, not a quantity inferred from the
+// live-stream count.
+//
+// Two collections are required. sync.Pool keeps returned buffers in a victim
+// cache that survives one collection, so a single GC would report the pool's
+// idle (reusable, not leaked) buffers as retained and mask the signal. After
+// the second collection the pool is empty and only genuinely reachable
+// objects remain. Taking the delta between two such samples (before and after
+// the load) measures retention growth across the load itself, independent of
+// whatever fixed runtime heap the surrounding test process already carries.
+//
+// The measurement is process-wide: it also includes the harness's own
+// per-connection TLS byte tap (relayStack.agentTap), which is bounded per run
+// and reported separately in the evidence line; the bound below is sized
+// around that measured overhead (see capacityRetainedHeapSlack).
+func retainedHeapStats() (uint64, uint64) {
+	runtime.GC()
 	runtime.GC()
 	var stats runtime.MemStats
 	runtime.ReadMemStats(&stats)
-	return stats.HeapInuse
+	return stats.HeapAlloc, stats.HeapObjects
 }
 
 // waitForActiveStreams blocks until the limiter reports the wanted per-agent
@@ -679,7 +707,10 @@ func TestRelayCapacityIdleActiveStreamSurvivesIdleWindow(t *testing.T) {
 		t.Fatalf("idle close after activity took %s with a %s idle window", closedAfterStop, idleWindow)
 	}
 	waitForStreams(t, harness.relayStack, 0, 10*time.Second)
-	t.Logf("%s case=active-stream-survives-idle idle_window_s=%.1f active_for_s=%.3f closed_after_stop_s=%.3f stream_registry=0",
+	if harness.limiter.ActiveStreams() != 0 {
+		t.Fatalf("limiter reports %d active streams after the idle close", harness.limiter.ActiveStreams())
+	}
+	t.Logf("%s case=active-stream-survives-idle idle_window_s=%.1f active_for_s=%.3f closed_after_stop_s=%.3f stream_registry=0 active_streams=0",
 		capacityEvidencePrefix, idleWindow.Seconds(), activeFor.Seconds(), closedAfterStop.Seconds())
 }
 
@@ -816,13 +847,16 @@ func TestRelayCapacityCancellationReleasesCapacity(t *testing.T) {
 // is the WITHIN-run delta: resources must return to the run's own baseline and
 // must not scale with the cumulative request count.
 //
-// The tight bound is the live-stream count: each stream owns at most two 32 KiB
-// pooled copy buffers (gateway.streamCopyBufferSize), so copy-buffer memory is
-// O(concurrent streams), and a peak live-stream count at the configured
-// concurrency proves it never scales with cumulative requests. Goroutine and FD
-// counts are then asserted to return to the pre-load baseline, and an
-// independent heap-plateau measurement confirms no cumulative buffering
-// survives the load.
+// The tight stream bound is the live-stream count: each stream owns at most
+// two 32 KiB pooled copy buffers (gateway.streamCopyBufferSize), so the pool
+// is bounded by O(concurrent streams) and a peak live-stream count at the
+// configured concurrency shows the pool never scales with cumulative
+// requests. Goroutine and FD counts are asserted to return to the pre-load
+// baseline, and the copy-buffer claim is confirmed by a REAL measurement of
+// retained memory: the GC-stabilised live-heap delta between the settled
+// baseline and the settled post-load state (retainedHeapStats). The stream
+// count bounds concurrency; the live-heap delta measures that nothing is
+// retained per connection.
 func TestRelayCapacityResourcePlateauUnderLoad(t *testing.T) {
 	requireIntegration(t)
 	config := limits.DefaultConfig()
@@ -847,7 +881,8 @@ func TestRelayCapacityResourcePlateauUnderLoad(t *testing.T) {
 
 	baselineGoroutines := runtime.NumGoroutine()
 	baselineFDs, fdsAvailable := openFDCount()
-	baselineHeap := heapInUseBytes()
+	baselineHeap, baselineObjects := retainedHeapStats()
+	baselineTapBytes := int64(harness.agentTap.Len())
 
 	const workers = 8
 	const rounds = 4
@@ -902,7 +937,28 @@ func TestRelayCapacityResourcePlateauUnderLoad(t *testing.T) {
 	if fdsAvailable {
 		finalFDs, _ = openFDCount()
 	}
-	finalHeap := heapInUseBytes()
+	finalHeap, finalObjects := retainedHeapStats()
+	retainedGrowth := int64(finalHeap) - int64(baselineHeap)
+	retainedObjectGrowth := int64(finalObjects) - int64(baselineObjects)
+	tapGrowth := int64(harness.agentTap.Len()) - baselineTapBytes
+
+	// Copy buffers: each live stream may hold at most two pooled 32 KiB
+	// buffers, so the peak buffer footprint is bounded by the peak stream
+	// count, not by the cumulative request count. This bound is a concurrency
+	// ceiling; the retained-heap assertion below is the measurement that no
+	// buffer survives per connection.
+	const copyBuffersPerStream = 2
+	const copyBufferBytes = 32 << 10
+	maxBufferBytes := int64((peakStreams + 1) * copyBuffersPerStream * copyBufferBytes)
+
+	// Emit evidence before the assertions so a failing run still reports the
+	// measured values it failed on.
+	t.Logf("%s case=resource-plateau requests_served=%d workers=%d rounds=%d baseline_goroutines=%d final_goroutines=%d peak_goroutines=%d baseline_fds=%d final_fds=%d peak_fds=%d fds_available=%t baseline_heap=%d final_heap=%d retained_growth=%d retained_heap_slack=%d harness_tap_growth=%d baseline_objects=%d final_objects=%d retained_object_growth=%d peak_streams=%d max_copy_buffer_bytes=%d",
+		capacityEvidencePrefix, rounds*workers*2, workers, rounds,
+		baselineGoroutines, finalGoroutines, peakGoroutines,
+		baselineFDs, finalFDs, peakFDs, fdsAvailable,
+		baselineHeap, finalHeap, retainedGrowth, capacityRetainedHeapSlack,
+		tapGrowth, baselineObjects, finalObjects, retainedObjectGrowth, peakStreams, maxBufferBytes)
 
 	if finalGoroutines > baselineGoroutines+capacityGoroutineSlack {
 		t.Fatalf("goroutines did not plateau: baseline=%d final=%d slack=%d after serving %d requests",
@@ -912,9 +968,9 @@ func TestRelayCapacityResourcePlateauUnderLoad(t *testing.T) {
 		t.Fatalf("file descriptors did not plateau: baseline=%d final=%d slack=%d after serving %d requests",
 			baselineFDs, finalFDs, capacityFDSlack, rounds*workers*2)
 	}
-	if finalHeap > baselineHeap+capacityHeapSlack {
-		t.Fatalf("heap did not plateau: baseline=%d final=%d growth_slack=%d after serving %d requests",
-			baselineHeap, finalHeap, capacityHeapSlack, rounds*workers*2)
+	if retainedGrowth > capacityRetainedHeapSlack {
+		t.Fatalf("retained heap grew %d bytes across %d served requests (baseline=%d final=%d), above the %d-byte bound: copy buffers must not be retained per connection",
+			retainedGrowth, rounds*workers*2, baselineHeap, finalHeap, capacityRetainedHeapSlack)
 	}
 	if peakGoroutines > baselineGoroutines+6*workers+capacityGoroutineSlack {
 		t.Fatalf("peak goroutines %d exceeded the concurrency bound baseline=%d + 6*workers=%d + slack=%d; goroutines must scale with concurrent streams, not the %d cumulative requests",
@@ -929,14 +985,4 @@ func TestRelayCapacityResourcePlateauUnderLoad(t *testing.T) {
 	if harness.limiter.ActiveStreams() != 0 {
 		t.Fatalf("limiter holds %d active streams after settling", harness.limiter.ActiveStreams())
 	}
-	// Copy buffers: each live stream may hold at most two pooled 32 KiB
-	// buffers, so the peak buffer footprint is bounded by the peak stream
-	// count, not by the cumulative request count.
-	const copyBuffersPerStream = 2
-	const copyBufferBytes = 32 << 10
-	maxBufferBytes := int64((peakStreams + 1) * copyBuffersPerStream * copyBufferBytes)
-	t.Logf("%s case=resource-plateau requests_served=%d workers=%d rounds=%d baseline_goroutines=%d final_goroutines=%d peak_goroutines=%d baseline_fds=%d final_fds=%d peak_fds=%d fds_available=%t baseline_heap=%d final_heap=%d peak_streams=%d max_copy_buffer_bytes=%d",
-		capacityEvidencePrefix, rounds*workers*2, workers, rounds,
-		baselineGoroutines, finalGoroutines, peakGoroutines,
-		baselineFDs, finalFDs, peakFDs, fdsAvailable, baselineHeap, finalHeap, peakStreams, maxBufferBytes)
 }

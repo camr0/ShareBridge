@@ -410,7 +410,7 @@ Safety cases (all GREEN, `-race -count=5`):
 | No-byte idle close | configured idle 2 s; closed 2.001 s after the handshake |
 | Absolute lifetime (hard close) | configured lifetime 2 s with idle 300 s; continuously active stream closed at 1.994–2.001 s (activity never extended it) |
 | Cancellation | 3 concurrent streams cancelled; agent observed cancellation, registry and every admission slot returned to 0, capacity reused afterwards |
-| Goroutine / FD / buffer plateau | after 64 served requests across 4 rounds at concurrency 8: goroutines returned to the run baseline (final = baseline ±1), FDs baseline 14–15 → final 15, heap growth ≤ ~0.4 MiB, peak live streams 8 (bound), so copy-buffer memory is bounded by ≤ (8+1)×2×32 KiB ≈ 576 KiB regardless of cumulative requests |
+| Goroutine / FD / retained-buffer plateau | after 64 served requests across 4 rounds at concurrency 8: goroutines returned to the run baseline (final = baseline ±1), FDs baseline 14–15 → final 15, **measured retained live heap** (GC-stabilised `HeapAlloc` delta) 162–237 KiB against a **1 MiB** bound, peak live streams 8 (concurrency bound, copy-buffer footprint ≤ (8+1)×2×32 KiB ≈ 576 KiB). One 32 KiB copy buffer retained per served connection would be 64 × 32 KiB = 2 MiB and fail; the 64 KiB/connection reviewer mutation (4 MiB) fails. |
 
 Interpretation limits (stated so the numbers are not over-read):
 
@@ -419,6 +419,17 @@ Interpretation limits (stated so the numbers are not over-read):
   more hermetic stacks are created in one process (a test-harness lifecycle
   effect); the asserted property is the **within-run** delta — resources return
   to the run's own baseline and do not scale with cumulative requests.
+- The retained-heap figure is the **measured** `HeapAlloc` delta between the
+  settled baseline and the settled post-load state after two forced
+  collections (the second drains the `sync.Pool` victim cache, so idle pooled
+  buffers are not miscounted as retained). It is grounded in a measured
+  quantity, not inferred from the live-stream count. The measurement is
+  process-wide and therefore also carries the harness's own per-connection TLS
+  byte tap; the evidence line reports that contribution separately as
+  `harness_tap_growth` (≈114 KiB at this request count). The 1 MiB bound is
+  deliberately below one 32 KiB copy buffer per served connection (2 MiB across
+  64 requests), so a realistic per-connection buffer retention fails while the
+  measured overhead keeps >4× headroom under `-race`.
 - Loopback throughput includes real pinned `frps`/`frpc` processes, real TLS
   and real L4 passthrough, but no WAN RTT, no packet loss and no target-VM
   CPU/NIC ceiling; it is a safety baseline, not a capacity promise.
