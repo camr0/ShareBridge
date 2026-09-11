@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"sharebridge/relay/internal/metrics"
 	"sharebridge/relay/internal/routes"
 )
 
@@ -89,6 +90,10 @@ type ApplierConfig struct {
 	BootID string
 	// Logger receives bounded diagnostics (never payload contents).
 	Logger *slog.Logger
+	// Metrics receives the §17.3 route/delta propagation-lag histogram and
+	// the revocation→stream-close latency histogram. Optional; a nil
+	// registry records nothing.
+	Metrics *metrics.Registry
 	// Clock overrides the wall clock for diagnostics. The route lease reads
 	// the table's clock, not this one.
 	Clock func() time.Time
@@ -104,6 +109,7 @@ type Applier struct {
 	namespace string
 	bootID    string
 	logger    *slog.Logger
+	metrics   *metrics.Registry
 	clock     func() time.Time
 
 	mu          sync.Mutex
@@ -141,6 +147,7 @@ func NewApplier(config ApplierConfig) (*Applier, error) {
 		namespace: config.Namespace,
 		bootID:    config.BootID,
 		logger:    logger,
+		metrics:   config.Metrics,
 		clock:     clock,
 	}, nil
 }
@@ -253,6 +260,7 @@ func (applier *Applier) Reconcile(ctx context.Context) error {
 // route never drops an otherwise well-formed snapshot; malformed pages are
 // already refused wholesale by the Task 11 validators).
 func (applier *Applier) applySnapshot(snapshot Snapshot) error {
+	receivedAt := applier.clock()
 	applier.mu.Lock()
 	currentEpoch := applier.epoch
 	applier.mu.Unlock()
@@ -297,9 +305,10 @@ func (applier *Applier) applySnapshot(snapshot Snapshot) error {
 	} else {
 		dropped = applier.table.ReplaceSnapshot(admitted)
 	}
-	applier.drain(dropped)
+	applier.drain(dropped, receivedAt)
 
 	applier.setState(snapshot.Epoch, snapshot.Revision)
+	applier.observePropagationLag(snapshot.PublishedAt)
 	applier.logger.Info("controlsync: route snapshot applied",
 		"routes", len(admitted),
 		"dropped", len(dropped),
@@ -326,6 +335,7 @@ func (applier *Applier) applySnapshot(snapshot Snapshot) error {
 // expiry never reaches this path: it is the absence of applied refreshes,
 // not a delta.
 func (applier *Applier) applyDeltas(page DeltaPage) error {
+	receivedAt := applier.clock()
 	applier.mu.Lock()
 	currentEpoch := applier.epoch
 	applier.mu.Unlock()
@@ -351,7 +361,7 @@ func (applier *Applier) applyDeltas(page DeltaPage) error {
 			err = applier.table.Revoke(hostname, delta.Revision)
 			switch {
 			case err == nil:
-				applier.drain([]string{hostname})
+				applier.drain([]string{hostname}, receivedAt)
 			case errors.Is(err, routes.ErrStaleRevision):
 				// A stale-revision revoke against an ACTIVE stored route is
 				// divergence, never an idempotent success: the stored route
@@ -396,6 +406,7 @@ func (applier *Applier) applyDeltas(page DeltaPage) error {
 	}
 
 	applier.setState(currentEpoch, page.LatestRevision)
+	applier.observePropagationLag(page.PublishedAt)
 	return nil
 }
 
@@ -469,17 +480,56 @@ func (applier *Applier) validateRelayHostname(hostname string) (string, error) {
 // ever be called after the motivating table mutation has been committed —
 // the ordering invariant documented on gateway Streams.RegisterAdmitted and
 // routes.Table.ReplaceSnapshot. A revoked hostname with no indexed streams
-// is the normal quiet case.
-func (applier *Applier) drain(hostnames []string) {
+// is the normal quiet case. receivedAt is when the revocation was received
+// (the payload's apply began); each hostname that actually closed at least
+// one established stream records one §17.3 revocation→close latency sample.
+func (applier *Applier) drain(hostnames []string, receivedAt time.Time) {
 	if applier.streams == nil || len(hostnames) == 0 {
 		return
 	}
 	for _, hostname := range hostnames {
 		if closed := applier.streams.CloseRoute(hostname); closed > 0 {
+			applier.observeRevocationClose(receivedAt)
 			applier.logger.Info("controlsync: revoked route closed established streams",
 				"hostname", hostname, "streams", closed)
 		}
 	}
+}
+
+// observeRevocationClose records one §17.3 "route revocation to active-stream
+// close" latency sample. It is invoked only when at least one established
+// stream was actually closed, so the histogram measures real closes rather
+// than revocations that had nothing to drain.
+func (applier *Applier) observeRevocationClose(receivedAt time.Time) {
+	if applier.metrics == nil {
+		return
+	}
+	applier.metrics.Observe("sharebridge_relay_revocation_close_seconds", nonNegativeSeconds(applier.clock().Sub(receivedAt)))
+}
+
+// observePropagationLag records one §17.3 control→gateway route propagation
+// lag sample from a payload's published_at stamp. An absent or malformed
+// stamp records NOTHING — the metric must never fabricate a lag value — and a
+// stamp in the future is clamped to zero elapsed.
+func (applier *Applier) observePropagationLag(publishedAt string) {
+	if applier.metrics == nil {
+		return
+	}
+	published, ok := parsePublishedAt(publishedAt)
+	if !ok {
+		return
+	}
+	applier.metrics.Observe("sharebridge_relay_route_propagation_lag_seconds", nonNegativeSeconds(applier.clock().Sub(published)))
+}
+
+// nonNegativeSeconds clamps an age to a non-negative seconds value; a clock
+// skew that predates the publish stamp records 0 rather than a negative
+// sample.
+func nonNegativeSeconds(delta time.Duration) float64 {
+	if delta < 0 {
+		return 0
+	}
+	return delta.Seconds()
 }
 
 // setState records a fully applied revision and its governing control epoch

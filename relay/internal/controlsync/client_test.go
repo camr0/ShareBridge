@@ -284,6 +284,7 @@ func TestSyncGoldenPayloadsRoundTripBothModules(t *testing.T) {
 					Limits:        Limits{MaxStreamsPerOrigin: 16, MaxStreamsPerAgent: 32, MaxStreamsGlobal: 8192},
 				},
 			},
+			PublishedAt: "2026-09-03T17:55:00Z",
 		}
 		constructedBytes, err := json.Marshal(constructed)
 		if err != nil {

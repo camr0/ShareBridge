@@ -166,6 +166,12 @@ type Publisher struct {
 	// is per-epoch only: cross-restart adoption is decided by epoch
 	// comparison at the gateway, not by revisions (R2, ruling 6).
 	revision uint64
+	// lastPublishedAt is the wall time at which revision last advanced (or
+	// the publisher's construction time for the initial revision). It is
+	// stamped onto every snapshot/delta page as published_at so the gateway
+	// can measure §17.3 route propagation lag without the timestamp ever
+	// participating in ordering or adoption decisions.
+	lastPublishedAt time.Time
 	// entries tracks the last published active route per hostname. An
 	// absent entry never implies absence on the gateway: after a control
 	// restart the snapshot re-derives everything from PocketBase.
@@ -244,6 +250,7 @@ func NewPublisher(app core.App, config PublisherConfig) (*Publisher, error) {
 		logger:            slog.Default(),
 		epoch:             epoch,
 		revision:          revisionSeed,
+		lastPublishedAt:   nowFn(),
 		entries:           make(map[string]publisherRoute),
 		revokedAt:         make(map[string]time.Time),
 	}, nil
@@ -353,6 +360,7 @@ func (p *Publisher) publishDeltaLocked(operation string, identity routeIdentity,
 		publishedAt: p.nowFn(),
 	})
 	now := p.nowFn()
+	p.lastPublishedAt = now
 	if active {
 		p.entries[identity.hostname] = publisherRoute{route: route, revision: revision, touchedAt: now}
 		delete(p.revokedAt, identity.hostname)
@@ -408,7 +416,7 @@ func (p *Publisher) RouteSnapshot() (Snapshot, error) {
 		})
 	}
 	sort.Slice(routes, func(a, b int) bool { return routes[a].Hostname < routes[b].Hostname })
-	return Snapshot{Version: ProtocolVersion, Epoch: p.epoch, Revision: p.revision, Routes: routes}, nil
+	return Snapshot{Version: ProtocolVersion, Epoch: p.epoch, Revision: p.revision, Routes: routes, PublishedAt: formatPublishedAt(p.lastPublishedAt)}, nil
 }
 
 // routeLimitsLocked returns the limits a snapshot route must carry: the
@@ -441,13 +449,15 @@ func (p *Publisher) RouteDeltas(since uint64) (DeltaPage, error) {
 		return DeltaPage{}, fmt.Errorf("%w: requested since %d is ahead of control revision %d", ErrBadRevision, since, p.revision)
 	}
 	if since == p.revision {
-		return DeltaPage{Version: ProtocolVersion, Epoch: p.epoch, Status: DeltaStatusOK, Since: since, LatestRevision: p.revision}, nil
+		return DeltaPage{Version: ProtocolVersion, Epoch: p.epoch, Status: DeltaStatusOK, Since: since, LatestRevision: p.revision, PublishedAt: formatPublishedAt(p.lastPublishedAt)}, nil
 	}
-	page := DeltaPage{Version: ProtocolVersion, Epoch: p.epoch, Status: DeltaStatusGap, Since: since, LatestRevision: p.revision}
+	page := DeltaPage{Version: ProtocolVersion, Epoch: p.epoch, Status: DeltaStatusGap, Since: since, LatestRevision: p.revision, PublishedAt: formatPublishedAt(p.lastPublishedAt)}
 	collected := make([]RouteDelta, 0, len(p.deltas))
+	latestPublishedAt := p.lastPublishedAt
 	for _, retained := range p.deltas {
 		if retained.delta.Revision > since {
 			collected = append(collected, retained.delta)
+			latestPublishedAt = retained.publishedAt
 		}
 	}
 	if len(collected) > 0 && collected[0].Revision == since+1 {
@@ -456,6 +466,7 @@ func (p *Publisher) RouteDeltas(since uint64) (DeltaPage, error) {
 		page.Status = DeltaStatusOK
 		page.Deltas = collected
 		page.LatestRevision = collected[len(collected)-1].Revision
+		page.PublishedAt = formatPublishedAt(latestPublishedAt)
 	}
 	return page, nil
 }

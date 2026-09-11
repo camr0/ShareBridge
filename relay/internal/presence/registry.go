@@ -575,6 +575,11 @@ func (registry *Registry) emitLocked(key tunnelKey, tunnel *tunnelState, state s
 	})
 }
 
+// BootID reports this gateway process's presence identity (§15.1): a fresh
+// value per process, so control discards a previous boot's stale presence
+// facts. The control-sync status ack carries the same identity.
+func (registry *Registry) BootID() string { return registry.bootID }
+
 // Online answers the route table's presence join (routes.Presence). It reads
 // only in-memory leased state and never blocks on I/O or re-enters the
 // streams registry — the gateway's RegisterAdmitted calls it under its own

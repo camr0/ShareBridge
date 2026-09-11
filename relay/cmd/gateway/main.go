@@ -22,10 +22,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"sharebridge/relay/internal/controlsync"
 	"sharebridge/relay/internal/frpplugin"
 	"sharebridge/relay/internal/gateway"
 	"sharebridge/relay/internal/limits"
@@ -46,6 +48,25 @@ const (
 	// §17.3 metrics). It must be a numeric loopback host:port; startup
 	// refuses anything else (spec §17.1: metrics/health are private).
 	envMetricsAddress = "SHAREBRIDGE_GATEWAY_METRICS_ADDR"
+	// Control↔gateway §11.3 sync configuration. All five values are
+	// required together; a partial configuration refuses startup. When none
+	// is set the gateway runs without control sync (the dark/enable-relay
+	// posture) and route readiness stays fail-closed false.
+	envControlSyncURL      = "SHAREBRIDGE_CONTROL_SYNC_URL"
+	envControlSyncSAN      = "SHAREBRIDGE_CONTROL_SYNC_SAN"
+	envControlSyncCAFile   = "SHAREBRIDGE_CONTROL_SYNC_CA_FILE"
+	envGatewaySyncCertFile = "SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE"
+	envGatewaySyncKeyFile  = "SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE"
+	// envGatewayNamespace is this gateway's §6 namespace ("sb" plus eight
+	// lowercase hex characters); required with the sync configuration.
+	envGatewayNamespace = "SHAREBRIDGE_GATEWAY_NAMESPACE"
+	// NIC saturation collector configuration (§17.3 bullet 5). The ratio is
+	// only reported when both the interface and a positive capacity are set;
+	// otherwise the gauge renders NaN (unavailable) rather than a fake 0.
+	envNICInterface       = "SHAREBRIDGE_GATEWAY_NIC_INTERFACE"
+	envNICCapacityBytes   = "SHAREBRIDGE_GATEWAY_NIC_CAPACITY_BYTES_PER_SEC"
+	procNetDevPath        = "/proc/net/dev"
+	defaultNICSampleEvery = 15 * time.Second
 
 	defaultPluginListenAddress = "127.0.0.1:9001"
 	defaultRelayPortMin        = 10000
@@ -93,13 +114,28 @@ func main() {
 	// an frps session reset clears presence and then closes the affected
 	// agent's established streams through it.
 	streams := gateway.NewStreams()
-	presenceRegistry, err := newPresenceRegistry(streams, registry)
+	// tunnelRestoration anchors an frps restart (the §15.2 SessionReset
+	// lifecycle fact) until the affected tunnel is confirm-online again, so
+	// the §17.3 tunnel-restoration histogram measures a real
+	// restart→restored interval rather than an offline→online guess.
+	restoration := newTunnelRestorationTracker(time.Now)
+	presenceRegistry, err := newPresenceRegistry(streams, registry, restoration)
 	if err != nil {
 		logger.Error("gateway: presence registry configuration rejected", "error", err)
 		os.Exit(1)
 	}
+	// The route table joins tunnel presence through the registry the plugin
+	// feeds: a route with no probe-confirmed online presence fails closed.
+	// It is built before the plugin so the control-sync applier can own its
+	// writes once sync is configured.
+	routeTable := routes.NewTable(presenceRegistry)
 
-	pluginServer, pluginListenAddress, err := configuredPluginServer(presenceRegistry, registry)
+	// frps process health is an independent §17.1 truth: any authenticated
+	// frps plugin call proves frps is driving the plugin boundary, and a
+	// §15.2 SessionReset proves frps restarted. The truth never gates route
+	// readiness.
+	pluginPresenceEvents := frpsLifecycleEvents{next: presenceRegistry, health: health, restoration: restoration}
+	pluginServer, pluginListenAddress, err := configuredPluginServer(pluginPresenceEvents, registry)
 	if err != nil {
 		logger.Error("gateway: FRP authorization plugin configuration rejected", "error", err)
 		os.Exit(1)
@@ -121,11 +157,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The route table joins tunnel presence through the registry the plugin
-	// feeds: a route with no probe-confirmed online presence fails closed, and
-	// a control snapshot has not yet been wired, so the table stays empty and
-	// every public lookup still fails closed.
-	routeTable := routes.NewTable(presenceRegistry)
 	server := gateway.NewServer(routeTable, streams,
 		gateway.WithLogger(logger), gateway.WithLimitsConfig(limitsConfig), gateway.WithMetrics(registry))
 	httpPluginServer := &http.Server{
@@ -163,6 +194,35 @@ func main() {
 
 	serveContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+
+	// Control sync loop (§17.1 snapshot/control-sync truth). It is built
+	// fail-closed from the operator environment and, when configured, is the
+	// only production caller of gateway.Health's snapshot/control-sync
+	// setters. Without it the gateway correctly reports route_ready=false.
+	syncLoop, syncEnabled, err := configuredSyncLoop(health, registry, routeTable, streams, presenceRegistry.BootID(), logger)
+	if err != nil {
+		_ = pluginListener.Close()
+		_ = listener.Close()
+		_ = metricsListener.Close()
+		logger.Error("gateway: control sync configuration rejected", "error", err)
+		os.Exit(1)
+	}
+	if syncEnabled {
+		go syncLoop.Run(serveContext)
+		logger.Info("gateway: control sync loop started")
+	} else {
+		logger.Warn("gateway: control sync not configured; route readiness stays fail-closed")
+	}
+
+	// Bounded NIC saturation collector (§17.3 bullet 5): exactly one sampler
+	// goroutine, no per-connection work. On a host without usable stats the
+	// gauge reports unavailable (NaN).
+	nicSampler, err := metrics.NewSampler(registry, "sharebridge_relay_gateway_nic_saturation_ratio", configuredNICSource(), defaultNICSampleEvery)
+	if err != nil {
+		logger.Error("gateway: NIC sampler configuration rejected", "error", err)
+		os.Exit(1)
+	}
+	go nicSampler.Run(serveContext)
 
 	gatewayErrors := make(chan error, 1)
 	go func() {
@@ -218,16 +278,105 @@ func configuredLimits() (limits.Config, error) {
 	return limits.ConfigFromEnvironment(os.LookupEnv)
 }
 
+// configuredSyncLoop builds the §11.3 control-sync loop from the operator
+// environment. It returns enabled=false when NO sync variable is set (the
+// dark/enable-relay posture: the gateway runs, route readiness is fail-closed
+// false, and the operator sees a warning). A PARTIAL configuration is a
+// startup error — a gateway must never silently run with a half-configured
+// control channel. The loop is the production writer of the §17.1
+// snapshot/control-sync health truths.
+func configuredSyncLoop(health *gateway.Health, registry *metrics.Registry, table *routes.Table, streams *gateway.Streams, bootID string, logger *slog.Logger) (*controlsync.Loop, bool, error) {
+	values := []string{
+		os.Getenv(envControlSyncURL),
+		os.Getenv(envControlSyncSAN),
+		os.Getenv(envControlSyncCAFile),
+		os.Getenv(envGatewaySyncCertFile),
+		os.Getenv(envGatewaySyncKeyFile),
+		os.Getenv(envGatewayNamespace),
+	}
+	configured := false
+	for _, value := range values {
+		if value != "" {
+			configured = true
+			break
+		}
+	}
+	if !configured {
+		return nil, false, nil
+	}
+	for _, value := range values {
+		if value == "" {
+			return nil, false, fmt.Errorf("control sync requires %s, %s, %s, %s, %s and %s together",
+				envControlSyncURL, envControlSyncSAN, envControlSyncCAFile, envGatewaySyncCertFile, envGatewaySyncKeyFile, envGatewayNamespace)
+		}
+	}
+	serverCAPEM, err := os.ReadFile(os.Getenv(envControlSyncCAFile))
+	if err != nil {
+		return nil, false, fmt.Errorf("control sync CA file: %w", err)
+	}
+	clientCertPEM, err := os.ReadFile(os.Getenv(envGatewaySyncCertFile))
+	if err != nil {
+		return nil, false, fmt.Errorf("gateway sync certificate file: %w", err)
+	}
+	clientKeyPEM, err := os.ReadFile(os.Getenv(envGatewaySyncKeyFile))
+	if err != nil {
+		return nil, false, fmt.Errorf("gateway sync key file: %w", err)
+	}
+	client, err := controlsync.NewClient(controlsync.ClientConfig{
+		BaseURL:           os.Getenv(envControlSyncURL),
+		ExpectedServerSAN: os.Getenv(envControlSyncSAN),
+		ServerCAPEM:       serverCAPEM,
+		ClientCertPEM:     clientCertPEM,
+		ClientKeyPEM:      clientKeyPEM,
+		Metrics:           registry,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	applier, err := controlsync.NewApplier(controlsync.ApplierConfig{
+		Client:    client,
+		Table:     table,
+		Streams:   streams,
+		Namespace: os.Getenv(envGatewayNamespace),
+		BootID:    bootID,
+		Logger:    logger,
+		Metrics:   registry,
+		Clock:     time.Now,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	loop, err := controlsync.NewLoop(controlsync.LoopConfig{
+		Applier: applier,
+		Health:  health,
+		Logger:  logger,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return loop, true, nil
+}
+
+// configuredNICSource builds the §17.3 bullet 5 NIC saturation source from the
+// operator environment. Without a configured interface and a positive link
+// capacity the source reports the value unavailable (the gauge renders NaN);
+// it never fabricates a ratio.
+func configuredNICSource() metrics.NICSource {
+	capacity, err := strconv.ParseFloat(strings.TrimSpace(os.Getenv(envNICCapacityBytes)), 64)
+	if err != nil {
+		capacity = 0
+	}
+	return metrics.ProcNetDevSource(procNetDevPath, os.Getenv(envNICInterface), capacity, time.Now)
+}
+
 // newPresenceRegistry builds the production presence registry the FRP plugin
 // feeds and the route table joins against. The boot identity is a fresh
 // 128-bit hex value per process: §15.1 requires a gateway restart to change
 // the boot ID so control discards stale presence events. The streams registry
 // is the §15.2 drain seam, and the §17.3 metrics sink observes the presence
-// transitions (online/offline counts and lease expirations). The control-sync
-// Sink is not wired yet, so presence events are currently process-local; route
-// snapshots are likewise not yet wired, so the route table stays empty and the
-// gateway fails closed.
-func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Registry) (*presence.Registry, error) {
+// transitions (online/offline counts, lease expirations, and restart→restored
+// latency). The control-sync Sink is wired separately once sync is configured.
+func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Registry, restoration *tunnelRestorationTracker) (*presence.Registry, error) {
 	var bootID [16]byte
 	if _, err := rand.Read(bootID[:]); err != nil {
 		return nil, fmt.Errorf("generate gateway boot id: %w", err)
@@ -235,8 +384,84 @@ func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Regist
 	return presence.NewRegistry(presence.Config{
 		BootID:  hex.EncodeToString(bootID[:]),
 		Drainer: drainer,
-		Sink:    &presenceMetricsSink{registry: registry},
+		Sink:    &presenceMetricsSink{registry: registry, restoration: restoration, now: time.Now},
 	})
+}
+
+// tunnelRestorationTracker anchors the frps-restart moment for an agent (the
+// §15.2 SessionReset lifecycle fact) until that agent's tunnel is
+// confirm-online again. It is the production input to §17.3 bullet 10 (time
+// from frps restart to tunnel restoration): an anchor is only ever created by
+// a real restart fact, so an ordinary offline→online transition is never
+// misreported as a restart restoration.
+type tunnelRestorationTracker struct {
+	mu         sync.Mutex
+	anchoredAt map[string]time.Time
+	now        func() time.Time
+}
+
+func newTunnelRestorationTracker(now func() time.Time) *tunnelRestorationTracker {
+	if now == nil {
+		now = time.Now
+	}
+	return &tunnelRestorationTracker{anchoredAt: make(map[string]time.Time), now: now}
+}
+
+// noteRestart records (or refreshes) the restart anchor for an agent.
+func (tracker *tunnelRestorationTracker) noteRestart(agentRecordID string) {
+	if tracker == nil || agentRecordID == "" {
+		return
+	}
+	tracker.mu.Lock()
+	tracker.anchoredAt[agentRecordID] = tracker.now()
+	tracker.mu.Unlock()
+}
+
+// takeElapsed consumes an agent's restart anchor and returns the seconds from
+// restart to now. ok is false when the agent has no pending restart anchor, so
+// nothing is recorded for a first-ever or ordinary online transition.
+func (tracker *tunnelRestorationTracker) takeElapsed(agentRecordID string) (float64, bool) {
+	if tracker == nil {
+		return 0, false
+	}
+	tracker.mu.Lock()
+	anchoredAt, ok := tracker.anchoredAt[agentRecordID]
+	if ok {
+		delete(tracker.anchoredAt, agentRecordID)
+	}
+	tracker.mu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	seconds := tracker.now().Sub(anchoredAt).Seconds()
+	if seconds < 0 {
+		seconds = 0
+	}
+	return seconds, true
+}
+
+// frpsLifecycleEvents is the production frps/plugin lifecycle view. Any
+// authenticated plugin fact proves frps is driving the plugin boundary, so it
+// marks the independent §17.1 frps process truth healthy; a §15.2 SessionReset
+// (a burned one-use credential re-presented) additionally proves frps
+// restarted and anchors the §17.3 restoration latency. It never touches route
+// readiness.
+type frpsLifecycleEvents struct {
+	next        frpplugin.PresenceEvents
+	health      *gateway.Health
+	restoration *tunnelRestorationTracker
+}
+
+func (events frpsLifecycleEvents) ObserveFRPEvent(fact frpplugin.PresenceFact) {
+	if events.health != nil {
+		events.health.SetFRPSHealthy(true)
+	}
+	if fact.Operation == frpplugin.OperationSessionReset && events.restoration != nil {
+		events.restoration.noteRestart(fact.AgentRecordID)
+	}
+	if events.next != nil {
+		events.next.ObserveFRPEvent(fact)
+	}
 }
 
 // presenceMetricsSink projects presence transitions onto the bounded §17.3
@@ -244,10 +469,12 @@ func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Regist
 // holds its state lock), so it MUST NOT block: every operation is an atomic
 // counter/gauge update.
 type presenceMetricsSink struct {
-	registry *metrics.Registry
-	mu       sync.Mutex
-	online   int64
-	offline  int64
+	registry    *metrics.Registry
+	restoration *tunnelRestorationTracker
+	now         func() time.Time
+	mu          sync.Mutex
+	online      int64
+	offline     int64
 }
 
 func (sink *presenceMetricsSink) ObservePresenceEvent(event presence.Event) {
@@ -273,8 +500,15 @@ func (sink *presenceMetricsSink) ObservePresenceEvent(event presence.Event) {
 	// registry emits synchronously with the transition, so this is the
 	// truthful classification available without coupling the metric to the
 	// registry internals.
-	if event.State == presence.StateOffline && !time.Now().Before(event.LeaseExpiresAt) {
+	if event.State == presence.StateOffline && !sink.now().Before(event.LeaseExpiresAt) {
 		sink.registry.Inc("sharebridge_relay_presence_lease_expirations_total")
+	}
+	// Restart→restored latency is recorded only when a real restart anchor
+	// exists for this agent; an ordinary online transition records nothing.
+	if event.State == presence.StateOnline {
+		if seconds, ok := sink.restoration.takeElapsed(event.AgentRecordID); ok {
+			sink.registry.Observe("sharebridge_relay_tunnel_restoration_seconds", seconds)
+		}
 	}
 }
 

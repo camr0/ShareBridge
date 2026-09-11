@@ -2,14 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +21,8 @@ import (
 	"sharebridge/relay/internal/gateway"
 	"sharebridge/relay/internal/limits"
 	"sharebridge/relay/internal/metrics"
+	"sharebridge/relay/internal/presence"
+	"sharebridge/relay/internal/routes"
 )
 
 // TestConfiguredLimitsReadsProductionEnvironment proves the gateway binary's
@@ -62,12 +67,168 @@ func TestConfiguredLimitsFailsClosedOnInvalidEnvironment(t *testing.T) {
 // construct its production presence registry (fresh boot identity plus the
 // streams drain seam) without operator configuration.
 func TestNewPresenceRegistryBuildsWithoutError(t *testing.T) {
-	registry, err := newPresenceRegistry(gateway.NewStreams(), metrics.NewRegistry(metrics.Relay))
+	registry, err := newPresenceRegistry(gateway.NewStreams(), metrics.NewRegistry(metrics.Relay), newTunnelRestorationTracker(time.Now))
 	if err != nil {
 		t.Fatalf("newPresenceRegistry() error = %v, want nil", err)
 	}
 	if registry == nil {
 		t.Fatal("newPresenceRegistry() returned a nil registry")
+	}
+	if registry.BootID() == "" {
+		t.Fatal("newPresenceRegistry() produced an empty boot identity")
+	}
+}
+
+// TestConfiguredSyncLoopFailsClosed proves the production control-sync build is
+// fail-closed: no sync variables means sync is disabled (route readiness stays
+// false), and a partial configuration refuses startup instead of running a
+// half-configured control channel.
+func TestConfiguredSyncLoopFailsClosed(t *testing.T) {
+	for _, name := range []string{envControlSyncURL, envControlSyncSAN, envControlSyncCAFile, envGatewaySyncCertFile, envGatewaySyncKeyFile, envGatewayNamespace} {
+		t.Setenv(name, "")
+	}
+	health := gateway.NewHealth()
+	registry := metrics.NewRegistry(metrics.Relay)
+	table := routes.NewTable(nil)
+	streams := gateway.NewStreams()
+	logger := slog.New(slog.DiscardHandler)
+
+	loop, enabled, err := configuredSyncLoop(health, registry, table, streams, "gw-boot", logger)
+	if err != nil || enabled || loop != nil {
+		t.Fatalf("unconfigured sync = (%v, enabled=%v, %v), want (nil, false, nil)", loop, enabled, err)
+	}
+
+	t.Setenv(envControlSyncURL, "https://control.sync.internal:8443")
+	if _, _, err := configuredSyncLoop(health, registry, table, streams, "gw-boot", logger); err == nil {
+		t.Fatal("a partial control-sync configuration was accepted; it must refuse startup")
+	}
+}
+
+// TestConfiguredNICSourceReportsUnavailableWithoutInterface proves the
+// production NIC source never fabricates a ratio: without a configured
+// interface it reports unavailable rather than a plausible 0.
+func TestConfiguredNICSourceReportsUnavailableWithoutInterface(t *testing.T) {
+	t.Setenv(envNICInterface, "")
+	t.Setenv(envNICCapacityBytes, "1000")
+	if _, ok := configuredNICSource()(); ok {
+		t.Fatal("NIC source reported a ratio without a configured interface")
+	}
+}
+
+// TestGatewayHealthReflectsRealFRPSPluginLifecycle proves the §17.1 frps
+// process truth is driven by the real frps/plugin boundary: an authenticated
+// Login from frps marks frps healthy, while route readiness stays false (the
+// independent sync truth).
+func TestGatewayHealthReflectsRealFRPSPluginLifecycle(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate control key: %v", err)
+	}
+	const sharedSecret = "gateway-health-test-secret"
+	t.Setenv(envPluginSharedSecret, sharedSecret)
+	t.Setenv(envControlPublicKey, hex.EncodeToString(publicKey))
+	t.Setenv(envRelayPortMin, "21000")
+	t.Setenv(envRelayPortMax, "21100")
+	t.Setenv(envRelayDataDir, t.TempDir())
+
+	health := gateway.NewHealth()
+	recorder := &wiringPresenceRecorder{}
+	events := frpsLifecycleEvents{next: recorder, health: health, restoration: newTunnelRestorationTracker(time.Now)}
+	plugin, _, err := configuredPluginServer(events, metrics.NewRegistry(metrics.Relay))
+	if err != nil {
+		t.Fatalf("configuredPluginServer() error = %v, want nil", err)
+	}
+
+	if health.FRPSProcessHealthy() {
+		t.Fatal("frps health defaults to false before any frps contact")
+	}
+	now := time.Now().UTC()
+	claims := wiringClaims{
+		Issuer: "sharebridge-control", Audience: "sharebridge-relay", APIKeyID: "api-health",
+		AgentRecordID: "agent-health", Namespace: "sbdeadbeef", ProxyName: "sb-sbdeadbeef",
+		RelayPort: 21042, Generation: 1, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(9 * time.Minute), JTI: "jti-health-one",
+	}
+	token := signWiringCredential(t, privateKey, claims)
+	if wiringRequest(t, plugin, sharedSecret, frpplugin.OperationLogin, wiringLoginContent(token, claims)).Reject {
+		t.Fatal("the Login was rejected; the plugin was not wired")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !health.FRPSProcessHealthy() {
+		time.Sleep(time.Millisecond)
+	}
+	if !health.FRPSProcessHealthy() {
+		t.Fatal("a real frps Login did not mark frps process health true")
+	}
+	if health.RouteReady() {
+		t.Fatal("frps health must never imply route readiness (snapshot/control sync are separate truths)")
+	}
+}
+
+// TestTunnelRestorationMetricFromRealPresenceRestart drives the real presence
+// registry through an frps SessionReset and a subsequent confirmed re-login,
+// and observes the §17.3 restart→restored histogram move. No metric method is
+// called directly.
+func TestTunnelRestorationMetricFromRealPresenceRestart(t *testing.T) {
+	registry := metrics.NewRegistry(metrics.Relay)
+	current := time.Date(2026, 9, 3, 18, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return current }
+	restoration := newTunnelRestorationTracker(clock)
+	sink := &presenceMetricsSink{registry: registry, restoration: restoration, now: clock}
+	presenceRegistry, err := presence.NewRegistry(presence.Config{
+		BootID: "gw-restoration-boot",
+		Now:    clock,
+		Probe:  func(context.Context, int) (string, error) { return "127.0.0.1:4444", nil },
+		Sink:   sink,
+	})
+	if err != nil {
+		t.Fatalf("presence.NewRegistry: %v", err)
+	}
+	events := frpsLifecycleEvents{next: presenceRegistry, health: gateway.NewHealth(), restoration: restoration}
+
+	const agent = "agent-restoration"
+	const port = 10001
+	login := func(jti string, issuedAt time.Time) {
+		fact := frpplugin.PresenceFact{Operation: frpplugin.OperationLogin, AgentRecordID: agent, Namespace: "sb0123abcd",
+			ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", CredentialJTI: jti, CredentialIssuedAt: issuedAt}
+		events.ObserveFRPEvent(fact)
+		events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationNewProxy, AgentRecordID: agent, Namespace: "sb0123abcd",
+			ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", CredentialJTI: jti, CredentialIssuedAt: issuedAt})
+		events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationNewUserConn, AgentRecordID: agent, Namespace: "sb0123abcd",
+			ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", RemoteAddr: "127.0.0.1:4444", CredentialJTI: jti, CredentialIssuedAt: issuedAt})
+	}
+	waitOnline := func() bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if presenceRegistry.Online(agent, port, 1) {
+				return true
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return false
+	}
+
+	firstLogin := current.Add(-time.Minute)
+	login("jti-one", firstLogin)
+	if !waitOnline() {
+		t.Fatal("the initial tunnel never confirmed online")
+	}
+
+	// frps restarts: the plugin re-presents the burned credential (SessionReset).
+	events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationSessionReset, AgentRecordID: agent, Namespace: "sb0123abcd",
+		ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", CredentialJTI: "jti-one", CredentialIssuedAt: firstLogin})
+	if presenceRegistry.Online(agent, port, 1) {
+		t.Fatal("the SessionReset did not clear the dead session's presence")
+	}
+
+	current = current.Add(3 * time.Second)
+	login("jti-two", firstLogin.Add(time.Second))
+	if !waitOnline() {
+		t.Fatal("the tunnel never restored online after the frps restart")
+	}
+
+	if rendered := registry.Render(); !strings.Contains(rendered, "sharebridge_relay_tunnel_restoration_seconds_count{} 1") {
+		t.Fatalf("the real restart→restored path recorded no restoration observation:\n%s", rendered)
 	}
 }
 

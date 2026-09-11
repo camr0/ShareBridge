@@ -229,8 +229,13 @@ type series struct {
 	scalar     atomic.Int64
 	labeled    map[string]*atomic.Int64
 	collectors map[string]func() int64
-	hist       *histogram
-	histLabel  map[string]*histogram
+	// ratios holds scrape-time floating-point collectors for ratio gauges
+	// (NIC saturation). A ratio collector reports ok=false when the host
+	// exposes no usable statistics; Render then emits NaN ("unavailable")
+	// rather than a fabricated 0 or 1.
+	ratios    map[string]func() (float64, bool)
+	hist      *histogram
+	histLabel map[string]*histogram
 }
 
 // Registry holds the bounded §17.3 signal set. It is safe for concurrent use
@@ -258,7 +263,7 @@ func NewRegistry(owner Process) *Registry {
 }
 
 func (r *Registry) register(def Signal) {
-	entry := &series{def: def, collectors: make(map[string]func() int64)}
+	entry := &series{def: def, collectors: make(map[string]func() int64), ratios: make(map[string]func() (float64, bool))}
 	if def.Kind == Histogram {
 		if def.Label == "" {
 			entry.hist = newHistogram()
@@ -339,6 +344,52 @@ func (r *Registry) SetFunc(name string, fn func() int64, label ...string) {
 	entry.collectors[key] = fn
 }
 
+// SetRatioFunc installs a scrape-time floating-point collector for a ratio
+// gauge series (a value in [0,1]). The collector runs on render; a nil
+// collector clears the source. When the collector reports ok=false the series
+// renders NaN, the conventional "no data" value — a ratio gauge must report
+// unavailable rather than fabricate a plausible-looking 0 (spec §17.3 bullet 5:
+// NIC saturation is only meaningful when the host actually exposes stats).
+func (r *Registry) SetRatioFunc(name string, fn func() (float64, bool), label ...string) {
+	entry, _, ok := r.series(name, label)
+	if !ok {
+		return
+	}
+	key := ""
+	if entry.def.Label != "" {
+		key = label[0]
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if fn == nil {
+		delete(entry.ratios, key)
+		return
+	}
+	entry.ratios[key] = fn
+}
+
+// Ratio reads a ratio gauge's current collector value without rendering. The
+// second result is false when the series carries no ratio collector or the
+// source reports the value unavailable. Used by tests and internal
+// assertions.
+func (r *Registry) Ratio(name string, label ...string) (float64, bool) {
+	entry, _, ok := r.series(name, label)
+	if !ok {
+		return 0, false
+	}
+	key := ""
+	if entry.def.Label != "" {
+		key = label[0]
+	}
+	r.mu.Lock()
+	fn := entry.ratios[key]
+	r.mu.Unlock()
+	if fn == nil {
+		return 0, false
+	}
+	return fn()
+}
+
 // Observe records one seconds value in a histogram series.
 func (r *Registry) Observe(name string, seconds float64, label ...string) {
 	entry, _, ok := r.series(name, label)
@@ -405,6 +456,10 @@ func (r *Registry) Render() string {
 				renderHistogram(&builder, name, entry.def.Label, value, entry.histLabel[value])
 			}
 		case entry.def.Label == "":
+			if fn := entry.ratios[""]; fn != nil {
+				fmt.Fprintf(&builder, "%s %s\n", name, renderRatio(fn))
+				break
+			}
 			value := entry.scalar.Load()
 			if fn := entry.collectors[""]; fn != nil {
 				value = fn()
@@ -412,6 +467,10 @@ func (r *Registry) Render() string {
 			fmt.Fprintf(&builder, "%s %d\n", name, value)
 		default:
 			for _, value := range entry.def.Values {
+				if fn := entry.ratios[value]; fn != nil {
+					fmt.Fprintf(&builder, "%s{%s=%q} %s\n", name, entry.def.Label, value, renderRatio(fn))
+					continue
+				}
 				cell := entry.labeled[value]
 				val := cell.Load()
 				if fn := entry.collectors[value]; fn != nil {
@@ -422,6 +481,17 @@ func (r *Registry) Render() string {
 		}
 	}
 	return builder.String()
+}
+
+// renderRatio formats one ratio-collector reading for the Prometheus text
+// exposition. An unavailable reading renders as NaN ("no data") rather than
+// a fabricated number.
+func renderRatio(fn func() (float64, bool)) string {
+	value, ok := fn()
+	if !ok {
+		return "NaN"
+	}
+	return strconv.FormatFloat(value, 'g', -1, 64)
 }
 
 func kindName(kind Kind) string {

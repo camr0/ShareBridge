@@ -114,6 +114,13 @@ type Snapshot struct {
 	Epoch    uint64  `json:"epoch"`
 	Revision uint64  `json:"revision"`
 	Routes   []Route `json:"routes"`
+	// PublishedAt is the RFC 3339 UTC time at which the revision stamped on
+	// this snapshot was published by control's route publisher. It feeds the
+	// §17.3 route propagation lag histogram and is OBSERVABILITY ONLY: the
+	// applier ignores an absent or malformed value (§17.3 must never
+	// fabricate a lag number) and the R2 epoch authority (Epoch) remains the
+	// sole adoption decision. Mirrors control's relayctl.Snapshot field.
+	PublishedAt string `json:"published_at,omitempty"`
 }
 
 // RouteDelta is one ordered route mutation.
@@ -134,6 +141,11 @@ type DeltaPage struct {
 	Since          uint64       `json:"since"`
 	LatestRevision uint64       `json:"latest_revision"`
 	Deltas         []RouteDelta `json:"deltas"`
+	// PublishedAt is the RFC 3339 UTC publish time of LatestRevision. It is
+	// OBSERVABILITY ONLY and omitempty for older control builds; an absent
+	// or malformed value records no lag observation. Mirrors control's
+	// relayctl.DeltaPage field.
+	PublishedAt string `json:"published_at,omitempty"`
 }
 
 // PresenceEvent is one gateway-authoritative tunnel lease fact (mirror of
@@ -652,6 +664,20 @@ func validateSyncIdentifier(value string, field string) error {
 
 func validateSyncIdentity(identity string) error {
 	return validateSyncIdentifier(identity, "identity")
+}
+
+// parsePublishedAt parses an observability published_at stamp. ok=false for an
+// absent or malformed value, in which case callers record no lag observation
+// rather than fabricating one.
+func parsePublishedAt(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 // validateSyncBaseURL accepts only an https URL with a host.

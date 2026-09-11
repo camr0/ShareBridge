@@ -19,8 +19,7 @@ import (
 	"time"
 )
 
-// ProtocolVersion versions every §11.3 sync payload; both sides reject any
-// other version instead of guessing (fail closed).
+// ProtocolVersion versions every §11.3 sync payload; both sides reject any// other version instead of guessing (fail closed).
 const ProtocolVersion = 1
 
 // Protocol bounds (§11.3 bounded payloads, §14). They are generous defaults
@@ -122,6 +121,16 @@ type Snapshot struct {
 	Epoch    uint64  `json:"epoch"`
 	Revision uint64  `json:"revision"`
 	Routes   []Route `json:"routes"`
+	// PublishedAt is the RFC 3339 UTC time at which the revision stamped on
+	// this snapshot was published by control's route publisher (the last
+	// time its revision counter advanced, or the publisher's start time for
+	// the initial revision). It is OBSERVABILITY ONLY: the gateway uses it
+	// to measure §17.3 route propagation lag. It is absent for older
+	// control builds (omitempty) and the gateway MUST NOT fabricate a lag
+	// value when it is missing or malformed — it simply records no
+	// observation. The R2 epoch authority (Epoch) remains the sole
+	// adoption decision.
+	PublishedAt string `json:"published_at,omitempty"`
 }
 
 // RouteDelta is one ordered route mutation. The delta revision and the route
@@ -147,6 +156,12 @@ type DeltaPage struct {
 	Since          uint64       `json:"since"`
 	LatestRevision uint64       `json:"latest_revision"`
 	Deltas         []RouteDelta `json:"deltas"`
+	// PublishedAt is the RFC 3339 UTC publish time of LatestRevision (the
+	// newest retained delta on an OK page, or the current revision on a
+	// gap/empty page). It is OBSERVABILITY ONLY and omitempty for older
+	// control builds; an absent or malformed value records no lag
+	// observation. See Snapshot.PublishedAt.
+	PublishedAt string `json:"published_at,omitempty"`
 }
 
 // PresenceEvent is one gateway-authoritative tunnel lease fact (the
@@ -417,6 +432,15 @@ func ValidateStatusAck(ack StatusAck) error {
 		return fmt.Errorf("%w: status ack control epoch is missing", ErrInvalidPayload)
 	}
 	return validateIdentifier(ack.GatewayBootID, "gateway_boot_id")
+}
+
+// formatPublishedAt renders an observability timestamp as RFC 3339 UTC, or an
+// empty string when unset (which omitempty then drops from the wire).
+func formatPublishedAt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func validateHostname(hostname string) error {
