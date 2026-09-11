@@ -2356,3 +2356,91 @@ func TestFRPCRestartObtainsFreshCredentialAfterReplayRejection(t *testing.T) {
 		t.Fatalf("unexpected child churn: %d starts", starter.startCount())
 	}
 }
+
+// failingDirectMapper refuses every add, modelling a direct-only failure
+// (router/UPnP refusal) that must not touch the relay path.
+type failingDirectMapper struct{ fakeDirectMapper }
+
+func (f *failingDirectMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
+	return 0, fmt.Errorf("router refused mapping")
+}
+
+// TestDirectFailureAndIPChangeDoNotDisturbRelayTunnel pins §15.6 at the agent:
+// a direct failure and a public IP/DDNS change are confined to the direct
+// route. The relay tunnel child is a separate path — it is never stopped,
+// restarted, or re-credentialed by either event, and a failed direct open is
+// answered with an error ack (before-navigation fallback is control's).
+func TestDirectFailureAndIPChangeDoNotDisturbRelayTunnel(t *testing.T) {
+	newRelayDaemon := func(t *testing.T, mapper direct.PortMapper) (*Daemon, *mockSignalingClient, *recordingTunnelStarter) {
+		t.Helper()
+		cfg := tunnelTestConfig(t)
+		st := newMockStore()
+		sig := newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID())
+		port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+		reporter := direct.NewReporter(func(ctx context.Context, ip string, p int, status string) error {
+			return sig.ReportEndpoint(ctx, ip, p, status)
+		})
+		port.SetTransitionCallback(reporter.OnTransition)
+		d := &Daemon{config: cfg, configMgr: &mockConfigManager{cfg: cfg}, store: st, signaling: sig}
+		d.direct = &directState{
+			ready:    true,
+			gate:     direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+			port:     port,
+			mapper:   mapper,
+			reporter: reporter,
+			origins:  map[string]originPair{},
+		}
+		starter := startTunnelForTest(t, d)
+		d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-relay-one"))
+		waitForCond(t, func() bool { return starter.startCount() == 1 })
+		return d, sig, starter
+	}
+
+	requireRelayTunnelUntouched := func(t *testing.T, starter *recordingTunnelStarter, label string) {
+		t.Helper()
+		assertConditionStays(t, label, 150*time.Millisecond, func() bool {
+			child := starter.recordAt(0).child
+			return starter.startCount() == 1 && child.gracefulStopCount() == 0 && child.killCount() == 0
+		})
+	}
+
+	requireNoRelayCredentialRequest := func(t *testing.T, sig *mockSignalingClient) {
+		t.Helper()
+		for _, msg := range sig.messagesSnapshot() {
+			if msg["type"] == "relay_credential_request" {
+				t.Fatalf("a direct-only event requested a fresh relay credential: %#v", msg)
+			}
+		}
+	}
+
+	t.Run("direct open failure", func(t *testing.T) {
+		failing := &failingDirectMapper{fakeDirectMapper{ip: "203.0.113.7"}}
+		d, sig, starter := newRelayDaemon(t, failing)
+
+		d.handleOpenSignal(openSignalMessage())
+
+		if !sig.hasSentMessage("open_ack", map[string]any{"status": "error", "error": "open_failed"}) {
+			t.Fatalf("expected an open_failed ack for the refused mapping, got %#v", sig.messagesSnapshot())
+		}
+		requireRelayTunnelUntouched(t, starter, "relay tunnel untouched by a direct open failure")
+		requireNoRelayCredentialRequest(t, sig)
+	})
+
+	t.Run("public IP change", func(t *testing.T) {
+		mapper := &fakeDirectMapper{ip: "203.0.113.7"}
+		d, sig, starter := newRelayDaemon(t, mapper)
+
+		// The public IP changed (DDNS re-point) and a fresh open reports it.
+		mapper.ip = "203.0.113.9"
+		d.handleOpenSignal(openSignalMessage())
+
+		if !sig.hasSentMessage("open_ack", map[string]any{
+			"share_id": "SHARE123", "nonce": "nonce-123", "seq": uint64(1),
+			"granted_port": 443, "public_ip": "203.0.113.9", "status": "ok",
+		}) {
+			t.Fatalf("expected an ok open_ack carrying the fresh IP, got %#v", sig.messagesSnapshot())
+		}
+		requireRelayTunnelUntouched(t, starter, "relay tunnel untouched by a public IP change")
+		requireNoRelayCredentialRequest(t, sig)
+	})
+}

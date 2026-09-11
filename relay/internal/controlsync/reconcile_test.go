@@ -1470,3 +1470,109 @@ func TestStaleRevokeAgainstActiveStoredRouteForcesReconciliation(t *testing.T) {
 	}
 	_ = drainer
 }
+
+// --- named case: contradictory state (§15.7) ---
+
+// TestContradictoryStateFailsClosedAtTheGateway pins §15.7 end to end over a
+// real public TCP listener: tunnel presence alone never makes an agent
+// generic-routable, a route whose agent/port/generation does not match online
+// presence never routes, and an unknown/missing route never routes — every
+// case is a generic close. The control-side route state is still applied
+// faithfully (the gateway never guesses or "repairs" it); only the presence
+// join decides routability.
+func TestContradictoryStateFailsClosedAtTheGateway(t *testing.T) {
+	certs := newSyncTestCertificates(t)
+	script, client := newScriptedControl(t, certs)
+
+	const (
+		portA = 10001 // route A's port, matched by online presence
+		portB = 10002 // route B's port, NOT matched by any presence
+		portC = 10003 // presence for C exists, but no route is ever published
+	)
+	joinA := reconcileJoin{agentRecordID: reconcileAgentA, relayPort: portA, generation: 3}
+	joinC := reconcileJoin{agentRecordID: reconcileAgentA, relayPort: portC, generation: 3}
+	// Presence for A and for C; C has no route (tunnel presence alone).
+	presence := newReconcilePresence(joinA, joinC)
+	table := routes.NewTable(presence)
+	streams := gateway.NewStreams()
+	applier := mustApplier(t, client, table, streams, nil)
+
+	publicListener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", "0"))
+	if err != nil {
+		t.Fatalf("public listener: %v", err)
+	}
+	t.Cleanup(func() { publicListener.Close() })
+	server := gateway.NewServer(table, streams, gateway.WithLogger(slog.New(slog.DiscardHandler)))
+	go func() { _ = server.Serve(publicListener) }()
+	t.Cleanup(func() {
+		server.Close()
+		server.Wait()
+	})
+	publicAddress := publicListener.Addr().String()
+
+	expectClosed := func(t *testing.T, hostname string) {
+		t.Helper()
+		browser := dialPublic(t, publicAddress)
+		if _, err := browser.Write(reconcileClientHello(hostname)); err != nil {
+			t.Fatalf("write ClientHello for %s: %v", hostname, err)
+		}
+		assertGenericClose(t, hostname, browser)
+	}
+
+	// Route A matches presence; route B does not (port mismatch — the exact
+	// §15.7 "route exists, generation/port mismatch" contradiction).
+	script.setSnapshot(t, Snapshot{
+		Version:  ProtocolVersion,
+		Epoch:    100,
+		Revision: 5,
+		Routes: []Route{
+			wireRoute(reconcileHostnameA, 5, reconcileAgentA, portA),
+			wireRoute(reconcileHostnameB, 5, reconcileAgentA, portB),
+		},
+	})
+	mustReconcileSnapshot(t, applier)
+
+	// A routes; B's route state is stored but never joins presence.
+	if _, err := table.Lookup(reconcileHostnameA); err != nil {
+		t.Fatalf("Lookup(A) with matching presence: %v", err)
+	}
+	if _, err := table.Lookup(reconcileHostnameB); !errors.Is(err, routes.ErrPresenceAbsent) {
+		t.Fatalf("Lookup(B) with mismatched presence error = %v, want ErrPresenceAbsent", err)
+	}
+	expectClosed(t, reconcileHostnameB)
+
+	// C: the gateway holds online tunnel presence for exact join C, but
+	// control has published no route. Tunnel presence alone never makes an
+	// agent generic-routable.
+	if _, ok := table.Peek(reconcileHostnameC); ok {
+		t.Fatalf("hostname C unexpectedly has route state")
+	}
+	if _, err := table.Lookup(reconcileHostnameC); !errors.Is(err, routes.ErrRouteNotFound) {
+		t.Fatalf("Lookup(C) without a route error = %v, want ErrRouteNotFound", err)
+	}
+	expectClosed(t, reconcileHostnameC)
+
+	// An entirely unknown hostname is closed identically.
+	expectClosed(t, "unknown."+"relay."+reconcileNamespace+"."+reconcileZone)
+
+	// Control publishes C's route at the next revision: now — and only now —
+	// the route joins its already-online presence and routes.
+	script.setDelta(t, DeltaPage{
+		Version:        ProtocolVersion,
+		Epoch:          100,
+		Status:         DeltaStatusOK,
+		Since:          5,
+		LatestRevision: 6,
+		Deltas: []RouteDelta{{
+			Revision:  6,
+			Operation: RouteOperationAdd,
+			Route:     wireRoute(reconcileHostnameC, 6, reconcileAgentA, portC),
+		}},
+	})
+	mustApplyDeltas(t, applier)
+	if _, err := table.Lookup(reconcileHostnameC); err != nil {
+		t.Fatalf("Lookup(C) after control published the route: %v", err)
+	}
+}
+
+// --- named case: contradictory state end ---

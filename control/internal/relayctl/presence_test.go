@@ -556,3 +556,83 @@ func TestAvailableProvesGatewayAcknowledgedRevisionWhileSyncHealthy(t *testing.T
 		t.Fatalf("legacy watermark join broken: Available past the current revision = true, want false")
 	}
 }
+
+// TestContradictoryPresenceEventsFailClosed pins §15.7's contradictory-state
+// discipline on the control view: presence facts that contradict the live
+// lease are discarded fail-closed and never regress or extend availability.
+// Specifically — a same-generation online for a DIFFERENT relay port (the
+// gateway never does this; port reassignment bumps the generation), an online
+// for a SUPERSEDED lower generation, and an offline for a superseded
+// generation are all ignored, while a newer-generation offline does fence the
+// older lease.
+func TestContradictoryPresenceEventsFailClosed(t *testing.T) {
+	app := newPublisherTestApp(t)
+	_, agentA := createPublisherAgent(t, app, "p15-contradiction", "sb0a1b2c3d", 10001, 3)
+	clock := newFakeClock(presenceViewBase)
+	view := newPresenceTestView(t, app, fixedRoutes{revision: 5}, clock.Now)
+
+	boot := presenceSnapshot(presenceTestBoot, 1, []PresenceEvent{
+		presenceOnline(presenceTestBoot, 1, agentA, 10001, 3, presenceViewBase.Add(45*time.Second)),
+	})
+	if err := view.ApplyPresenceSnapshot(boot); err != nil {
+		t.Fatalf("apply boot snapshot: %v", err)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("baseline lease not available")
+	}
+
+	// Revision 2: same generation, different port. Contradictory state is
+	// discarded; the live lease and its port are untouched.
+	contradiction := PresenceEnvelope{Version: ProtocolVersion, Events: []PresenceEvent{
+		presenceOnline(presenceTestBoot, 2, agentA, 10002, 3, presenceViewBase.Add(45*time.Second)),
+	}}
+	if err := view.ApplyPresenceEvents(contradiction); err != nil {
+		t.Fatalf("apply same-generation port contradiction: %v", err)
+	}
+	if view.lastRevision != 2 {
+		t.Fatalf("contradiction did not advance the stream position: %d", view.lastRevision)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("same-generation port contradiction discarded the live lease")
+	}
+	if view.Available(agentA, 10002, 3, 5, clock.Now()) {
+		t.Fatal("contradictory port became available")
+	}
+
+	// Revision 3: an online for a superseded lower generation is discarded.
+	superseded := PresenceEnvelope{Version: ProtocolVersion, Events: []PresenceEvent{
+		presenceOnline(presenceTestBoot, 3, agentA, 10001, 2, presenceViewBase.Add(45*time.Second)),
+	}}
+	if err := view.ApplyPresenceEvents(superseded); err != nil {
+		t.Fatalf("apply superseded online: %v", err)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("superseded online disturbed the live lease")
+	}
+	if view.Available(agentA, 10001, 2, 5, clock.Now()) {
+		t.Fatal("superseded generation became available")
+	}
+
+	// Revision 4: an offline for a superseded generation must not clear the
+	// newer live lease.
+	staleOffline := PresenceEnvelope{Version: ProtocolVersion, Events: []PresenceEvent{
+		presenceOffline(presenceTestBoot, 4, agentA, 10001, 2),
+	}}
+	if err := view.ApplyPresenceEvents(staleOffline); err != nil {
+		t.Fatalf("apply stale offline: %v", err)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("stale-generation offline cleared the live lease")
+	}
+
+	// Revision 5: a NEWER-generation offline fences the older lease.
+	fence := PresenceEnvelope{Version: ProtocolVersion, Events: []PresenceEvent{
+		presenceOffline(presenceTestBoot, 5, agentA, 10001, 4),
+	}}
+	if err := view.ApplyPresenceEvents(fence); err != nil {
+		t.Fatalf("apply newer-generation offline: %v", err)
+	}
+	if view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("newer-generation offline did not fence the older lease")
+	}
+}
