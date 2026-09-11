@@ -47,6 +47,7 @@ func newTestController(t *testing.T) (core.App, *Controller) {
 		mig.CreateAgents,
 		mig.AddSessionsInactiveReason,
 		mig.AddAgentsRelaySTUN,
+		mig.AddAgentEndpointStatus,
 	} {
 		if err := fn(app); err != nil {
 			t.Fatalf("session schema: %v", err)

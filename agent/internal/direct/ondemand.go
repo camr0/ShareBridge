@@ -375,9 +375,15 @@ func (p *OnDemandPort) CommitOpenAck(gen uint64) (OpenAckCommit, bool) {
 // no-op when a newer generation already owns the mapping, so a superseded
 // caller can never close a post-unlock reopen; and it is a no-op when the
 // mapping is already gone (for example a §13.4 CloseIf closed it). The
-// direct-open path uses it when the endpoint report fails: the open is
-// unsuccessful, so the mapping must not survive — but only the mapping this
-// open created may be removed.
+// direct-open path uses it when the endpoint report fails or the OK ack could
+// not be delivered: the open is unsuccessful, so the mapping must not survive —
+// but only the mapping this open created may be removed.
+//
+// It RETURNS the immediate deletion error when the router refused the delete
+// (the mapping is then handed to the port's existing close-retry timer and
+// escalates via StateCloseFailed/CloseError/the close_failed endpoint report),
+// and nil when the logical rollback completed. A repeat call after the open was
+// already discarded is a nil no-op.
 func (p *OnDemandPort) DiscardOpenMapping(gen uint64) error {
 	ch := make(chan portReply, 1)
 	return p.send(portCommand{op: opDiscardOpen, gen: gen, reply: ch}).err
@@ -642,8 +648,12 @@ func (p *OnDemandPort) loop() {
 	// itself is not transactional — so it is undone here before the caller is
 	// answered. wasOpen is true when StateOpen had already been published (the
 	// renewal paths). The delete is attempted immediately; a failure hands the
-	// mapping to the existing close-retry timer, which escalates via CloseError.
-	discardFencedMapping := func(wasOpen bool) {
+	// mapping to the existing close-retry timer, which escalates via CloseError,
+	// and is RETURNED so a caller that must report (opDiscardOpen) can surface
+	// it instead of swallowing it. A nil return means the logical rollback
+	// completed (the mapping was deleted, or this generation no longer owned
+	// one); the delete is never left half-done silently.
+	discardFencedMapping := func(wasOpen bool) error {
 		open = false
 		closing = true
 		closeFail = 0
@@ -653,8 +663,12 @@ func (p *OnDemandPort) loop() {
 		if wasOpen {
 			p.setState(StateClosing, grantedPort)
 		}
-		tryDelete()
+		deleteErr := error(nil)
+		if !tryDelete() {
+			deleteErr = p.CloseError()
+		}
 		rearm()
+		return deleteErr
 	}
 	// commitOpenSuccess is the ONE choke point every success outcome of an
 	// open-signal operation (and of the autonomous renewal) passes through. It
@@ -771,7 +785,7 @@ func (p *OnDemandPort) loop() {
 						p.setState(StateOpen, grantedPort)
 						rearm()
 					}) {
-						discardFencedMapping(false)
+						_ = discardFencedMapping(false)
 						p.extPort = prevExtPort
 						c.reply <- portReply{err: ErrOpenSuperseded}
 						continue
@@ -815,7 +829,7 @@ func (p *OnDemandPort) loop() {
 						deadline = now.Add(l)
 						renewAt = deadline.Add(-p.renewWindow)
 					}) {
-						discardFencedMapping(true)
+						_ = discardFencedMapping(true)
 						c.reply <- portReply{err: ErrOpenSuperseded}
 						continue
 					}
@@ -837,7 +851,7 @@ func (p *OnDemandPort) loop() {
 					}
 					rearm()
 				}) {
-					discardFencedMapping(true)
+					_ = discardFencedMapping(true)
 					c.reply <- portReply{err: ErrOpenSuperseded}
 					continue
 				}
@@ -942,16 +956,21 @@ func (p *OnDemandPort) loop() {
 				}
 				p.ackMu.Unlock()
 				if open && openGen == c.gen {
-					discardFencedMapping(true)
+					_ = discardFencedMapping(true)
 				}
 				c.reply <- portReply{open: false}
 
 			case opDiscardOpen:
-				// Roll back only the mapping this open's generation still owns.
+				// Roll back only the mapping this open's generation still owns, and
+				// REPORT the immediate deletion failure: the direct-open rollback path
+				// must be able to tell a completed discard from one handed to the
+				// close-retry timer (remediation finding 3 — the error used to be
+				// swallowed here, leaving the escalation only internally visible).
+				var discardErr error
 				if open && openGen == c.gen {
-					discardFencedMapping(true)
+					discardErr = discardFencedMapping(true)
 				}
-				c.reply <- portReply{}
+				c.reply <- portReply{err: discardErr}
 
 			case opGrantedPort:
 				c.reply <- portReply{granted: grantedPort}
@@ -1022,7 +1041,7 @@ func (p *OnDemandPort) loop() {
 							renewAt = deadline.Add(-p.renewWindow)
 							rearm()
 						}) {
-							discardFencedMapping(true)
+							_ = discardFencedMapping(true)
 						}
 					}
 				default:

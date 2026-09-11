@@ -63,13 +63,14 @@ const DirectReasonAgentOffline DirectStatusReason = "agent_offline"
 // relay assignment join key, and the route publisher's revision at read
 // time. Produced ONLY by readRouteFacts.
 type routeFacts struct {
-	apiKeyID      string
-	agentRecordID string
-	endpointIP    string
-	endpointPort  int
-	relayPort     int
-	generation    uint64
-	routeRevision uint64
+	apiKeyID       string
+	agentRecordID  string
+	endpointIP     string
+	endpointPort   int
+	endpointStatus string
+	relayPort      int
+	generation     uint64
+	routeRevision  uint64
 }
 
 // assignable reports whether the agent carries a relay assignment that could
@@ -101,6 +102,7 @@ func (c *Controller) readRouteFacts(apiKeyID string) (routeFacts, bool) {
 	facts.agentRecordID = rec.Id
 	facts.endpointIP = rec.GetString("endpoint_ip")
 	facts.endpointPort = rec.GetInt("endpoint_port")
+	facts.endpointStatus = rec.GetString("endpoint_status")
 	facts.relayPort = rec.GetInt("relay_port")
 	if gen := rec.GetInt("relay_generation"); gen >= 0 {
 		facts.generation = uint64(gen)
@@ -165,6 +167,10 @@ func (c *Controller) relaySelectable(facts routeFacts, now time.Time) bool {
 //     is impossible.
 //   - no fresh observation + published endpoint → stun_timeout: the §9.1
 //     "only STUN freshness is missing/stale" interstitial category.
+//   - persisted close_failed escalation → endpoint_close_failed: the agent
+//     could not release an owned mapping, so a mapping may still be live on the
+//     router; hard-ineligible (relay/offline, never preparable) until a later
+//     endpoint report clears the status.
 //   - fresh but not-public observation → stun_not_public: §10.3 never
 //     qualifies CGNAT/private/reserved egress for direct regardless of any
 //     published endpoint; a later observation succeeding is the only path
@@ -186,6 +192,17 @@ func (c *Controller) directSelectionTerm(facts routeFacts, now time.Time) Direct
 	// the §10.3 STUN policy against the published endpoint.
 	if !c.epochReady(facts.apiKeyID) || !c.hub.AgentConnected(facts.apiKeyID) {
 		off.Reason = DirectReasonAgentOffline
+		return off
+	}
+	// A persisted close_failed escalation is a hard reliability fact, and it is
+	// the ONE persisted endpoint-status value selection consults: the agent
+	// reported that an owned on-demand mapping could not be released, so a
+	// mapping may still be live on the router. Suppress direct (fail closed to
+	// relay) until a later endpoint report clears the status. Suppress-only,
+	// exactly like AgentLocked: every live predicate below still has to pass
+	// once the report clears, so it can never make a route available.
+	if facts.endpointStatus == endpointStatusCloseFailed {
+		off.Reason = DirectReasonEndpointCloseFailed
 		return off
 	}
 	if facts.endpointIP == "" {

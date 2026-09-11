@@ -1991,6 +1991,17 @@ func (d *Daemon) ackOpenSuccess(msg signaling.Message, ds *directState, gen uint
 		WasAlreadyOpen: wasOpen, Status: "ok",
 		Validation: &signaling.OpenAckValidation{Epoch: gen},
 	}); err != nil {
+		// The OK ack never reached control, so the open is unsuccessful and its
+		// mapping must not outlive the undelivered ack (remediation finding 2):
+		// a WebSocket loss between the endpoint report and the ack previously
+		// left the mapping live for its whole lease. Tear it down through the
+		// same generation-guarded, discovered-identity discard the
+		// report-failure arm uses. This is a no-op when the transport guard
+		// already discarded a superseded generation, and it never touches a
+		// newer generation's mapping.
+		if closeErr := ds.port.DiscardOpenMapping(gen); closeErr != nil {
+			log.Printf("open_signal %s: mapping teardown after an undelivered OK open_ack: %v", msg.ShareID, closeErr)
+		}
 		return false
 	}
 	return true
@@ -2801,9 +2812,12 @@ func (d *Daemon) runLockdownLevers(levers []lockdownLever) {
 // emits NONE of the unlocked-success lifecycle actions — no tunnel restart, no
 // credential request, no unlocked status report — so the daemon stays out of
 // service (the latched start guard keeps the replacement from binding and the
-// binder keeps its withdrawn admissions). ds.restorePending records the owed
-// relay restore, so a later Unlock retries it instead of short-circuiting as
-// an idempotent no-op and falsely reporting success.
+// binder keeps its withdrawn admissions). Direct-open admission stays FENCED
+// (locked port stamp + locked SignalGate) until the ordered handoff and the
+// listener start both succeed, so a failed unlock cannot be followed by an
+// open that creates a router mapping and acks OK. ds.restorePending records the
+// owed relay restore, so a later Unlock retries it instead of short-circuiting
+// as an idempotent no-op and falsely reporting success.
 func (d *Daemon) Unlock() error {
 	d.lockdownMu.Lock()
 	defer d.lockdownMu.Unlock()
@@ -2820,7 +2834,6 @@ func (d *Daemon) Unlock() error {
 		return nil
 	}
 	wasLocked := ds.locked
-	var epoch uint64
 	if wasLocked {
 		ds.locked = false
 		// Supersede every in-flight lockdown lever BEFORE the gate re-opens: a
@@ -2828,7 +2841,6 @@ func (d *Daemon) Unlock() error {
 		// listener stop must not tear down the listener restored below. Bumping
 		// under ds.mu makes the bump atomic with the fenced levers' checks.
 		ds.lockdownEpoch++
-		epoch = ds.lockdownEpoch
 		// Force syncDirectServe to rebuild the Binder/DirectServer and re-admit
 		// every recorded origin (direct pairs, relay-only bindings, and pending
 		// relay-only bindings), reusing the tested namespace-rebuild path. The
@@ -2837,25 +2849,28 @@ func (d *Daemon) Unlock() error {
 		// current; the owed relay lifecycle below is what must still run.
 		ds.serveNS = ""
 	}
+	epoch := ds.lockdownEpoch
 	gate := ds.gate
 	port := ds.port
 	ds.mu.Unlock()
 
-	// Publish the unlock generation to the on-demand port BEFORE the gate
-	// re-opens, so no open admitted after Unlock is fenced against the stale
-	// locked stamp; the new stamp both clears the locked bit and advances the
-	// epoch, so an open admitted under the pre-lockdown generation is still
-	// refused.
-	if port != nil && wasLocked {
-		port.SetGeneration(epoch, false)
-	}
-	if gate != nil {
-		gate.SetLockdown(false)
-	}
+	// Direct-open eligibility stays FENCED until the replacement listener is
+	// confirmed serving (remediation finding 1). Publishing the unlocked
+	// generation and opening the SignalGate BEFORE the ordered handoff meant a
+	// failed handoff left admission OPEN: an open signal could then create a
+	// router mapping, report it, and ack OK while the daemon claimed to be out
+	// of service. Publishing the CURRENT epoch with the locked bit keeps the
+	// port's stamp both current and observably locked across the handoff, and
+	// the gate stays locked in lockstep; a retried unlock re-fences idempotently.
+	fenceDirectAdmission(port, gate, epoch)
+
 	if err := d.syncDirectServe(); err != nil {
 		ds.mu.Lock()
 		ds.restorePending = true
 		ds.mu.Unlock()
+		// Restore the locked stamp explicitly: the handoff failed, so admission
+		// must stay closed however the failed path left the fence.
+		fenceDirectAdmission(port, gate, epoch)
 		log.Printf("unlock: direct listener handoff failed closed; the daemon stays out of service: %v", err)
 		return fmt.Errorf("unlock: %w", err)
 	}
@@ -2863,9 +2878,15 @@ func (d *Daemon) Unlock() error {
 		ds.mu.Lock()
 		ds.restorePending = true
 		ds.mu.Unlock()
+		fenceDirectAdmission(port, gate, epoch)
 		log.Printf("unlock: direct listener did not start; the daemon stays out of service: %v", err)
 		return fmt.Errorf("unlock: %w", err)
 	}
+	// The ordered handoff completed and the replacement listener was brought
+	// into service: re-open direct admission, publishing the unlocked port
+	// generation BEFORE the gate so no open admitted after the gate opens is
+	// fenced against a stale locked stamp.
+	openDirectAdmission(port, gate, epoch)
 	d.learnAndReportPublicIP()
 	d.restartTunnelManager()
 	d.sendLockdownStatus(d.nextLockdownGeneration(), false)
@@ -2874,6 +2895,35 @@ func (d *Daemon) Unlock() error {
 	ds.restorePending = false
 	ds.mu.Unlock()
 	return nil
+}
+
+// fenceDirectAdmission keeps direct-open admission closed for the given epoch:
+// the port's published generation stamp keeps its locked bit (so the port's
+// OpenForIf/CommitOpenAck fences refuse an open admitted under epoch) and the
+// SignalGate refuses every open signal. Unlock calls it while a listener
+// handoff is unconfirmed, and restores it explicitly when the handoff fails
+// closed. Both dependencies may be nil (a no-mapper agent), in which case the
+// open path fails closed on its own nil checks.
+func fenceDirectAdmission(port *direct.OnDemandPort, gate *direct.SignalGate, epoch uint64) {
+	if port != nil {
+		port.SetGeneration(epoch, true)
+	}
+	if gate != nil {
+		gate.SetLockdown(true)
+	}
+}
+
+// openDirectAdmission publishes the unlocked generation to the port BEFORE it
+// opens the SignalGate, so no open admitted after the gate opens is fenced
+// against a stale locked stamp, and there is no window where the port stamp is
+// unlocked while the gate still refuses.
+func openDirectAdmission(port *direct.OnDemandPort, gate *direct.SignalGate, epoch uint64) {
+	if port != nil {
+		port.SetGeneration(epoch, false)
+	}
+	if gate != nil {
+		gate.SetLockdown(false)
+	}
 }
 
 // withdrawBinderAdmissions removes every admission from the binder the

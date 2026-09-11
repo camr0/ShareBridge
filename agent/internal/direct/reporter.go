@@ -8,12 +8,22 @@ import (
 	"time"
 )
 
-// defaultEndpointSendTimeout bounds ONE reporter send. It is a transport bound,
-// not a state-loop bound: the drain goroutine performs the send, so no caller
-// (and no port lock) ever waits on the network. The open-path report is
-// additionally bounded by the caller's context (see ReportOpen), which is the
-// confirmation deadline that gates the OK open_ack.
+// defaultEndpointSendTimeout bounds ONE reporter send on the confirmed-open
+// path: the send is additionally bounded by the caller's context (the open
+// report's confirmation deadline), so this is the upper transport bound.
 const defaultEndpointSendTimeout = 5 * time.Second
+
+// advisorySendTimeout bounds ONE advisory (closed / close-failed) send. The
+// drain serializes sends, so an advisory already in flight delays a confirmed
+// open report queued behind it — and the daemon's open confirmation deadline
+// (defaultOpenReportTimeout, 3s) is SHORTER than the 5s transport bound, so an
+// unmodified advisory could occupy the drain past the open's deadline and fail
+// the open closed for no reason (remediation finding 4). Bounding advisories
+// well below that deadline keeps the residual in-flight delay harmless. It is
+// only a backstop against the in-flight case; queued advisories are handled by
+// the drain's open-priority selection, which is what makes an arbitrary
+// advisory backlog harmless.
+const advisorySendTimeout = time.Second
 
 // ErrReporterClosed is returned by ReportOpen once the reporter has been
 // closed: a closed reporter cannot confirm an open report, so the open must be
@@ -34,6 +44,7 @@ type Reporter struct {
 	ip     string
 	send   func(ctx context.Context, ip string, port int, status string) error
 	ch     chan endpointEvent // queued advisory transitions: never blocks the state loop
+	openCh chan endpointEvent // confirmed open reports: prioritized by the drain
 	done   chan struct{}      // closed by Close to stop the drain goroutine
 	closed bool
 }
@@ -56,20 +67,36 @@ type endpointEvent struct {
 
 func NewReporter(send func(ctx context.Context, ip string, port int, status string) error) *Reporter {
 	r := &Reporter{
-		send: send,
-		ch:   make(chan endpointEvent, 64),
-		done: make(chan struct{}),
+		send:   send,
+		ch:     make(chan endpointEvent, 64),
+		openCh: make(chan endpointEvent, 1),
+		done:   make(chan struct{}),
 	}
 	go r.drain()
 	return r
 }
 
 // drain is the reporter's single send goroutine. It serializes advisory and
-// confirmed sends in enqueue order, so a confirmed open report can never be
-// overtaken by a later close report within the same connection.
+// confirmed sends, so a confirmed open report can never be overtaken by a later
+// close report within the same connection.
+//
+// Confirmed open events are PRIORITIZED over queued advisory events: the drain
+// first drains openCh non-blockingly, then falls into a blocking select that
+// prefers openCh again. A backlog of advisory transitions (which the state loop
+// enqueues drop-on-full) therefore cannot delay an open confirmation behind
+// it. Combined with the advisory send bound in deliver, the residual is at most
+// one advisory already in flight when the open is enqueued.
 func (r *Reporter) drain() {
 	for {
 		select {
+		case e := <-r.openCh:
+			r.deliver(e)
+			continue
+		default:
+		}
+		select {
+		case e := <-r.openCh:
+			r.deliver(e)
 		case e := <-r.ch:
 			r.deliver(e)
 		case <-r.done:
@@ -78,15 +105,20 @@ func (r *Reporter) drain() {
 	}
 }
 
-// deliver performs one send under the per-send transport bound, then signals
-// the event's confirmation channel (if any). A nil event context (advisory
-// transitions) is bounded only by defaultEndpointSendTimeout.
+// deliver performs one send under a bound, then signals the event's
+// confirmation channel (if any). A confirmed open event carries the caller's
+// deadline (bounded further by the transport bound); an advisory event has no
+// caller and is bounded by advisorySendTimeout so it cannot occupy the drain
+// past the open confirmation window.
 func (r *Reporter) deliver(e endpointEvent) {
 	ctx := e.ctx
+	bound := advisorySendTimeout
 	if ctx == nil {
 		ctx = context.Background()
+	} else {
+		bound = defaultEndpointSendTimeout
 	}
-	sendCtx, cancel := context.WithTimeout(ctx, defaultEndpointSendTimeout)
+	sendCtx, cancel := context.WithTimeout(ctx, bound)
 	err := r.send(sendCtx, e.ip, e.port, e.status)
 	cancel()
 	if e.done != nil {
@@ -167,8 +199,10 @@ func (r *Reporter) ReportOpen(ctx context.Context, grantedPort int) error {
 	done := make(chan error, 1)
 	e := endpointEvent{ip: ip, port: grantedPort, ctx: ctx, done: done}
 
+	// Confirmed open reports ride their own prioritized queue: a backlog of
+	// advisory events can never sit in front of them in the drain.
 	select {
-	case r.ch <- e:
+	case r.openCh <- e:
 	case <-ctx.Done():
 		return fmt.Errorf("endpoint open report enqueue: %w", ctx.Err())
 	}

@@ -77,6 +77,12 @@ const (
 	// DirectReasonProbeFailed: the STUN-gated reachability probe itself
 	// failed (non-200 or wrong nonce).
 	DirectReasonProbeFailed DirectStatusReason = "probe_failed"
+	// DirectReasonEndpointCloseFailed: the agent reported (report_endpoint status
+	// "close_failed") that it exhausted its on-demand mapping-deletion retries,
+	// so an owned mapping may still be live on the router. Selection fails
+	// closed to relay until a later endpoint report clears the escalation. It is
+	// a hard-ineligible (not preparable-unknown) reason.
+	DirectReasonEndpointCloseFailed DirectStatusReason = "endpoint_close_failed"
 )
 
 // DirectMatch is one §10.3 policy evaluation: whether the observation
