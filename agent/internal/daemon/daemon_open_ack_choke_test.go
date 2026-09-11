@@ -1,104 +1,157 @@
 package daemon
 
-// M4 remediation round C, fix round: the structural guard for the OK open_ack
-// choke point.
+// M4 remediation round C, fix round 3: the structural half of the OK open_ack
+// guard, strengthened from the fix-round-2 version.
 //
-// Three separate bypasses of the direct-open success path have been found in
-// this remediation (the cold open, the already-open non-renewal fast path, and
-// the endpoint-report confirmation path). Each was a *new* code path that
-// emitted a status-"ok" open_ack without re-validating the open's §13.4
-// generation immediately before the emission. The behavioural test
-// TestOpenSignalFencedByLockdownDuringReportConfirm pins the known
-// interleaving; this test pins the STRUCTURE that makes the next one fail:
+// Three separate bypasses of the direct-open success path were found in this
+// remediation (the cold open, the already-open non-renewal fast path, and the
+// endpoint-report confirmation path). Round 2 answered them with a single
+// *conventional* OK-ack writer plus an AST guard over daemon.go. That guard
+// pinned today's shape, but not the transport: signaling.OpenAck is publicly
+// constructible and Client.OpenAck is publicly callable, so a new caller in
+// another file could emit an unvalidated OK ack.
 //
-//   - the daemon may construct exactly ONE status-"ok" signaling.OpenAck
-//     literal, and it must live inside ackOpenSuccess;
-//   - ackOpenSuccess must itself call OnDemandPort.CommitOpenAck (the port's
-//     generation re-validation, performed after the endpoint report was
-//     confirmed); and
-//   - ackOpenSuccess must not accept an OpenAckCommit parameter, i.e. it must
-//     produce the authorization internally rather than being handed one a
-//     caller validated earlier (the A1 bypass: validate before the report wait,
-//     ack after it).
+// Fix round 3 seals the transport (see Daemon.openAckGuard and
+// signaling.Client.checkOpenAckSeal) and this test makes the static half
+// robust:
 //
-// A future contributor who adds another OK ack path — or who weakens
-// ackOpenSuccess back into a token-taking writer — is caught here even if their
-// new interleaving is not yet covered by a behavioural test.
+//   - it scans the WHOLE production agent module (not just daemon.go) for
+//     signaling.OpenAck constructions that carry an OK status, including
+//     assignment-form `X.Status = "ok"` and non-literal (variable/const)
+//     Status values that could be "ok" at run time;
+//   - it requires exactly one such construction, inside ackOpenSuccess, and
+//     requires that writer to call CommitOpenAck, to derive the granted port
+//     from the commit, and to attach the validation context the transport guard
+//     consumes;
+//   - it requires the production daemon to install the guard at construction.
+//
+// What it does NOT guarantee, and why the transport seal makes the gap
+// non-exploitable: a hand-rolled map (`map[string]any{"type":"open_ack",
+// "status":"ok"}`) or a status computed by an opaque helper cannot be classified
+// statically. Both hand the transport a message with no recoverable validation
+// context, so signaling.Client.Send refuses it; and any caller that supplies a
+// genuinely valid context has, by construction, performed the same
+// CommitOpenAck generation re-validation the choke point performs. The static
+// scan is therefore a *source-level* tripwire for new writers; the transport is
+// the guarantee.
 
 import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// TestOpenAckOKOnlyInsideTheValidatedChokePoint parses the production daemon
-// source and fails unless the single OK open_ack is constructed inside
-// ackOpenSuccess, which must internally re-validate the generation. It is
-// deliberately an AST check (not a string count) so formatting and helper
-// extraction do not matter: what is forbidden is a second OK ack construction
-// anywhere else in the package, and an OK ack writer that skips the port's
-// re-validation.
+// okAckSite is one production source construction that can produce a
+// status-"ok" open_ack.
+type okAckSite struct {
+	pos token.Position
+	lit *ast.CompositeLit
+}
+
+// TestOpenAckOKOnlyInsideTheValidatedChokePoint is the module-wide structural
+// guard. It fails on a second OK-ack writer anywhere in production code, on a
+// writer that skips the port's re-validation or the validation context, on an
+// assignment-form or unclassifiable OK status, and on a daemon that fails to
+// install the transport guard.
 func TestOpenAckOKOnlyInsideTheValidatedChokePoint(t *testing.T) {
+	root := agentModuleRoot(t)
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "daemon.go", nil, 0)
+
+	var (
+		okSites        []okAckSite
+		unverifiable   []string
+		assignmentForm []string
+		dotImports     []string
+	)
+
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", "vendor", "testdata", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", path, perr)
+		}
+		importsSignaling := false
+		signalingName := "signaling"
+		for _, imp := range file.Imports {
+			importPath := strings.Trim(imp.Path.Value, `"`)
+			if importPath == "sharebridge/agent/internal/signaling" || strings.HasSuffix(importPath, "/signaling") {
+				importsSignaling = true
+				if imp.Name != nil {
+					if imp.Name.Name == "." {
+						dotImports = append(dotImports, fset.Position(imp.Pos()).String())
+					} else if imp.Name.Name != "_" {
+						signalingName = imp.Name.Name
+					}
+				}
+			}
+		}
+		for _, lit := range signalingOpenAckLiterals(file, signalingName) {
+			kind := openAckStatusKind(lit)
+			switch kind {
+			case "ok":
+				okSites = append(okSites, okAckSite{pos: fset.Position(lit.Pos()), lit: lit})
+			case "nonliteral":
+				unverifiable = append(unverifiable, fset.Position(lit.Pos()).String())
+			}
+		}
+		if importsSignaling {
+			assignmentForm = append(assignmentForm, statusOkAssignments(fset, file)...)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk agent module %s: %v", root, err)
+	}
+
+	if len(dotImports) != 0 {
+		t.Fatalf("dot-import of the signaling package hides the qualifier from the structural scan: %v", dotImports)
+	}
+	if len(unverifiable) != 0 {
+		t.Fatalf("signaling.OpenAck construction with a non-literal Status (could be \"ok\" at run time): %v", unverifiable)
+	}
+	if len(assignmentForm) != 0 {
+		t.Fatalf("assignment-form status \"ok\" in a signaling-importing file: %v; "+
+			"an OK open_ack must be built by the single writer with a validation context", assignmentForm)
+	}
+	if len(okSites) != 1 {
+		t.Fatalf("the production agent module constructs %d status-\"ok\" signaling.OpenAck values, want exactly 1 "+
+			"(inside ackOpenSuccess); a second one is a success path that can skip the generation re-validation", len(okSites))
+	}
+
+	// The one OK construction must live inside ackOpenSuccess (in daemon.go).
+	daemonFile, err := parser.ParseFile(fset, filepath.Join(root, "internal", "daemon", "daemon.go"), nil, 0)
 	if err != nil {
 		t.Fatalf("parse daemon.go: %v", err)
 	}
-
-	var okAcks []*ast.CompositeLit
-	ast.Inspect(file, func(n ast.Node) bool {
-		lit, isLit := n.(*ast.CompositeLit)
-		if !isLit {
-			return true
-		}
-		sel, isSel := lit.Type.(*ast.SelectorExpr)
-		if !isSel {
-			return true
-		}
-		pkg, isIdent := sel.X.(*ast.Ident)
-		if !isIdent || pkg.Name != "signaling" || sel.Sel.Name != "OpenAck" {
-			return true
-		}
-		for _, elt := range lit.Elts {
-			kv, isKV := elt.(*ast.KeyValueExpr)
-			if !isKV {
-				continue
-			}
-			key, isKey := kv.Key.(*ast.Ident)
-			if !isKey || key.Name != "Status" {
-				continue
-			}
-			bl, isBasic := kv.Value.(*ast.BasicLit)
-			if isBasic && bl.Kind == token.STRING && bl.Value == `"ok"` {
-				okAcks = append(okAcks, lit)
-			}
-		}
-		return true
-	})
-
-	var ackFn *ast.FuncDecl
-	for _, decl := range file.Decls {
-		fn, isFn := decl.(*ast.FuncDecl)
-		if isFn && fn.Name.Name == "ackOpenSuccess" {
-			ackFn = fn
-			break
-		}
-	}
+	ackFn := findFunc(daemonFile, "ackOpenSuccess")
 	if ackFn == nil {
 		t.Fatalf("daemon.go has no ackOpenSuccess function: the OK open_ack choke point that " +
 			"re-validates the generation is missing")
 	}
-	if len(okAcks) != 1 {
-		t.Fatalf("daemon.go constructs %d status-\"ok\" signaling.OpenAck literals, want exactly 1 "+
-			"(inside ackOpenSuccess); a second one is a success path that can skip the generation "+
-			"re-validation", len(okAcks))
+	if !sameFile(okSites[0].pos, fset.Position(ackFn.Pos())) {
+		t.Fatalf("the only status-\"ok\" signaling.OpenAck is at %s, outside daemon.go's ackOpenSuccess",
+			okSites[0].pos)
 	}
-	okPos := okAcks[0].Pos()
-	if okPos < ackFn.Pos() || okPos > ackFn.End() {
-		t.Fatalf("the only status-\"ok\" signaling.OpenAck literal is at %s, outside ackOpenSuccess "+
-			"(%s..%s): an OK ack is being emitted without the choke point",
-			fset.Position(okPos), fset.Position(ackFn.Pos()), fset.Position(ackFn.End()))
+	if okSites[0].pos.Offset < fset.Position(ackFn.Pos()).Offset || okSites[0].pos.Offset > fset.Position(ackFn.End()).Offset {
+		t.Fatalf("the only status-\"ok\" signaling.OpenAck is at %s, outside ackOpenSuccess (%s..%s)",
+			okSites[0].pos, fset.Position(ackFn.Pos()), fset.Position(ackFn.End()))
 	}
 
 	// ackOpenSuccess must re-validate internally: it must call CommitOpenAck.
@@ -114,11 +167,139 @@ func TestOpenAckOKOnlyInsideTheValidatedChokePoint(t *testing.T) {
 	}
 	// The ack's granted port must come from that re-validation, not from a
 	// value read before the wait.
-	if !grantedPortFromCommit(okAcks[0]) {
+	if !grantedPortFromCommit(okSites[0].lit) {
 		t.Fatalf("the OK open_ack's GrantedPort is not derived from the commit token: the port the " +
 			"ack advertises must be the one CommitOpenAck re-confirmed")
 	}
+	// ... and it must carry the validation context the transport guard consumes,
+	// or the sealed transport would refuse the daemon's own OK acks.
+	if !validationContextSet(okSites[0].lit) {
+		t.Fatalf("the OK open_ack does not set Validation: the transport guard has no generation to " +
+			"re-validate and would refuse to send it")
+	}
+
+	// The production daemon must install the transport guard at construction.
+	if !installsOpenAckGuard(daemonFile) {
+		t.Fatalf("daemon.go never calls SetOpenAckGuard: the transport seal is not wired, so an OK " +
+			"ack would fail closed (or, if the seal were removed, an unvalidated one could be sent)")
+	}
 }
+
+// agentModuleRoot walks up from the test's working directory to the agent
+// module root (the directory containing go.mod).
+func agentModuleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("no go.mod found above the test working directory")
+		}
+		dir = parent
+	}
+}
+
+// signalingOpenAckLiterals returns every composite literal of type
+// <name>.OpenAck in file, where name is the local name of the signaling
+// package (default or aliased).
+func signalingOpenAckLiterals(file *ast.File, name string) []*ast.CompositeLit {
+	var lits []*ast.CompositeLit
+	ast.Inspect(file, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		sel, ok := lit.Type.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || pkg.Name != name || sel.Sel.Name != "OpenAck" {
+			return true
+		}
+		lits = append(lits, lit)
+		return true
+	})
+	return lits
+}
+
+// openAckStatusKind classifies a signaling.OpenAck literal's Status field:
+// "ok" (a literal "ok"), "other" (a different literal, e.g. "error"), "absent"
+// (zero value, which control ignores), or "nonliteral" (a variable/const/expr
+// that could be "ok" at run time).
+func openAckStatusKind(lit *ast.CompositeLit) string {
+	found := false
+	kind := "absent"
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok || key.Name != "Status" {
+			continue
+		}
+		found = true
+		bl, ok := kv.Value.(*ast.BasicLit)
+		if !ok || bl.Kind != token.STRING {
+			kind = "nonliteral"
+			continue
+		}
+		if bl.Value == `"ok"` {
+			kind = "ok"
+		} else {
+			kind = "other"
+		}
+	}
+	if !found {
+		return "absent"
+	}
+	return kind
+}
+
+// statusOkAssignments returns the positions of `X.Status = "ok"` assignments in
+// file. This is the assignment-form bypass the round-2 literal-only scan missed.
+func statusOkAssignments(fset *token.FileSet, file *ast.File) []string {
+	var found []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || assign.Tok != token.ASSIGN {
+			return true
+		}
+		for i, lhs := range assign.Lhs {
+			sel, ok := lhs.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Status" || i >= len(assign.Rhs) {
+				continue
+			}
+			bl, ok := assign.Rhs[i].(*ast.BasicLit)
+			if !ok || bl.Kind != token.STRING || bl.Value != `"ok"` {
+				continue
+			}
+			found = append(found, fset.Position(assign.Pos()).String())
+		}
+		return true
+	})
+	return found
+}
+
+// findFunc returns the named function declaration in file, or nil.
+func findFunc(file *ast.File, name string) *ast.FuncDecl {
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == name {
+			return fn
+		}
+	}
+	return nil
+}
+
+// sameFile reports whether two positions name the same source file.
+func sameFile(a, b token.Position) bool { return a.Filename == b.Filename }
 
 // callsCommitOpenAck reports whether fn's body contains a call to a
 // CommitOpenAck method (the port's post-open generation re-validation).
@@ -172,12 +353,66 @@ func grantedPortFromCommit(okAck *ast.CompositeLit) bool {
 		if !isKey || key.Name != "GrantedPort" {
 			continue
 		}
-		call, isCall := kv.Value.(*ast.CallExpr)
-		if !isCall {
-			return false
-		}
-		sel, isSel := call.Fun.(*ast.SelectorExpr)
-		return isSel && sel.Sel.Name == "GrantedPort"
+		return isGrantedPortCall(kv.Value)
 	}
 	return false
+}
+
+// isGrantedPortCall reports whether expr is a call to a GrantedPort() method.
+func isGrantedPortCall(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "GrantedPort"
+}
+
+// validationContextSet reports whether the OK OpenAck literal sets Validation to
+// a non-nil signaling.OpenAckValidation value (the transport guard's context).
+func validationContextSet(okAck *ast.CompositeLit) bool {
+	for _, elt := range okAck.Elts {
+		kv, isKV := elt.(*ast.KeyValueExpr)
+		if !isKV {
+			continue
+		}
+		key, isKey := kv.Key.(*ast.Ident)
+		if !isKey || key.Name != "Validation" {
+			continue
+		}
+		unary, isUnary := kv.Value.(*ast.UnaryExpr)
+		if !isUnary || unary.Op != token.AND {
+			return false
+		}
+		lit, isLit := unary.X.(*ast.CompositeLit)
+		if !isLit {
+			return false
+		}
+		sel, isSel := lit.Type.(*ast.SelectorExpr)
+		if !isSel {
+			return false
+		}
+		pkg, isIdent := sel.X.(*ast.Ident)
+		return isIdent && pkg.Name == "signaling" && sel.Sel.Name == "OpenAckValidation"
+	}
+	return false
+}
+
+// installsOpenAckGuard reports whether file calls SetOpenAckGuard (the daemon's
+// construction-time wiring of the transport seal).
+func installsOpenAckGuard(file *ast.File) bool {
+	found := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && sel.Sel.Name == "SetOpenAckGuard" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }

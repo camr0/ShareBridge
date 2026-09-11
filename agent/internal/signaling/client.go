@@ -72,6 +72,22 @@ type OpenAck struct {
 	WasAlreadyOpen bool   `json:"was_already_open"`
 	Status         string `json:"status"`
 	Error          string `json:"error,omitempty"`
+
+	// Validation is the OK-ack guard's validation context (see
+	// OpenAckValidation). The daemon's single OK-ack writer fills it from the
+	// direct-state generation the open was admitted under. It is process-local
+	// metadata and is never serialized: it carries `json:"-"`, and the send
+	// path inspects the in-memory value rather than the wire bytes.
+	Validation *OpenAckValidation `json:"-"`
+}
+
+// OpenAckValidation is the transport guard's validation context for a
+// status-"ok" open_ack. A nil Validation on an OK ack means "no validation
+// context", which the installed guard rejects: that is what makes an
+// unvalidated OK ack fail closed rather than default to the zero generation.
+type OpenAckValidation struct {
+	// Epoch is the direct-state generation the open was admitted under.
+	Epoch uint64
 }
 
 type RegisterShareOptions struct {
@@ -95,6 +111,13 @@ type Client struct {
 	OnMessage func(msg Message)
 	mu        sync.Mutex
 
+	// openAckGuard is the injected transport gate for status-"ok" open_acks.
+	// It is installed once by the daemon (SetOpenAckGuard) and consulted by
+	// OpenAck before anything is written. A nil guard makes every OK ack fail
+	// closed; error acks never consult it. Guarded by openAckGuardMu.
+	openAckGuard   func(OpenAck) error
+	openAckGuardMu sync.RWMutex
+
 	// pendingReg receives the share_registered (or error) response for the
 	// RegisterShare call currently in flight. nil when no registration pending.
 	// All WebSocket reads go through Listen, so RegisterShare must not call
@@ -109,6 +132,34 @@ func New(serverURL, apiKey, agentID string) *Client {
 		apiKey:    apiKey,
 		agentID:   agentID,
 	}
+}
+
+// SetOpenAckGuard installs the one-time OK-ack approval gate on this client.
+// Once installed, every status-"ok" OpenAck must be approved by the guard
+// before any bytes are written; a missing or rejecting guard is a hard error
+// and nothing reaches the wire. Error acks never consult the guard.
+//
+// The gate is installed once by construction so a later caller cannot widen
+// it: a second install and a nil guard are both refused. A client that never
+// installs one can still send error acks; only OK acks fail closed.
+func (c *Client) SetOpenAckGuard(guard func(OpenAck) error) error {
+	if guard == nil {
+		return errors.New("signaling: cannot install a nil OK-ack guard")
+	}
+	c.openAckGuardMu.Lock()
+	defer c.openAckGuardMu.Unlock()
+	if c.openAckGuard != nil {
+		return errors.New("signaling: OK-ack guard already installed")
+	}
+	c.openAckGuard = guard
+	return nil
+}
+
+// openAckGuardSnapshot returns the installed OK-ack guard, if any.
+func (c *Client) openAckGuardSnapshot() func(OpenAck) error {
+	c.openAckGuardMu.RLock()
+	defer c.openAckGuardMu.RUnlock()
+	return c.openAckGuard
 }
 
 // Connect dials the signaling server with API key auth and sends hello.
@@ -229,22 +280,24 @@ func (c *Client) ReportEndpoint(ctx context.Context, ip string, port int, status
 	return c.Send(ctx, msg)
 }
 
+// openAckWire is the on-wire shape of an OpenAck. It adds the message type to
+// the OpenAck fields; the embedded struct's json tags (and the non-serialized
+// Validation context) carry through. Sending the whole value through Send means
+// the transport's OK-ack seal sees the in-memory Validation context.
+type openAckWire struct {
+	Type string `json:"type"`
+	OpenAck
+}
+
 // OpenAck acknowledges an open_signal with the granted port and public IP.
+//
+// A status-"ok" ack is the one privileged open_ack: it tells control the
+// mapping is live and its endpoint report has been confirmed. It is therefore
+// gated at the transport (see Send): it must carry a validation context and be
+// approved by the installed OK-ack guard, or the ack is never written. Error
+// acks are not gated and keep working with no guard.
 func (c *Client) OpenAck(ctx context.Context, ack OpenAck) error {
-	msg := map[string]any{
-		"type":             "open_ack",
-		"share_id":         ack.ShareID,
-		"nonce":            ack.Nonce,
-		"seq":              ack.Seq,
-		"granted_port":     ack.GrantedPort,
-		"public_ip":        ack.PublicIP,
-		"was_already_open": ack.WasAlreadyOpen,
-		"status":           ack.Status,
-	}
-	if ack.Error != "" {
-		msg["error"] = ack.Error
-	}
-	return c.Send(ctx, msg)
+	return c.Send(ctx, openAckWire{Type: "open_ack", OpenAck: ack})
 }
 
 // TLSReady reports a successfully installed leaf certificate.
@@ -517,16 +570,63 @@ func (c *Client) connSnapshot() *websocket.Conn {
 // Send serializes msg as JSON and writes it to the CURRENT WebSocket. It
 // snapshots the connection once so a concurrent reconnect can only move a
 // later send to the new socket, never tear this write.
+//
+// Send is ALSO the transport's OK-ack seal, so every outbound message — the
+// typed OpenAck front-end and any raw struct or map a caller hands to Send — is
+// inspected before it is written. A status-"ok" open_ack is refused unless the
+// injected OK-ack guard approves it; nothing reaches the wire on refusal.
 func (c *Client) Send(ctx context.Context, msg any) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
+	}
+	if err := c.checkOpenAckSeal(data, msg); err != nil {
+		return err
 	}
 	conn := c.connSnapshot()
 	if conn == nil {
 		return errors.New("send: signaling connection not established")
 	}
 	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+// checkOpenAckSeal is the fail-closed transport gate for status-"ok"
+// open_acks. It classifies the marshalled message; anything that is not an OK
+// open_ack passes through untouched. An OK open_ack must be approved by the
+// installed guard, and the guard receives the validation context only when the
+// caller passed a typed OpenAck (directly or wrapped in openAckWire). A raw
+// map/struct that merely looks like an OK open_ack carries no context and is
+// therefore rejected — the case a static shape check cannot see.
+func (c *Client) checkOpenAckSeal(data []byte, original any) error {
+	var probe struct {
+		Type   string `json:"type"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil // not a JSON object Send can classify; leave it to the consumer
+	}
+	if probe.Type != "open_ack" || probe.Status != "ok" {
+		return nil
+	}
+	var validation OpenAck
+	switch v := original.(type) {
+	case openAckWire:
+		validation = v.OpenAck
+	case OpenAck:
+		validation = v
+	default:
+		// A raw message that merely encodes an OK open_ack: no validation
+		// context can be recovered, so the guard sees none and rejects it.
+		validation = OpenAck{Status: probe.Status}
+	}
+	guard := c.openAckGuardSnapshot()
+	if guard == nil {
+		return errors.New(`signaling: refusing to send a status "ok" open_ack: no OK-ack guard installed`)
+	}
+	if err := guard(validation); err != nil {
+		return fmt.Errorf(`signaling: refusing to send a status "ok" open_ack: %w`, err)
+	}
+	return nil
 }
 
 // Listen reads messages in a loop and dispatches them.

@@ -392,6 +392,11 @@ func TestSendHelpers_WireShape(t *testing.T) {
 
 	t.Run("OpenAck", func(t *testing.T) {
 		got := captureAgentMessage(t, func(ctx context.Context, c *Client) error {
+			// A status-"ok" ack is transport-gated: approve it here. The
+			// seal itself is covered by client_open_ack_seal_test.go.
+			if err := c.SetOpenAckGuard(func(OpenAck) error { return nil }); err != nil {
+				return err
+			}
 			return c.OpenAck(ctx, OpenAck{
 				ShareID: "SHARE123", Nonce: "n", Seq: 7,
 				GrantedPort: 443, PublicIP: "1.2.3.4",

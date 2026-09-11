@@ -1129,7 +1129,18 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 	if err := d.buildDirectState(true); err != nil {
 		return nil, fmt.Errorf("init direct transport: %w", err)
 	}
+	// The transport-level OK-ack seal is installed HERE, at construction, so
+	// no daemon code path can emit a status-"ok" open_ack without it.
+	if err := sig.SetOpenAckGuard(d.openAckGuard); err != nil {
+		return nil, fmt.Errorf("install OK-ack guard: %w", err)
+	}
 	return d, nil
+}
+
+// openAckGuardInstaller is the optional seam a concrete signaling client
+// exposes to receive the daemon's OK-ack guard. Mocks do not implement it.
+type openAckGuardInstaller interface {
+	SetOpenAckGuard(func(signaling.OpenAck) error) error
 }
 
 // NewWithSignaling creates a new Daemon with a custom signaling client.
@@ -1137,14 +1148,22 @@ func New(cfgMgr ConfigManagerInterface, st StoreInterface) (*Daemon, error) {
 func NewWithSignaling(cfgMgr ConfigManagerInterface, st StoreInterface, sig SignalingClientInterface) (*Daemon, error) {
 	cfg := cfgMgr.Get()
 
-	return &Daemon{
+	d := &Daemon{
 		config:    cfg,
 		configMgr: cfgMgr,
 		store:     st,
 		signaling: sig,
 		resolver:  direct.NewResolverRegistry(),
 		sessions:  make(map[string]*Session),
-	}, nil
+	}
+	// A real signaling client gets the same transport seal as production; a
+	// mock (the test seam) does not implement the installer and is unchanged.
+	if installer, ok := sig.(openAckGuardInstaller); ok {
+		if err := installer.SetOpenAckGuard(d.openAckGuard); err != nil {
+			return nil, fmt.Errorf("install OK-ack guard: %w", err)
+		}
+	}
+	return d, nil
 }
 
 // SetWebServer sets the web server instance. Called after web server creation
@@ -1926,7 +1945,7 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 		return
 	}
 	if !d.ackOpenSuccess(msg, ds, openEpoch, ip, wasOpen) {
-		log.Printf("open_signal %s refused after reporting: superseded by a lockdown transition", msg.ShareID)
+		log.Printf("open_signal %s refused after reporting: not the confirmed current open (superseded or OK-ack refused)", msg.ShareID)
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "superseded"})
 		return
@@ -1946,21 +1965,67 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 // then ack after the endpoint-report wait — the A1 bypass. It returns false on
 // refusal, and the caller emits the error ack.
 //
+// The transport is a SECOND, unreachable-around gate: the OK ack carries the
+// generation it was validated under (signaling.OpenAckValidation) and
+// signaling.Client.OpenAck consults Daemon.openAckGuard before writing. Any
+// other caller anywhere in the process that constructs a status-"ok" open_ack
+// cannot put it on the wire without that guard approving the same
+// CommitOpenAck re-validation.
+//
 // Do NOT add another OK open_ack anywhere: the structural guard
-// TestOpenAckOKOnlyInsideTheValidatedChokePoint parses daemon.go and fails if a
-// second status-"ok" signaling.OpenAck literal appears outside this function, or
-// if this function stops calling CommitOpenAck (see
-// daemon_open_ack_choke_test.go).
+// TestOpenAckOKOnlyInsideTheValidatedChokePoint parses the whole production
+// agent module and fails if a second status-"ok" signaling.OpenAck
+// construction (literal or assignment) appears outside this function, or if
+// this function stops calling CommitOpenAck (see daemon_open_ack_choke_test.go).
+//
+// This function's granted-port source must stay the commit token: the structural
+// guard also pins that.
 func (d *Daemon) ackOpenSuccess(msg signaling.Message, ds *directState, gen uint64, ip string, wasOpen bool) bool {
 	commit, current := ds.port.CommitOpenAck(gen)
 	if !current {
 		return false
 	}
-	_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
+	if err := d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
 		GrantedPort: commit.GrantedPort(), PublicIP: ip,
-		WasAlreadyOpen: wasOpen, Status: "ok"})
+		WasAlreadyOpen: wasOpen, Status: "ok",
+		Validation: &signaling.OpenAckValidation{Epoch: gen},
+	}); err != nil {
+		return false
+	}
 	return true
+}
+
+// openAckGuard is the transport-level approval gate for status-"ok"
+// open_acks, installed on the signaling client at construction (see New).
+// signaling.Client.OpenAck consults it before writing anything, so there is no
+// path — inside ackOpenSuccess or anywhere else in the process — that can put
+// an OK ack on the wire without this validation.
+//
+// It re-runs the post-report generation re-validation (OnDemandPort.
+// CommitOpenAck) for the generation the ack says the open was admitted under,
+// and additionally requires the ack's advertised port to be the one the port
+// re-confirmed. It is deliberately stateless: the OK ack carries its own
+// validation context and the port is the authority, so a caller that supplies
+// a currently-authorized generation has performed the same check the choke
+// point performs. The OK-ack writer still calls CommitOpenAck itself to obtain
+// the granted port, so this is the second, unreachable-around gate.
+func (d *Daemon) openAckGuard(ack signaling.OpenAck) error {
+	if ack.Validation == nil {
+		return errors.New("open_ack carries no validation context")
+	}
+	ds := d.direct
+	if ds == nil || ds.port == nil {
+		return errors.New("direct transport is unavailable")
+	}
+	commit, current := ds.port.CommitOpenAck(ack.Validation.Epoch)
+	if !current {
+		return fmt.Errorf("generation %d is no longer the current committed open", ack.Validation.Epoch)
+	}
+	if got := commit.GrantedPort(); got != ack.GrantedPort {
+		return fmt.Errorf("granted port %d does not match the committed port %d", ack.GrantedPort, got)
+	}
+	return nil
 }
 
 // confirmOpenEndpoint sends the open-path endpoint report carrying the
