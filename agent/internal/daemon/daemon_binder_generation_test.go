@@ -187,7 +187,7 @@ func TestFailedRegistrationRollsBackBinding(t *testing.T) {
 		// Point the client at a disallowed host so newImmichClient fails.
 		d.config.ImmichAllowedHost = "not-the-immich-host:2283"
 		const code = "IMMICHROLLBACK1"
-		if _, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: code, Type: "ALBUM"}, 5, time.Time{}); err == nil {
+		if _, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: code, Type: "ALBUM"}, 5, time.Time{}, false); err == nil {
 			t.Fatalf("expected Immich client creation to fail")
 		}
 		assertNoHalfBinding(t, d, ds, sig, code)
@@ -199,7 +199,7 @@ func TestFailedRegistrationRollsBackBinding(t *testing.T) {
 		st.saveError = errors.New("disk full")
 		st.mu.Unlock()
 		const code = "IMMICHROLLBACK2"
-		if _, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: code, Type: "ALBUM"}, 5, time.Time{}); err == nil {
+		if _, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: code, Type: "ALBUM"}, 5, time.Time{}, true); err == nil {
 			t.Fatalf("expected SaveSession to fail")
 		}
 		assertNoHalfBinding(t, d, ds, sig, code)

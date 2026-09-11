@@ -26,7 +26,9 @@ type v1CreateShareRequest struct {
 	Password     string `json:"password"`
 	ExpiryHours  int    `json:"expiry_hours"`
 	MaxDownloads int    `json:"max_downloads"`
-	RelayOnly    bool   `json:"relay_only"`
+	// RelayOnly is a pointer so an ABSENT field (nil) falls back to the
+	// persisted DefaultRelayOnly default while an explicit false still wins.
+	RelayOnly *bool `json:"relay_only"`
 }
 
 type v1CreateShareResponse struct {
@@ -116,6 +118,14 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 		expiryHours = ws.daemon.GetConfig().DefaultExpiry
 	}
 
+	// Per-share relay-only selection (§6.1): an explicitly supplied JSON value
+	// wins; an absent field falls back to the persisted DefaultRelayOnly
+	// default so shares created without the field keep their previous behavior.
+	relayOnly := ws.daemon.GetConfig().DefaultRelayOnly
+	if req.RelayOnly != nil {
+		relayOnly = *req.RelayOnly
+	}
+
 	code, err := ws.daemon.CreateSession(
 		r.Context(),
 		req.ShareURL,
@@ -123,7 +133,7 @@ func (ws *WebServer) v1CreateShareHandler(w http.ResponseWriter, r *http.Request
 		req.Password,
 		time.Duration(expiryHours)*time.Hour,
 		req.MaxDownloads,
-		req.RelayOnly,
+		relayOnly,
 	)
 	if err != nil {
 		if isValidationError(err) {

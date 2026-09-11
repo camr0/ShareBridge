@@ -206,7 +206,7 @@ func TestDirectDDNSFailureDoesNotBlockShareRegistration(t *testing.T) {
 			{Key: "IMMICHBASE", Type: "ALBUM"},
 		}}, nil
 	}
-	session, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: "IMMICHBASE", Type: "ALBUM"}, 10, time.Now().Add(time.Hour))
+	session, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: "IMMICHBASE", Type: "ALBUM"}, 10, time.Now().Add(time.Hour), false)
 	if err != nil {
 		t.Fatalf("share registration must not be blocked by direct DDNS failure: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestShareRegisteredReturnsAndPersistsBothOrigins(t *testing.T) {
 	d.syncDirectServe()
 
 	const code = "BOTHPAIR1"
-	session, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: code, Type: "ALBUM"}, 10, time.Now().Add(time.Hour))
+	session, err := d.registerImmichShare(context.Background(), immich.SharedLink{Key: code, Type: "ALBUM"}, 10, time.Now().Add(time.Hour), false)
 	if err != nil {
 		t.Fatalf("registerImmichShare: %v", err)
 	}

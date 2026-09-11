@@ -106,8 +106,14 @@ func (ws *WebServer) createShareHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Parse relay only
-	relayOnly := r.FormValue("relay_only") == "true"
+	// Per-share relay-only selection (§6.1): an explicit posted value wins; an
+	// absent field falls back to the persisted DefaultRelayOnly default so
+	// shares created without the field keep their previous behavior.
+	defaultRelayOnly := false
+	if cfg := ws.daemon.GetConfig(); cfg != nil {
+		defaultRelayOnly = cfg.DefaultRelayOnly
+	}
+	relayOnly := resolveRelayOnly(defaultRelayOnly, r.FormValue(relayOnlyFormField))
 
 	// Create session
 	code, err := ws.daemon.CreateSession(
@@ -270,6 +276,26 @@ func (ws *WebServer) lockdownStatusHandler(w http.ResponseWriter, r *http.Reques
 func writeLockdownJSON(w http.ResponseWriter, locked bool) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"locked": locked})
+}
+
+// relayOnlyFormField is the share form's relay-mode radio group name. The
+// handler and the template must agree on it; the drift guard
+// TestShareFormRelayOnlyFieldMatchesHandler renders the real template, extracts
+// this name, and posts it back through the handler.
+const relayOnlyFormField = "relay_only"
+
+// resolveRelayOnly applies the per-share precedence rule: an explicit
+// selection ("true"/"false") wins; an absent or unrecognized field falls back
+// to the persisted default.
+func resolveRelayOnly(defaultRelayOnly bool, selection string) bool {
+	switch selection {
+	case "true":
+		return true
+	case "false":
+		return false
+	default:
+		return defaultRelayOnly
+	}
 }
 
 type shareFormData struct {

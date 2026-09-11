@@ -1135,7 +1135,7 @@ func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, err := d.registerImmichShare(ctx, link, 0, time.Time{})
+			_, err := d.registerImmichShare(ctx, link, 0, time.Time{}, false)
 			done <- err
 		}()
 
@@ -1166,7 +1166,7 @@ func TestRegisterImmichShareWaitsForDirectReady(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, err := d.registerImmichShare(ctx, link, 0, time.Time{})
+			_, err := d.registerImmichShare(ctx, link, 0, time.Time{}, true)
 			done <- err
 		}()
 

@@ -1515,13 +1515,20 @@ func (d *Daemon) Stop() error {
 
 // CreateSession creates a new share session and registers it with the
 // signaling server. Phase 4a serves direct and relay-only public Immich
-// gallery shares (§13.3: the temporary relay-only rejection is removed;
-// relay-only mode follows the persisted DefaultRelayOnly setting). WebDAV/
-// file (opencloud/nextcloud) shares remain rejected deferred share types.
+// gallery shares (§13.3: the temporary relay-only rejection is removed).
+// WebDAV/file (opencloud/nextcloud) shares remain rejected deferred share
+// types.
+//
+// relayOnly is the FULLY RESOLVED per-share decision: an explicit per-share
+// selection wins, and a caller with no per-share selection resolves it against
+// the persisted DefaultRelayOnly setting before calling here (the web form and
+// JSON API do exactly that). It is honored end to end — the session's mode,
+// the T27 single relay binding, and the relay_only carried to control — rather
+// than being dropped in favor of the global default (M4 closeout batch 4).
 func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, password string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
 	switch shareType {
 	case "immich":
-		return d.createManualImmichSession(ctx, shareURL, expiryDuration, maxDownloads)
+		return d.createManualImmichSession(ctx, shareURL, expiryDuration, maxDownloads, relayOnly)
 	case "opencloud", "nextcloud":
 		return "", validationError{message: fmt.Sprintf("share type %q is not supported", shareType)}
 	default:
@@ -1529,7 +1536,7 @@ func (d *Daemon) CreateSession(ctx context.Context, shareURL, shareType, passwor
 	}
 }
 
-func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string, expiryDuration time.Duration, maxDownloads int) (string, error) {
+func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string, expiryDuration time.Duration, maxDownloads int, relayOnly bool) (string, error) {
 	const prefix = "immich://"
 	if !strings.HasPrefix(shareURL, prefix) || strings.TrimPrefix(shareURL, prefix) == "" {
 		return "", validationError{message: "share_url must be immich://KEY for manual Immich shares"}
@@ -1569,7 +1576,7 @@ func (d *Daemon) createManualImmichSession(ctx context.Context, shareURL string,
 		return "", validationError{message: "password-protected Immich shares are not supported"}
 	}
 
-	session, err := d.registerImmichShare(ctx, link, maxDownloads, time.Now().Add(expiryDuration))
+	session, err := d.registerImmichShare(ctx, link, maxDownloads, time.Now().Add(expiryDuration), relayOnly)
 	if err != nil {
 		return "", err
 	}
@@ -2444,7 +2451,7 @@ func (d *Daemon) syncImmichShares(ctx context.Context) error {
 			continue
 		}
 
-		session, err := d.registerImmichShare(ctx, link, d.GetConfig().DefaultMaxDownloads, time.Time{})
+		session, err := d.registerImmichShare(ctx, link, d.GetConfig().DefaultMaxDownloads, time.Time{}, d.GetConfig().DefaultRelayOnly)
 		if err != nil {
 			return err
 		}
@@ -2507,7 +2514,12 @@ func (d *Daemon) getImmichPoller() (immichPoller, error) {
 	})
 }
 
-func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink, maxDownloads int, expiresAt time.Time) (*Session, error) {
+// registerImmichShare registers one public Immich share with control, binding
+// the T26 dual-origin pair for a normal share or the T27 relay-only single
+// binding for a relay-only one. relayOnly is the already-resolved per-share
+// decision supplied by the caller (CreateSession carries an explicit per-share
+// selection; the poller passes the persisted DefaultRelayOnly default).
+func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink, maxDownloads int, expiresAt time.Time, relayOnly bool) (*Session, error) {
 	reg, ok := d.signaling.(shareOptionRegistrar)
 	if !ok {
 		return nil, fmt.Errorf("signaling client does not support option registration")
@@ -2515,7 +2527,6 @@ func (d *Daemon) registerImmichShare(ctx context.Context, link immich.SharedLink
 
 	shareURL := "immich://" + link.Key
 	passwordProtected := link.IsPasswordProtected()
-	relayOnly := d.GetConfig().DefaultRelayOnly
 
 	// Password-protected Immich shares remain a deferred share type (§13.3);
 	// relay-only public Immich shares are restored (Phase 4a).
