@@ -50,6 +50,20 @@ type HoldTracker interface {
 	End(token uint64)
 }
 
+// SessionLiveness optionally extends SessionTracker with the per-request
+// liveness check the direct content gate needs: whether a connection's session
+// is still live on the port — the port is still logically open and the session
+// has not been dropped by a close — renewing it exactly like Activity.
+// OnDemandPort implements it, so the production DirectServer has no un-gated
+// direct content path: a keep-alive connection whose session was abandoned by
+// a close can no longer be served, which fails closed the lingering-mapping
+// reuse of the M4 composition gap. A SessionTracker that does not implement it
+// is treated as always-live — the pre-existing behavior for handler-level test
+// doubles — which is safe because the production port is the authority.
+type SessionLiveness interface {
+	SessionActive(sessionID string) bool
+}
+
 // DirectServer serves the native-HTTPS "direct" data path (placeholder content
 // plus a reachability probe) on an on-demand port. It composes the Binder (SNI
 // admission + per-request authorization), a CertProvider (the current serving
@@ -296,7 +310,9 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.resolveContent(w, code); !ok {
 			return
 		}
-		s.activity(w, r, code)
+		if !s.activity(w, r, code) {
+			return
+		}
 		s.handlePage(w, r, code)
 	case rest == "/items":
 		s.handleItems(w, r, code)
@@ -305,7 +321,9 @@ func (s *DirectServer) route(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.resolveContent(w, code); !ok {
 			return
 		}
-		s.activity(w, r, code)
+		if !s.activity(w, r, code) {
+			return
+		}
 		s.handleDownload(w, r)
 	case strings.HasPrefix(rest, "/thumb/"):
 		if id, ok := contentID(rest, "/thumb/"); ok {
@@ -517,30 +535,64 @@ func (zeroReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// activity ties each request to a connection-scoped session: BeginSession on
-// the first request of a connection, Activity on subsequent ones. EndSession
-// is driven by ConnState (StateClosed). Only DIRECT connections drive the
-// port's session accounting (§13.2): relay connections must never begin,
-// renew, or hold the home mapping, so their requests skip the tracker. The
+// activity ties each request to a connection-scoped session and is the
+// authoritative direct-content gate: BeginSession on the first request of a
+// connection, SessionActive on subsequent ones. EndSession is driven by
+// ConnState (StateClosed). Only DIRECT connections drive the port's session
+// accounting (§13.2): relay connections must never begin, renew, or hold the
+// home mapping, so their requests skip the tracker entirely (T26/T27/T30). The
 // conn's mutex guards sessionID so a connection (an HTTP/2 connection with
 // concurrent streams) can't double-begin or race a close.
-func (s *DirectServer) activity(w http.ResponseWriter, r *http.Request, code string) {
+//
+// It reports whether the request may be served, and the caller must refuse to
+// serve when it returns false (it has already written the 503). A DirectServer
+// with a non-nil port (the production construction) serves direct content ONLY
+// while the port is logically open: BeginSession fails while the port is
+// closed, and a liveness-aware tracker reports a session abandoned by a close
+// so the connection re-begins — which again fails closed while the port is not
+// logically open. That closes the M4 composition gap in which a lingering
+// router mapping (close-failed / unresolved delete) kept forwarding to the
+// listener and a previously-authorized recipient was served over a known
+// origin with no new open signal: the mapping may still exist on the router,
+// but the port is not logically open, so no direct content is served. A nil
+// port (handler-level tests and the no-mapper construction) has no mapping to
+// gate and is allowed through.
+//
+// The refusal is made visible in the existing terms: it is logged, and the
+// response is the mapped 503 (content temporarily unavailable).
+func (s *DirectServer) activity(w http.ResponseWriter, r *http.Request, code string) bool {
 	if s.port == nil {
-		return
+		return true
 	}
 	cs := connStateFromContext(r.Context())
 	if cs == nil || cs.boundRoute() != RouteDirect {
-		return
+		return true
 	}
 	cs.mu.Lock()
-	if cs.sessionID == "" {
-		if sid, err := s.port.BeginSession(code); err == nil {
-			cs.sessionID = sid
+	defer cs.mu.Unlock()
+	if cs.sessionID != "" {
+		live, livenessAware := s.port.(SessionLiveness)
+		if !livenessAware {
+			s.port.Activity(cs.sessionID)
+			return true
 		}
-	} else {
-		s.port.Activity(cs.sessionID)
+		if !live.SessionActive(cs.sessionID) {
+			// The port closed and dropped this session (or re-opened for a
+			// newer epoch). Re-beginning below fails closed while the port is
+			// not logically open.
+			cs.sessionID = ""
+		}
 	}
-	cs.mu.Unlock()
+	if cs.sessionID == "" {
+		sid, err := s.port.BeginSession(code)
+		if err != nil {
+			log.Printf("direct: refusing content for share %s: the on-demand port is not logically open: %v", code, err)
+			http.Error(w, "direct content unavailable", http.StatusServiceUnavailable)
+			return false
+		}
+		cs.sessionID = sid
+	}
+	return true
 }
 
 // Server resource limits (§11): explicit header/keep-alive timeouts and the

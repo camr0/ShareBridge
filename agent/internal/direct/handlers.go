@@ -264,7 +264,9 @@ func (s *DirectServer) handleThumb(w http.ResponseWriter, r *http.Request, code,
 	if !ok {
 		return
 	}
-	s.activity(w, r, code)
+	if !s.activity(w, r, code) {
+		return
+	}
 	contentType, length, known, err := session.Backend.ThumbnailInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -286,7 +288,9 @@ func (s *DirectServer) handlePreview(w http.ResponseWriter, r *http.Request, cod
 	if !ok {
 		return
 	}
-	s.activity(w, r, code)
+	if !s.activity(w, r, code) {
+		return
+	}
 	contentType, length, known, err := session.Backend.PreviewInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -311,7 +315,9 @@ func (s *DirectServer) handleItems(w http.ResponseWriter, r *http.Request, code 
 	if !ok {
 		return
 	}
-	s.activity(w, r, code)
+	if !s.activity(w, r, code) {
+		return
+	}
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method == http.MethodHead {
@@ -343,7 +349,9 @@ func (s *DirectServer) handleAsset(w http.ResponseWriter, r *http.Request, code,
 	if !ok {
 		return
 	}
-	s.activity(w, r, code)
+	if !s.activity(w, r, code) {
+		return
+	}
 	asset, err := session.Backend.GetAssetInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -438,7 +446,9 @@ func (s *DirectServer) handlePlayback(w http.ResponseWriter, r *http.Request, co
 	if !ok {
 		return
 	}
-	s.activity(w, r, code)
+	if !s.activity(w, r, code) {
+		return
+	}
 	length, known, err := session.Backend.PlaybackInfo(r.Context(), id)
 	if err != nil {
 		http.Error(w, http.StatusText(classifyErr(err)), classifyErr(err))
@@ -559,7 +569,9 @@ func (s *DirectServer) handleArchiveManifest(w http.ResponseWriter, r *http.Requ
 		if _, ok := s.resolveContent(w, code); !ok {
 			return
 		}
-		s.activity(w, r, code)
+		if !s.activity(w, r, code) {
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -571,7 +583,9 @@ func (s *DirectServer) handleArchiveManifest(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		if !recorded {
-			s.activity(w, r, code)
+			if !s.activity(w, r, code) {
+				return
+			}
 			recorded = true
 		}
 		if session.Archives == nil {
@@ -652,7 +666,9 @@ func (s *DirectServer) handleArchivePart(w http.ResponseWriter, r *http.Request,
 	if !ok {
 		return
 	}
-	s.activity(w, r, code)
+	if !s.activity(w, r, code) {
+		return
+	}
 	if session.Archives == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return

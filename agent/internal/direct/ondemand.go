@@ -403,6 +403,18 @@ func (p *OnDemandPort) Activity(sessionID string) {
 	p.send(portCommand{op: opActivity, sessionID: sessionID, reply: ch})
 }
 
+// SessionActive reports whether sessionID is still live on the port — the port
+// is logically open and the session has not been dropped by a close — and
+// renews it exactly like Activity. It is the liveness half of the direct
+// content gate (see the SessionLiveness interface in server.go): a keep-alive
+// connection whose session was abandoned when the port closed can no longer be
+// served, so the lingering-mapping reuse of the M4 composition gap fails
+// closed.
+func (p *OnDemandPort) SessionActive(sessionID string) bool {
+	ch := make(chan portReply, 1)
+	return p.send(portCommand{op: opActivity, sessionID: sessionID, reply: ch}).open
+}
+
 // EndSession ends sessionID. When the last session ends, the port stays mapped
 // only until the inactivity timeout (or the unrenewed lease), then closes.
 func (p *OnDemandPort) EndSession(sessionID string) {
@@ -870,11 +882,16 @@ func (p *OnDemandPort) loop() {
 				c.reply <- portReply{sessionID: id}
 
 			case opActivity:
+				// Activity and SessionActive share this op; the reply's open flag
+				// is the liveness answer the direct content gate consumes (the
+				// exported Activity ignores it).
 				if _, ok := sessions[c.sessionID]; ok {
 					now := p.clock.Now()
 					sessions[c.sessionID] = now
 					idleAt = now.Add(p.idleTimeout)
 					rearm()
+					c.reply <- portReply{open: true}
+					continue
 				}
 				c.reply <- portReply{}
 

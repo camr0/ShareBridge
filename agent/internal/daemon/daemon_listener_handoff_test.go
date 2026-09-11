@@ -476,6 +476,10 @@ func TestListenerHandoffDrainsOldServerRegistry(t *testing.T) {
 	}
 	waitDialable(t, ds.listenAddr)
 	oldServer := ds.server
+	// Direct content requires the on-demand port to be logically open; without
+	// this the registry-drain request would fail closed before recording its
+	// connection on the old server.
+	require.NoError(t, ds.port.OpenFor(fx.code, time.Minute))
 	conn := openRouteConn(t, ds, fx.origin, fx.code)
 
 	handoffDone := make(chan struct{})

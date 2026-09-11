@@ -3029,6 +3029,36 @@ func (d *Daemon) Unlock() error {
 	port := ds.port
 	ds.mu.Unlock()
 
+	// M4 closeout batch 2: an owned router mapping whose deletion is
+	// unresolved (close-failed) still forwards from the router to the
+	// listener, so it is a live direct path even though the port is not
+	// logically open. Unlock must not claim success — and must not perform any
+	// unlocked-success lifecycle action — while that mapping lingers: the
+	// direct content gate already fails closed, but a lingering owned mapping
+	// is a service-integrity failure that must be surfaced, not hidden behind a
+	// locked gate. CloseError is the port's record of an unresolved delete (set
+	// by every failed delete, cleared only by a successful one), and the port's
+	// ordinary Close RECLAIMS a close-failed mapping rather than merely
+	// observing it — reclaiming is what lets a retried Unlock recover once the
+	// router accepts the delete (its mapping lease expires or the router
+	// recovers). The call may wait at most one bounded router round trip
+	// (direct.RouterIOTimeout) behind an in-flight retry, holds no daemon lock,
+	// and is never reached by a wedged first delete (whose CloseError is still
+	// nil); the failure arm re-fences and reports, and no unlocked-success
+	// lifecycle action runs. Recovery needs no operator action: the port's own
+	// bounded retry schedule clears the mapping, and a retried Unlock then
+	// completes.
+	if port != nil && port.CloseError() != nil {
+		if closeErr := port.Close(); closeErr != nil {
+			ds.mu.Lock()
+			ds.restorePending = true
+			ds.mu.Unlock()
+			fenceDirectAdmission(port, gate, epoch)
+			log.Printf("unlock: refusing to restore direct service while an owned router mapping is unresolved: %v", closeErr)
+			return fmt.Errorf("unlock: owned direct mapping unresolved: %w", closeErr)
+		}
+	}
+
 	// Direct-open eligibility stays FENCED until the replacement listener is
 	// confirmed serving (remediation finding 1). Publishing the unlocked
 	// generation and opening the SignalGate BEFORE the ordered handoff meant a

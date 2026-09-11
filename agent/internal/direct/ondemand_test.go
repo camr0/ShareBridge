@@ -31,6 +31,14 @@ type fakeClock struct {
 	now    time.Time
 	timers []*fakeTimer
 
+	// armed is signalled (non-blocking, buffered cap 1) on every NewTimer call,
+	// i.e. every time the state loop installs a timer. Tests gate a clock
+	// advance on it so an advance can never race the loop's re-arm: the
+	// delete-retry tests used to advance again while the loop was still between
+	// tryDelete and rearm, which made the next advance fire nothing and the test
+	// flake under cross-package load. It is test machinery only.
+	armed chan struct{}
+
 	// nowEntered/nowRelease are a one-shot gate: while armed, the next Now()
 	// call signals entry on nowEntered and blocks until nowRelease is closed.
 	// It lets a test publish a generation transition in the window between a
@@ -40,7 +48,9 @@ type fakeClock struct {
 	nowRelease chan struct{}
 }
 
-func newFakeClock(start time.Time) *fakeClock { return &fakeClock{now: start} }
+func newFakeClock(start time.Time) *fakeClock {
+	return &fakeClock{now: start, armed: make(chan struct{}, 1)}
+}
 
 func (f *fakeClock) Now() time.Time {
 	f.mu.Lock()
@@ -65,10 +75,86 @@ func (f *fakeClock) gateNextNow(entered, release chan struct{}) {
 
 func (f *fakeClock) NewTimer(d time.Duration) portTimer {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	t := &fakeTimer{c: make(chan time.Time, 1), at: f.now.Add(d)}
 	f.timers = append(f.timers, t)
+	armed := f.armed
+	f.mu.Unlock()
+	if armed != nil {
+		select {
+		case armed <- struct{}{}:
+		default:
+		}
+	}
 	return t
+}
+
+// drainArmed removes any pending timer-armed signal so a subsequent
+// advanceGated observes only the re-arm caused by its own fire.
+func (f *fakeClock) drainArmed() {
+	for {
+		select {
+		case <-f.armed:
+		default:
+			return
+		}
+	}
+}
+
+// advanceGated advances the fake clock by d to fire the timer the state loop
+// has armed and blocks until the loop has either installed its next timer or
+// reached the terminal state signalled by done (which may be nil). Both waits
+// are channel-gated, so the advance cannot race the loop's re-arm.
+func (f *fakeClock) advanceGated(t *testing.T, d time.Duration, done <-chan struct{}) {
+	t.Helper()
+	f.drainArmed()
+	f.advance(d)
+	select {
+	case <-f.armed:
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("state loop neither re-armed nor reached the terminal state after advancing %s", d)
+	}
+}
+
+// channelClosed reports whether ch is already closed (non-blocking).
+func channelClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// stateSignal returns a channel closed the first time p transitions into the
+// given state. It must be installed before the transition of interest; it is
+// used to gate a clock advance on a terminal transition (a close that stops
+// retrying and never re-arms).
+func stateSignal(p *OnDemandPort, want PortState) <-chan struct{} {
+	ch := make(chan struct{})
+	var once sync.Once
+	p.SetTransitionCallback(func(_, next PortState, _ int) {
+		if next == want {
+			once.Do(func() { close(ch) })
+		}
+	})
+	return ch
+}
+
+// escalateCloseFailure drives p's delete-retry timer to StateCloseFailed,
+// gating every advance on the loop having re-armed the next retry (or reached
+// the terminal transition). p must already be in the retrying close state.
+func escalateCloseFailure(t *testing.T, fc *fakeClock, failed <-chan struct{}) {
+	t.Helper()
+	for i := 0; i < maxCloseAttempts; i++ {
+		if channelClosed(failed) {
+			return
+		}
+		fc.advanceGated(t, closeRetryDelay+time.Millisecond, failed)
+	}
+	if !channelClosed(failed) {
+		t.Fatalf("close did not escalate to StateCloseFailed")
+	}
 }
 
 // advance moves time forward and fires every non-stopped timer whose deadline
@@ -377,6 +463,7 @@ func TestOnDemandPort_CloseRetriesThenSucceeds(t *testing.T) {
 	fc := newFakeClock(time.Unix(1_700_000_000, 0))
 	rm := &recordingMapper{delFails: 2}
 	p := newTestPort(fc, rm, time.Minute)
+	settled := stateSignal(p, StateClosed)
 
 	if err := p.OpenFor("share-1", time.Minute); err != nil {
 		t.Fatalf("OpenFor: %v", err)
@@ -384,10 +471,19 @@ func TestOnDemandPort_CloseRetriesThenSucceeds(t *testing.T) {
 	if err := p.Close(); !errors.Is(err, ErrDeleteRetry) {
 		t.Fatalf("want ErrDeleteRetry, got %v", err)
 	}
-	fc.advance(closeRetryDelay + time.Millisecond)
-	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= 2 })
-	fc.advance(closeRetryDelay + time.Millisecond)
-	waitFor(t, func() bool { return p.CloseError() == nil })
+	// Attempt 2 fails; the advance is gated on the loop re-arming.
+	fc.advanceGated(t, closeRetryDelay+time.Millisecond, settled)
+	if _, _, d, _ := rm.snapshot(); d != 2 {
+		t.Fatalf("delete attempts = %d, want 2", d)
+	}
+	// Attempt 3 succeeds → StateClosed; the gate observes the transition.
+	fc.advanceGated(t, closeRetryDelay+time.Millisecond, settled)
+	if !channelClosed(settled) {
+		t.Fatalf("port did not reach StateClosed after the retries")
+	}
+	if p.CloseError() != nil {
+		t.Fatalf("CloseError = %v, want nil after a successful retry", p.CloseError())
+	}
 	_, closed, _, _ := rm.snapshot()
 	if closed != 1 {
 		t.Fatalf("closed = %d, want 1", closed)
@@ -398,6 +494,7 @@ func TestOnDemandPort_CloseEscalatesAfterMaxAttempts(t *testing.T) {
 	fc := newFakeClock(time.Unix(1_700_000_000, 0))
 	rm := &recordingMapper{alwaysFailDel: true}
 	p := newTestPort(fc, rm, time.Minute)
+	failed := stateSignal(p, StateCloseFailed)
 
 	if err := p.OpenFor("share-1", time.Minute); err != nil {
 		t.Fatalf("OpenFor: %v", err)
@@ -405,17 +502,12 @@ func TestOnDemandPort_CloseEscalatesAfterMaxAttempts(t *testing.T) {
 	if err := p.Close(); !errors.Is(err, ErrDeleteRetry) {
 		t.Fatalf("want ErrDeleteRetry, got %v", err)
 	}
-	for i := 0; i < maxCloseAttempts; i++ {
-		fc.advance(closeRetryDelay + time.Millisecond)
-		// Yield to the single state-loop goroutine so it processes the fired
-		// retry timer and re-arms the next one before the clock advances
-		// again. The final tick fires no timer (escalation disarms), so the
-		// wait is capped at maxCloseAttempts.
-		waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= i+2 || d >= maxCloseAttempts })
-	}
-	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= maxCloseAttempts })
+	escalateCloseFailure(t, fc, failed)
 	if p.CloseError() == nil {
 		t.Fatalf("CloseError must be non-nil after escalation")
+	}
+	if _, _, d, _ := rm.snapshot(); d < maxCloseAttempts {
+		t.Fatalf("delete attempts = %d, want >= %d", d, maxCloseAttempts)
 	}
 }
 
@@ -433,8 +525,10 @@ func TestOnDemandPort_OpenForFailureDuringCloseKeepsRetrying(t *testing.T) {
 	if err := p.Close(); !errors.Is(err, ErrDeleteRetry) {
 		t.Fatalf("want ErrDeleteRetry, got %v", err)
 	}
-	fc.advance(closeRetryDelay + time.Millisecond)
-	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= 2 })
+	fc.advanceGated(t, closeRetryDelay+time.Millisecond, nil)
+	if _, _, d, _ := rm.snapshot(); d < 2 {
+		t.Fatalf("delete attempts = %d, want >= 2", d)
+	}
 
 	// Now a reopen fails to add the mapping. The buggy code cleared `closing`
 	// BEFORE AddPortMapping, so on failure the armed delete-retry timer was
@@ -451,17 +545,20 @@ func TestOnDemandPort_OpenForFailureDuringCloseKeepsRetrying(t *testing.T) {
 	}
 
 	_, _, base, _ := rm.snapshot()
-	fc.advance(closeRetryDelay + time.Millisecond)
-	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d > base })
+	fc.advanceGated(t, closeRetryDelay+time.Millisecond, nil)
 	_, _, after, _ := rm.snapshot()
 	if after <= base {
 		t.Fatalf("delete retry did not fire after failed OpenFor: delCalls %d -> %d", base, after)
 	}
 
 	// And it keeps firing on the next tick, proving the retry is re-armed and
-	// not a one-off.
-	fc.advance(closeRetryDelay + time.Millisecond)
-	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d > after })
+	// not a one-off. That tick is the fifth failed attempt, so the loop
+	// escalates instead of re-arming; the terminal transition is the gate.
+	failed := stateSignal(p, StateCloseFailed)
+	fc.advanceGated(t, closeRetryDelay+time.Millisecond, failed)
+	if _, _, d, _ := rm.snapshot(); d <= after {
+		t.Fatalf("delete retry did not re-arm: delCalls %d -> %d", after, d)
+	}
 }
 
 func TestOpenForFastPathRenewsOnlyWhenLeaseTooShort(t *testing.T) {
@@ -507,11 +604,7 @@ func TestColdOpenCleansLingeringMapping(t *testing.T) {
 		t.Fatalf("Close: want ErrDeleteRetry, got %v", err)
 	}
 	// Drive the delete-retry timer to escalation (close-failed).
-	for i := 0; i < maxCloseAttempts; i++ {
-		fc.advance(closeRetryDelay + time.Millisecond)
-		waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= i+2 || d >= maxCloseAttempts })
-	}
-	waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= maxCloseAttempts })
+	escalateCloseFailure(t, fc, stateSignal(p, StateCloseFailed))
 	if got := p.State(); got != StateCloseFailed {
 		t.Fatalf("State = %v, want StateCloseFailed", got)
 	}
@@ -642,7 +735,14 @@ func TestOnDemandPort_StateCloseFailedTransition(t *testing.T) {
 	defer p.Close()
 
 	rec := &transitionRecorder{}
-	p.SetTransitionCallback(rec.cb)
+	failed := make(chan struct{})
+	var once sync.Once
+	p.SetTransitionCallback(func(old, new PortState, granted int) {
+		rec.cb(old, new, granted)
+		if new == StateCloseFailed {
+			once.Do(func() { close(failed) })
+		}
+	})
 
 	if err := p.OpenFor("share-1", time.Minute); err != nil {
 		t.Fatalf("OpenFor: %v", err)
@@ -654,11 +754,7 @@ func TestOnDemandPort_StateCloseFailedTransition(t *testing.T) {
 		t.Fatalf("State = %v, want StateClosing while retrying", p.State())
 	}
 	// Drive the delete-retry timer to escalation (close-failed).
-	for i := 0; i < maxCloseAttempts; i++ {
-		fc.advance(closeRetryDelay + time.Millisecond)
-		waitFor(t, func() bool { _, _, d, _ := rm.snapshot(); return d >= i+2 || d >= maxCloseAttempts })
-	}
-	waitFor(t, func() bool { return p.State() == StateCloseFailed })
+	escalateCloseFailure(t, fc, failed)
 
 	assertTransitions(t, rec.snapshot(), []stateTransition{
 		{StateClosed, StateOpen, 52000},
