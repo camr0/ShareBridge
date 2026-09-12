@@ -83,6 +83,137 @@ func TestDiscardOpenMappingForCreatedRollsBack(t *testing.T) {
 	}
 }
 
+// TestDiscardOpenMappingForCreatorAfterJoinIsNoOp is the M5 remediation R1
+// fix-round finding: "created the mapping" is necessary but not sufficient for
+// a rollback. A recipient that joined the SAME mapping instance after the
+// creation is another owner, so the creator is no longer the sole owner and
+// its failed open must not clear the mapping, its logical-open state, its
+// session or its holds. This is the concurrent interleaving the daemon cannot
+// order: with the mapping already created, another recipient's open commits on
+// the state loop while the creator is still blocked in report confirmation.
+func TestDiscardOpenMappingForCreatorAfterJoinIsNoOp(t *testing.T) {
+	fc := newFakeClock(time.Now())
+	p := newTestPort(fc, &recordingMapper{}, time.Minute)
+	defer p.Close()
+
+	creator, err := p.OpenForIfTracked("share", time.Minute, 0)
+	if err != nil {
+		t.Fatalf("creator open: %v", err)
+	}
+	if !creator.Created() {
+		t.Fatalf("the first open must be the creator")
+	}
+
+	// A second recipient joins the SAME instance while the creator is still in
+	// report confirmation: its open commits, its report is confirmed (the
+	// OK-ack commit succeeds), and it starts a stream.
+	joiner, err := p.OpenForIfTracked("share", 30*time.Second, 0)
+	if err != nil {
+		t.Fatalf("join open: %v", err)
+	}
+	if joiner.Created() {
+		t.Fatalf("the second open must not report created=true")
+	}
+	if joiner.Instance() != creator.Instance() {
+		t.Fatalf("the join must be on the creator's instance %d, got %d", creator.Instance(), joiner.Instance())
+	}
+	if _, ok := p.CommitOpenAck(0); !ok {
+		t.Fatalf("the joining recipient's OK-ack commit must be authorized")
+	}
+	sess, err := p.BeginSession("share")
+	if err != nil {
+		t.Fatalf("BeginSession: %v", err)
+	}
+	hold := p.Begin()
+	if hold == 0 {
+		t.Fatalf("Begin returned the zero token on an open port")
+	}
+
+	// The creator's report now fails and it rolls back. It is no longer the sole
+	// owner, so the rollback must be a no-op: the joining recipient (and its
+	// stream) must survive.
+	if err := p.DiscardOpenMappingFor(creator); err != nil {
+		t.Fatalf("creator rollback after a join must be a nil no-op, got %v", err)
+	}
+	if !p.Open() {
+		t.Fatalf("the creator's failure discarded a mapping another recipient joined")
+	}
+	if !p.SessionActive(sess) {
+		t.Fatalf("the creator's failure cleared the joining recipient's session")
+	}
+	if got := p.Begin(); got != hold {
+		t.Fatalf("the creator's failure cleared the joining recipient's holds (epoch %d, want %d)", got, hold)
+	}
+}
+
+// TestDiscardOpenMappingForCreatorAfterRecipientRenewalIsNoOp pins the
+// ownership counter to the state loop's own join/renewal decisions: a
+// recipient whose longer lease extends the mapping's lease is an owner too, so
+// the creator's later failure must not remove the instance it renewed.
+func TestDiscardOpenMappingForCreatorAfterRecipientRenewalIsNoOp(t *testing.T) {
+	fc := newFakeClock(time.Now())
+	p := newTestPort(fc, &recordingMapper{}, time.Minute)
+	defer p.Close()
+
+	creator, err := p.OpenForIfTracked("share", time.Minute, 0)
+	if err != nil {
+		t.Fatalf("creator open: %v", err)
+	}
+	// A longer lease takes the renewal branch, writing the mapping again.
+	if _, err := p.OpenForIfTracked("share", 5*time.Minute, 0); err != nil {
+		t.Fatalf("recipient renewal: %v", err)
+	}
+	if err := p.DiscardOpenMappingFor(creator); err != nil {
+		t.Fatalf("creator rollback after a renewal must be a nil no-op, got %v", err)
+	}
+	if !p.Open() {
+		t.Fatalf("the creator's failure discarded a mapping a recipient renewed")
+	}
+}
+
+// TestJoinCounterResetsWithANewMappingInstance proves the ownership counter is
+// per-instance, not a monotonic port-global: a join on a discarded instance
+// must not make the NEXT instance's creator look non-sole, otherwise the
+// genuine created-open rollback would be disabled forever.
+func TestJoinCounterResetsWithANewMappingInstance(t *testing.T) {
+	fc := newFakeClock(time.Now())
+	p := newTestPort(fc, &recordingMapper{}, time.Minute)
+	defer p.Close()
+
+	first, err := p.OpenForIfTracked("share", time.Minute, 0)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if _, err := p.OpenForIfTracked("share", time.Minute, 0); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if err := p.DiscardOpenMappingFor(first); err != nil {
+		t.Fatalf("joined creator rollback: %v", err)
+	}
+
+	// A lockdown close removes the instance; the next creation is a fresh
+	// instance whose creator is the sole owner again.
+	if err := p.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	second, err := p.OpenForIfTracked("share", time.Minute, 0)
+	if err != nil {
+		t.Fatalf("second creation: %v", err)
+	}
+	if !second.Created() {
+		t.Fatalf("the post-close open must be a creation")
+	}
+	if second.Instance() == first.Instance() {
+		t.Fatalf("a replacement mapping must be a distinct instance")
+	}
+	if err := p.DiscardOpenMappingFor(second); err != nil {
+		t.Fatalf("the new instance's creator rollback must be allowed: %v", err)
+	}
+	if p.Open() {
+		t.Fatalf("the new instance's creator rollback must discard it")
+	}
+}
+
 // TestDiscardOpenMappingForJoinedIsNoOp is the audit's port-level root cause: a
 // later open that joined an already-open mapping must NOT clear the owner's
 // logical-open state (or its sessions) when it rolls back.

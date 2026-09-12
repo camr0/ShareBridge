@@ -106,7 +106,12 @@ type portReply struct {
 	// instance is the mapping-instance identity in effect at a successful
 	// opOpenFor commit (see OpenOutcome.Instance).
 	instance uint64
-	state    PortState
+	// joins is the instance's join/ownership count at that commit (see
+	// OpenOutcome.Joins): the successful recipient opens on the instance after
+	// its creation. It is captured so the creator's rollback can require that
+	// it is still the sole owner of the instance.
+	joins uint64
+	state PortState
 }
 
 type portCommand struct {
@@ -126,11 +131,13 @@ type portCommand struct {
 	fenced bool
 	gen    uint64
 
-	// created/instance are the ownership identity of opDiscardOpenOwned (see
-	// DiscardOpenMappingFor): the open created the mapping, and the mapping
-	// instance it committed to.
+	// created/instance/joins are the ownership identity of opDiscardOpenOwned
+	// (see DiscardOpenMappingFor): the open created the mapping, the mapping
+	// instance it committed to, and that instance's join/ownership count when
+	// this open committed.
 	created  bool
 	instance uint64
+	joins    uint64
 }
 
 // OnDemandPort manages a public port that is closed by default and opened only
@@ -304,21 +311,32 @@ func (p *OnDemandPort) Generation() (epoch uint64, locked bool) {
 //
 //   - gen is the §13.4 direct-state generation the open was admitted under (the
 //     daemon's openEpoch);
+//
 //   - instance is the port's monotonically increasing mapping-instance
 //     identity, assigned when the mapping was CREATED and stable across every
 //     renewal and join. It is deliberately NOT the generation: every open in
 //     one unlocked epoch shares that generation, which is exactly why a
 //     generation alone cannot identify "the mapping this open owns";
+//
 //   - created reports whether THIS operation created the mapping (a cold open)
 //     as opposed to joining or renewing one that already existed.
 //
-// An unsuccessful open's rollback must use created and instance
+//   - joins is the mapping instance's join/ownership count when this open
+//     committed: the number of successful recipient opens that landed on this
+//     instance after its creation (zero for the open that created it). A
+//     creator's rollback requires it unchanged, so a creator that another
+//     recipient has since joined — or whose longer lease a recipient has
+//     renewed — is no longer the sole owner and must not discard the mapping.
+//
+// An unsuccessful open's rollback must use created, instance and joins
 // (DiscardOpenMappingFor): a joined open must never clear the owner's mapping,
-// and even within one generation a created mapping's stale rollback must not
-// touch a replacement instance.
+// a created mapping's stale rollback must not touch a replacement instance,
+// and a creator must not discard an instance another recipient has since
+// joined.
 type OpenOutcome struct {
 	gen      uint64
 	instance uint64
+	joins    uint64
 	created  bool
 }
 
@@ -327,6 +345,11 @@ func (o OpenOutcome) Generation() uint64 { return o.gen }
 
 // Instance returns the mapping-instance identity the open committed to.
 func (o OpenOutcome) Instance() uint64 { return o.instance }
+
+// Joins returns the mapping instance's join/ownership count at the commit
+// (see OpenOutcome.Joins). It is zero for the open that created the mapping and
+// is the value the creator's rollback requires to be unchanged.
+func (o OpenOutcome) Joins() uint64 { return o.joins }
 
 // Created reports whether the open created the mapping rather than joining or
 // renewing an existing one.
@@ -386,7 +409,7 @@ func (p *OnDemandPort) openFor(shareID string, lease time.Duration, fenced bool,
 	// false only when the operation cold-opened (created) the mapping. It
 	// cannot be confused by a concurrent open, because the loop evaluates it
 	// inside the operation it answers.
-	return OpenOutcome{gen: gen, instance: r.instance, created: !r.wasOpen}, nil
+	return OpenOutcome{gen: gen, instance: r.instance, joins: r.joins, created: !r.wasOpen}, nil
 }
 
 // OpenAckCommit is the port's authorization to emit a successful (status "ok")
@@ -471,19 +494,28 @@ func (p *OnDemandPort) DiscardOpenMapping(gen uint64) error {
 //   - the mapping's instance still equals o.instance: the mapping this open
 //     committed to is still the published one. A same-generation REPLACEMENT
 //     mapping (a newer creation) shares o.gen and is never touched.
+//   - the mapping instance's join/ownership count still equals o.joins: no
+//     recipient has successfully joined (or renewed) this instance since this
+//     open created it, so this open is STILL THE SOLE OWNER. A recipient whose
+//     open committed on the state loop while this creator was still blocked in
+//     report confirmation is another owner: the creator's failure is
+//     unsuccessful for its own request, but it must not clear the mapping, its
+//     logical-open state, sessions or holds (the post-M5 concurrent-open
+//     availability finding).
 //   - the mapping is still owned by o.gen (openGen == o.gen): a §13.4
 //     supersession that moved the mapping to a newer generation makes this a
 //     no-op, exactly like DiscardOpenMapping.
 //
 // Otherwise it is a nil no-op (the mapping is already gone, another recipient
-// owns it, or a newer generation owns it). It RETURNS the immediate deletion
-// error when the router refused the delete — the mapping is then handed to the
-// port's close-retry timer and escalates via StateCloseFailed/CloseError — and
-// nil when the logical rollback completed. A repeat call is a nil no-op.
+// owns it, this open is no longer its sole owner, or a newer generation owns
+// it). It RETURNS the immediate deletion error when the router refused the
+// delete — the mapping is then handed to the port's close-retry timer and
+// escalates via StateCloseFailed/CloseError — and nil when the logical
+// rollback completed. A repeat call is a nil no-op.
 func (p *OnDemandPort) DiscardOpenMappingFor(o OpenOutcome) error {
 	ch := make(chan portReply, 1)
 	return p.send(portCommand{
-		op: opDiscardOpenOwned, gen: o.gen, instance: o.instance, created: o.created, reply: ch,
+		op: opDiscardOpenOwned, gen: o.gen, instance: o.instance, joins: o.joins, created: o.created, reply: ch,
 	}).err
 }
 
@@ -611,6 +643,7 @@ func (p *OnDemandPort) loop() {
 		openFenced  bool   // mapping was opened by a generation-fenced OpenForIf
 		openGen     uint64 // the generation stamp that opened the current mapping
 		epoch       uint64 // bumped on each open; hold tokens bind to this epoch
+		joins       uint64 // successful recipient opens onto the current instance after creation
 		seq         uint64
 		timer       portTimer
 		timerC      <-chan time.Time
@@ -803,11 +836,24 @@ func (p *OnDemandPort) loop() {
 			return false
 		}
 		publish()
+		if wasOpen && c.reply != nil {
+			// A recipient open that landed on an existing mapping instance is an
+			// established owner of it: the creator is no longer its sole owner, so
+			// the creator's later failure must not discard the instance (see
+			// DiscardOpenMappingFor). The autonomous renewal (c.reply == nil) is
+			// the port keeping its own mapping alive, not a recipient, so it does
+			// not count. The increment runs on the single state loop inside this
+			// command, so it is atomic with respect to the creator's rollback
+			// command: whichever the loop processes first decides, and a join that
+			// committed first is always visible to a later rollback.
+			joins++
+		}
 		if c.reply != nil {
 			// epoch is the mapping-instance identity: it advances only inside a
 			// cold open's publish (below), so it identifies exactly which mapping
-			// instance this under-ackMu commit handed over.
-			c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: wasOpen, instance: epoch}
+			// instance this under-ackMu commit handed over. joins is the
+			// instance's ownership count at the same commit.
+			c.reply <- portReply{err: nil, open: true, granted: grantedPort, wasOpen: wasOpen, instance: epoch, joins: joins}
 		}
 		return true
 	}
@@ -884,7 +930,8 @@ func (p *OnDemandPort) loop() {
 						open = true
 						openFenced = c.fenced
 						openGen = c.gen
-						epoch++ // new open epoch: hold tokens from a prior open can no longer match
+						epoch++   // new open epoch: hold tokens from a prior open can no longer match
+						joins = 0 // a new mapping instance starts with no joining recipients
 						closing = false
 						closeFail = 0
 						renewFailed = false
@@ -1092,12 +1139,14 @@ func (p *OnDemandPort) loop() {
 
 			case opDiscardOpenOwned:
 				// Ownership-scoped rollback: only a mapping THIS open created, still
-				// at the same mapping instance. A joined open's failure (created ==
-				// false) and a same-generation replacement (instance mismatch) are
-				// both nil no-ops, so an unsuccessful open cannot tear down another
-				// recipient's healthy mapping — the post-M5 availability finding.
+				// at the same mapping instance, and still in the same sole-ownership
+				// state. A joined open's failure (created == false), a
+				// same-generation replacement (instance mismatch) and a creator that
+				// another recipient has since joined (join count changed) are all nil
+				// no-ops, so an unsuccessful open cannot tear down another
+				// recipient's healthy mapping — the post-M5 availability findings.
 				var discardErr error
-				if c.created && open && openGen == c.gen && epoch == c.instance {
+				if c.created && open && openGen == c.gen && epoch == c.instance && joins == c.joins {
 					discardErr = discardFencedMapping(true)
 				}
 				c.reply <- portReply{err: discardErr}

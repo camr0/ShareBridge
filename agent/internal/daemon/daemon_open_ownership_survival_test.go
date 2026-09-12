@@ -90,7 +90,7 @@ func (c *openOwnershipClient) OpenAck(ctx context.Context, ack signaling.OpenAck
 type ownershipFixture struct {
 	daemon   *Daemon
 	client   *openOwnershipClient
-	mapper   *remapDirectMapper
+	mapper   direct.PortMapper
 	port     *direct.OnDemandPort
 	reporter *direct.Reporter
 }
@@ -321,4 +321,341 @@ func TestNoRegressionLaterJoinKeepsHealthyMappingAndSessions(t *testing.T) {
 		t.Fatalf("ok open_ack count = %d, want A's and the join's", n)
 	}
 	f.assertRecipientASurvives(t, sess, hold, granted)
+}
+
+// --- M5 remediation R1 fix round: concurrent-open sole ownership ---
+//
+// The sequential cases above all pass with only "did THIS open create the
+// mapping" as the discriminator. The concurrent case does not: while recipient
+// A's cold open is still in report confirmation (A created the instance but has
+// not completed), a recipient B can join the SAME instance, confirm its own
+// report, be acked OK and start a stream. If A then fails, A is no longer the
+// mapping's sole owner, so A's rollback must be a no-op.
+//
+// The window is real because the daemon's open path has no ordering that keeps
+// a slow creator ahead of a faster joiner: A can be descheduled anywhere
+// between OpenForIfTracked returning and confirmOpenEndpoint completing, and a
+// concurrent handler completes B's entire open in that window. The tests below
+// gate that window open deterministically: A's endpoint-report send is held
+// (the Reporter's single drain serializes sends, so no later report can be
+// delivered while A holds it), the state loop stays free to admit B, and only
+// then is A released to fail.
+
+// gateOpenOwnershipClient blocks the FIRST endpoint report send (recipient A's
+// cold open) until release is closed, then returns errs[0]; later sends return
+// errs[i] (or succeed) without blocking. Holding the first send holds the
+// Reporter's single drain, which is exactly the production window in which A
+// has created the mapping but not completed its confirmation.
+type gateOpenOwnershipClient struct {
+	*openOwnershipClient
+
+	mu      sync.Mutex
+	calls   int
+	errs    []error
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *gateOpenOwnershipClient) ReportEndpoint(ctx context.Context, ip string, port int, status string) error {
+	c.mu.Lock()
+	idx := c.calls
+	c.calls++
+	var err error
+	if idx < len(c.errs) {
+		err = c.errs[idx]
+	}
+	c.mu.Unlock()
+
+	if idx == 0 {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+		<-c.release
+	}
+	if err != nil {
+		return err
+	}
+	return c.openOwnershipClient.ReportEndpoint(ctx, ip, port, status)
+}
+
+// signalMapper is the daemon's remap fixture mapper with an observable write
+// counter: every successful AddPortMapping publishes on writes (never
+// blocking), so a test can order a concurrent recipient's renewal-path open
+// commit (which writes the mapping on the state loop) against the creator's
+// report failure. A non-renewal join writes nothing, so tests that need a
+// non-renewal joiner establish it on the port directly.
+type signalMapper struct {
+	*remapDirectMapper
+	writes chan struct{}
+}
+
+func (m *signalMapper) AddPortMapping(ext, internal int, desc string, lease int) (int, error) {
+	granted, err := m.remapDirectMapper.AddPortMapping(ext, internal, desc, lease)
+	if err == nil {
+		select {
+		case m.writes <- struct{}{}:
+		default:
+		}
+	}
+	return granted, err
+}
+
+// gateOwnershipFixture is the ownership fixture with a gated report transport
+// and an observable mapping-write signal. reportTimeout is raised so a held
+// report cannot turn into the bounded confirmation timeout under a slow CI
+// machine; the gate, not the clock, is the ordering.
+type gateOwnershipFixture struct {
+	*ownershipFixture
+	gate   *gateOpenOwnershipClient
+	writes chan struct{}
+}
+
+func newGateOwnershipFixture(t *testing.T, granted int, errs ...error) *gateOwnershipFixture {
+	t.Helper()
+	cfg := &config.Config{SignalingURL: "ws://localhost:8080", APIKey: "test-key"}
+	st := newMockStore()
+	mapper := &signalMapper{remapDirectMapper: newRemapDirectMapper(granted), writes: make(chan struct{}, 8)}
+	base := &openOwnershipClient{
+		mockSignalingClient: newMockSignalingClient(cfg.SignalingURL, cfg.APIKey, st.GetAgentID()),
+	}
+	gate := &gateOpenOwnershipClient{
+		openOwnershipClient: base,
+		entered:             make(chan struct{}, 1),
+		release:             make(chan struct{}),
+		errs:                errs,
+	}
+	port := direct.NewOnDemandPortOwned(mapper, 443, 8443, time.Minute, "test", "192.168.1.20")
+	reporter := direct.NewReporter(func(ctx context.Context, ip string, port int, status string) error {
+		return gate.ReportEndpoint(ctx, ip, port, status)
+	})
+	port.SetTransitionCallback(reporter.OnTransition)
+
+	d := &Daemon{
+		store:     st,
+		signaling: gate,
+		direct: &directState{
+			ready:         true,
+			gate:          direct.NewSignalGate(st.GetAgentID(), func(string, direct.RouteKind) bool { return true }),
+			port:          port,
+			mapper:        mapper,
+			reporter:      reporter,
+			reportTimeout: 30 * time.Second,
+		},
+	}
+	t.Cleanup(func() {
+		_ = port.Close()
+		reporter.Close()
+	})
+	return &gateOwnershipFixture{
+		ownershipFixture: &ownershipFixture{daemon: d, client: base, mapper: mapper, port: port, reporter: reporter},
+		gate:             gate,
+		writes:           mapper.writes,
+	}
+}
+
+// startBlockedCreatorA starts recipient A's cold open in a goroutine and waits
+// until A is held inside report confirmation, so the caller knows A created the
+// mapping but has not completed. It returns A's handler-completion channel.
+func (f *gateOwnershipFixture) startBlockedCreatorA(t *testing.T) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.daemon.handleOpenSignal(openSignalMessageLease(1, "nonce-A", 600))
+	}()
+	awaitRecv(t, f.gate.entered, "recipient A's endpoint report entering confirmation")
+	if !f.port.Open() {
+		t.Fatalf("recipient A's cold open did not create the mapping")
+	}
+	awaitRecv(t, f.writes, "recipient A's cold-open mapping write")
+	return done
+}
+
+// TestConcurrentJoinSurvivesCreatorReportFailure is the audit's exact
+// concurrent scenario: A's cold open creates the mapping and blocks in report
+// confirmation; B joins the SAME instance, confirms its report (its OK-ack
+// commit is authorized by the production OK-ack writer, ackOpenSuccess), and
+// starts a stream; then A's report fails. A must get its error ack, and B's
+// mapping, logical-open state, session, hold and stream must all survive.
+func TestConcurrentJoinSurvivesCreatorReportFailure(t *testing.T) {
+	f := newGateOwnershipFixture(t, 52411, errors.New("recipient A's report send failed"))
+
+	aDone := f.startBlockedCreatorA(t)
+
+	// B joins the instance A created while A is still blocked. B's report is
+	// confirmed (CommitOpenAck is the report-confirmed success authorization)
+	// and B's OK open_ack is emitted by the production writer.
+	bJoin, err := f.port.OpenForIfTracked("SHARE123", 30*time.Second, 0)
+	if err != nil {
+		t.Fatalf("recipient B's join: %v", err)
+	}
+	if bJoin.Created() {
+		t.Fatalf("recipient B's open must be a join on A's mapping instance")
+	}
+	if !f.daemon.ackOpenSuccess(openSignalMessageAt(2, "nonce-B-ack"), f.daemon.direct, bJoin, "203.0.113.7") {
+		t.Fatalf("recipient B's report-confirmed OK open_ack was refused")
+	}
+	sess, err := f.port.BeginSession("SHARE123")
+	if err != nil {
+		t.Fatalf("recipient B's BeginSession: %v", err)
+	}
+	hold := f.port.Begin()
+	if hold == 0 {
+		t.Fatalf("recipient B's Begin returned the zero hold token on an open port")
+	}
+	granted := f.port.GrantedPort()
+
+	// A's report now fails and A rolls back.
+	close(f.gate.release)
+	<-aDone
+
+	if !f.client.hasSentMessage("open_ack", map[string]any{"status": "error", "error": "open_failed"}) {
+		t.Fatalf("recipient A's failed report must get an open_failed error ack, got %#v", f.client.messagesSnapshot())
+	}
+	if n := countOpenAcks(f.client.messagesSnapshot(), "ok"); n != 1 {
+		t.Fatalf("ok open_ack count = %d, want exactly recipient B's", n)
+	}
+	f.assertRecipientASurvives(t, sess, hold, granted)
+}
+
+// TestConcurrentRenewalOpenSurvivesCreatorReportFailure drives recipient B
+// through the full daemon open path while A is blocked. B's longer lease makes
+// its write on the state loop observable, so the test can wait for B's committed
+// open before releasing A — the audit's ordering (B established before A
+// resumes). B's report send queues behind A's on the Reporter's FIFO and
+// completes once A is released.
+func TestConcurrentRenewalOpenSurvivesCreatorReportFailure(t *testing.T) {
+	f := newGateOwnershipFixture(t, 52412, errors.New("recipient A's report send failed"))
+
+	aDone := f.startBlockedCreatorA(t)
+
+	bDone := make(chan struct{})
+	go func() {
+		defer close(bDone)
+		f.daemon.handleOpenSignal(openSignalMessageLease(2, "nonce-B", 900))
+	}()
+	awaitRecv(t, f.writes, "recipient B's renewal mapping write")
+
+	// B's open has committed on the state loop; A's report now fails.
+	close(f.gate.release)
+	<-aDone
+	<-bDone
+
+	if !f.client.hasSentMessage("open_ack", map[string]any{"status": "ok", "was_already_open": true}) {
+		t.Fatalf("recipient B's join must be acked OK with was_already_open=true, got %#v", f.client.messagesSnapshot())
+	}
+	if !f.client.hasSentMessage("open_ack", map[string]any{"status": "error", "error": "open_failed"}) {
+		t.Fatalf("recipient A's failed report must get an open_failed error ack, got %#v", f.client.messagesSnapshot())
+	}
+	if n := countOpenAcks(f.client.messagesSnapshot(), "ok"); n != 1 {
+		t.Fatalf("ok open_ack count = %d, want exactly recipient B's", n)
+	}
+	if !f.port.Open() {
+		t.Fatalf("recipient A's failure tore down the mapping recipient B had renewed")
+	}
+	sess, err := f.port.BeginSession("SHARE123")
+	if err != nil {
+		t.Fatalf("BeginSession after A's failure: %v", err)
+	}
+	hold := f.port.Begin()
+	f.assertRecipientASurvives(t, sess, hold, f.port.GrantedPort())
+}
+
+// TestConcurrentJoinFailureThenCreatorFailureLeavesNoHalfState is the
+// orthogonal variant: B joins the instance but B's own report fails too, so no
+// recipient ever completed. A's later failure may then act on the mapping, but
+// because B's committed open is ownership the fail-safe outcome is a single,
+// coherent lingering mapping (logical-open, one router mapping, no sessions or
+// holds) — never a half-torn-down one. Both failing requests still get error
+// acks and no OK ack is emitted.
+func TestConcurrentJoinFailureThenCreatorFailureLeavesNoHalfState(t *testing.T) {
+	f := newGateOwnershipFixture(t, 52413,
+		errors.New("recipient A's report send failed"),
+		errors.New("recipient B's report send failed"),
+	)
+
+	aDone := f.startBlockedCreatorA(t)
+
+	bDone := make(chan struct{})
+	go func() {
+		defer close(bDone)
+		f.daemon.handleOpenSignal(openSignalMessageLease(2, "nonce-B", 900))
+	}()
+	awaitRecv(t, f.writes, "recipient B's renewal mapping write")
+
+	close(f.gate.release)
+	<-aDone
+	<-bDone
+
+	if n := countOpenAcks(f.client.messagesSnapshot(), "ok"); n != 0 {
+		t.Fatalf("no OK open_ack is expected for two failed opens, got %#v", f.client.messagesSnapshot())
+	}
+	if n := countOpenAcks(f.client.messagesSnapshot(), "error"); n != 2 {
+		t.Fatalf("both unsuccessful opens must get error acks, got %#v", f.client.messagesSnapshot())
+	}
+	if !f.port.Open() {
+		t.Fatalf("recipient A's failure discarded an instance recipient B had joined")
+	}
+	if got := f.port.State(); got != direct.StateOpen {
+		t.Fatalf("port state = %v, want StateOpen", got)
+	}
+	listing, err := f.mapper.ListPortMappings()
+	if err != nil {
+		t.Fatalf("ListPortMappings: %v", err)
+	}
+	if len(listing) != 1 {
+		t.Fatalf("%d mapping(s) survived, want exactly the lingering one: %#v", len(listing), listing)
+	}
+	// The lingering mapping is usable and coherent: a fresh stream can begin on
+	// it (the port has no half-cleared session state).
+	if _, err := f.port.BeginSession("SHARE123"); err != nil {
+		t.Fatalf("BeginSession on the lingering mapping: %v", err)
+	}
+	if hold := f.port.Begin(); hold == 0 {
+		t.Fatalf("Begin returned the zero hold token on the lingering open port")
+	}
+}
+
+// TestConcurrentCreatedOpenFailureWithNoJoinDiscardsMapping preserves the
+// genuine rollback for an UNSHARED created mapping under the same blocked
+// creator: with nobody else having joined, A is still the sole owner and its
+// failed report must still discard the mapping.
+func TestConcurrentCreatedOpenFailureWithNoJoinDiscardsMapping(t *testing.T) {
+	f := newGateOwnershipFixture(t, 52414, errors.New("recipient A's report send failed"))
+
+	aDone := f.startBlockedCreatorA(t)
+	close(f.gate.release)
+	<-aDone
+
+	f.assertFailedOpenRolledBack(t)
+}
+
+// TestJoinAfterCreatorFailureCreatesFreshMapping is the second orthogonal
+// variant: A fails and discards FIRST (it is still the sole owner), and a later
+// recipient's open then cold-creates a fresh mapping and is acked OK with
+// was_already_open=false.
+func TestJoinAfterCreatorFailureCreatesFreshMapping(t *testing.T) {
+	f := newGateOwnershipFixture(t, 52415, errors.New("recipient A's report send failed"))
+
+	aDone := f.startBlockedCreatorA(t)
+	close(f.gate.release)
+	<-aDone
+	f.assertFailedOpenRolledBack(t)
+
+	f.daemon.handleOpenSignal(openSignalMessageLease(2, "nonce-B", 600))
+
+	if !f.client.hasSentMessage("open_ack", map[string]any{"status": "ok", "was_already_open": false}) {
+		t.Fatalf("the post-discard open must be acked OK as a fresh cold open, got %#v", f.client.messagesSnapshot())
+	}
+	if !f.port.Open() {
+		t.Fatalf("the post-discard open did not create a fresh mapping")
+	}
+	listing, err := f.mapper.ListPortMappings()
+	if err != nil {
+		t.Fatalf("ListPortMappings: %v", err)
+	}
+	if len(listing) != 1 {
+		t.Fatalf("%d mapping(s), want exactly the fresh one: %#v", len(listing), listing)
+	}
 }
