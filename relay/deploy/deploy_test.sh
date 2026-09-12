@@ -12,7 +12,7 @@
 # Usage:  bash relay/deploy/deploy_test.sh
 # Exit:   0 = every assertion passed (GREEN); 1 = at least one failed (RED).
 #
-# The assertion IDs (A1…A15) are referenced by the Task 35 report so each
+# The assertion IDs (A1…A16) are referenced by the Task 35 report so each
 # published hardening claim maps to the check that enforces it. A3/A4/A6/A15
 # are strict-parsing assertions: a duplicate, redefined or extra directive is a
 # failure, never silently ignored, and A12/A13 prove their properties by
@@ -105,6 +105,42 @@ require_eq() {
     pass
   else
     fail "$3 (got '$1', want '$2')"
+  fi
+}
+
+# shell_var_values <file> <NAME> — every non-comment `NAME=<value>` (or
+# `export NAME=<value>`) assignment in a shell file, printing the value with one
+# layer of matching single/double quotes stripped. Used to cross-check the
+# installer's account/library constants against the units: a rename in
+# install.sh must fail the gate even though the units are checked separately.
+shell_var_values() {
+  local raw
+  while IFS= read -r raw; do
+    [[ -z "$raw" ]] && continue
+    case "$raw" in
+      \"*\") raw="${raw#\"}"; raw="${raw%\"}" ;;
+      \'*\') raw="${raw#\'}"; raw="${raw%\'}" ;;
+    esac
+    printf '%s\n' "$raw"
+  done < <(parsed_lines "$1" \
+    | grep -E "^[[:space:]]*(export[[:space:]]+)?$2=" \
+    | sed -E "s/^[[:space:]]*(export[[:space:]]+)?$2=//")
+}
+
+# require_shell_var <file> <NAME> <expected> <description> — the installer must
+# assign NAME exactly once and to exactly the expected value. A second,
+# countermanding assignment (a later `GATEWAY_USER=daemon`) is a failure, never
+# a silently-used override.
+require_shell_var() {
+  local count value
+  count="$(shell_var_values "$1" "$2" | grep -c . || true)"
+  value="$(shell_var_values "$1" "$2" | head -n 1)"
+  if [[ "$count" != "1" ]]; then
+    fail "$4 ($1 assigns $2 ${count}x; exactly one is required)"
+  elif [[ "$value" != "$3" ]]; then
+    fail "$4 ($1 has $2='$value', want '$3')"
+  else
+    pass
   fi
 }
 
@@ -536,11 +572,38 @@ if [[ ! -f "$gateway_unit" || ! -f "$frps_unit" || ! -f "$firewall" || ! -f "$in
   exit 1
 fi
 
-printf -- '-- A2: distinct unprivileged service users\n'
+printf -- '-- A2: exact dedicated service identities and accounts (pinned, not properties)\n'
+# The deployment property is not "non-root, non-nobody, distinct": it is that
+# each unit names exactly the dedicated account the installer creates, and that
+# the account is the one the rest of the deployment assumes. The gateway
+# account owns /var/lib/sharebridge-relay-gateway and reads the gateway's
+# systemd credentials; the frps account owns /var/lib/sharebridge-relay-frps.
+# Neither service may run as a shared/generic host account (root, nobody,
+# daemon, www-data, ...): running the gateway as a generic account would let it
+# reach the frps state (or the host) with rights it was never granted, and vice
+# versa. The expected values below are the single source of truth for the
+# installer cross-check, so neither side can be renamed alone.
+EXPECTED_GATEWAY_ACCOUNT="sharebridge-relay-gateway"
+EXPECTED_FRPS_ACCOUNT="sharebridge-relay-frps"
+EXPECTED_LIB_DIR="/usr/local/lib/sharebridge/relay"
 gateway_user="$(unit_field_one "$gateway_unit" User)"
 frps_user="$(unit_field_one "$frps_unit" User)"
-if [[ -z "$gateway_user" ]]; then fail "gateway unit has no User="; else pass; fi
-if [[ -z "$frps_user" ]]; then fail "frps unit has no User="; else pass; fi
+require_unit_scalar "$gateway_unit" User "$EXPECTED_GATEWAY_ACCOUNT" \
+  "gateway must run as the dedicated sharebridge-relay-gateway account"
+require_unit_scalar "$gateway_unit" Group "$EXPECTED_GATEWAY_ACCOUNT" \
+  "gateway must run in its matching sharebridge-relay-gateway group"
+require_unit_scalar "$frps_unit" User "$EXPECTED_FRPS_ACCOUNT" \
+  "frps must run as the dedicated sharebridge-relay-frps account"
+require_unit_scalar "$frps_unit" Group "$EXPECTED_FRPS_ACCOUNT" \
+  "frps must run in its matching sharebridge-relay-frps group"
+# A further identity directive would override or add to the pinned pair.
+for unit in "$gateway_unit" "$frps_unit"; do
+  require_not_contains "$unit" '^[[:space:]]*(DynamicUser|SupplementaryGroups)=' \
+    "$unit must not override its pinned identity with an implicit/extra identity directive"
+done
+# Defence in depth: keep the weak-property checks too, so a future edit that
+# loosens the exact pin to a property still cannot name root/nobody/a shared
+# account. (With the pins above these pass whenever the pin passes.)
 if [[ "$gateway_user" == "root" || "$frps_user" == "root" ]]; then
   fail "services must not run as root (gateway='$gateway_user' frps='$frps_user')"
 else
@@ -553,11 +616,58 @@ else
 fi
 require_eq "$([[ "$gateway_user" != "$frps_user" ]] && echo distinct)" "distinct" \
   "gateway and frps must run as distinct users"
-# install.sh creates both accounts as system (loginless) users and must
-# actually invoke the creation helper for each configured account name.
-require_parsed_contains "$install_sh" 'useradd[[:space:]]+--system' "installer must create system accounts"
-require_parsed_contains "$install_sh" 'create_service_user[[:space:]]+"\$GATEWAY_USER"' "installer must create the gateway user"
-require_parsed_contains "$install_sh" 'create_service_user[[:space:]]+"\$FRPS_USER"' "installer must create the frps user"
+# install.sh must create exactly the two accounts the units name, as system
+# (loginless) users with a matching dedicated group, and must own each service
+# state directory with that account. A rename on either side fails: the units'
+# User=/Group= are pinned above and the installer's constants are pinned here.
+require_shell_var "$install_sh" GATEWAY_USER "$EXPECTED_GATEWAY_ACCOUNT" \
+  "installer must create the gateway account the unit runs as"
+require_shell_var "$install_sh" FRPS_USER "$EXPECTED_FRPS_ACCOUNT" \
+  "installer must create the frps account the unit runs as"
+require_shell_var "$install_sh" LIB_DIR "$EXPECTED_LIB_DIR" \
+  "installer must install the service binaries where the units execute them"
+require_unique_function_def "$install_sh" create_service_user \
+  "the service-account creator must be defined exactly once"
+require_eq "$(parsed_lines "$install_sh" | grep -cE '^[[:space:]]*useradd([[:space:]]|$)')" "1" \
+  "installer must invoke useradd exactly once (a single account-creation path)"
+require_parsed_contains "$install_sh" \
+  '^[[:space:]]*useradd[[:space:]]+--system[[:space:]]+--user-group[[:space:]]+--no-create-home[[:space:]]+--home-dir[[:space:]]+/nonexistent[[:space:]]+--shell[[:space:]]+/usr/sbin/nologin[[:space:]]+"\$name"[[:space:]]*$' \
+  "create_service_user must create a --system loginless account with a matching group"
+require_parsed_contains "$install_sh" '^[[:space:]]*create_service_user[[:space:]]+"\$GATEWAY_USER"[[:space:]]*$' \
+  "installer must create the gateway account via the pinned constant"
+require_parsed_contains "$install_sh" '^[[:space:]]*create_service_user[[:space:]]+"\$FRPS_USER"[[:space:]]*$' \
+  "installer must create the frps account via the pinned constant"
+require_eq "$(parsed_lines "$install_sh" | grep -cE '^[[:space:]]*create_service_user[[:space:]]+')" "2" \
+  "installer must create exactly the two pinned service accounts"
+require_parsed_contains "$install_sh" \
+  'install[[:space:]]+-d[[:space:]]+-o[[:space:]]+"\$GATEWAY_USER"[[:space:]]+-g[[:space:]]+"\$GATEWAY_USER"[[:space:]]+-m[[:space:]]+0700[[:space:]]+/var/lib/sharebridge-relay-gateway' \
+  "installer must own the gateway state directory by the pinned dedicated account/group"
+require_parsed_contains "$install_sh" \
+  'install[[:space:]]+-d[[:space:]]+-o[[:space:]]+"\$FRPS_USER"[[:space:]]+-g[[:space:]]+"\$FRPS_USER"[[:space:]]+-m[[:space:]]+0700[[:space:]]+/var/lib/sharebridge-relay-frps' \
+  "installer must own the frps state directory by the pinned dedicated account/group"
+unit_accounts="$(printf '%s\n' "$gateway_user" "$frps_user" | sort -u | tr '\n' ' ')"
+installer_accounts="$( { shell_var_values "$install_sh" GATEWAY_USER; shell_var_values "$install_sh" FRPS_USER; } | sort -u | tr '\n' ' ')"
+require_eq "$unit_accounts" "$installer_accounts" \
+  "the units' User= accounts must be exactly the accounts install.sh creates"
+
+printf -- '-- A16: exact ExecStart command lines (binary path and argument vector)\n'
+# The gate must pin the exact command each unit runs, not merely "some non-empty
+# command that is not a shell": a service that starts as /bin/true, or that
+# executes the other service's binary, is a nonfunctional service the gate must
+# reject. frps additionally MUST be given its credential-directory config flag
+# (-c ${CREDENTIALS_DIRECTORY}/frps-config); without it frps starts with no
+# transport configuration. The binaries named here are the artifacts install.sh
+# installs at ${LIB_DIR} (cross-checked below), so the unit and the installer
+# cannot drift apart.
+require_unit_scalar "$gateway_unit" ExecStart "${EXPECTED_LIB_DIR}/gateway" \
+  "gateway ExecStart must be exactly the installed gateway binary with no arguments"
+require_unit_scalar "$frps_unit" ExecStart \
+  "${EXPECTED_LIB_DIR}/frps -c \${CREDENTIALS_DIRECTORY}/frps-config" \
+  "frps ExecStart must be exactly the installed frps binary with its credential config flag"
+require_parsed_contains "$install_sh" '"\$\{LIB_DIR\}/gateway"' \
+  "installer must install the gateway binary at the path the unit executes"
+require_parsed_contains "$install_sh" '"\$\{LIB_DIR\}/frps"' \
+  "installer must install the frps binary at the path the unit executes"
 
 printf -- '-- A3: root-owned 0600 secrets and root config\n'
 require_parsed_contains "$install_sh" 'install[[:space:]]+-o[[:space:]]+root[[:space:]]+-g[[:space:]]+root[[:space:]]+-m[[:space:]]+0?600' \

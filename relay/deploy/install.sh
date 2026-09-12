@@ -117,7 +117,10 @@ create_service_user() {
     log "user ${name} already exists"
     return 0
   fi
-  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$name"
+  # --user-group creates the matching dedicated group: the units' Group= and
+  # the state-directory ownership below (-g "$name") both require it, and a
+  # shared group would let the other service reach this service's state.
+  useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$name"
   log "created system user ${name}"
 }
 
