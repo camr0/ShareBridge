@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -130,19 +131,66 @@ func ParseChallenge(version int, challengeField string, server string, expiresAt
 }
 
 // validateServerField checks the wire `server` value syntactically: a
-// bounded host:port with a usable port. Name resolution stays in Exchange so
-// parse-time validation is deterministic.
+// bounded host:port with a usable port and a well-formed host. Name
+// resolution stays in Exchange so parse-time validation is deterministic.
 func validateServerField(server string) error {
 	if server == "" || len(server) > 253+6 {
 		return fmt.Errorf("%w: server field length out of range", ErrMalformedChallenge)
 	}
-	_, portText, err := net.SplitHostPort(server)
+	host, portText, err := net.SplitHostPort(server)
 	if err != nil {
 		return fmt.Errorf("%w: server is not host:port", ErrMalformedChallenge)
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil || port <= 0 || port > 65535 {
 		return fmt.Errorf("%w: server port out of range", ErrMalformedChallenge)
+	}
+	return validateServerHost(host)
+}
+
+// validateServerHost pins the host half of the §10.1 contract shared with
+// control's STUNAdvertise: either an IPv4 literal, or an RFC 1123 hostname
+// whose labels are 1-63 bytes of ASCII letters/digits with interior hyphens
+// only (no leading or trailing hyphen) and whose total length is at most 253
+// bytes. The direct path is IPv4-only (§10.3), so an IPv6 literal fails
+// closed exactly as control's validator refuses to advertise one. An empty
+// host, a trailing dot, and a double dot all fail closed here.
+func validateServerHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("%w: server host is empty", ErrMalformedChallenge)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !ip.Is4() {
+			return fmt.Errorf("%w: server host is not an IPv4 literal", ErrMalformedChallenge)
+		}
+		return nil
+	}
+	if len(host) > 253 {
+		return fmt.Errorf("%w: server host too long", ErrMalformedChallenge)
+	}
+	for _, label := range strings.Split(host, ".") {
+		if err := validateServerLabel(label); err != nil {
+			return fmt.Errorf("%w: invalid server host label %q", ErrMalformedChallenge, label)
+		}
+	}
+	return nil
+}
+
+// validateServerLabel enforces one RFC 1123 label: 1-63 bytes of ASCII
+// letters, digits, and interior hyphens.
+func validateServerLabel(label string) error {
+	if label == "" || len(label) > 63 {
+		return fmt.Errorf("label length %d outside 1..63", len(label))
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return errors.New("label has a leading or trailing hyphen")
+	}
+	for index := 0; index < len(label); index++ {
+		char := label[index]
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '-' {
+			return fmt.Errorf("label contains byte %#02x outside [A-Za-z0-9-]", char)
+		}
 	}
 	return nil
 }
