@@ -594,7 +594,7 @@ scripts/live-phase4a.sh --list
 scripts/live-phase4a.sh --dry-run
 
 # prove the pass/fail plumbing (trivially-true, trivially-false, skip,
-# zero-check, crash-after-PASS and placeholder cases)
+# zero-check, note-only, crash-after-PASS, placeholder, secret-detail cases)
 scripts/live-phase4a.sh --selftest
 
 # redirect evidence somewhere other than docs/operations/evidence/runs
@@ -609,9 +609,11 @@ error, `3` PARTIAL (no failures but at least one SKIP, or a dry run).
 gate that executes zero checks is `MISSING`, never PASS. A gate whose function
 exits non-zero after recording PASSes is `FAIL`. An unimplemented registered
 gate is `NOT_IMPLEMENTED`, never PASS. A `SKIP` sub-check makes the gate `SKIP`
-(PARTIAL overall). `--case` scoping may only narrow the verdict to the gates it
-ran; unselected gates are printed as `NOT_RUN` and explicitly excluded. The
-only GREEN is every selected gate PASS.
+(PARTIAL overall). A gate needs at least one measured, PASSing `check`: the
+`note()` helper is informational and cannot carry a verdict, so a note-only (or
+otherwise check-less) gate is `MISSING` and the run is RED. `--case` scoping may
+only narrow the verdict to the gates it ran; unselected gates are printed as
+`NOT_RUN` and explicitly excluded. The only GREEN is every selected gate PASS.
 
 **Safety.** Remote commands are read-only (`systemctl show/cat`, `nft list`,
 `ss`, `curl`, `dig`, `openssl s_client`, `ip addr`, `grep`); nothing is written
@@ -635,9 +637,12 @@ $ scripts/live-phase4a.sh --case gate_23_9_dark_topology   # today
 ```
 
 The dark-posture assertion is deliberately a separate check: a missing topology
-must never be masked, and `RELAY_SELECTION_ENABLED` is read from the control
-deployment (unset/absent counts as the default `false`; an unreadable env file
-fails the check instead of assuming the dark posture; `true` fails loudly).
+must never be masked, and `RELAY_SELECTION_ENABLED` is **observed** in the
+deployed control configuration — the running control process environment, an
+explicit unit `Environment=`, or the env file the unit loads (highest authority
+first). Absent means unobservable: the check FAILs rather than assuming the
+code default (`never assume the dark posture`), an unreadable config FAILs
+instead of assuming it, and an observed `true` fails loudly.
 
 ### 13.2 Environment surface
 
@@ -675,7 +680,7 @@ observation — never extrapolated.
 
 | Gate | Task | Proves | Needs |
 |---|---|---|---|
-| `gate_23_9_dark_topology` | 37 | §23.9: control reachable; a NEW relay VM distinct from control in the same Hetzner region/private network (metadata `instance-id`/`region` + private `/24`); home Mac agent and real Immich reachable; public allowlist exactly 443 + transport with `policy drop` and no public UDP; private mTLS `CONTROL_SYNC_*`/`SHAREBRIDGE_*` configured with a live authenticated handshake and enforced client auth; tunnel-host DNS (A/AAAA/no ECH) plus wildcard synthesis and dedicated transport-cert validation; `route_ready` snapshot health and frps process health; gateway-before-frps restart ordering with no `BindsTo`/`PartOf`; `RELAY_SELECTION_ENABLED` still false | second VM, DNS, mTLS material (operator) |
+| `gate_23_9_dark_topology` | 37 | §23.9: control reachable; a NEW relay VM distinct from control in the same Hetzner region/private network (metadata `instance-id`/`region` + private `/24`); home Mac agent and real Immich reachable; public allowlist exactly 443 + transport with `policy drop` and no public UDP; private mTLS `CONTROL_SYNC_*`/`SHAREBRIDGE_*` configured with a live authenticated handshake and enforced client auth; tunnel-host DNS (A/AAAA/no ECH) plus wildcard synthesis and dedicated transport-cert validation; `route_ready` snapshot health and frps process health; gateway-before-frps restart ordering with no `BindsTo`/`PartOf`; `RELAY_SELECTION_ENABLED` observed and still false | second VM, DNS, mTLS material (operator) |
 | `acceptance_01_owner_hairpin` | 38 | §19 #1 owner hairpin on the confirmed non-hairpin router | user (router, 3 browsers) |
 | `acceptance_04_interstitial_blackhole` | 38 | §19 #4 deterministic interstitial fallback to the exact relay origin | user (browser) |
 | `acceptance_02_cellular_relay_video` | 39 | §19 #2 cellular/no-direct gallery + video, ≥2 valid `206` seeks | user (phone, cellular) |

@@ -125,11 +125,13 @@ per-name DNS-only/ECH claim, not a zone-wide absence proof.
 
 | Field | Value |
 |---|---|
-| Observed `RELAY_SELECTION_ENABLED` in the control deployment | **PENDING** (must be `false` or absent/false-default; `true` is a FAIL) |
+| Observed `RELAY_SELECTION_ENABLED` in the control deployment | **PENDING** (must be observed as `false`; absent/unobservable is a FAIL, `true` is a FAIL) |
 
 A missing topology must never be masked by an enabled flag. The harness records
-the observed value; an unreadable env file fails the check rather than assuming
-the dark posture.
+the observed value from the deployed configuration — the running control
+process environment, an explicit unit `Environment=`, or the env file the unit
+loads (highest authority first). An absent or unreadable value fails the check
+rather than assuming the code default and the dark posture.
 
 ## 8. Gate evidence index
 

@@ -29,6 +29,9 @@
 #
 # HONESTY CONTRACT (the project has been bitten by skip-as-PASS twice):
 #   * A gate that executes no checks is MISSING, never PASS.
+#   * A gate needs at least one measured, PASSing `check`: note() output is
+#     informational and never a measurement. A note-only (or otherwise
+#     check-less) gate is MISSING, never PASS.
 #   * A gate whose function exits nonzero after recording only PASSes is FAIL.
 #   * A registered-but-unimplemented gate is NOT_IMPLEMENTED, never PASS.
 #   * A gate with any SKIP sub-check is SKIP, never PASS.
@@ -42,10 +45,10 @@
 #     dig, openssl s_client, ip addr, grep). Nothing is written remotely.
 #   * The only writes are local evidence files under the evidence directory.
 #   * The optional restart drill is off unless LIVE_PHASE4A_ALLOW_RESTART=1.
-#   * Secrets are never printed: every captured line passes through sanitize(),
-#     which redacts key/token/password/secret/cookie/authorization/jti values,
-#     private-key blocks and share codes. `--dry-run` prints variable NAMES,
-#     never values that look secret.
+#   * Secrets are never printed: every captured line and every check() detail
+#     passes through sanitize(), which redacts key/token/password/secret/
+#     cookie/authorization/jti values, private-key blocks and share codes.
+#     `--dry-run` prints variable NAMES, never values that look secret.
 #   * Idempotent: repeated runs only create new timestamped evidence records.
 #
 # THE M6 RELAY VM IS NOT THE COLLOCATED TEST VPS. The down test VPS
@@ -111,7 +114,9 @@
 set -u -o pipefail
 
 usage() {
-  sed -n '2,109p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Print the header comment block (everything after the shebang up to the
+  # first non-comment line), so the help text cannot drift from the file.
+  awk 'NR==1 { next } /^[^#]/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
   exit 0
 }
 
@@ -283,9 +288,13 @@ sha256_file() {
 
 check() {
   # check <check-name> <PASS|FAIL|SKIP|NOTE> <observed...>
+  # The detail is operator-visible evidence, so it passes through the same
+  # sanitiser as captured output: a value that looks like a secret is redacted
+  # in both the console line and the recorded check file.
   local cname="$1" verdict="$2"
   shift 2
-  local detail="$*"
+  local detail
+  detail="$(printf '%s' "$*" | sanitize)"
   if [[ -z "${GATE_CHECK_FILE:-}" ]]; then
     printf 'ERROR: check() called outside the gate runner\n' >&2
     return 1
@@ -460,6 +469,12 @@ execute_gate() {
   elif grep -q '^SKIP|' "$GATE_CHECK_FILE"; then
     EXECUTE_RESULT="SKIP"
     EXECUTE_DETAIL="$(grep '^SKIP|' "$GATE_CHECK_FILE" | head -n1 | cut -d'|' -f2)"
+  elif ! grep -q '^PASS|' "$GATE_CHECK_FILE"; then
+    # Notes are informational, not measurements: a PASS verdict requires at
+    # least one `check ... PASS`. A gate that emits only notes (or only notes
+    # and non-PASS checks that did not already decide the verdict) is MISSING.
+    EXECUTE_RESULT="MISSING"
+    EXECUTE_DETAIL="gate recorded $(grep -c '^NOTE|' "$GATE_CHECK_FILE") note(s) but zero measured PASS checks — refusing to report PASS"
   else
     EXECUTE_RESULT="PASS"
     EXECUTE_DETAIL="$(grep -c '^PASS|' "$GATE_CHECK_FILE") PASS check(s)"
@@ -1096,29 +1111,57 @@ gate_chk_restart_ordering() {
 }
 
 # --- 9. Dark posture: the selection flag remains false ----------------------
+# The flag must be OBSERVED in the deployed control configuration: the env file
+# the unit loads, an explicit unit Environment=, or the running control
+# process's own environment (authoritative). An absent flag FAILS — the code
+# default is not evidence of the deployed state, and the dark posture is never
+# assumed.
 gate_chk_selection_flag() {
   if ! need_cfg selection_flag_remains_false LIVE_PHASE4A_CONTROL_HOST "$CONTROL_HOST" "ssh target of the control VM (the flag lives in the control deployment)"; then
     return
   fi
-  local line value
-  line="$(remote_exec "$CONTROL_HOST" "if [ -f '$CONTROL_ENV_FILE' ]; then echo ENV_FILE_PRESENT; grep -E '^RELAY_SELECTION_ENABLED=' '$CONTROL_ENV_FILE' 2>/dev/null | tail -n1; else echo ENV_FILE_MISSING; fi")"
-  if printf '%s' "$line" | grep -q '^ENV_FILE_MISSING'; then
+  local probe procenv unitenv envfile value source
+  probe="$(remote_exec "$CONTROL_HOST" "if [ -f '$CONTROL_ENV_FILE' ]; then echo ENV_FILE_PRESENT; grep -E '^RELAY_SELECTION_ENABLED=' '$CONTROL_ENV_FILE' 2>/dev/null | tail -n1 | sed 's/^/ENVFILE:/'; else echo ENV_FILE_MISSING; fi
+systemctl show -p Environment --value $CONTROL_UNIT 2>/dev/null | tr ' ' '\n' | grep -E '^RELAY_SELECTION_ENABLED=' | tail -n1 | sed 's/^/UNITENV:/'
+pid=\$(systemctl show -p MainPID --value $CONTROL_UNIT 2>/dev/null)
+if [ -n \"\$pid\" ] && [ \"\$pid\" != 0 ] && [ -r \"/proc/\$pid/environ\" ]; then tr '\0' '\n' < \"/proc/\$pid/environ\" | grep -E '^RELAY_SELECTION_ENABLED=' | tail -n1 | sed 's/^/PROCENV:/'; echo PROCENV_READABLE; else echo PROCENV_UNREADABLE; fi
+echo PROBE_OK")"
+  if printf '%s' "$probe" | grep -q '^ENV_FILE_MISSING'; then
     set_fact selection_flag_observed "unverifiable (env file missing)"
     check selection_flag_remains_false FAIL "${CONTROL_ENV_FILE} not found on ${CONTROL_HOST} — cannot verify the dark posture (never assume it)"
     return
   fi
-  if ! printf '%s' "$line" | grep -q '^ENV_FILE_PRESENT'; then
+  if ! printf '%s' "$probe" | grep -q '^ENV_FILE_PRESENT' || ! printf '%s' "$probe" | grep -q '^PROBE_OK'; then
     set_fact selection_flag_observed "unverifiable (ssh/read failure)"
-    check selection_flag_remains_false FAIL "could not read ${CONTROL_ENV_FILE} on ${CONTROL_HOST} — cannot verify the dark posture"
+    check selection_flag_remains_false FAIL "could not read the deployed control configuration on ${CONTROL_HOST} — cannot verify the dark posture"
     return
   fi
-  value="$(env_value "$line" RELAY_SELECTION_ENABLED)"
-  set_fact selection_flag_observed "${value:-unset}"
+
+  # Precedence: what the running process actually uses > the unit's explicit
+  # Environment= > the env file the unit loads. Every source is observed.
+  procenv="$(printf '%s\n' "$probe" | sed -n 's/^PROCENV://p' | tail -n1)"
+  unitenv="$(printf '%s\n' "$probe" | sed -n 's/^UNITENV://p' | tail -n1)"
+  envfile="$(printf '%s\n' "$probe" | sed -n 's/^ENVFILE://p' | tail -n1)"
+  value=""; source=""
+  if [[ -n "$procenv" ]]; then
+    value="$(env_value "$procenv" RELAY_SELECTION_ENABLED)"; source="the running ${CONTROL_UNIT} process environment"
+  elif [[ -n "$unitenv" ]]; then
+    value="$(env_value "$unitenv" RELAY_SELECTION_ENABLED)"; source="the ${CONTROL_UNIT} unit Environment="
+  elif [[ -n "$envfile" ]]; then
+    value="$(env_value "$envfile" RELAY_SELECTION_ENABLED)"; source="the deployed env file ${CONTROL_ENV_FILE}"
+  fi
+
+  if [[ -z "$source" ]]; then
+    set_fact selection_flag_observed "not observed"
+    check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED was not observed in the deployed control configuration (env file ${CONTROL_ENV_FILE}, ${CONTROL_UNIT} unit Environment=, or the running process environment on ${CONTROL_HOST}) — cannot verify the dark posture (never assume the code default)"
+    return
+  fi
+  set_fact selection_flag_observed "${value:-<empty>} (${source})"
   case "$value" in
-    false) check selection_flag_remains_false PASS "RELAY_SELECTION_ENABLED=false in ${CONTROL_ENV_FILE} (dark posture held)" ;;
-    "")    check selection_flag_remains_false PASS "RELAY_SELECTION_ENABLED absent from ${CONTROL_ENV_FILE} -> control default false (dark posture held)" ;;
-    true)  check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED=true — production selection is ON; the dark posture is violated and a missing topology would be masked" ;;
-    *)     check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED='${value}' is not a boolean — cannot verify the dark posture" ;;
+    false) check selection_flag_remains_false PASS "RELAY_SELECTION_ENABLED=false observed in ${source} (dark posture held)" ;;
+    "")    check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED is set but empty in ${source} — cannot verify the dark posture (never assume it)" ;;
+    true)  check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED=true observed in ${source} — production selection is ON; the dark posture is violated and a missing topology would be masked" ;;
+    *)     check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED='${value}' observed in ${source} is not a boolean — cannot verify the dark posture" ;;
   esac
 }
 
@@ -1175,6 +1218,14 @@ _selftest_empty() { :; }
 _selftest_notimpl() { gate_not_implemented "selftest" "a not-implemented gate"; }
 _selftest_crash() { check selftest_check PASS "recorded before crashing"; return 7; }
 
+# A gate that emits only note() must never pass: notes are informational, a
+# PASS verdict requires at least one measured `check ... PASS`.
+_selftest_note_only() { note selftest_note "an informational note with no measured check"; }
+# Notes do not invalidate a gate that really measured a passing check.
+_selftest_note_and_pass() { note selftest_note "an informational note"; check selftest_check PASS "a measured passing check"; }
+# Secret-shaped wording in a check() detail must be redacted everywhere.
+_selftest_secret() { check selftest_secret PASS "observed token=SUPERSECRETTOKEN123456 api_key=ABCDEFGHIJKLMNOP for /s/SECRETSHARE99"; }
+
 run_selftest() {
   local failures=0 got verdict
   printf '=== live-phase4a.sh selftest (pass/fail plumbing) ===\n'
@@ -1186,6 +1237,25 @@ run_selftest() {
   execute_gate _selftest_notimpl; selftest_check "placeholder gate is NOT_IMPLEMENTED" "$EXECUTE_RESULT" "NOT_IMPLEMENTED" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
   execute_gate _selftest_crash;   selftest_check "gate that records PASS then crashes is FAIL" "$EXECUTE_RESULT" "FAIL" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
   execute_gate does_not_exist;    selftest_check "unregistered function is MISSING" "$EXECUTE_RESULT" "MISSING" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate _selftest_note_only; selftest_check "note-only gate is MISSING (never PASS)" "$EXECUTE_RESULT" "MISSING" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate _selftest_note_and_pass; selftest_check "notes plus a measured PASS stay PASS" "$EXECUTE_RESULT" "PASS" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+
+  # B2 negative test: a secret-shaped check() detail must come out redacted in
+  # BOTH the console output and the recorded (evidence) check file. Capture the
+  # gate's stdout to a file so EXECUTE_TMP stays visible in this shell.
+  local secret_out_file secret_out secret_checks
+  secret_out_file="$(mktemp)"
+  execute_gate _selftest_secret > "$secret_out_file"
+  secret_out="$(cat "$secret_out_file")"
+  secret_checks="$(cat "$EXECUTE_TMP/checks")"
+  rm -rf "$EXECUTE_TMP"; rm -f "$secret_out_file"
+  got="redacted"
+  printf '%s\n%s' "$secret_out" "$secret_checks" | grep -qE 'SUPERSECRETTOKEN123456|ABCDEFGHIJKLMNOP|SECRETSHARE99' && got="raw secret leaked"
+  selftest_check "check() detail has no raw secret (console + evidence)" "$got" "redacted" || failures=$((failures + 1))
+  got="redacted"
+  printf '%s' "$secret_out" | grep -q 'REDACTED' || got="console detail not redacted"
+  printf '%s' "$secret_checks" | grep -q 'REDACTED' || got="recorded detail not redacted"
+  selftest_check "check() detail carries a redaction marker (console + evidence)" "$got" "redacted" || failures=$((failures + 1))
 
   got="$(verdict_for "PASS,")";                 selftest_check "verdict(all PASS)" "$got" "GREEN" || failures=$((failures + 1))
   got="$(verdict_for "PASS,FAIL,")";            selftest_check "verdict(FAIL present)" "$got" "RED" || failures=$((failures + 1))
@@ -1194,7 +1264,7 @@ run_selftest() {
   got="$(verdict_for "PASS,MISSING,")";         selftest_check "verdict(unrun/missing)" "$got" "RED" || failures=$((failures + 1))
 
   if [[ "$failures" -eq 0 ]]; then
-    printf 'SELFTEST RESULT: PASS (0 failures) — the gate runner refuses PASS for unexecuted, skipped, crashing or unimplemented gates\n'
+    printf 'SELFTEST RESULT: PASS (0 failures) — the gate runner refuses PASS for unexecuted, note-only, skipped, crashing or unimplemented gates\n'
     exit 0
   fi
   printf 'SELFTEST RESULT: FAIL (%d assertions failed) — the harness plumbing is broken\n' "$failures"
