@@ -1,0 +1,376 @@
+// Command gwharness is the gateway half of the cross-module control-sync
+// integration test. It is NOT a production binary: the integration test
+// copies this file into a throwaway module whose path ("sharebridge/relay/
+// ...") lets it import the gateway's internal controlsync package, then
+// builds and drives it over stdin/stdout.
+//
+// The harness constructs the REAL gateway types — controlsync.NewClient,
+// NewApplier, NewLoop, and NewPresencePublisher — and exposes a tiny JSON
+// line protocol so the test can drive reconcile/presence passes and read the
+// health truths back. It reads the sync material from environment variables
+// (paths only; no secret is ever printed) and writes ONLY protocol JSON to
+// stdout: all diagnostics go to stderr.
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	"sharebridge/relay/internal/controlsync"
+	"sharebridge/relay/internal/routes"
+)
+
+// presenceEntry is one test-controlled authoritative tunnel lease. The lease
+// expiry is expressed as an offset from the harness's (fake) clock so the
+// test can advance time deterministically without sleeping.
+type presenceEntry struct {
+	AgentRecordID string `json:"agent_record_id"`
+	RelayPort     int    `json:"relay_port"`
+	Generation    uint64 `json:"generation"`
+	LeaseOffsetMS int64  `json:"lease_offset_ms"`
+}
+
+type presenceSource struct {
+	mu       sync.Mutex
+	bootID   string
+	revision uint64
+	entries  []presenceEntry
+	now      *fakeClock
+	// calls counts PresenceSnapshot reads; because PresencePublisher calls
+	// the source exactly once per PublishOnce (explicit or loop-driven), it
+	// is the observable proof that the RUNNING republish loop is ticking.
+	calls int
+}
+
+func (source *presenceSource) PresenceSnapshot() (string, uint64, []controlsync.PresenceSnapshotEntry) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.calls++
+	now := source.now.Now()
+	entries := make([]controlsync.PresenceSnapshotEntry, 0, len(source.entries))
+	for _, entry := range source.entries {
+		entries = append(entries, controlsync.PresenceSnapshotEntry{
+			AgentRecordID:  entry.AgentRecordID,
+			RelayPort:      entry.RelayPort,
+			Generation:     entry.Generation,
+			LeaseExpiresAt: now.Add(time.Duration(entry.LeaseOffsetMS) * time.Millisecond),
+		})
+	}
+	return source.bootID, source.revision, entries
+}
+
+func (source *presenceSource) setEntries(entries []presenceEntry) {
+	source.mu.Lock()
+	source.entries = entries
+	source.mu.Unlock()
+}
+
+func (source *presenceSource) snapshotCalls() int {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	return source.calls
+}
+
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (clock *fakeClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *fakeClock) Advance(delta time.Duration) {
+	clock.mu.Lock()
+	clock.now = clock.now.Add(delta)
+	clock.mu.Unlock()
+}
+
+type healthSink struct {
+	mu     sync.Mutex
+	ready  bool
+	synced bool
+}
+
+func (health *healthSink) SetSnapshotReady(ready bool) {
+	health.mu.Lock()
+	health.ready = ready
+	health.mu.Unlock()
+}
+
+func (health *healthSink) SetControlSynced(synced bool) {
+	health.mu.Lock()
+	health.synced = synced
+	health.mu.Unlock()
+}
+
+func (health *healthSink) truths() (bool, bool) {
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	return health.ready, health.synced
+}
+
+type harnessConfig struct {
+	baseURL           string
+	serverSAN         string
+	serverCAFile      string
+	clientCertFile    string
+	clientKeyFile     string
+	bootID            string
+	namespace         string
+	presenceInterval  time.Duration
+	presenceAutostart bool
+	clockBase         time.Time
+}
+
+func loadConfig() (harnessConfig, error) {
+	var config harnessConfig
+	config.baseURL = os.Getenv("GW_BASE_URL")
+	config.serverSAN = os.Getenv("GW_SERVER_SAN")
+	config.serverCAFile = os.Getenv("GW_SERVER_CA_FILE")
+	config.clientCertFile = os.Getenv("GW_CLIENT_CERT_FILE")
+	config.clientKeyFile = os.Getenv("GW_CLIENT_KEY_FILE")
+	config.bootID = os.Getenv("GW_BOOT_ID")
+	config.namespace = os.Getenv("GW_NAMESPACE")
+	intervalMS, err := strconv.ParseInt(os.Getenv("GW_PRESENCE_INTERVAL_MS"), 10, 64)
+	if err != nil {
+		return harnessConfig{}, fmt.Errorf("GW_PRESENCE_INTERVAL_MS: %w", err)
+	}
+	config.presenceInterval = time.Duration(intervalMS) * time.Millisecond
+	config.presenceAutostart = os.Getenv("GW_PRESENCE_AUTOSTART") != "0"
+	base, err := time.Parse(time.RFC3339, os.Getenv("GW_CLOCK_BASE"))
+	if err != nil {
+		return harnessConfig{}, fmt.Errorf("GW_CLOCK_BASE: %w", err)
+	}
+	config.clockBase = base
+	for name, value := range map[string]string{
+		"GW_BASE_URL": config.baseURL, "GW_SERVER_SAN": config.serverSAN,
+		"GW_SERVER_CA_FILE": config.serverCAFile, "GW_CLIENT_CERT_FILE": config.clientCertFile,
+		"GW_CLIENT_KEY_FILE": config.clientKeyFile, "GW_BOOT_ID": config.bootID,
+		"GW_NAMESPACE": config.namespace,
+	} {
+		if value == "" {
+			return harnessConfig{}, fmt.Errorf("%s is required", name)
+		}
+	}
+	return config, nil
+}
+
+// harnessRequest is one driver command. Only the fields relevant to Cmd are
+// read; the test never sends credential material or bodies.
+type harnessRequest struct {
+	Cmd      string          `json:"cmd"`
+	MS       int64           `json:"ms"`
+	Entries  []presenceEntry `json:"entries"`
+	Revision uint64          `json:"revision"`
+	Events   []eventRequest  `json:"events"`
+	Epoch    uint64          `json:"epoch"`
+}
+
+type eventRequest struct {
+	AgentRecordID string `json:"agent_record_id"`
+	RelayPort     int    `json:"relay_port"`
+	Generation    uint64 `json:"generation"`
+	State         string `json:"state"`
+	LeaseOffsetMS int64  `json:"lease_offset_ms"`
+}
+
+// harnessResponse carries the post-command gateway state plus any bounded
+// error string. It never carries payload bodies.
+type harnessResponse struct {
+	OK              bool   `json:"ok"`
+	Error           string `json:"error,omitempty"`
+	Ready           bool   `json:"ready"`
+	Synced          bool   `json:"synced"`
+	Healthy         bool   `json:"healthy"`
+	AppliedEpoch    uint64 `json:"applied_epoch"`
+	AppliedRevision uint64 `json:"applied_revision"`
+	Routes          int    `json:"routes"`
+	PublishCount    int    `json:"publish_count"`
+}
+type harness struct {
+	config    harnessConfig
+	client    *controlsync.Client
+	table     *routes.Table
+	applier   *controlsync.Applier
+	loop      *controlsync.Loop
+	source    *presenceSource
+	publisher *controlsync.PresencePublisher
+	health    *healthSink
+	clock     *fakeClock
+}
+
+func (harness *harness) state() harnessResponse {
+	ready, synced := harness.health.truths()
+	return harnessResponse{
+		OK:              true,
+		Ready:           ready,
+		Synced:          synced,
+		Healthy:         harness.applier.ControlSyncHealthy(),
+		AppliedEpoch:    harness.applier.AppliedEpoch(),
+		AppliedRevision: harness.applier.LastAppliedRevision(),
+		Routes:          harness.table.Len(),
+		PublishCount:    harness.source.snapshotCalls(),
+	}
+}
+
+func (harness *harness) publishPresence(ctx context.Context) error {
+	return harness.publisher.PublishOnce(ctx)
+}
+
+func (harness *harness) publishEvents(ctx context.Context, revision uint64, events []eventRequest) error {
+	converted := make([]controlsync.PresenceEvent, 0, len(events))
+	for _, event := range events {
+		presenceEvent := controlsync.PresenceEvent{
+			GatewayBootID: harness.config.bootID,
+			Revision:      revision,
+			AgentRecordID: event.AgentRecordID,
+			RelayPort:     event.RelayPort,
+			Generation:    event.Generation,
+			State:         event.State,
+		}
+		if event.State == controlsync.PresenceStateOnline {
+			presenceEvent.LeaseExpiresAt = harness.clock.Now().
+				Add(time.Duration(event.LeaseOffsetMS) * time.Millisecond).UTC().Format(time.RFC3339)
+		}
+		converted = append(converted, presenceEvent)
+	}
+	return harness.client.PublishPresenceEvents(ctx, controlsync.PresenceEnvelope{
+		Version: controlsync.ProtocolVersion,
+		Events:  converted,
+	})
+}
+
+func (harness *harness) handle(ctx context.Context, request harnessRequest) harnessResponse {
+	response := harnessResponse{}
+	var err error
+	switch request.Cmd {
+	case "state":
+	case "reconcile":
+		err = harness.loop.ReconcileOnce(ctx)
+	case "advance_clock":
+		harness.clock.Advance(time.Duration(request.MS) * time.Millisecond)
+	case "set_presence":
+		harness.source.setEntries(request.Entries)
+	case "publish_presence":
+		err = harness.publishPresence(ctx)
+	case "publish_events":
+		err = harness.publishEvents(ctx, request.Revision, request.Events)
+	case "quit":
+		response = harness.state()
+		if err != nil {
+			response.OK, response.Error = false, err.Error()
+		}
+		return response
+	default:
+		err = fmt.Errorf("unknown command %q", request.Cmd)
+	}
+	response = harness.state()
+	if err != nil {
+		response.OK = false
+		response.Error = err.Error()
+	}
+	return response
+}
+
+func main() {
+	config, err := loadConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gwharness: config:", err)
+		os.Exit(2)
+	}
+	readFile := func(path string) []byte {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			fmt.Fprintln(os.Stderr, "gwharness: read", path, readErr)
+			os.Exit(2)
+		}
+		return data
+	}
+	client, err := controlsync.NewClient(controlsync.ClientConfig{
+		BaseURL:           config.baseURL,
+		ExpectedServerSAN: config.serverSAN,
+		ServerCAPEM:       readFile(config.serverCAFile),
+		ClientCertPEM:     readFile(config.clientCertFile),
+		ClientKeyPEM:      readFile(config.clientKeyFile),
+		RequestTimeout:    5 * time.Second,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gwharness: client:", err)
+		os.Exit(2)
+	}
+	table := routes.NewTable(nil)
+	applier, err := controlsync.NewApplier(controlsync.ApplierConfig{
+		Client:    client,
+		Table:     table,
+		Namespace: config.namespace,
+		BootID:    config.bootID,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gwharness: applier:", err)
+		os.Exit(2)
+	}
+	health := &healthSink{}
+	loop, err := controlsync.NewLoop(controlsync.LoopConfig{Applier: applier, Health: health})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gwharness: loop:", err)
+		os.Exit(2)
+	}
+	clock := &fakeClock{now: config.clockBase}
+	source := &presenceSource{bootID: config.bootID, revision: 0, now: clock}
+	publisher, err := controlsync.NewPresencePublisher(controlsync.PresencePublisherConfig{
+		Client:   client,
+		Source:   source,
+		Interval: config.presenceInterval,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gwharness: presence publisher:", err)
+		os.Exit(2)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	harness := &harness{
+		config: config, client: client, table: table, applier: applier, loop: loop,
+		source: source, publisher: publisher, health: health, clock: clock,
+	}
+	if config.presenceAutostart {
+		go publisher.Run(ctx)
+	}
+
+	// Startup banner: the test reads exactly one line before it starts
+	// driving, so a harness that fails to construct never looks like a hang.
+	// (Any construction failure above exits before this line is printed.)
+	fmt.Fprintln(os.Stdout, `{"ok":true}`)
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	encoder := json.NewEncoder(os.Stdout)
+	for scanner.Scan() {
+		var request harnessRequest
+		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
+			encoder.Encode(harnessResponse{OK: false, Error: "invalid request JSON"})
+			continue
+		}
+		response := harness.handle(ctx, request)
+		if err := encoder.Encode(response); err != nil {
+			fmt.Fprintln(os.Stderr, "gwharness: encode response:", err)
+			return
+		}
+		if request.Cmd == "quit" {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
+		fmt.Fprintln(os.Stderr, "gwharness: stdin:", err)
+	}
+}
