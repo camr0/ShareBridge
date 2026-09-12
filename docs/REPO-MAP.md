@@ -1,0 +1,312 @@
+# ShareBridge repository map
+
+Where things live, what each seam is, and how to run the gates.
+
+Scope: the `phase-4a` branch of the ShareBridge monorepo (relay MVP).
+Every path, command and package named here was checked to exist at the
+branch HEAD when this file was written; line numbers are deliberately not
+quoted because they drift. When in doubt, run the gate — do not trust prose.
+
+The repo has **four Go modules** plus a browser test tree:
+
+| Module | Path | `go.mod` module | Purpose |
+|---|---|---|---|
+| agent | `agent/` | `sharebridge/agent` | Private-network agent: talks to OpenCloud/Immich, exposes shares directly (PnP/DDNS) or through the relay tunnel |
+| control | `control/` | `sharebridge/control` | Signaling, accounts, browser app, direct-route decisioning, and the private sync server for the gateway |
+| relay | `relay/` | `sharebridge/relay` | Public L4 relay gateway + FRP plugin + the separate-VM deployment artifacts |
+| integration (test-only) | `integration/controlsync/` | `sharebridge/control/integration` | Cross-module proof that the *real* gateway sync loop drives the *real* control listener |
+| browser e2e | `e2e/browser/` | npm | Playwright route-flow gate against a hermetic fixture |
+
+## 1. Module map
+
+### 1.1 `agent` — private-network agent
+
+Entry points (`agent/cmd/`):
+
+- `cmd/agent` — the shipped agent binary (cobra; loads config, store, web UI, daemon).
+- `cmd/spike-*` — throwaway spike commands (`spike-certagent`, `spike-e2e`, `spike-map`, `spike-upnp`); not production.
+- `frpc/` — gitignored staging directory for the checksum-pinned frpc binary; no binary is committed.
+
+Key `internal/` packages:
+
+| Package | Purpose (one line) |
+|---|---|
+| `internal/config` | Config struct + env parsing, including the admin-UI bind/password rules |
+| `internal/store` | Durable agent state (sessions/shares) behind the daemon |
+| `internal/daemon` | The orchestrator: signaling loop, share lifecycle, direct/relay selection, lockdown and revocation |
+| `internal/signaling` | WebSocket client and message shapes for agent↔control, backoff, and the OK-ack transport seal |
+| `internal/tunnel` | Supervises the pinned frpc child process and its presence lifecycle |
+| `internal/direct` | Direct data plane: SNI binder, HTTPS server, PnP/NAT-PMP port mapping, on-demand mapping state machine, endpoint reporter, connection registry |
+| `internal/cert` | Agent-side CSR generation, certificate manager and validation for tunnel/content origins |
+| `internal/stun` | Agent half of the control-observed STUN check (authenticated Binding exchange) |
+| `internal/immich` | Immich API client |
+| `internal/cloudwebdav` | OpenCloud WebDAV client |
+| `internal/web` | Agent admin UI + `/api/v1` (API-key) surface, templates and static assets |
+
+### 1.2 `control` — signaling, direct decisioning, sync server
+
+Entry points (`control/cmd/`):
+
+- `cmd/server` — the control server: PocketBase-backed API/browser app, agent WebSocket, direct-route decisioning, STUN listener, the private relayctl sync listener, metrics.
+- `cmd/admin` — control admin CLI.
+- `cmd/spike-*` — spike commands (`spike-cert`, `spike-ddns`, `spike-dnsset`); not production.
+
+Key `internal/` packages:
+
+| Package | Purpose (one line) |
+|---|---|
+| `internal/config` | Control config incl. the five `CONTROL_SYNC_*` variables (all-or-nothing) |
+| `internal/handler` | HTTP/WS handlers, including the agent WebSocket (`agent_ws.go`) |
+| `internal/hub` | In-memory agent connection hub used by signaling |
+| `internal/middleware` | API-key and related request middleware |
+| `internal/directctl` | Direct-route logic: eligibility predicate, route selection, prepare-route, open-signal, probe, endpoint facts, interstitial |
+| `internal/stun` | Control's authenticated STUN observation listener (one-use challenge/credential) |
+| `internal/ddns` | Cloudflare DDNS updates for content/hostname records |
+| `internal/certcoordinator` | ACME coordination for per-agent wildcard certificates |
+| `internal/relayctl` | The `§11.3` control-side sync surface: protocol, mTLS server, route publisher/deltas, presence view, relay credentials |
+
+### 1.3 `relay` — public L4 gateway and deployment
+
+Entry point: `relay/cmd/gateway` — accepts browser TLS without terminating it, routes by exact ClientHello SNI, splices to agent loopback FRP ports, and serves the loopback-only FRP authorization plugin, health, and metrics.
+
+Key `internal/` packages:
+
+| Package | Purpose (one line) |
+|---|---|
+| `internal/gateway` | Public L4 acceptor + stream pump (limits enforced before/at admission) |
+| `internal/clienthello` | Bounded TLS ClientHello parser that extracts the exact SNI server name |
+| `internal/routes` | Gateway's authoritative in-memory route table (epochs, revisions, tombstones, capacity) |
+| `internal/controlsync` | Gateway's client for the control↔gateway sync: fetch/apply snapshot+deltas, status ack, presence publisher, reconcile loop |
+| `internal/presence` | Authoritative tunnel presence registry (credential-precise lease state, boot/revision fencing) |
+| `internal/frpplugin` | Local fail-closed HTTP authorization plugin for frps (Login/NewProxy/CloseProxy/Ping/NewUserConn) |
+| `internal/limits` | `§14` resource bounds: config, acquire/release around the listener |
+| `internal/metrics` | `§17.3` metadata-only metric registry, health split, private-only handler, NIC sampler |
+| `internal/frptest` | Pinned FRP artifact verification (`§23.1`/`§23.2`/`§23.7`) |
+| `internal/integration` | Real-FRP `§23.3` parity/recovery gate + `§23.8` capacity baseline |
+
+Deployment artifacts: `relay/deploy/` (`sharebridge-relay-gateway.service`, `sharebridge-relay-frps.service`, `firewall.nft`, `install.sh`, `deploy_test.sh`), `relay/config/frps.toml`, `relay/frp/manifest.json` + `GATE-EVIDENCE.md`, `relay/scripts/fetch-frp.sh`.
+
+### 1.4 `integration/controlsync` — cross-module ack test (test-only module)
+
+Not shipped; exists to run both halves for real.
+
+- Control half runs in-process (real `relayctl.Server`/`Publisher`/`PresenceView`) over a real mTLS listener.
+- Gateway half is a throwaway subprocess module built from `gatewayharness/main.go.txt`, importing the real `controlsync` client/applier/loop/presence publisher.
+- See `integration/controlsync/README.md` for the Go internal-package constraint that forces the split.
+
+## 2. Protocol surfaces
+
+### 2.1 agent ↔ control WebSocket
+
+- Agent side: `agent/internal/signaling/client.go` (transport + message types), `agent/internal/daemon/daemon.go` (handlers).
+- Control side: `control/internal/handler/agent_ws.go` (endpoint), `control/internal/hub/hub.go`.
+- Message types in use: `hello`, `enrolled`, `enrollment_ready`, `tls_ready`, `relay_config`, `relay_credential_request`, `stun_challenge`, `stun_result`, `open_signal`, `open_ack`, `report_endpoint`, `relay_client_state`, `lockdown_status`.
+- Invariants worth knowing: `status:"ok"` `open_ack`s are sealed at the transport (`agent/internal/signaling`) — no OK ack reaches the wire without the daemon's generation/port guard approving; unknown JSON fields are tolerated by design.
+- Tests: `control/internal/handler/agent_ws_test.go`, `control/internal/handler/e2e_test.go`; `agent/internal/signaling/client_test.go`, `agent/internal/signaling/client_open_ack_seal_test.go`; `agent/internal/daemon/daemon_*_test.go`.
+
+### 2.2 control ↔ gateway private mTLS sync (`§11.3`)
+
+- Control side: `control/internal/relayctl/` — `protocol.go` (wire), `server.go` (mTLS endpoints `/internal/relay/v1/{snapshot,deltas,status,presence/snapshot,presence/events}`), `publisher.go` (epoch/revision, tighten-only limits, `published_at`), `presence.go`, `credentials.go`.
+- Gateway side: `relay/internal/controlsync/` — `client.go`, `reconcile.go` (applier; `Reconcile`, never raw deltas), `loop.go` (sync loop + ack watermark health), `presence.go` (≤60 s presence republish).
+- Contracts:
+  - snapshot / delta / status-ack; ack is `acknowledged:true|false` with a bounded `reason` (e.g. `foreign_epoch`); the gateway records a watermark only on genuine acceptance.
+  - presence envelope carries top-level `gateway_boot_id` and `revision` so a fresh (or empty) snapshot is adoptable.
+- Tests: `control/internal/relayctl/*_test.go` (incl. `sync_e2e_test.go`), `relay/internal/controlsync/*_test.go`, and the cross-module module `integration/controlsync/crossmodule_test.go`.
+
+### 2.3 Relay data path (via frps)
+
+- Gateway: `relay/internal/gateway` (accept/splice), `relay/internal/clienthello` (SNI), `relay/internal/routes` (table), `relay/internal/frpplugin` (authorization), `relay/internal/presence` (availability).
+- Agent: `agent/internal/tunnel` (frpc supervisor + fresh-credential recovery), pinned binary via `relay/frp/manifest.json`.
+- frps config: `relay/config/frps.toml`.
+- Tests: `relay/internal/integration/*` (real frps/frpc, `§23.3` + `§23.8`), `relay/internal/frptest/*` (artifact/config gate), `relay/internal/frpplugin/*_test.go`, `agent/internal/tunnel/*_test.go`.
+
+### 2.4 Direct data path (PnP + DDNS)
+
+- Agent: `agent/internal/direct` — `portmap.go` (UPnP/NAT-PMP with bounded router I/O), `ondemand.go` (mapping state machine + generation fence), `server.go` (HTTPS content gate), `sni.go` (binder), `reporter.go` (endpoint reports), `connections.go`; plus `agent/internal/cert` and `agent/internal/stun`.
+- Control: `control/internal/directctl` — `directpredicate.go`, `routes.go`, `prepare.go`, `opensignal.go`, `probe.go`, `endpoint.go`, `stun.go`; `control/internal/ddns/ddns.go`; STUN listener `control/internal/stun/server.go`.
+- Tests: `agent/internal/direct/*_test.go`, `agent/internal/daemon/daemon_direct_test.go`, `control/internal/directctl/*_test.go`, `control/internal/stun/server_test.go`.
+
+## 3. Gates and how to run them
+
+### 3.1 `§23.3` FRP required-mode gate (BLOCKING)
+
+```bash
+cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
+  go test -v -race -count=1 -timeout 900s ./internal/integration
+```
+
+Proves: byte-exact TLS parity through the *real pinned* frps/frpc for TLS 1.2/HTTP1.1,
+TLS 1.3/HTTP2, and a fragmented ClientHello (`extraAtAgent=0`), plus routing, presence and
+restart/recovery cases — currently **16 named cases**. Required mode fails closed (non-zero
+exit, no case started) when the integration env is unset, the run is `-short`, a case is
+skipped or never started, or the pinned artifacts are missing/poisoned. Evidence and digest
+table: `relay/frp/GATE-EVIDENCE.md`.
+
+### 3.2 Deployment gate
+
+```bash
+bash relay/deploy/deploy_test.sh
+```
+
+Proves: the separate-VM relay artifacts are hardened and exact — distinct unprivileged
+service users, root-owned `0600` secrets, systemd sandbox directives with expected values,
+the public TCP allowlist being exactly `{443, transport}`, integrity-checked pinned frps,
+pinned `ExecStart`/`User`/`Group`, and the collocated test-VPS `CONTROL_SYNC_*` wiring.
+Prints `== N checks, M failure(s) ==` and `RESULT: GREEN|RED`; exit 0 only on GREEN.
+Static only: it does not need systemd, root, or a relay host.
+
+### 3.3 M6 acceptance harness (Task 37 skeleton)
+
+```bash
+scripts/live-phase4a.sh                 # all registered gates
+scripts/live-phase4a.sh --case <name>   # one gate
+scripts/live-phase4a.sh --list          # print the gate table
+scripts/live-phase4a.sh --dry-run       # print config + plan; runs nothing
+scripts/live-phase4a.sh --selftest      # verify the pass/fail plumbing
+```
+
+16 registered gates: `gate_23_9_dark_topology`, `acceptance_01_owner_hairpin`,
+`acceptance_04_interstitial_blackhole`, `acceptance_02_cellular_relay_video`,
+`acceptance_11_content_parity`, `acceptance_03_relay_only`, `l4_no_plaintext_capture`,
+`acceptance_06_no_mapper_enrollment`, `acceptance_12_stun_mismatch`,
+`acceptance_13_stun_cadence_cold_budget`, `acceptance_07_no_relay_open_signal`,
+`acceptance_08_exact_routing`, `acceptance_09_restart_recovery`, `acceptance_10_lockdown`,
+`acceptance_15_heartbeat_tunnel_dns`, `release_go_no_go_rollback`.
+
+Exit codes: `0` GREEN, `1` RED (FAIL / MISSING / NOT_IMPLEMENTED), `2` usage error,
+`3` PARTIAL (at least one SKIP, or a dry run — nothing executed is never a pass).
+
+Honesty rules (enforced by `--selftest`): a gate with only `note()` lines is `MISSING`,
+not PASS; a registered-but-unimplemented gate is `NOT_IMPLEMENTED`, never PASS; check
+details are sanitised before console and evidence; the dark-posture selection flag must be
+*observed*, never assumed from a code default.
+
+### 3.4 STUN real-NAT gate (`§23.5`, BLOCKING)
+
+```bash
+scripts/stun-nat-gate.sh --target local     # normative in-process protocol proof (7 cases)
+scripts/stun-nat-gate.sh --target remote    # against a deployed control, from behind a real NAT
+```
+
+Local mode spins the real listener + controller on loopback and proves all seven cases
+including fail-closed negatives (7/7 PASS today). Remote mode needs `STUN_GATE_SERVER` and
+`STUN_GATE_API_KEY` (`STUN_GATE_EXPECTED_PUBLIC_IP` for the full matrix — without it the
+mismatched-egress case SKIPs rather than passing); see `--help`. Exit 0 iff no case FAILed —
+SKIPs are reported as partial, not pass. Evidence:
+`docs/operations/evidence/phase4a-stun-nat-gate.md`.
+
+### 3.5 Cross-module ack test module
+
+```bash
+cd integration/controlsync && go test ./...
+cd integration/controlsync && go test -race -count=5 -timeout 900s .
+```
+
+Proves: the real control listener and the real gateway sync loop agree over a real mTLS
+socket — watermark advance, presence renewal past the lease, foreign-epoch ack refusal with
+health withdrawal, mTLS identity rejection, and empty-snapshot boot adoption.
+
+### 3.6 Capacity gate (`§23.8`, supplementary)
+
+```bash
+bash scripts/relay-capacity-gate.sh
+```
+
+Runs the local capacity/plateau suite and prints target-VM numbers as `PENDING HARDWARE`
+(later filled in by the M6 environment record). Results do not alter route selection.
+
+## 4. Operations docs index
+
+- `docs/operations/phase4a-relay.md` — relay VM runbook: topology/ports, provisioning, hardening inventory, restart ordering, the `§17.3` metrics + listeners, the operator environment surface, and how to run/renew the gates.
+- `docs/operations/phase4a-test-vps-deploy.md` — collocated test-VPS deploy (control + gateway + frps on one box): `.env.testing` keys, upgrade-in-place, frps.toml contents, and the `§11.3` sync-channel wiring.
+- `docs/operations/agent-admin-ui-security.md` — agent admin UI bind defaults, fail-closed rule for non-loopback binds, auth, and secret handling.
+- `docs/operations/evidence/phase4a-environment.md` — M6 environment record template (every value `PENDING`, filled by `scripts/live-phase4a.sh` runs).
+- `docs/operations/evidence/phase4a-stun-nat-gate.md` — `§23.5` STUN gate run evidence.
+- `relay/frp/GATE-EVIDENCE.md` — `§23.1`/`§23.2`/`§23.3`/`§23.7` FRP evidence: pin, digests, verbatim gate output.
+- `docs/RELEASING.md` — release/verification/publish/deploy/rollback checklist.
+- `relay/README.md`, `control/README.md`, `integration/controlsync/README.md` — per-component notes.
+
+## 5. Configuration surfaces
+
+Pointers only — the tables are the source of truth, do not duplicate them here.
+
+| Family | Defined in | Documented in |
+|---|---|---|
+| Agent admin/security (`UI_ADDR`, `UI_PASSWORD`, `UI_PORT`, `CONNECT_ALLOWED_ORIGIN`, agent API keys) | `agent/internal/config/config.go` | `docs/operations/agent-admin-ui-security.md` |
+| Ten `SHAREBRIDGE_GATEWAY_*` limits (`MAX_STREAMS_PER_SOURCE_IP/PER_ORIGIN/PER_AGENT/GLOBAL`, `MAX_HELLO_BYTES`, `HELLO_TIMEOUT`, `DIAL_TIMEOUT`, `IDLE_TIMEOUT`, `ABSOLUTE_LIFETIME`, `MAX_TRACKED_AGENTS`) | `relay/internal/limits/limits.go` (`ConfigFromEnvironment`) | `docs/operations/phase4a-relay.md` (limits + env-surface sections) |
+| Metrics listeners (`SHAREBRIDGE_GATEWAY_METRICS_ADDR` 127.0.0.1:9101; `CONTROL_METRICS_ADDR` 127.0.0.1:9102) | `relay/cmd/gateway/main.go`, `control/cmd/server/main.go` | `docs/operations/phase4a-relay.md` |
+| Six gateway sync vars (`SHAREBRIDGE_CONTROL_SYNC_URL/_SAN/_CA_FILE`, `SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE/_KEY_FILE`, `SHAREBRIDGE_GATEWAY_NAMESPACE`; also `SHAREBRIDGE_GATEWAY_NIC_INTERFACE`, `_NIC_CAPACITY_BYTES_PER_SEC`) | `relay/cmd/gateway/main.go` | `docs/operations/phase4a-relay.md`, `docs/operations/phase4a-test-vps-deploy.md` |
+| Five control sync vars (`CONTROL_SYNC_BIND_ADDR`, `_CERT_FILE`, `_KEY_FILE`, `_CLIENT_CA_FILE`, `_EXPECTED_CLIENT_SAN`) | `control/internal/config/config.go` | `docs/operations/phase4a-relay.md`, `docs/operations/phase4a-test-vps-deploy.md` |
+| Test-deploy vars | `control/deploy-testing-relay.sh`, `control/.env.testing.example` | `docs/operations/phase4a-test-vps-deploy.md` |
+
+Rules that apply across families: gateway limits fail closed on invalid values and the
+global/listener-relevant ceilings are hard upper bounds; the control sync listener is
+all-or-nothing (the material vars switch it on, bind address alone never does); the gateway
+sync client requires all six together (partial config is a startup error).
+
+## 6. Deferred-minor triage
+
+Compiled from the project ledger carry-forward lists, the post-M4 and post-M5 milestone
+audits, and the per-task reviews. Dispositions: **must-fix-before-M6**, **should-fix**,
+**note-only**, **done** (with commit).
+
+| Item | Origin | Disposition | Rationale |
+|---|---|---|---|
+| h2 multi-stream hardening test (revoke / re-registration on a shared HTTP/2 connection) | Post-M4 B2b review; post-M5 audit | should-fix | Code path is protocol-independent and covered over HTTP/1.1; a real multiplexed case would harden coverage only. |
+| `TestOnDemandPort_CloseEscalatesAfterMaxAttempts` flake | Post-M4 B2b verify | note-only | Root cause is test-design fake-clock re-arm; stabilized and passes stress runs; no production race found. |
+| `TestOnDemandPort_CloseRetriesThenSucceeds` flake | M4 closeout batch 1 | note-only | Same fake-clock family as above; passes standalone, flakes only under cross-package `-race` contention. |
+| Readiness-correlation flake (`TestRealFRPContentParity`/revocation probe dials) | Task 33 fix round 2 | note-only | Observed once under load; 220+ isolated iterations and the full `-count=10` rerun passed; does not weaken a gate. |
+| Capacity-timing tests flaking under `-race` contention | M5 round 2 | note-only | Unregistered timing tests; pass in isolation and in the gate runs; contention artifact. |
+| chromedp seek-forced-fresh-request coverage note | Task 24 review | note-only | Ranged fetch + seek effect is proven; Chromium prefetch means "seek forced a fresh request" is not claimed. |
+| Control direct-report freshness (per-open nonce/sequence) | Task 34 / Round C review | should-fix | Persisted IP+port must equal the ack and a live probe re-verifies reachability; provenance is weak but not unsafe. |
+| Timer-renewal mapped-port changes are not proactively reported | Task 34 verify | should-fix | A renewed mapping's port change is only corrected by a later open signal; worst case an avoidable relay fallback. |
+| Pre-report refusal arm lacks a behavioural RED | M4 closeout batch 1 | note-only | No deterministic pre-existing seam existed; kept as defence in depth, converges on the tested end state. |
+| TCP-segmentation deliberately unclaimed for `§23.3` | Task 31 fix round | note-only | The gate proves exact TLS-record fragmentation (2/2/5); TCP segment boundaries are neither preserved nor relied upon. |
+| NAT-PMP retry depth ≈ 4 attempts | Task 30 fix round 2 | should-fix | Bounded router I/O trade-off; validate on NAT-PMP hardware and consider a separate bounded budget if flaky. |
+| `ActiveStreams` briefly lags after close | Task 33 / T36 verify | note-only | Bounded, self-converging; registry returns to zero and the post-close assertion now pins it. |
+| `--case ""` semantics in the M6 harness | M6 harness verify | note-only | An empty string means "no scope" (runs all gates); an empty/unknown element exits 2. A one-line usage-error change if desired. |
+| Single-namespace vs per-agent namespace design question | Remediation verification | must-fix-before-M6 | One gateway applier serves exactly one agent namespace; a second agent or a re-enroll makes relay unreachable. Resolve or explicitly accept before M6. |
+| `integration/controlsync` module not enumerated in CI | Cross-module ack verify | should-fix | No repo-wide workflow enumerates modules yet; the module runs via `cd integration/controlsync && go test ./...`. |
+| Misconfigured control sync listener `log.Fatalf`s at startup | Remediation verification | note-only | Fail-closed deploy-time trade-off (never silently serves); documented in the relay runbook. |
+| STUN empty / leading-trailing-hyphen host validation | Post-M5 audit | done (`4963db34`) | Validator now rejects empty, hyphen-edged, over-length, underscore, IPv6 and space hosts; `ErrMalformedChallenge` fail-closed. |
+| Cross-module real-gateway ↔ real-control ack integration test | Post-M5 audits | done (`0d872dfc`) | New test-only module drives both real halves over mTLS and pins watermark/presence/epoch behaviour. |
+| Daemon exits on initial signaling connect failure | Live infra recon | done (`36cc7681`) | Initial connect/listen failures now retry with the existing backoff; only the web-server start failure stays fatal. |
+| Presence-transport renewal + empty-snapshot boot adoption | Ledger I4-partial | done (`fc0359ba`) | 15 s presence republish (< 45 s lease) and top-level `gateway_boot_id`/`revision` adoption; control listener wired in production. |
+| Lingering mapping usable after Unlock | Post-M4 Sol audit composition gap | done (`06a97708`) | Direct content now requires a logically open port and Unlock refuses while a close-failed mapping is unresolved. |
+| Route `MaxStreamsGlobal` transported but unenforced; zero-limit semantics disagreed | Post-M5 audit | done (`f58b22c2`) | Route global now enforced as `min(process, route)`; zero is invalid on active routes on both sides; `MAX_TRACKED_AGENTS` hard-bounded. |
+| Control-sync health ignored failed status acks; false lag on no-op polls; restoration anchored on emission | Post-M5 audit | done (`e15da308`, `5f0fb3e9`, `2799e882`) | Ack failure withdraws health; lag only sampled on a new revision; restoration anchors only on an accepted reset. |
+| Deployment gate could approve a nonfunctional service or a non-dedicated account | Post-M5 audit | done (`150030b8`) | `ExecStart` and `User`/`Group` are exact-value pinned, cross-checked against the installer. |
+| A later failed open tore down a healthy shared mapping | Post-M5 audit (remediation-introduced) | done (`794e2390`, `06115eec`) | Rollback now requires sole ownership (created + instance + join count) decided in the port loop. |
+| Sol-model milestone audit over the remediation range | Quota escalation | note-only | Codex `gpt-5.6-sol` was quota-exhausted; verification ran on glm-5.3 (partial) + deepseek-v4-pro (remainder). Re-run if Sol sign-off is wanted. |
+
+## 7. Current state at HEAD
+
+**Landed:** M1–M5 complete, plus the M4 closeout batches, the M5 remediation rounds
+(R1–R4), and task #16 (control sync listener + presence renewal + empty-snapshot boot
+adoption), the carry-forward robustness round (signaling retry, STUN host validation), the
+cross-module ack test module, and the M6 acceptance-harness skeleton.
+
+**Gate status:** `§23.3` required-mode gate GO (16 cases); deployment gate GREEN; `§23.5`
+STUN gate GO (7/7 local + remote against the deployed test control); M6 harness RED by
+design (no M6 infrastructure exists yet; all placeholders are `NOT_IMPLEMENTED`, never PASS).
+
+**Known-open / remaining:**
+
+- M6 acceptance (Tasks 37–44) is pending **infrastructure and user presence**: the separate
+  relay VM, a non-hairpin/router surface, a cellular device, a second VM for the L4 capture,
+  real NAT surfaces, and browser/device runs.
+- The M4-exit live e2e (7 scenarios) is deferred until the user is available and the test
+  VPS is restored.
+- The single-namespace-per-gateway design question above must be resolved or explicitly
+  accepted before a multi-agent M6 topology.
+- The **Sol-model milestone audit over the remediation range remains OWED**: both Codex
+  models (`gpt-5.6-sol`, `gpt-5.6-terra`) were quota-exhausted at the end of this stretch and
+  `zai/glm-5.3` hit its limit; the verification was completed by glm-5.3 (partial) and
+  deepseek-v4-pro (remainder), which is weaker cross-model independence. Re-run on Sol when
+  quota returns if that sign-off is required.
+- The deferred-minor table in §6 lists the should-fix and note-only items still open.
+
+**Before M6 acceptance:** provision the relay/test infrastructure, wire and verify the
+`§11.3` sync channel live on the test VPS, run the full `scripts/live-phase4a.sh` gate set
+with the M6 environment record filled from measured values, complete the user/browser
+scenarios, and (per policy) obtain the final whole-branch review.

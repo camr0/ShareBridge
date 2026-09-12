@@ -30,9 +30,17 @@ Direct mode sends data peer-to-peer over WebRTC. Relay mode sends payloads throu
 ## Repository layout
 
 - `agent/` — private-network agent and backend integrations
-- `control/` — signaling, accounts, secure relay, and browser application
+- `control/` — signaling, accounts, direct-route decisioning, and browser application
 - `control/web/` — browser client
+- `relay/` — public L4 relay gateway and its deployment artifacts
+- `integration/` — test-only cross-module integration modules
+- `e2e/browser/` — Playwright route-flow gate
+- `scripts/` — operator gates (M6 acceptance harness, STUN NAT gate, capacity gate)
 - `docs/` — architecture, design, operations, and release documentation
+
+See [docs/REPO-MAP.md](docs/REPO-MAP.md) for the module/entry-point map, the protocol
+surfaces between the components, the gates and how to run them, and the configuration
+surfaces.
 
 The control plane has additional setup and configuration guidance in [control/README.md](control/README.md).
 
