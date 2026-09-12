@@ -341,6 +341,28 @@ gateway-sync.crt --sync-key gateway-sync.key --sync-san control-sync.internal`
 to `relay/deploy/install.sh`; it installs them `root:root 0600` and serves
 them to the gateway through systemd credentials.
 
+**Collocated test topology.** `control/deploy-testing-relay.sh` performs the
+steps above automatically for the single-box test deployment: it generates one
+shared sync CA and both leaves locally in `control/.env.testing.d/` (never
+committed), installs the public material `root:root 0600` in
+`/opt/sharebridge/control-sync/` (the systemd equivalent of the container
+topology's `/run/sharebridge-sync` read-only mount of `./control-sync`), writes
+all five `CONTROL_SYNC_*` variables into control's env, and writes the six
+gateway sync variables **together** into the gateway env. Because control
+generates the §6 namespace per agent at enrollment and the applier is
+single-namespace, the test script ships the gateway **dark** until the operator
+pins the enrolled agent's namespace:
+
+```bash
+control/deploy-testing-relay.sh <user@host> --pin-namespace sbXXXXXXXX
+```
+
+That pin is a deliberate single-agent test simplification. The observable is
+the gateway's private `route_ready` (`curl -sf http://127.0.0.1:9101/healthz`
+on the box) — the sync listener is loopback-private and is never probed over
+the network. Full operator steps:
+`docs/operations/phase4a-test-vps-deploy.md` §3c and §6.
+
 Presence transport: the gateway republishes its full authoritative presence
 state every **15 seconds** (and immediately on a transition), one third of the
 45-second presence lease, so control's stored lease cannot expire while the

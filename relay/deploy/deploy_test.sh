@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 #
-# deploy_test.sh — static deployment-hardening gate for the separate relay VM
-# (spec §4.6, §6, §17.1; plan Task 35).
+# deploy_test.sh — static deployment-hardening gate for the relay deployment
+# (separate-VM artifacts: spec §4.6, §6, §17.1; plan Task 35; plus the
+# collocated test-VPS §11.3 sync wiring, task #16).
 #
 # This test does NOT need systemd, root, or a relay VM: it parses the
 # committed deployment artifacts (the two systemd units, the nftables ruleset,
-# install.sh and the operator runbook) and asserts the hardening properties
-# the deployment must prove. `systemd-analyze verify` is run separately in a
-# Linux container to check the units are syntactically valid.
+# install.sh, the collocated control/deploy-testing-relay.sh and the operator
+# runbooks) and asserts the hardening properties the deployments must prove.
+# `systemd-analyze verify` is run separately in a Linux container to check the
+# units are syntactically valid.
+#
+# The collocated test topology (A18) lives here rather than in a second script
+# because this is the repo's single executed deployment gate and it already
+# reads control-module artifacts (A17); a standalone script would not be run
+# by anyone and a rename could silently escape every gate.
 #
 # Usage:  bash relay/deploy/deploy_test.sh
 # Exit:   0 = every assertion passed (GREEN); 1 = at least one failed (RED).
 #
-# The assertion IDs (A1…A16) are referenced by the Task 35 report so each
+# The assertion IDs (A1…A18) are referenced by the Task 35 report so each
 # published hardening claim maps to the check that enforces it. A3/A4/A6/A15
 # are strict-parsing assertions: a duplicate, redefined or extra directive is a
 # failure, never silently ignored, and A12/A13 prove their properties by
@@ -39,6 +46,9 @@ plan_doc="${repo_root}/docs/superpowers/plans/2026-09-03-phase4a-relay-mvp.md"
 control_config="${repo_root}/control/internal/config/config.go"
 control_main="${repo_root}/control/cmd/server/main.go"
 control_compose="${repo_root}/control/docker-compose.yml"
+# Collocated test-VPS topology: the deploy script and its operator runbook.
+test_vps_script="${repo_root}/control/deploy-testing-relay.sh"
+test_vps_doc="${repo_root}/docs/operations/phase4a-test-vps-deploy.md"
 
 failures=0
 checks=0
@@ -1297,6 +1307,130 @@ require_contains "$control_config" 'func \(c \*Config\) ControlSyncConfigured\(\
   "control sync enable switch is the mTLS material set"
 require_contains "$control_config" 'requires %s together with the other CONTROL_SYNC_\* variables' \
   "control sync partial configuration fails closed"
+
+printf -- '-- A18: collocated test-VPS deploy wires the §11.3 sync channel exactly\n'
+# The collocated test deploy is a DIFFERENT topology from the separate relay VM
+# (Task 35), but it is the only live deployment that enables the channel, so its
+# surface is asserted here with the same exact-name/all-or-nothing discipline.
+require_file "$test_vps_script" "test-VPS deploy script"
+require_file "$test_vps_doc" "test-VPS deploy runbook"
+
+# Five control-side variables and six gateway-side variables, by exact name.
+for name in \
+  CONTROL_SYNC_BIND_ADDR \
+  CONTROL_SYNC_CERT_FILE \
+  CONTROL_SYNC_KEY_FILE \
+  CONTROL_SYNC_CLIENT_CA_FILE \
+  CONTROL_SYNC_EXPECTED_CLIENT_SAN; do
+  require_contains "$test_vps_script" "^${name}=" "test deploy sets ${name}"
+done
+for name in \
+  SHAREBRIDGE_CONTROL_SYNC_URL \
+  SHAREBRIDGE_CONTROL_SYNC_SAN \
+  SHAREBRIDGE_CONTROL_SYNC_CA_FILE \
+  SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE \
+  SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE \
+  SHAREBRIDGE_GATEWAY_NAMESPACE; do
+  require_contains "$test_vps_script" "${name}=" "test deploy sets ${name}"
+done
+
+# Fixed identities for the collocated test box: a drifted bind or SAN fails.
+require_contains "$test_vps_script" '^CONTROL_SYNC_BIND_ADDR="127\.0\.0\.1:9443"' \
+  "test sync bind is numeric loopback 127.0.0.1:9443"
+require_contains "$test_vps_script" '^CONTROL_SYNC_SERVER_SAN="control-sync\.internal"' \
+  "test sync server SAN is control-sync.internal"
+require_contains "$test_vps_script" '^GATEWAY_SYNC_CLIENT_SAN="sharebridge-relay-gateway\.sync\.internal"' \
+  "test sync client SAN is sharebridge-relay-gateway.sync.internal"
+# The control .env must actually carry the five variables (exact rendered
+# lines, not just a same-named shell constant).
+require_contains "$test_vps_script" '^CONTROL_SYNC_BIND_ADDR=\$\{CONTROL_SYNC_BIND_ADDR\}$' \
+  "control env writes CONTROL_SYNC_BIND_ADDR"
+require_contains "$test_vps_script" '^CONTROL_SYNC_CERT_FILE=\$\{REMOTE_CONTROL_SYNC_DIR\}/control-sync\.crt$' \
+  "control env writes CONTROL_SYNC_CERT_FILE"
+require_contains "$test_vps_script" '^CONTROL_SYNC_KEY_FILE=\$\{REMOTE_CONTROL_SYNC_DIR\}/control-sync\.key$' \
+  "control env writes CONTROL_SYNC_KEY_FILE"
+require_contains "$test_vps_script" '^CONTROL_SYNC_CLIENT_CA_FILE=\$\{REMOTE_CONTROL_SYNC_DIR\}/sync-ca\.crt$' \
+  "control env writes CONTROL_SYNC_CLIENT_CA_FILE"
+require_contains "$test_vps_script" '^CONTROL_SYNC_EXPECTED_CLIENT_SAN=\$\{GATEWAY_SYNC_CLIENT_SAN\}$' \
+  "control env writes CONTROL_SYNC_EXPECTED_CLIENT_SAN"
+# The gateway URL/SAN must be derived from the pinned loopback bind and the
+# pinned server SAN, not a second hard-coded string.
+require_contains "$test_vps_script" '^SHAREBRIDGE_CONTROL_SYNC_URL=https://\$\{CONTROL_SYNC_BIND_ADDR\}$' \
+  "gateway sync URL derives from the loopback bind"
+require_contains "$test_vps_script" '^SHAREBRIDGE_CONTROL_SYNC_SAN=\$\{CONTROL_SYNC_SERVER_SAN\}$' \
+  "gateway sync SAN derives from the pinned server SAN"
+
+# The ALL-OR-NOTHING rule: the six gateway variables must be emitted together
+# inside the namespace guard. Break the guard or move one variable out and this
+# fails, because the block excerpt is searched for every name.
+test_vps_guard_line="$(grep -nF 'if [[ -n "$GATEWAY_SYNC_NAMESPACE" ]]' "$test_vps_script" | head -n 1 | cut -d: -f1 || true)"
+if [[ -n "$test_vps_guard_line" ]]; then pass; else fail "test deploy has no GATEWAY_SYNC_NAMESPACE guard (all-or-nothing)"; fi
+test_vps_sync_block=""
+if [[ -n "$test_vps_guard_line" ]]; then
+  test_vps_guard_end="$(awk -v s="$test_vps_guard_line" 'NR > s && /^[[:space:]]*fi[[:space:]]*$/ {print NR; exit}' "$test_vps_script")"
+  if [[ -n "$test_vps_guard_end" ]]; then
+    test_vps_sync_block="$(sed -n "${test_vps_guard_line},${test_vps_guard_end}p" "$test_vps_script")"
+  fi
+fi
+for name in \
+  SHAREBRIDGE_CONTROL_SYNC_URL \
+  SHAREBRIDGE_CONTROL_SYNC_SAN \
+  SHAREBRIDGE_CONTROL_SYNC_CA_FILE \
+  SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE \
+  SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE \
+  SHAREBRIDGE_GATEWAY_NAMESPACE; do
+  if printf '%s\n' "$test_vps_sync_block" | grep -qF "${name}="; then pass; else fail "gateway sync guard does not set ${name} (all six must be set together)"; fi
+done
+# The dark branch must exist (no sync variables at all) and the script must NOT
+# hard-code the per-agent namespace.
+require_contains "$test_vps_script" 'sync intentionally DARK' "test deploy documents the fail-closed dark posture"
+require_not_contains "$test_vps_script" 'SHAREBRIDGE_GATEWAY_NAMESPACE=sb[0-9a-f]{8}' \
+  "test deploy must not hard-code a per-agent namespace"
+require_contains "$test_vps_script" 'sb\[0-9a-f\]\{8\}' "test deploy validates the namespace shape"
+
+# mTLS material is generated by the runbook recipe and only PUBLIC material is
+# installed; no private key or CA key is ever committed or uploaded.
+require_contains "$test_vps_script" 'openssl x509 -req' "test deploy issues sync leaves with the runbook recipe"
+require_contains "$test_vps_script" 'extendedKeyUsage=\$\{eku\}' "test deploy pins leaf EKU via extfile"
+require_contains "$test_vps_script" 'generate_sync_leaf control-sync control-sync\.internal serverAuth' "test deploy issues the control server leaf (serverAuth)"
+require_contains "$test_vps_script" 'generate_sync_leaf gateway-sync sharebridge-relay-gateway\.sync\.internal clientAuth' "test deploy issues the gateway client leaf (clientAuth)"
+require_contains "$test_vps_script" 'scp -q "\$SYNC_CA_CRT"' "test deploy installs the sync CA certificate"
+require_not_contains "$test_vps_script" 'scp -q "\$SYNC_CA_KEY"' "test deploy never uploads the sync CA private key"
+require_not_contains "$test_vps_script" 'PRIVATE KEY' "test deploy commits no private key material"
+# Material lands under the same-named control-sync directory (container mount
+# alignment) and is locked down on the box.
+require_contains "$test_vps_script" '^REMOTE_CONTROL_SYNC_DIR="\$REMOTE_DIR/control-sync"' \
+  "test deploy uses the control-sync directory name aligned with the compose mount"
+require_contains "$test_vps_script" 'chmod 700 .*\$REMOTE_CONTROL_SYNC_DIR' \
+  "test deploy locks the sync material directory to root 0700"
+require_contains "$test_vps_script" 'chmod 600 .*\$REMOTE_CONTROL_SYNC_DIR' \
+  "test deploy locks every sync material file to root 0600"
+require_contains "$test_vps_script" 'control-sync:/run/sharebridge-sync|\.\./control-sync:/run/sharebridge-sync|/run/sharebridge-sync:ro' \
+  "test deploy documents the control-sync:/run/sharebridge-sync mount convention"
+
+# Operator runbook: the post-enrollment namespace rule and the observable.
+for name in \
+  CONTROL_SYNC_BIND_ADDR \
+  CONTROL_SYNC_CERT_FILE \
+  CONTROL_SYNC_KEY_FILE \
+  CONTROL_SYNC_CLIENT_CA_FILE \
+  CONTROL_SYNC_EXPECTED_CLIENT_SAN \
+  SHAREBRIDGE_CONTROL_SYNC_URL \
+  SHAREBRIDGE_CONTROL_SYNC_SAN \
+  SHAREBRIDGE_CONTROL_SYNC_CA_FILE \
+  SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE \
+  SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE \
+  SHAREBRIDGE_GATEWAY_NAMESPACE; do
+  require_contains "$test_vps_doc" "$name" "test-VPS runbook documents $name"
+done
+require_contains "$test_vps_doc" '127\.0\.0\.1:9443' "test-VPS runbook states the loopback sync bind"
+require_contains "$test_vps_doc" '\-\-pin-namespace' "test-VPS runbook gives the post-enrollment pin command"
+require_contains "$test_vps_doc" 'deliberate single-agent TEST simplification' \
+  "test-VPS runbook states the single-agent namespace simplification"
+require_contains "$test_vps_doc" 'route_ready' "test-VPS runbook names the route_ready observable"
+require_contains "$test_vps_doc" 'sync-ca\.key' "test-VPS runbook states the CA key never leaves the workstation"
+require_contains "$test_vps_doc" 'never probed over the network|never curl|loopback-private' \
+  "test-VPS runbook marks the sync listener private"
 
 printf '\n== %d checks, %d failure(s) ==\n' "$checks" "$failures"
 if [[ $failures -gt 0 ]]; then

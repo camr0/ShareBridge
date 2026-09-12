@@ -23,7 +23,7 @@ re-running it upgrades the box in place, preserving `pb_data`.
 
 | Process (systemd unit)             | Listens on                          | Purpose |
 |------------------------------------|-------------------------------------|---------|
-| `sharebridge.service`              | `:8080` plain HTTP + UDP `3478`     | control (signaling, interstitial, STUN listener) |
+| `sharebridge.service`              | `:8080` plain HTTP + UDP `3478` + `127.0.0.1:9443` TCP | control (signaling, interstitial, STUN listener, private §11.3 sync listener) |
 | `sharebridge-relay-gateway.service`| `:443` TCP + `127.0.0.1:9001` TCP   | SNI gateway (TLS passthrough) + FRP authorization plugin (loopback-only, enforced by the binary) |
 | `sharebridge-relay-frps.service`   | `:<transport>` TCP (default `7000`) + `127.0.0.1:<10000-10099>` TCP | pinned frps v0.71.0; transport TLS; proxy ports are loopback-only (§15.1) |
 
@@ -75,7 +75,9 @@ Required: `CLOUDFLARE_TOKEN`, `RELAY_GATEWAY_HOST`, `RELAY_GATEWAY_IPV4`,
 
 Optional (defaults in the template): `CONTENT_BASE_DOMAIN`, `ACME_EMAIL`,
 `ACME_CA_DIR`, `PORT`, `RELAY_GATEWAY_PORT`, `RELAY_PORT_MIN`,
-`RELAY_PORT_MAX`, `STUN_ADVERTISE_ADDR`, `RELAY_SELECTION_ENABLED`.
+`RELAY_PORT_MAX`, `STUN_ADVERTISE_ADDR`, `RELAY_SELECTION_ENABLED`,
+`GATEWAY_SYNC_NAMESPACE` (the §11.3 gateway namespace; normally omitted — see
+§3c — and pinned post-enrollment with `--pin-namespace`).
 
 The relay transport CA lands in `control/.env.testing.d/` (gitignored via the
 `.env.*` pattern): `relay-transport-ca.pem` (+ key). **Keep the CA stable** —
@@ -135,6 +137,85 @@ phase-3 `.env` line `RELAY_JWT_SECRET` disappears with the rewrite — current
 config code does not read it (stale v1-era name). The new gateway/frps units
 are additive. You do not need to clean anything by hand first; if the box
 was snapshotted mid-deploy, just re-run the script.
+
+### 3c. Control↔gateway sync channel (§11.3, task #16)
+
+The relay-dependent gates need control's private sync listener **live** and the
+gateway **subscribed** to it. On this collocated box control serves the
+listener on **numeric loopback `127.0.0.1:9443`** and the gateway is its only
+client, over mutual TLS. There is no public surface and no firewall rule for
+it; a public/unspecified bind makes control refuse to start
+(`relayctl.NewServer`).
+
+**Generated material (never committed).** The deploy script generates one
+shared sync CA and two leaves locally in `control/.env.testing.d/` (gitignored
+by the `.env.*` pattern) using the runbook §8 recipe, and installs only the
+public parts on the box:
+
+| Local (`.env.testing.d/`) | On-box (`/opt/sharebridge/control-sync/`) | Identity |
+|---|---|---|
+| `sync-ca.crt` (+ `sync-ca.key`, **never uploaded**) | `sync-ca.crt` | shared sync CA |
+| `control-sync.crt` / `.key` | `control-sync.crt` / `.key` | control leaf, SAN `control-sync.internal`, EKU `serverAuth` |
+| `gateway-sync.crt` / `.key` | `gateway-sync.crt` / `.key` | gateway leaf, SAN `sharebridge-relay-gateway.sync.internal`, EKU `clientAuth` |
+
+On the box the directory is `chmod 700`, every file `root:root 0600`. This is a
+systemd (not container) topology, so control and the gateway read the files by
+absolute path. The production container topology mounts the same-named
+`./control-sync` directory read-only at `/run/sharebridge-sync`
+(`control/docker-compose.yml`, `CONTROL_SYNC_DIR`); this script aligns the
+name and filenames with that convention.
+
+**Env written by the script (all-or-nothing on each side).** Control gets the
+five `CONTROL_SYNC_*` variables (the four material/identity ones are the
+switch — `CONTROL_SYNC_BIND_ADDR` alone never enables the channel). The
+gateway gets the six sync variables **together** — a partial set refuses
+gateway startup, and none set is the fail-closed dark posture:
+
+| Side | Variable | Value on this box |
+|---|---|---|
+| control | `CONTROL_SYNC_BIND_ADDR` | `127.0.0.1:9443` (private loopback) |
+| control | `CONTROL_SYNC_CERT_FILE` | `/opt/sharebridge/control-sync/control-sync.crt` |
+| control | `CONTROL_SYNC_KEY_FILE` | `/opt/sharebridge/control-sync/control-sync.key` |
+| control | `CONTROL_SYNC_CLIENT_CA_FILE` | `/opt/sharebridge/control-sync/sync-ca.crt` |
+| control | `CONTROL_SYNC_EXPECTED_CLIENT_SAN` | `sharebridge-relay-gateway.sync.internal` |
+| gateway | `SHAREBRIDGE_CONTROL_SYNC_URL` | `https://127.0.0.1:9443` |
+| gateway | `SHAREBRIDGE_CONTROL_SYNC_SAN` | `control-sync.internal` |
+| gateway | `SHAREBRIDGE_CONTROL_SYNC_CA_FILE` | `/opt/sharebridge/control-sync/sync-ca.crt` |
+| gateway | `SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE` | `/opt/sharebridge/control-sync/gateway-sync.crt` |
+| gateway | `SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE` | `/opt/sharebridge/control-sync/gateway-sync.key` |
+| gateway | `SHAREBRIDGE_GATEWAY_NAMESPACE` | the enrolled agent's `sbXXXXXXXX` |
+
+`SHAREBRIDGE_GATEWAY_METRICS_ADDR` stays at its loopback default
+(`127.0.0.1:9101`), which is the private surface the §6.9 check uses.
+
+**Namespace rule (important).** `SHAREBRIDGE_GATEWAY_NAMESPACE` must equal the
+**enrolled agent's** §6 namespace (`sb` + 8 lowercase hex). Control generates
+that namespace **fresh at enrollment** (`directctl.GenerateNamespace`), so it
+is **not known at deploy time**, and the gateway's applier is
+**single-namespace** — it rejects every relay hostname bound to another
+namespace (`relay/internal/controlsync/reconcile.go`). Pinning exactly one
+namespace is a **deliberate single-agent TEST simplification** for this
+collocated topology; production serves each namespace from its own gateway.
+
+Because of that the script ships the gateway **DARK** by default (no sync
+variables at all):
+
+1. Deploy (`./deploy-testing-relay.sh <host>`). Control's listener comes up;
+the gateway runs without sync (`route_ready=false`).
+2. Run the agent and let it enroll (runbook §5). Read the agent's namespace
+from control's admin UI (`http://<vps-host>:8080/_/` → collection `agents` →
+`namespace`) or from the agent's persisted config.
+3. Pin it:
+   ```bash
+   ./deploy-testing-relay.sh <host> --pin-namespace sbXXXXXXXX
+   ```
+   (`sbXXXXXXXX` = the enrolled agent's namespace). This re-runs the idempotent
+deploy and writes all six gateway sync variables. `GATEWAY_SYNC_NAMESPACE` in
+`control/.env.testing` has the same effect for a fully-live re-run.
+4. Verify per §6.9–§6.11: the gateway's private `/healthz` reports
+`route_ready:true` once control has published this namespace's routes. That
+health field is the observable — the sync listener itself is loopback-private
+and is never probed over the network.
 
 ### 4b. Fresh-box path (only if the snapshot is gone)
 
@@ -235,7 +316,8 @@ Run these top to bottom; do not skip ahead. `<vps-host>` is the ssh target,
    `systemctl is-active sharebridge sharebridge-relay-gateway
    sharebridge-relay-frps` all `active`; `ss -ltn` shows `:443`,
    `:<transport>`, `:8080`; `ss -lun` shows `:3478`; `ss -ltn | grep 9001`
-   shows **`127.0.0.1:9001`** (never `0.0.0.0`).
+   shows **`127.0.0.1:9001`** (never `0.0.0.0`); `ss -ltn | grep 9443` shows
+   **`127.0.0.1:9443`** (the private §11.3 sync listener, never `0.0.0.0`).
 2. **Control health**: `curl -sf http://<vps-host>:8080/_/` answers
    (PocketBase health route used by the deploy script).
 3. **Agent enrollment succeeds**: with the agent up (§5), the agent log
@@ -258,6 +340,18 @@ Run these top to bottom; do not skip ahead. `<vps-host>` is the ssh target,
    `http://<vps-host>:8080/s/<code>` — the no-store “Preparing your share…”
    interstitial renders with the Task 22 assets. (Plain HTTP on :8080 is the
    phase-3 test posture; content origins are still HTTPS.)
+7. **Control sync listener (private)**: on the box, `ss -ltn | grep 9443`
+   must show `127.0.0.1:9443` (never `0.0.0.0`), and control's log must carry
+   `control sync listener on 127.0.0.1:9443 (private mTLS)`
+   (`ssh <vps> journalctl -u sharebridge | grep 'control sync listener on'`).
+8. **Sync material on the box**: `ls -ld /opt/sharebridge/control-sync` is
+   `root` `0700` and every file in it is `root:root 0600`. The CA private key
+   (`sync-ca.key`) must **not** be on the box.
+9. **Gateway sync live (after the §3c namespace pin)**: on the box,
+   `curl -sf http://127.0.0.1:9101/healthz` reports
+   `{"route_ready":true,"frps_process_healthy":...}` for the pinned
+   namespace. `route_ready` is the observable; a namespace mismatch leaves it
+   fail-closed `false` and the gateway logs the rejected hostname.
 
 ---
 
@@ -294,12 +388,16 @@ direct origin, e.g. `sb0a1b2c3.test.example.com`).
 > **Wiring status caveat (read before running Phase B):** cases 2.2, 2.3,
 > 2.4 and 2.8 need a **live relay tunnel + presence lease** so the
 > interstitial renders the relay URL / “Use relay now” / noscript redirect.
-> The daemon↔tunnel-manager wiring (`agent/internal/tunnel`) lands with
-> plan **Task 28**; until then the deployed agent will not supervise frpc,
-> no presence lease exists, and the interstitial correctly offers no relay
-> button (fail-closed §9.1). The direct-path cases (2.1, 2.5, 2.6, 2.7) are
-> executable regardless. Verify the current wiring state before scheduling
-> the human checklist session.
+> The agent tunnel supervision lands with plan **Task 28**; until then the
+> deployed agent will not supervise frpc, no presence lease exists, and the
+> interstitial correctly offers no relay button (fail-closed §9.1).
+>
+> **Additionally, the gateway's control-sync channel must be live for these
+> relay cases.** Follow §3c: deploy, enroll the agent, then re-run the script
+> with `--pin-namespace sbXXXXXXXX` and confirm §6.9 `route_ready:true`.
+> Without that pin the gateway is dark and every relay-dependent scenario
+> fails closed — the direct-path cases (2.1, 2.5, 2.6, 2.7) are executable
+> regardless.
 >
 > The same gap blocks **creating** the `<RELAYONLY>` share: the daemon
 > currently rejects relay-only sessions at `agent/internal/daemon/daemon.go`
