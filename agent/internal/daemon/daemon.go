@@ -2123,8 +2123,16 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	if ds.reporter != nil {
 		ds.reporter.SetIP(ip) // keep subsequent transition reports fresh
 	}
-	wasOpen := ds.port.Open()
-	if err := ds.port.OpenForIf(msg.ShareID, sig.Lease, openEpoch); err != nil {
+	// Capture the identity of the mapping THIS open committed to. The identity
+	// is the port's own serialized decision — whether this operation CREATED the
+	// mapping, and which mapping instance it committed to — so the failure
+	// rollback below can target exactly that mapping. A bare `ds.port.Open()`
+	// probe cannot: it round-trips before the open, so a concurrent creator can
+	// flip the answer and make a JOIN look like a creation. Every open in one
+	// unlocked epoch shares openEpoch, so the generation alone cannot make the
+	// distinction either.
+	outcome, err := ds.port.OpenForIfTracked(msg.ShareID, sig.Lease, openEpoch)
+	if err != nil {
 		if errors.Is(err, direct.ErrOpenSuperseded) {
 			log.Printf("open_signal %s refused: superseded by a lockdown transition", msg.ShareID)
 			_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
@@ -2142,10 +2150,11 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	// CONFIRM delivery inside a bounded context BEFORE the OK open_ack. The
 	// report is sent from the reporter's drain goroutine, so no port lock,
 	// ackMu, or router I/O is held while we wait. A failed, dropped, or
-	// unconfirmed report is an unsuccessful open: tear the mapping back down
-	// (targeting the created mapping's identity, so no half-open or foreign
-	// mapping is touched) and answer with an error ack instead of advertising
-	// an unreported endpoint.
+	// unconfirmed report is an unsuccessful open. It is torn down ONLY if THIS
+	// open created the mapping (ownership-scoped rollback, targeting that exact
+	// mapping instance): an open that merely joined an already-healthy mapping
+	// is unsuccessful for its own request, but it must not clear the owner's
+	// mapping, logical-open state, sessions or holds.
 	//
 	// A §13.4 lockdown may publish its generation and close the mapping at any
 	// point between OpenForIf returning and the ack — in particular during the
@@ -2164,7 +2173,7 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 	}
 	if reportErr := d.confirmOpenEndpoint(ds, preCommit.GrantedPort()); reportErr != nil {
 		log.Printf("open_signal %s: endpoint report before open_ack failed: %v", msg.ShareID, reportErr)
-		if closeErr := ds.port.DiscardOpenMapping(openEpoch); closeErr != nil {
+		if closeErr := ds.port.DiscardOpenMappingFor(outcome); closeErr != nil {
 			// The mapping delete is retried by the port's own close timer and
 			// escalated via CloseError; the open is already unsuccessful.
 			log.Printf("open_signal %s: mapping teardown after report failure: %v", msg.ShareID, closeErr)
@@ -2173,7 +2182,7 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "open_failed"})
 		return
 	}
-	if !d.ackOpenSuccess(msg, ds, openEpoch, ip, wasOpen) {
+	if !d.ackOpenSuccess(msg, ds, outcome, ip) {
 		log.Printf("open_signal %s refused after reporting: not the confirmed current open (superseded or OK-ack refused)", msg.ShareID)
 		_ = d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 			ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq, Status: "error", Error: "superseded"})
@@ -2209,26 +2218,30 @@ func (d *Daemon) handleOpenSignal(msg signaling.Message) {
 //
 // This function's granted-port source must stay the commit token: the structural
 // guard also pins that.
-func (d *Daemon) ackOpenSuccess(msg signaling.Message, ds *directState, gen uint64, ip string, wasOpen bool) bool {
-	commit, current := ds.port.CommitOpenAck(gen)
+func (d *Daemon) ackOpenSuccess(msg signaling.Message, ds *directState, outcome direct.OpenOutcome, ip string) bool {
+	commit, current := ds.port.CommitOpenAck(outcome.Generation())
 	if !current {
 		return false
 	}
 	if err := d.signaling.OpenAck(context.Background(), signaling.OpenAck{
 		ShareID: msg.ShareID, Nonce: msg.Nonce, Seq: msg.Seq,
 		GrantedPort: commit.GrantedPort(), PublicIP: ip,
-		WasAlreadyOpen: wasOpen, Status: "ok",
-		Validation: &signaling.OpenAckValidation{Epoch: gen},
+		// The ack reports whether the mapping was ALREADY open at this
+		// operation. outcome.Created() is the port state loop's serialized
+		// answer for THIS open, not a pre-open probe that a concurrent creator
+		// could flip.
+		WasAlreadyOpen: !outcome.Created(), Status: "ok",
+		Validation: &signaling.OpenAckValidation{Epoch: outcome.Generation()},
 	}); err != nil {
-		// The OK ack never reached control, so the open is unsuccessful and its
-		// mapping must not outlive the undelivered ack (remediation finding 2):
-		// a WebSocket loss between the endpoint report and the ack previously
-		// left the mapping live for its whole lease. Tear it down through the
-		// same generation-guarded, discovered-identity discard the
-		// report-failure arm uses. This is a no-op when the transport guard
-		// already discarded a superseded generation, and it never touches a
-		// newer generation's mapping.
-		if closeErr := ds.port.DiscardOpenMapping(gen); closeErr != nil {
+		// The OK ack never reached control, so the open is unsuccessful. It is
+		// rolled back through the SAME ownership-scoped discard the
+		// report-failure arm uses: only a mapping THIS open CREATED may not
+		// outlive its undelivered ack (remediation finding 2); an open that
+		// merely joined an already-healthy mapping must leave that mapping, its
+		// logical-open state, sessions and holds intact. The discard is a no-op
+		// when the transport guard already discarded a superseded generation,
+		// and it never touches a newer generation's mapping.
+		if closeErr := ds.port.DiscardOpenMappingFor(outcome); closeErr != nil {
 			log.Printf("open_signal %s: mapping teardown after an undelivered OK open_ack: %v", msg.ShareID, closeErr)
 		}
 		return false

@@ -316,12 +316,13 @@ func TestOpenSignalReportSendFailureFailsOpen(t *testing.T) {
 	}
 }
 
-// TestOpenSignalAlreadyOpenReportFailureTearsDownMapping proves the failure
-// contract also holds on the already-open fast path: once a signal's report
-// cannot be confirmed, the mapping is closed (no surviving mapping) even though
-// the port was open from an earlier successful signal, and the ack is an error
-// rather than a second OK.
-func TestOpenSignalAlreadyOpenReportFailureTearsDownMapping(t *testing.T) {
+// TestOpenSignalAlreadyOpenReportFailureKeepsMapping proves the failure
+// contract on the already-open fast path was corrected by the post-M5
+// availability remediation: a signal whose report cannot be confirmed is
+// unsuccessful FOR THAT REQUEST and gets the open_failed error ack, but it did
+// not create the mapping, so it must NOT clear the already-healthy mapping
+// another recipient established (that teardown was the audit finding).
+func TestOpenSignalAlreadyOpenReportFailureKeepsMapping(t *testing.T) {
 	f := newReportOrderFixture(t, newRemapDirectMapper(52022))
 
 	// First open succeeds and reports.
@@ -329,9 +330,11 @@ func TestOpenSignalAlreadyOpenReportFailureTearsDownMapping(t *testing.T) {
 	if !f.port.Open() {
 		t.Fatalf("the first open must leave the mapping open")
 	}
+	granted := f.port.GrantedPort()
 
 	// The second signal finds the port already open (its shorter lease takes
-	// the non-renewal fast path); its report fails, so the open is unsuccessful.
+	// the non-renewal fast path); its report fails, so the open is unsuccessful
+	// for that request.
 	f.client.setReportFn(func(ctx context.Context, ip string, port int, status string) error {
 		return errors.New("report send failed on the already-open path")
 	})
@@ -343,14 +346,16 @@ func TestOpenSignalAlreadyOpenReportFailureTearsDownMapping(t *testing.T) {
 	if acks := countOpenAcks(f.client.messagesSnapshot(), "ok"); acks != 1 {
 		t.Fatalf("ok open_ack count = %d, want exactly the first open's", acks)
 	}
-	if f.port.Open() {
-		t.Fatalf("a failed report on the already-open path must not leave the mapping open")
+	// The already-open mapping did not belong to the failing request: it must
+	// survive untouched.
+	if !f.port.Open() {
+		t.Fatalf("a failed report on the already-open path must not tear down the healthy mapping")
 	}
-	if got := f.port.GrantedPort(); got != 0 {
-		t.Fatalf("granted port = %d, want 0 after teardown", got)
+	if got := f.port.GrantedPort(); got != granted {
+		t.Fatalf("granted port = %d, want the healthy mapping's %d", got, granted)
 	}
-	if listing, err := f.mapper.ListPortMappings(); err != nil || len(listing) != 0 {
-		t.Fatalf("mappings after already-open report failure = %#v (err %v), want none", listing, err)
+	if listing, err := f.mapper.ListPortMappings(); err != nil || len(listing) != 1 {
+		t.Fatalf("mappings after already-open report failure = %#v (err %v), want exactly the healthy one", listing, err)
 	}
 }
 
