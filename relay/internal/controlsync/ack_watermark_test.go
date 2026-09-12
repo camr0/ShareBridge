@@ -19,6 +19,7 @@ package controlsync
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -60,9 +61,16 @@ func ackWatermarkSnapshot(revision uint64) Snapshot {
 // ackWatermarkNoopDelta is the up-to-date poll control answers when it has
 // published nothing new: since == latest_revision == revision.
 func ackWatermarkNoopDelta(revision uint64) DeltaPage {
+	return ackWatermarkNoopDeltaAt(7, revision)
+}
+
+// ackWatermarkNoopDeltaAt is the same up-to-date poll stamped with an explicit
+// control epoch, so the restart boundary can be driven against a payload the
+// pre-restart control served.
+func ackWatermarkNoopDeltaAt(epoch, revision uint64) DeltaPage {
 	return DeltaPage{
 		Version:        ProtocolVersion,
-		Epoch:          7,
+		Epoch:          epoch,
 		Status:         DeltaStatusOK,
 		Since:          revision,
 		LatestRevision: revision,
@@ -138,6 +146,60 @@ func TestNewRevisionAckFailureWithdrawsControlSync(t *testing.T) {
 	}
 	if health.RouteReady() {
 		t.Fatal("a rejected ack after a NEW revision was applied must withdraw route_ready until an ack catches up")
+	}
+}
+
+// TestForeignEpochAckRefusalWithdrawsControlSync pins the control-restart
+// boundary the A1 watermark missed: control restarts to a new epoch, and the
+// ack the gateway sends for the epoch it had applied reaches the NEW control,
+// which refuses it (acknowledged:false, reason "foreign_epoch") because it
+// recorded nothing. A refusal is not the same as a transport failure: control
+// has explicitly told the gateway that the acknowledgement does not exist, so
+// the gateway must withdraw the superseded epoch's watermark and report
+// unhealthy, exactly as the new control does (hasAck=false). It must not stay
+// route_ready on the strength of an ack the new control never recorded.
+// Adopting the new epoch and re-acking restores the truth.
+func TestForeignEpochAckRefusalWithdrawsControlSync(t *testing.T) {
+	certs := newSyncTestCertificates(t)
+	script, _, health, loop := ackWatermarkLoop(t, certs)
+
+	// Control (epoch 7) publishes revision 40; the gateway applies and acks.
+	script.setStatusEpoch(7)
+	script.setSnapshot(t, ackWatermarkSnapshot(40))
+	if err := loop.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("initial ReconcileOnce: %v", err)
+	}
+	if !health.RouteReady() {
+		t.Fatal("precondition: a current ack must leave route_ready=true")
+	}
+
+	// Control restarts to epoch 8 while the gateway is still applied at epoch
+	// 7: the in-flight epoch-7 poll (served by the pre-restart control) is
+	// applied, then its epoch-7 ack reaches the new control, which refuses it.
+	script.setStatusEpoch(8)
+	script.setDelta(t, ackWatermarkNoopDelta(40))
+	if err := loop.ReconcileOnce(context.Background()); !errors.Is(err, ErrAckFailed) {
+		t.Fatalf("foreign-epoch refusal: err=%v, want ErrAckFailed", err)
+	}
+	if health.RouteReady() {
+		t.Fatal("the new control refused the epoch-7 ack and recorded nothing; the gateway must not stay route_ready on the superseded epoch's watermark")
+	}
+
+	// The gateway now talks to the new epoch: a page not stamped with its
+	// applied epoch forces a fresh snapshot; adopting and acking epoch 8
+	// restores health.
+	script.setDelta(t, ackWatermarkNoopDeltaAt(8, 2))
+	script.setSnapshot(t, Snapshot{
+		Version:  ProtocolVersion,
+		Epoch:    8,
+		Revision: 2,
+		Routes:   []Route{wireRoute(reconcileHostnameA, 2, reconcileAgentA, reconcilePort)},
+	})
+	if err := loop.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("ReconcileOnce after adopting the new epoch: %v", err)
+	}
+	if !health.RouteReady() {
+		t.Fatal("adopting the new epoch and acking it must restore route_ready")
 	}
 }
 

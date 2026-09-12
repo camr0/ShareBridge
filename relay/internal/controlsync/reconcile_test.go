@@ -101,6 +101,17 @@ type scriptedControl struct {
 	// statusFail makes PathStatus answer 503 while the snapshot/delta GETs
 	// keep succeeding (M5 remediation round 2, Finding A).
 	statusFail bool
+	// statusEpoch, when non-zero, makes PathStatus answer like a control
+	// publisher at that epoch: an ack carrying any other control epoch is
+	// refused with acknowledged:false / "foreign_epoch", exactly as control
+	// refuses in-flight acks across a restart (R2). Zero (the default) keeps
+	// the pre-boundary behaviour of accepting every ack.
+	statusEpoch uint64
+	// statusHasAck/statusAckedRevision mirror control's accepted watermark for
+	// the declared statusEpoch, so a test can observe which acks control
+	// actually recorded.
+	statusHasAck        bool
+	statusAckedRevision uint64
 }
 
 func newScriptedControl(t *testing.T, certs syncTestCertificates) (*scriptedControl, *Client) {
@@ -144,6 +155,42 @@ func (script *scriptedControl) handle(t *testing.T, request *http.Request) (int,
 			t.Fatalf("scriptedControl: read status body: %v", err)
 		}
 		script.statusBodies = append(script.statusBodies, body)
+		if script.statusEpoch != 0 {
+			// Model control's publisher at a declared epoch: refuse any ack
+			// that does not carry it, recording nothing, and report the
+			// explicit bounded negative. The wire shape is built from an
+			// anonymous struct so the test pins the exact JSON independent
+			// of the production Go type (and compiles against the base).
+			var ack StatusAck
+			if err := json.Unmarshal(body, &ack); err != nil {
+				t.Fatalf("scriptedControl: decode status ack: %v", err)
+			}
+			accepted := ack.ControlEpoch == script.statusEpoch
+			reason := ""
+			if accepted {
+				if !script.statusHasAck || ack.LastAppliedRevision > script.statusAckedRevision {
+					script.statusAckedRevision = ack.LastAppliedRevision
+				}
+				script.statusHasAck = true
+			} else {
+				reason = "foreign_epoch"
+			}
+			receipt, err := json.Marshal(struct {
+				Version             int    `json:"version"`
+				Acknowledged        bool   `json:"acknowledged"`
+				Reason              string `json:"reason,omitempty"`
+				LastAppliedRevision uint64 `json:"last_applied_revision"`
+			}{
+				Version:             ProtocolVersion,
+				Acknowledged:        accepted,
+				Reason:              reason,
+				LastAppliedRevision: script.statusAckedRevision,
+			})
+			if err != nil {
+				t.Fatalf("scriptedControl: marshal status response: %v", err)
+			}
+			return http.StatusOK, receipt
+		}
 		receipt, err := json.Marshal(StatusAckResponse{Version: ProtocolVersion, Acknowledged: true})
 		if err != nil {
 			t.Fatalf("scriptedControl: marshal status response: %v", err)
@@ -221,6 +268,16 @@ func (script *scriptedControl) failStatus(fail bool) {
 	script.mu.Lock()
 	defer script.mu.Unlock()
 	script.statusFail = fail
+}
+
+// setStatusEpoch declares the scripted control's current epoch (see the field
+// doc): acks for any other epoch get an explicit acknowledged:false refusal
+// with reason "foreign_epoch", while acks for this epoch advance the
+// scripted control's own watermark.
+func (script *scriptedControl) setStatusEpoch(epoch uint64) {
+	script.mu.Lock()
+	defer script.mu.Unlock()
+	script.statusEpoch = epoch
 }
 
 func (script *scriptedControl) setDelta(t *testing.T, page DeltaPage) {

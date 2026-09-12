@@ -227,14 +227,22 @@ func (stub *stubPresenceSink) ApplyPresenceEvents(envelope PresenceEnvelope) err
 type stubStatusSink struct {
 	acks []StatusAck
 	err  error
+	// epoch, when non-zero, makes the sink model control's publisher: an ack
+	// carrying any other control epoch is refused with the bounded
+	// AckReasonForeignEpoch and records nothing. Zero (the default) accepts
+	// every ack, preserving the pre-boundary test scripts.
+	epoch uint64
 }
 
-func (stub *stubStatusSink) Acknowledge(ack StatusAck) error {
+func (stub *stubStatusSink) Acknowledge(ack StatusAck) (AckOutcome, error) {
 	if stub.err != nil {
-		return stub.err
+		return AckOutcome{}, stub.err
+	}
+	if stub.epoch != 0 && ack.ControlEpoch != stub.epoch {
+		return AckOutcome{Accepted: false, Reason: AckReasonForeignEpoch}, nil
 	}
 	stub.acks = append(stub.acks, ack)
-	return nil
+	return AckOutcome{Accepted: true}, nil
 }
 
 // startSyncTestServer mounts the control sync server behind httptest with its
@@ -995,6 +1003,119 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 		response.Body.Close()
 		if response.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("nil sink presence status = %d, want 503", response.StatusCode)
+		}
+	})
+}
+
+// TestSyncReportsUnacceptedAcknowledgementTruthfully pins the A2 control-side
+// truth: /status must report whether the acknowledgement was ACTUALLY recorded
+// — the epoch matched and the watermark advanced — not merely that the request
+// was handled. An ack for a foreign control epoch is refused with
+// acknowledged:false / reason "foreign_epoch", it does not pollute the
+// server's own dedup cache, and a subsequent ack for the current epoch is
+// still forwarded and accepted. A stale-epoch ack arriving after a current one
+// does not disturb the recorded watermark.
+func TestSyncReportsUnacceptedAcknowledgementTruthfully(t *testing.T) {
+	certs := newSyncTestCertificates(t)
+	const currentEpoch = 9
+	const gatewayBoot = "gwboot4k9x2m7qzr15"
+
+	postAck := func(t *testing.T, client *http.Client, baseURL string, ack StatusAck) StatusAckResponse {
+		t.Helper()
+		payload, err := json.Marshal(ack)
+		if err != nil {
+			t.Fatalf("marshal ack: %v", err)
+		}
+		request, err := http.NewRequest(http.MethodPost, baseURL+PathStatus, bytes.NewReader(payload))
+		if err != nil {
+			t.Fatalf("build POST: %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatalf("POST status: %v", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("ack status = %d, want 200", response.StatusCode)
+		}
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read status body: %v", err)
+		}
+		var decoded StatusAckResponse
+		decodeStrictJSON(t, body, &decoded)
+		return decoded
+	}
+
+	t.Run("foreign-epoch ack is reported not accepted and is not recorded", func(t *testing.T) {
+		sink := &stubStatusSink{epoch: currentEpoch}
+		server, testServer := newSyncTestServer(t, certs, func(config *ServerConfig) {
+			config.StatusSink = sink
+		})
+		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
+
+		decoded := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: gatewayBoot, ControlEpoch: currentEpoch - 1, LastAppliedRevision: 7})
+		if decoded.Acknowledged {
+			t.Fatalf("foreign-epoch ack reported acknowledged:true: %+v", decoded)
+		}
+		if decoded.Reason != AckReasonForeignEpoch {
+			t.Fatalf("foreign-epoch refusal reason = %q, want %q", decoded.Reason, AckReasonForeignEpoch)
+		}
+		if len(sink.acks) != 0 {
+			t.Fatalf("foreign-epoch ack reached the sink: %+v", sink.acks)
+		}
+		if got := server.LastAcknowledgedRevision(gatewayBoot); got != 0 {
+			t.Fatalf("a refused ack polluted the recorded revision: %d, want 0", got)
+		}
+	})
+
+	t.Run("a current-epoch ack after a refused foreign ack is still accepted", func(t *testing.T) {
+		sink := &stubStatusSink{epoch: currentEpoch}
+		server, testServer := newSyncTestServer(t, certs, func(config *ServerConfig) {
+			config.StatusSink = sink
+		})
+		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
+
+		if decoded := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: gatewayBoot, ControlEpoch: currentEpoch - 1, LastAppliedRevision: 7}); decoded.Acknowledged {
+			t.Fatalf("foreign-epoch ack reported acknowledged:true: %+v", decoded)
+		}
+		// The refused ack must not have primed the dedup cache; the same boot
+		// reporting the same revision for the CURRENT epoch must be forwarded.
+		decoded := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: gatewayBoot, ControlEpoch: currentEpoch, LastAppliedRevision: 7})
+		if !decoded.Acknowledged {
+			t.Fatalf("current-epoch ack after a refusal reported acknowledged:false: %+v", decoded)
+		}
+		if decoded.LastAppliedRevision != 7 {
+			t.Fatalf("current-epoch ack echoed revision %d, want 7", decoded.LastAppliedRevision)
+		}
+		if got := server.LastAcknowledgedRevision(gatewayBoot); got != 7 {
+			t.Fatalf("recorded revision = %d, want 7", got)
+		}
+		if len(sink.acks) != 1 || sink.acks[0].ControlEpoch != currentEpoch {
+			t.Fatalf("sink acks = %+v, want exactly the current-epoch ack", sink.acks)
+		}
+	})
+
+	t.Run("a stale-epoch ack after a current one does not disturb the watermark", func(t *testing.T) {
+		sink := &stubStatusSink{epoch: currentEpoch}
+		server, testServer := newSyncTestServer(t, certs, func(config *ServerConfig) {
+			config.StatusSink = sink
+		})
+		client := newSyncTestHTTPClient(t, certs.serverCAPEM, certs.gatewayCertPEM, certs.gatewayKeyPEM, testControlIdentity)
+
+		if decoded := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: gatewayBoot, ControlEpoch: currentEpoch, LastAppliedRevision: 7}); !decoded.Acknowledged {
+			t.Fatalf("current-epoch ack reported acknowledged:false: %+v", decoded)
+		}
+		decoded := postAck(t, client, testServer.URL, StatusAck{Version: ProtocolVersion, GatewayBootID: gatewayBoot, ControlEpoch: currentEpoch - 1, LastAppliedRevision: 9})
+		if decoded.Acknowledged {
+			t.Fatalf("stale-epoch ack reported acknowledged:true: %+v", decoded)
+		}
+		if decoded.Reason != AckReasonForeignEpoch {
+			t.Fatalf("stale-epoch refusal reason = %q, want %q", decoded.Reason, AckReasonForeignEpoch)
+		}
+		if got := server.LastAcknowledgedRevision(gatewayBoot); got != 7 {
+			t.Fatalf("stale-epoch ack disturbed the recorded watermark: %d, want 7", got)
 		}
 	})
 }

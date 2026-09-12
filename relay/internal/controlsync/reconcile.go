@@ -621,6 +621,13 @@ func (applier *Applier) setState(epoch uint64, revision uint64) {
 // when a reconcile never reached control (see Loop.ReconcileOnce), because
 // only then can it not know whether control has published past
 // appliedRevision.
+//
+// An explicit refusal (control answered acknowledged:false, so it recorded no
+// ack for the epoch the gateway submitted) drops the watermark via
+// invalidateAck; the gateway then reports false for that epoch rather than
+// claim an ack control does not hold (A2). A plain transport failure leaves
+// the watermark standing, since control may still hold a previously recorded
+// ack — that is the A1 no-op case.
 func (applier *Applier) ControlSyncHealthy() bool {
 	applier.mu.Lock()
 	defer applier.mu.Unlock()
@@ -630,7 +637,9 @@ func (applier *Applier) ControlSyncHealthy() bool {
 // recordAck records the revision an ACCEPTED acknowledgement covered. The
 // watermark advances monotonically within an epoch and is replaced wholesale
 // when the epoch changes, exactly mirroring control's own Acknowledge handling
-// of a new gateway boot ID (control/internal/relayctl/publisher.go).
+// of a new gateway boot ID (control/internal/relayctl/publisher.go). It is
+// only ever called when control's response said the ack was accepted; a
+// refusal records nothing.
 func (applier *Applier) recordAck(epoch uint64, revision uint64) {
 	applier.mu.Lock()
 	defer applier.mu.Unlock()
@@ -645,6 +654,25 @@ func (applier *Applier) recordAck(epoch uint64, revision uint64) {
 	}
 }
 
+// invalidateAck drops the recorded acknowledgement watermark for rejectedEpoch
+// when it is the epoch the watermark is currently keyed on. It is invoked when
+// control explicitly REFUSED an acknowledgement (acknowledged:false, e.g.
+// reason "foreign_epoch"): control holds no ack from this gateway for its
+// current epoch, so the gateway must stop claiming an ack on the strength of a
+// superseded epoch (under-claim, never over-claim). A refusal for an epoch
+// other than the recorded one is ignored: a newer accepted ack is still a fact
+// control shares, and a delayed refusal of an older ack must not withdraw it.
+// The next reconcile adopts the new epoch and re-acks.
+func (applier *Applier) invalidateAck(rejectedEpoch uint64) {
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	if applier.hasAcked && applier.ackedEpoch == rejectedEpoch {
+		applier.hasAcked = false
+		applier.ackedEpoch = 0
+		applier.ackedRevision = 0
+	}
+}
+
 // appliedState reads the applied epoch and revision as one atomic pair, so an
 // acknowledgement and the watermark it records always refer to the same
 // applied state even if another goroutine applies concurrently.
@@ -655,15 +683,18 @@ func (applier *Applier) appliedState() (uint64, uint64) {
 }
 
 // acknowledge reports the applied revision to control (§11.3 status),
-// carrying the control epoch of the applied state (R2: control ignores acks
-// from foreign epochs). The apply has already committed, so the acknowledgement
-// is the LAST step and its failure is returned to the caller wrapped in
-// ErrAckFailed: control renews route leases only while its publisher is
-// Healthy(), which requires the current boot's explicit ack of the latest
-// revision. An ACCEPTED acknowledgement records the revision control now
-// covers (recordAck) so the health truth mirrors control's watermark rather
-// than a blanket boolean. It is not latched — the next accepted ack advances
-// the watermark, which is control's own non-latching predicate.
+// carrying the control epoch of the applied state (R2: control refuses acks
+// from foreign epochs). The apply has already committed, so the
+// acknowledgement is the LAST step and its failure is returned to the caller
+// wrapped in ErrAckFailed: control renews route leases only while its
+// publisher is Healthy(), which requires the current boot's explicit ack of
+// the latest revision. The watermark is recorded ONLY when control's response
+// says the ack was ACCEPTED; an explicit negative (ErrAckRejected) additionally
+// withdraws any watermark the gateway was claiming for that epoch, because
+// control recorded nothing there (A2). A transport failure is different: it
+// leaves the previous watermark standing, since control may still hold it.
+// Nothing is latched — the next accepted ack advances the watermark, which is
+// control's own non-latching predicate.
 func (applier *Applier) acknowledge(ctx context.Context) error {
 	epoch, revision := applier.appliedState()
 	ack := StatusAck{
@@ -673,6 +704,13 @@ func (applier *Applier) acknowledge(ctx context.Context) error {
 		LastAppliedRevision: revision,
 	}
 	if _, err := applier.client.SendStatus(ctx, ack); err != nil {
+		if errors.Is(err, ErrAckRejected) {
+			// Control handled the request and explicitly did not record the
+			// ack (our applied epoch is not control's current one): the
+			// watermark for the rejected epoch does not exist on control's
+			// side, so it must not exist on ours either.
+			applier.invalidateAck(epoch)
+		}
 		applier.logger.Warn("controlsync: status ack failed (the next reconcile re-acks)",
 			"error", err)
 		return fmt.Errorf("%w: %w", ErrAckFailed, err)

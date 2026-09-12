@@ -454,7 +454,7 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 
 	// A stale acknowledgement (below the published revision) keeps sync
 	// unhealthy.
-	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, ControlEpoch: publisher.Epoch(), LastAppliedRevision: publisherTestSeed}); err != nil {
+	if _, err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, ControlEpoch: publisher.Epoch(), LastAppliedRevision: publisherTestSeed}); err != nil {
 		t.Fatalf("stale ack: %v", err)
 	}
 	if publisher.Healthy() {
@@ -462,7 +462,7 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 	}
 
 	// The explicit ack of the published revision makes sync healthy.
-	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, ControlEpoch: publisher.Epoch(), LastAppliedRevision: publisherTestSeed + 1}); err != nil {
+	if _, err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: publisherTestBootID, ControlEpoch: publisher.Epoch(), LastAppliedRevision: publisherTestSeed + 1}); err != nil {
 		t.Fatalf("explicit ack: %v", err)
 	}
 	if !publisher.Healthy() {
@@ -475,8 +475,15 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 	// An ack from a foreign control epoch (in-flight across a control
 	// restart) is ignored wholesale: it must not reset the recorded state
 	// nor disturb the current epoch's health watermark (R2).
-	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: "gateway-boot-foreign", ControlEpoch: publisher.Epoch() + 1, LastAppliedRevision: 0}); err != nil {
+	foreignOutcome, err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: "gateway-boot-foreign", ControlEpoch: publisher.Epoch() + 1, LastAppliedRevision: 0})
+	if err != nil {
 		t.Fatalf("foreign-epoch ack: %v", err)
+	}
+	if foreignOutcome.Accepted {
+		t.Fatalf("foreign-epoch ack must be reported NOT accepted, got %+v", foreignOutcome)
+	}
+	if foreignOutcome.Reason != AckReasonForeignEpoch {
+		t.Fatalf("foreign-epoch refusal reason = %q, want %q", foreignOutcome.Reason, AckReasonForeignEpoch)
 	}
 	if !publisher.Healthy() {
 		t.Fatalf("foreign-epoch ack must be ignored, not reset health")
@@ -493,7 +500,7 @@ func TestPublisherRetriesUntilExplicitAck(t *testing.T) {
 	}
 
 	// A gateway restart (new boot ID) resets acknowledgement state wholesale.
-	if err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: "gateway-boot-test-2", ControlEpoch: publisher.Epoch(), LastAppliedRevision: 0}); err != nil {
+	if _, err := publisher.Acknowledge(StatusAck{Version: ProtocolVersion, GatewayBootID: "gateway-boot-test-2", ControlEpoch: publisher.Epoch(), LastAppliedRevision: 0}); err != nil {
 		t.Fatalf("new-boot ack: %v", err)
 	}
 	if publisher.Healthy() {

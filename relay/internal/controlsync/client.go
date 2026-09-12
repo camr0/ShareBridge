@@ -82,6 +82,14 @@ var (
 	// ErrInvalidPayload covers malformed payloads: wrong enums, bad
 	// identities, unparseable expiries, non-JSON, and trailing data.
 	ErrInvalidPayload = errors.New("controlsync: sync payload rejected")
+	// ErrAckRejected is the explicit NEGATIVE answer to a status ack: control
+	// handled the request but did not record the acknowledgement (its
+	// response carried acknowledged:false). It is deliberately distinct from
+	// a transport failure: a transport failure may leave a previously
+	// recorded ack standing, while an explicit rejection means control holds
+	// no ack for the submitted epoch and the gateway must withdraw any
+	// watermark it was claiming for it (M5 r2 Fix A2).
+	ErrAckRejected = errors.New("controlsync: status acknowledgement rejected")
 )
 
 // Limits carries the §14 concurrency ceilings distributed with a route.
@@ -178,12 +186,32 @@ type StatusAck struct {
 	LastAppliedRevision uint64 `json:"last_applied_revision"`
 }
 
+// AckReasonForeignEpoch mirrors control's bounded reason for an ack it did
+// not record because the submitted control epoch was not control's own. Only
+// this fixed token (and the generic fallback) may appear in an error or log
+// line; see BoundedAckReason.
+const AckReasonForeignEpoch = "foreign_epoch"
+
 // StatusAckResponse echoes control's recorded last-applied revision for the
-// reporting boot.
+// reporting boot. Acknowledged is true only when control actually RECORDED
+// the acknowledgement; a foreign-epoch (or otherwise unrecorded) ack answers
+// acknowledged:false with a bounded Reason, and LastAppliedRevision is not
+// meaningful. The gateway must treat acknowledged:false as "not acked".
 type StatusAckResponse struct {
 	Version             int    `json:"version"`
 	Acknowledged        bool   `json:"acknowledged"`
+	Reason              string `json:"reason,omitempty"`
 	LastAppliedRevision uint64 `json:"last_applied_revision"`
+}
+
+// BoundedAckReason maps a control-reported acknowledgement reason to the
+// fixed allowlist that may appear in an error (and therefore a log line), so
+// an unexpected or high-cardinality reason can never leak into diagnostics.
+func BoundedAckReason(reason string) string {
+	if reason == AckReasonForeignEpoch {
+		return reason
+	}
+	return "not_accepted"
 }
 
 // SyncReceipt is the bounded response to a presence publish.
@@ -360,7 +388,8 @@ func (client *Client) SendStatus(ctx context.Context, ack StatusAck) (StatusAckR
 		return StatusAckResponse{}, err
 	}
 	if !response.Acknowledged {
-		return StatusAckResponse{}, fmt.Errorf("%w: status ack not acknowledged", ErrInvalidPayload)
+		return StatusAckResponse{}, fmt.Errorf("%w: control refused to record the acknowledgement (reason %s)",
+			ErrAckRejected, BoundedAckReason(response.Reason))
 	}
 	return response, nil
 }

@@ -56,10 +56,12 @@ type PresenceSink interface {
 }
 
 // StatusSink receives explicit acknowledgements of the gateway's last-applied
-// revision (the Task 12 publisher uses them to stop retrying deltas). A nil
-// sink serves 503.
+// revision (the Task 12 publisher uses them to stop retrying deltas). It
+// reports whether the acknowledgement was actually RECORDED and, when it was
+// not, a bounded reason — the /status response must echo that truth rather
+// than a blanket success. A nil sink serves 503.
 type StatusSink interface {
-	Acknowledge(StatusAck) error
+	Acknowledge(StatusAck) (AckOutcome, error)
 }
 
 // ServerConfig is the complete sync server configuration. Certificate
@@ -111,6 +113,7 @@ type Server struct {
 
 	mu                       sync.Mutex
 	acknowledgedBootID       string
+	acknowledgedEpoch        uint64
 	lastAcknowledgedRevision uint64
 	forwardFailed            bool
 }
@@ -367,28 +370,33 @@ func (server *Server) handleStatus(responseWriter http.ResponseWriter, request *
 		return
 	}
 
+	// Decide whether the sink must see this ack WITHOUT mutating the cache:
+	// the cache may only record an acknowledgement the sink actually accepted
+	// (A2). A foreign-epoch ack is never an idempotent duplicate — only the
+	// sink can say whether the current epoch accepted it — so it is always
+	// forwarded, regardless of the cached revision.
 	server.mu.Lock()
 	forward := false
-	if ack.GatewayBootID != server.acknowledgedBootID {
-		// New gateway epoch: its applied revision replaces the old record
+	switch {
+	case ack.GatewayBootID != server.acknowledgedBootID:
+		// New gateway boot: its applied revision replaces the old record
 		// wholesale — a restarted gateway may apply a lower revision again.
-		server.acknowledgedBootID = ack.GatewayBootID
-		server.lastAcknowledgedRevision = ack.LastAppliedRevision
 		forward = true
-	} else if ack.LastAppliedRevision > server.lastAcknowledgedRevision {
-		server.lastAcknowledgedRevision = ack.LastAppliedRevision
+	case ack.ControlEpoch != server.acknowledgedEpoch:
 		forward = true
-	} else if server.forwardFailed && ack.LastAppliedRevision == server.lastAcknowledgedRevision {
+	case ack.LastAppliedRevision > server.lastAcknowledgedRevision:
+		forward = true
+	case server.forwardFailed && ack.LastAppliedRevision == server.lastAcknowledgedRevision:
 		// The previous forward failed before the publisher saw it: re-deliver
 		// the equal acknowledgement so a retry cannot be swallowed.
 		forward = true
 	}
-	echoed := server.lastAcknowledgedRevision
 	server.forwardFailed = false
 	server.mu.Unlock()
 
 	if forward {
-		if err := server.statusSink.Acknowledge(ack); err != nil {
+		outcome, err := server.statusSink.Acknowledge(ack)
+		if err != nil {
 			server.mu.Lock()
 			server.forwardFailed = true
 			server.mu.Unlock()
@@ -396,7 +404,33 @@ func (server *Server) handleStatus(responseWriter http.ResponseWriter, request *
 			server.writeError(responseWriter, http.StatusInternalServerError, "status sink failure")
 			return
 		}
+		if !outcome.Accepted {
+			// The sink recorded nothing: do not prime the cache with an ack
+			// that does not exist, and report the explicit negative. A
+			// subsequent current-epoch ack must still reach the sink.
+			server.writeJSON(responseWriter, http.StatusOK, StatusAckResponse{
+				Version:      ProtocolVersion,
+				Acknowledged: false,
+				Reason:       BoundedAckReason(outcome.Reason),
+			})
+			return
+		}
 	}
+
+	server.mu.Lock()
+	if ack.GatewayBootID != server.acknowledgedBootID {
+		server.acknowledgedBootID = ack.GatewayBootID
+		server.acknowledgedEpoch = ack.ControlEpoch
+		server.lastAcknowledgedRevision = ack.LastAppliedRevision
+	} else {
+		server.acknowledgedEpoch = ack.ControlEpoch
+		if ack.LastAppliedRevision > server.lastAcknowledgedRevision {
+			server.lastAcknowledgedRevision = ack.LastAppliedRevision
+		}
+	}
+	echoed := server.lastAcknowledgedRevision
+	server.mu.Unlock()
+
 	server.writeJSON(responseWriter, http.StatusOK, StatusAckResponse{
 		Version:             ProtocolVersion,
 		Acknowledged:        true,

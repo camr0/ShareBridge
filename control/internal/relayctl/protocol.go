@@ -202,11 +202,35 @@ type StatusAck struct {
 	LastAppliedRevision uint64 `json:"last_applied_revision"`
 }
 
+// AckReasonForeignEpoch is the bounded reason control reports for a status ack
+// it did not record: a StatusAck is accepted only when it carries the
+// publisher's own control epoch, and any other epoch is in-flight traffic from
+// a gateway that has not yet reconciled across a control restart (R2). The
+// value is a fixed, low-cardinality token, safe to report on the wire and to
+// log.
+const AckReasonForeignEpoch = "foreign_epoch"
+
+// AckOutcome is control's truthful answer to a status acknowledgement: whether
+// the acknowledgement was actually RECORDED (the control epoch matched and the
+// watermark advanced). A request that was handled but recorded nothing is not
+// an accepted acknowledgement, and the bounded Reason says why. The zero value
+// is the accepted outcome.
+type AckOutcome struct {
+	Accepted bool
+	// Reason is AckReasonForeignEpoch (or a future bounded token) when the ack
+	// was not recorded, and empty when Accepted is true.
+	Reason string
+}
+
 // StatusAckResponse echoes control's recorded last-applied revision for the
-// reporting boot.
+// reporting boot. Acknowledged is true only when the acknowledgement was
+// actually recorded: a foreign-epoch (or otherwise unrecorded) ack answers
+// acknowledged:false with the bounded Reason, and LastAppliedRevision is not
+// meaningful. A client must treat acknowledged:false as "not acked".
 type StatusAckResponse struct {
 	Version             int    `json:"version"`
 	Acknowledged        bool   `json:"acknowledged"`
+	Reason              string `json:"reason,omitempty"`
 	LastAppliedRevision uint64 `json:"last_applied_revision"`
 }
 
@@ -214,6 +238,16 @@ type StatusAckResponse struct {
 type SyncReceipt struct {
 	Version  int  `json:"version"`
 	Accepted bool `json:"accepted"`
+}
+
+// BoundedAckReason maps a sink-reported acknowledgement reason to the fixed
+// allowlist that may appear on the wire, so an unexpected (or high-cardinality)
+// reason can never leak into a response or a log line.
+func BoundedAckReason(reason string) string {
+	if reason == AckReasonForeignEpoch {
+		return reason
+	}
+	return "not_accepted"
 }
 
 // ValidateRoute checks one wire route: bounded exact hostname (wildcards and

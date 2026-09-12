@@ -472,31 +472,34 @@ func (p *Publisher) RouteDeltas(since uint64) (DeltaPage, error) {
 }
 
 // Acknowledge implements StatusSink: records the gateway's explicitly
-// acknowledged last-applied revision. A new gateway boot ID replaces the
-// recorded state wholesale (§15.1: a restarted gateway may report a lower
-// revision again); the same boot only moves forward. Acks carrying another
-// control's epoch are stale in-flight traffic across a control restart and
-// are ignored without error — they must never satisfy the current epoch's
-// health watermark (R2); the gateway re-acks after reconciling to the new
+// acknowledged last-applied revision and reports whether it was actually
+// RECORDED. A new gateway boot ID replaces the recorded state wholesale
+// (§15.1: a restarted gateway may report a lower revision again); the same
+// boot only moves forward. Acks carrying another control's epoch are stale
+// in-flight traffic across a control restart: they are refused with
+// AckOutcome{Accepted:false, Reason:AckReasonForeignEpoch} and record
+// nothing — they must never satisfy the current epoch's health watermark
+// (R2), and the caller must be able to report the refusal truthfully rather
+// than claim success. The gateway re-acks after reconciling to the new
 // epoch's snapshot.
-func (p *Publisher) Acknowledge(ack StatusAck) error {
+func (p *Publisher) Acknowledge(ack StatusAck) (AckOutcome, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if ack.ControlEpoch != p.epoch {
-		p.logger.Debug("relayctl: status ack for a foreign control epoch ignored",
+		p.logger.Debug("relayctl: status ack for a foreign control epoch refused",
 			"ack_epoch", ack.ControlEpoch, "epoch", p.epoch)
-		return nil
+		return AckOutcome{Accepted: false, Reason: AckReasonForeignEpoch}, nil
 	}
 	if ack.GatewayBootID != p.ackBootID {
 		p.ackBootID = ack.GatewayBootID
 		p.ackedRevision = ack.LastAppliedRevision
 		p.hasAck = true
-		return nil
+		return AckOutcome{Accepted: true}, nil
 	}
 	if ack.LastAppliedRevision > p.ackedRevision {
 		p.ackedRevision = ack.LastAppliedRevision
 	}
-	return nil
+	return AckOutcome{Accepted: true}, nil
 }
 
 // Healthy reports whether sync is healthy: the current gateway boot has
