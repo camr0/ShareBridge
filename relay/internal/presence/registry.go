@@ -143,6 +143,15 @@ type Config struct {
 	Probe ProbeFunc
 	// Drainer drains established streams on the frps-reset path. Optional.
 	Drainer AgentDrainer
+	// ResetAccepted is invoked after a §15.2 SessionReset fact actually clears
+	// the exact session whose recorded credential identity (JTI and issued-at)
+	// matches the replayed credential. A reset that matches no live session —
+	// already fenced, superseded, or identity-mismatched — is a no-op and does
+	// NOT invoke it. Production uses it to anchor the §17.3 restart→restored
+	// clock only on an accepted restart fact, so a stale replay cannot create a
+	// false anchor. It runs after the registry lock is released, on the plugin's
+	// event dispatcher, and must not block. Optional.
+	ResetAccepted func(agentRecordID string)
 	// Probe budget overrides; zero selects the §14 defaults.
 	ProbeMaxAttempts  int
 	ProbeBackoff      time.Duration
@@ -211,6 +220,7 @@ type Registry struct {
 	sink              Sink
 	probe             ProbeFunc
 	drainer           AgentDrainer
+	resetAccepted     func(agentRecordID string)
 	probeHardDeadline time.Duration
 
 	mu       sync.Mutex
@@ -267,6 +277,7 @@ func NewRegistry(config Config) (*Registry, error) {
 		sink:              sink,
 		probe:             probe,
 		drainer:           config.Drainer,
+		resetAccepted:     config.ResetAccepted,
 		probeHardDeadline: bounds.hardDeadline,
 		tunnels:           make(map[tunnelKey]*tunnelState),
 		agentHighWater:    make(map[string]uint64),
@@ -683,6 +694,15 @@ func (registry *Registry) clearSession(fact frpplugin.PresenceFact) {
 		}
 	}
 	registry.mu.Unlock()
+	// The reset was ACCEPTED: the credential identity matched the live session
+	// and the entry was cleared. Only now may the restart→restored clock be
+	// anchored (Finding C); a rejected stale replay must not create an anchor
+	// that a later ordinary online transition would misreport as restoration
+	// latency. The callback is invoked after the lock is released and before
+	// the (potentially slower) stream drain so the anchor is the accept moment.
+	if registry.resetAccepted != nil {
+		registry.resetAccepted(key.agentRecordID)
+	}
 	if !remaining {
 		registry.drainAgents([]string{key.agentRecordID})
 	}

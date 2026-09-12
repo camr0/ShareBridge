@@ -134,7 +134,7 @@ func main() {
 	// frps plugin call proves frps is driving the plugin boundary, and a
 	// §15.2 SessionReset proves frps restarted. The truth never gates route
 	// readiness.
-	pluginPresenceEvents := frpsLifecycleEvents{next: presenceRegistry, health: health, restoration: restoration}
+	pluginPresenceEvents := frpsLifecycleEvents{next: presenceRegistry, health: health}
 	pluginServer, pluginListenAddress, err := configuredPluginServer(pluginPresenceEvents, registry)
 	if err != nil {
 		logger.Error("gateway: FRP authorization plugin configuration rejected", "error", err)
@@ -385,6 +385,10 @@ func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Regist
 		BootID:  hex.EncodeToString(bootID[:]),
 		Drainer: drainer,
 		Sink:    &presenceMetricsSink{registry: registry, restoration: restoration, now: time.Now},
+		// Anchor the restart→restored clock only when presence ACCEPTS a
+		// SessionReset (the credential-precise clear actually committed).
+		// A stale replay that clears nothing must not anchor anything.
+		ResetAccepted: restoration.noteRestart,
 	})
 }
 
@@ -443,26 +447,24 @@ func (tracker *tunnelRestorationTracker) takeElapsed(agentRecordID string) (floa
 // frpsLifecycleEvents is the production frps/plugin lifecycle view. Any
 // authenticated plugin fact proves frps is driving the plugin boundary, so it
 // marks the independent §17.1 frps process truth healthy and stamps the
-// bounded freshness window; a §15.2 SessionReset (a burned one-use credential
-// re-presented) additionally proves frps restarted and anchors the §17.3
-// restoration latency. Because the frps↔gateway plugin channel is per-operation
-// HTTP with no persistent link to watch, the down transition is observed by
-// the window expiring rather than by an explicit event: once the newest fact is
-// older than gateway.DefaultFRPSFreshnessWindow (three 10-second frpc
-// heartbeats), /healthz renders frps unhealthy instead of stale-true. It never
-// touches route readiness.
+// bounded freshness window. A §15.2 SessionReset (a burned one-use credential
+// re-presented) proves frps restarted; the presence registry anchors the §17.3
+// restoration latency only when it ACCEPTS that reset (its credential-precise
+// clear committed), so this wrapper does not anchor on the raw fact. Because
+// the frps↔gateway plugin channel is per-operation HTTP with no persistent
+// link to watch, the down transition is observed by the window expiring
+// rather than by an explicit event: once the newest fact is older than
+// gateway.DefaultFRPSFreshnessWindow (three 10-second frpc heartbeats),
+// /healthz renders frps unhealthy instead of stale-true. It never touches
+// route readiness.
 type frpsLifecycleEvents struct {
-	next        frpplugin.PresenceEvents
-	health      *gateway.Health
-	restoration *tunnelRestorationTracker
+	next   frpplugin.PresenceEvents
+	health *gateway.Health
 }
 
 func (events frpsLifecycleEvents) ObserveFRPEvent(fact frpplugin.PresenceFact) {
 	if events.health != nil {
 		events.health.SetFRPSHealthy(true)
-	}
-	if fact.Operation == frpplugin.OperationSessionReset && events.restoration != nil {
-		events.restoration.noteRestart(fact.AgentRecordID)
 	}
 	if events.next != nil {
 		events.next.ObserveFRPEvent(fact)

@@ -98,6 +98,9 @@ type scriptedControl struct {
 	paths        []string
 	deltaSinces  []uint64
 	statusBodies [][]byte
+	// statusFail makes PathStatus answer 503 while the snapshot/delta GETs
+	// keep succeeding (M5 remediation round 2, Finding A).
+	statusFail bool
 }
 
 func newScriptedControl(t *testing.T, certs syncTestCertificates) (*scriptedControl, *Client) {
@@ -133,14 +136,17 @@ func (script *scriptedControl) handle(t *testing.T, request *http.Request) (int,
 		script.deltaSinces = append(script.deltaSinces, since)
 		return http.StatusOK, script.deltaBody
 	case PathStatus:
+		if script.statusFail {
+			return http.StatusServiceUnavailable, []byte("status unavailable")
+		}
 		body, err := io.ReadAll(io.LimitReader(request.Body, MaxRequestBodyBytes))
 		if err != nil {
 			t.Fatalf("scriptedControl: read status body: %v", err)
 		}
 		script.statusBodies = append(script.statusBodies, body)
-		receipt, err := json.Marshal(SyncReceipt{Version: ProtocolVersion, Accepted: true})
+		receipt, err := json.Marshal(StatusAckResponse{Version: ProtocolVersion, Acknowledged: true})
 		if err != nil {
-			t.Fatalf("scriptedControl: marshal receipt: %v", err)
+			t.Fatalf("scriptedControl: marshal status response: %v", err)
 		}
 		return http.StatusOK, receipt
 	default:
@@ -206,6 +212,15 @@ func rawDeltaBody(t *testing.T, epoch uint64, page DeltaPage) []byte {
 		t.Fatalf("marshal raw delta page: %v", err)
 	}
 	return encoded
+}
+
+// failStatus toggles PathStatus rejection while the snapshot/delta GETs keep
+// succeeding, so a test can prove the health truth follows the acknowledgement
+// rather than the apply (Finding A).
+func (script *scriptedControl) failStatus(fail bool) {
+	script.mu.Lock()
+	defer script.mu.Unlock()
+	script.statusFail = fail
 }
 
 func (script *scriptedControl) setDelta(t *testing.T, page DeltaPage) {

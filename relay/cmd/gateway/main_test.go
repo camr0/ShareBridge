@@ -134,7 +134,7 @@ func TestGatewayHealthReflectsRealFRPSPluginLifecycle(t *testing.T) {
 
 	health := gateway.NewHealth()
 	recorder := &wiringPresenceRecorder{}
-	events := frpsLifecycleEvents{next: recorder, health: health, restoration: newTunnelRestorationTracker(time.Now)}
+	events := frpsLifecycleEvents{next: recorder, health: health}
 	plugin, _, err := configuredPluginServer(events, metrics.NewRegistry(metrics.Relay))
 	if err != nil {
 		t.Fatalf("configuredPluginServer() error = %v, want nil", err)
@@ -206,7 +206,7 @@ func TestGatewayFRPSHealthDownTransitionAndRecovery(t *testing.T) {
 	health := gateway.NewHealthWithFRPSFreshness(window, clock)
 	registry := metrics.NewRegistry(metrics.Relay)
 	recorder := &wiringPresenceRecorder{}
-	events := frpsLifecycleEvents{next: recorder, health: health, restoration: newTunnelRestorationTracker(time.Now)}
+	events := frpsLifecycleEvents{next: recorder, health: health}
 	plugin, _, err := configuredPluginServer(events, registry)
 	if err != nil {
 		t.Fatalf("configuredPluginServer() error = %v, want nil", err)
@@ -292,15 +292,16 @@ func TestTunnelRestorationMetricFromRealPresenceRestart(t *testing.T) {
 	restoration := newTunnelRestorationTracker(clock)
 	sink := &presenceMetricsSink{registry: registry, restoration: restoration, now: clock}
 	presenceRegistry, err := presence.NewRegistry(presence.Config{
-		BootID: "gw-restoration-boot",
-		Now:    clock,
-		Probe:  func(context.Context, int) (string, error) { return "127.0.0.1:4444", nil },
-		Sink:   sink,
+		BootID:        "gw-restoration-boot",
+		Now:           clock,
+		Probe:         func(context.Context, int) (string, error) { return "127.0.0.1:4444", nil },
+		Sink:          sink,
+		ResetAccepted: restoration.noteRestart,
 	})
 	if err != nil {
 		t.Fatalf("presence.NewRegistry: %v", err)
 	}
-	events := frpsLifecycleEvents{next: presenceRegistry, health: gateway.NewHealth(), restoration: restoration}
+	events := frpsLifecycleEvents{next: presenceRegistry, health: gateway.NewHealth()}
 
 	const agent = "agent-restoration"
 	const port = 10001
@@ -345,6 +346,83 @@ func TestTunnelRestorationMetricFromRealPresenceRestart(t *testing.T) {
 
 	if rendered := registry.Render(); !strings.Contains(rendered, "sharebridge_relay_tunnel_restoration_seconds_count{} 1") {
 		t.Fatalf("the real restart→restored path recorded no restoration observation:\n%s", rendered)
+	}
+}
+
+// TestRejectedSessionResetDoesNotAnchorRestoration pins Finding C: restoration
+// is anchored only when the presence registry ACCEPTS a SessionReset — i.e. the
+// replayed credential identity matches the live session it clears (Task 33's
+// credential-precise guard). A stale/replayed reset that clears nothing must
+// not leave an anchor that a later ordinary offline→online transition
+// misreports as restart latency.
+func TestRejectedSessionResetDoesNotAnchorRestoration(t *testing.T) {
+	registry := metrics.NewRegistry(metrics.Relay)
+	current := time.Date(2026, 9, 3, 18, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return current }
+	restoration := newTunnelRestorationTracker(clock)
+	sink := &presenceMetricsSink{registry: registry, restoration: restoration, now: clock}
+	presenceRegistry, err := presence.NewRegistry(presence.Config{
+		BootID:        "gw-rejected-reset-boot",
+		Now:           clock,
+		Probe:         func(context.Context, int) (string, error) { return "127.0.0.1:4444", nil },
+		Sink:          sink,
+		ResetAccepted: restoration.noteRestart,
+	})
+	if err != nil {
+		t.Fatalf("presence.NewRegistry: %v", err)
+	}
+	events := frpsLifecycleEvents{next: presenceRegistry, health: gateway.NewHealth()}
+
+	const agent = "agent-rejected-reset"
+	const port = 10002
+	login := func(jti string, issuedAt time.Time) {
+		events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationLogin, AgentRecordID: agent, Namespace: "sb0123abcd",
+			ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", CredentialJTI: jti, CredentialIssuedAt: issuedAt})
+		events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationNewProxy, AgentRecordID: agent, Namespace: "sb0123abcd",
+			ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", CredentialJTI: jti, CredentialIssuedAt: issuedAt})
+		events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationNewUserConn, AgentRecordID: agent, Namespace: "sb0123abcd",
+			ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", RemoteAddr: "127.0.0.1:4444", CredentialJTI: jti, CredentialIssuedAt: issuedAt})
+	}
+	waitOnline := func() bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if presenceRegistry.Online(agent, port, 1) {
+				return true
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return false
+	}
+
+	issued := current.Add(-time.Minute)
+	login("jti-live", issued)
+	if !waitOnline() {
+		t.Fatal("the initial tunnel never confirmed online")
+	}
+
+	// A replay naming a credential that never created the live session is
+	// rejected by the credential-precise guard and clears nothing.
+	events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationSessionReset, AgentRecordID: agent, Namespace: "sb0123abcd",
+		ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", CredentialJTI: "jti-superseded", CredentialIssuedAt: issued})
+	if !presenceRegistry.Online(agent, port, 1) {
+		t.Fatal("a stale reset must not clear the live session")
+	}
+
+	// A later ordinary offline→online transition must not be misreported as a
+	// restart restoration: the rejected reset must not have anchored anything.
+	events.ObserveFRPEvent(frpplugin.PresenceFact{Operation: frpplugin.OperationCloseProxy, AgentRecordID: agent, Namespace: "sb0123abcd",
+		ProxyName: "sb-sb0123abcd", RelayPort: port, Generation: 1, RunID: "run-1", CredentialJTI: "jti-live", CredentialIssuedAt: issued})
+	if presenceRegistry.Online(agent, port, 1) {
+		t.Fatal("CloseProxy did not take the tunnel offline")
+	}
+	current = current.Add(30 * time.Second)
+	login("jti-next", issued.Add(time.Second))
+	if !waitOnline() {
+		t.Fatal("the tunnel never came back online")
+	}
+
+	if rendered := registry.Render(); strings.Contains(rendered, "sharebridge_relay_tunnel_restoration_seconds_count{} 1") {
+		t.Fatalf("a rejected stale reset anchored a false restoration latency:\n%s", rendered)
 	}
 }
 

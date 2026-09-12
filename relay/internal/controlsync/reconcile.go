@@ -188,7 +188,11 @@ func (applier *Applier) AppliedEpoch() uint64 {
 // Errors from the client (transport, ErrUnauthorized, ErrOversize,
 // ErrUnsupportedVersion, ErrInvalidPayload, ErrBadRevision) and from the
 // applier's epoch authority (ErrStaleControlEpoch) propagate unchanged;
-// nothing is applied unless the fetch and validation succeeded.
+// Nothing is applied unless the fetch and validation succeeded. The status
+// acknowledgement is the last step and its failure is returned: control
+// renews route leases only while the current boot has acknowledged the
+// latest published revision, so the caller's health truth must follow the
+// ack, not just the apply.
 func (applier *Applier) ReconcileSnapshot(ctx context.Context) error {
 	snapshot, err := applier.client.FetchSnapshot(ctx)
 	if err != nil {
@@ -197,8 +201,7 @@ func (applier *Applier) ReconcileSnapshot(ctx context.Context) error {
 	if err := applier.applySnapshot(snapshot); err != nil {
 		return err
 	}
-	applier.acknowledge(ctx)
-	return nil
+	return applier.acknowledge(ctx)
 }
 
 // SyncDeltas fetches the ordered delta page answering the current cursor and
@@ -210,17 +213,27 @@ func (applier *Applier) ReconcileSnapshot(ctx context.Context) error {
 // therefore the ack — untouched. A never-applied applier fetches since 0; a
 // well-formed control answers a gap for any position the gateway cannot
 // bridge, which routes the caller back to ReconcileSnapshot, so starting
-// from an empty table is never trusted to be complete when it is not.
+// from an empty table is never trusted to be complete when it is not. The
+// acknowledgement failure is returned after a successful apply so the health
+// truth can reflect it.
 func (applier *Applier) SyncDeltas(ctx context.Context) error {
+	if err := applier.fetchAndApplyDeltas(ctx); err != nil {
+		return err
+	}
+	return applier.acknowledge(ctx)
+}
+
+// fetchAndApplyDeltas fetches the ordered delta page answering the current
+// cursor and applies it WITHOUT acknowledging. It is the shared body of
+// SyncDeltas and Reconcile so Reconcile can distinguish "the delta step
+// needs a snapshot recovery" (fetch/apply failure) from "the apply
+// committed but the ack failed" (which a snapshot refetch cannot fix).
+func (applier *Applier) fetchAndApplyDeltas(ctx context.Context) error {
 	page, err := applier.client.FetchDeltas(ctx, applier.LastAppliedRevision())
 	if err != nil {
 		return err
 	}
-	if err := applier.applyDeltas(page); err != nil {
-		return err
-	}
-	applier.acknowledge(ctx)
-	return nil
+	return applier.applyDeltas(page)
 }
 
 // Reconcile is the one-step catch-up the sync loop calls: snapshot first on
@@ -232,14 +245,19 @@ func (applier *Applier) SyncDeltas(ctx context.Context) error {
 // that cross-restart convergence hole here). Nothing has been applied when
 // the delta step fails, so the authoritative snapshot fetch is always the
 // safe recovery; its error (if it also fails) is the one surfaced.
+//
+// An acknowledgement failure is NOT a delta-step failure: the apply already
+// committed and a snapshot refetch cannot change the ack outcome, so the ack
+// error is returned directly (Finding A) rather than triggering a full
+// snapshot pull that would only re-read the same state.
 func (applier *Applier) Reconcile(ctx context.Context) error {
 	if !applier.Ready() {
 		return applier.ReconcileSnapshot(ctx)
 	}
-	if err := applier.SyncDeltas(ctx); err != nil {
+	if err := applier.fetchAndApplyDeltas(ctx); err != nil {
 		return applier.ReconcileSnapshot(ctx)
 	}
-	return nil
+	return applier.acknowledge(ctx)
 }
 
 // applySnapshot admits a fetched snapshot under the R2 epoch authority:
@@ -263,6 +281,8 @@ func (applier *Applier) applySnapshot(snapshot Snapshot) error {
 	receivedAt := applier.clock()
 	applier.mu.Lock()
 	currentEpoch := applier.epoch
+	appliedRevision := applier.lastApplied
+	wasApplied := applier.applied
 	applier.mu.Unlock()
 	if currentEpoch != 0 && snapshot.Epoch < currentEpoch {
 		return fmt.Errorf("%w: snapshot epoch %d is older than the applied epoch %d",
@@ -308,7 +328,14 @@ func (applier *Applier) applySnapshot(snapshot Snapshot) error {
 	applier.drain(dropped, receivedAt)
 
 	applier.setState(snapshot.Epoch, snapshot.Revision)
-	applier.observePropagationLag(snapshot.PublishedAt)
+	// Propagation lag is observed only when the snapshot actually carries new
+	// work: a first snapshot (no applied revision yet), a newer control epoch
+	// (wholesale-authoritative regardless of its revision), or a same-epoch
+	// snapshot that advances the applied revision. A same-revision re-push is
+	// a no-op catch-up, not a propagation event (Finding B).
+	if !wasApplied || newerEpoch || snapshot.Revision > appliedRevision {
+		applier.observePropagationLag(snapshot.PublishedAt)
+	}
 	applier.logger.Info("controlsync: route snapshot applied",
 		"routes", len(admitted),
 		"dropped", len(dropped),
@@ -338,6 +365,7 @@ func (applier *Applier) applyDeltas(page DeltaPage) error {
 	receivedAt := applier.clock()
 	applier.mu.Lock()
 	currentEpoch := applier.epoch
+	appliedRevision := applier.lastApplied
 	applier.mu.Unlock()
 	if page.Epoch != currentEpoch {
 		return fmt.Errorf("%w: delta page epoch %d does not match the applied epoch %d",
@@ -406,7 +434,14 @@ func (applier *Applier) applyDeltas(page DeltaPage) error {
 	}
 
 	applier.setState(currentEpoch, page.LatestRevision)
-	applier.observePropagationLag(page.PublishedAt)
+	// Propagation lag is observed only when the page actually advances the
+	// applied revision. An up-to-date poll (Since == LatestRevision) repeats
+	// the last revision's publish stamp, and observing it would record
+	// age-of-last-update samples (5s, 10s, 15s...) rather than propagation
+	// latency (Finding B).
+	if page.LatestRevision > appliedRevision {
+		applier.observePropagationLag(page.PublishedAt)
+	}
 	return nil
 }
 
@@ -508,9 +543,11 @@ func (applier *Applier) observeRevocationClose(receivedAt time.Time) {
 }
 
 // observePropagationLag records one §17.3 control→gateway route propagation
-// lag sample from a payload's published_at stamp. An absent or malformed
-// stamp records NOTHING — the metric must never fabricate a lag value — and a
-// stamp in the future is clamped to zero elapsed.
+// lag sample from a payload's published_at stamp. It is invoked only when a
+// payload actually carried new work (a new revision/epoch), never on a no-op
+// poll. An absent or malformed stamp records NOTHING — the metric must never
+// fabricate a lag value — and a stamp in the future is clamped to zero
+// elapsed.
 func (applier *Applier) observePropagationLag(publishedAt string) {
 	if applier.metrics == nil {
 		return
@@ -546,12 +583,15 @@ func (applier *Applier) setState(epoch uint64, revision uint64) {
 
 // acknowledge reports the applied revision to control (§11.3 status),
 // carrying the control epoch of the applied state (R2: control ignores acks
-// from foreign epochs). It is deliberately non-fatal: the apply already
-// committed, control's own no-regression guard accepts equal re-acks, and
-// the next reconcile re-acks. Without acks control would stop refreshing
-// leases (Healthy() requires the current boot's explicit ack), so an ack
-// failure is logged for operators.
-func (applier *Applier) acknowledge(ctx context.Context) {
+// from foreign epochs). The apply has already committed, so the acknowledgement
+// is the LAST step and its failure is returned to the caller: control renews
+// route leases only while its publisher is Healthy(), which requires the
+// current boot's explicit ack of the latest revision. Surfacing the failure
+// lets the sync loop mark control sync unhealthy, exactly matching the truth
+// control's lease renewal depends on. It is not latched — the next successful
+// reconcile re-acks and restores the truth, which is control's own
+// non-latching predicate.
+func (applier *Applier) acknowledge(ctx context.Context) error {
 	ack := StatusAck{
 		Version:             ProtocolVersion,
 		GatewayBootID:       applier.bootID,
@@ -561,7 +601,9 @@ func (applier *Applier) acknowledge(ctx context.Context) {
 	if _, err := applier.client.SendStatus(ctx, ack); err != nil {
 		applier.logger.Warn("controlsync: status ack failed (the next reconcile re-acks)",
 			"error", err)
+		return fmt.Errorf("controlsync: status acknowledgement failed: %w", err)
 	}
+	return nil
 }
 
 // validApplierNamespace mirrors frpplugin.validNamespace: control generates
