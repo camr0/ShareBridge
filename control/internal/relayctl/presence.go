@@ -189,38 +189,52 @@ func NewPresenceView(config PresenceViewConfig) (*PresenceView, error) {
 // the gateway's full current presence at one revision, applied as wholesale
 // atomic replacement. This is the §4.2 control-restart load, the §15.1
 // gateway-restart reset (the snapshot is empty until FRP clients re-register),
-// and the reconcile path after any rejected event batch. A snapshot is
-// accepted from any boot: the posting peer is the pinned gateway identity,
-// and its snapshot IS the current truth (the same wholesale-replacement-on-
-// new-boot posture the Task 11 ack records take).
+// the periodic ≤60 s renewal republish, and the reconcile path after any
+// rejected event batch. A snapshot is accepted from any boot: the posting
+// peer is the pinned gateway identity, and its snapshot IS the current truth
+// (the same wholesale-replacement-on-new-boot posture the Task 11 ack records
+// take).
 //
-// Task 34 republish requirement (Sol Important-4, R2 ruling 5): periodic
-// full-state republish must be wired by Task 34 — while sync is healthy the
-// gateway must re-post this snapshot on a cadence ≤ DefaultMaxLeaseTTL
-// (60 s), because every control-side lease is bounded by receipt + 60 s and
-// nothing else renews it: a silent gateway goes relay-unavailable within one
-// lease period even while its FRP pings stay healthy. Nothing here blocks
-// that wiring: this method already accepts wholesale republishes from any
-// boot, and the route snapshot fetch follows any epoch change (R2).
+// An EMPTY snapshot is also the boot-ADOPTION primitive when it carries the
+// top-level GatewayBootID/Revision (task #16, ledger I4-partial): control
+// records the reporting boot, so the fresh boot's first real events apply
+// (§15.1) instead of being discarded as a superseded boot's replay. Without
+// the boot identity an empty snapshot was indistinguishable from "the
+// previously recorded boot now has no routes", and a restarted gateway could
+// never become adoptable until it happened to post a non-empty snapshot —
+// which it cannot do before its first tunnel confirms, and whose events control
+// was discarding. A legacy empty snapshot (no boot identity) still clears every
+// lease and leaves boot/revision tracking untouched.
 func (view *PresenceView) ApplyPresenceSnapshot(envelope PresenceEnvelope) error {
 	if err := ValidatePresenceSnapshotEnvelope(envelope, MaxPresenceEventsPerEnvelope); err != nil {
 		return err
 	}
 	now := view.now()
 
+	// Resolve the reporting boot: the top-level fields describe the snapshot's
+	// boot even when it carries no events; an older build's envelope only
+	// stamps them on the events.
+	bootID := envelope.GatewayBootID
+	revision := envelope.Revision
+	if bootID == "" && len(envelope.Events) > 0 {
+		bootID = envelope.Events[0].GatewayBootID
+		revision = envelope.Events[0].Revision
+	}
+
 	// An empty snapshot is legitimate §15.1 state ("on gateway restart the
-	// snapshot is empty until FRP clients reconnect and re-register"). It
-	// carries no boot ID or revision (those ride on events), so it clears
-	// every lease and leaves boot/revision tracking untouched.
+	// snapshot is empty until FRP clients reconnect and re-register"). When it
+	// names its boot it is additionally the adoption primitive described above.
 	if len(envelope.Events) == 0 {
 		view.mu.Lock()
 		view.leases = make(map[string]presenceLease)
+		if bootID != "" {
+			view.bootID = bootID
+			view.lastRevision = revision
+			view.haveBoot = true
+		}
 		view.mu.Unlock()
 		return nil
 	}
-
-	bootID := envelope.Events[0].GatewayBootID
-	revision := envelope.Events[0].Revision
 
 	// Pre-pass: validate every lease expiry BEFORE mutating anything so the
 	// replacement is atomic — a single future-dated entry rejects the whole

@@ -636,3 +636,151 @@ func TestContradictoryPresenceEventsFailClosed(t *testing.T) {
 		t.Fatal("newer-generation offline did not fence the older lease")
 	}
 }
+
+// --- task #16: empty-snapshot boot adoption and renewal republish ---
+
+// emptyPresenceSnapshot builds the top-level empty boot snapshot the gateway
+// posts at startup: no events, but a boot identity and revision.
+func emptyPresenceSnapshot(boot string, revision uint64) PresenceEnvelope {
+	return PresenceEnvelope{Version: ProtocolVersion, GatewayBootID: boot, Revision: revision, Events: []PresenceEvent{}}
+}
+
+// TestEmptyBootSnapshotAdoptsFreshGatewayBoot pins the task #16 fix: an empty
+// snapshot carrying the top-level boot identity is adoptable, so the restarted
+// gateway's first real event batch applies. Before the fix the empty snapshot
+// left the previous boot recorded and the new boot's events were discarded as
+// a superseded boot's replay.
+func TestEmptyBootSnapshotAdoptsFreshGatewayBoot(t *testing.T) {
+	app := newPublisherTestApp(t)
+	_, agentA := createPublisherAgent(t, app, "t16-a", "sb0a1b2c3d", 10001, 3)
+	clock := newFakeClock(presenceViewBase)
+	view := newPresenceTestView(t, app, fixedRoutes{revision: 5}, clock.Now)
+
+	// Boot A announces itself by snapshot with one lease.
+	bootA := presenceSnapshot(presenceTestBoot, 10, []PresenceEvent{
+		presenceOnline(presenceTestBoot, 10, agentA, 10001, 3, clock.Now().Add(45*time.Second)),
+	})
+	if err := view.ApplyPresenceSnapshot(bootA); err != nil {
+		t.Fatalf("apply boot A snapshot: %v", err)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("boot A lease not established")
+	}
+
+	// Gateway restarts (boot B): its presence is empty until FRP clients
+	// reconnect, and the empty snapshot names the new boot.
+	const bootB = "gateway-boot-ctrl16"
+	if err := view.ApplyPresenceSnapshot(emptyPresenceSnapshot(bootB, 0)); err != nil {
+		t.Fatalf("apply empty boot B snapshot: %v", err)
+	}
+	if view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("empty boot snapshot did not clear the previous boot's lease")
+	}
+	if view.bootID != bootB || !view.haveBoot || view.lastRevision != 0 {
+		t.Fatalf("empty boot snapshot was not adopted: boot %q haveBoot %v revision %d", view.bootID, view.haveBoot, view.lastRevision)
+	}
+
+	// Boot B's first confirmed tunnel emits an ordered event batch; it must
+	// apply because control recorded the boot.
+	first := PresenceEnvelope{Version: ProtocolVersion, Events: []PresenceEvent{
+		presenceOnline(bootB, 1, agentA, 10001, 3, clock.Now().Add(45*time.Second)),
+	}}
+	if err := view.ApplyPresenceEvents(first); err != nil {
+		t.Fatalf("apply boot B first event: %v", err)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("fresh boot's first event was not adopted")
+	}
+}
+
+// TestLegacyEmptySnapshotStillClearsWithoutDisturbingBootTracking keeps the
+// pre-fix empty snapshot (no top-level boot) wire-compatible: it clears every
+// lease and leaves boot/revision tracking untouched.
+func TestLegacyEmptySnapshotStillClearsWithoutDisturbingBootTracking(t *testing.T) {
+	app := newPublisherTestApp(t)
+	_, agentA := createPublisherAgent(t, app, "t16-legacy", "sb0a1b2c3d", 10001, 3)
+	clock := newFakeClock(presenceViewBase)
+	view := newPresenceTestView(t, app, fixedRoutes{revision: 5}, clock.Now)
+
+	boot := presenceSnapshot(presenceTestBoot, 10, []PresenceEvent{
+		presenceOnline(presenceTestBoot, 10, agentA, 10001, 3, clock.Now().Add(45*time.Second)),
+	})
+	if err := view.ApplyPresenceSnapshot(boot); err != nil {
+		t.Fatalf("apply boot snapshot: %v", err)
+	}
+	if err := view.ApplyPresenceSnapshot(PresenceEnvelope{Version: ProtocolVersion, Events: []PresenceEvent{}}); err != nil {
+		t.Fatalf("apply legacy empty snapshot: %v", err)
+	}
+	if view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("legacy empty snapshot did not clear the lease")
+	}
+	if view.bootID != presenceTestBoot || view.lastRevision != 10 {
+		t.Fatalf("legacy empty snapshot disturbed boot/revision tracking: boot %q revision %d", view.bootID, view.lastRevision)
+	}
+}
+
+// TestEmptyBootSnapshotValidation proves the top-level boot identity is
+// validated and must agree with the events when both are present.
+func TestEmptyBootSnapshotValidation(t *testing.T) {
+	valid := emptyPresenceSnapshot("gateway-boot-x", 3)
+	if err := ValidatePresenceSnapshotEnvelope(valid, MaxPresenceEventsPerEnvelope); err != nil {
+		t.Fatalf("valid empty boot snapshot rejected: %v", err)
+	}
+	// Identifiers carry no control/whitespace bytes.
+	badBoot := emptyPresenceSnapshot("gateway boot", 3)
+	if err := ValidatePresenceSnapshotEnvelope(badBoot, MaxPresenceEventsPerEnvelope); err == nil {
+		t.Fatal("empty boot snapshot with an invalid boot identity was accepted")
+	}
+	// A top-level boot that disagrees with the events is a producer bug.
+	mismatch := PresenceEnvelope{Version: ProtocolVersion, GatewayBootID: "boot-one", Revision: 4, Events: []PresenceEvent{
+		presenceOnline("boot-two", 4, "agent", 10001, 3, presenceViewBase.Add(45*time.Second)),
+	}}
+	if err := ValidatePresenceSnapshotEnvelope(mismatch, MaxPresenceEventsPerEnvelope); err == nil {
+		t.Fatal("snapshot with mismatched top-level and event boot IDs was accepted")
+	}
+	// A top-level revision that disagrees with the event revision is refused.
+	revisionMismatch := PresenceEnvelope{Version: ProtocolVersion, GatewayBootID: "boot-one", Revision: 9, Events: []PresenceEvent{
+		presenceOnline("boot-one", 4, "agent", 10001, 3, presenceViewBase.Add(45*time.Second)),
+	}}
+	if err := ValidatePresenceSnapshotEnvelope(revisionMismatch, MaxPresenceEventsPerEnvelope); err == nil {
+		t.Fatal("snapshot with mismatched top-level and event revisions was accepted")
+	}
+}
+
+// TestRenewedSnapshotRestoresAvailabilityAfterTheOriginalLeaseExpires mirrors
+// the periodic renew republish on the control side: the original lease lapses
+// (fail closed), and a republished snapshot carrying the renewed expiry
+// restores availability.
+func TestRenewedSnapshotRestoresAvailabilityAfterTheOriginalLeaseExpires(t *testing.T) {
+	app := newPublisherTestApp(t)
+	_, agentA := createPublisherAgent(t, app, "t16-renew", "sb0a1b2c3d", 10001, 3)
+	clock := newFakeClock(presenceViewBase)
+	view := newPresenceTestView(t, app, fixedRoutes{revision: 5}, clock.Now)
+
+	originalLease := clock.Now().Add(45 * time.Second)
+	if err := view.ApplyPresenceSnapshot(presenceSnapshot(presenceTestBoot, 1, []PresenceEvent{
+		presenceOnline(presenceTestBoot, 1, agentA, 10001, 3, originalLease),
+	})); err != nil {
+		t.Fatalf("apply original snapshot: %v", err)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("original lease not available")
+	}
+
+	clock.Advance(46 * time.Second)
+	if view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("lease still available after the original expiry")
+	}
+
+	// The gateway's periodic republish carries the renewed lease at a new
+	// revision; the wholesale replacement restores the lease.
+	renewedLease := clock.Now().Add(45 * time.Second)
+	if err := view.ApplyPresenceSnapshot(presenceSnapshot(presenceTestBoot, 2, []PresenceEvent{
+		presenceOnline(presenceTestBoot, 2, agentA, 10001, 3, renewedLease),
+	})); err != nil {
+		t.Fatalf("apply renewed snapshot: %v", err)
+	}
+	if !view.Available(agentA, 10001, 3, 5, clock.Now()) {
+		t.Fatal("renewed republish did not restore availability")
+	}
+}

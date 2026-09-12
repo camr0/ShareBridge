@@ -591,6 +591,59 @@ func (registry *Registry) emitLocked(key tunnelKey, tunnel *tunnelState, state s
 // facts. The control-sync status ack carries the same identity.
 func (registry *Registry) BootID() string { return registry.bootID }
 
+// SnapshotEntry is one currently-online tunnel in an authoritative presence
+// snapshot: the §7.3 join key plus its CURRENT lease expiry (the last
+// authenticated Ping + the 45-second lease, refreshed on every engine Ping).
+// The expiry is the renewed value, not the confirmation-time value: nothing
+// else carries the renewal to control, so a full-state republish is what keeps
+// control's lease from silently expiring while the tunnel is healthy.
+type SnapshotEntry struct {
+	AgentRecordID  string
+	RelayPort      int
+	Generation     uint64
+	LeaseExpiresAt time.Time
+}
+
+// Snapshot returns the gateway's current boot identity, presence revision, and
+// one entry per currently-online tunnel with its current lease expiry. It is
+// the source for the periodic §15.1 full-state republish: the snapshot is read
+// atomically under the registry lock at one revision, so control's wholesale
+// replacement never sees a torn view. Expired leases are applied (their lazy
+// offline transition is emitted through the sink) before the snapshot is
+// taken; offline/fenced tunnels are omitted. Deterministic ordering (agent,
+// port, generation) keeps the republished payload stable. Read-only for
+// callers; the only mutation is the same lazy lease-expiry transition Online()
+// applies.
+func (registry *Registry) Snapshot() (bootID string, revision uint64, entries []SnapshotEntry) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	for key, tunnel := range registry.tunnels {
+		registry.expireIfDueLocked(key, tunnel)
+	}
+	entries = make([]SnapshotEntry, 0, len(registry.tunnels))
+	for key, tunnel := range registry.tunnels {
+		if !tunnel.online {
+			continue
+		}
+		entries = append(entries, SnapshotEntry{
+			AgentRecordID:  key.agentRecordID,
+			RelayPort:      key.relayPort,
+			Generation:     key.generation,
+			LeaseExpiresAt: tunnel.leaseExpiresAt,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].AgentRecordID != entries[j].AgentRecordID {
+			return entries[i].AgentRecordID < entries[j].AgentRecordID
+		}
+		if entries[i].RelayPort != entries[j].RelayPort {
+			return entries[i].RelayPort < entries[j].RelayPort
+		}
+		return entries[i].Generation < entries[j].Generation
+	})
+	return registry.bootID, registry.revision, entries
+}
+
 // Online answers the route table's presence join (routes.Presence). It reads
 // only in-memory leased state and never blocks on I/O or re-enters the
 // streams registry — the gateway's RegisterAdmitted calls it under its own

@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -119,7 +120,11 @@ func main() {
 	// the §17.3 tunnel-restoration histogram measures a real
 	// restart→restored interval rather than an offline→online guess.
 	restoration := newTunnelRestorationTracker(time.Now)
-	presenceRegistry, err := newPresenceRegistry(streams, registry, restoration)
+	// The presence sink projects transitions onto the §17.3 metrics AND signals
+	// the §11.3 full-state republish; the publisher is attached once the sync
+	// client exists (below), so the registry can be built first.
+	presenceSync := newPresenceSyncSink(registry, restoration)
+	presenceRegistry, err := newPresenceRegistry(streams, presenceSync)
 	if err != nil {
 		logger.Error("gateway: presence registry configuration rejected", "error", err)
 		os.Exit(1)
@@ -199,7 +204,7 @@ func main() {
 	// fail-closed from the operator environment and, when configured, is the
 	// only production caller of gateway.Health's snapshot/control-sync
 	// setters. Without it the gateway correctly reports route_ready=false.
-	syncLoop, syncEnabled, err := configuredSyncLoop(health, registry, routeTable, streams, presenceRegistry.BootID(), logger)
+	syncLoop, syncClient, syncEnabled, err := configuredControlSync(health, registry, routeTable, streams, presenceRegistry.BootID(), logger)
 	if err != nil {
 		_ = pluginListener.Close()
 		_ = listener.Close()
@@ -208,7 +213,27 @@ func main() {
 		os.Exit(1)
 	}
 	if syncEnabled {
+		// Presence transport (task #16): the gateway's authoritative tunnel
+		// presence must reach control or every relay lease stays empty. The
+		// publisher republishes the full state at boot (empty snapshots
+		// included, so a restarted gateway is adoptable) and on the bounded
+		// cadence, and flushes immediately on a registry transition. It reuses
+		// the same mTLS client as the route sync.
+		presencePublisher, err := controlsync.NewPresencePublisher(controlsync.PresencePublisherConfig{
+			Client: syncClient,
+			Source: gatewayPresenceSource{registry: presenceRegistry},
+			Logger: logger,
+		})
+		if err != nil {
+			_ = pluginListener.Close()
+			_ = listener.Close()
+			_ = metricsListener.Close()
+			logger.Error("gateway: presence transport configuration rejected", "error", err)
+			os.Exit(1)
+		}
+		presenceSync.attach(presencePublisher)
 		go syncLoop.Run(serveContext)
+		go presencePublisher.Run(serveContext)
 		logger.Info("gateway: control sync loop started")
 	} else {
 		logger.Warn("gateway: control sync not configured; route readiness stays fail-closed")
@@ -278,14 +303,15 @@ func configuredLimits() (limits.Config, error) {
 	return limits.ConfigFromEnvironment(os.LookupEnv)
 }
 
-// configuredSyncLoop builds the §11.3 control-sync loop from the operator
-// environment. It returns enabled=false when NO sync variable is set (the
-// dark/enable-relay posture: the gateway runs, route readiness is fail-closed
-// false, and the operator sees a warning). A PARTIAL configuration is a
-// startup error — a gateway must never silently run with a half-configured
-// control channel. The loop is the production writer of the §17.1
-// snapshot/control-sync health truths.
-func configuredSyncLoop(health *gateway.Health, registry *metrics.Registry, table *routes.Table, streams *gateway.Streams, bootID string, logger *slog.Logger) (*controlsync.Loop, bool, error) {
+// configuredControlSync builds the §11.3 control-sync loop (and returns its
+// mTLS client for the presence transport) from the operator environment. It
+// returns enabled=false when NO sync variable is set (the dark/enable-relay
+// posture: the gateway runs, route readiness is fail-closed false, and the
+// operator sees a warning). A PARTIAL configuration is a startup error — a
+// gateway must never silently run with a half-configured control channel. The
+// loop is the production writer of the §17.1 snapshot/control-sync health
+// truths; the client is shared with the presence publisher.
+func configuredControlSync(health *gateway.Health, registry *metrics.Registry, table *routes.Table, streams *gateway.Streams, bootID string, logger *slog.Logger) (*controlsync.Loop, *controlsync.Client, bool, error) {
 	values := []string{
 		os.Getenv(envControlSyncURL),
 		os.Getenv(envControlSyncSAN),
@@ -302,25 +328,25 @@ func configuredSyncLoop(health *gateway.Health, registry *metrics.Registry, tabl
 		}
 	}
 	if !configured {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	for _, value := range values {
 		if value == "" {
-			return nil, false, fmt.Errorf("control sync requires %s, %s, %s, %s, %s and %s together",
+			return nil, nil, false, fmt.Errorf("control sync requires %s, %s, %s, %s, %s and %s together",
 				envControlSyncURL, envControlSyncSAN, envControlSyncCAFile, envGatewaySyncCertFile, envGatewaySyncKeyFile, envGatewayNamespace)
 		}
 	}
 	serverCAPEM, err := os.ReadFile(os.Getenv(envControlSyncCAFile))
 	if err != nil {
-		return nil, false, fmt.Errorf("control sync CA file: %w", err)
+		return nil, nil, false, fmt.Errorf("control sync CA file: %w", err)
 	}
 	clientCertPEM, err := os.ReadFile(os.Getenv(envGatewaySyncCertFile))
 	if err != nil {
-		return nil, false, fmt.Errorf("gateway sync certificate file: %w", err)
+		return nil, nil, false, fmt.Errorf("gateway sync certificate file: %w", err)
 	}
 	clientKeyPEM, err := os.ReadFile(os.Getenv(envGatewaySyncKeyFile))
 	if err != nil {
-		return nil, false, fmt.Errorf("gateway sync key file: %w", err)
+		return nil, nil, false, fmt.Errorf("gateway sync key file: %w", err)
 	}
 	client, err := controlsync.NewClient(controlsync.ClientConfig{
 		BaseURL:           os.Getenv(envControlSyncURL),
@@ -331,7 +357,7 @@ func configuredSyncLoop(health *gateway.Health, registry *metrics.Registry, tabl
 		Metrics:           registry,
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	applier, err := controlsync.NewApplier(controlsync.ApplierConfig{
 		Client:    client,
@@ -344,7 +370,7 @@ func configuredSyncLoop(health *gateway.Health, registry *metrics.Registry, tabl
 		Clock:     time.Now,
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	loop, err := controlsync.NewLoop(controlsync.LoopConfig{
 		Applier: applier,
@@ -352,9 +378,9 @@ func configuredSyncLoop(health *gateway.Health, registry *metrics.Registry, tabl
 		Logger:  logger,
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	return loop, true, nil
+	return loop, client, true, nil
 }
 
 // configuredNICSource builds the §17.3 bullet 5 NIC saturation source from the
@@ -373,10 +399,9 @@ func configuredNICSource() metrics.NICSource {
 // feeds and the route table joins against. The boot identity is a fresh
 // 128-bit hex value per process: §15.1 requires a gateway restart to change
 // the boot ID so control discards stale presence events. The streams registry
-// is the §15.2 drain seam, and the §17.3 metrics sink observes the presence
-// transitions (online/offline counts, lease expirations, and restart→restored
-// latency). The control-sync Sink is wired separately once sync is configured.
-func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Registry, restoration *tunnelRestorationTracker) (*presence.Registry, error) {
+// is the §15.2 drain seam, and the supplied sink receives every transition
+// (the §17.3 metrics projection plus the §11.3 republish trigger).
+func newPresenceRegistry(drainer presence.AgentDrainer, sink presence.Sink) (*presence.Registry, error) {
 	var bootID [16]byte
 	if _, err := rand.Read(bootID[:]); err != nil {
 		return nil, fmt.Errorf("generate gateway boot id: %w", err)
@@ -384,12 +409,71 @@ func newPresenceRegistry(drainer presence.AgentDrainer, registry *metrics.Regist
 	return presence.NewRegistry(presence.Config{
 		BootID:  hex.EncodeToString(bootID[:]),
 		Drainer: drainer,
-		Sink:    &presenceMetricsSink{registry: registry, restoration: restoration, now: time.Now},
+		Sink:    sink,
 		// Anchor the restart→restored clock only when presence ACCEPTS a
 		// SessionReset (the credential-precise clear actually committed).
 		// A stale replay that clears nothing must not anchor anything.
-		ResetAccepted: restoration.noteRestart,
+		ResetAccepted: newRestorationResetAccepted(sink),
 	})
+}
+
+// presenceSyncSink fans presence transitions out to the bounded §17.3 metrics
+// projection and the §11.3 control-sync republish trigger. The registry calls
+// it under its state lock (and the gateway stream-admission path holds that
+// lock in turn), so it MUST NOT block: the metrics projection is atomic
+// counter/gauge updates and the publisher signal is a coalescing channel send.
+// The publisher is attached once the sync client exists; before that (or with
+// sync unconfigured) transitions only update metrics.
+type presenceSyncSink struct {
+	metrics   *presenceMetricsSink
+	publisher atomic.Pointer[controlsync.PresencePublisher]
+}
+
+func newPresenceSyncSink(registry *metrics.Registry, restoration *tunnelRestorationTracker) *presenceSyncSink {
+	return &presenceSyncSink{metrics: &presenceMetricsSink{registry: registry, restoration: restoration, now: time.Now}}
+}
+
+// attach installs the republish trigger. Called once, before any publisher
+// goroutine starts; a later Store is still race-free.
+func (sink *presenceSyncSink) attach(publisher *controlsync.PresencePublisher) {
+	sink.publisher.Store(publisher)
+}
+
+func (sink *presenceSyncSink) ObservePresenceEvent(event presence.Event) {
+	if sink.metrics != nil {
+		sink.metrics.ObservePresenceEvent(event)
+	}
+	if publisher := sink.publisher.Load(); publisher != nil {
+		publisher.Notify()
+	}
+}
+
+// newRestorationResetAccepted wires the registry's accepted-reset callback to
+// the §17.3 restoration tracker held by the metrics sink.
+func newRestorationResetAccepted(sink presence.Sink) func(agentRecordID string) {
+	if syncSink, ok := sink.(*presenceSyncSink); ok && syncSink.metrics != nil && syncSink.metrics.restoration != nil {
+		return syncSink.metrics.restoration.noteRestart
+	}
+	return nil
+}
+
+// gatewayPresenceSource adapts the presence registry's authoritative snapshot
+// to the control-sync wire entry type (the presence package stays independent
+// of the sync protocol package).
+type gatewayPresenceSource struct{ registry *presence.Registry }
+
+func (source gatewayPresenceSource) PresenceSnapshot() (string, uint64, []controlsync.PresenceSnapshotEntry) {
+	bootID, revision, records := source.registry.Snapshot()
+	entries := make([]controlsync.PresenceSnapshotEntry, 0, len(records))
+	for _, record := range records {
+		entries = append(entries, controlsync.PresenceSnapshotEntry{
+			AgentRecordID:  record.AgentRecordID,
+			RelayPort:      record.RelayPort,
+			Generation:     record.Generation,
+			LeaseExpiresAt: record.LeaseExpiresAt,
+		})
+	}
+	return bootID, revision, entries
 }
 
 // tunnelRestorationTracker anchors the frps-restart moment for an agent (the

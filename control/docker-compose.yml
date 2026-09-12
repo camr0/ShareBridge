@@ -14,8 +14,22 @@ services:
       - RELAY_JWT_SECRET=${RELAY_JWT_SECRET}
       - RELAY_PENDING_WAIT_WINDOW=${RELAY_PENDING_WAIT_WINDOW:-30s}
       - STUN_URL=${STUN_URL:-stun:stun.cloudflare.com:3478}
+      # §11.3 control↔gateway sync listener (task #16 / ledger I4-partial).
+      # DISABLED unless the mTLS material/identity variables are set: all four
+      # must be set together or the server refuses to start (fail-closed, no
+      # half-configured channel). The bind defaults to numeric loopback; mount
+      # the material read-only (e.g. ./control-sync:/run/sharebridge-sync:ro)
+      # and leave this channel off the public firewall — the hardened relay
+      # gateway validates control by SHAREBRIDGE_CONTROL_SYNC_SAN against the
+      # CA in SHAREBRIDGE_CONTROL_SYNC_CA_FILE.
+      - CONTROL_SYNC_BIND_ADDR=${CONTROL_SYNC_BIND_ADDR:-127.0.0.1:9443}
+      - CONTROL_SYNC_CERT_FILE=${CONTROL_SYNC_CERT_FILE:-}
+      - CONTROL_SYNC_KEY_FILE=${CONTROL_SYNC_KEY_FILE:-}
+      - CONTROL_SYNC_CLIENT_CA_FILE=${CONTROL_SYNC_CLIENT_CA_FILE:-}
+      - CONTROL_SYNC_EXPECTED_CLIENT_SAN=${CONTROL_SYNC_EXPECTED_CLIENT_SAN:-}
     volumes:
       - sharebridge-data:/data
+      - ${CONTROL_SYNC_DIR:-./control-sync}:/run/sharebridge-sync:ro
 
 volumes:
   sharebridge-data:

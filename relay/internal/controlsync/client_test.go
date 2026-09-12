@@ -331,6 +331,23 @@ func TestSyncGoldenPayloadsRoundTripBothModules(t *testing.T) {
 			t.Fatalf("golden presence envelope rejected: %v", err)
 		}
 	})
+
+	t.Run("empty boot snapshot carries its boot and revision", func(t *testing.T) {
+		golden := readGoldenPayload(t, "presence-snapshot-empty.json")
+		var decoded PresenceEnvelope
+		decodeGoldenJSON(t, golden, &decoded)
+
+		reEncoded, err := json.Marshal(decoded)
+		if err != nil {
+			t.Fatalf("marshal decoded empty snapshot: %v", err)
+		}
+		if !bytes.Equal(reEncoded, golden) {
+			t.Fatalf("decoded empty snapshot does not re-encode to the golden bytes")
+		}
+		if err := ValidatePresenceSnapshotEnvelope(decoded, MaxPresenceEventsPerEnvelope); err != nil {
+			t.Fatalf("golden empty snapshot rejected: %v", err)
+		}
+	})
 }
 
 // --- Task 11 named test 2: mutual TLS is mandatory ---

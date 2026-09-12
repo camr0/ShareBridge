@@ -35,6 +35,10 @@ install_sh="${deploy_dir}/install.sh"
 fetch_sh="${repo_root}/relay/scripts/fetch-frp.sh"
 frp_manifest="${repo_root}/relay/frp/manifest.json"
 plan_doc="${repo_root}/docs/superpowers/plans/2026-09-03-phase4a-relay-mvp.md"
+# Task #16 control-side §11.3 sync listener surface (control module).
+control_config="${repo_root}/control/internal/config/config.go"
+control_main="${repo_root}/control/cmd/server/main.go"
+control_compose="${repo_root}/control/docker-compose.yml"
 
 failures=0
 checks=0
@@ -1251,12 +1255,48 @@ for name in \
   SHAREBRIDGE_GATEWAY_NAMESPACE \
   SHAREBRIDGE_GATEWAY_NIC_INTERFACE \
   SHAREBRIDGE_GATEWAY_NIC_CAPACITY_BYTES_PER_SEC \
+  CONTROL_SYNC_BIND_ADDR \
+  CONTROL_SYNC_CERT_FILE \
+  CONTROL_SYNC_KEY_FILE \
+  CONTROL_SYNC_CLIENT_CA_FILE \
+  CONTROL_SYNC_EXPECTED_CLIENT_SAN \
   DefaultFRPSFreshnessWindow; do
   require_contains "$ops_doc" "$name" "runbook documents $name"
 done
 require_contains "$ops_doc" '30[[:space:]]*(s|seconds)|30-second|30s' "runbook states the 30-second frps freshness window"
-require_contains "$ops_doc" '[Pp]resence-transport' "runbook records the open presence-transport gap"
+require_contains "$ops_doc" '[Pp]resence-transport' "runbook records the presence-transport item"
 require_contains "$readme" 'deploy/install\.sh' "relay README points at the deployment installer"
+
+printf -- '-- A17: control-side §11.3 sync listener is wired, private and exact\n'
+# The five control-side variables are the operator's enable/identity surface;
+# a rename anywhere fails the gate.
+for name in \
+  CONTROL_SYNC_BIND_ADDR \
+  CONTROL_SYNC_CERT_FILE \
+  CONTROL_SYNC_KEY_FILE \
+  CONTROL_SYNC_CLIENT_CA_FILE \
+  CONTROL_SYNC_EXPECTED_CLIENT_SAN; do
+  require_contains "$control_config" "\"$name\"" "control config loads $name"
+  require_contains "$ops_doc" "$name" "runbook documents $name"
+  require_contains "$control_compose" "$name" "control compose passes $name"
+done
+# The production entrypoint builds the real listener with the real publisher
+# (RouteSource + StatusSink) and presence view (PresenceSink), served over TLS.
+require_contains "$control_main" 'configuredControlSyncServer\(cfg, routePublisher, routePublisher, presenceView\)' \
+  "control main wires the listener with the real publisher and presence view"
+require_contains "$control_main" 'relayctl\.NewServer' "control main constructs relayctl.NewServer"
+require_contains "$control_main" 'tls\.NewListener' "control sync listener is served over TLS"
+require_contains "$control_main" 'configuredControlSyncServer\(cfg,' "control main uses the fail-closed listener builder"
+# Default bind is numeric loopback; never unspecified/public by default.
+require_contains "$control_config" 'DefaultControlSyncBindAddr = "127\.0\.0\.1:9443"' \
+  "control sync default bind is numeric loopback"
+require_not_contains "$control_config" 'DefaultControlSyncBindAddr = "0\.0\.0\.0' \
+  "control sync default bind is not unspecified"
+# All-or-nothing configuration (no half-configured listener).
+require_contains "$control_config" 'func \(c \*Config\) ControlSyncConfigured\(\) bool' \
+  "control sync enable switch is the mTLS material set"
+require_contains "$control_config" 'requires %s together with the other CONTROL_SYNC_\* variables' \
+  "control sync partial configuration fails closed"
 
 printf '\n== %d checks, %d failure(s) ==\n' "$checks" "$failures"
 if [[ $failures -gt 0 ]]; then

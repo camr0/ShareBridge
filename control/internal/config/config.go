@@ -74,6 +74,23 @@ type Config struct {
 	// only after the relay gateway, route distribution, and presence sync are
 	// verified (the release gate blocks on it).
 	RelaySelectionEnabled bool // RELAY_SELECTION_ENABLED (default false = rollback mode)
+
+	// §11.3 control↔gateway sync listener (plan task #16, ledger I4-partial).
+	// Control serves the private, mutually authenticated sync endpoints the
+	// hardened relay gateway's client already points at
+	// (SHAREBRIDGE_CONTROL_SYNC_URL/_SAN/_CA_FILE in the relay unit). The
+	// listener is enabled by setting any of the four material variables below
+	// — all four must be set together or the process refuses to start (no
+	// half-configured channel). ControlSyncBindAddr selects the bind address;
+	// empty selects DefaultControlSyncBindAddr, and any public/unspecified
+	// bind is rejected at startup by relayctl.NewServer, so the listener is
+	// private/loopback unless an operator deliberately supplies a private
+	// (RFC 1918/ULA) address.
+	ControlSyncBindAddr          string // CONTROL_SYNC_BIND_ADDR (default 127.0.0.1:9443)
+	ControlSyncCertFile          string // CONTROL_SYNC_CERT_FILE (control server leaf, PEM)
+	ControlSyncKeyFile           string // CONTROL_SYNC_KEY_FILE (control server key, PEM)
+	ControlSyncClientCAFile      string // CONTROL_SYNC_CLIENT_CA_FILE (CA pinning the gateway client leaf)
+	ControlSyncExpectedClientSAN string // CONTROL_SYNC_EXPECTED_CLIENT_SAN (exact gateway client SAN)
 }
 
 func Load() *Config {
@@ -104,6 +121,12 @@ func Load() *Config {
 		STUNAdvertiseAddr: getEnv("STUN_ADVERTISE_ADDR", ""),
 
 		RelaySelectionEnabled: getEnvBool("RELAY_SELECTION_ENABLED", false),
+
+		ControlSyncBindAddr:          getEnv("CONTROL_SYNC_BIND_ADDR", ""),
+		ControlSyncCertFile:          getEnv("CONTROL_SYNC_CERT_FILE", ""),
+		ControlSyncKeyFile:           getEnv("CONTROL_SYNC_KEY_FILE", ""),
+		ControlSyncClientCAFile:      getEnv("CONTROL_SYNC_CLIENT_CA_FILE", ""),
+		ControlSyncExpectedClientSAN: getEnv("CONTROL_SYNC_EXPECTED_CLIENT_SAN", ""),
 	}
 }
 
@@ -227,6 +250,68 @@ func getEnvBool(key string, def bool) bool {
 // HasSMTP returns true if SMTP is configured.
 func (c *Config) HasSMTP() bool {
 	return c.SMTPHost != ""
+}
+
+// DefaultControlSyncBindAddr is the §11.3 sync listener's safe default: a
+// numeric loopback address, so an operator who configures only the mTLS
+// material never accidentally exposes the channel. relayctl.NewServer still
+// re-validates it as loopback/private and refuses anything else at startup.
+const DefaultControlSyncBindAddr = "127.0.0.1:9443"
+
+// ControlSyncListener is the resolved §11.3 sync listener configuration. An
+// empty BindAddress means the listener is disabled.
+type ControlSyncListener struct {
+	BindAddress       string
+	CertFile          string
+	KeyFile           string
+	ClientCAFile      string
+	ExpectedClientSAN string
+}
+
+// ControlSyncConfigured reports whether the §11.3 sync listener is enabled.
+// The four mTLS material/identity variables are the switch: the bind address
+// alone never enables the listener (it is a defaulted loopback value), so a
+// deployment that only sets CONTROL_SYNC_BIND_ADDR keeps the channel dark.
+func (c *Config) ControlSyncConfigured() bool {
+	return c.ControlSyncCertFile != "" || c.ControlSyncKeyFile != "" ||
+		c.ControlSyncClientCAFile != "" || c.ControlSyncExpectedClientSAN != ""
+}
+
+// ControlSyncListener resolves and validates the §11.3 sync listener
+// configuration. When the listener is disabled it returns the zero value and
+// no error; when it is enabled, every required variable must be set or the
+// whole configuration is refused (fail closed, never half-configured).
+func (c *Config) ControlSyncListener() (ControlSyncListener, error) {
+	if !c.ControlSyncConfigured() {
+		return ControlSyncListener{}, nil
+	}
+	listener := ControlSyncListener{
+		BindAddress:       c.ControlSyncBindAddr,
+		CertFile:          c.ControlSyncCertFile,
+		KeyFile:           c.ControlSyncKeyFile,
+		ClientCAFile:      c.ControlSyncClientCAFile,
+		ExpectedClientSAN: c.ControlSyncExpectedClientSAN,
+	}
+	if listener.BindAddress == "" {
+		listener.BindAddress = DefaultControlSyncBindAddr
+	}
+	var missing []string
+	if listener.CertFile == "" {
+		missing = append(missing, "CONTROL_SYNC_CERT_FILE")
+	}
+	if listener.KeyFile == "" {
+		missing = append(missing, "CONTROL_SYNC_KEY_FILE")
+	}
+	if listener.ClientCAFile == "" {
+		missing = append(missing, "CONTROL_SYNC_CLIENT_CA_FILE")
+	}
+	if listener.ExpectedClientSAN == "" {
+		missing = append(missing, "CONTROL_SYNC_EXPECTED_CLIENT_SAN")
+	}
+	if len(missing) > 0 {
+		return ControlSyncListener{}, fmt.Errorf("control sync listener requires %s together with the other CONTROL_SYNC_* variables", strings.Join(missing, ", "))
+	}
+	return listener, nil
 }
 
 // RelayPolicyEnabled reports whether the operator configured enough relay

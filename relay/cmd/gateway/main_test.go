@@ -68,7 +68,7 @@ func TestConfiguredLimitsFailsClosedOnInvalidEnvironment(t *testing.T) {
 // construct its production presence registry (fresh boot identity plus the
 // streams drain seam) without operator configuration.
 func TestNewPresenceRegistryBuildsWithoutError(t *testing.T) {
-	registry, err := newPresenceRegistry(gateway.NewStreams(), metrics.NewRegistry(metrics.Relay), newTunnelRestorationTracker(time.Now))
+	registry, err := newPresenceRegistry(gateway.NewStreams(), newPresenceSyncSink(metrics.NewRegistry(metrics.Relay), newTunnelRestorationTracker(time.Now)))
 	if err != nil {
 		t.Fatalf("newPresenceRegistry() error = %v, want nil", err)
 	}
@@ -94,13 +94,13 @@ func TestConfiguredSyncLoopFailsClosed(t *testing.T) {
 	streams := gateway.NewStreams()
 	logger := slog.New(slog.DiscardHandler)
 
-	loop, enabled, err := configuredSyncLoop(health, registry, table, streams, "gw-boot", logger)
-	if err != nil || enabled || loop != nil {
-		t.Fatalf("unconfigured sync = (%v, enabled=%v, %v), want (nil, false, nil)", loop, enabled, err)
+	loop, client, enabled, err := configuredControlSync(health, registry, table, streams, "gw-boot", logger)
+	if err != nil || enabled || loop != nil || client != nil {
+		t.Fatalf("unconfigured sync = (loop %v, client %v, enabled=%v, %v), want (nil, nil, false, nil)", loop, client, enabled, err)
 	}
 
 	t.Setenv(envControlSyncURL, "https://control.sync.internal:8443")
-	if _, _, err := configuredSyncLoop(health, registry, table, streams, "gw-boot", logger); err == nil {
+	if _, _, _, err := configuredControlSync(health, registry, table, streams, "gw-boot", logger); err == nil {
 		t.Fatal("a partial control-sync configuration was accepted; it must refuse startup")
 	}
 }

@@ -276,6 +276,79 @@ set **together**; a **partial** configuration is a startup error and a
 In the hardened unit the three file paths point at `%d` (the service's systemd
 credential directory); the on-disk files stay `root:root 0600`.
 
+### Control-side §11.3 sync listener (task #16 / ledger I4-partial)
+
+The gateway's client above points at an endpoint that **control** serves. Until
+task #16 control's production entrypoint never constructed the listener, so the
+channel was dark in production: no `/status` endpoint existed, publisher lease
+renewal and presence never reached control, and the gateway fail-closed to
+not-ready. Control now constructs and serves the private mTLS listener when the
+following variables are configured (all four material/identity variables must
+be set **together**; a partial configuration is a startup error, and none set
+means the channel stays dark):
+
+| Variable | Purpose |
+|---|---|
+| `CONTROL_SYNC_BIND_ADDR` | private bind (default `127.0.0.1:9443`; only loopback/RFC 1918/ULA accepted) |
+| `CONTROL_SYNC_CERT_FILE` | control sync server leaf (PEM) |
+| `CONTROL_SYNC_KEY_FILE` | control sync server key (PEM) |
+| `CONTROL_SYNC_CLIENT_CA_FILE` | CA that issued the gateway's client leaf |
+| `CONTROL_SYNC_EXPECTED_CLIENT_SAN` | exact gateway client SAN accepted |
+
+The listener is TLS 1.3 with `RequireAndVerifyClientCert`: it accepts only a
+client leaf issued by `CONTROL_SYNC_CLIENT_CA_FILE` and carrying exactly
+`CONTROL_SYNC_EXPECTED_CLIENT_SAN`. The gateway side must point at it with
+`SHAREBRIDGE_CONTROL_SYNC_URL=https://<control-sync-host:port>`,
+`SHAREBRIDGE_CONTROL_SYNC_SAN` equal to the control leaf's SAN, and
+`SHAREBRIDGE_CONTROL_SYNC_CA_FILE` equal to the CA that issued the control
+leaf. The three control-side files stay `root:root 0600`; mount them read-only.
+
+Private-only by construction: the bind must be numeric loopback or RFC
+1918/ULA (an unspecified/public address fails startup), and in the collocated
+test deployment it is loopback, so it is never added to the firewall. In the
+separate-VM production topology bind control's private-network address and let
+the relay VM reach it over the private network — never the public interface.
+
+Material generation (operator step; no generator ships yet). One shared sync
+CA signs control's server leaf and the gateway's client leaf:
+
+```bash
+# On a trusted workstation (not a service host):
+openssl ecparam -genkey -name prime256v1 -noout -out sync-ca.key
+openssl req -x509 -new -key sync-ca.key -sha256 -days 825 \
+  -subj /CN=sharebridge-sync-ca -out sync-ca.crt
+# Control server leaf, SAN = the control sync endpoint name (the value the
+# gateway pins in SHAREBRIDGE_CONTROL_SYNC_SAN).
+openssl ecparam -genkey -name prime256v1 -noout -out control-sync.key
+openssl req -new -key control-sync.key -subj /CN=control-sync.internal -out control-sync.csr
+openssl x509 -req -in control-sync.csr -CA sync-ca.crt -CAkey sync-ca.key \
+  -CAcreateserial -days 825 -out control-sync.crt \
+  -extfile <(printf 'subjectAltName=DNS:control-sync.internal\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature')
+# Gateway client leaf, SAN = CONTROL_SYNC_EXPECTED_CLIENT_SAN exactly.
+openssl ecparam -genkey -name prime256v1 -noout -out gateway-sync.key
+openssl req -new -key gateway-sync.key -subj /CN=sharebridge-relay-gateway.sync.internal -out gateway-sync.csr
+openssl x509 -req -in gateway-sync.csr -CA sync-ca.crt -CAkey sync-ca.key \
+  -CAcreateserial -days 825 -out gateway-sync.crt \
+  -extfile <(printf 'subjectAltName=DNS:sharebridge-relay-gateway.sync.internal\nextendedKeyUsage=clientAuth\nkeyUsage=digitalSignature')
+chmod 600 sync-ca.key control-sync.key gateway-sync.key
+```
+
+Install `control-sync.{crt,key}` + `sync-ca.crt` on control as
+`root:root 0600` (`CONTROL_SYNC_CERT_FILE`, `CONTROL_SYNC_KEY_FILE`,
+`CONTROL_SYNC_CLIENT_CA_FILE`) and `CONTROL_SYNC_EXPECTED_CLIENT_SAN` =
+the gateway leaf SAN. On the relay VM pass `--sync-ca sync-ca.crt --sync-cert
+gateway-sync.crt --sync-key gateway-sync.key --sync-san control-sync.internal`
+to `relay/deploy/install.sh`; it installs them `root:root 0600` and serves
+them to the gateway through systemd credentials.
+
+Presence transport: the gateway republishes its full authoritative presence
+state every **15 seconds** (and immediately on a transition), one third of the
+45-second presence lease, so control's stored lease cannot expire while the
+tunnel is healthy. The first republish after a gateway boot is its **empty**
+boot snapshot carrying the top-level `gateway_boot_id`/`revision`, which is what
+makes a restarted gateway adoptable at control (its later events are no longer
+discarded as a superseded boot's replay).
+
 NIC saturation (an optional §17.3 gauge) is reported only when **both** of the
 following are set; otherwise the gauge renders `NaN` (unavailable) rather than
 a fabricated `0`:
@@ -340,12 +413,14 @@ audit passes.
 
 ## 11. Known open items
 
-- **Presence-transport gap (ledger I4-partial) — open, not solved here.** The
-  gateway's presence is gateway-authoritative over the control-sync channel,
-  but the presence-transport completeness item carried by the security ledger
-  remains a **known open item with its own task**. This runbook does not claim
-  it is resolved: do not treat these units, the firewall, or the DNS audit as
-  closing it.
+- ~~**Presence-transport gap (ledger I4-partial) — open, not solved here.**~~
+  **Resolved by task #16.** Control constructs and serves the private mTLS sync
+  listener from `CONTROL_SYNC_*` (see §8), the gateway republishes its
+  authoritative presence every 15 s, and an empty boot snapshot carries the
+  reporting boot identity so a restarted gateway is adoptable. The remaining
+  operational prerequisite is the mTLS material itself (control server
+  leaf/key, the gateway client leaf/key, and the shared client CA), which is
+  operator-provisioned on both hosts.
 - The Phase 4a bandwidth throttle is intentionally disabled (deferred to
   Phase 4b); the global stream ceiling / FD budget and per-agent counters are
   the MVP safety tools.

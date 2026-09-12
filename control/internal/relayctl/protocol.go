@@ -180,12 +180,25 @@ type PresenceEvent struct {
 }
 
 // PresenceEnvelope carries either a full presence snapshot (every current
-// lease at one revision, posted on boot/reconnect) or an ordered batch of
-// presence events (strictly increasing revisions). The wire shape is shared;
-// the endpoint gives it semantics.
+// lease at one revision, posted on boot/reconnect and periodically thereafter)
+// or an ordered batch of presence events (strictly increasing revisions). The
+// wire shape is shared; the endpoint gives it semantics.
+//
+// GatewayBootID and Revision are the reporting boot's identity, carried at the
+// TOP LEVEL so that a FULL SNAPSHOT describes its boot even when it has no
+// events at all. This is what makes a freshly restarted gateway (whose
+// presence is legitimately empty until its FRP clients reconnect, §15.1)
+// ADOPTABLE: control records the new boot from the empty snapshot, so the new
+// boot's first real events apply instead of being discarded as a replay of a
+// superseded boot. Without them an empty snapshot was indistinguishable from
+// "the previously recorded boot now has no routes", and a fresh boot could
+// never adopt. They are omitempty so an ordered event batch (which already
+// stamps boot/revision per event, §7.3) is wire-identical to earlier builds.
 type PresenceEnvelope struct {
-	Version int             `json:"version"`
-	Events  []PresenceEvent `json:"events"`
+	Version       int             `json:"version"`
+	GatewayBootID string          `json:"gateway_boot_id,omitempty"`
+	Revision      uint64          `json:"revision,omitempty"`
+	Events        []PresenceEvent `json:"events"`
 }
 
 // StatusAck is the gateway's explicit acknowledgement: its boot ID, the
@@ -430,6 +443,13 @@ func ValidatePresenceSnapshotEnvelope(envelope PresenceEnvelope, maxEvents int) 
 	if err := validatePresenceEnvelopeHeader(envelope, maxEvents); err != nil {
 		return err
 	}
+	// The top-level boot identity is what makes an EMPTY snapshot adoptable, so
+	// it is bounded/validated exactly like an event's boot ID when present.
+	if envelope.GatewayBootID != "" {
+		if err := validateIdentifier(envelope.GatewayBootID, "gateway_boot_id"); err != nil {
+			return err
+		}
+	}
 	for _, event := range envelope.Events {
 		if err := ValidatePresenceEvent(event); err != nil {
 			return err
@@ -437,9 +457,18 @@ func ValidatePresenceSnapshotEnvelope(envelope PresenceEnvelope, maxEvents int) 
 		if event.GatewayBootID != envelope.Events[0].GatewayBootID {
 			return fmt.Errorf("%w: presence snapshot mixes boot IDs", ErrInvalidPayload)
 		}
+		if envelope.GatewayBootID != "" && event.GatewayBootID != envelope.GatewayBootID {
+			return fmt.Errorf("%w: presence snapshot top-level boot does not match its events", ErrInvalidPayload)
+		}
 		if event.Revision != envelope.Events[0].Revision {
 			return fmt.Errorf("%w: presence snapshot mixes revisions", ErrBadRevision)
 		}
+	}
+	// When both describe the same boot they must agree; a disagreement is a
+	// producer bug and is never guessed at.
+	if len(envelope.Events) > 0 && envelope.GatewayBootID != "" && envelope.Revision != envelope.Events[0].Revision {
+		return fmt.Errorf("%w: presence snapshot top-level revision %d does not match event revision %d",
+			ErrBadRevision, envelope.Revision, envelope.Events[0].Revision)
 	}
 	return nil
 }

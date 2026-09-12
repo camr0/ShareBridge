@@ -169,10 +169,19 @@ type PresenceEvent struct {
 }
 
 // PresenceEnvelope carries a full presence snapshot or an ordered event
-// batch; the endpoint decides the semantics.
+// batch; the endpoint decides the semantics. GatewayBootID and Revision are
+// the reporting boot's identity at the TOP LEVEL, so a full snapshot describes
+// its boot even when it carries no events (a freshly restarted gateway posts
+// an empty snapshot before any tunnel is confirmed, §15.1) — control records
+// the new boot from that empty snapshot and the boot's later events apply.
+// omitempty keeps an ordered event batch (which stamps boot/revision per
+// event) wire-identical to earlier builds. Mirrors control's
+// relayctl.PresenceEnvelope field-for-field.
 type PresenceEnvelope struct {
-	Version int             `json:"version"`
-	Events  []PresenceEvent `json:"events"`
+	Version       int             `json:"version"`
+	GatewayBootID string          `json:"gateway_boot_id,omitempty"`
+	Revision      uint64          `json:"revision,omitempty"`
+	Events        []PresenceEvent `json:"events"`
 }
 
 // StatusAck is the gateway's explicit acknowledgement of its last-applied
@@ -604,6 +613,13 @@ func ValidatePresenceSnapshotEnvelope(envelope PresenceEnvelope, maxEvents int) 
 	if err := validatePresenceHeader(envelope, maxEvents); err != nil {
 		return err
 	}
+	// The top-level boot identity is what makes an EMPTY snapshot adoptable, so
+	// it is bounded/validated exactly like an event's boot ID when present.
+	if envelope.GatewayBootID != "" {
+		if err := validateSyncIdentifier(envelope.GatewayBootID, "gateway_boot_id"); err != nil {
+			return err
+		}
+	}
 	for _, event := range envelope.Events {
 		if err := ValidatePresenceEvent(event); err != nil {
 			return err
@@ -611,9 +627,16 @@ func ValidatePresenceSnapshotEnvelope(envelope PresenceEnvelope, maxEvents int) 
 		if event.GatewayBootID != envelope.Events[0].GatewayBootID {
 			return fmt.Errorf("%w: presence snapshot mixes boot IDs", ErrInvalidPayload)
 		}
+		if envelope.GatewayBootID != "" && event.GatewayBootID != envelope.GatewayBootID {
+			return fmt.Errorf("%w: presence snapshot top-level boot does not match its events", ErrInvalidPayload)
+		}
 		if event.Revision != envelope.Events[0].Revision {
 			return fmt.Errorf("%w: presence snapshot mixes revisions", ErrBadRevision)
 		}
+	}
+	if len(envelope.Events) > 0 && envelope.GatewayBootID != "" && envelope.Revision != envelope.Events[0].Revision {
+		return fmt.Errorf("%w: presence snapshot top-level revision %d does not match event revision %d",
+			ErrBadRevision, envelope.Revision, envelope.Events[0].Revision)
 	}
 	return nil
 }

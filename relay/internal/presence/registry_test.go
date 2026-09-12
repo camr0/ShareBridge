@@ -1139,3 +1139,49 @@ func TestLoopbackProbeRespectsBudget(t *testing.T) {
 		}
 	})
 }
+
+// TestRegistrySnapshotReportsOnlineTunnelsWithRenewedLease covers the source of
+// the task #16 periodic full-state republish: Snapshot returns the boot
+// identity, the current revision, and one entry per online tunnel carrying its
+// CURRENT (Ping-renewed) lease expiry, and drops leases that have expired.
+func TestRegistrySnapshotReportsOnlineTunnelsWithRenewedLease(t *testing.T) {
+	fixture := newRegistryFixture(t)
+	fixture.probe.source = "127.0.0.1:55555"
+	fixture.registerOnline(3, "run-snapshot", "127.0.0.1:55555")
+
+	bootID, revision, entries := fixture.registry.Snapshot()
+	if bootID != testBootID {
+		t.Fatalf("snapshot boot = %q, want %q", bootID, testBootID)
+	}
+	if revision == 0 {
+		t.Fatal("snapshot revision = 0, want the emitted-transition revision")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("snapshot entries = %+v, want one online tunnel", entries)
+	}
+	if entries[0].AgentRecordID != testAgent || entries[0].RelayPort != testPort || entries[0].Generation != 3 {
+		t.Fatalf("snapshot entry = %+v, want the live tunnel key", entries[0])
+	}
+	if want := testNow.Add(DefaultLeaseTTL); !entries[0].LeaseExpiresAt.Equal(want) {
+		t.Fatalf("snapshot lease = %s, want %s", entries[0].LeaseExpiresAt, want)
+	}
+
+	// A Ping renews the lease WITHOUT emitting a transition: the snapshot must
+	// carry the renewed expiry or control's stored lease would expire anyway.
+	fixture.clock.Advance(10 * time.Second)
+	fixture.observe(testFact(frpplugin.OperationPing, 3, "run-snapshot"))
+	_, _, renewed := fixture.registry.Snapshot()
+	if len(renewed) != 1 {
+		t.Fatalf("renewed snapshot entries = %+v, want one online tunnel", renewed)
+	}
+	if want := fixture.clock.Now().Add(DefaultLeaseTTL); !renewed[0].LeaseExpiresAt.Equal(want) {
+		t.Fatalf("renewed snapshot lease = %s, want %s", renewed[0].LeaseExpiresAt, want)
+	}
+
+	// Past the lease the tunnel is no longer reported online.
+	fixture.clock.Advance(DefaultLeaseTTL + time.Second)
+	_, _, expired := fixture.registry.Snapshot()
+	if len(expired) != 0 {
+		t.Fatalf("expired snapshot entries = %+v, want none", expired)
+	}
+}

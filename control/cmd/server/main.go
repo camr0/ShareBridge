@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -78,13 +79,11 @@ func main() {
 
 	// Task 15 presence view: control's gateway-authoritative relay
 	// availability. The Task 11 sync server feeds it via PresenceSink
-	// (ApplyPresenceSnapshot/ApplyPresenceEvents); the sync LISTENER itself
-	// (relayctl.NewServer TLS endpoint plus its certificate/env plumbing) is
-	// deliberately NOT wired here — it belongs to a later task's file list.
-	// Until that listener ships, the view stays empty in production, so
-	// every relay term fails CLOSED (RelayAvailable is always false — never
-	// a faked availability): direct candidates get the interstitial, and
-	// relay-dependent cases answer 503, exactly as before this wiring.
+	// (ApplyPresenceSnapshot/ApplyPresenceEvents); the §11.3 sync LISTENER is
+	// wired below from CONTROL_SYNC_* configuration (task #16 / ledger
+	// I4-partial). When the listener is not configured the view stays empty in
+	// production, so every relay term fails CLOSED (RelayAvailable is always
+	// false — never a faked availability).
 	presenceView, err := relayctl.NewPresenceView(relayctl.PresenceViewConfig{
 		App:    app, // best-effort relay_last_seen_at diagnostics (§12)
 		Routes: routePublisher,
@@ -115,6 +114,44 @@ func main() {
 	publisherCtx, stopPublisher := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopPublisher()
 	go routePublisher.Run(publisherCtx)
+
+	// §11.3 control↔gateway sync listener (task #16 / ledger I4-partial). The
+	// hardened relay gateway's control-sync client already points at this
+	// private endpoint; without the listener the gateway's snapshot/delta/
+	// status/presence traffic reaches nothing and every relay route stays
+	// fail-closed. The listener is private/mTLS by construction (loopback or
+	// RFC 1918/ULA bind, TLS 1.3, RequireAndVerifyClientCert against the
+	// pinned client CA + exact gateway client SAN) and refuses to start on a
+	// partial configuration rather than half-enabling the channel.
+	syncServer, err := configuredControlSyncServer(cfg, routePublisher, routePublisher, presenceView)
+	if err != nil {
+		log.Fatalf("control sync listener: %v", err)
+	}
+	if syncServer != nil {
+		syncListener, err := net.Listen("tcp", syncServer.BindAddress())
+		if err != nil {
+			log.Fatalf("control sync listener: %v", err)
+		}
+		syncHTTP := &http.Server{
+			Handler:           syncServer,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+		go func() {
+			if err := syncHTTP.Serve(tls.NewListener(syncListener, syncServer.TLSConfig())); err != nil && err != http.ErrServerClosed {
+				log.Printf("control sync listener stopped: %v", err)
+			}
+		}()
+		go func() {
+			<-publisherCtx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = syncHTTP.Shutdown(shutdownCtx)
+		}()
+		log.Printf("control sync listener on %s (private mTLS)", syncServer.BindAddress())
+	}
 
 	// Task 34 §17.3: the control-owned direct-preparation, browser-fallback and
 	// STUN counters are exposed on a separate LOOPBACK-ONLY listener. The main
@@ -338,6 +375,47 @@ func main() {
 // emits stun_challenge and stunServer.TakeObservation when stun_result
 // arrives. Package-level because main itself does not read it yet.
 var stunServer *stun.Server
+
+// configuredControlSyncServer builds the §11.3 control↔gateway sync listener
+// from the CONTROL_SYNC_* configuration, wiring the real route publisher
+// (RouteSource and StatusSink) and the presence view (PresenceSink). It
+// returns (nil, nil) when the listener is not configured — the process then
+// keeps its pre-existing fail-closed posture (no /status endpoint, every relay
+// term unavailable) — and an error for a partial configuration or unreadable
+// mTLS material, so the process refuses to start rather than half-configure
+// the channel. relayctl.NewServer performs the remaining fail-closed
+// validation (private bind, TLS 1.3, client-CA pin, SAN shape).
+func configuredControlSyncServer(cfg *config.Config, routes relayctl.RouteSource, status relayctl.StatusSink, presence relayctl.PresenceSink) (*relayctl.Server, error) {
+	if !cfg.ControlSyncConfigured() {
+		return nil, nil
+	}
+	listener, err := cfg.ControlSyncListener()
+	if err != nil {
+		return nil, err
+	}
+	serverCertPEM, err := os.ReadFile(listener.CertFile)
+	if err != nil {
+		return nil, fmt.Errorf("sync server certificate: %w", err)
+	}
+	serverKeyPEM, err := os.ReadFile(listener.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("sync server key: %w", err)
+	}
+	clientCAPEM, err := os.ReadFile(listener.ClientCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("sync client CA: %w", err)
+	}
+	return relayctl.NewServer(relayctl.ServerConfig{
+		BindAddress:       listener.BindAddress,
+		ServerCertPEM:     serverCertPEM,
+		ServerKeyPEM:      serverKeyPEM,
+		ClientCAPEM:       clientCAPEM,
+		ExpectedClientSAN: listener.ExpectedClientSAN,
+		RouteSource:       routes,
+		StatusSink:        status,
+		PresenceSink:      presence,
+	})
+}
 
 func deleteExpiredSessions(app core.App, routes handler.RoutePublisher) error {
 	records, err := app.FindAllRecords("sessions")

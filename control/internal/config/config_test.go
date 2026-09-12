@@ -146,3 +146,90 @@ func TestLoad_STUNAdvertiseAddrEnv(t *testing.T) {
 		t.Fatalf("STUNAdvertise = %q, want the env value verbatim", got)
 	}
 }
+
+// TestControlSyncListener pins the task #16 §11.3 sync listener configuration:
+// the listener is enabled only by the mTLS material/identity variables, all
+// four are required together (fail closed, no half-configured channel), the
+// bind defaults to numeric loopback, and an explicit bind is preserved for
+// relayctl.NewServer to validate.
+func TestControlSyncListener(t *testing.T) {
+	base := &Config{}
+	if base.ControlSyncConfigured() {
+		t.Fatal("empty configuration enabled the sync listener")
+	}
+	listener, err := base.ControlSyncListener()
+	if err != nil || listener.BindAddress != "" {
+		t.Fatalf("disabled listener = (%+v, %v), want the zero value and nil", listener, err)
+	}
+
+	// A bind address alone never enables the listener (safe compose default).
+	onlyBind := &Config{ControlSyncBindAddr: "127.0.0.1:9443"}
+	if onlyBind.ControlSyncConfigured() {
+		t.Fatal("CONTROL_SYNC_BIND_ADDR alone enabled the sync listener")
+	}
+
+	full := &Config{
+		ControlSyncCertFile:          "/etc/sharebridge/control-sync/control-sync.crt",
+		ControlSyncKeyFile:           "/etc/sharebridge/control-sync/control-sync.key",
+		ControlSyncClientCAFile:      "/etc/sharebridge/control-sync/sync-ca.crt",
+		ControlSyncExpectedClientSAN: "sharebridge-relay-gateway.sync.internal",
+	}
+	if !full.ControlSyncConfigured() {
+		t.Fatal("full configuration did not enable the sync listener")
+	}
+	listener, err = full.ControlSyncListener()
+	if err != nil {
+		t.Fatalf("full ControlSyncListener: %v", err)
+	}
+	if listener.BindAddress != DefaultControlSyncBindAddr {
+		t.Fatalf("default bind = %q, want %q", listener.BindAddress, DefaultControlSyncBindAddr)
+	}
+	if listener.CertFile != full.ControlSyncCertFile || listener.ExpectedClientSAN != full.ControlSyncExpectedClientSAN {
+		t.Fatalf("resolved listener = %+v, want the configured material", listener)
+	}
+
+	withBind := *full
+	withBind.ControlSyncBindAddr = "10.20.30.40:9443"
+	listener, err = withBind.ControlSyncListener()
+	if err != nil {
+		t.Fatalf("explicit bind ControlSyncListener: %v", err)
+	}
+	if listener.BindAddress != "10.20.30.40:9443" {
+		t.Fatalf("explicit bind = %q, want it preserved verbatim", listener.BindAddress)
+	}
+
+	// Each missing material variable refuses the whole configuration.
+	for name, mutate := range map[string]func(*Config){
+		"cert":   func(c *Config) { c.ControlSyncCertFile = "" },
+		"key":    func(c *Config) { c.ControlSyncKeyFile = "" },
+		"ca":     func(c *Config) { c.ControlSyncClientCAFile = "" },
+		"client": func(c *Config) { c.ControlSyncExpectedClientSAN = "" },
+	} {
+		partial := *full
+		mutate(&partial)
+		if !partial.ControlSyncConfigured() {
+			t.Fatalf("partial config (%s) was considered disabled", name)
+		}
+		if _, err := partial.ControlSyncListener(); err == nil {
+			t.Fatalf("partial config (missing %s) was accepted; it must fail closed", name)
+		}
+	}
+}
+
+// TestLoad_ControlSyncEnvNames pins the exact env names the deployment gate
+// asserts.
+func TestLoad_ControlSyncEnvNames(t *testing.T) {
+	t.Setenv("CONTROL_SYNC_BIND_ADDR", "127.0.0.1:19443")
+	t.Setenv("CONTROL_SYNC_CERT_FILE", "/tmp/control-sync.crt")
+	t.Setenv("CONTROL_SYNC_KEY_FILE", "/tmp/control-sync.key")
+	t.Setenv("CONTROL_SYNC_CLIENT_CA_FILE", "/tmp/sync-ca.crt")
+	t.Setenv("CONTROL_SYNC_EXPECTED_CLIENT_SAN", "gateway-sync.internal")
+	cfg := Load()
+	if cfg.ControlSyncBindAddr != "127.0.0.1:19443" ||
+		cfg.ControlSyncCertFile != "/tmp/control-sync.crt" ||
+		cfg.ControlSyncKeyFile != "/tmp/control-sync.key" ||
+		cfg.ControlSyncClientCAFile != "/tmp/sync-ca.crt" ||
+		cfg.ControlSyncExpectedClientSAN != "gateway-sync.internal" {
+		t.Fatalf("loaded control sync config = %+v", cfg)
+	}
+}
