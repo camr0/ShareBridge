@@ -716,6 +716,64 @@ func callsBeginGateCase(function *ast.FuncDecl) bool {
 	return found
 }
 
+// gateCapacitySkipPattern is the §23.8 capacity/safety suite's test-name
+// prefix (`load_test.go`). It is the exact -skip regex in the documented §23.3
+// gate command, so the BLOCKING gate's package exit code reflects only the gate
+// and its guards. The capacity cases are timing-shaped, have their own gate
+// (`scripts/relay-capacity-gate.sh`) and their own CAPACITY(EVIDENCE) signal,
+// and a capacity flake must neither turn the §23.3 gate RED nor let a capacity
+// failure hide behind a gate-green run. Required mode still fails closed on its
+// own: TestMain asserts every requiredGateCases entry started and completed.
+const gateCapacitySkipPattern = "^TestRelayCapacity"
+
+// TestGateScheduleScopesOutOnlyTheCapacitySuite keeps the documented gate
+// command's -skip scope mechanically honest. If a §23.8 capacity case in
+// load_test.go is renamed out of the prefix, or a §23.3 gate case or gate guard
+// ever matches the prefix, this test fails — and because it is not a capacity
+// case it runs under the documented gate command, so the drift makes the gate
+// exit non-zero instead of silently running (or silently dropping) the wrong
+// set.
+func TestGateScheduleScopesOutOnlyTheCapacitySuite(t *testing.T) {
+	skip := regexp.MustCompile(gateCapacitySkipPattern)
+	for _, name := range requiredGateCases {
+		if skip.MatchString(name) {
+			t.Errorf("the §23.3 gate's -skip pattern %q matches required gate case %s; the gate would exclude a case it is required to run", gateCapacitySkipPattern, name)
+		}
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package directory: %v", err)
+	}
+	scanned := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), entry.Name(), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		capacityFile := entry.Name() == "load_test.go"
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Recv != nil || !strings.HasPrefix(function.Name.Name, "Test") || function.Name.Name == "TestMain" {
+				continue
+			}
+			scanned++
+			matched := skip.MatchString(function.Name.Name)
+			if capacityFile && !matched {
+				t.Errorf("%s: %s must match the gate -skip pattern %q; a §23.8 capacity case outside the pattern would pollute the §23.3 gate's exit code", entry.Name(), function.Name.Name, gateCapacitySkipPattern)
+			}
+			if !capacityFile && matched {
+				t.Errorf("%s: %s matches the gate -skip pattern %q but does not live in load_test.go; the §23.3 gate would silently drop a non-capacity test", entry.Name(), function.Name.Name, gateCapacitySkipPattern)
+			}
+		}
+	}
+	if scanned < len(requiredGateCases) {
+		t.Fatalf("scanned only %d package test functions, fewer than the %d required gate cases; the guard is not looking at the whole package", scanned, len(requiredGateCases))
+	}
+}
+
 // TestGateCaseRegistryFailsClosedOnMissingSkippedAndFailedCases is the
 // in-process negative control for the required-mode registry: a case that
 // never started, a skipped case, and a failed case are all violations, while a

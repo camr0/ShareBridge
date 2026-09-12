@@ -476,7 +476,7 @@ The gate runs the hermetic real-FRP suite
 ```bash
 cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 \
   go test -race -count=5 -timeout 45m ./internal/integration \
-  -run 'Load|Capacity|Plateau|Starvation|Lifetime|Idle|Cancel' -v
+  -run '^TestRelayCapacity' -v
 ```
 
 ### 12.1 What was measured here vs what is pending

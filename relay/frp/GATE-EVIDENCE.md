@@ -161,8 +161,19 @@ skipping:
 
 ```text
 cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
-  go test -v -race -count=1 -timeout 900s ./internal/integration
+  go test -v -race -count=1 -timeout 900s -skip '^TestRelayCapacity' ./internal/integration
 ```
+
+The `-skip '^TestRelayCapacity'` scope keeps the package's §23.8 capacity/safety
+suite (`load_test.go`) out of this blocking gate's exit code, so an exit-1 run is
+always attributable to a genuine §23.3 case or gate guard rather than a
+capacity-timing flake. The capacity suite is non-blocking and has its own gate
+(`scripts/relay-capacity-gate.sh`, §3.6 of `docs/REPO-MAP.md`); the scope cannot
+weaken the gate because required mode asserts every `requiredGateCases` entry
+started and completed, and `TestGateScheduleScopesOutOnlyTheCapacitySuite` (which
+runs under the gate command) fails if the pattern ever matches a gate case or
+misses a capacity case. This fixes the whole-branch review's F1 signal-integrity
+finding for the §23.3 gate.
 
 `TestMain` in required mode fails closed (non-zero exit, no case started) when
 `SHAREBRIDGE_FRP_INTEGRATION=1` is unset or the pinned artifacts are missing,
@@ -354,6 +365,9 @@ cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=1 -timeout 300s \
 cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
   go test -v -race -count=1 -timeout 900s ./internal/integration
 # PASS — exit 0; "all 16 named §23.3 gate cases executed to completion"; ok 85.188s
+# NOTE (F1 signal-hygiene fix, later revision): this recorded run predates the
+# `-skip '^TestRelayCapacity'` scope; the current documented command adds it so
+# the §23.8 capacity suite can no longer pollute the gate's package exit code.
 
 # GREEN (mandated repetition, fix round 3 revision):
 cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=10 -timeout 30m ./internal/integration

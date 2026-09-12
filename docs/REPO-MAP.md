@@ -82,7 +82,7 @@ Key `internal/` packages:
 | `internal/limits` | `§14` resource bounds: config, acquire/release around the listener |
 | `internal/metrics` | `§17.3` metadata-only metric registry, health split, private-only handler, NIC sampler |
 | `internal/frptest` | Pinned FRP artifact verification (`§23.1`/`§23.2`/`§23.7`) |
-| `internal/integration` | Real-FRP `§23.3` parity/recovery gate + `§23.8` capacity baseline |
+| `internal/integration` | Real-FRP `§23.3` parity/recovery gate (`*_test.go` except `load_test.go`) + `§23.8` capacity baseline (`load_test.go`, its own gate) |
 
 Deployment artifacts: `relay/deploy/` (`sharebridge-relay-gateway.service`, `sharebridge-relay-frps.service`, `firewall.nft`, `install.sh`, `deploy_test.sh`), `relay/config/frps.toml`, `relay/frp/manifest.json` + `GATE-EVIDENCE.md`, `relay/scripts/fetch-frp.sh`.
 
@@ -118,7 +118,7 @@ Not shipped; exists to run both halves for real.
 - Gateway: `relay/internal/gateway` (accept/splice), `relay/internal/clienthello` (SNI), `relay/internal/routes` (table), `relay/internal/frpplugin` (authorization), `relay/internal/presence` (availability).
 - Agent: `agent/internal/tunnel` (frpc supervisor + fresh-credential recovery), pinned binary via `relay/frp/manifest.json`.
 - frps config: `relay/config/frps.toml`.
-- Tests: `relay/internal/integration/*` (real frps/frpc, `§23.3` + `§23.8`), `relay/internal/frptest/*` (artifact/config gate), `relay/internal/frpplugin/*_test.go`, `agent/internal/tunnel/*_test.go`.
+- Tests: `relay/internal/integration/*` (real frps/frpc; `§23.3` gate cases + gate guards, and `§23.8` capacity suite in `load_test.go` with its own gate), `relay/internal/frptest/*` (artifact/config gate), `relay/internal/frpplugin/*_test.go`, `agent/internal/tunnel/*_test.go`.
 
 ### 2.4 Direct data path (PnP + DDNS)
 
@@ -132,7 +132,7 @@ Not shipped; exists to run both halves for real.
 
 ```bash
 cd relay && SHAREBRIDGE_FRP_INTEGRATION=1 SHAREBRIDGE_FRP_GATE=required \
-  go test -v -race -count=1 -timeout 900s ./internal/integration
+  go test -v -race -count=1 -timeout 900s -skip '^TestRelayCapacity' ./internal/integration
 ```
 
 Proves: byte-exact TLS parity through the *real pinned* frps/frpc for TLS 1.2/HTTP1.1,
@@ -141,6 +141,17 @@ restart/recovery cases — currently **16 named cases**. Required mode fails clo
 exit, no case started) when the integration env is unset, the run is `-short`, a case is
 skipped or never started, or the pinned artifacts are missing/poisoned. Evidence and digest
 table: `relay/frp/GATE-EVIDENCE.md`.
+
+The `-skip '^TestRelayCapacity'` scope keeps the package's `§23.8` capacity/safety suite
+(`load_test.go`) out of this BLOCKING gate's exit code. Those cases are timing-shaped and
+non-blocking, and they are already covered by their own gate (`§3.6`,
+`scripts/relay-capacity-gate.sh`); before the scope was added, a capacity flake made the
+gate exit non-zero while its own verdict printed all 16 gate cases green, so an exit-1 run
+could not be attributed to a genuine blocking failure. The scope cannot weaken the gate:
+required mode asserts every `requiredGateCases` entry started and completed, and the
+pattern is pinned by `gateCapacitySkipPattern` in `relay/internal/integration/gate_test.go`
+with `TestGateScheduleScopesOutOnlyTheCapacitySuite` (itself not a capacity case, so it runs
+under the gate command) failing on any drift.
 
 ### 3.2 Deployment gate
 
@@ -212,8 +223,9 @@ health withdrawal, mTLS identity rejection, and empty-snapshot boot adoption.
 bash scripts/relay-capacity-gate.sh
 ```
 
-Runs the local capacity/plateau suite and prints target-VM numbers as `PENDING HARDWARE`
-(later filled in by the M6 environment record). Results do not alter route selection.
+Runs the local capacity/plateau suite (`relay/internal/integration/load_test.go`) and prints target-VM numbers as `PENDING HARDWARE`
+(later filled in by the M6 environment record). Results do not alter route selection. This is the
+only gate that exercises the `§23.8` capacity cases; the `§23.3` gate command scopes them out (`§3.1`).
 
 ## 4. Operations docs index
 
@@ -256,14 +268,14 @@ audits, and the per-task reviews. Dispositions: **must-fix-before-M6**, **should
 | `TestOnDemandPort_CloseEscalatesAfterMaxAttempts` flake | Post-M4 B2b verify | note-only | Root cause is test-design fake-clock re-arm; stabilized and passes stress runs; no production race found. |
 | `TestOnDemandPort_CloseRetriesThenSucceeds` flake | M4 closeout batch 1 | note-only | Same fake-clock family as above; passes standalone, flakes only under cross-package `-race` contention. |
 | Readiness-correlation flake (`TestRealFRPContentParity`/revocation probe dials) | Task 33 fix round 2 | note-only | Observed once under load; 220+ isolated iterations and the full `-count=10` rerun passed; does not weaken a gate. |
-| Capacity-timing tests flaking under `-race` contention | M5 round 2 | note-only | Unregistered timing tests; pass in isolation and in the gate runs; contention artifact. |
+| Capacity-timing tests flaking under `-race` contention | M5 round 2 | done (F1 fix, `fix(relay): keep the §23.3 gate exit code free of the capacity suite`) | The old rationale — "pass in isolation and in the gate runs" — was false: `TestRelayCapacityIdleActiveStreamSurvivesIdleWindow` flaked in the primary `§23.3` gate command and its failure polluted the gate's exit code. Removed the coupling (the `§23.3` gate command now `-skip`s `^TestRelayCapacity`, so its exit code reflects only the gate) and made the racy post-close `ActiveStreams()` assertion deterministic (`waitForLimiterDrain` polls the bounded, self-converging lease release instead of a one-shot check). The capacity suite still runs standalone and via `scripts/relay-capacity-gate.sh` with unchanged assertions. |
 | chromedp seek-forced-fresh-request coverage note | Task 24 review | note-only | Ranged fetch + seek effect is proven; Chromium prefetch means "seek forced a fresh request" is not claimed. |
 | Control direct-report freshness (per-open nonce/sequence) | Task 34 / Round C review | should-fix | Persisted IP+port must equal the ack and a live probe re-verifies reachability; provenance is weak but not unsafe. |
 | Timer-renewal mapped-port changes are not proactively reported | Task 34 verify | should-fix | A renewed mapping's port change is only corrected by a later open signal; worst case an avoidable relay fallback. |
 | Pre-report refusal arm lacks a behavioural RED | M4 closeout batch 1 | note-only | No deterministic pre-existing seam existed; kept as defence in depth, converges on the tested end state. |
 | TCP-segmentation deliberately unclaimed for `§23.3` | Task 31 fix round | note-only | The gate proves exact TLS-record fragmentation (2/2/5); TCP segment boundaries are neither preserved nor relied upon. |
 | NAT-PMP retry depth ≈ 4 attempts | Task 30 fix round 2 | should-fix | Bounded router I/O trade-off; validate on NAT-PMP hardware and consider a separate bounded budget if flaky. |
-| `ActiveStreams` briefly lags after close | Task 33 / T36 verify | note-only | Bounded, self-converging; registry returns to zero and the post-close assertion now pins it. |
+| `ActiveStreams` briefly lags after close | Task 33 / T36 verify | done (F1 fix, `fix(relay): keep the §23.3 gate exit code free of the capacity suite`) | Bounded, self-converging; the gateway removes a stream from the registry before its deferred lease release, so the old one-shot post-close check was racy under `-race` contention. `waitForLimiterDrain` now polls the drain to zero (a lease that never releases still fails). |
 | `--case ""` semantics in the M6 harness | M6 harness verify | note-only | An empty string means "no scope" (runs all gates); an empty/unknown element exits 2. A one-line usage-error change if desired. |
 | Single-namespace vs per-agent namespace design question | Remediation verification | must-fix-before-M6 | One gateway applier serves exactly one agent namespace; a second agent or a re-enroll makes relay unreachable. Resolve or explicitly accept before M6. |
 | `integration/controlsync` module not enumerated in CI | Cross-module ack verify | should-fix | No repo-wide workflow enumerates modules yet; the module runs via `cd integration/controlsync && go test ./...`. |

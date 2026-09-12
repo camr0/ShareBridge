@@ -11,8 +11,11 @@
 #   cross-agent starvation, an active stream surviving beyond the idle window, the
 #   no-byte idle close, the absolute-lifetime hard close under continuous activity,
 #   cancellation releasing every admission slot, and goroutine/FD/copy-buffer
-#   plateau under cumulative load. It also prints the host file-descriptor budget
-#   and derives the safe global stream default from it.
+#   plateau under cumulative load. This is the only gate that runs those cases:
+#   the §23.3 gate command scopes them out with `-skip '^TestRelayCapacity'`
+#   (docs/REPO-MAP.md §3.1) so a capacity flake cannot pollute its exit code.
+#   It also prints the host file-descriptor budget and derives the safe global
+#   stream default from it.
 #
 #   TARGET — the hardware-dependent numbers on the real relay VM size: throughput,
 #   CPU, RSS, NIC saturation and the global FD-budget choice for the shipped
@@ -246,12 +249,12 @@ fi
 
 if [ "$MODE" = "local" ] && [ "$SKIP_TESTS" -eq 0 ]; then
   echo "--- local hermetic real-FRP capacity/safety suite (§18.5, §23.8) ---"
-  echo "command: SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=1 -timeout 30m ./internal/integration -run 'Load|Capacity|Plateau|Starvation|Lifetime|Idle|Cancel' -v"
+  echo "command: SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=1 -timeout 30m ./internal/integration -run '^TestRelayCapacity' -v"
   log_file="$(mktemp -t relay-capacity-gate.XXXXXX)"
   (
     cd "$RELAY_DIR" || exit 1
     SHAREBRIDGE_FRP_INTEGRATION=1 go test -race -count=1 -timeout 30m \
-      ./internal/integration -run 'Load|Capacity|Plateau|Starvation|Lifetime|Idle|Cancel' -v
+      ./internal/integration -run '^TestRelayCapacity' -v
   ) >"$log_file" 2>&1
   suite_status=$?
   grep -E 'CAPACITY\(EVIDENCE\)' "$log_file" || true

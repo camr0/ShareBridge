@@ -301,6 +301,26 @@ func waitForActiveStreams(t *testing.T, limiter *limits.Limiter, agentID string,
 	t.Fatalf("agent %q holds %d active streams, want %d", agentID, limiter.ActiveStreamsForAgent(agentID), want)
 }
 
+// waitForLimiterDrain blocks until every §14 admission slot is released, then
+// fails if it is not. The gateway removes a stream from the registry before its
+// deferred lease release runs — gateway.(*Server).handleConnection defers
+// stream.Close() before streamLease.Release() — so a one-shot ActiveStreams()
+// check taken immediately after waitForStreams can observe the bounded,
+// self-converging release lag under -race contention. Polling to zero keeps the
+// leak assertion (a lease that never releases still fails) while removing the
+// instantaneous race.
+func waitForLimiterDrain(t *testing.T, harness *capacityHarness, deadline time.Duration) {
+	t.Helper()
+	limit := time.Now().Add(deadline)
+	for time.Now().Before(limit) {
+		if harness.limiter.ActiveStreams() == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("limiter holds %d active streams after settling", harness.limiter.ActiveStreams())
+}
+
 // tryOpenRelayTLS is the non-fatal counterpart of openRelayTLS: it returns the
 // handshake error so a saturation case can assert a generic rejection.
 func tryOpenRelayTLS(ctx context.Context, stack *relayStack, host string) (net.Conn, error) {
@@ -535,9 +555,7 @@ func TestRelayCapacityLimitSaturationWithoutCrossAgentStarvation(t *testing.T) {
 	waitForActiveStreams(t, harness.limiter, harness.specA.agentID, 0, 10*time.Second)
 	waitForActiveStreams(t, harness.limiter, harness.specB.agentID, 0, 10*time.Second)
 	waitForStreams(t, harness.relayStack, 0, 10*time.Second)
-	if harness.limiter.ActiveStreams() != 0 {
-		t.Fatalf("limiter still reports %d active streams after release", harness.limiter.ActiveStreams())
-	}
+	waitForLimiterDrain(t, harness, 10*time.Second)
 
 	recovered, err := tryOpenRelayTLS(ctx, harness.relayStack, harness.relayHost)
 	if err != nil {
@@ -652,9 +670,7 @@ func TestRelayCapacityIdleCloseWithoutBytes(t *testing.T) {
 		t.Fatalf("idle stream was still open after %s with a %s idle window", closedAfter, idleWindow)
 	}
 	waitForStreams(t, harness.relayStack, 0, 10*time.Second)
-	if harness.limiter.ActiveStreams() != 0 {
-		t.Fatalf("limiter reports %d active streams after the idle close", harness.limiter.ActiveStreams())
-	}
+	waitForLimiterDrain(t, harness, 10*time.Second)
 	t.Logf("%s case=idle-close-without-bytes idle_window_s=%.1f closed_after_s=%.3f stream_registry=0 active_streams=0",
 		capacityEvidencePrefix, idleWindow.Seconds(), closedAfter.Seconds())
 }
@@ -707,9 +723,7 @@ func TestRelayCapacityIdleActiveStreamSurvivesIdleWindow(t *testing.T) {
 		t.Fatalf("idle close after activity took %s with a %s idle window", closedAfterStop, idleWindow)
 	}
 	waitForStreams(t, harness.relayStack, 0, 10*time.Second)
-	if harness.limiter.ActiveStreams() != 0 {
-		t.Fatalf("limiter reports %d active streams after the idle close", harness.limiter.ActiveStreams())
-	}
+	waitForLimiterDrain(t, harness, 10*time.Second)
 	t.Logf("%s case=active-stream-survives-idle idle_window_s=%.1f active_for_s=%.3f closed_after_stop_s=%.3f stream_registry=0 active_streams=0",
 		capacityEvidencePrefix, idleWindow.Seconds(), activeFor.Seconds(), closedAfterStop.Seconds())
 }
@@ -752,9 +766,7 @@ func TestRelayCapacityAbsoluteLifetimeHardClosesActiveStream(t *testing.T) {
 		t.Fatalf("absolute lifetime close took %s against a %s bound", closedAfter, lifetime)
 	}
 	waitForStreams(t, harness.relayStack, 0, 10*time.Second)
-	if harness.limiter.ActiveStreams() != 0 {
-		t.Fatalf("limiter reports %d active streams after the absolute lifetime close", harness.limiter.ActiveStreams())
-	}
+	waitForLimiterDrain(t, harness, 10*time.Second)
 	t.Logf("%s case=absolute-lifetime-hard-close absolute_lifetime_s=%.1f closed_after_s=%.3f idle_window_s=%.0f stream_registry=0",
 		capacityEvidencePrefix, lifetime.Seconds(), closedAfter.Seconds(), config.IdleTimeout.Seconds())
 }
@@ -812,9 +824,7 @@ func TestRelayCapacityCancellationReleasesCapacity(t *testing.T) {
 	waitSlowCancelled(t, harness.relayStack, 15*time.Second)
 	waitForActiveStreams(t, harness.limiter, harness.specA.agentID, 0, 15*time.Second)
 	waitForStreams(t, harness.relayStack, 0, 15*time.Second)
-	if harness.limiter.ActiveStreams() != 0 {
-		t.Fatalf("limiter still reports %d active streams after cancelling %d", harness.limiter.ActiveStreams(), streams)
-	}
+	waitForLimiterDrain(t, harness, 15*time.Second)
 
 	// Capacity is reusable: a fresh request succeeds.
 	after, err := client.Get("https://" + harness.relayHost + "/s/" + fixtureCode + "/items")
