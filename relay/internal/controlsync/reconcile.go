@@ -53,6 +53,12 @@ var (
 	// stale-revision revoke against an ACTIVE stored route (an explicit
 	// revoke of a live route is never an idempotent no-op — Sol Critical-2).
 	ErrReconcileRequired = errors.New("controlsync: full snapshot reconciliation required")
+	// ErrAckFailed marks a reconcile whose fetch+apply committed but whose
+	// /status acknowledgement control rejected. It is deliberately a SEPARATE
+	// class from the fetch/apply failures above: the apply already observed
+	// control's current revision, so control's own lease watermark — not a
+	// blanket "sync is down" — decides the health truth (M5 r2 Fix A1).
+	ErrAckFailed = errors.New("controlsync: status acknowledgement failed")
 )
 
 // StreamDrainer is the established-stream drain seam (satisfied by
@@ -116,6 +122,15 @@ type Applier struct {
 	applied     bool
 	epoch       uint64
 	lastApplied uint64
+	// hasAcked/ackedEpoch/ackedRevision are the gateway-side mirror of
+	// control's lease watermark (relayctl.Publisher): the revision carried by
+	// the last acknowledgement control ACCEPTED, keyed on the control epoch
+	// the ack was sent for. Control renews this gateway's leases only while
+	// `hasAck && ackedRevision >= revision`, so the gateway tracks the same
+	// two facts to answer the same question locally (ControlSyncHealthy).
+	hasAcked      bool
+	ackedEpoch    uint64
+	ackedRevision uint64
 }
 
 // NewApplier validates the configuration fail-closed and returns the applier.
@@ -581,28 +596,88 @@ func (applier *Applier) setState(epoch uint64, revision uint64) {
 	applier.lastApplied = revision
 }
 
+// ControlSyncHealthy reports whether the gateway's control sync is healthy in
+// exactly the sense control's lease-renewal predicate uses: control renews
+// this gateway's route leases only while the current boot has acknowledged
+// every revision control has published. The gateway cannot read control's
+// published watermark directly, so it mirrors the predicate with the two
+// facts it owns:
+//
+//	control:  relayctl.Publisher.Healthy() == hasAck && ackedRevision >= revision
+//	gateway:  ControlSyncHealthy()          == hasAcked && ackedEpoch == appliedEpoch
+//	                                          && ackedRevision >= appliedRevision
+//
+// where appliedRevision is control's published revision as observed by the
+// last successful fetch+apply, and ackedRevision is the revision carried by
+// the last acknowledgement control ACCEPTED (recordAck). The epoch term
+// mirrors control's own "a new gateway boot ID replaces the recorded ack
+// state wholesale" rule across a control restart: revisions restart within an
+// epoch, so adopting a new epoch must invalidate the previous epoch's
+// watermark rather than let a numerically larger old-epoch revision appear to
+// cover the new one.
+//
+// The mirror is exact whenever the gateway has actually observed control's
+// current revision; the sync loop conservatively withdraws the truth instead
+// when a reconcile never reached control (see Loop.ReconcileOnce), because
+// only then can it not know whether control has published past
+// appliedRevision.
+func (applier *Applier) ControlSyncHealthy() bool {
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	return applier.hasAcked && applier.ackedEpoch == applier.epoch && applier.ackedRevision >= applier.lastApplied
+}
+
+// recordAck records the revision an ACCEPTED acknowledgement covered. The
+// watermark advances monotonically within an epoch and is replaced wholesale
+// when the epoch changes, exactly mirroring control's own Acknowledge handling
+// of a new gateway boot ID (control/internal/relayctl/publisher.go).
+func (applier *Applier) recordAck(epoch uint64, revision uint64) {
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	if !applier.hasAcked || applier.ackedEpoch != epoch {
+		applier.hasAcked = true
+		applier.ackedEpoch = epoch
+		applier.ackedRevision = revision
+		return
+	}
+	if revision > applier.ackedRevision {
+		applier.ackedRevision = revision
+	}
+}
+
+// appliedState reads the applied epoch and revision as one atomic pair, so an
+// acknowledgement and the watermark it records always refer to the same
+// applied state even if another goroutine applies concurrently.
+func (applier *Applier) appliedState() (uint64, uint64) {
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	return applier.epoch, applier.lastApplied
+}
+
 // acknowledge reports the applied revision to control (§11.3 status),
 // carrying the control epoch of the applied state (R2: control ignores acks
 // from foreign epochs). The apply has already committed, so the acknowledgement
-// is the LAST step and its failure is returned to the caller: control renews
-// route leases only while its publisher is Healthy(), which requires the
-// current boot's explicit ack of the latest revision. Surfacing the failure
-// lets the sync loop mark control sync unhealthy, exactly matching the truth
-// control's lease renewal depends on. It is not latched — the next successful
-// reconcile re-acks and restores the truth, which is control's own
-// non-latching predicate.
+// is the LAST step and its failure is returned to the caller wrapped in
+// ErrAckFailed: control renews route leases only while its publisher is
+// Healthy(), which requires the current boot's explicit ack of the latest
+// revision. An ACCEPTED acknowledgement records the revision control now
+// covers (recordAck) so the health truth mirrors control's watermark rather
+// than a blanket boolean. It is not latched — the next accepted ack advances
+// the watermark, which is control's own non-latching predicate.
 func (applier *Applier) acknowledge(ctx context.Context) error {
+	epoch, revision := applier.appliedState()
 	ack := StatusAck{
 		Version:             ProtocolVersion,
 		GatewayBootID:       applier.bootID,
-		ControlEpoch:        applier.AppliedEpoch(),
-		LastAppliedRevision: applier.LastAppliedRevision(),
+		ControlEpoch:        epoch,
+		LastAppliedRevision: revision,
 	}
 	if _, err := applier.client.SendStatus(ctx, ack); err != nil {
 		applier.logger.Warn("controlsync: status ack failed (the next reconcile re-acks)",
 			"error", err)
-		return fmt.Errorf("controlsync: status acknowledgement failed: %w", err)
+		return fmt.Errorf("%w: %w", ErrAckFailed, err)
 	}
+	applier.recordAck(epoch, revision)
 	return nil
 }
 

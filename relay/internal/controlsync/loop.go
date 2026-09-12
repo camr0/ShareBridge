@@ -15,8 +15,10 @@ const DefaultSyncInterval = 5 * time.Second
 // HealthSink is the truthful §17.1 health surface the sync loop drives. It is
 // the production write path for `gateway.Health`'s snapshot/control-sync
 // truths: route readiness becomes true only after a snapshot has actually
-// been applied AND the last reconcile succeeded, and it becomes false again
-// when control sync is lost. Snapshot readiness NEVER regresses (a later gap
+// been applied AND control sync is healthy, and control sync is healthy only
+// while the revision control last ACKNOWLEDGED covers the revision the
+// gateway has applied (control's own lease watermark — see
+// Applier.ControlSyncHealthy). Snapshot readiness NEVER regresses (a later gap
 // must not withdraw routing for already-served routes — §15.4).
 type HealthSink interface {
 	SetSnapshotReady(ready bool)
@@ -73,18 +75,30 @@ func NewLoop(config LoopConfig) (*Loop, error) {
 }
 
 // ReconcileOnce performs one reconcile pass and reports the resulting health
-// truths. On success route snapshot readiness is set from the applier's real
-// state (true after the first applied snapshot) and control sync is healthy;
-// on failure control sync is withdrawn while snapshot readiness is left
-// untouched. The error is returned for the caller's own retry/log policy.
+// truths. Snapshot readiness is set from the applier's real state on every
+// pass (true after the first applied snapshot) — it is independent of the
+// acknowledgement outcome, because an apply that committed really did make
+// the gateway snapshot-ready. Control-sync health mirrors control's own lease
+// predicate (Applier.ControlSyncHealthy: the last ACKNOWLEDGED revision must
+// cover the applied revision) whenever the pass actually reached control — a
+// full success, or a successful fetch+apply whose only failure was the
+// /status acknowledgement (ErrAckFailed). Any other failure means the gateway
+// could not observe control's current revision, so the truth is withdrawn
+// rather than asserted. The error is returned for the caller's own retry/log
+// policy.
 func (loop *Loop) ReconcileOnce(ctx context.Context) error {
 	err := loop.applier.Reconcile(ctx)
 	if loop.health != nil {
-		if err != nil {
-			loop.health.SetControlSynced(false)
+		loop.health.SetSnapshotReady(loop.applier.Ready())
+		// An ack failure leaves the watermark exactly where control's own
+		// predicate leaves it: a rejected ack for a no-op poll changes
+		// nothing control has to renew (still healthy), while a rejected ack
+		// after a NEW revision was applied leaves it uncovered (unhealthy)
+		// until an ack catches up.
+		if err == nil || errors.Is(err, ErrAckFailed) {
+			loop.health.SetControlSynced(loop.applier.ControlSyncHealthy())
 		} else {
-			loop.health.SetSnapshotReady(loop.applier.Ready())
-			loop.health.SetControlSynced(true)
+			loop.health.SetControlSynced(false)
 		}
 	}
 	return err
