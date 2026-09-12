@@ -170,9 +170,21 @@ type Daemon struct {
 	stunInFlight chan struct{}
 	now          func() time.Time
 
+	// webServer is the admin surface; a failure to start it is fatal (see Start).
 	webServer          WebServer
 	startTime          time.Time
 	signalingConnected bool // true once welcome received
+
+	// reconnectSleep paces the signaling reconnect loop. Production leaves it
+	// nil and uses sleepCtx; tests install a fake to observe the retry/backoff
+	// schedule without real waits.
+	reconnectSleep func(ctx context.Context, delay time.Duration) bool
+
+	// reconnectLogInterval is the minimum spacing between repeated signaling
+	// outage log lines during one outage. Zero means
+	// defaultReconnectLogInterval; the first failure of each outage always
+	// logs. It bounds log growth during a long control outage.
+	reconnectLogInterval time.Duration
 
 	newImmichPoller func() (immichPoller, error)
 
@@ -187,6 +199,12 @@ const (
 	directIntPort         = 8443
 	directExtPort         = 443
 	directPortIdle        = 5 * time.Minute
+
+	// defaultReconnectLogInterval bounds how often a repeated signaling outage
+	// diagnostic is logged. The first failure of an outage logs immediately;
+	// later failures inside the interval are suppressed so a control outage
+	// cannot flood the operator log.
+	defaultReconnectLogInterval = 30 * time.Second
 
 	// defaultLockdownLeverTimeout bounds how long Lockdown waits for its
 	// best-effort levers. The local locked gate is final before the wait
@@ -1257,7 +1275,10 @@ func (d *Daemon) SetWebServer(ws WebServer) {
 
 // Start connects to signaling server (with reconnect), loads sessions from
 // store, starts the web server, and begins the expiry pruner + cert renewal.
-// Returns an error channel that emits errors from background goroutines.
+// Returns an error channel that emits only GENUINELY FATAL runtime errors —
+// today, a web server start failure. Signaling connect/listener failures are
+// deliberately NOT sent here: the reconnect loop owns their recovery with a
+// bounded backoff, so a control outage never terminates the process.
 func (d *Daemon) Start(ctx context.Context) <-chan error {
 	errChan := make(chan error, 10)
 
@@ -1271,7 +1292,9 @@ func (d *Daemon) Start(ctx context.Context) <-chan error {
 	d.signaling.SetOnMessage(d.handleSignalingMessage)
 
 	// Signaling connect + listen run in a reconnect loop (bounded backoff).
-	go d.runSignalingLoop(ctx, errChan)
+	// A failure here never terminates the daemon; only a genuinely fatal
+	// local error (web server start) reaches errChan.
+	go d.runSignalingLoop(ctx)
 
 	// Renewal scheduler re-issues the cert at the 30-day threshold.
 	go d.runRenewalScheduler(ctx)
@@ -1300,8 +1323,14 @@ func (d *Daemon) Start(ctx context.Context) <-chan error {
 // runSignalingLoop drives connect + listen with bounded exponential backoff.
 // Each successful connect re-registers persisted sessions; each disconnect
 // resets direct-transport readiness and the open-signal gate for the new epoch.
-func (d *Daemon) runSignalingLoop(ctx context.Context, errChan chan<- error) {
+//
+// Every failure is retryable by construction: an unreachable or dropped
+// control connection is a transient remote condition, so the loop logs a
+// rate-limited diagnostic and retries instead of terminating the process.
+// The loop ends only when ctx is cancelled (daemon shutdown).
+func (d *Daemon) runSignalingLoop(ctx context.Context) {
 	backoff := signaling.NewBackoff()
+	outageLog := newRepeatLogLimiter(d.reconnectLogEvery())
 	for {
 		if ctx.Err() != nil {
 			return
@@ -1310,13 +1339,16 @@ func (d *Daemon) runSignalingLoop(ctx context.Context, errChan chan<- error) {
 			if ctx.Err() != nil {
 				return
 			}
-			errChan <- fmt.Errorf("connect to signaling server: %w", err)
-			if !sleepCtx(ctx, backoff.Next()) {
+			if outageLog.shouldLog() {
+				log.Printf("signaling connect failed (retrying with backoff): %v", err)
+			}
+			if !d.sleepForReconnect(ctx, backoff.Next()) {
 				return
 			}
 			continue
 		}
 		backoff.Reset()
+		outageLog.reset()
 		log.Printf("connected to signaling server at %s", d.GetConfig().SignalingURL)
 
 		// Listen is the sole WebSocket reader and must run before re-enrollment
@@ -1337,13 +1369,32 @@ func (d *Daemon) runSignalingLoop(ctx context.Context, errChan chan<- error) {
 			}
 			d.onSignalingDisconnect()
 			if !errors.Is(err, context.Canceled) {
-				errChan <- fmt.Errorf("signaling listener: %w", err)
+				if outageLog.shouldLog() {
+					log.Printf("signaling listener stopped (reconnecting with backoff): %v", err)
+				}
 			}
-			if !sleepCtx(ctx, backoff.Next()) {
+			if !d.sleepForReconnect(ctx, backoff.Next()) {
 				return
 			}
 		}
 	}
+}
+
+// sleepForReconnect paces the reconnect loop through the test-visible
+// reconnectSleep seam, falling back to the production sleepCtx.
+func (d *Daemon) sleepForReconnect(ctx context.Context, delay time.Duration) bool {
+	if d.reconnectSleep != nil {
+		return d.reconnectSleep(ctx, delay)
+	}
+	return sleepCtx(ctx, delay)
+}
+
+// reconnectLogEvery returns the effective outage-log interval.
+func (d *Daemon) reconnectLogEvery() time.Duration {
+	if d.reconnectLogInterval > 0 {
+		return d.reconnectLogInterval
+	}
+	return defaultReconnectLogInterval
 }
 
 // onSignalingDisconnect resets the direct-transport epoch: readiness is
@@ -1445,6 +1496,33 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 		return true
 	}
 }
+
+// repeatLogLimiter rate-limits one repeated diagnostic so a long outage does
+// not flood the operator log. It is not safe for concurrent use; each limiter
+// is confined to a single reconnect-loop goroutine.
+type repeatLogLimiter struct {
+	interval time.Duration
+	now      func() time.Time
+	last     time.Time
+}
+
+func newRepeatLogLimiter(interval time.Duration) *repeatLogLimiter {
+	return &repeatLogLimiter{interval: interval, now: time.Now}
+}
+
+// shouldLog reports whether a line may be logged now. The first call always
+// allows it; subsequent calls are allowed at most once per interval.
+func (l *repeatLogLimiter) shouldLog() bool {
+	now := l.now()
+	if !l.last.IsZero() && now.Sub(l.last) < l.interval {
+		return false
+	}
+	l.last = now
+	return true
+}
+
+// reset forgets the last log time so a new outage logs immediately.
+func (l *repeatLogLimiter) reset() { l.last = time.Time{} }
 
 // Stop gracefully shuts down the daemon.
 //

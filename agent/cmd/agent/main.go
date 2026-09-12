@@ -102,12 +102,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	log.Printf("daemon started — web UI at http://%s:%d", uiAddr, uiPort)
 
-	// Wait for interrupt or error
+	// Wait for interrupt or a genuinely fatal daemon error. Signaling
+	// connect/listener failures are NOT delivered here: the daemon's reconnect
+	// loop owns their recovery with a bounded backoff, so a control outage
+	// never terminates the process.
 	select {
 	case <-ctx.Done():
 		log.Println("shutting down...")
 	case err := <-errChan:
-		log.Printf("daemon error: %v", err)
+		log.Printf("fatal daemon error: %v", err)
 	}
 
 	// Cancel the process context BEFORE tearing down so the WebSocket read

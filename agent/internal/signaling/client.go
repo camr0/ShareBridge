@@ -171,6 +171,14 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
+		// wsURL carries the API key in its query string, and net/http's
+		// *url.Error renders the whole URL. Never propagate (or later log)
+		// that URL: unwrap to the transport cause, which never contains the
+		// credential. This keeps the reconnect-loop diagnostic credential-free.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return fmt.Errorf("dial signaling server: %w", urlErr.Err)
+		}
 		return fmt.Errorf("dial signaling server: %w", err)
 	}
 	c.connMu.Lock()
