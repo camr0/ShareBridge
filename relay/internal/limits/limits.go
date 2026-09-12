@@ -52,7 +52,16 @@ const (
 	// one map that outlives individual streams). Control's Task 11 snapshot
 	// validator bounds a gateway's route set at 4096; an agent ceiling of the
 	// same size keeps per-agent accounting from growing without bound while
-	// admitting every agent a healthy deployment can hold.
+	// admitting every agent a healthy deployment can hold. It is also the
+	// HARD CEILING for the environment input: because this map persists for
+	// the process lifetime, the operator surface must be finite, so
+	// SHAREBRIDGE_GATEWAY_MAX_TRACKED_AGENTS may only lower it, never raise
+	// it (the same tighten-only pattern as MaxStreamsGlobal). See
+	// ConfigFromEnvironment; the documented memory cost is roughly two map
+	// entries per agent (an identity key of at most 64 bytes, per
+	// controlsync.MaxIdentityBytes, plus one uint64 and one bool), i.e. on the
+	// order of a few hundred bytes per agent and about 1 MiB at this ceiling —
+	// negligible against the runbook's 512 MiB gateway MemoryMax.
 	DefaultMaxTrackedAgents = 4096
 )
 
@@ -81,7 +90,9 @@ const (
 	EnvIdleTimeout = "SHAREBRIDGE_GATEWAY_IDLE_TIMEOUT"
 	// EnvAbsoluteLifetime is the hard connection lifetime.
 	EnvAbsoluteLifetime = "SHAREBRIDGE_GATEWAY_ABSOLUTE_LIFETIME"
-	// EnvMaxTrackedAgents bounds the persistent per-agent byte map.
+	// EnvMaxTrackedAgents bounds the persistent per-agent byte map. It is a
+	// HARD-CEILING input: a value above DefaultMaxTrackedAgents refuses
+	// startup rather than letting the persistent map grow without bound.
 	EnvMaxTrackedAgents = "SHAREBRIDGE_GATEWAY_MAX_TRACKED_AGENTS"
 )
 
@@ -186,12 +197,14 @@ func DefaultConfig() Config {
 // ConfigFromEnvironment builds the production §14 configuration from an
 // environment lookup. An unset (or empty) variable keeps its documented
 // default; a set variable must be a positive integer or Go duration, and the
-// two hard ceilings are enforced: MaxHelloBytes may not exceed the parser's
-// inspection budget and MaxStreamsGlobal may not exceed the §14 global
+// hard ceilings are enforced: MaxHelloBytes may not exceed the parser's
+// inspection budget, MaxStreamsGlobal may not exceed the §14 global
 // ceiling (the documentation defines it as 8,192 or a LOWER host
-// file-descriptor budget). Any invalid value fails closed: the zero Config is
-// returned with a descriptive error so main.go refuses startup instead of
-// silently using a wrong bound.
+// file-descriptor budget), and MaxTrackedAgents may not exceed its ceiling
+// (the persistent per-agent map is not bounded by current concurrency over
+// the process lifetime, so its configuration surface must be finite). Any
+// invalid value fails closed: the zero Config is returned with a descriptive
+// error so main.go refuses startup instead of silently using a wrong bound.
 func ConfigFromEnvironment(lookup EnvironmentLookup) (Config, error) {
 	config := DefaultConfig()
 	integerBounds := []struct {
@@ -231,6 +244,10 @@ func ConfigFromEnvironment(lookup EnvironmentLookup) (Config, error) {
 	if config.MaxStreamsGlobal > DefaultMaxStreamsGlobal {
 		return Config{}, fmt.Errorf("limits: %s = %d exceeds the §14 global ceiling %d",
 			EnvMaxStreamsGlobal, config.MaxStreamsGlobal, DefaultMaxStreamsGlobal)
+	}
+	if config.MaxTrackedAgents > DefaultMaxTrackedAgents {
+		return Config{}, fmt.Errorf("limits: %s = %d exceeds the tracked-agent ceiling %d",
+			EnvMaxTrackedAgents, config.MaxTrackedAgents, DefaultMaxTrackedAgents)
 	}
 	return config, nil
 }
@@ -323,12 +340,17 @@ type Saturation struct {
 
 // StreamRequest describes one stream admission after the exact route lookup.
 // The route ceilings are control-distributed and may only tighten the
-// process defaults: an absent (zero) or looser route value is ignored.
+// process defaults: a zero route value means "no override" (the process
+// ceiling stays authoritative) and a looser route value is ignored. This is
+// the same tighten-only rule for the route global as for origin and agent.
 type StreamRequest struct {
 	Hostname            string
 	AgentRecordID       string
 	MaxStreamsPerOrigin int
 	MaxStreamsPerAgent  int
+	// MaxStreamsGlobal is the route-distributed global ceiling. It may only
+	// tighten the process ceiling; effectiveLimit resolves the minimum.
+	MaxStreamsGlobal int
 }
 
 // Limiter is the concurrency/accounting authority for one gateway process.
@@ -448,11 +470,21 @@ func (limiter *Limiter) AdmitStream(conn *ConnectionLease, request StreamRequest
 	}
 	agentLimit := effectiveLimit(limiter.config.MaxStreamsPerAgent, request.MaxStreamsPerAgent)
 	originLimit := effectiveLimit(limiter.config.MaxStreamsPerOrigin, request.MaxStreamsPerOrigin)
+	globalLimit := effectiveLimit(limiter.config.MaxStreamsGlobal, request.MaxStreamsGlobal)
 
 	limiter.mu.Lock()
 	var alert *Saturation
 	var failure error
 	switch {
+	case limiter.global > globalLimit:
+		// The global slot was taken at AdmitConnection against the process
+		// ceiling; a route-level tightening must be re-checked here, at the
+		// same atomic admission point, before any agent or origin slot is
+		// acquired. The check only reads the already-held counter, so it
+		// acquires nothing and release semantics are unchanged.
+		alert = &Saturation{Kind: SaturationGlobal, Active: limiter.global, Limit: globalLimit}
+		failure = fmt.Errorf("%w: %d active streams against the route-tightened global ceiling %d",
+			ErrGlobalLimit, limiter.global, globalLimit)
 	case limiter.activePerAgent[agentKey] >= agentLimit:
 		alert = &Saturation{Kind: SaturationAgent, Key: agentKey, Active: limiter.activePerAgent[agentKey], Limit: agentLimit}
 		failure = fmt.Errorf("%w: agent %q holds %d streams against the ceiling %d",
@@ -629,7 +661,8 @@ func (limiter *Limiter) emit(saturation Saturation) {
 }
 
 // effectiveLimit resolves a §14 ceiling. The process value is the safety
-// ceiling; a positive control-distributed route value may only tighten it.
+// ceiling; a positive control-distributed route value may only tighten it,
+// and a zero route value means "no override".
 func effectiveLimit(configured, routeValue int) int {
 	if routeValue > 0 && routeValue < configured {
 		return routeValue

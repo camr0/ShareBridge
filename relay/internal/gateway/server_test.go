@@ -185,6 +185,23 @@ func applyRoute(t *testing.T, table *routes.Table, hostname string, relayPort in
 	}
 }
 
+func applyRouteWithLimits(t *testing.T, table *routes.Table, hostname string, relayPort int, limits routes.Limits) {
+	t.Helper()
+	err := table.Apply(routes.Route{
+		Hostname:      hostname,
+		AgentRecordID: relayAgentRecord,
+		RelayPort:     relayPort,
+		Generation:    relayGeneration,
+		SessionID:     "session-alpha",
+		Revision:      relayRevision,
+		Active:        true,
+		Limits:        limits,
+	})
+	if err != nil {
+		t.Fatalf("applying route %q with limits: %v", hostname, err)
+	}
+}
+
 // clientHelloRecord builds a single-record TLS ClientHello whose only
 // extension is server_name carrying sni — structurally complete enough for
 // the Task 2 parser to accept, ending exactly at the record boundary.
@@ -753,6 +770,66 @@ func TestGatewayLimitsEnforcePerOriginAndPerAgent(t *testing.T) {
 	})
 }
 
+// TestGatewayEnforcesRouteGlobalCeiling is the behavioural proof that the
+// control-distributed route global ceiling is enforced at admission, not just
+// transported (audit #2). A route that tightens the global below the process
+// ceiling must reject the excess stream at admission, before any dial; a
+// route that tries to loosen it must not raise the process ceiling.
+func TestGatewayEnforcesRouteGlobalCeiling(t *testing.T) {
+	t.Run("tighter route global rejects the excess stream before dialing", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.MaxStreamsGlobal = 100
+		config.MaxStreamsPerSourceIP = 100
+		config.MaxStreamsPerOrigin = 100
+		config.MaxStreamsPerAgent = 100
+		limiter := limits.NewLimiter(config)
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+		applyRouteWithLimits(t, harness.table, relayRouteAlpha, harness.agentPort, routes.Limits{
+			MaxStreamsPerOrigin: 100,
+			MaxStreamsPerAgent:  100,
+			MaxStreamsGlobal:    2,
+		})
+
+		openStream(t, harness, relayRouteAlpha)
+		openStream(t, harness, relayRouteAlpha)
+
+		third := connectBrowser(t, harness.publicAddr)
+		_, _ = third.Write(clientHelloRecord(relayRouteAlpha))
+		assertRejectedWithoutBytes(t, "route-global over-limit connection", third)
+		if observations := harness.dialer.recorded(); len(observations) != 2 {
+			t.Fatalf("gateway dialed the agent %d times, want 2 (the over-limit stream must never dial)", len(observations))
+		}
+		if got := limiter.ActiveStreams(); got != 2 {
+			t.Fatalf("ActiveStreams() = %d after the route-global rejection, want 2", got)
+		}
+	})
+
+	t.Run("looser route global cannot raise the process ceiling", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.MaxStreamsGlobal = 2
+		config.MaxStreamsPerSourceIP = 100
+		config.MaxStreamsPerOrigin = 100
+		config.MaxStreamsPerAgent = 100
+		limiter := limits.NewLimiter(config)
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+		applyRouteWithLimits(t, harness.table, relayRouteAlpha, harness.agentPort, routes.Limits{
+			MaxStreamsPerOrigin: 100,
+			MaxStreamsPerAgent:  100,
+			MaxStreamsGlobal:    999,
+		})
+
+		openStream(t, harness, relayRouteAlpha)
+		openStream(t, harness, relayRouteAlpha)
+
+		third := connectBrowser(t, harness.publicAddr)
+		_, _ = third.Write(clientHelloRecord(relayRouteAlpha))
+		assertRejectedWithoutBytes(t, "process-global over-limit connection", third)
+		if observations := harness.dialer.recorded(); len(observations) != 2 {
+			t.Fatalf("gateway dialed the agent %d times, want 2 (the loosened route value must not raise the process ceiling)", len(observations))
+		}
+	})
+}
+
 // TestGatewayLimitsReleaseOnEveryRejectionPath walks every pre-pump exit
 // path and asserts the held global/IP/agent/origin counters return to zero.
 // The dispatch requires the release to be provably absent of leaks on error
@@ -803,6 +880,33 @@ func TestGatewayLimitsReleaseOnEveryRejectionPath(t *testing.T) {
 		browser := connectBrowser(t, harness.publicAddr)
 		_, _ = browser.Write(clientHelloRecord(relayRouteAlpha))
 		assertClosedWithNoBytes(t, "loopback dial failure", browser)
+		awaitLimiterIdle(t, limiter)
+	})
+
+	t.Run("route-global admission rejection", func(t *testing.T) {
+		config := limits.DefaultConfig()
+		config.MaxStreamsGlobal = 10
+		config.MaxStreamsPerSourceIP = 10
+		config.MaxStreamsPerOrigin = 100
+		config.MaxStreamsPerAgent = 100
+		limiter := limits.NewLimiter(config)
+		harness := newGatewayHarness(t, staticPresence{online: true}, WithLimiter(limiter))
+		applyRouteWithLimits(t, harness.table, relayRouteAlpha, harness.agentPort, routes.Limits{
+			MaxStreamsPerOrigin: 100,
+			MaxStreamsPerAgent:  100,
+			MaxStreamsGlobal:    1,
+		})
+
+		firstBrowser, firstAgent := openStream(t, harness, relayRouteAlpha)
+		second := connectBrowser(t, harness.publicAddr)
+		_, _ = second.Write(clientHelloRecord(relayRouteAlpha))
+		assertRejectedWithoutBytes(t, "route-global admission rejection", second)
+		if got := limiter.ActiveStreams(); got != 1 {
+			t.Fatalf("ActiveStreams() = %d after the route-global rejection, want 1 (the rejected stream must not leak a slot)", got)
+		}
+
+		firstBrowser.Close()
+		firstAgent.Close()
 		awaitLimiterIdle(t, limiter)
 	})
 

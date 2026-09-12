@@ -414,6 +414,7 @@ func (server *Server) handleConnection(publicConn net.Conn, connLease *limits.Co
 		AgentRecordID:       route.AgentRecordID,
 		MaxStreamsPerOrigin: route.Limits.MaxStreamsPerOrigin,
 		MaxStreamsPerAgent:  route.Limits.MaxStreamsPerAgent,
+		MaxStreamsGlobal:    route.Limits.MaxStreamsGlobal,
 	})
 	if err != nil {
 		server.recordRejection(metrics.ReasonLimits)

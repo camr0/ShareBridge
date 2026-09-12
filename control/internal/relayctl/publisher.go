@@ -283,8 +283,7 @@ func (p *Publisher) PublishAdd(sessionRecordID string) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.publishDeltaLocked(RouteOperationAdd, identity, p.limits, true)
-	return nil
+	return p.publishDeltaLocked(RouteOperationAdd, identity, p.limits, true)
 }
 
 // PublishRevoke publishes the route_revoke delta for a session before
@@ -303,8 +302,7 @@ func (p *Publisher) PublishRevoke(sessionRecordID string) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.publishDeltaLocked(RouteOperationRevoke, identity, Limits{}, false)
-	return nil
+	return p.publishDeltaLocked(RouteOperationRevoke, identity, Limits{}, false)
 }
 
 // publishLimit publishes one route_limit delta for the identity, enforcing
@@ -325,8 +323,7 @@ func (p *Publisher) publishLimit(identity routeIdentity, limits Limits) error {
 			return err
 		}
 	}
-	p.publishDeltaLocked(RouteOperationLimit, identity, limits, true)
-	return nil
+	return p.publishDeltaLocked(RouteOperationLimit, identity, limits, true)
 }
 
 // requireTightenOnly rejects a limit set that widens any ceiling relative
@@ -341,8 +338,16 @@ func requireTightenOnly(current, next Limits) error {
 }
 
 // publishDeltaLocked appends one delta at the next revision and updates the
-// tracked state. Caller holds p.mu.
-func (p *Publisher) publishDeltaLocked(operation string, identity routeIdentity, limits Limits, active bool) {
+// tracked state. Caller holds p.mu. It fails closed on an active route whose
+// ceilings are not all positive: zero is not a limit value (the gateway reads
+// it as "unset" and restores the process default), so an active route may
+// never carry one, and an inactive revoke tombstone never carries a
+// meaningful limit. Validation runs before any mutation, so a refused delta
+// emits nothing and leaves the revision and tracked state untouched.
+func (p *Publisher) publishDeltaLocked(operation string, identity routeIdentity, limits Limits, active bool) error {
+	if active && (limits.MaxStreamsPerOrigin <= 0 || limits.MaxStreamsPerAgent <= 0 || limits.MaxStreamsGlobal <= 0) {
+		return fmt.Errorf("%w: active route limits must be positive, got %+v", ErrInvalidPayload, limits)
+	}
 	p.revision++
 	revision := p.revision
 	route := Route{
@@ -369,6 +374,7 @@ func (p *Publisher) publishDeltaLocked(operation string, identity routeIdentity,
 		p.revokedAt[identity.hostname] = now
 	}
 	p.pruneLocked()
+	return nil
 }
 
 // CurrentRevision returns control's current monotonic route revision — the
@@ -569,7 +575,9 @@ func (p *Publisher) RefreshLeases() (int, error) {
 				return 0, err // unreachable; guards future limit-policy changes
 			}
 		}
-		p.publishDeltaLocked(RouteOperationLimit, identity, limits, true)
+		if err := p.publishDeltaLocked(RouteOperationLimit, identity, limits, true); err != nil {
+			return 0, err // unreachable; every tracked/configured limit is positive
+		}
 	}
 	// Drop tracked entries absent from the current DB-derived route set
 	// once their last touch is older than the retention window: their

@@ -29,9 +29,14 @@ func mustAdmitConnection(t *testing.T, limiter *Limiter, ip string) *ConnectionL
 
 func mustAdmitStream(t *testing.T, limiter *Limiter, conn *ConnectionLease, hostname, agentRecordID string) *StreamLease {
 	t.Helper()
-	lease, err := limiter.AdmitStream(conn, StreamRequest{Hostname: hostname, AgentRecordID: agentRecordID})
+	return mustAdmitStreamWithRequest(t, limiter, conn, StreamRequest{Hostname: hostname, AgentRecordID: agentRecordID})
+}
+
+func mustAdmitStreamWithRequest(t *testing.T, limiter *Limiter, conn *ConnectionLease, request StreamRequest) *StreamLease {
+	t.Helper()
+	lease, err := limiter.AdmitStream(conn, request)
 	if err != nil {
-		t.Fatalf("AdmitStream(%s, %s) = %v, want nil", hostname, agentRecordID, err)
+		t.Fatalf("AdmitStream(%s, %s) = %v, want nil", request.Hostname, request.AgentRecordID, err)
 	}
 	return lease
 }
@@ -444,6 +449,208 @@ func TestLimitsSaturationAlertsReportEveryCeiling(t *testing.T) {
 	stream.Release()
 	first.Release()
 	assertIdleLimiter(t, limiter)
+}
+
+// TestLimitsRouteGlobalCeilingTightensOnly pins the route-distributed global
+// stream ceiling (audit #2): it is enforced at the same mutex-protected
+// admission point as the other ceilings, it may only tighten the process
+// ceiling, and a zero route value means "no override" so the process ceiling
+// stays authoritative.
+func TestLimitsRouteGlobalCeilingTightensOnly(t *testing.T) {
+	t.Run("a tighter route global limits concurrency at admission", func(t *testing.T) {
+		config := DefaultConfig()
+		config.MaxStreamsGlobal = 10
+		config.MaxStreamsPerSourceIP = 100
+		config.MaxStreamsPerOrigin = 100
+		config.MaxStreamsPerAgent = 100
+		var alertsMu sync.Mutex
+		var alerts []Saturation
+		config.OnSaturation = func(saturation Saturation) {
+			alertsMu.Lock()
+			defer alertsMu.Unlock()
+			alerts = append(alerts, saturation)
+		}
+		limiter := NewLimiter(config)
+
+		request := StreamRequest{
+			Hostname:            "app.relay.ns1.example.com",
+			AgentRecordID:       "agent-a",
+			MaxStreamsPerOrigin: 100,
+			MaxStreamsPerAgent:  100,
+			MaxStreamsGlobal:    2,
+		}
+		connections := make([]*ConnectionLease, 0, 3)
+		streams := make([]*StreamLease, 0, 2)
+		for i := 0; i < 2; i++ {
+			conn := mustAdmitConnection(t, limiter, fmt.Sprintf("198.51.100.%d", 20+i))
+			stream, err := limiter.AdmitStream(conn, request)
+			if err != nil {
+				t.Fatalf("AdmitStream %d under the route global ceiling = %v, want nil", i, err)
+			}
+			connections = append(connections, conn)
+			streams = append(streams, stream)
+		}
+
+		// The third public connection is admitted at the pre-parse process
+		// ceiling (10), but the route-tightened global rejects the stream at
+		// admission, before any agent slot or origin slot is taken.
+		third := mustAdmitConnection(t, limiter, "198.51.100.30")
+		connections = append(connections, third)
+		if _, err := limiter.AdmitStream(third, request); !errors.Is(err, ErrGlobalLimit) {
+			t.Fatalf("route-tightened global admission error = %v, want %v", err, ErrGlobalLimit)
+		}
+		if got := limiter.ActiveStreams(); got != 2 {
+			t.Fatalf("ActiveStreams() = %d after the route-global rejection, want 2", got)
+		}
+		if got := limiter.ActiveStreamsForAgent("agent-a"); got != 2 {
+			t.Fatalf("ActiveStreamsForAgent(agent-a) = %d after the route-global rejection, want 2 (the rejected stream must not leak an agent slot)", got)
+		}
+
+		alertsMu.Lock()
+		var sawGlobal bool
+		for _, alert := range alerts {
+			if alert.Kind == SaturationGlobal && alert.Limit == 2 {
+				sawGlobal = true
+			}
+		}
+		alertsMu.Unlock()
+		if !sawGlobal {
+			t.Fatalf("route-tightened global rejection did not emit a %s saturation alert with limit 2: %+v", SaturationGlobal, alerts)
+		}
+
+		for _, stream := range streams {
+			stream.Release()
+		}
+		for _, conn := range connections {
+			conn.Release()
+		}
+		assertIdleLimiter(t, limiter)
+	})
+
+	t.Run("a looser route global never raises the process ceiling", func(t *testing.T) {
+		config := DefaultConfig()
+		config.MaxStreamsGlobal = 2
+		config.MaxStreamsPerSourceIP = 100
+		limiter := NewLimiter(config)
+
+		if got := effectiveLimit(config.MaxStreamsGlobal, 999); got != config.MaxStreamsGlobal {
+			t.Fatalf("effectiveLimit(process=%d, route=999) = %d, want the process ceiling %d", config.MaxStreamsGlobal, got, config.MaxStreamsGlobal)
+		}
+		loose := StreamRequest{Hostname: "app.relay.ns1.example.com", AgentRecordID: "agent-a", MaxStreamsGlobal: 999}
+		first := mustAdmitConnection(t, limiter, "198.51.100.40")
+		firstStream, err := limiter.AdmitStream(first, loose)
+		if err != nil {
+			t.Fatalf("AdmitStream under the process ceiling with a looser route value = %v, want nil", err)
+		}
+		second := mustAdmitConnection(t, limiter, "198.51.100.41")
+		secondStream, err := limiter.AdmitStream(second, loose)
+		if err != nil {
+			t.Fatalf("second AdmitStream under the process ceiling = %v, want nil", err)
+		}
+		// The process ceiling still wins: the route value cannot admit a third.
+		if _, err := limiter.AdmitConnection(testSourceAddr("198.51.100.42")); !errors.Is(err, ErrGlobalLimit) {
+			t.Fatalf("process global ceiling with a looser route value error = %v, want %v", err, ErrGlobalLimit)
+		}
+		secondStream.Release()
+		second.Release()
+		firstStream.Release()
+		first.Release()
+		assertIdleLimiter(t, limiter)
+	})
+
+	t.Run("a zero route global means no override", func(t *testing.T) {
+		config := DefaultConfig()
+		config.MaxStreamsGlobal = 2
+		config.MaxStreamsPerSourceIP = 100
+		limiter := NewLimiter(config)
+
+		if got := effectiveLimit(config.MaxStreamsGlobal, 0); got != config.MaxStreamsGlobal {
+			t.Fatalf("effectiveLimit(process=%d, route=0) = %d, want the process ceiling %d (zero is unset)", config.MaxStreamsGlobal, got, config.MaxStreamsGlobal)
+		}
+		unset := StreamRequest{Hostname: "app.relay.ns1.example.com", AgentRecordID: "agent-a"}
+		first := mustAdmitConnection(t, limiter, "198.51.100.50")
+		firstStream := mustAdmitStreamWithRequest(t, limiter, first, unset)
+		second := mustAdmitConnection(t, limiter, "198.51.100.51")
+		secondStream := mustAdmitStreamWithRequest(t, limiter, second, unset)
+		if _, err := limiter.AdmitConnection(testSourceAddr("198.51.100.52")); !errors.Is(err, ErrGlobalLimit) {
+			t.Fatalf("process global ceiling with an unset route value error = %v, want %v", err, ErrGlobalLimit)
+		}
+		secondStream.Release()
+		second.Release()
+		firstStream.Release()
+		first.Release()
+		assertIdleLimiter(t, limiter)
+	})
+
+	t.Run("per-origin and per-agent still apply independently", func(t *testing.T) {
+		config := DefaultConfig()
+		config.MaxStreamsGlobal = 100
+		config.MaxStreamsPerSourceIP = 100
+		config.MaxStreamsPerOrigin = 100
+		config.MaxStreamsPerAgent = 100
+		limiter := NewLimiter(config)
+
+		conn := mustAdmitConnection(t, limiter, "198.51.100.60")
+		originRequest := StreamRequest{
+			Hostname:            "app.relay.ns1.example.com",
+			AgentRecordID:       "agent-a",
+			MaxStreamsPerOrigin: 1,
+			MaxStreamsGlobal:    50,
+		}
+		first := mustAdmitStreamWithRequest(t, limiter, conn, originRequest)
+		if _, err := limiter.AdmitStream(conn, originRequest); !errors.Is(err, ErrOriginLimit) {
+			t.Fatalf("per-origin rejection under an unsaturated route global error = %v, want %v", err, ErrOriginLimit)
+		}
+
+		agentRequest := StreamRequest{
+			Hostname:           "photos.relay.ns1.example.com",
+			AgentRecordID:      "agent-b",
+			MaxStreamsPerAgent: 1,
+			MaxStreamsGlobal:   50,
+		}
+		second := mustAdmitStreamWithRequest(t, limiter, conn, agentRequest)
+		if _, err := limiter.AdmitStream(conn, StreamRequest{
+			Hostname:           "videos.relay.ns1.example.com",
+			AgentRecordID:      "agent-b",
+			MaxStreamsPerAgent: 1,
+			MaxStreamsGlobal:   50,
+		}); !errors.Is(err, ErrAgentLimit) {
+			t.Fatalf("per-agent rejection under an unsaturated route global error = %v, want %v", err, ErrAgentLimit)
+		}
+
+		second.Release()
+		first.Release()
+		conn.Release()
+		assertIdleLimiter(t, limiter)
+	})
+}
+
+// TestLimitsRouteGlobalRejectionReleasesEveryCeiling walks the route-global
+// rejection path and proves the new admission check acquires nothing: the
+// connection lease release still returns every counter to zero.
+func TestLimitsRouteGlobalRejectionReleasesEveryCeiling(t *testing.T) {
+	config := DefaultConfig()
+	config.MaxStreamsGlobal = 4
+	config.MaxStreamsPerSourceIP = 4
+	config.MaxStreamsPerOrigin = 4
+	config.MaxStreamsPerAgent = 4
+	limiter := NewLimiter(config)
+	request := StreamRequest{Hostname: "app.relay.ns1.example.com", AgentRecordID: "agent-a", MaxStreamsGlobal: 1}
+
+	for i := 0; i < 3; i++ {
+		first := mustAdmitConnection(t, limiter, "203.0.113.80")
+		stream := mustAdmitStreamWithRequest(t, limiter, first, request)
+		second := mustAdmitConnection(t, limiter, "203.0.113.81")
+		if _, err := limiter.AdmitStream(second, request); !errors.Is(err, ErrGlobalLimit) {
+			t.Fatalf("iteration %d route-global rejection error = %v, want %v", i, err, ErrGlobalLimit)
+		}
+		second.Release()
+		stream.Release()
+		stream.Release()
+		first.Release()
+		first.Release()
+		assertIdleLimiter(t, limiter)
+	}
 }
 
 // TestLimitsRouteCeilingsCanOnlyTightenProcessDefaults pins the safety

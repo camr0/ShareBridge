@@ -218,7 +218,7 @@ wrong bound.
 | `SHAREBRIDGE_GATEWAY_DIAL_TIMEOUT` | `2s` | loopback connect budget |
 | `SHAREBRIDGE_GATEWAY_IDLE_TIMEOUT` | `5m` | no-byte stream idle timeout (activity in either direction resets it) |
 | `SHAREBRIDGE_GATEWAY_ABSOLUTE_LIFETIME` | `24h` | hard connection close; continuous activity cannot extend it |
-| `SHAREBRIDGE_GATEWAY_MAX_TRACKED_AGENTS` | `4096` | bound on the persistent per-agent byte map; a new agent beyond it is refused (fail-closed, never evicted) |
+| `SHAREBRIDGE_GATEWAY_MAX_TRACKED_AGENTS` | `4096` | **hard ceiling**: bound on the persistent per-agent byte map; it may only be lowered, never raised (a larger value refuses startup). A new agent beyond the configured ceiling is refused (fail-closed, never evicted). At the ceiling the map costs roughly 1 MiB (≈2 map entries × ≤64-byte agent ID per agent), negligible against the 512 MiB gateway `MemoryMax` |
 
 All ten are declared and installed explicitly in `gateway.env` so the deployed
 values are auditable. The §14 product-tier bandwidth throttle stays **off** in

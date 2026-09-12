@@ -781,3 +781,49 @@ func TestSyncAcknowledgesLastAppliedRevision(t *testing.T) {
 		}
 	})
 }
+
+// TestValidateDeltaPageZeroLimitAgreement pins the gateway half of the
+// zero-semantics agreement with control: an active route (add/limit) carrying
+// a zero ceiling is a protocol violation, because the limits layer would read
+// zero as "unset" and restore the process default — turning a control
+// "tightening" into a widening. A revoke tombstone still carries zeroed
+// limits and must stay valid.
+func TestValidateDeltaPageZeroLimitAgreement(t *testing.T) {
+	page := func(operation string, active bool, limits Limits) DeltaPage {
+		return DeltaPage{
+			Version:        ProtocolVersion,
+			Epoch:          7777,
+			Status:         DeltaStatusOK,
+			Since:          41,
+			LatestRevision: 42,
+			Deltas: []RouteDelta{{
+				Revision:  42,
+				Operation: operation,
+				Route: Route{
+					Hostname:      "docs.relay.sb5t4g3h2.docs.example.com",
+					AgentRecordID: "agtw8hks2m4qp01",
+					RelayPort:     10000,
+					Generation:    3,
+					SessionID:     "sessp8lkr3tvq52",
+					Revision:      42,
+					Active:        active,
+					Limits:        limits,
+				},
+			}},
+		}
+	}
+
+	for _, operation := range []string{RouteOperationAdd, RouteOperationLimit} {
+		err := ValidateDeltaPage(page(operation, true, Limits{}), MaxDeltasPerPage)
+		if !errors.Is(err, ErrInvalidPayload) {
+			t.Fatalf("ValidateDeltaPage(%s with zero limits) error = %v, want %v", operation, err, ErrInvalidPayload)
+		}
+	}
+	if err := ValidateDeltaPage(page(RouteOperationRevoke, false, Limits{}), MaxDeltasPerPage); err != nil {
+		t.Fatalf("ValidateDeltaPage(revoke with zeroed limits) = %v, want nil", err)
+	}
+	positive := Limits{MaxStreamsPerOrigin: 16, MaxStreamsPerAgent: 32, MaxStreamsGlobal: 8192}
+	if err := ValidateDeltaPage(page(RouteOperationLimit, true, positive), MaxDeltasPerPage); err != nil {
+		t.Fatalf("ValidateDeltaPage(active positive limits) = %v, want nil", err)
+	}
+}

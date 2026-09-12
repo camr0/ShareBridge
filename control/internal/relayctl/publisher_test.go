@@ -14,6 +14,7 @@ package relayctl
 // relay route must be published like any other supported share's.
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -403,6 +404,65 @@ func TestPublisherOrdersAddRevokeLimitDeltas(t *testing.T) {
 	_ = tightenRevision
 }
 
+// TestPublisherRefusesZeroLimitsOnActiveRoutes pins the zero-semantics
+// agreement with the gateway (audit #2): a zero ceiling is not "tighten to
+// zero" and must never reach the wire on an active route, where the gateway
+// would read it as unset and restore the process default — a widening. The
+// publisher refuses a non-positive value on the tighten path with a bounded
+// protocol error and emits nothing.
+func TestPublisherRefusesZeroLimitsOnActiveRoutes(t *testing.T) {
+	app := newPublisherTestApp(t)
+	apiKey, agent := createPublisherAgent(t, app, "zerolimit", "sb7c6b5a4", 10055, 3)
+	sessionID := createPublisherSession(t, app, apiKey, "zeroshare", "docs.sb7c6b5a4.example.com", nil)
+	hostname := "docs.relay.sb7c6b5a4.example.com"
+
+	publisher := newTestPublisher(t, app, PublisherConfig{RevisionSeed: publisherTestSeed})
+	identity := routeIdentity{
+		sessionID:     sessionID,
+		hostname:      hostname,
+		agentRecordID: agent,
+		relayPort:     10055,
+		generation:    3,
+	}
+	if err := publisher.PublishAdd(sessionID); err != nil {
+		t.Fatalf("publish add: %v", err)
+	}
+	addRevision := publisher.CurrentRevision()
+
+	zeroCases := []struct {
+		name   string
+		limits Limits
+	}{
+		{"all zero", Limits{}},
+		{"zero global only", Limits{MaxStreamsPerOrigin: 32, MaxStreamsPerAgent: 64, MaxStreamsGlobal: 0}},
+		{"zero origin only", Limits{MaxStreamsPerOrigin: 0, MaxStreamsPerAgent: 64, MaxStreamsGlobal: 8192}},
+		{"zero agent only", Limits{MaxStreamsPerOrigin: 32, MaxStreamsPerAgent: 0, MaxStreamsGlobal: 8192}},
+	}
+	for _, testCase := range zeroCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := publisher.publishLimit(identity, testCase.limits)
+			if err == nil {
+				t.Fatalf("publishLimit(%+v) = nil, want a bounded invalid-payload rejection", testCase.limits)
+			}
+			if !errors.Is(err, ErrInvalidPayload) {
+				t.Fatalf("publishLimit(%+v) error = %v, want %v", testCase.limits, err, ErrInvalidPayload)
+			}
+			if got := publisher.CurrentRevision(); got != addRevision {
+				t.Fatalf("revision advanced to %d after a refused zero limit, want %d (nothing may be emitted)", got, addRevision)
+			}
+		})
+	}
+	if tracked := publisher.entries[hostname]; tracked.route.Limits != (Limits{MaxStreamsPerOrigin: 32, MaxStreamsPerAgent: 64, MaxStreamsGlobal: 8192}) {
+		t.Fatalf("tracked limits changed after refused zero limits: %+v", tracked.route.Limits)
+	}
+
+	// A genuine positive tighten is still accepted, proving the guard is not
+	// a blanket rejection of tightening.
+	if err := publisher.publishLimit(identity, Limits{MaxStreamsPerOrigin: 16, MaxStreamsPerAgent: 32, MaxStreamsGlobal: 4096}); err != nil {
+		t.Fatalf("legitimate tighten refused: %v", err)
+	}
+}
+
 // TestPublisherRetriesUntilExplicitAck pins the acknowledgement contract:
 // delta pages are retried verbatim (never consumed by a fetch) until the
 // gateway explicitly acknowledges the last-applied revision; the 30-second
@@ -681,5 +741,51 @@ func TestPublisherStampsControlEpochOnSnapshotsAndDeltas(t *testing.T) {
 	generated := newTestPublisher(t, app, PublisherConfig{RevisionSeed: publisherTestSeed})
 	if generated.Epoch() == 0 {
 		t.Fatalf("generated epoch = 0, want a non-zero per-boot identifier")
+	}
+}
+
+// TestValidateDeltaPageZeroLimitAgreement pins control's wire half of the
+// zero-semantics agreement with the gateway: an active route (add/limit)
+// carrying a zero ceiling is rejected, while a revoke tombstone with zeroed
+// limits stays valid. Together with the gateway's mirror test this is the
+// by-construction agreement that zero is never a limit value on an active
+// route.
+func TestValidateDeltaPageZeroLimitAgreement(t *testing.T) {
+	page := func(operation string, active bool, limits Limits) DeltaPage {
+		return DeltaPage{
+			Version:        ProtocolVersion,
+			Epoch:          7777,
+			Status:         DeltaStatusOK,
+			Since:          41,
+			LatestRevision: 42,
+			Deltas: []RouteDelta{{
+				Revision:  42,
+				Operation: operation,
+				Route: Route{
+					Hostname:      "docs.relay.sb5t4g3h2.docs.example.com",
+					AgentRecordID: "agtw8hks2m4qp01",
+					RelayPort:     10000,
+					Generation:    3,
+					SessionID:     "sessp8lkr3tvq52",
+					Revision:      42,
+					Active:        active,
+					Limits:        limits,
+				},
+			}},
+		}
+	}
+
+	for _, operation := range []string{RouteOperationAdd, RouteOperationLimit} {
+		err := ValidateDeltaPage(page(operation, true, Limits{}), MaxDeltasPerPage)
+		if !errors.Is(err, ErrInvalidPayload) {
+			t.Fatalf("ValidateDeltaPage(%s with zero limits) error = %v, want %v", operation, err, ErrInvalidPayload)
+		}
+	}
+	if err := ValidateDeltaPage(page(RouteOperationRevoke, false, Limits{}), MaxDeltasPerPage); err != nil {
+		t.Fatalf("ValidateDeltaPage(revoke with zeroed limits) = %v, want nil", err)
+	}
+	positive := Limits{MaxStreamsPerOrigin: 16, MaxStreamsPerAgent: 32, MaxStreamsGlobal: 8192}
+	if err := ValidateDeltaPage(page(RouteOperationLimit, true, positive), MaxDeltasPerPage); err != nil {
+		t.Fatalf("ValidateDeltaPage(active positive limits) = %v, want nil", err)
 	}
 }

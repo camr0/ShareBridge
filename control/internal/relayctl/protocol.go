@@ -250,6 +250,20 @@ func BoundedAckReason(reason string) string {
 	return "not_accepted"
 }
 
+// validateActiveLimits rejects a zero (or negative) ceiling on an ACTIVE
+// route. Zero is not a limit value: the gateway's limits layer reads a zero
+// route value as "unset" and restores the process default, so emitting a
+// control "tightening to zero" would silently widen the ceiling. Revoke
+// tombstones (inactive) legitimately carry zeroed limits and are not passed
+// here. This is the control half of the by-construction zero-semantics
+// agreement, paired with the gateway's controlsync.validateActiveLimits.
+func validateActiveLimits(limits Limits) error {
+	if limits.MaxStreamsPerOrigin <= 0 || limits.MaxStreamsPerAgent <= 0 || limits.MaxStreamsGlobal <= 0 {
+		return fmt.Errorf("%w: active route limits must be positive, got %+v", ErrInvalidPayload, limits)
+	}
+	return nil
+}
+
 // ValidateRoute checks one wire route: bounded exact hostname (wildcards and
 // separators rejected), bounded identity strings, port in range, and
 // non-negative limit ceilings. Full §6 label validation and lowercasing
@@ -290,6 +304,9 @@ func ValidateSnapshot(snapshot Snapshot, maxRoutes int) error {
 	}
 	for _, route := range snapshot.Routes {
 		if err := ValidateRoute(route); err != nil {
+			return err
+		}
+		if err := validateActiveLimits(route.Limits); err != nil {
 			return err
 		}
 		if route.Revision > snapshot.Revision {
@@ -336,6 +353,9 @@ func ValidateDeltaPage(page DeltaPage, maxDeltas int) error {
 			if !delta.Route.Active {
 				return fmt.Errorf("%w: route_add carries an inactive route", ErrInvalidPayload)
 			}
+			if err := validateActiveLimits(delta.Route.Limits); err != nil {
+				return err
+			}
 		case RouteOperationRevoke:
 			if delta.Route.Active {
 				return fmt.Errorf("%w: route_revoke carries an active route", ErrInvalidPayload)
@@ -343,6 +363,9 @@ func ValidateDeltaPage(page DeltaPage, maxDeltas int) error {
 		case RouteOperationLimit:
 			if !delta.Route.Active {
 				return fmt.Errorf("%w: route_limit carries an inactive route", ErrInvalidPayload)
+			}
+			if err := validateActiveLimits(delta.Route.Limits); err != nil {
+				return err
 			}
 		default:
 			return fmt.Errorf("%w: delta operation %q", ErrInvalidPayload, delta.Operation)

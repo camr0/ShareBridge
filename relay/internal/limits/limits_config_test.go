@@ -3,6 +3,7 @@ package limits
 import (
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,5 +130,35 @@ func TestLimitsConfigFromEnvironmentFailsClosedOnInvalidValues(t *testing.T) {
 				t.Fatalf("rejected config = %+v, want the zero Config so startup cannot use a partial bound", config)
 			}
 		})
+	}
+}
+
+// TestLimitsConfigTrackedAgentCeilingIsHard pins the audit-#6 hard ceiling:
+// the persistent per-agent byte map is the one map whose size is not bounded
+// by current concurrency over process lifetime, so the operator surface must
+// not be effectively unbounded. Any value at or below the ceiling is
+// accepted; anything above it fails closed with an error naming the variable
+// and the ceiling.
+func TestLimitsConfigTrackedAgentCeilingIsHard(t *testing.T) {
+	for _, value := range []int{1, DefaultMaxTrackedAgents - 1, DefaultMaxTrackedAgents} {
+		config, err := ConfigFromEnvironment(environmentFrom(map[string]string{EnvMaxTrackedAgents: strconv.Itoa(value)}))
+		if err != nil {
+			t.Fatalf("ConfigFromEnvironment(%s=%d) = %v, want it accepted", EnvMaxTrackedAgents, value, err)
+		}
+		if config.MaxTrackedAgents != value {
+			t.Fatalf("MaxTrackedAgents = %d, want the configured %d", config.MaxTrackedAgents, value)
+		}
+	}
+
+	config, err := ConfigFromEnvironment(environmentFrom(map[string]string{EnvMaxTrackedAgents: strconv.Itoa(DefaultMaxTrackedAgents + 1)}))
+	if err == nil {
+		t.Fatalf("ConfigFromEnvironment(%s=%d) = %+v, want a fail-closed rejection above the ceiling %d",
+			EnvMaxTrackedAgents, DefaultMaxTrackedAgents+1, config, DefaultMaxTrackedAgents)
+	}
+	if !reflect.DeepEqual(config, Config{}) {
+		t.Fatalf("rejected config = %+v, want the zero Config so startup cannot use a partial bound", config)
+	}
+	if !strings.Contains(err.Error(), EnvMaxTrackedAgents) || !strings.Contains(err.Error(), strconv.Itoa(DefaultMaxTrackedAgents)) {
+		t.Fatalf("ceiling error %q must name %s and the ceiling %d", err, EnvMaxTrackedAgents, DefaultMaxTrackedAgents)
 	}
 }
