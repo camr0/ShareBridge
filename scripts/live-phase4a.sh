@@ -1,0 +1,1251 @@
+#!/usr/bin/env bash
+# live-phase4a.sh — ShareBridge Phase 4a M6 live acceptance harness
+# (plan: docs/superpowers/plans/2026-09-03-phase4a-relay-mvp.md Tasks 37–44;
+# spec §§19, 20, 23.9).
+#
+# Task 37 ships the SKELETON: the named gate `gate_23_9_dark_topology` plus
+# registered placeholders for every later M6 acceptance case, so Tasks 38–44
+# each add exactly ONE gate function + ONE registration line and nothing else.
+#
+#   Task 37  gate_23_9_dark_topology            §23.9 dark separate-VM topology
+#   Task 38  acceptance_01_owner_hairpin        §19 #1 owner hairpin
+#   Task 38  acceptance_04_interstitial_blackhole §19 #4 interstitial fallback
+#   Task 39  acceptance_02_cellular_relay_video §19 #2 cellular relay + 206 seeks
+#   Task 39  acceptance_11_content_parity       §19 #11 Phase 3 content parity
+#   Task 40  acceptance_03_relay_only           §19 #3 relayOnly end to end
+#   Task 41  l4_no_plaintext_capture            §19 #5 / §18.4 L4 passthrough proof
+#   Task 42  acceptance_06_no_mapper_enrollment §19 #6 no-mapper enrollment
+#   Task 42  acceptance_12_stun_mismatch        §19 #12 STUN mismatch -> relay
+#   Task 42  acceptance_13_stun_cadence_cold_budget §19 #13 cadence/cold budget
+#   Task 43  acceptance_07_no_relay_open_signal §19 #7 no relay open signal
+#   Task 43  acceptance_08_exact_routing        §19 #8 exact routing
+#   Task 43  acceptance_09_restart_recovery     §19 #9 restart recovery
+#   Task 43  acceptance_10_lockdown             §19 #10 lockdown
+#   Task 43  acceptance_15_heartbeat_tunnel_dns §19 #15 heartbeat + tunnel DNS
+#   Task 44  release_go_no_go_rollback          §20 steps 5–7 + §23 blocking rule
+#
+# §19 #14 (no-JS/CSP fallback) is a Task 24 hermetic browser gate, not part of
+# this harness; it is deliberately absent.
+#
+# HONESTY CONTRACT (the project has been bitten by skip-as-PASS twice):
+#   * A gate that executes no checks is MISSING, never PASS.
+#   * A gate whose function exits nonzero after recording only PASSes is FAIL.
+#   * A registered-but-unimplemented gate is NOT_IMPLEMENTED, never PASS.
+#   * A gate with any SKIP sub-check is SKIP, never PASS.
+#   * An unscoped (default) run is GREEN only if every registered gate is PASS.
+#   * `--case a,b` scopes the verdict to the named gates and explicitly lists
+#     the unselected ones as NOT_RUN / excluded — an unrun gate is never a pass.
+#   * `--dry-run` executes nothing and exits PARTIAL; it is NOT a pass.
+#
+# SAFETY:
+#   * Read-only remote commands only (systemctl show/cat, nft list, ss, curl,
+#     dig, openssl s_client, ip addr, grep). Nothing is written remotely.
+#   * The only writes are local evidence files under the evidence directory.
+#   * The optional restart drill is off unless LIVE_PHASE4A_ALLOW_RESTART=1.
+#   * Secrets are never printed: every captured line passes through sanitize(),
+#     which redacts key/token/password/secret/cookie/authorization/jti values,
+#     private-key blocks and share codes. `--dry-run` prints variable NAMES,
+#     never values that look secret.
+#   * Idempotent: repeated runs only create new timestamped evidence records.
+#
+# THE M6 RELAY VM IS NOT THE COLLOCATED TEST VPS. The down test VPS
+# (178.156.174.47 by default) is explicitly rejected as the M6 relay target
+# (LIVE_PHASE4A_EXCLUDED_RELAY_IPS). If no M6 topology exists, the correct
+# outcome is RED with a diagnostic naming each missing input — that is the
+# Task 37 Step 2 RED, not a failure of this script.
+#
+# Usage:
+#   scripts/live-phase4a.sh                      # run every registered gate (live)
+#   scripts/live-phase4a.sh --case gate_23_9_dark_topology
+#   scripts/live-phase4a.sh --list               # print the gate table
+#   scripts/live-phase4a.sh --dry-run            # print config + plan; runs nothing
+#   scripts/live-phase4a.sh --selftest           # prove the pass/fail plumbing
+#   scripts/live-phase4a.sh --help
+#
+# Exit codes:
+#   0  GREEN   — every selected gate PASS (and, unscoped, all registered gates)
+#   1  RED     — at least one selected gate FAIL / MISSING / NOT_IMPLEMENTED,
+#                or the selftest plumbing is broken
+#   2  USAGE   — bad arguments
+#   3  PARTIAL — no failures, but at least one SKIP (skip is not a pass), or a
+#                dry run (nothing executed)
+#
+# Environment (all resolved at startup; unset required values FAIL the gate and
+# are named in the diagnostic — never guessed). Values are paths/names, not
+# secrets; never put credentials in them.
+#   LIVE_PHASE4A_CONTROL_HOST          ssh target of the control VM (required)
+#   LIVE_PHASE4A_RELAY_HOST            ssh target of the NEW relay VM (required)
+#   LIVE_PHASE4A_CONTROL_PUBLIC_HOST   optional public control host for probes
+#   LIVE_PHASE4A_CONTROL_PORT          control public port for agent-connection info (default 8080)
+#   LIVE_PHASE4A_RELAY_PUBLIC_IP       relay public IPv4 (required for firewall/DNS)
+#   LIVE_PHASE4A_RELAY_TUNNEL_HOST     <relay-tunnel-host> (required for DNS/cert)
+#   LIVE_PHASE4A_TRANSPORT_PORT        FRP transport port (default 7000)
+#   LIVE_PHASE4A_BASE_DOMAIN           content base domain (default sharebridgeusercontent.com)
+#   LIVE_PHASE4A_NAMESPACE             enrolled test namespace sbXXXXXXXX (wildcard DNS)
+#   LIVE_PHASE4A_IMMICH_URL            real Immich base URL on the home Mac (required)
+#   LIVE_PHASE4A_AGENT_PID_MATCH       pgrep -f pattern for the home Mac agent (default sharebridge-agent)
+#   LIVE_PHASE4A_CONTROL_UNIT          control systemd unit (default sharebridge.service)
+#   LIVE_PHASE4A_GATEWAY_UNIT          relay gateway unit (default sharebridge-relay-gateway.service)
+#   LIVE_PHASE4A_FRPS_UNIT             relay frps unit (default sharebridge-relay-frps.service)
+#   LIVE_PHASE4A_CONTROL_ENV_FILE      control env file on the control VM (default /opt/sharebridge/.env)
+#   LIVE_PHASE4A_GATEWAY_ENV_FILE      gateway env file on the relay VM (default /etc/sharebridge/relay/gateway.env)
+#   LIVE_PHASE4A_TRANSPORT_CA_FILE     transport CA (PEM) for tunnel cert validation (required for that check)
+#   LIVE_PHASE4A_SYNC_CA_FILE          sync CA PEM, path ON THE RELAY VM (required for the mTLS handshake check)
+#   LIVE_PHASE4A_GATEWAY_SYNC_CERT     gateway sync client cert, path ON THE RELAY VM
+#   LIVE_PHASE4A_GATEWAY_SYNC_KEY      gateway sync client key, path ON THE RELAY VM
+#   LIVE_PHASE4A_HEALTHZ_URL           gateway health URL probed on the relay VM (default http://127.0.0.1:9101/healthz)
+#   LIVE_PHASE4A_HETZNER_METADATA_URL  Hetzner metadata endpoint (default http://169.254.169.254/hetzner/v1/metadata)
+#   LIVE_PHASE4A_EXCLUDED_RELAY_IPS    comma list of IPs that must NOT be the relay (default 178.156.174.47)
+#   LIVE_PHASE4A_EVIDENCE_DIR          evidence root (default docs/operations/evidence/runs)
+#   LIVE_PHASE4A_ALLOW_RESTART         1 enables the guarded live restart drill (default 0)
+#   LIVE_PHASE4A_SSH_OPTS              extra ssh options, word-split
+#   LIVE_PHASE4A_SSH_CONNECT_TIMEOUT   ssh ConnectTimeout seconds (default 8)
+#   LIVE_PHASE4A_REMOTE_TIMEOUT        remote command timeout seconds (default 20)
+#
+# Evidence: every gate writes docs/operations/evidence/runs/<run-id>/gate-<name>.txt
+# (timestamp, git sha, commands, sanitised output, per-check PASS/FAIL, result
+# and a content hash) plus summary.txt, manifest.txt and environment-facts.txt.
+# Copy the facts into docs/operations/evidence/phase4a-environment.md; never
+# paste a value the run did not observe.
+
+set -u -o pipefail
+
+usage() {
+  sed -n '2,109p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+MODE="live"
+DRY_RUN=0
+SELECTED_CASES=""
+EVIDENCE_DIR_OVERRIDE=""
+LIST_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --case)          SELECTED_CASES="$2"; shift 2 ;;
+    --dry-run)       DRY_RUN=1; shift ;;
+    --selftest)      MODE="selftest"; shift ;;
+    --list)          LIST_ONLY=1; shift ;;
+    --evidence-dir)  EVIDENCE_DIR_OVERRIDE="$2"; shift 2 ;;
+    -h|--help)       usage; exit 0 ;;
+    *) printf 'ERROR: unknown argument %s (see --help)\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Configuration (documented env vars; no hard-coded hosts)
+# ---------------------------------------------------------------------------
+
+CONTROL_HOST="${LIVE_PHASE4A_CONTROL_HOST:-}"
+RELAY_HOST="${LIVE_PHASE4A_RELAY_HOST:-}"
+CONTROL_PUBLIC_HOST="${LIVE_PHASE4A_CONTROL_PUBLIC_HOST:-}"
+CONTROL_PORT="${LIVE_PHASE4A_CONTROL_PORT:-8080}"
+RELAY_PUBLIC_IP="${LIVE_PHASE4A_RELAY_PUBLIC_IP:-}"
+RELAY_TUNNEL_HOST="${LIVE_PHASE4A_RELAY_TUNNEL_HOST:-}"
+TRANSPORT_PORT="${LIVE_PHASE4A_TRANSPORT_PORT:-7000}"
+BASE_DOMAIN="${LIVE_PHASE4A_BASE_DOMAIN:-sharebridgeusercontent.com}"
+NAMESPACE="${LIVE_PHASE4A_NAMESPACE:-}"
+IMMICH_URL="${LIVE_PHASE4A_IMMICH_URL:-}"
+AGENT_PID_MATCH="${LIVE_PHASE4A_AGENT_PID_MATCH:-sharebridge-agent}"
+CONTROL_UNIT="${LIVE_PHASE4A_CONTROL_UNIT:-sharebridge.service}"
+GATEWAY_UNIT="${LIVE_PHASE4A_GATEWAY_UNIT:-sharebridge-relay-gateway.service}"
+FRPS_UNIT="${LIVE_PHASE4A_FRPS_UNIT:-sharebridge-relay-frps.service}"
+CONTROL_ENV_FILE="${LIVE_PHASE4A_CONTROL_ENV_FILE:-/opt/sharebridge/.env}"
+GATEWAY_ENV_FILE="${LIVE_PHASE4A_GATEWAY_ENV_FILE:-/etc/sharebridge/relay/gateway.env}"
+TRANSPORT_CA_FILE="${LIVE_PHASE4A_TRANSPORT_CA_FILE:-}"
+SYNC_CA_FILE="${LIVE_PHASE4A_SYNC_CA_FILE:-}"
+GATEWAY_SYNC_CERT="${LIVE_PHASE4A_GATEWAY_SYNC_CERT:-}"
+GATEWAY_SYNC_KEY="${LIVE_PHASE4A_GATEWAY_SYNC_KEY:-}"
+HEALTHZ_URL="${LIVE_PHASE4A_HEALTHZ_URL:-http://127.0.0.1:9101/healthz}"
+HETZNER_METADATA_URL="${LIVE_PHASE4A_HETZNER_METADATA_URL:-http://169.254.169.254/hetzner/v1/metadata}"
+EXCLUDED_RELAY_IPS="${LIVE_PHASE4A_EXCLUDED_RELAY_IPS:-178.156.174.47}"
+EVIDENCE_DIR="${EVIDENCE_DIR_OVERRIDE:-${LIVE_PHASE4A_EVIDENCE_DIR:-docs/operations/evidence/runs}}"
+ALLOW_RESTART="${LIVE_PHASE4A_ALLOW_RESTART:-0}"
+SSH_CONNECT_TIMEOUT="${LIVE_PHASE4A_SSH_CONNECT_TIMEOUT:-8}"
+REMOTE_TIMEOUT="${LIVE_PHASE4A_REMOTE_TIMEOUT:-20}"
+
+SSH_EXTRA=()
+if [[ -n "${LIVE_PHASE4A_SSH_OPTS:-}" ]]; then
+  read -r -a SSH_EXTRA <<< "${LIVE_PHASE4A_SSH_OPTS}"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+GIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="${EVIDENCE_DIR}/${RUN_ID}"
+
+MSYS=0
+uname_s="$(uname -s 2>/dev/null || echo unknown)"
+
+# ---------------------------------------------------------------------------
+# Gate registry — ONE line per gate; Tasks 38–44 replace one placeholder body
+# and add nothing here unless they add a new named acceptance case.
+# ---------------------------------------------------------------------------
+
+GATE_TABLE=(
+  "gate_23_9_dark_topology|Task 37|dark separate-VM topology: control/relay reachability, distinct same-region relay VM + private network, home agent + real Immich, minimal public firewall, private mTLS sync, tunnel DNS + transport cert, snapshot route_ready, restart ordering, dark selection flag"
+  "acceptance_01_owner_hairpin|Task 38|§19 #1 owner hairpin: browser direct check times out and the same share loads over the exact relay origin"
+  "acceptance_04_interstitial_blackhole|Task 38|§19 #4 deterministic interstitial fallback after blackholing direct post-preparation"
+  "acceptance_02_cellular_relay_video|Task 39|§19 #2 cellular/no-direct-path gallery + video with at least two valid 206 seeks over relay"
+  "acceptance_11_content_parity|Task 39|§19 #11 Phase 3 gallery/preview/original/archive/accounting/Range parity through relay"
+  "acceptance_03_relay_only|Task 40|§19 #3 relayOnly end to end with zero direct DNS/probe/open-signal/mapper/browser activity"
+  "l4_no_plaintext_capture|Task 41|§19 #5 / §18.4 no-plaintext L4 passthrough canary/capture proof (scripts/l4-canary-capture.sh)"
+  "acceptance_06_no_mapper_enrollment|Task 42|§19 #6 CGNAT/UPnP-off agent enrolls and serves solely over the outbound tunnel"
+  "acceptance_12_stun_mismatch|Task 42|§19 #12 STUN egress mismatch -> relay_fallback diagnostic, no public probe, relay serves"
+  "acceptance_13_stun_cadence_cold_budget|Task 42|§19 #13 immediate post-reconnect + four-minute cadence, no warm repeat, cold budget within four seconds"
+  "acceptance_07_no_relay_open_signal|Task 43|§19 #7 route=relay emits no open_signal/open_ack/direct probe/mapper call"
+  "acceptance_08_exact_routing|Task 43|§19 #8 unknown/random/bare/tombstoned SNI never reaches an agent; exact route reaches only its owner"
+  "acceptance_09_restart_recovery|Task 43|§19 #9 gateway/frps/agent restart restores availability only after fresh authoritative presence"
+  "acceptance_10_lockdown|Task 43|§19 #10 lockdown drops direct mapping + tunnel, closes both connection kinds, unlock with fresh credential"
+  "acceptance_15_heartbeat_tunnel_dns|Task 43|§19 #15 tunnel DNS + dedicated transport cert, 10s Pings, one delayed Ping tolerated, true 45s expiry"
+  "release_go_no_go_rollback|Task 44|§20 steps 5–7 + §23 blocking rule: release manifest gate + staged fallback + rollback drill"
+)
+
+gate_names=()
+gate_owners=()
+gate_purposes=()
+for entry in "${GATE_TABLE[@]}"; do
+  gate_names+=("$(printf '%s' "$entry" | cut -d'|' -f1)")
+  gate_owners+=("$(printf '%s' "$entry" | cut -d'|' -f2)")
+  gate_purposes+=("$(printf '%s' "$entry" | cut -d'|' -f3-)")
+done
+
+gate_index_of() {
+  local want="$1" i
+  for i in "${!gate_names[@]}"; do
+    [[ "${gate_names[$i]}" == "$want" ]] && { printf '%s' "$i"; return 0; }
+  done
+  return 1
+}
+
+is_selected() {
+  local name="$1"
+  if [[ -z "$SELECTED_CASES" ]]; then return 0; fi
+  case ",${SELECTED_CASES}," in
+    *",${name},"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Validate --case names before any work happens (typo safety).
+if [[ -n "$SELECTED_CASES" ]]; then
+  IFS=',' read -r -a requested_cases <<< "$SELECTED_CASES"
+  for want in "${requested_cases[@]}"; do
+    gate_index_of "$want" >/dev/null || {
+      printf 'ERROR: unknown gate %s\n' "$want" >&2
+      printf 'Registered gates:\n' >&2
+      for n in "${gate_names[@]}"; do printf '  %s\n' "$n" >&2; done
+      exit 2
+    }
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Output / sanitising helpers
+# ---------------------------------------------------------------------------
+
+log() { printf '%s\n' "$*" >&2; }
+
+# sanitize: stdin -> stdout. Redacts credentials, private-key blocks and share
+# codes. Never removes data we rely on for a verdict (it only rewrites secrets).
+sanitize() {
+  awk '
+    /BEGIN [A-Z ]*PRIVATE KEY/ { print "[REDACTED: private key material]"; inkey=1; next }
+    inkey && /^[A-Za-z0-9+\/=]+$/ { next }
+    { inkey=0; print }
+  ' | sed -E \
+    -e "s#([Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Aa]uthorization|[Bb]earer|[Pp]assword|[Ss]ecret|[Cc]ookie|[Tt]oken)([[:space:]]*[=:][[:space:]]*|[[:space:]]+)[^[:space:],;\"']+#\1=[REDACTED]#g" \
+    -e "s#([^A-Za-z0-9]|^)(jti|JTI)([=:][[:space:]]*)?[A-Za-z0-9._-]{8,}#\1\2=[REDACTED]#g" \
+    -e "s#/s/[A-Za-z0-9_-]{6,}#/s/[REDACTED-SHARE-CODE]#g"
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    printf 'unavailable'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Per-gate check plumbing. `check` is invoked inside the gate's subshell and
+# appends to the per-gate temp files so a crash cannot lose recorded checks.
+# ---------------------------------------------------------------------------
+
+check() {
+  # check <check-name> <PASS|FAIL|SKIP|NOTE> <observed...>
+  local cname="$1" verdict="$2"
+  shift 2
+  local detail="$*"
+  if [[ -z "${GATE_CHECK_FILE:-}" ]]; then
+    printf 'ERROR: check() called outside the gate runner\n' >&2
+    return 1
+  fi
+  printf '%s|%s|%s\n' "$verdict" "$cname" "$detail" >> "$GATE_CHECK_FILE"
+  printf '  [%s] %s: %s\n' "$verdict" "$cname" "$detail"
+}
+
+note() { check "$1" NOTE "$2"; }
+
+record_cmd() {
+  [[ -n "${GATE_CMD_FILE:-}" ]] || return 0
+  printf '%s\n' "$1" >> "$GATE_CMD_FILE"
+}
+
+record_out() {
+  [[ -n "${GATE_OUT_FILE:-}" ]] || return 0
+  printf '%s\n' "$1" | sanitize >> "$GATE_OUT_FILE"
+}
+
+gate_not_implemented() {
+  local task="$1" proves="$2"
+  if [[ -n "${GATE_NI_FILE:-}" ]]; then
+    printf '%s|%s\n' "$task" "$proves" > "$GATE_NI_FILE"
+  fi
+  printf '  [NOT_IMPLEMENTED] owner=%s — %s\n' "$task" "$proves"
+}
+
+# need_cfg: fail the named check when a required env input is missing.
+# Returns 0 when the value is present so the caller can proceed.
+need_cfg() {
+  local cname="$1" var="$2" value="$3" desc="$4"
+  if [[ -z "$value" ]]; then
+    check "$cname" FAIL "$var is unset — cannot verify: $desc"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Command runners — every remote/local command is recorded for the evidence.
+# ---------------------------------------------------------------------------
+
+remote_exec() {
+  # remote_exec <ssh-target> <remote-command>
+  local target="$1" remote="$2" wrapped out status
+  record_cmd "ssh ${target} :: ${remote}"
+  wrapped="if command -v timeout >/dev/null 2>&1; then timeout ${REMOTE_TIMEOUT} sh -c $(printf '%q' "$remote"); else sh -c $(printf '%q' "$remote"); fi"
+  out="$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" ${SSH_EXTRA[@]+"${SSH_EXTRA[@]}"} "$target" "$wrapped" 2>&1)"
+  status=$?
+  record_out "--- ssh ${target} exit=${status} ---"$'\n'"${out}"
+  printf '%s\n' "$out"
+  return "$status"
+}
+
+local_exec() {
+  # local_exec <shell-command>
+  local remote="$1" out status
+  record_cmd "sh -c :: ${remote}"
+  out="$(sh -c "$remote" 2>&1)"
+  status=$?
+  record_out "--- local exit=${status} ---"$'\n'"${out}"
+  printf '%s\n' "$out"
+  return "$status"
+}
+
+tcp_open() {
+  # tcp_open <host> <port> -> 0 when a TCP connection is accepted
+  local h="$1" p="$2"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 3 "$h" "$p" >/dev/null 2>&1
+    return $?
+  fi
+  (exec 3<>"/dev/tcp/$h/$p") >/dev/null 2>&1
+}
+
+json_str() {
+  # json_str <json> <field>  (flat string fields only)
+  printf '%s\n' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1
+}
+
+env_value() {
+  # env_value <env-text> <VAR>
+  printf '%s\n' "$1" | sed -n "s/^$2=//p" | tail -n1 | sed -e 's/^"//' -e 's/"$//'
+}
+
+is_private_bind() {
+  # loopback or RFC1918 / ULA / link-local — never a public or wildcard bind
+  local addr="$1" host
+  host="${addr%%:*}"
+  host="${host#[}"
+  case "$host" in
+    127.*|localhost|::1|"[::1]") return 0 ;;
+    10.*|192.168.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    fd*|fc*|fe80*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+private_v4_list() {
+  # private_v4_list <multiline ip -4 -o addr output>
+  printf '%s\n' "$1" | awk '{print $4}' | cut -d/ -f1 | grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | sort -u
+}
+
+same_subnet24() {
+  local a="$1" b="$2"
+  [[ -n "$a" && -n "$b" && "${a%.*}" == "${b%.*}" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Gate runner
+# ---------------------------------------------------------------------------
+
+declare -a RESULT_NAMES=() RESULT_OWNERS=() RESULT_VALUES=() RESULT_DETAILS=()
+declare -a RESULT_SELECTED=()
+
+# Environment facts observed by gates. Gates run in a subshell, so observed
+# facts are written to a per-gate file and accumulated into RUN_FACTS_FILE,
+# which the environment record reads. A value the run did not observe is never
+# printed as measured.
+set_fact() {
+  local key="$1" value="$2"
+  [[ -n "${GATE_FACT_FILE:-}" ]] || return 0
+  value="$(printf '%s' "$value" | tr '\n' ' ' | sanitize)"
+  [[ -n "$value" ]] || value="PENDING (not observed)"
+  printf '%s=%s\n' "$key" "$value" >> "$GATE_FACT_FILE"
+}
+
+fact_get() {
+  local key="$1" value=""
+  if [[ -n "${RUN_FACTS_FILE:-}" && -f "$RUN_FACTS_FILE" ]]; then
+    value="$(grep "^${key}=" "$RUN_FACTS_FILE" | tail -n1 | cut -d= -f2-)"
+  fi
+  if [[ -n "$value" ]]; then printf '%s' "$value"; else printf 'PENDING (not observed)'; fi
+}
+
+execute_gate() {
+  # execute_gate <fn-name> ; sets EXECUTE_RESULT (PASS|FAIL|SKIP|NOT_IMPLEMENTED|MISSING)
+  local name="$1"
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/live-phase4a-gate.XXXXXX")"
+  GATE_CHECK_FILE="$tmp/checks"
+  GATE_CMD_FILE="$tmp/cmds"
+  GATE_OUT_FILE="$tmp/out"
+  GATE_NI_FILE="$tmp/notimpl"
+  GATE_FACT_FILE="$tmp/facts"
+  : > "$GATE_CHECK_FILE"
+  : > "$GATE_CMD_FILE"
+  : > "$GATE_OUT_FILE"
+  : > "$GATE_NI_FILE"
+  : > "$GATE_FACT_FILE"
+  local status=0
+  if declare -f "$name" >/dev/null 2>&1; then
+    ( "$name" ) || status=$?
+  else
+    status=127
+  fi
+
+  if [[ -s "$GATE_NI_FILE" ]]; then
+    EXECUTE_RESULT="NOT_IMPLEMENTED"
+    EXECUTE_DETAIL="$(cut -d'|' -f1 "$GATE_NI_FILE")"
+  elif [[ ! -s "$GATE_CHECK_FILE" ]]; then
+    EXECUTE_RESULT="MISSING"
+    EXECUTE_DETAIL="gate executed zero checks (status=${status}) — refusing to report PASS"
+  elif grep -q '^FAIL|' "$GATE_CHECK_FILE"; then
+    EXECUTE_RESULT="FAIL"
+    EXECUTE_DETAIL="$(grep '^FAIL|' "$GATE_CHECK_FILE" | head -n1 | cut -d'|' -f2)"
+  elif [[ "$status" -ne 0 ]]; then
+    EXECUTE_RESULT="FAIL"
+    EXECUTE_DETAIL="gate exited nonzero (status=${status}) after recording checks"
+  elif grep -q '^SKIP|' "$GATE_CHECK_FILE"; then
+    EXECUTE_RESULT="SKIP"
+    EXECUTE_DETAIL="$(grep '^SKIP|' "$GATE_CHECK_FILE" | head -n1 | cut -d'|' -f2)"
+  else
+    EXECUTE_RESULT="PASS"
+    EXECUTE_DETAIL="$(grep -c '^PASS|' "$GATE_CHECK_FILE") PASS check(s)"
+  fi
+
+  EXECUTE_TMP="$tmp"
+  EXECUTE_STATUS="$status"
+}
+
+write_gate_evidence() {
+  # write_gate_evidence <run-dir> <name> <owner> <purpose> <result> <detail> <tmp>
+  local dir="$1" name="$2" owner="$3" purpose="$4" result="$5" detail="$6" tmp="$7"
+  local file="${dir}/gate-${name}.txt"
+  {
+    printf '# Phase 4a live acceptance evidence — gate record\n'
+    printf 'run_id=%s\n' "$RUN_ID"
+    printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'gate=%s\n' "$name"
+    printf 'owner_task=%s\n' "$owner"
+    printf 'purpose=%s\n' "$purpose"
+    printf 'git_sha=%s\n' "$GIT_SHA"
+    printf 'harness=%s\n' "scripts/live-phase4a.sh"
+    printf 'control_host=%s\n' "${CONTROL_HOST:-<unset>}"
+    printf 'relay_host=%s\n' "${RELAY_HOST:-<unset>}"
+    printf 'result=%s\n' "$result"
+    printf 'result_detail=%s\n' "$detail"
+    printf 'checks:\n'
+    sed 's/^/  /' "$tmp/checks"
+    printf 'commands:\n'
+    if [[ -s "$tmp/cmds" ]]; then sed 's/^/  /' "$tmp/cmds"; else printf '  <none>\n'; fi
+    printf 'sanitised_output:\n'
+    if [[ -s "$tmp/out" ]]; then sed 's/^/  /' "$tmp/out"; else printf '  <none>\n'; fi
+  } > "$file"
+  printf 'evidence_sha256_over_header_and_body=%s\n' "$(sha256_file "$file")" >> "$file"
+}
+
+run_all_gates() {
+  local entry name owner purpose i result detail
+  printf 'run_id=%s\n' "$RUN_ID"
+  printf 'git_sha=%s\n' "$GIT_SHA"
+  printf 'mode=%s\n' "$MODE"
+  printf 'scope=%s\n' "$([[ -z "$SELECTED_CASES" ]] && echo all-registered || echo "$SELECTED_CASES")"
+  printf 'evidence_dir=%s\n' "$RUN_DIR"
+  printf 'control_host=%s\n' "${CONTROL_HOST:-<unset>}"
+  printf 'relay_host=%s\n' "${RELAY_HOST:-<unset>}"
+  printf 'relay_tunnel_host=%s\n' "${RELAY_TUNNEL_HOST:-<unset>}"
+  printf 'namespace=%s\n' "${NAMESPACE:-<unset>}"
+
+  if ! mkdir -p "$RUN_DIR"; then
+    printf 'ERROR: cannot create evidence directory %s\n' "$RUN_DIR" >&2
+    exit 1
+  fi
+  RUN_FACTS_FILE="$RUN_DIR/environment-facts.observed"
+  : > "$RUN_FACTS_FILE"
+
+  for i in "${!gate_names[@]}"; do
+    name="${gate_names[$i]}"
+    owner="${gate_owners[$i]}"
+    purpose="${gate_purposes[$i]}"
+    printf '\n=== GATE %s (%s) ===\n' "$name" "$owner"
+    printf 'purpose: %s\n' "$purpose"
+    if ! is_selected "$name"; then
+      printf '  [NOT_RUN] not selected by --case — excluded from this verdict\n'
+      RESULT_NAMES+=("$name"); RESULT_OWNERS+=("$owner")
+      RESULT_VALUES+=("NOT_RUN"); RESULT_DETAILS+=("not selected by --case")
+      RESULT_SELECTED+=("no")
+      continue
+    fi
+    execute_gate "$name"
+    result="$EXECUTE_RESULT"
+    detail="$EXECUTE_DETAIL"
+    RESULT_NAMES+=("$name"); RESULT_OWNERS+=("$owner")
+    RESULT_VALUES+=("$result"); RESULT_DETAILS+=("$detail")
+    RESULT_SELECTED+=("yes")
+    write_gate_evidence "$RUN_DIR" "$name" "$owner" "$purpose" "$result" "$detail" "$EXECUTE_TMP"
+    if [[ -s "$EXECUTE_TMP/facts" ]]; then cat "$EXECUTE_TMP/facts" >> "$RUN_FACTS_FILE"; fi
+    printf '  => %s (%s)\n' "$result" "$detail"
+    rm -rf "$EXECUTE_TMP"
+  done
+}
+
+verdict_for() {
+  # verdict_for <comma-separated results> -> GREEN|RED|PARTIAL
+  case ",$1," in
+    *,FAIL,*|*,MISSING,*|*,NOT_IMPLEMENTED,*) printf 'RED' ;;
+    *,SKIP,*) printf 'PARTIAL' ;;
+    *) printf 'GREEN' ;;
+  esac
+}
+
+print_summary() {
+  local i selected_results=""
+  printf '\n=== M6 live acceptance summary ===\n'
+  printf '%-42s %-9s %-17s %s\n' "GATE" "OWNER" "RESULT" "DETAIL"
+  for i in "${!RESULT_NAMES[@]}"; do
+    printf '%-42s %-9s %-17s %s\n' "${RESULT_NAMES[$i]}" "${RESULT_OWNERS[$i]}" "${RESULT_VALUES[$i]}" "${RESULT_DETAILS[$i]}"
+    if [[ "${RESULT_SELECTED[$i]}" == "yes" ]]; then
+      selected_results+="${RESULT_VALUES[$i]},"
+    fi
+  done
+  VERDICT="$(verdict_for "$selected_results")"
+
+  {
+    printf 'run_id=%s\n' "$RUN_ID"
+    printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'git_sha=%s\n' "$GIT_SHA"
+    printf 'verdict=%s\n' "$VERDICT"
+    printf 'scope=%s\n' "$([[ -z "$SELECTED_CASES" ]] && echo all-registered || echo "$SELECTED_CASES")"
+    for i in "${!RESULT_NAMES[@]}"; do
+      printf 'gate=%s owner=%s selected=%s result=%s detail=%s\n' \
+        "${RESULT_NAMES[$i]}" "${RESULT_OWNERS[$i]}" "${RESULT_SELECTED[$i]}" "${RESULT_VALUES[$i]}" "${RESULT_DETAILS[$i]}"
+    done
+  } > "$RUN_DIR/summary.txt"
+
+  {
+    for i in "${!RESULT_NAMES[@]}"; do
+      printf '%s=%s|%s\n' "${RESULT_NAMES[$i]}" "${RESULT_VALUES[$i]}" "${RESULT_OWNERS[$i]}"
+    done
+  } > "$RUN_DIR/manifest.txt"
+
+  write_environment_facts > "$RUN_DIR/environment-facts.txt"
+
+  printf '\nscope: %s\n' "$([[ -z "$SELECTED_CASES" ]] && echo "all registered gates" || echo "$SELECTED_CASES")"
+  printf 'VERDICT: %s\n' "$VERDICT"
+  printf 'evidence: %s\n' "$RUN_DIR"
+  case "$VERDICT" in
+    GREEN) printf 'RESULT: all selected gates PASS (exit 0)\n' ;;
+    PARTIAL) printf 'RESULT: no failures, but at least one SKIP — skip is NOT a pass (exit 3)\n' ;;
+    RED) printf 'RESULT: at least one selected gate failed or was not executable (exit 1)\n' ;;
+  esac
+}
+
+write_environment_facts() {
+  # Emits the fields docs/operations/evidence/phase4a-environment.md lists.
+  # Measured-this-run values or an explicit PENDING — never an invented value.
+  printf 'environment_record_template=docs/operations/evidence/phase4a-environment.md\n'
+  printf 'run_id=%s\n' "$RUN_ID"
+  printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'harness_git_sha=%s\n' "$GIT_SHA"
+  printf 'harness_host_platform=%s_%s\n' "$uname_s" "$(uname -m 2>/dev/null || echo unknown)"
+  printf 'control_host=%s\n' "${CONTROL_HOST:-PENDING (LIVE_PHASE4A_CONTROL_HOST unset)}"
+  printf 'relay_host=%s\n' "${RELAY_HOST:-PENDING (LIVE_PHASE4A_RELAY_HOST unset)}"
+  printf 'relay_public_ip=%s\n' "${RELAY_PUBLIC_IP:-PENDING (LIVE_PHASE4A_RELAY_PUBLIC_IP unset)}"
+  printf 'relay_tunnel_host=%s\n' "${RELAY_TUNNEL_HOST:-PENDING (LIVE_PHASE4A_RELAY_TUNNEL_HOST unset)}"
+  printf 'transport_port=%s\n' "$TRANSPORT_PORT"
+  printf 'base_domain=%s\n' "$BASE_DOMAIN"
+  printf 'namespace=%s\n' "${NAMESPACE:-PENDING (LIVE_PHASE4A_NAMESPACE unset)}"
+  printf 'immich_url=%s\n' "${IMMICH_URL:-PENDING (LIVE_PHASE4A_IMMICH_URL unset)}"
+  printf 'hetzner_instance_id_control=%s\n' "$(fact_get hetzner_instance_id_control)"
+  printf 'hetzner_instance_id_relay=%s\n' "$(fact_get hetzner_instance_id_relay)"
+  printf 'hetzner_region_control=%s\n' "$(fact_get hetzner_region_control)"
+  printf 'hetzner_region_relay=%s\n' "$(fact_get hetzner_region_relay)"
+  printf 'private_ipv4_control=%s\n' "$(fact_get private_ipv4_control)"
+  printf 'private_ipv4_relay=%s\n' "$(fact_get private_ipv4_relay)"
+  printf 'nft_public_tcp_allowlist=%s\n' "$(fact_get nft_public_tcp_allowlist)"
+  printf 'tunnel_dns_a=%s\n' "$(fact_get tunnel_dns_a)"
+  printf 'tunnel_dns_aaaa=%s\n' "$(fact_get tunnel_dns_aaaa)"
+  printf 'tunnel_dns_https=%s\n' "$(fact_get tunnel_dns_https)"
+  printf 'tunnel_cert_verify=%s\n' "$(fact_get tunnel_cert_verify)"
+  printf 'gateway_route_ready=%s\n' "$(fact_get gateway_route_ready)"
+  printf 'gateway_frps_process_healthy=%s\n' "$(fact_get gateway_frps_process_healthy)"
+  printf 'selection_flag_observed=%s\n' "$(fact_get selection_flag_observed)"
+}
+
+# ---------------------------------------------------------------------------
+# Shared probe helpers used by gate bodies
+# ---------------------------------------------------------------------------
+
+host_only() {
+  local t="$1"
+  t="${t##*@}"
+  t="${t%%:*}"
+  printf '%s' "$t"
+}
+
+# Record Hetzner metadata facts into FACT_* (used by the environment record).
+probe_hetzner_facts() {
+  local role="$1" host="$2" meta rid region az
+  meta="$(remote_exec "$host" "curl -fsS --max-time 5 '${HETZNER_METADATA_URL}'")" || true
+  rid="$(json_str "$meta" instance-id)"
+  region="$(json_str "$meta" region)"
+  az="$(json_str "$meta" availability-zone)"
+  if [[ -z "$region" && -n "$az" ]]; then region="${az%%-dc*}"; fi
+  if [[ "$role" == "control" ]]; then
+    set_fact hetzner_instance_id_control "$rid"; set_fact hetzner_region_control "$region"
+  else
+    set_fact hetzner_instance_id_relay "$rid"; set_fact hetzner_region_relay "$region"
+  fi
+  printf '%s|%s|%s' "$rid" "$region" "$az"
+}
+
+# ===========================================================================
+# GATE: gate_23_9_dark_topology — Task 37 (spec §20 steps 1–4, §23.9)
+# ===========================================================================
+
+# --- 1. Control VM reachable -------------------------------------------------
+gate_chk_control_reachable() {
+  local out st
+  if ! need_cfg control_reachable LIVE_PHASE4A_CONTROL_HOST "$CONTROL_HOST" "ssh target of the control VM"; then
+    return
+  fi
+  out="$(remote_exec "$CONTROL_HOST" "systemctl is-active $CONTROL_UNIT")"
+  st=$?
+  if [[ "$st" -eq 0 && "$(printf '%s' "$out" | tr -d '[:space:]')" == "active" ]]; then
+    check control_reachable PASS "$CONTROL_HOST: $CONTROL_UNIT is active"
+  else
+    check control_reachable FAIL "$CONTROL_HOST: expected '$CONTROL_UNIT active', observed exit=${st} output='$(printf '%s' "$out" | tr -d '\n' | cut -c1-200)'"
+  fi
+}
+
+# --- 2. New relay VM, same Hetzner region/private network, distinct box ------
+gate_chk_relay_topology() {
+  local relay_facts control_facts rid cid rregion cregion
+  if ! need_cfg relay_vm_distinct LIVE_PHASE4A_RELAY_HOST "$RELAY_HOST" "ssh target of the new relay VM"; then
+    return
+  fi
+  need_cfg relay_vm_distinct LIVE_PHASE4A_CONTROL_HOST "$CONTROL_HOST" "ssh target of the control VM (needed for the same-region comparison)" || return
+
+  relay_facts="$(probe_hetzner_facts relay "$RELAY_HOST")"
+  control_facts="$(probe_hetzner_facts control "$CONTROL_HOST")"
+  rid="${relay_facts%%|*}"; relay_facts="${relay_facts#*|}"; rregion="${relay_facts%%|*}"
+  cid="${control_facts%%|*}"; control_facts="${control_facts#*|}"; cregion="${control_facts%%|*}"
+
+  if [[ -z "$rid" || -z "$cid" ]]; then
+    check relay_vm_distinct FAIL "Hetzner metadata instance-id unavailable (relay='${rid:-<empty>}', control='${cid:-<empty>}') — cannot prove a NEW distinct VM in a Hetzner region"
+  elif [[ "$rid" == "$cid" ]]; then
+    check relay_vm_distinct FAIL "relay instance-id == control instance-id (${rid}) — the relay must be a NEW, distinct VM"
+  else
+    check relay_vm_distinct PASS "distinct instances: control=${cid} relay=${rid}"
+  fi
+
+  if [[ -z "$rregion" || -z "$cregion" ]]; then
+    check relay_vm_same_region FAIL "Hetzner region unavailable (relay='${rregion:-<empty>}', control='${cregion:-<empty>}') — cannot prove same region"
+  elif [[ "$rregion" == "$cregion" ]]; then
+    check relay_vm_same_region PASS "both in region ${rregion}"
+  else
+    check relay_vm_same_region FAIL "relay region=${rregion} != control region=${cregion}"
+  fi
+
+  local rlist rpriv clist cpriv
+  rlist="$(remote_exec "$RELAY_HOST" "ip -4 -o addr show scope global 2>/dev/null")" || true
+  clist="$(remote_exec "$CONTROL_HOST" "ip -4 -o addr show scope global 2>/dev/null")" || true
+  rpriv="$(private_v4_list "$rlist" | head -n1)"
+  cpriv="$(private_v4_list "$clist" | head -n1)"
+  set_fact private_ipv4_relay "$rpriv"; set_fact private_ipv4_control "$cpriv"
+  if [[ -z "$rpriv" || -z "$cpriv" ]]; then
+    check relay_vm_private_network FAIL "private IPv4 not found on both hosts (relay='${rpriv:-<none>}', control='${cpriv:-<none>}') — relay must share control's private network"
+  elif same_subnet24 "$rpriv" "$cpriv"; then
+    check relay_vm_private_network PASS "relay ${rpriv} and control ${cpriv} share a /24 private network"
+  else
+    check relay_vm_private_network FAIL "relay private ${rpriv} and control private ${cpriv} are not in the same /24"
+  fi
+
+  # The M6 relay must not be the collocated (and currently down) test VPS.
+  local excluded hit
+  hit=""
+  IFS=',' read -r -a excluded <<< "$EXCLUDED_RELAY_IPS"
+  for ip in "${excluded[@]}"; do
+    [[ -z "$ip" ]] && continue
+    if [[ -n "$RELAY_PUBLIC_IP" && "$RELAY_PUBLIC_IP" == "$ip" ]]; then hit="$ip"; fi
+  done
+  if [[ -n "$hit" ]]; then
+    check relay_is_not_test_vps FAIL "relay public IP ${hit} is the excluded collocated test VPS — not the M6 dark relay VM"
+  elif [[ -z "$RELAY_PUBLIC_IP" ]]; then
+    check relay_is_not_test_vps FAIL "LIVE_PHASE4A_RELAY_PUBLIC_IP unset — cannot prove the relay is not the excluded test VPS"
+  else
+    check relay_is_not_test_vps PASS "relay public IP ${RELAY_PUBLIC_IP} is not in the excluded set (${EXCLUDED_RELAY_IPS})"
+  fi
+}
+
+# --- 3. Home Mac agent + real Immich ----------------------------------------
+gate_chk_home_side() {
+  local pids out st
+  pids="$(pgrep -f "$AGENT_PID_MATCH" 2>/dev/null | tr '\n' ' ')"
+  if [[ -n "${pids// /}" ]]; then
+    check home_agent_running PASS "process(es) matching '${AGENT_PID_MATCH}': ${pids}"
+  else
+    check home_agent_running FAIL "no local process matches '${AGENT_PID_MATCH}' on the harness host (the home Mac agent)"
+  fi
+
+  if ! need_cfg immich_reachable LIVE_PHASE4A_IMMICH_URL "$IMMICH_URL" "real Immich base URL on the home Mac"; then
+    return
+  fi
+  out="$(local_exec "curl -fsS --max-time 5 '${IMMICH_URL%/}/api/server/ping'")"
+  st=$?
+  if [[ "$st" -eq 0 ]] && printf '%s' "$out" | grep -q '"res"[[:space:]]*:[[:space:]]*"pong"'; then
+    check immich_reachable PASS "${IMMICH_URL%/}/api/server/ping -> pong"
+  else
+    check immich_reachable FAIL "Immich ping at ${IMMICH_URL%/}/api/server/ping failed (exit=${st}, output='$(printf '%s' "$out" | tr -d '\n' | cut -c1-160)')"
+  fi
+
+  # Informational: an established agent->control connection, when we can see it.
+  local ctl_h
+  ctl_h="${CONTROL_PUBLIC_HOST:-$(host_only "$CONTROL_HOST")}"
+  if [[ -n "$ctl_h" ]] && command -v lsof >/dev/null 2>&1; then
+    out="$(lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null | grep -F ":${CONTROL_PORT}" | grep -F "$ctl_h" | head -n3)"
+    if [[ -n "$out" ]]; then
+      note home_agent_control_connection "established connection(s) observed to ${ctl_h}:${CONTROL_PORT}"
+    else
+      note home_agent_control_connection "no established connection observed to ${ctl_h}:${CONTROL_PORT} (informational; the agent may be between reconnects)"
+    fi
+  else
+    note home_agent_control_connection "skipped (lsof unavailable or control host unknown)"
+  fi
+}
+
+# --- 4. Relay public firewall = 443/tcp + transport port only ----------------
+gate_chk_relay_firewall() {
+  local nft_out nft_st elements got want policy extra p
+  if ! need_cfg relay_firewall_allowlist LIVE_PHASE4A_RELAY_HOST "$RELAY_HOST" "ssh target of the relay VM (needed to read the nftables ruleset)"; then
+    return
+  fi
+
+  nft_out="$(remote_exec "$RELAY_HOST" "nft list table inet sharebridge_relay 2>/dev/null")"
+  nft_st=$?
+  elements="$(printf '%s' "$nft_out" | tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | head -n1)"
+  if [[ "$nft_st" -ne 0 || -z "$elements" ]]; then
+    check relay_firewall_allowlist FAIL "could not read the inet sharebridge_relay public set on ${RELAY_HOST} (ssh/parse exit=${nft_st}; output='$(printf '%s' "$nft_out" | tr '\n' ' ' | cut -c1-160)')"
+    check relay_firewall_input_policy FAIL "not evaluated: no parseable inet sharebridge_relay ruleset"
+    check relay_firewall_no_extra_dport FAIL "not evaluated: no parseable inet sharebridge_relay ruleset"
+  else
+    got="$(printf '%s' "$elements" | tr -cs '0-9' ' ' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -nu | tr '\n' ' ' | sed 's/ *$//')"
+    want="$(printf '%s\n%s\n' 443 "$TRANSPORT_PORT" | sort -nu | tr '\n' ' ' | sed 's/ *$//')"
+    set_fact nft_public_tcp_allowlist "${got:-<none>}"
+    if [[ "$got" == "$want" ]]; then
+      check relay_firewall_allowlist PASS "public tcp allowlist = { ${got} } (expected 443 + transport ${TRANSPORT_PORT})"
+    else
+      check relay_firewall_allowlist FAIL "public tcp allowlist = { ${got:-<none>} } but expected exactly { ${want} }"
+    fi
+
+    policy="$(printf '%s' "$nft_out" | grep -o 'policy drop' | head -n1)"
+    if [[ "$policy" == "policy drop" ]]; then
+      check relay_firewall_input_policy PASS "input chain policy drop"
+    else
+      check relay_firewall_input_policy FAIL "input chain does not declare 'policy drop'"
+    fi
+
+    # Any dport number in the ruleset must be in the expected allowlist.
+    extra="$(printf '%s' "$nft_out" | tr '\n' ' ' | grep -o 'dport [^ ]*' | tr -cs '0-9' ' ' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -nu | tr '\n' ' ' | sed 's/ *$//')"
+    local bad=""
+    for p in $extra; do
+      case " 443 $TRANSPORT_PORT " in
+        *" $p "*) : ;;
+        *) bad="${bad}${p} " ;;
+      esac
+    done
+    if [[ -z "$bad" ]]; then
+      check relay_firewall_no_extra_dport PASS "every numeric dport in the ruleset is in { ${want} }"
+    else
+      check relay_firewall_no_extra_dport FAIL "unexpected accept dport(s): ${bad}"
+    fi
+  fi
+
+  # External TCP surface probe from the harness host.
+  if [[ -z "$RELAY_PUBLIC_IP" ]]; then
+    check relay_public_443_open FAIL "LIVE_PHASE4A_RELAY_PUBLIC_IP unset — cannot probe the public surface"
+    check relay_public_transport_open FAIL "LIVE_PHASE4A_RELAY_PUBLIC_IP unset — cannot probe the public surface"
+    check relay_forbidden_ports_closed FAIL "LIVE_PHASE4A_RELAY_PUBLIC_IP unset — cannot probe the public surface"
+  else
+    if tcp_open "$RELAY_PUBLIC_IP" 443; then
+      check relay_public_443_open PASS "${RELAY_PUBLIC_IP}:443 accepts TCP"
+    else
+      check relay_public_443_open FAIL "${RELAY_PUBLIC_IP}:443 did not accept TCP"
+    fi
+    if tcp_open "$RELAY_PUBLIC_IP" "$TRANSPORT_PORT"; then
+      check relay_public_transport_open PASS "${RELAY_PUBLIC_IP}:${TRANSPORT_PORT} accepts TCP"
+    else
+      check relay_public_transport_open FAIL "${RELAY_PUBLIC_IP}:${TRANSPORT_PORT} did not accept TCP"
+    fi
+    local open_forbidden=""
+    for p in 9001 9101 9102 7500 10000 10099; do
+      if tcp_open "$RELAY_PUBLIC_IP" "$p"; then open_forbidden="${open_forbidden}${p} "; fi
+    done
+    if [[ -z "$open_forbidden" ]]; then
+      check relay_forbidden_ports_closed PASS "no forbidden public port accepted TCP (checked 9001 9101 9102 7500 10000 10099)"
+    else
+      check relay_forbidden_ports_closed FAIL "forbidden public port(s) reachable: ${open_forbidden}"
+    fi
+  fi
+
+  # No public UDP listener on the relay VM (spec §17.1). Any bound UDP socket
+  # whose local address is not loopback is a public listener.
+  if [[ -n "$RELAY_HOST" ]]; then
+    local udp_all udp_st udp_public
+    udp_all="$(remote_exec "$RELAY_HOST" "ss -lun 2>/dev/null | awk 'NR>1{print \$5}'")"
+    udp_st=$?
+    if [[ "$udp_st" -ne 0 ]]; then
+      check relay_no_public_udp FAIL "could not read UDP listeners on ${RELAY_HOST} (ssh exit=${udp_st})"
+    else
+      udp_public="$(printf '%s\n' "$udp_all" | grep -vE '^(127\.|\[::1\]:|::1:)' | grep -vE '^[[:space:]]*$' | tr '\n' ' ' | sed 's/ *$//')"
+      if [[ -z "$udp_public" ]]; then
+        check relay_no_public_udp PASS "no non-loopback UDP listener on ${RELAY_HOST}"
+      else
+        check relay_no_public_udp FAIL "non-loopback UDP listener(s) on ${RELAY_HOST}: ${udp_public}"
+      fi
+    fi
+  fi
+}
+
+# --- 5. Private mTLS control sync configured and healthy ---------------------
+gate_chk_private_sync() {
+  local ctl_env gw_env gw_unit bind url san ns
+  if ! need_cfg sync_configured LIVE_PHASE4A_CONTROL_HOST "$CONTROL_HOST" "ssh target of the control VM"; then
+    return
+  fi
+
+  ctl_env="$(remote_exec "$CONTROL_HOST" "cat '$CONTROL_ENV_FILE' 2>/dev/null")" || true
+  bind="$(env_value "$ctl_env" CONTROL_SYNC_BIND_ADDR)"
+  local missing=""
+  for v in CONTROL_SYNC_CERT_FILE CONTROL_SYNC_KEY_FILE CONTROL_SYNC_CLIENT_CA_FILE CONTROL_SYNC_EXPECTED_CLIENT_SAN; do
+    [[ -n "$(env_value "$ctl_env" "$v")" ]] || missing="${missing}${v} "
+  done
+  if [[ -n "$missing" ]]; then
+    check sync_control_configured FAIL "${CONTROL_ENV_FILE} on ${CONTROL_HOST} is missing: ${missing}"
+  elif [[ -n "$bind" ]] && ! is_private_bind "$bind"; then
+    check sync_control_configured FAIL "CONTROL_SYNC_BIND_ADDR=${bind} is not a private/loopback bind"
+  else
+    check sync_control_configured PASS "CONTROL_SYNC_* material set${bind:+ ; bind=${bind}} (private)"
+  fi
+
+  if ! need_cfg sync_gateway_configured LIVE_PHASE4A_RELAY_HOST "$RELAY_HOST" "ssh target of the relay VM"; then
+    return
+  fi
+  gw_env="$(remote_exec "$RELAY_HOST" "cat '$GATEWAY_ENV_FILE' 2>/dev/null")" || true
+  gw_unit="$(remote_exec "$RELAY_HOST" "systemctl cat $GATEWAY_UNIT 2>/dev/null")" || true
+  url="$(env_value "$gw_env" SHAREBRIDGE_CONTROL_SYNC_URL)"
+  san="$(env_value "$gw_env" SHAREBRIDGE_CONTROL_SYNC_SAN)"
+  ns="$(env_value "$gw_env" SHAREBRIDGE_GATEWAY_NAMESPACE)"
+  local gw_missing=""
+  [[ -n "$url" ]] || gw_missing="${gw_missing}SHAREBRIDGE_CONTROL_SYNC_URL "
+  [[ -n "$san" ]] || gw_missing="${gw_missing}SHAREBRIDGE_CONTROL_SYNC_SAN "
+  [[ -n "$(env_value "$gw_env" SHAREBRIDGE_CONTROL_SYNC_CA_FILE)" ]] || gw_missing="${gw_missing}SHAREBRIDGE_CONTROL_SYNC_CA_FILE "
+  if [[ -n "$gw_missing" ]]; then
+    check sync_gateway_configured FAIL "${GATEWAY_ENV_FILE} on ${RELAY_HOST} is missing: ${gw_missing}"
+  else
+    local creds=""
+    printf '%s' "$gw_env" "$gw_unit" | grep -q 'SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE' || creds="${creds}SHAREBRIDGE_GATEWAY_SYNC_CERT_FILE "
+    printf '%s' "$gw_env" "$gw_unit" | grep -q 'SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE' || creds="${creds}SHAREBRIDGE_GATEWAY_SYNC_KEY_FILE "
+    printf '%s' "$gw_unit" | grep -q 'LoadCredential=' || creds="${creds}LoadCredential= "
+    if [[ -n "$creds" ]]; then
+      check sync_gateway_configured FAIL "gateway sync material incomplete on ${RELAY_HOST}: ${creds}"
+    elif [[ -n "$ns" ]] && ! printf '%s' "$ns" | grep -Eq '^sb[0-9a-f]{8}$'; then
+      check sync_gateway_configured FAIL "SHAREBRIDGE_GATEWAY_NAMESPACE=${ns} is not the §6 form sbXXXXXXXX"
+    else
+      check sync_gateway_configured PASS "gateway sync client material configured${ns:+ ; namespace=${ns}}"
+    fi
+  fi
+
+  # Live mTLS handshake from the relay VM. The paths are ON the relay VM.
+  local missing_paths=""
+  [[ -n "$SYNC_CA_FILE" ]] || missing_paths="${missing_paths}LIVE_PHASE4A_SYNC_CA_FILE "
+  [[ -n "$GATEWAY_SYNC_CERT" ]] || missing_paths="${missing_paths}LIVE_PHASE4A_GATEWAY_SYNC_CERT "
+  [[ -n "$GATEWAY_SYNC_KEY" ]] || missing_paths="${missing_paths}LIVE_PHASE4A_GATEWAY_SYNC_KEY "
+  if [[ -n "$missing_paths" ]] || [[ -z "$url" || -z "$san" ]]; then
+    check sync_mtls_handshake FAIL "cannot run the live mTLS probe: ${missing_paths:-<sync URL/SAN missing from the gateway env>} (paths are on the relay VM)"
+    return
+  fi
+  case "$url" in
+    https://*) : ;;
+    *) check sync_mtls_handshake FAIL "SHAREBRIDGE_CONTROL_SYNC_URL='${url}' is not an https:// URL"; return ;;
+  esac
+  local endpoint="${url#https://}"
+  endpoint="${endpoint%%/*}"
+  local out st
+  out="$(remote_exec "$RELAY_HOST" "openssl s_client -connect '${endpoint}' -servername '${san}' -verify_hostname '${san}' -verify_return_error -CAfile '${SYNC_CA_FILE}' -cert '${GATEWAY_SYNC_CERT}' -key '${GATEWAY_SYNC_KEY}' -brief </dev/null")"
+  st=$?
+  if [[ "$st" -eq 0 ]] && printf '%s' "$out" | grep -q 'Verification: OK'; then
+    check sync_mtls_handshake PASS "authenticated mTLS handshake to ${endpoint} (server SAN ${san}) succeeded"
+  else
+    check sync_mtls_handshake FAIL "authenticated mTLS handshake to ${endpoint} failed (exit=${st}): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+  fi
+  out="$(remote_exec "$RELAY_HOST" "openssl s_client -connect '${endpoint}' -servername '${san}' -verify_return_error -CAfile '${SYNC_CA_FILE}' -brief </dev/null")"
+  st=$?
+  if [[ "$st" -ne 0 ]]; then
+    check sync_mtls_enforced PASS "a client without a certificate was rejected (RequireAndVerifyClientCert)"
+  else
+    check sync_mtls_enforced FAIL "the sync listener accepted a client with no certificate — mTLS is not enforced"
+  fi
+}
+
+# --- 6. Tunnel DNS + transport certificate validation ------------------------
+gate_chk_tunnel_dns_cert() {
+  if ! need_cfg tunnel_dns LIVE_PHASE4A_RELAY_TUNNEL_HOST "$RELAY_TUNNEL_HOST" "<relay-tunnel-host> for DNS and transport-certificate validation"; then
+    return
+  fi
+  if ! command -v dig >/dev/null 2>&1; then
+    check tunnel_dns FAIL "dig is not installed on the harness host — cannot validate relay DNS"
+    return
+  fi
+
+  local a aaaa https svcb
+  a="$(local_exec "dig +short A '${RELAY_TUNNEL_HOST}'" | tr '\n' ' ' | sed 's/ *$//')"
+  aaaa="$(local_exec "dig +short AAAA '${RELAY_TUNNEL_HOST}'" | tr '\n' ' ' | sed 's/ *$//')"
+  https="$(local_exec "dig +short HTTPS '${RELAY_TUNNEL_HOST}'" | tr '\n' ' ' | sed 's/ *$//')"
+  svcb="$(local_exec "dig +short SVCB '${RELAY_TUNNEL_HOST}'" | tr '\n' ' ' | sed 's/ *$//')"
+  set_fact tunnel_dns_a "${a:-<empty>}"; set_fact tunnel_dns_aaaa "${aaaa:-<empty>}"; set_fact tunnel_dns_https "${https:-<empty>}"
+
+  if [[ -z "$a" ]]; then
+    check tunnel_dns_a FAIL "A ${RELAY_TUNNEL_HOST} -> empty"
+  elif [[ -n "$RELAY_PUBLIC_IP" ]] && ! printf '%s' "$a" | grep -qF "$RELAY_PUBLIC_IP"; then
+    check tunnel_dns_a FAIL "A ${RELAY_TUNNEL_HOST} -> ${a} does not include the relay public IP ${RELAY_PUBLIC_IP}"
+  else
+    check tunnel_dns_a PASS "A ${RELAY_TUNNEL_HOST} -> ${a}"
+  fi
+
+  if [[ -z "$aaaa" ]]; then
+    check tunnel_dns_aaaa PASS "AAAA ${RELAY_TUNNEL_HOST} -> empty (DNS-only A, acceptable)"
+  elif printf '%s' "$aaaa" | grep -Eq '^[0-9A-Fa-f:]+$'; then
+    check tunnel_dns_aaaa PASS "AAAA ${RELAY_TUNNEL_HOST} -> ${aaaa} (valid IPv6 literal)"
+  else
+    check tunnel_dns_aaaa FAIL "AAAA ${RELAY_TUNNEL_HOST} -> '${aaaa}' is not a valid IPv6 literal"
+  fi
+
+  if [[ -n "$https" || -n "$svcb" ]]; then
+    check tunnel_dns_no_ech FAIL "HTTPS/SVCB present for ${RELAY_TUNNEL_HOST} (HTTPS='${https}' SVCB='${svcb}') — an ECH key would hide the SNI"
+  elif printf '%s %s' "$https" "$svcb" | grep -qi 'ech='; then
+    check tunnel_dns_no_ech FAIL "an ech= parameter is present for ${RELAY_TUNNEL_HOST}"
+  else
+    check tunnel_dns_no_ech PASS "no HTTPS/SVCB record and no ech= parameter for ${RELAY_TUNNEL_HOST}"
+  fi
+
+  if [[ -n "$NAMESPACE" ]]; then
+    local child out
+    child="probe-$(date +%s)-$$.relay.${NAMESPACE}.${BASE_DOMAIN}"
+    out="$(local_exec "dig +short A '${child}'" | tr '\n' ' ' | sed 's/ *$//')"
+    if [[ -z "$out" ]]; then
+      check tunnel_dns_wildcard_synthesis FAIL "random child ${child} -> empty (wildcard does not synthesize)"
+    elif [[ -n "$RELAY_PUBLIC_IP" ]] && ! printf '%s' "$out" | grep -qF "$RELAY_PUBLIC_IP"; then
+      check tunnel_dns_wildcard_synthesis FAIL "random child ${child} -> ${out}, expected ${RELAY_PUBLIC_IP}"
+    else
+      check tunnel_dns_wildcard_synthesis PASS "random child ${child} -> ${out}"
+    fi
+  else
+    check tunnel_dns_wildcard_synthesis FAIL "LIVE_PHASE4A_NAMESPACE unset — cannot prove wildcard synthesis for the test namespace"
+  fi
+
+  # Transport certificate: dedicated cert, verifies against the transport CA,
+  # SAN matches the tunnel host, over the pinned transport port.
+  if [[ -z "$TRANSPORT_CA_FILE" ]]; then
+    check tunnel_transport_cert FAIL "LIVE_PHASE4A_TRANSPORT_CA_FILE unset — cannot validate the dedicated transport certificate"
+    return
+  fi
+  local out st
+  out="$(local_exec "openssl s_client -connect '${RELAY_TUNNEL_HOST}:${TRANSPORT_PORT}' -servername '${RELAY_TUNNEL_HOST}' -verify_hostname '${RELAY_TUNNEL_HOST}' -verify_return_error -CAfile '${TRANSPORT_CA_FILE}' -brief </dev/null")"
+  st=$?
+  if [[ "$st" -eq 0 ]] && printf '%s' "$out" | grep -q 'Verification: OK'; then
+    check tunnel_transport_cert PASS "transport certificate at ${RELAY_TUNNEL_HOST}:${TRANSPORT_PORT} verifies against the configured CA with SAN match"
+    set_fact tunnel_cert_verify "OK"
+  else
+    check tunnel_transport_cert FAIL "transport certificate validation failed at ${RELAY_TUNNEL_HOST}:${TRANSPORT_PORT} (exit=${st}): $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    set_fact tunnel_cert_verify "FAILED (exit=${st})"
+  fi
+}
+
+# --- 7. Snapshot health (route_ready) ---------------------------------------
+gate_chk_snapshot_health() {
+  if ! need_cfg snapshot_route_ready LIVE_PHASE4A_RELAY_HOST "$RELAY_HOST" "ssh target of the relay VM (health endpoint is loopback-private)"; then
+    return
+  fi
+  local out st rr rh
+  out="$(remote_exec "$RELAY_HOST" "curl -fsS --max-time 5 '${HEALTHZ_URL}'")"
+  st=$?
+  rr="$(printf '%s' "$out" | grep -o '"route_ready":[a-z]*' | head -n1 | cut -d: -f2)"
+  rh="$(printf '%s' "$out" | grep -o '"frps_process_healthy":[a-z]*' | head -n1 | cut -d: -f2)"
+  set_fact gateway_route_ready "${rr:-PENDING (not observed)}"
+  set_fact gateway_frps_process_healthy "${rh:-PENDING (not observed)}"
+
+  if [[ "$st" -ne 0 ]]; then
+    check snapshot_route_ready FAIL "GET ${HEALTHZ_URL} on ${RELAY_HOST} failed (exit=${st}) — route snapshot health unobservable"
+  elif [[ "$rr" == "true" ]]; then
+    check snapshot_route_ready PASS "route_ready=true (full route snapshot applied AND control sync live)"
+  else
+    check snapshot_route_ready FAIL "route_ready=${rr:-<absent>} (raw: $(printf '%s' "$out" | tr -d '\n' | cut -c1-200))"
+  fi
+
+  if [[ "$st" -ne 0 ]]; then
+    check frps_process_healthy FAIL "frps process health unobservable (health endpoint failed)"
+  elif [[ "$rh" == "true" ]]; then
+    check frps_process_healthy PASS "frps_process_healthy=true (independent of route_ready)"
+  else
+    check frps_process_healthy FAIL "frps_process_healthy=${rh:-<absent>}"
+  fi
+}
+
+# --- 8. Restart ordering -----------------------------------------------------
+gate_chk_restart_ordering() {
+  if ! need_cfg restart_order_frps_after_gateway LIVE_PHASE4A_RELAY_HOST "$RELAY_HOST" "ssh target of the relay VM (unit dependency metadata)"; then
+    return
+  fi
+  local show frps_after frps_wants frps_bindsto frps_partof gw_after
+  show="$(remote_exec "$RELAY_HOST" "for p in After Wants BindsTo PartOf; do printf '%s=%s\n' \"\$p\" \"\$(systemctl show -p \$p --value $FRPS_UNIT)\"; done; printf 'GATEWAY_AFTER=%s\n' \"\$(systemctl show -p After --value $GATEWAY_UNIT)\"; printf 'SHOW_OK\n'")"
+  if ! printf '%s' "$show" | grep -q '^SHOW_OK$'; then
+    check restart_order_frps_after_gateway FAIL "could not read $FRPS_UNIT dependency metadata on ${RELAY_HOST}"
+    check restart_order_frps_wants_gateway FAIL "could not read $FRPS_UNIT dependency metadata on ${RELAY_HOST}"
+    check restart_order_no_coupling FAIL "could not read $FRPS_UNIT dependency metadata on ${RELAY_HOST}"
+    check restart_order_not_reversed FAIL "could not read $GATEWAY_UNIT dependency metadata on ${RELAY_HOST}"
+    return
+  fi
+  frps_after="$(printf '%s' "$show" | sed -n 's/^After=//p' | head -n1)"
+  frps_wants="$(printf '%s' "$show" | sed -n 's/^Wants=//p' | head -n1)"
+  frps_bindsto="$(printf '%s' "$show" | sed -n 's/^BindsTo=//p' | head -n1)"
+  frps_partof="$(printf '%s' "$show" | sed -n 's/^PartOf=//p' | head -n1)"
+  gw_after="$(printf '%s' "$show" | sed -n 's/^GATEWAY_AFTER=//p' | head -n1)"
+
+  case " $frps_after " in
+    *" $GATEWAY_UNIT "*) check restart_order_frps_after_gateway PASS "$FRPS_UNIT After= includes $GATEWAY_UNIT" ;;
+    *) check restart_order_frps_after_gateway FAIL "$FRPS_UNIT After='${frps_after:-<empty>}' does not include $GATEWAY_UNIT" ;;
+  esac
+  case " $frps_wants " in
+    *" $GATEWAY_UNIT "*) check restart_order_frps_wants_gateway PASS "$FRPS_UNIT Wants= includes $GATEWAY_UNIT" ;;
+    *) check restart_order_frps_wants_gateway FAIL "$FRPS_UNIT Wants='${frps_wants:-<empty>}' does not include $GATEWAY_UNIT" ;;
+  esac
+  if [[ -z "${frps_bindsto// /}" && -z "${frps_partof// /}" ]]; then
+    check restart_order_no_coupling PASS "$FRPS_UNIT has no BindsTo=/PartOf= coupling to the gateway"
+  else
+    check restart_order_no_coupling FAIL "$FRPS_UNIT couples to the gateway (BindsTo='${frps_bindsto}' PartOf='${frps_partof}')"
+  fi
+  case " $gw_after " in
+    *" $FRPS_UNIT "*) check restart_order_not_reversed FAIL "$GATEWAY_UNIT After= includes $FRPS_UNIT (ordering is reversed)" ;;
+    *) check restart_order_not_reversed PASS "$GATEWAY_UNIT After= does not include $FRPS_UNIT" ;;
+  esac
+
+  if [[ "$ALLOW_RESTART" == "1" ]]; then
+    local drill
+    drill="$(remote_exec "$RELAY_HOST" "systemctl restart $GATEWAY_UNIT && sleep 2 && systemctl is-active $GATEWAY_UNIT $FRPS_UNIT")"
+    if printf '%s' "$drill" | grep -q 'active'; then
+      check restart_order_live_drill PASS "gateway-only restart left both units active: $(printf '%s' "$drill" | tr '\n' ' ')"
+    else
+      check restart_order_live_drill FAIL "gateway-only restart did not leave both units active: $(printf '%s' "$drill" | tr '\n' ' ')"
+    fi
+  else
+    note restart_order_live_drill "LIVE_PHASE4A_ALLOW_RESTART!=1 — live restart drill not run (unit metadata is the gate contract; Task 43 owns the live recovery drill)"
+  fi
+}
+
+# --- 9. Dark posture: the selection flag remains false ----------------------
+gate_chk_selection_flag() {
+  if ! need_cfg selection_flag_remains_false LIVE_PHASE4A_CONTROL_HOST "$CONTROL_HOST" "ssh target of the control VM (the flag lives in the control deployment)"; then
+    return
+  fi
+  local line value
+  line="$(remote_exec "$CONTROL_HOST" "if [ -f '$CONTROL_ENV_FILE' ]; then echo ENV_FILE_PRESENT; grep -E '^RELAY_SELECTION_ENABLED=' '$CONTROL_ENV_FILE' 2>/dev/null | tail -n1; else echo ENV_FILE_MISSING; fi")"
+  if printf '%s' "$line" | grep -q '^ENV_FILE_MISSING'; then
+    set_fact selection_flag_observed "unverifiable (env file missing)"
+    check selection_flag_remains_false FAIL "${CONTROL_ENV_FILE} not found on ${CONTROL_HOST} — cannot verify the dark posture (never assume it)"
+    return
+  fi
+  if ! printf '%s' "$line" | grep -q '^ENV_FILE_PRESENT'; then
+    set_fact selection_flag_observed "unverifiable (ssh/read failure)"
+    check selection_flag_remains_false FAIL "could not read ${CONTROL_ENV_FILE} on ${CONTROL_HOST} — cannot verify the dark posture"
+    return
+  fi
+  value="$(env_value "$line" RELAY_SELECTION_ENABLED)"
+  set_fact selection_flag_observed "${value:-unset}"
+  case "$value" in
+    false) check selection_flag_remains_false PASS "RELAY_SELECTION_ENABLED=false in ${CONTROL_ENV_FILE} (dark posture held)" ;;
+    "")    check selection_flag_remains_false PASS "RELAY_SELECTION_ENABLED absent from ${CONTROL_ENV_FILE} -> control default false (dark posture held)" ;;
+    true)  check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED=true — production selection is ON; the dark posture is violated and a missing topology would be masked" ;;
+    *)     check selection_flag_remains_false FAIL "RELAY_SELECTION_ENABLED='${value}' is not a boolean — cannot verify the dark posture" ;;
+  esac
+}
+
+gate_23_9_dark_topology() {
+  gate_chk_control_reachable
+  gate_chk_relay_topology
+  gate_chk_home_side
+  gate_chk_relay_firewall
+  gate_chk_private_sync
+  gate_chk_tunnel_dns_cert
+  gate_chk_snapshot_health
+  gate_chk_restart_ordering
+  gate_chk_selection_flag
+}
+
+# ===========================================================================
+# Placeholders for Tasks 38–44. Each later task replaces exactly one body.
+# ===========================================================================
+
+acceptance_01_owner_hairpin()        { gate_not_implemented "Task 38" "§19 #1 owner hairpin on the confirmed non-hairpin router, three browsers, exact relay origin, zero CSP violations"; }
+acceptance_04_interstitial_blackhole() { gate_not_implemented "Task 38" "§19 #4 deterministic interstitial fallback: blackhole direct after successful preparation, prove relay navigation within the documented bound and same content"; }
+acceptance_02_cellular_relay_video() { gate_not_implemented "Task 39" "§19 #2 phone on cellular loads gallery + video over relay with at least two valid 206 seeks"; }
+acceptance_11_content_parity()       { gate_not_implemented "Task 39" "§19 #11 Phase 3 gallery/items/thumb/preview/original/archive/accounting/Range parity through relay vs the direct baseline"; }
+acceptance_03_relay_only()           { gate_not_implemented "Task 40" "§19 #3 relayOnly share: zero direct DNS mutation/lookup, probe, open signal, mapper call or browser direct request; exact relay URL; content succeeds"; }
+l4_no_plaintext_capture()            { gate_not_implemented "Task 41" "§19 #5 / §18.4 canary capture proving the relay sees only TLS ciphertext (scripts/l4-canary-capture.sh), any plaintext is NO-GO"; }
+acceptance_06_no_mapper_enrollment() { gate_not_implemented "Task 42" "§19 #6 no-mapper agent enrolls, registers a public share, serves it solely over the outbound tunnel"; }
+acceptance_12_stun_mismatch()        { gate_not_implemented "Task 42" "§19 #12 egress mismatch marks the direct diagnostic relay_fallback, suppresses the public probe, routes through relay"; }
+acceptance_13_stun_cadence_cold_budget() { gate_not_implemented "Task 42" "§19 #13 immediate post-reconnect challenge, ~4-minute refresh, no warm repeat, cold preparation within four seconds or relay fallback, later warm direct succeeds"; }
+acceptance_07_no_relay_open_signal() { gate_not_implemented "Task 43" "§19 #7 route=relay generates no open_signal/open_ack/direct probe/port-mapper call"; }
+acceptance_08_exact_routing()        { gate_not_implemented "Task 43" "§19 #8 random/bare/tombstoned SNI never reaches any agent; a valid exact route reaches only its owning agent"; }
+acceptance_09_restart_recovery()     { gate_not_implemented "Task 43" "§19 #9 gateway/frps/agent restarts restore availability only after fresh authoritative presence, never on stale DB state"; }
+acceptance_10_lockdown()             { gate_not_implemented "Task 43" "§19 #10 lockdown drops direct mapping + FRP tunnel, closes both active connection kinds, unlock requires fresh credential"; }
+acceptance_15_heartbeat_tunnel_dns() { gate_not_implemented "Task 43" "§19 #15 tunnel DNS + dedicated transport cert, 10s Pings, one delayed Ping tolerated, unavailable after a true 45s lease expiry"; }
+release_go_no_go_rollback()          { gate_not_implemented "Task 44" "§20 steps 5–7 + §23 blocking rule: release-manifest gate, staged automatic fallback, rollback drill with RELAY_SELECTION_ENABLED=false"; }
+
+# ===========================================================================
+# Selftest — proves the runner's pass/fail/skip/missing plumbing is real.
+# ===========================================================================
+
+selftest_check() {
+  local label="$1" got="$2" want="$3"
+  if [[ "$got" == "$want" ]]; then
+    printf 'SELFTEST [PASS] %s: got %s\n' "$label" "$got"
+    return 0
+  fi
+  printf 'SELFTEST [FAIL] %s: got %s, want %s\n' "$label" "$got" "$want"
+  return 1
+}
+
+_selftest_pass() { check selftest_check PASS "a trivially true check"; }
+_selftest_fail() { check selftest_check FAIL "a trivially false check"; }
+_selftest_skip() { check selftest_check SKIP "a deliberately skipped check"; }
+_selftest_empty() { :; }
+_selftest_notimpl() { gate_not_implemented "selftest" "a not-implemented gate"; }
+_selftest_crash() { check selftest_check PASS "recorded before crashing"; return 7; }
+
+run_selftest() {
+  local failures=0 got verdict
+  printf '=== live-phase4a.sh selftest (pass/fail plumbing) ===\n'
+
+  execute_gate _selftest_pass;    selftest_check "trivially-true gate" "$EXECUTE_RESULT" "PASS" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate _selftest_fail;    selftest_check "trivially-false gate" "$EXECUTE_RESULT" "FAIL" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate _selftest_skip;    selftest_check "skipped gate is not a pass" "$EXECUTE_RESULT" "SKIP" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate _selftest_empty;   selftest_check "zero-check gate is MISSING (never PASS)" "$EXECUTE_RESULT" "MISSING" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate _selftest_notimpl; selftest_check "placeholder gate is NOT_IMPLEMENTED" "$EXECUTE_RESULT" "NOT_IMPLEMENTED" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate _selftest_crash;   selftest_check "gate that records PASS then crashes is FAIL" "$EXECUTE_RESULT" "FAIL" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+  execute_gate does_not_exist;    selftest_check "unregistered function is MISSING" "$EXECUTE_RESULT" "MISSING" || failures=$((failures + 1)); rm -rf "$EXECUTE_TMP"
+
+  got="$(verdict_for "PASS,")";                 selftest_check "verdict(all PASS)" "$got" "GREEN" || failures=$((failures + 1))
+  got="$(verdict_for "PASS,FAIL,")";            selftest_check "verdict(FAIL present)" "$got" "RED" || failures=$((failures + 1))
+  got="$(verdict_for "PASS,SKIP,")";            selftest_check "verdict(SKIP is not a pass)" "$got" "PARTIAL" || failures=$((failures + 1))
+  got="$(verdict_for "PASS,NOT_IMPLEMENTED,")"; selftest_check "verdict(placeholder present)" "$got" "RED" || failures=$((failures + 1))
+  got="$(verdict_for "PASS,MISSING,")";         selftest_check "verdict(unrun/missing)" "$got" "RED" || failures=$((failures + 1))
+
+  if [[ "$failures" -eq 0 ]]; then
+    printf 'SELFTEST RESULT: PASS (0 failures) — the gate runner refuses PASS for unexecuted, skipped, crashing or unimplemented gates\n'
+    exit 0
+  fi
+  printf 'SELFTEST RESULT: FAIL (%d assertions failed) — the harness plumbing is broken\n' "$failures"
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if [[ "$LIST_ONLY" -eq 1 ]]; then
+  printf '%-42s %-9s %s\n' "GATE" "OWNER" "PURPOSE"
+  for i in "${!gate_names[@]}"; do
+    printf '%-42s %-9s %s\n' "${gate_names[$i]}" "${gate_owners[$i]}" "${gate_purposes[$i]}"
+  done
+  exit 0
+fi
+
+if [[ "$MODE" == "selftest" ]]; then
+  run_selftest
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  printf '=== live-phase4a.sh dry run (nothing executed) ===\n'
+  printf 'git_sha=%s\n' "$GIT_SHA"
+  printf 'control_host=%s\n' "${CONTROL_HOST:-<unset>}"
+  printf 'relay_host=%s\n' "${RELAY_HOST:-<unset>}"
+  printf 'relay_public_ip=%s\n' "${RELAY_PUBLIC_IP:-<unset>}"
+  printf 'relay_tunnel_host=%s\n' "${RELAY_TUNNEL_HOST:-<unset>}"
+  printf 'namespace=%s\n' "${NAMESPACE:-<unset>}"
+  printf 'transport_port=%s\n' "$TRANSPORT_PORT"
+  printf 'evidence_dir=%s\n' "$RUN_DIR"
+  printf '\nGates that would run:\n'
+  for i in "${!gate_names[@]}"; do
+    if is_selected "${gate_names[$i]}"; then
+      printf '  %-42s (%s)\n' "${gate_names[$i]}" "${gate_owners[$i]}"
+    else
+      printf '  %-42s (%s) [not selected]\n' "${gate_names[$i]}" "${gate_owners[$i]}"
+    fi
+  done
+  printf '\nDRY RUN: no gate was executed; this is NOT a pass (exit 3).\n'
+  exit 3
+fi
+
+printf '=== ShareBridge Phase 4a M6 live acceptance harness (Tasks 37–44) ===\n'
+printf 'This run targets the M6 dark topology. The collocated test VPS (%s) is explicitly excluded.\n' "$EXCLUDED_RELAY_IPS"
+run_all_gates
+print_summary
+
+case "$VERDICT" in
+  GREEN) exit 0 ;;
+  PARTIAL) exit 3 ;;
+  *) exit 1 ;;
+esac

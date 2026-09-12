@@ -567,3 +567,141 @@ from `127.0.0.1:9101/metrics`, and, when `SHAREBRIDGE_CAPACITY_RELAY_URL` is
 set, a bounded request sample against the live relay origin. Any input it
 cannot read is printed as **PENDING HARDWARE (Task 37)** — the gate never
 prints a number it did not measure.
+
+---
+
+## 13. M6 live acceptance harness (Tasks 37–44)
+
+`scripts/live-phase4a.sh` is the single, gated, evidence-producing harness for
+the M6 live acceptance cases. Task 37 ships the skeleton: the real §23.9 dark
+topology gate plus one registered placeholder per later acceptance case, so
+Tasks 38–44 each change **one gate function body** and nothing in the runner.
+
+### 13.1 Running it
+
+Run from the repository root (the default evidence path is relative to the
+working directory):
+
+```bash
+# every registered gate (the full M6 run)
+scripts/live-phase4a.sh
+
+# one gate only (unselected gates are listed NOT_RUN and excluded from the verdict)
+scripts/live-phase4a.sh --case gate_23_9_dark_topology
+
+# show the gate table, or the planned run without executing anything
+scripts/live-phase4a.sh --list
+scripts/live-phase4a.sh --dry-run
+
+# prove the pass/fail plumbing (trivially-true, trivially-false, skip,
+# zero-check, crash-after-PASS and placeholder cases)
+scripts/live-phase4a.sh --selftest
+
+# redirect evidence somewhere other than docs/operations/evidence/runs
+scripts/live-phase4a.sh --evidence-dir /tmp/phase4a-evidence
+```
+
+Exit codes: `0` GREEN (every selected gate PASS; unscoped, every registered
+gate), `1` RED (any selected gate FAIL / MISSING / NOT_IMPLEMENTED), `2` usage
+error, `3` PARTIAL (no failures but at least one SKIP, or a dry run).
+
+**Honesty contract (this project has been bitten by skip-as-PASS twice).** A
+gate that executes zero checks is `MISSING`, never PASS. A gate whose function
+exits non-zero after recording PASSes is `FAIL`. An unimplemented registered
+gate is `NOT_IMPLEMENTED`, never PASS. A `SKIP` sub-check makes the gate `SKIP`
+(PARTIAL overall). `--case` scoping may only narrow the verdict to the gates it
+ran; unselected gates are printed as `NOT_RUN` and explicitly excluded. The
+only GREEN is every selected gate PASS.
+
+**Safety.** Remote commands are read-only (`systemctl show/cat`, `nft list`,
+`ss`, `curl`, `dig`, `openssl s_client`, `ip addr`, `grep`); nothing is written
+on control or the relay VM. The only writes are local evidence files. Every
+captured line passes through a sanitizer that redacts key/token/password/
+secret/cookie/authorization/`jti` values, private-key blocks and share codes.
+The optional live restart drill runs only with
+`LIVE_PHASE4A_ALLOW_RESTART=1`. The collocated test VPS (`178.156.174.47` by
+default) is explicitly rejected as the M6 relay target
+(`LIVE_PHASE4A_EXCLUDED_RELAY_IPS`); the M6 gate needs the new separate VM.
+
+Running it before the topology exists is expected to fail with a diagnostic
+naming every missing input. That is Task 37 Step 2's RED, not a harness bug:
+
+```bash
+$ scripts/live-phase4a.sh --case gate_23_9_dark_topology   # today
+  [FAIL] control_reachable: LIVE_PHASE4A_CONTROL_HOST is unset — ...
+  [FAIL] relay_vm_distinct: LIVE_PHASE4A_RELAY_HOST is unset — ...
+  [FAIL] selection_flag_remains_false: LIVE_PHASE4A_CONTROL_HOST is unset — ...
+  VERDICT: RED
+```
+
+The dark-posture assertion is deliberately a separate check: a missing topology
+must never be masked, and `RELAY_SELECTION_ENABLED` is read from the control
+deployment (unset/absent counts as the default `false`; an unreadable env file
+fails the check instead of assuming the dark posture; `true` fails loudly).
+
+### 13.2 Environment surface
+
+All inputs are documented env vars; unset required values FAIL the gate and name
+the variable. No host is hard-coded.
+
+| Variable | Default | Needed for |
+|---|---|---|
+| `LIVE_PHASE4A_CONTROL_HOST` | — | control SSH target (all control checks) |
+| `LIVE_PHASE4A_RELAY_HOST` | — | relay VM SSH target (topology, firewall, health, ordering) |
+| `LIVE_PHASE4A_RELAY_PUBLIC_IP` | — | external firewall probe, DNS match, excluded-VPS check |
+| `LIVE_PHASE4A_RELAY_TUNNEL_HOST` | — | `<relay-tunnel-host>` DNS + transport cert |
+| `LIVE_PHASE4A_NAMESPACE` | — | relay wildcard synthesis probe |
+| `LIVE_PHASE4A_IMMICH_URL` | — | real Immich ping on the home Mac |
+| `LIVE_PHASE4A_TRANSPORT_CA_FILE` | — | transport certificate validation |
+| `LIVE_PHASE4A_SYNC_CA_FILE`, `LIVE_PHASE4A_GATEWAY_SYNC_CERT`, `LIVE_PHASE4A_GATEWAY_SYNC_KEY` | — | live sync mTLS handshake (paths **on the relay VM**) |
+| `LIVE_PHASE4A_AGENT_PID_MATCH` | `sharebridge-agent` | home Mac agent process |
+| `LIVE_PHASE4A_TRANSPORT_PORT` | `7000` | firewall allowlist, cert probe |
+| `LIVE_PHASE4A_BASE_DOMAIN` | `sharebridgeusercontent.com` | wildcard DNS |
+| `LIVE_PHASE4A_CONTROL_UNIT` / `_GATEWAY_UNIT` / `_FRPS_UNIT` | `sharebridge.service` / `sharebridge-relay-gateway.service` / `sharebridge-relay-frps.service` | reachability + restart ordering |
+| `LIVE_PHASE4A_CONTROL_ENV_FILE` | `/opt/sharebridge/.env` | `RELAY_SELECTION_ENABLED`, `CONTROL_SYNC_*` |
+| `LIVE_PHASE4A_GATEWAY_ENV_FILE` | `/etc/sharebridge/relay/gateway.env` | gateway sync + namespace |
+| `LIVE_PHASE4A_HEALTHZ_URL` | `http://127.0.0.1:9101/healthz` | `route_ready` (private, probed over SSH) |
+| `LIVE_PHASE4A_EVIDENCE_DIR` | `docs/operations/evidence/runs` | evidence output root |
+| `LIVE_PHASE4A_ALLOW_RESTART` | `0` | enables the guarded live restart drill |
+| `LIVE_PHASE4A_EXCLUDED_RELAY_IPS` | `178.156.174.47` | refuses the collocated test VPS |
+| `LIVE_PHASE4A_SSH_OPTS`, `_SSH_CONNECT_TIMEOUT`, `_REMOTE_TIMEOUT` | —, `8`, `20` | SSH plumbing |
+
+The environment record these gates populate is
+`docs/operations/evidence/phase4a-environment.md`; the harness writes the same
+keys to `<run-dir>/environment-facts.txt`. A field is only filled from an
+observation — never extrapolated.
+
+### 13.3 What each gate proves, and who runs it
+
+| Gate | Task | Proves | Needs |
+|---|---|---|---|
+| `gate_23_9_dark_topology` | 37 | §23.9: control reachable; a NEW relay VM distinct from control in the same Hetzner region/private network (metadata `instance-id`/`region` + private `/24`); home Mac agent and real Immich reachable; public allowlist exactly 443 + transport with `policy drop` and no public UDP; private mTLS `CONTROL_SYNC_*`/`SHAREBRIDGE_*` configured with a live authenticated handshake and enforced client auth; tunnel-host DNS (A/AAAA/no ECH) plus wildcard synthesis and dedicated transport-cert validation; `route_ready` snapshot health and frps process health; gateway-before-frps restart ordering with no `BindsTo`/`PartOf`; `RELAY_SELECTION_ENABLED` still false | second VM, DNS, mTLS material (operator) |
+| `acceptance_01_owner_hairpin` | 38 | §19 #1 owner hairpin on the confirmed non-hairpin router | user (router, 3 browsers) |
+| `acceptance_04_interstitial_blackhole` | 38 | §19 #4 deterministic interstitial fallback to the exact relay origin | user (browser) |
+| `acceptance_02_cellular_relay_video` | 39 | §19 #2 cellular/no-direct gallery + video, ≥2 valid `206` seeks | user (phone, cellular) |
+| `acceptance_11_content_parity` | 39 | §19 #11 Phase 3 content/Range/accounting parity through relay | user (browser) |
+| `acceptance_03_relay_only` | 40 | §19 #3 relayOnly never activates direct | user (browser) + instrumentation |
+| `l4_no_plaintext_capture` | 41 | §19 #5 / §18.4 no plaintext at the relay (canary capture; any plaintext is NO-GO) | relay VM (`scripts/l4-canary-capture.sh`) |
+| `acceptance_06_no_mapper_enrollment` | 42 | §19 #6 no-mapper enrollment + outbound-tunnel serving | user (NAT setup) |
+| `acceptance_12_stun_mismatch` | 42 | §19 #12 egress mismatch → `relay_fallback`, no public probe | user (NAT) |
+| `acceptance_13_stun_cadence_cold_budget` | 42 | §19 #13 cadence and four-second cold budget | user (NAT) |
+| `acceptance_07_no_relay_open_signal` | 43 | §19 #7 no open signal/probe/mapper on route=relay | instrumented run |
+| `acceptance_08_exact_routing` | 43 | §19 #8 exact SNI routing, no cross-agent routing | live topology |
+| `acceptance_09_restart_recovery` | 43 | §19 #9 availability only after fresh presence | live topology |
+| `acceptance_10_lockdown` | 43 | §19 #10 lockdown closes both connection kinds; fresh-credential unlock | live topology |
+| `acceptance_15_heartbeat_tunnel_dns` | 43 | §19 #15 tunnel DNS/cert, 10 s Pings, 45 s expiry | live topology |
+| `release_go_no_go_rollback` | 44 | §20 steps 5–7 + §23 blocking rule; manifest gate + rollback drill | all evidence + user GO |
+
+§19 #14 (no-JS/CSP) is a Task 24 hermetic browser gate and is intentionally not
+in this harness.
+
+### 13.4 M6 ordering
+
+`37 (dark topology) → 38 → 39 → 40 → 41 → 42 → 43 → 44`. Tasks 38–43 each add
+one acceptance gate body to `scripts/live-phase4a.sh` (and Task 41 adds
+`scripts/l4-canary-capture.sh`); Task 44 adds `scripts/phase4a-release-gate.sh`
+and the release manifest. Gate names in the registry follow the plan's
+`acceptance_NN_*` names so the later briefs slot in without touching the runner.
+Within a case, "Verify RED" runs the still-placeholder/unmet precondition and
+requires a FAIL before the case is implemented — the same RED discipline this
+skeleton follows.
