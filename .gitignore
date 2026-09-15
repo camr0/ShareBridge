@@ -22,3 +22,7 @@ signaling-server/server
 agent/opencloudshare
 agent/agent
 agent/benchdirect
+
+# e2e test scaffolding (generated, not source)
+agent/forks/
+agent/apply_sctp_patch.sh

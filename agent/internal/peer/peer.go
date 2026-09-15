@@ -2,7 +2,11 @@ package peer
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 	"sharebridge/agent/internal/multilane"
@@ -40,17 +44,18 @@ type Peer struct {
 // New creates a PeerConnection with the given ICE servers.
 // If relayOnly is true, forces ICETransportPolicyRelay to hide the agent's IP.
 //
-// NOTE: SCTP min-congestion-window tuning (SettingEngine.SetSCTPMinCwnd) was
-// tested and reverted — a 4 MiB floor over-drove real bandwidth-constrained
-// links (bufferbloat → throughput collapsed below the link's natural rate). See
-// agent/cmd/benchdirect/BENCH_RESULTS.md.
+// NOTE: SCTP congestion-control tuning is opt-in via environment variables (see
+// applySCTPTuning). With none set, pion's defaults are used unchanged. An earlier
+// unconditional SetSCTPMinCwnd(4 MiB) was tested and reverted — a 4 MiB floor
+// over-drove bandwidth-constrained links (bufferbloat → throughput collapsed
+// below the link's natural rate). See agent/cmd/benchdirect/BENCH_RESULTS.md.
 func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
 	config := webrtc.Configuration{ICEServers: iceServers}
 	if relayOnly {
 		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
 	}
 
-	pc, err := webrtc.NewPeerConnection(config)
+	pc, err := newPeerConnection(config)
 	if err != nil {
 		return nil, fmt.Errorf("new peer connection: %w", err)
 	}
@@ -77,6 +82,96 @@ func New(iceServers []webrtc.ICEServer, relayOnly bool) (*Peer, error) {
 		}
 	})
 	return p, nil
+}
+
+// --- SCTP congestion-control tuning (opt-in, env-driven) ---
+//
+// pion initialises ssthresh to the peer's receiver window and grows the
+// congestion window by one MTU per RTT during congestion avoidance. At a 100 ms
+// RTT that is roughly 12 KB/s, so climbing to an 800 KB bandwidth-delay product
+// takes ~66 seconds; any transfer shorter than that is ramp-limited rather than
+// link-limited. SB_SCTP_CA_STEP raises the per-RTT step.
+//
+// Measured in agent/cmd/benchdirect: at a 64 Mbps / 100 ms / 800 KB-queue link
+// the CA step alone lifted a 300 MB transfer from 27.5 to 37.2 Mbps and lifted the
+// 8 MiB case from 8.4 to 20.8 Mbps. See docs/superpowers/spikes/.
+
+var (
+	defaultAPIOnce sync.Once
+	defaultAPI     *webrtc.API
+)
+
+// sctpEnvUint reads an unsigned integer setting from the environment.
+func sctpEnvUint(name string) uint32 {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		log.Printf("peer: ignoring %s=%q: %v", name, v, err)
+		return 0
+	}
+	return uint32(n)
+}
+
+// applySCTPTuning overlays pion's SCTP parameters from the environment and
+// returns a human-readable list of what it applied.
+func applySCTPTuning(se *webrtc.SettingEngine) []string {
+	var applied []string
+	if v := sctpEnvUint("SB_SCTP_CA_STEP"); v > 0 {
+		se.SetSCTPCwndCAStep(v)
+		applied = append(applied, fmt.Sprintf("cwndCAStep=%d", v))
+	}
+	if v := sctpEnvUint("SB_SCTP_MIN_CWND"); v > 0 {
+		se.SetSCTPMinCwnd(v)
+		applied = append(applied, fmt.Sprintf("minCwnd=%d", v))
+	}
+	if v := sctpEnvUint("SB_SCTP_FAST_RTX_WND"); v > 0 {
+		se.SetSCTPFastRtxWnd(v)
+		applied = append(applied, fmt.Sprintf("fastRtxWnd=%d", v))
+	}
+	if v := sctpEnvUint("SB_SCTP_MAX_RX_BUF"); v > 0 {
+		se.SetSCTPMaxReceiveBufferSize(v)
+		applied = append(applied, fmt.Sprintf("maxRxBuf=%d", v))
+	}
+	if v := sctpEnvUint("SB_SCTP_MAX_MSG"); v > 0 {
+		se.SetSCTPMaxMessageSize(v)
+		applied = append(applied, fmt.Sprintf("maxMsg=%d", v))
+	}
+	if raw := os.Getenv("SB_SCTP_RTO_MAX_MS"); raw != "" {
+		if n, err := strconv.ParseUint(raw, 10, 32); err == nil && n > 0 {
+			se.SetSCTPRTOMax(time.Duration(n) * time.Millisecond)
+			applied = append(applied, fmt.Sprintf("rtoMax=%dms", n))
+		} else {
+			log.Printf("peer: ignoring SB_SCTP_RTO_MAX_MS=%q", raw)
+		}
+	}
+	return applied
+}
+
+// apiForPeers returns a pion API carrying the configured SCTP tuning, or nil
+// when nothing is configured — in which case callers use pion's default API so
+// behaviour is bit-for-bit unchanged.
+func apiForPeers() *webrtc.API {
+	defaultAPIOnce.Do(func() {
+		se := webrtc.SettingEngine{}
+		applied := applySCTPTuning(&se)
+		if len(applied) == 0 {
+			return
+		}
+		log.Printf("peer: enabling custom SCTP tuning: %v", applied)
+		defaultAPI = webrtc.NewAPI(webrtc.WithSettingEngine(se))
+	})
+	return defaultAPI
+}
+
+// newPeerConnection uses the tuned API when configured, else pion's default.
+func newPeerConnection(config webrtc.Configuration) (*webrtc.PeerConnection, error) {
+	if api := apiForPeers(); api != nil {
+		return api.NewPeerConnection(config)
+	}
+	return webrtc.NewPeerConnection(config)
 }
 
 // CreateOffer creates all required lane channels before generating the offer.
