@@ -190,8 +190,8 @@ Full writeups: `2026-09-15-e2e-campus-home-field-test.md`, `2026-09-15-e2e-sctp-
 
 | node | location | role |
 |---|---|---|
-| Browser | <campus>, NJ | campus Wi-Fi client |
-| Agent | <home-agent-host>, <home-city> NJ | v1 agent on home ISP, behind home NAT |
+| Browser | <campus> (two campus networks) | campus Wi-Fi client |
+| Agent | <home-agent-host> | v1 agent on a home ISP, behind home NAT |
 | Signaling + relay | Hetzner, Ashburn VA | v1 signaling server; real Let's Encrypt cert |
 
 Implication: direct is a ~15-mile path; the relay detours ~200 miles.

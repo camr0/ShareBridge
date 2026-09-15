@@ -101,9 +101,10 @@ var (
 	defaultAPI     *webrtc.API
 )
 
-// sctpEnvUint reads an unsigned integer setting from the environment.
-func sctpEnvUint(name string) uint32 {
-	v := os.Getenv(name)
+// sctpEnvUint reads an unsigned integer setting via the supplied lookup, so that
+// tests can pass a hermetic environment instead of depending on the process's.
+func sctpEnvUint(getenv func(string) string, name string) uint32 {
+	v := getenv(name)
 	if v == "" {
 		return 0
 	}
@@ -115,31 +116,33 @@ func sctpEnvUint(name string) uint32 {
 	return uint32(n)
 }
 
-// applySCTPTuning overlays pion's SCTP parameters from the environment and
-// returns a human-readable list of what it applied.
-func applySCTPTuning(se *webrtc.SettingEngine) []string {
+// applySCTPTuning overlays pion's SCTP parameters from the given environment
+// lookup and returns a human-readable list of what it applied. Production passes
+// os.Getenv; tests pass a stub so they are independent of the ambient environment
+// and of test execution order.
+func applySCTPTuning(se *webrtc.SettingEngine, getenv func(string) string) []string {
 	var applied []string
-	if v := sctpEnvUint("SB_SCTP_CA_STEP"); v > 0 {
+	if v := sctpEnvUint(getenv, "SB_SCTP_CA_STEP"); v > 0 {
 		se.SetSCTPCwndCAStep(v)
 		applied = append(applied, fmt.Sprintf("cwndCAStep=%d", v))
 	}
-	if v := sctpEnvUint("SB_SCTP_MIN_CWND"); v > 0 {
+	if v := sctpEnvUint(getenv, "SB_SCTP_MIN_CWND"); v > 0 {
 		se.SetSCTPMinCwnd(v)
 		applied = append(applied, fmt.Sprintf("minCwnd=%d", v))
 	}
-	if v := sctpEnvUint("SB_SCTP_FAST_RTX_WND"); v > 0 {
+	if v := sctpEnvUint(getenv, "SB_SCTP_FAST_RTX_WND"); v > 0 {
 		se.SetSCTPFastRtxWnd(v)
 		applied = append(applied, fmt.Sprintf("fastRtxWnd=%d", v))
 	}
-	if v := sctpEnvUint("SB_SCTP_MAX_RX_BUF"); v > 0 {
+	if v := sctpEnvUint(getenv, "SB_SCTP_MAX_RX_BUF"); v > 0 {
 		se.SetSCTPMaxReceiveBufferSize(v)
 		applied = append(applied, fmt.Sprintf("maxRxBuf=%d", v))
 	}
-	if v := sctpEnvUint("SB_SCTP_MAX_MSG"); v > 0 {
+	if v := sctpEnvUint(getenv, "SB_SCTP_MAX_MSG"); v > 0 {
 		se.SetSCTPMaxMessageSize(v)
 		applied = append(applied, fmt.Sprintf("maxMsg=%d", v))
 	}
-	if raw := os.Getenv("SB_SCTP_RTO_MAX_MS"); raw != "" {
+	if raw := getenv("SB_SCTP_RTO_MAX_MS"); raw != "" {
 		if n, err := strconv.ParseUint(raw, 10, 32); err == nil && n > 0 {
 			se.SetSCTPRTOMax(time.Duration(n) * time.Millisecond)
 			applied = append(applied, fmt.Sprintf("rtoMax=%dms", n))
@@ -156,7 +159,7 @@ func applySCTPTuning(se *webrtc.SettingEngine) []string {
 func apiForPeers() *webrtc.API {
 	defaultAPIOnce.Do(func() {
 		se := webrtc.SettingEngine{}
-		applied := applySCTPTuning(&se)
+		applied := applySCTPTuning(&se, os.Getenv)
 		if len(applied) == 0 {
 			return
 		}

@@ -1,12 +1,12 @@
 # Field A/B: does the SCTP patch hold up? (2026-09-15, second campus)
 
 Follow-up to `2026-09-15-e2e-campus-home-field-test.md`. Same topology; the laptop moved from
-<campus A> to <campus B> mid-session, so the network changed and the
+<campus-A> to <campus-B> mid-session, so the network changed and the
 ceilings were re-measured.
 
 ## Ceilings
 
-| | old campus | new campus |
+| | old campus (<campus-A>) | new campus (<campus-B>) |
 |---|---|---|
 | Campus Wi-Fi download | 213 Mbps | **562 / 411 Mbps** |
 | Home upload (<home-agent-host> → Cloudflare) | ~200–224 Mbps | (unchanged) |

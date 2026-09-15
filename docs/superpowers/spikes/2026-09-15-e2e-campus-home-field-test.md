@@ -7,8 +7,8 @@ measurements were loopback with synthetic `netem` delay/loss.
 
 | node | location | network | role |
 |---|---|---|---|
-| Browser | <campus>, NJ | campus Wi-Fi | client (this is the "restrictive network") |
-| Agent | <home-agent-host>, <home-city> NJ | home ISP, behind home NAT | v1 agent, host networking |
+| Browser | <campus> | campus Wi-Fi | client (this is the "restrictive network") |
+| Agent | <home-agent-host> | home ISP, behind home NAT | v1 agent, host networking |
 | Signaling + relay | Hetzner, Ashburn VA | public VPS | v1 signaling server + WebSocket/Noise relay |
 
 Both peers are ~15 miles apart; the relay detours ~200 miles via Ashburn.
