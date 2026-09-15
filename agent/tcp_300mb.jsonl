@@ -1,0 +1,2 @@
+{"variant":"kernel_tcp","label":"kernel_tcp_c1_300MB","conns":1,"size_label":"300MiB","wall_mbps":55.9,"wall_secs":45,"tool":"iperf3 -n 300M","link":"netem delay 50ms rate 64mbit limit 530"}
+{"variant":"kernel_tcp","label":"kernel_tcp_c1_300MB","conns":1,"size_label":"300MiB","wall_mbps":57.2,"wall_secs":44,"tool":"iperf3 -n 300M","link":"netem delay 50ms rate 64mbit limit 530"}

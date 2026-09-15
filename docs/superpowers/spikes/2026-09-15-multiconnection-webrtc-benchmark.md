@@ -437,6 +437,83 @@ Noise crypto and framing in favour of DTLS, and for making direct-vs-relayed an 
 choice rather than a code path. That is a materially better trade than the unpatched numbers
 suggested.
 
+## Follow-up 5: payload size — the 32 MiB numbers measured the ramp, not the link
+
+### The question
+
+32 MiB at ~40 Mbps completes in ~6 s. If the first seconds run at line rate into the 5 MB
+receiver window, `size / wall` would report an inflated average. 300 MB amortises that.
+
+### The answer: the result does not survive — but in the *opposite* direction
+
+| variant | conns | 32 MiB | 300 MB | ratio |
+|---|---|---|---|---|
+| unpatched | 1 | 8.7 | 27.5 | 3.16x |
+| unpatched | 4 | 14.7 | 39.2 | 2.67x |
+| patched (ssthresh + CA) | 1 | 33.7 | 40.4 | 1.20x |
+| patched (ssthresh + CA) | 4 | 41.2 | 49.9 | 1.21x |
+| BBR-lite | 4 | 22.7 | 4.7 | 0.21x |
+
+Throughput *rises* with payload size. The 32 MiB runs were not generous to SCTP — they
+were measuring a transient.
+
+### Why: the dominant pathology is the congestion-avoidance RAMP
+
+The 100 ms sample trace, unpatched / N=1 / 300 MB (interval rate and cumulative average):
+
+```
+ t(s)  interval Mbps  cumulative
+  5.0         1.0            9.9
+ 15.0         6.8            6.0
+ 30.0        16.8            9.2
+ 45.0        28.3           13.8
+ 60.0        38.3           18.6
+ 75.0        48.8           23.6
+ 86.0        56.1           27.3
+```
+
+It rises monotonically for the whole 87 s and **never plateaus**. That is textbook
+`+1 MTU per RTT` congestion avoidance: 1200 bytes / 100 ms = 12 KB/s, so climbing to an
+800 KB BDP takes **~66 seconds**. A 32 MiB transfer therefore never leaves the ramp, and
+`size / wall` measures the ramp rather than the link. This also retroactively reassigns
+results previously attributed to tail-drop collapse.
+
+### 300 MB consolidated (rtt=100ms, jitter=10ms, 64 Mbps cap, 800 KB queue)
+
+| variant | c | mean | min | max | wall s | % of TCP |
+|---|---|---|---|---|---|---|
+| kernel TCP (`iperf3 -n 300M`) | 1 | 56.5 | 55.9 | 57.2 | 44 | 100% |
+| **patched (ssthresh + CA)** | **4** | **49.9** | 49.0 | 51.4 | **50** | **88%** |
+| CA only (**pristine fork**) | 4 | 47.1 | 46.4 | 47.8 | 54 | 83% |
+| unpatched | 4 | 39.2 | 35.4 | 45.0 | 65 | 69% |
+| patched (ssthresh + CA) | 1 | 40.4 | 37.6 | 42.7 | 62 | 71% |
+| CA only (pristine fork) | 1 | 37.2 | 35.2 | 39.3 | 67 | 66% |
+| unpatched | 1 | 27.5 | 26.9 | 28.1 | 90 | 49% |
+| BBR-lite | 4 | 4.7 | 4.7 | 4.7 | 514 | 8% |
+
+### The main lever needs no fork at all
+
+`cwndCAStep` alone — pristine fork, one already-public `SettingEngine.SetSCTPCwndCAStep`
+call, no product code — reaches 47.1 Mbps (83% of kernel TCP). The one-line ssthresh fork
+adds ~6% (49.9 / 88%). So the bulk of the win does not require maintaining a pion fork.
+
+### BBR-lite is worse at scale, not merely unhelpful
+
+22.7 Mbps at 32 MiB becomes **4.7 Mbps at 300 MB (514 s)**; its 10-second rate-decay
+progressively strangles a long transfer (last-50% steady state = 1.6 Mbps). Rejected.
+
+### Corrected implication for the architecture decision
+
+At a realistic payload the SCTP penalty against kernel TCP is **~12%**, not the ~46% the
+32 MiB runs implied: 50 s versus 44 s for 300 MB. That makes TURN's price — trading kernel
+TCP for SCTP on relayed paths — substantially cheaper than earlier estimated.
+
+**Caveat, and it matters for the product:** the patch's *relative* benefit is
+payload-dependent. It is largest for small files, where the ramp would otherwise consume
+the entire transfer, and shrinks toward 1.0x as the payload grows. A 5 MB photo today is
+ramp-dominated; a 300 MB file is not. Any decision should consider the expected file-size
+mix, not this single payload.
+
 ## Bearing on the architecture decision
 
 This does **not** revive WebRTC as the primary transport, and it does not change the FRP

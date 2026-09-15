@@ -1,0 +1,8 @@
+  ssthca_c1_300MB      rep1:    37.6 Mbps  (66s wall)
+  ssthca_c1_300MB      rep2:    42.7 Mbps  (59s wall)
+  ssthca_c4_300MB      rep1:    49.3 Mbps  (51s wall)
+  ssthca_c4_300MB      rep2:    49.0 Mbps  (51s wall)
+  unpatched_c1_300MB   rep1:    28.1 Mbps  (88s wall)
+  unpatched_c4_300MB   rep1:    35.4 Mbps  (71s wall)
+  bbr_c4_300MB         rep1:     4.7 Mbps  (514s wall)
+restored pristine fork; results in bigpayload_results.jsonl
