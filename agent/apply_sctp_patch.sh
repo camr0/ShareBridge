@@ -5,6 +5,7 @@ set -eu
 cd "$(dirname "$0")"
 FORK=forks/sctp
 PRISTINE=forks/sctp-pristine
+PATCHDIR=forks/bbr
 
 # Bootstrap the pristine copy from the module cache on first use, so the fork is
 # regenerable and does not need to be committed.
@@ -39,16 +40,26 @@ patch_ssthresh() {
   sed -i '' "s/^\ta\.ssthresh = a\.RWND()$/\ta.ssthresh = ${1:-256 * 1024}/" "$FORK/association.go"
 }
 
+# BBR-lite: cap cwnd at a measured BDP instead of slow-starting toward rwnd.
+patch_bbr() {
+  cp "$PATCHDIR/bbr.go" "$FORK/bbr.go"
+  # Insert the sampler/clamp call as the first statement of the cumulative-ACK
+  # handler (whose contract already requires the association lock).
+  perl -0pi -e 's/(func \(a \*Association\) onCumulativeTSNAckPointAdvanced\(totalBytesAcked int\) \{\n)/$1\ta.bbrOnAck(totalBytesAcked)\n/' "$FORK/association.go"
+}
+
 case "${1:-none}" in
   none)     restore ;;
   rtomin)   restore; patch_rtomin ;;
   ssthresh) restore; patch_ssthresh ;;
   ssth768)  restore; patch_ssthresh "768 * 1024" ;;
+  bbr)      restore; patch_bbr ;;
   both)     restore; patch_rtomin; patch_ssthresh ;;
-  *) echo "unknown variant: $1 (want none|rtomin|ssthresh|ssth768|both)" >&2; exit 2 ;;
+  *) echo "unknown variant: $1 (want none|rtomin|ssthresh|ssth768|bbr|both)" >&2; exit 2 ;;
 esac
 
 echo "variant=$1"
 echo -n "  rtoMin:   "; grep -n 'rtoMin float64' "$FORK/rtx_timer.go" | head -1
 echo -n "  rtoMax:   "; grep -n 'defaultRTOMax float64' "$FORK/rtx_timer.go" | head -1
 echo    "  ssthresh: $(grep -cE 'a\.ssthresh = [0-9]+ \* 1024' "$FORK/association.go") line(s) patched"
+echo    "  bbr hook: $(grep -c 'a.bbrOnAck(totalBytesAcked)' "$FORK/association.go") line(s), bbr.go present: $([ -f "$FORK/bbr.go" ] && echo yes || echo no)"

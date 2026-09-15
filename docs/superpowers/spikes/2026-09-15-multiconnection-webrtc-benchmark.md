@@ -372,6 +372,71 @@ cost, and the N=4 result shows why a constant cannot substitute for it.
 Practical note: `SetSCTPCwndCAStep(32KB)` ships today with **zero forking**, but buys
 nothing on its own (36% vs 23%); it only pays off once `ssthresh` is capped.
 
+## Follow-up 4: BBR-lite, and whether the patches survive packet loss
+
+Two questions: (a) does a BDP-aware cwnd cap close the remaining gap to kernel TCP?
+(b) do the patches help under packet loss — never measured on a patched build?
+
+### Method
+
+Implemented BBR-lite in the fork (`agent/forks/bbr/bbr.go`, ~70 lines plus a one-line
+hook into `onCumulativeTSNAckPointAdvanced`): sample delivery rate per round (one min-RTT),
+track windowed-min RTT from the RTO manager's `srtt`, exit startup after 3 rounds without
+≥25% rate growth, then clamp cwnd to `rate x minRTT`. Two iterations were needed; the first
+exited startup on 20ms instantaneous samples and was worse than doing nothing.
+
+Condition: rtt=100ms, jitter=10ms, 64 Mbps cap, default 800 KB queue, 32 MiB, n=3.
+Unpatched baseline from the `lossmatch` group at identical settings.
+
+| loss | conns | unpatched | **ssthresh cap + CA step** | BBR-lite | kernel TCP | patch gain |
+|---|---|---|---|---|---|---|
+| 0% | 1 | 8.7 | **33.7** | 7.6 | 54.7 | 3.87x |
+| 0% | 4 | 14.7 | **41.2** | 22.7 | 54.7 | 2.81x |
+| 0.01% | 1 | — | **30.5** | 12.3 | ~54.7* | — |
+| 0.01% | 4 | — | **37.6** | 11.4 | ~54.7* | — |
+| 0.1% | 1 | 4.1 | **15.5** | 2.2 | 56.3 | 3.81x |
+| 0.1% | 4 | 10.1 | **38.5** | 7.3 | 56.3 | 3.82x |
+
+\* interpolated; the netem control measured 0%, 0.1%, 1% and 5%.
+
+Stability across 3 reps: ssthresh+CA step ranges 1.07–1.22x min→max. BBR-lite ranges up to
+**3.05x** (8.1–39.0 on the same configuration).
+
+### Findings
+
+1. **BBR-lite failed.** It is worse than the two-constant patch in every cell, and worse than
+   *unpatched* at 0% loss / N=1 (7.6 vs 8.7). The diagnosis matters more than the number: pion
+   does not **pace**. cwnd growth is realised as immediate bursts on ACK, so the buffer
+   overflows during startup — before the rate estimator can have any information about the
+   path. Startup exit is therefore structurally late. Real BBR depends on pacing to make
+   startup non-destructive, and adding pacing means changing pion's send loop.
+2. **The two-constant patch survives loss.** It delivers a consistent **~3.8x** over unpatched
+   at 0% *and* at 0.1% loss, and stays tight (≤1.22x spread). This closes the gap flagged as
+   unknown earlier: the patch is not just a no-loss optimisation.
+3. **Multi-connection + patch is the best configuration**: 41.2 Mbps at 0% loss and 38.5 Mbps
+   at 0.1% loss, versus 8.7 / 4.1 unpatched single-connection.
+4. **The remaining gap to kernel TCP is ~1.3–1.5x** (41.2 vs 54.7 at 0%; 38.5 vs 56.3 at 0.1%),
+   not the 6.3x gap measured on the unpatched build.
+
+### What this means for the fork-v1 decision
+
+The honest summary is that "write a simple algorithm that adapts to the network" was answered
+empirically: **~70 lines of BBR-lite made things worse than doing nothing**, because the missing
+component is pacing, which is not small. Meanwhile a **one-line fork constant plus an
+already-exposed knob** (no estimator at all) delivers 3.8x and is robust.
+
+So the cost curve is very uneven:
+
+- **~1 line + 1 existing option → 3.8x, stable, loss-robust.** Cheap and clearly worth doing.
+- **The last ~1.4x → pacing + a real congestion controller inside pion's send loop.** This is
+  the expensive part, and the failed attempt above is evidence for that, not against it.
+
+For the relay question specifically: at 0.1% loss the patched multi-connection path reaches
+38.5 Mbps where kernel TCP reaches 56.3 — **a 1.46x price** for deleting ~1,000 LOC of custom
+Noise crypto and framing in favour of DTLS, and for making direct-vs-relayed an ICE candidate
+choice rather than a code path. That is a materially better trade than the unpatched numbers
+suggested.
+
 ## Bearing on the architecture decision
 
 This does **not** revive WebRTC as the primary transport, and it does not change the FRP
