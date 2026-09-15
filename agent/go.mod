@@ -47,5 +47,3 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/time v0.10.0 // indirect
 )
-
-replace github.com/pion/sctp => ./forks/sctp

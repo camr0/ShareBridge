@@ -5,7 +5,9 @@ set -eu
 cd "$(dirname "$0")"
 FORK=forks/sctp
 PRISTINE=forks/sctp-pristine
-PATCHDIR=forks/bbr
+# Underscore prefix so the Go tool ignores this directory: bbr.go is package sctp
+# and references fork internals, so it only compiles once copied into forks/sctp.
+PATCHDIR=forks/_bbr
 
 # Bootstrap the pristine copy from the module cache on first use, so the fork is
 # regenerable and does not need to be committed.
@@ -57,6 +59,15 @@ case "${1:-none}" in
   both)     restore; patch_rtomin; patch_ssthresh ;;
   *) echo "unknown variant: $1 (want none|rtomin|ssthresh|ssth768|bbr|both)" >&2; exit 2 ;;
 esac
+
+# Wire the local fork into the module graph. This is deliberately NOT committed in
+# go.mod: forks/sctp is generated (and gitignored), so a committed replace would
+# break `go build` for anyone who has not run this script first.
+if [ "${1:-none}" = "none" ]; then
+  go mod edit -dropreplace github.com/pion/sctp
+else
+  go mod edit -replace github.com/pion/sctp=./forks/sctp
+fi
 
 echo "variant=$1"
 echo -n "  rtoMin:   "; grep -n 'rtoMin float64' "$FORK/rtx_timer.go" | head -1
