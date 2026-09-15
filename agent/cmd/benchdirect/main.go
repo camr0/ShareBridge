@@ -27,6 +27,7 @@ func main() {
 	bandwidth := flag.String("bandwidth", "0", "link bandwidth cap (e.g. 8MB), 0 = unlimited")
 	queue := flag.String("queue", "0", "bottleneck buffer depth (e.g. 5MB), 0 = derive from -bandwidth (100ms)")
 	rtoMax := flag.String("rtomax", "0", "SCTP max RTO (e.g. 200ms). Below 1s this also lowers the effective RTO floor, 0 = pion default (60s)")
+	cwndCAStep := flag.String("cwndcastep", "0", "SCTP congestion-avoidance cwnd step (e.g. 32KB), 0 = default (1 MTU)")
 	conns := flag.Int("conns", 1, "number of parallel PeerConnections (raw mode)")
 	sharing := flag.String("sharing", "shared", "shared|independent bottleneck across connections")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
@@ -71,6 +72,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid -rtomax:", rtoMaxErr)
 		os.Exit(2)
 	}
+	cwndCAStepBytes, cwndCAStepErr := parseByteSize(*cwndCAStep)
+	if cwndCAStepErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -cwndcastep:", cwndCAStepErr)
+		os.Exit(2)
+	}
 
 	cfg := runConfig{
 		mode:         *mode,
@@ -86,6 +92,7 @@ func main() {
 		bandwidth:    bandwidthBytes,
 		queue:        queueBytes,
 		rtoMax:       rtoMaxDur,
+		cwndCAStep:   cwndCAStepBytes,
 		conns:        *conns,
 		sharing:      *sharing,
 	}
@@ -156,6 +163,9 @@ func validateRunConfig(cfg runConfig) error {
 	}
 	if cfg.rtoMax < 0 {
 		return fmt.Errorf("invalid -rtomax %v: must be >= 0", cfg.rtoMax)
+	}
+	if cfg.cwndCAStep < 0 {
+		return fmt.Errorf("invalid -cwndcastep %d: must be >= 0", cfg.cwndCAStep)
 	}
 	if cfg.deadline <= 0 {
 		return fmt.Errorf("invalid -deadline %v: must be > 0", cfg.deadline)

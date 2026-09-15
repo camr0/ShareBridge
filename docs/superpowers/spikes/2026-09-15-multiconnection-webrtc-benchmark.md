@@ -313,6 +313,65 @@ This is the controlled version of the earlier claim, and it holds. It is not tha
 SCTP *harness* was unfair; it is that SCTP's congestion control is aimed at the wrong
 target for a constrained link.
 
+## Follow-up 3: does patching pion/sctp actually fix it?
+
+Setup: `pion/sctp@v1.9.4` copied from the module cache to `agent/forks/sctp` (regenerable
+via `apply_sctp_patch.sh`, gitignored) and selected with a `replace` directive in
+go.mod. Both candidate constants live on the **agent's** SCTP stack, and in the
+share-download flow the agent is the *sender*, so **no browser-side change is required** —
+the browser only receives DATA and advertises rwnd, which is an upper bound the sender may
+undershoot freely.
+
+Condition: the matched worst case (rtt=100ms, jitter=10ms, 64 Mbps cap, 800 KB queue,
+32 MiB, n=3). Unpatched = 14.5 Mbps; kernel TCP = 54.7 Mbps (86%) on the same nominal link.
+
+| config | N=1 | N=4 | % of 64 Mbps (N=1) |
+|---|---|---|---|
+| unpatched (pion default) | 14.5 | 14.5 | 23% |
+| unpatched + `SetSCTPCwndCAStep(32KB)` — **no fork** | 22.8 | 27.3 | 36% |
+| ssthresh = 256 KB | 21.8 | 26.3 | 34% |
+| ssthresh = 256 KB + CA step 8 KB | 33.9 | 32.5 | 53% |
+| **ssthresh = 256 KB + CA step 32 KB** | **34.2** | **40.4** | **53%** |
+| ssthresh = 256 KB + CA step 128 KB | 27.6 | 35.1 | 43% |
+| ssthresh = 768 KB (approx the BDP) | 43.7 | 16.1 | 68% |
+| **kernel TCP (control)** | **54.7** | — | **86%** |
+
+### What this shows
+
+1. **The patch works.** Capping `ssthresh` moves 14.5 -> 21.8 Mbps and, more importantly,
+   removes the collapse: spread across reps falls from 3.03 to **1.00** (three consecutive
+   N=1 runs at 21.7 / 21.8 / 21.9). The tail is fixed.
+2. **`rtoMin` is irrelevant once the overshoot is gone.** `both` (rtoMin + ssthresh) is
+   identical to `ssthresh` alone (21.8 vs 21.8, spread 1.01). No overshoot -> no drops ->
+   no RTOs -> the RTO floor never matters. This is also why the earlier `rtoMax` proxy
+   failed: it was treating a symptom.
+3. **The 34% plateau is the congestion-avoidance step.** Slow start stops at ssthresh and CA
+   grows only `max(MTU, cwndCAStep)` per RTT; `cwndCAStep` is unset, so +1 MTU per RTT,
+   which cannot reach an 800 KB BDP within the transfer. Raising it is worth **+57% (N=1) /
+   +54% (N=4)** and needs no fork at all, since `SetSCTPCwndCAStep` is already exposed.
+4. **Neither knob alone suffices.** `cwndCAStep` without the ssthresh cap gives 22.8 Mbps
+   (CA never engages while ssthresh = 5 MB); the cap without a CA step gives 21.8. Together:
+   34 / 40.
+5. **Tuning ssthresh to the BDP nearly reaches TCP** — 768 KB (the BDP at 64 Mbps x 100ms)
+   gives 51 Mbps (80%) for N=1. But it is a magic number: it needs the BDP, and at N=4 the
+   same value collapses to 16.1 Mbps because four associations each targeting 768 KB
+   overflow the shared 800 KB queue. **A fixed constant cannot win across link speeds or
+   connection counts.**
+6. **CA step 128 KB is too aggressive** (27.6 Mbps, unstable) — overshoot reintroduces drops.
+
+### Verdict for a fork
+
+A **one-line fork** plus an **already-exposed knob** takes a constrained link from 23% to
+53–63% of capacity and removes the variance that made direct mode unpredictable. That is
+the honest size of the win — real, but not parity.
+
+Closing the remaining gap to kernel TCP (86%) requires a per-link BDP estimate rather than a
+constant, i.e. an actual congestion controller. That is the "reimplement TCP in userspace"
+cost, and the N=4 result shows why a constant cannot substitute for it.
+
+Practical note: `SetSCTPCwndCAStep(32KB)` ships today with **zero forking**, but buys
+nothing on its own (36% vs 23%); it only pays off once `ssthresh` is capped.
+
 ## Bearing on the architecture decision
 
 This does **not** revive WebRTC as the primary transport, and it does not change the FRP
