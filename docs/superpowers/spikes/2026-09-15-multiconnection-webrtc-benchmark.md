@@ -514,6 +514,98 @@ the entire transfer, and shrinks toward 1.0x as the payload grows. A 5 MB photo 
 ramp-dominated; a 300 MB file is not. Any decision should consider the expected file-size
 mix, not this single payload.
 
+## Follow-up 6: payload sweep 8 MiB -> 1 GB — is a static policy enough?
+
+This is the cheap test that decides whether an adaptive controller is worth building: if a
+fixed configuration holds its share of kernel TCP across the whole payload range, an adaptive
+algorithm buys little.
+
+Condition: rtt=100ms, jitter=10ms, 64 Mbps cap, 800 KB queue, 0% loss, n=1 per cell.
+
+### Kernel TCP (CUBIC) reference is itself payload-dependent
+
+| 8 MiB | 32 MiB | 128 MiB | 300 MB | 1 GB |
+|---|---|---|---|---|
+| 31.6 | 49.4 | 56.2 | 56.6 | 57.1 |
+
+CUBIC needs ~128 MiB to converge (31.6 is only 55% of its own 57.1 steady state). So part of
+the small-payload penalty is inherent to any CC, not specific to SCTP.
+
+### wall Mbps (% of kernel TCP) [steady-state, last 50% of trace]
+
+| variant | c | 8 MiB | 32 MiB | 128 MiB | 300 MB | 1 GB |
+|---|---|---|---|---|---|---|
+| unpatched | 1 | 17.2 (55%) [17.9] | 9.4 (19%) [12.2] | 18.7 (33%) [27.5] | 28.4 (50%) [42.1] | 43.5 (76%) [56.2] |
+| unpatched | 4 | 11.8 (37%) [5.0] | 37.2 (75%) [36.4] | 30.8 (55%) [34.1] | 49.2 (87%) [45.5] | 49.5 (87%) [46.0] |
+| CA only (no fork) | 1 | 8.4 (27%) [10.4] | 20.8 (42%) [35.1] | 40.7 (72%) [45.8] | 35.2 (62%) [36.6] | 36.4 (64%) [36.0] |
+| CA only (no fork) | 4 | 13.2 (42%) [10.3] | 22.8 (46%) [18.1] | 49.5 (88%) [46.5] | 49.0 (87%) [45.0] | 49.2 (86%) [50.6] |
+| **ssthresh + CA** | 1 | 30.1 (95%) [34.7] | 30.9 (63%) [26.9] | 42.6 (76%) [45.5] | 39.2 (69%) [38.2] | 40.3 (71%) [40.0] |
+| **ssthresh + CA** | **4** | **23.3 (74%)** [21.4] | **42.9 (87%)** [40.9] | **47.6 (85%)** [46.7] | **47.9 (85%)** [49.2] | **51.8 (91%)** [50.8] |
+
+### Findings
+
+1. **A static policy does hold — but only with both knobs.** `ssthresh + CA` at N=4 sits at
+   **74-91% of kernel TCP across the entire range**, and raises the worst cell from 19-27%
+   (unpatched/CA-only) to **63%** (c1) and **74%** (c4). It is the only variant that never
+   falls off a cliff.
+2. **The fork is needed for small payloads, and this is the clearest result in the sweep.**
+   CA-only (pristine fork) is poor at 8 MiB (27-42%) while `ssthresh + CA` reaches 74-95%.
+   Mechanism: capping slow start at 256 KB stops it overshooting the 800 KB queue, so there
+   is no drop and no RTO collapse — and on an 8 MiB transfer there is no time to recover from
+   one. The `ssthresh` cap protects the *start*; `cwndCAStep` accelerates the *ramp*.
+3. **N is genuinely payload-dependent, and it is the one knob with no single static value.**
+   N=4 *hurts* at 8 MiB (0.77x for `ssthresh + CA`) because four associations must each
+   complete a handshake and a slow start inside a transfer too short to benefit. From 32 MiB
+   up it helps (1.12-1.39x). Payload size is known at t=0, so this is a policy input, not a
+   CC input.
+4. **Steady state is not the problem for unpatched.** At 1 GB, unpatched c1 reaches 56.2 Mbps
+   steady-state against CUBIC's 57.1 — 98%. Its deficit is entirely the ramp.
+
+### Verdict on building an adaptive controller
+
+The static policy captures most of the available headroom (74-91%, floor 63-74%). A congestion
+controller would chase the remaining ~10-25%, in exchange for ~200 lines of CC logic, a
+permanent pion fork, and real risk — and the one attempt at this (BBR-lite) made things
+substantially worse. **Recommendation: do not build the controller yet.** Ship the cheap
+version (fork constant + already-exposed `cwndCAStep` + size-based N selection), measure the
+real field distribution, and revisit only if the gap materialises in practice.
+
+**Caveats:** n=1 per cell, and small-payload cells are visibly noisy (unpatched is
+non-monotonic: 17.2 at 8 MiB vs 9.4 at 32 MiB), so individual percentages are soft — the floor
+comparison is the robust part. One RTT, one bandwidth, one queue depth, 0% loss; the 256 KB
+constant is tuned to this 800 KB queue.
+
+## Would libwebrtc be better than pion?
+
+No — not for this bottleneck, and the reason is specific.
+
+1. **libwebrtc's data-channel SCTP uses RFC 4960 congestion control.** usrsctp's default CC
+   module is documented as "Default is 0, i.e. the one specified in RFC 4960" — the same
+   `+1 MTU/RTT` ramp measured here as the dominant pathology. Migrating would change the
+   implementation, not the algorithm.
+2. **The replacement is explicitly not faster.** WebRTC is moving from usrsctp to in-tree
+   dcSCTP; the announcement states the CC "hasn't been fully tuned, so performance may be
+   slightly worse compared to usrsctp, but should generally be on par." On par is not a fix.
+3. **GCC does not apply.** Google Congestion Control governs RTP/media — it estimates a bitrate
+   for the encoder from transport-wide feedback on RTP packets. Data channels run SCTP's own
+   CC. RFC 8831 lists "modifiable congestion control for integration with the SRTP media
+   stream congestion control" as a *feature to be implemented*, not a default.
+4. **usrsctp is CPU-bound too**, single-threaded at roughly 500 Mbit/s in RAWRTC — the same
+   class of ceiling as pion, not an advantage.
+5. **Cost.** libwebrtc is C++; the agent is Go. Adoption means cgo against a very large tree
+   with an embedding API that is not stability-guaranteed, or rewriting the transport in C++.
+   For one constant's worth of throughput this is not a trade.
+6. **The browser side is fixed regardless.** Chrome speaks DataChannel either way; only the
+   agent's stack is our choice, and pion already reaches 88-91% of kernel TCP with an exposed
+   option.
+
+RFC 8831 explicitly permits a non-standard CC ("Using a congestion control different from the
+standard one might improve..."). That makes **pion the better place to innovate**: its CC is
+~200 lines of readable Go, whereas the same change in libwebrtc means patching C++ behind an
+unstable API. Independent work agrees on the diagnosis: a Helsinki evaluation of WebRTC data
+channels found throughput inversely proportional to RTT and concluded "increasing the default
+SCTP window sizes for WebRTC data channels is a must."
+
 ## Bearing on the architecture decision
 
 This does **not** revive WebRTC as the primary transport, and it does not change the FRP

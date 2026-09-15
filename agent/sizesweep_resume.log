@@ -1,0 +1,17 @@
+  ssthca_c1_8MiB               30.1 Mbps  (4s)
+  ssthca_c4_8MiB               23.3 Mbps  (6s)
+  ssthca_c1_32MiB              30.9 Mbps  (11s)
+  ssthca_c4_32MiB              42.9 Mbps  (9s)
+  ssthca_c1_128MiB             42.6 Mbps  (27s)
+  ssthca_c4_128MiB             47.6 Mbps  (25s)
+  ssthca_c1_300MB              39.2 Mbps  (63s)
+  ssthca_c4_300MB              47.9 Mbps  (53s)
+  ssthca_c1_1GB                40.3 Mbps  (200s)
+  ssthca_c4_1GB                51.8 Mbps  (157s)
+ssthca phase done; now kernel TCP reference
+  kernel_tcp c1 8MiB         31.6 Mbps  (2.123959s, retx 0)
+  kernel_tcp c1 32MiB        49.4 Mbps  (5.412583s, retx 0)
+  kernel_tcp c1 128MiB       56.2 Mbps  (19.10353s, retx 0)
+  kernel_tcp c1 300MB        56.6 Mbps  (42.399393s, retx 0)
+  kernel_tcp c1 1GB          57.1 Mbps  (140.115621s, retx 0)
+kernel TCP reference in tcp_sizesweep.jsonl
