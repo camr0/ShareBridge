@@ -1,0 +1,37 @@
+  unpatched_c1_8MiB            17.2 Mbps  (7s)
+  unpatched_c4_8MiB            11.8 Mbps  (8s)
+  unpatched_c1_32MiB            9.4 Mbps  (31s)
+  unpatched_c4_32MiB           37.2 Mbps  (10s)
+  unpatched_c1_128MiB          18.7 Mbps  (59s)
+  unpatched_c4_128MiB          30.8 Mbps  (38s)
+  unpatched_c1_300MB           28.4 Mbps  (86s)
+  unpatched_c4_300MB           49.2 Mbps  (52s)
+  unpatched_c1_1GB             43.5 Mbps  (185s)
+  unpatched_c4_1GB             49.5 Mbps  (165s)
+  caonly_c1_8MiB                8.4 Mbps  (11s)
+  caonly_c4_8MiB               13.2 Mbps  (7s)
+  caonly_c1_32MiB              20.8 Mbps  (15s)
+  caonly_c4_32MiB              22.8 Mbps  (15s)
+  caonly_c1_128MiB             40.7 Mbps  (28s)
+  caonly_c4_128MiB             49.5 Mbps  (25s)
+  caonly_c1_300MB              35.2 Mbps  (70s)
+  caonly_c4_300MB              49.0 Mbps  (51s)
+  caonly_c1_1GB                36.4 Mbps  (222s)
+  caonly_c4_1GB                49.2 Mbps  (166s)
+  ssthca_c1_8MiB           FAILED
+  ssthca_c4_8MiB           FAILED
+  ssthca_c1_32MiB          FAILED
+  ssthca_c4_32MiB          FAILED
+  ssthca_c1_128MiB         FAILED
+  ssthca_c4_128MiB         FAILED
+  ssthca_c1_300MB          FAILED
+  ssthca_c4_300MB          FAILED
+  ssthca_c1_1GB            FAILED
+  ssthca_c4_1GB            FAILED
+restored pristine fork; results in sizesweep_results.jsonl
+  kernel_tcp c1 8MiB     FAILED
+  kernel_tcp c1 32MiB    FAILED
+  kernel_tcp c1 128MiB   FAILED
+  kernel_tcp c1 300MB    FAILED
+  kernel_tcp c1 1GB      FAILED
+kernel TCP reference in tcp_sizesweep.jsonl

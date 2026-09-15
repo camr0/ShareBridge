@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,7 +20,7 @@ func TestReportJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(sb.String()), &back); err != nil {
 		t.Fatal(err)
 	}
-	if back != r {
+	if !reflect.DeepEqual(back, r) {
 		t.Fatalf("round trip mismatch: %+v != %+v", back, r)
 	}
 }
@@ -50,7 +51,7 @@ func TestParseByteSize(t *testing.T) {
 }
 
 func TestValidateRunConfig(t *testing.T) {
-	valid := runConfig{mode: "raw", rttMs: 25, loss: 0.5, size: 8 << 20, chunk: 16 << 10, backpressure: "event", deadline: 30 * time.Second, window: 5 << 20}
+	valid := runConfig{mode: "raw", rttMs: 25, loss: 0.5, size: 8 << 20, chunk: 16 << 10, backpressure: "event", deadline: 30 * time.Second, window: 5 << 20, conns: 1, sharing: "shared"}
 	cases := []struct {
 		name    string
 		mutate  func(*runConfig)
@@ -72,7 +73,14 @@ func TestValidateRunConfig(t *testing.T) {
 		{"zero deadline", func(c *runConfig) { c.deadline = 0 }, true},
 		{"negative deadline", func(c *runConfig) { c.deadline = -time.Second }, true},
 		{"zero window", func(c *runConfig) { c.window = 0 }, true},
+		{"negative queue", func(c *runConfig) { c.queue = -1 }, true},
+		{"explicit queue ok", func(c *runConfig) { c.queue = 5 << 20 }, false},
 		{"prod skips backpressure", func(c *runConfig) { c.mode = "prod"; c.backpressure = "burst" }, false},
+		{"zero conns", func(c *runConfig) { c.conns = 0 }, true},
+		{"negative conns", func(c *runConfig) { c.conns = -2 }, true},
+		{"multi conns ok", func(c *runConfig) { c.conns = 4 }, false},
+		{"invalid sharing", func(c *runConfig) { c.sharing = "split" }, true},
+		{"independent sharing ok", func(c *runConfig) { c.sharing = "independent" }, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

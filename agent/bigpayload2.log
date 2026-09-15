@@ -1,0 +1,11 @@
+  caonly_c1_300MB        rep1:    39.3 Mbps  (63s)
+  caonly_c1_300MB        rep2:    35.2 Mbps  (71s)
+  caonly_c4_300MB        rep1:    46.4 Mbps  (54s)
+  caonly_c4_300MB        rep2:    47.8 Mbps  (53s)
+  ssthca_c1_300MB        rep1:    40.8 Mbps  (62s)
+  ssthca_c4_300MB        rep1:    51.4 Mbps  (49s)
+  unpatched_c1_300MB     rep1:    26.9 Mbps  (91s)
+  unpatched_c1_300MB     rep2:    27.4 Mbps  (90s)
+  unpatched_c4_300MB     rep1:    37.2 Mbps  (67s)
+  unpatched_c4_300MB     rep2:    45.0 Mbps  (56s)
+restored pristine fork; results in bigpayload_results.jsonl

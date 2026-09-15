@@ -1,0 +1,5 @@
+{"variant":"kernel_tcp","label":"kernel_tcp_c1_8MiB","conns":1,"size_label":"8MiB","wall_mbps":31.596120264091727,"wall_secs":2,"retransmits":0,"tool":"iperf3","cc":"cubic"}
+{"variant":"kernel_tcp","label":"kernel_tcp_c1_32MiB","conns":1,"size_label":"32MiB","wall_mbps":49.400975467720315,"wall_secs":5,"retransmits":0,"tool":"iperf3","cc":"cubic"}
+{"variant":"kernel_tcp","label":"kernel_tcp_c1_128MiB","conns":1,"size_label":"128MiB","wall_mbps":56.2064615283144,"wall_secs":19,"retransmits":0,"tool":"iperf3","cc":"cubic"}
+{"variant":"kernel_tcp","label":"kernel_tcp_c1_300MB","conns":1,"size_label":"300MB","wall_mbps":56.60907607804668,"wall_secs":42,"retransmits":0,"tool":"iperf3","cc":"cubic"}
+{"variant":"kernel_tcp","label":"kernel_tcp_c1_1GB","conns":1,"size_label":"1GB","wall_mbps":57.100234955244574,"wall_secs":140,"retransmits":0,"tool":"iperf3","cc":"cubic"}
