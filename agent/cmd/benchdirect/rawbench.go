@@ -26,6 +26,7 @@ type runConfig struct {
 	minCwnd      int64
 	jitter       time.Duration
 	bandwidth    int64
+	queue        int64
 	conns        int
 	sharing      string
 }
@@ -87,6 +88,7 @@ func newShapers(cfg runConfig, n int, delay time.Duration) ([]*Shaper, []*Flow, 
 		}
 		sh.SetJitter(cfg.jitter)
 		sh.SetBandwidth(cfg.bandwidth)
+		sh.SetQueueBytes(cfg.queue)
 		shapers = append(shapers, sh)
 	}
 	flows := make([]*Flow, 0, n)

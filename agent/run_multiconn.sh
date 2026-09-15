@@ -81,4 +81,52 @@ if want loss; then
   done
 fi
 
+# Loss sweep at the same rtt/jitter baseline as bwcap: where is the cliff between
+# 0.01% (a decent link) and 1% (the documented catastrophe)?
+if want lossmid; then
+  echo "== lossmid: rtt=100 jitter=10, loss sweep, 8 MiB, 3 reps =="
+  for spec in "0.0001:0.01pct" "0.001:0.1pct" "0.003:0.3pct" "0.01:1pct"; do
+    loss="${spec%%:*}"; name="${spec##*:}"
+    for c in 1 4; do
+      run_one "loss_${name}" "$c" 8MiB 3 --rtt 100 --loss "$loss" --jitter 10 --deadline 120
+    done
+  done
+fi
+
+# Bandwidth sweep: locate the cliff where SCTP stops collapsing and becomes
+# window-limited. Buffer defaults to 100ms of buffering at each rate.
+if want bwsweep; then
+  echo "== bwsweep: rtt=100 jitter=10, bandwidth sweep, 16 MiB, 2 reps =="
+  for bw in 2MB 4MB 8MB 16MB 32MB; do
+    mbps=$(( ${bw%MB} * 8 ))
+    for c in 1 4; do
+      run_one "bw_${mbps}mbps" "$c" 16MiB 2 --rtt 100 --loss 0 --jitter 10 --bandwidth "$bw" --deadline 180
+    done
+  done
+fi
+
+# Buffer-depth sweep: is the collapse caused by the bottleneck buffer being
+# smaller than SCTP's slow-start target (the peer's ~5 MB rwnd)?
+# queue_800KB is the default for bw=8MB and should reproduce the bwcap numbers.
+if want queue; then
+  echo "== queue: rtt=100 jitter=10 bw=8MB, buffer depth sweep, 32 MiB, 3 reps =="
+  for q in 800KB 2MB 5MB 16MB; do
+    for c in 1 4; do
+      run_one "queue_${q}" "$c" 32MiB 3 --rtt 100 --loss 0 --jitter 10 --bandwidth 8MB --queue "$q" --deadline 180
+    done
+  done
+fi
+
+# Is a buffer >= N x rwnd enough at ALL rates, or is there a separate
+# rate-dependent ceiling? Compare a fat buffer at a low and a high rate.
+if want bfix; then
+  echo "== bfix: explicit large buffer at low and high rate, 16 MiB, 2 reps =="
+  for spec in "2MB:5MB:16mbps" "32MB:32MB:256mbps"; do
+    bwc="${spec%%:*}"; rest="${spec#*:}"; q="${rest%%:*}"; name="${rest##*:}"
+    for c in 1 4; do
+      run_one "bfix_${name}" "$c" 16MiB 2 --rtt 100 --loss 0 --jitter 10 --bandwidth "$bwc" --queue "$q" --deadline 180
+    done
+  done
+fi
+
 echo "results appended to $OUT"

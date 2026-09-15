@@ -138,6 +138,104 @@ windows — which is what RFC 8831 predicts — not opportunistic rebalancing.
 - n=10 for highrtt/jitter, n=3 for the bandwidth-capped and loss conditions (the latter are
   noisy; `bwindep` N=2 had a 3.27x spread from a single 43 Mbps outlier).
 
+## Follow-up: the loss cliff, buffer depth, and the tunability question (same day)
+
+Prompted by: "how likely is that scenario?" and "could we set these config options dynamically
+based on the user's network setup?"
+
+New harness capability: `-queue <bytes>` sets the bottleneck buffer depth explicitly. Without
+it the buffer is `bandwidth/10` (100 ms of buffering at the capped rate).
+
+### Loss sweep at the rtt=100 + jitter baseline (uncapped, 8 MiB, n=3)
+
+| loss | N=1 Mbps | N=4 Mbps | speedup |
+|---|---|---|---|
+| 0% (from `jitter` group) | 209.0 | 341.9 | 1.64 |
+| 0.01% (1 in 10,000) | 41.5 | 87.6 | 2.11 |
+| 0.1% | 6.5 | 21.1 | 3.25 |
+| 0.3% | 2.1 | 8.3 | 3.95 |
+| 1% | 1.0 | 4.1 | 4.10 |
+
+The cliff is **between 0% and 0.01%**, not between 0.1% and 1%. A single lost packet in
+10,000 costs ~80% of throughput; 0.1% costs ~97%. Multi-connection helps substantially in
+relative terms (2–4x) but does not make any lossy path usable. This answers "how likely is
+that scenario": the damaging loss rates are not exotic — they are the normal background loss
+of an ordinary WAN path, and give or take, a good Wi-Fi link.
+
+### Buffer depth sweep (rtt=100 + jitter, 64 Mbps cap, 32 MiB, n=3)
+
+| bottleneck buffer | N=1 Mbps | util | N=4 Mbps | util | drops N=1 | drops N=4 |
+|---|---|---|---|---|---|---|
+| 800 KB (default) | 9.6 | 15% | 19.3 | 30% | 1107 | 2356 |
+| 2 MB | 16.0 | 25% | 18.9 | 30% | 1996 | 4233 |
+| 5 MB (= rwnd) | **55.6** | **87%** | 27.9 | 44% | **0** | 4029 |
+| 16 MB | 42.9 | 67% | **56.4** | **88%** | **0** | **0** |
+
+**This confirms the mechanism.** With a buffer at least as large as the peer's receive window
+(~5 MB), tail drop stops entirely and the single connection reaches **87% of the link**. The
+collapse was never about link speed.
+
+It also reveals a second-order cost: each association independently slow-starts toward its own
+5 MB `rwnd`, so N connections need roughly **N x rwnd** of buffer. 5 MB is enough for N=1 and
+exactly reproduces the collapse at N=4, while 16 MB fixes N=4. **Multi-connection makes the
+buffer requirement worse, not better.**
+
+### Bandwidth sweep (rtt=100 + jitter, buffer = bandwidth/10, 16 MiB, n=2)
+
+| link cap | N=1 | util | N=4 | util | drops N=1 |
+|---|---|---|---|---|---|
+| 16 Mbps | 8.0 | 50% | 10.9 | 68% | 417 |
+| 32 Mbps | 7.6 | 24% | 8.2 | 26% | 698 |
+| 64 Mbps | 7.3 | 11% | 11.3 | 18% | 1549 |
+| 128 Mbps | 6.9 | 5% | 9.8 | 8% | 2810 |
+| 256 Mbps | 5.3 | 2% | 15.4 | 6% | 1488 |
+
+Throughput is roughly **constant (~5–15 Mbps) across a 16x range of link speeds** — it does not
+scale with bandwidth at all. Since the buffer is `bandwidth/10`, every rate tail-drops.
+
+### Confirming that the buffer is the whole story
+
+Giving each rate a buffer large enough to stop dropping removes the effect completely:
+
+| config | N=1 | util | N=4 | util | drops |
+|---|---|---|---|---|---|
+| 16 Mbps + 200 KB buffer (default) | 8.0 | 50% | 10.9 | 68% | 417 / 472 |
+| 16 Mbps + **5 MB** buffer | **14.7** | **92%** | 11.4 | 71% | **0** |
+| 256 Mbps + 3.2 MB buffer (default) | 5.3 | 2% | 15.4 | 6% | 1488 / 4296 |
+| 256 Mbps + **32 MB** buffer | **116.6** | 46% | **150.3** | 59% | **0** |
+
+Across every experiment in this report the rule holds without exception:
+
+> **zero tail drops => 45–92% link utilisation. Any tail drops => collapse to 2–30%.**
+
+### Can these parameters be tuned dynamically from the user's network setup?
+
+Investigated in pion's source. `SettingEngine` exposes exactly six SCTP knobs:
+`SetSCTPMaxReceiveBufferSize`, `SetSCTPMaxMessageSize`, `SetSCTPRTOMax`, `SetSCTPMinCwnd`,
+`SetSCTPFastRtxWnd`, `SetSCTPCwndCAStep`.
+
+The decisive parameter is **not among them**. `sctp/association.go` hardcodes
+`a.ssthresh = a.RWND()` (lines 803 and 1809), so slow start always targets the *peer's
+advertised window* rather than the bandwidth-delay product. And `RWND()` is the peer's window —
+in the ShareBridge flow that peer is **Chrome**, so the target (~5 MB) is set by the browser and
+is not ours to configure. The one knob that was tested (`SetSCTPMinCwnd`) helped where there
+were no drops and *hurt* where there were — because raising a congestion-window floor increases
+the over-drive that causes the drops in the first place.
+
+So dynamic tuning is not available through this API. To fix the overshoot properly you would have
+to estimate the BDP and drive the sender at it — i.e. reimplement TCP's congestion control inside
+pion's SCTP. That is precisely the work the kernel already does for the FRP / HTTPS-direct path.
+
+### What this changes in the verdict
+
+The earlier conclusion stands and is now sharper. The problem is not high RTT, and it is not
+loss alone: it is that **SCTP's slow start targets the peer's receive window (~5 MB) rather than
+the path's bandwidth-delay product, so on any bottleneck whose buffer is smaller than ~5 MB it
+over-drives, tail-drops, and collapses.** Real routers do not have 5 MB buffers, and the
+requirement grows to ~N x 5 MB if you add connections. Multi-connection therefore sums N
+degraded associations rather than restoring utilisation, and it raises the buffer requirement
+that was already the binding constraint.
+
 ## Bearing on the architecture decision
 
 This does **not** revive WebRTC as the primary transport, and it does not change the FRP

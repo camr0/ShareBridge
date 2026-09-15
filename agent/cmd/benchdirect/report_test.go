@@ -73,6 +73,8 @@ func TestValidateRunConfig(t *testing.T) {
 		{"zero deadline", func(c *runConfig) { c.deadline = 0 }, true},
 		{"negative deadline", func(c *runConfig) { c.deadline = -time.Second }, true},
 		{"zero window", func(c *runConfig) { c.window = 0 }, true},
+		{"negative queue", func(c *runConfig) { c.queue = -1 }, true},
+		{"explicit queue ok", func(c *runConfig) { c.queue = 5 << 20 }, false},
 		{"prod skips backpressure", func(c *runConfig) { c.mode = "prod"; c.backpressure = "burst" }, false},
 		{"zero conns", func(c *runConfig) { c.conns = 0 }, true},
 		{"negative conns", func(c *runConfig) { c.conns = -2 }, true},

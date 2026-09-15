@@ -25,6 +25,7 @@ func main() {
 	mincwnd := flag.String("mincwnd", "0", "minimum SCTP congestion window (e.g. 2MiB), 0 = default")
 	jitter := flag.Int("jitter", 0, "per-packet delay jitter in ms (uniform +/-)")
 	bandwidth := flag.String("bandwidth", "0", "link bandwidth cap (e.g. 8MB), 0 = unlimited")
+	queue := flag.String("queue", "0", "bottleneck buffer depth (e.g. 5MB), 0 = derive from -bandwidth (100ms)")
 	conns := flag.Int("conns", 1, "number of parallel PeerConnections (raw mode)")
 	sharing := flag.String("sharing", "shared", "shared|independent bottleneck across connections")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
@@ -59,6 +60,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid -bandwidth:", bandwidthErr)
 		os.Exit(2)
 	}
+	queueBytes, queueErr := parseByteSize(*queue)
+	if queueErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -queue:", queueErr)
+		os.Exit(2)
+	}
 
 	cfg := runConfig{
 		mode:         *mode,
@@ -72,6 +78,7 @@ func main() {
 		minCwnd:      minCwndBytes,
 		jitter:       time.Duration(*jitter) * time.Millisecond,
 		bandwidth:    bandwidthBytes,
+		queue:        queueBytes,
 		conns:        *conns,
 		sharing:      *sharing,
 	}
@@ -136,6 +143,9 @@ func validateRunConfig(cfg runConfig) error {
 	}
 	if cfg.bandwidth < 0 {
 		return fmt.Errorf("invalid -bandwidth %d: must be >= 0", cfg.bandwidth)
+	}
+	if cfg.queue < 0 {
+		return fmt.Errorf("invalid -queue %d: must be >= 0", cfg.queue)
 	}
 	if cfg.deadline <= 0 {
 		return fmt.Errorf("invalid -deadline %v: must be > 0", cfg.deadline)

@@ -401,6 +401,57 @@ func TestSeparateShapersAreIsolated(t *testing.T) {
 	}
 }
 
+// An explicit queue depth must force tail drop even with no rate cap, and must
+// work regardless of whether it is set before or after SetBandwidth.
+func TestQueueBytesOverrideForcesTailDrop(t *testing.T) {
+	for _, order := range []string{"queue-first", "bandwidth-first"} {
+		t.Run(order, func(t *testing.T) {
+			s, err := NewShaper(50*time.Millisecond, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if order == "queue-first" {
+				s.SetQueueBytes(1000)
+			} else {
+				s.SetBandwidth(0) // no cap; must not clear an explicit queue
+				s.SetQueueBytes(1000)
+			}
+
+			f, err := s.NewFlow()
+			if err != nil {
+				t.Fatal(err)
+			}
+			aConn, aAddr := listenUDP(t)
+			defer aConn.Close()
+			bConn, _ := listenUDP(t)
+			defer bConn.Close()
+			f.SetPeerA(aAddr)
+			learnAndEcho(t, f, aConn, bConn, 1)
+			time.Sleep(150 * time.Millisecond) // let the learning exchange drain
+
+			_, _, before := f.Stats()
+			payload := make([]byte, 512)
+			for i := 0; i < 20; i++ {
+				if _, err := aConn.WriteToUDP(payload, f.Addr()); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// 20 x 512 B = 10 KiB against a 1 KiB queue held for 50 ms: must drop.
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				_, _, dropped := f.Stats()
+				if dropped > before {
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			t.Fatal("expected tail drop with an explicit 1000-byte queue, got none")
+		})
+	}
+}
+
 func TestNewFlowAfterCloseFails(t *testing.T) {
 	s, err := NewShaper(0, 0)
 	if err != nil {

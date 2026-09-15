@@ -79,6 +79,8 @@ type Shaper struct {
 	wg            sync.WaitGroup
 	closed        bool
 	limiter       *rateLimiter
+	rateBps       int64
+	queueOverride int64
 	maxQueueBytes int64
 	queueBytes    int64
 	flows         []*flowState
@@ -162,11 +164,35 @@ func (s *Shaper) SetBandwidth(bytesPerSec int64) {
 	defer s.mu.Unlock()
 	if bytesPerSec <= 0 {
 		s.limiter = nil
-		s.maxQueueBytes = 0
-		return
+		s.rateBps = 0
+	} else {
+		s.limiter = newRateLimiter(float64(bytesPerSec))
+		s.rateBps = bytesPerSec
 	}
-	s.limiter = newRateLimiter(float64(bytesPerSec))
-	s.maxQueueBytes = bytesPerSec / 10 // 100ms buffer before tail drop
+	s.applyQueueLocked()
+}
+
+// SetQueueBytes overrides the bottleneck buffer depth in bytes, independent of
+// the bandwidth cap. Without this the buffer is 100ms of buffering at the
+// capped rate. Zero restores that default.
+func (s *Shaper) SetQueueBytes(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queueOverride = n
+	s.applyQueueLocked()
+}
+
+// applyQueueLocked resolves the tail-drop buffer depth. An explicit override
+// wins; otherwise derive 100ms of buffering from the rate cap.
+func (s *Shaper) applyQueueLocked() {
+	switch {
+	case s.queueOverride > 0:
+		s.maxQueueBytes = s.queueOverride
+	case s.rateBps > 0:
+		s.maxQueueBytes = s.rateBps / 10 // 100ms buffer before tail drop
+	default:
+		s.maxQueueBytes = 0
+	}
 }
 
 // Stats aggregates counters across every flow on this Shaper.
