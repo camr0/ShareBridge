@@ -168,12 +168,12 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 	}
 	shim.SetPeerA(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: goPort})
 
-	answerCh := make(chan string, 1)
+	answerCh := make(chan answerMsg, 1)
 	webRoot, err := fs.Sub(webFS, "web")
 	if err != nil {
 		return res, err
 	}
-	srv := newBenchServer(func() string { return rewrittenOffer }, answerCh, webRoot)
+	srv := newBenchServer([]string{rewrittenOffer}, answerCh, webRoot)
 	srv.mode, srv.size, srv.chunk = cfg.mode, cfg.size, cfg.chunk
 	baseURL, err := srv.listen()
 	if err != nil {
@@ -191,7 +191,7 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 
 	select {
 	case answer := <-answerCh:
-		rewrittenAnswer, _, _, err := RewriteHostCandidate(answer, shim.Addr().Port)
+		rewrittenAnswer, _, _, err := RewriteHostCandidate(answer.SDP, shim.Addr().Port)
 		if err != nil {
 			return res, err
 		}

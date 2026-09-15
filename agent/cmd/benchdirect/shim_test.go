@@ -185,3 +185,234 @@ func TestShimCloseReturns(t *testing.T) {
 		t.Fatal("Close did not return promptly")
 	}
 }
+
+// waitForCounter polls until fn reaches want, so assertions do not race the
+// drain goroutine (counters are incremented after the datagram is written).
+func waitForCounter(t *testing.T, want int64, fn func() int64, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := fn(); got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %d, want %d", what, fn(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// learnAndEcho establishes a flow: B's first datagram teaches the shim B's
+// address, then A's datagram proves the return path works. Returns nothing but
+// fails the test on any error.
+func learnAndEcho(t *testing.T, f *Flow, aConn, bConn *net.UDPConn, mark byte) {
+	t.Helper()
+	if _, err := bConn.WriteToUDP([]byte{mark}, f.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	_ = aConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := aConn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("peer A did not receive learning packet: %v", err)
+	}
+	if _, err := aConn.WriteToUDP([]byte{mark, mark}, f.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	_ = bConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := bConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("peer B did not receive echoed packet: %v", err)
+	}
+	if n != 2 || buf[0] != mark || buf[1] != mark {
+		t.Fatalf("corrupted echo: %v", buf[:n])
+	}
+}
+
+// One Shaper must carry several flows without mixing their peer pairings.
+func TestShaperCarriesMultipleFlows(t *testing.T) {
+	s, err := NewShaper(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const n = 3
+	for i := 0; i < n; i++ {
+		f, err := s.NewFlow()
+		if err != nil {
+			t.Fatal(err)
+		}
+		aConn, aAddr := listenUDP(t)
+		defer aConn.Close()
+		bConn, _ := listenUDP(t)
+		defer bConn.Close()
+		f.SetPeerA(aAddr)
+		learnAndEcho(t, f, aConn, bConn, byte(i))
+		if f.Addr().Port == 0 {
+			t.Fatal("flow has no address")
+		}
+	}
+}
+
+// Every flow on a Shaper gets its own socket, so flows cannot share a 5-tuple.
+func TestFlowsHaveDistinctAddresses(t *testing.T) {
+	s, err := NewShaper(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	seen := map[int]bool{}
+	for i := 0; i < 4; i++ {
+		f, err := s.NewFlow()
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := f.Addr().Port
+		if seen[port] {
+			t.Fatalf("duplicate flow port %d", port)
+		}
+		seen[port] = true
+	}
+}
+
+// Shaper.Stats must aggregate per-flow counters, and per-flow Stats must report
+// only that flow's share.
+func TestShaperStatsAggregateAcrossFlows(t *testing.T) {
+	s, err := NewShaper(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	f0, err := s.NewFlow()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f1, err := s.NewFlow()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a0, a0Addr := listenUDP(t)
+	defer a0.Close()
+	b0, _ := listenUDP(t)
+	defer b0.Close()
+	a1, a1Addr := listenUDP(t)
+	defer a1.Close()
+	b1, _ := listenUDP(t)
+	defer b1.Close()
+
+	f0.SetPeerA(a0Addr)
+	f1.SetPeerA(a1Addr)
+	learnAndEcho(t, f0, a0, b0, 1)
+	learnAndEcho(t, f1, a1, b1, 2)
+
+	// Each flow forwarded two datagrams (one learning, one echo).
+	waitForCounter(t, 4, func() int64 { fw, _, _ := s.Stats(); return fw }, "shaper forwarded")
+	waitForCounter(t, 2, func() int64 { fw, _, _ := f0.Stats(); return fw }, "flow 0 forwarded")
+	waitForCounter(t, 2, func() int64 { fw, _, _ := f1.Stats(); return fw }, "flow 1 forwarded")
+}
+
+// A bandwidth cap on a Shaper is shared: overflowing the single queue must drop
+// datagrams, and the per-flow drop counts must add up to the shaper total.
+func TestShaperBandwidthCapIsSharedAcrossFlows(t *testing.T) {
+	s, err := NewShaper(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetBandwidth(8 << 10) // 8 KiB/s => 800-byte shared queue
+
+	flows := make([]*Flow, 2)
+	senders := make([]*net.UDPConn, 2)
+	buf := make([]byte, 16)
+	for i := range flows {
+		f, err := s.NewFlow()
+		if err != nil {
+			t.Fatal(err)
+		}
+		aConn, aAddr := listenUDP(t)
+		defer aConn.Close()
+		bConn, _ := listenUDP(t)
+		defer bConn.Close()
+		f.SetPeerA(aAddr)
+		learnAndEcho(t, f, aConn, bConn, byte(i))
+		_ = aConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		flows[i], senders[i] = f, aConn
+	}
+
+	payload := make([]byte, 512)
+	for burst := 0; burst < 40; burst++ {
+		for i := range flows {
+			if _, err := senders[i].WriteToUDP(payload, flows[i].Addr()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var total int64
+	for time.Now().Before(deadline) {
+		_, _, total = s.Stats()
+		if total > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if total == 0 {
+		t.Fatal("expected tail drop on the shared queue, got none")
+	}
+
+	_, _, d0 := flows[0].Stats()
+	_, _, d1 := flows[1].Stats()
+	if d0+d1 != total {
+		t.Fatalf("per-flow drops %d+%d != shaper drops %d", d0, d1, total)
+	}
+	_ = buf
+}
+
+// Separate Shapers must not share accounting or capacity.
+func TestSeparateShapersAreIsolated(t *testing.T) {
+	s0, err := NewShaper(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s0.Close()
+	s1, err := NewShaper(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s1.Close()
+
+	f0, err := s0.NewFlow()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a0, a0Addr := listenUDP(t)
+	defer a0.Close()
+	b0, _ := listenUDP(t)
+	defer b0.Close()
+	f0.SetPeerA(a0Addr)
+	learnAndEcho(t, f0, a0, b0, 1)
+
+	waitForCounter(t, 2, func() int64 { fw, _, _ := s0.Stats(); return fw }, "shaper 0 forwarded")
+	if fw, _, _ := s1.Stats(); fw != 0 {
+		t.Fatalf("shaper 1 forwarded = %d, want 0 (isolated)", fw)
+	}
+}
+
+func TestNewFlowAfterCloseFails(t *testing.T) {
+	s, err := NewShaper(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.NewFlow(); err == nil {
+		t.Fatal("expected error creating a flow on a closed shaper")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close returned error: %v", err)
+	}
+}

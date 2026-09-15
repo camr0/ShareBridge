@@ -25,6 +25,8 @@ func main() {
 	mincwnd := flag.String("mincwnd", "0", "minimum SCTP congestion window (e.g. 2MiB), 0 = default")
 	jitter := flag.Int("jitter", 0, "per-packet delay jitter in ms (uniform +/-)")
 	bandwidth := flag.String("bandwidth", "0", "link bandwidth cap (e.g. 8MB), 0 = unlimited")
+	conns := flag.Int("conns", 1, "number of parallel PeerConnections (raw mode)")
+	sharing := flag.String("sharing", "shared", "shared|independent bottleneck across connections")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
 	flag.Parse()
 
@@ -70,6 +72,8 @@ func main() {
 		minCwnd:      minCwndBytes,
 		jitter:       time.Duration(*jitter) * time.Millisecond,
 		bandwidth:    bandwidthBytes,
+		conns:        *conns,
+		sharing:      *sharing,
 	}
 	if err := validateRunConfig(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -148,6 +152,14 @@ func validateRunConfig(cfg runConfig) error {
 		default:
 			return fmt.Errorf("invalid -backpressure %q: must be event or poll", cfg.backpressure)
 		}
+	}
+	if cfg.conns < 1 {
+		return fmt.Errorf("invalid -conns %d: must be >= 1", cfg.conns)
+	}
+	switch cfg.sharing {
+	case "shared", "independent":
+	default:
+		return fmt.Errorf("invalid -sharing %q: must be shared or independent", cfg.sharing)
 	}
 	return nil
 }
