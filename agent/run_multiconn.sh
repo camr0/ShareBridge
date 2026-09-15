@@ -129,4 +129,30 @@ if want bfix; then
   done
 fi
 
+# RTO ceiling sweep. pion hardcodes rtoMin = 1000ms, but the RTO is
+# min(max(srtt+4*rttvar, rtoMin), rtoMax) -- so setting rtoMax below 1s
+# effectively lowers the RTO floor. Does that recover the loss collapse?
+if want rto; then
+  echo "== rto: rtt=100 jitter=10, RTO ceiling sweep, 8 MiB, 3 reps =="
+  for spec in "0:default" "500ms:500ms" "200ms:200ms" "100ms:100ms"; do
+    r="${spec%%:*}"; name="${spec##*:}"
+    for l in 0 0.0001 0.001; do
+      for c in 1 4; do
+        run_one "rto_${name}_l${l}" "$c" 8MiB 3 --rtt 100 --jitter 10 --loss "$l" --rtomax "$r" --deadline 150
+      done
+    done
+  done
+fi
+
+# Matched loss comparison against the tc/netem TCP control: same RTT, same
+# 64 Mbps cap, same ~800KB queue, same loss, steady-state transfer size.
+if want lossmatch; then
+  echo "== lossmatch: rtt=100 jitter=10 bw=8MB (64Mbps) queue=default(800KB), 32 MiB, 3 reps =="
+  for l in 0 0.001 0.01; do
+    for c in 1 4; do
+      run_one "lossmatch_l${l}" "$c" 32MiB 3 --rtt 100 --jitter 10 --bandwidth 8MB --loss "$l" --deadline 240
+    done
+  done
+fi
+
 echo "results appended to $OUT"

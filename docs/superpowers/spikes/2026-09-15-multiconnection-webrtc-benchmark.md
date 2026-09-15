@@ -236,6 +236,83 @@ requirement grows to ~N x 5 MB if you add connections. Multi-connection therefor
 degraded associations rather than restoring utilisation, and it raises the buffer requirement
 that was already the binding constraint.
 
+## Follow-up 2: kernel TCP control, the RTO knob, and a size-confound correction
+
+### METHODOLOGICAL CORRECTION: 8 MiB is too small at 100 ms RTT
+
+Same nominal condition (rtt=100, jitter=10, loss=0, N=1, all defaults):
+
+| transfer size | throughput |
+|---|---|
+| 64 MiB | 209.0 Mbps (n=10) |
+| 8 MiB | 73.8 Mbps (n=3) |
+
+An 8 MiB transfer at 100 ms RTT finishes during slow start and never reaches steady
+state, so it understates throughput by ~3x. Worse, at 0.1% loss an 8 MiB transfer
+expects only ~0.7 loss events, so it samples "did a loss event happen" rather than a
+rate. Two independently-run groups at loss=0.1%, 8 MiB, N=1, identical configuration:
+
+- `loss_0.1pct`:       9.3, 4.0, 6.2 Mbps
+- `rto_default_l0.001`: 8.0, 67.3, 3.5 Mbps
+
+A 19x spread. **The loss-cliff figures in the previous section are therefore not
+steady-state throughput and must not be read as a rate.** The corrected, matched
+measurement is `lossmatch` below.
+
+### RTO ceiling sweep — hypothesis not confirmed
+
+pion hardcodes `rtoMin = 1000ms` (rtx_timer.go:17) but computes
+`rto = min(max(srtt+4*rttvar, rtoMin), rtoMax)`, so an `rtoMax` below 1s also lowers the
+effective floor. `SetSCTPRTOMax` is exposed, so this is testable without forking pion.
+
+| rtoMax | loss=0 N=1 | loss=0.01% N=1 | loss=0.1% N=1 | loss=0.1% N=4 |
+|---|---|---|---|---|
+| default (60s) | 73.8 | 69.2 | 26.3 | 18.5 |
+| 500ms | 58.7 | 71.2 | 12.8 | 33.9 |
+| 200ms | 69.9 | 72.2 | 7.3 | 56.6 |
+| 100ms | **5.0** | 5.0 | 2.1 | 2.9 |
+
+- `rtoMax=100ms` (below the path RTT) is catastrophic even at zero loss: constant
+  spurious retransmits. Do not do this.
+- 500ms / 200ms are roughly neutral at 0 – 0.01% loss.
+- At 0.1% loss the effect is inconsistent: it helps N=4 by ~3x and hurts N=1 by ~3.5x,
+  with n=3 and wide spreads (200ms / N=4 ranges 17.3–95.2).
+
+Verdict: the 1-second RTO floor is real, but `rtoMax` is not a clean substitute for
+lowering `rtoMin`, and this does not demonstrate a reliable win. It also inherits the
+8 MiB size confound, so it should be re-run at 32 MiB before any conclusion is drawn.
+
+### Kernel TCP control on matched conditions (tc/netem, Linux 6.10 in Docker)
+
+Everything above compared SCTP-on-the-shim against TCP-on-*real WAN paths* — different
+conditions, so indicative only. Docker Desktop supplies a Linux 6.10 kernel, so kernel
+TCP can be measured under `tc netem` at the same nominal settings. One container, both
+endpoints over `lo`, `delay 50ms` => ~100 ms RTT (verified: ping reports ~108 ms).
+
+| rtt=100ms, 64 Mbps cap, ~800 KB queue | SCTP N=1 | SCTP N=4 | kernel TCP |
+|---|---|---|---|
+| loss = 0% | 8.7 Mbps (14%) | 14.7 Mbps (23%) | **54.7 Mbps (86%)**, 0 drops |
+| loss = 0.1% | 4.0 Mbps (6%) | 10.1 Mbps (16%) | ~56 Mbps (88%) |
+| loss = 1% | 1.1 Mbps (2%), timed out | 3.8 Mbps (6%) | **47.2 Mbps (74%)** |
+
+Loss was verified as actually applied — the qdisc reports `loss 1%` / `loss 5%` and
+throughput falls 54.7 -> 47.2 -> 24.6 Mbps for 0 -> 1% -> 5%. (netem at 5% loss still
+beats SCTP at 0% loss on an identical link.)
+
+**At zero packet loss, on identical links, kernel TCP is 6.3x faster than SCTP. At 1%
+loss it is 43x faster. A single kernel TCP connection (54.7 Mbps) beats four parallel
+SCTP associations (14.7 Mbps) by 3.7x.**
+
+The mechanism is the one identified earlier: TCP converges its congestion window to the
+bandwidth-delay product and therefore never overflows the 800 KB queue (zero drops
+reported), while SCTP slow-starts toward the peer's ~5 MB rwnd, overflows, and collapses.
+Queue depth makes no difference to TCP — 57.0 Mbps at a 530-packet queue vs 56.3 Mbps at
+3500 packets — because it fills neither.
+
+This is the controlled version of the earlier claim, and it holds. It is not that the
+SCTP *harness* was unfair; it is that SCTP's congestion control is aimed at the wrong
+target for a constrained link.
+
 ## Bearing on the architecture decision
 
 This does **not** revive WebRTC as the primary transport, and it does not change the FRP

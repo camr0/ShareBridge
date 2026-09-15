@@ -27,6 +27,7 @@ type runConfig struct {
 	jitter       time.Duration
 	bandwidth    int64
 	queue        int64
+	rtoMax       time.Duration
 	conns        int
 	sharing      string
 }
@@ -56,6 +57,8 @@ type rawResult struct {
 	Loss         float64    `json:"loss"`
 	JitterMs     int        `json:"jitter_ms"`
 	Bandwidth    int64      `json:"bandwidth_bps"`
+	Queue        int64      `json:"queue_bytes"`
+	RtoMaxMs     int64      `json:"rto_max_ms"`
 	Conns        int        `json:"conns"`
 	Sharing      string     `json:"sharing"`
 	SentBytes    int64      `json:"sent_bytes"`
@@ -188,6 +191,7 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 	res := rawResult{
 		Mode: "raw", RTT: cfg.rttMs, Loss: cfg.loss, Conns: n, Sharing: cfg.sharing,
 		JitterMs: int(cfg.jitter / time.Millisecond), Bandwidth: cfg.bandwidth,
+		Queue: cfg.queue, RtoMaxMs: int64(cfg.rtoMax / time.Millisecond),
 	}
 	delay := time.Duration(cfg.rttMs) * time.Millisecond / 2
 
@@ -213,6 +217,9 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		se.SetIncludeLoopbackCandidate(true)
 		if cfg.minCwnd > 0 {
 			se.SetSCTPMinCwnd(uint32(cfg.minCwnd))
+		}
+		if cfg.rtoMax > 0 {
+			se.SetSCTPRTOMax(cfg.rtoMax)
 		}
 		api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
 		pc, err := api.NewPeerConnection(webrtc.Configuration{})

@@ -325,7 +325,6 @@ func TestShaperBandwidthCapIsSharedAcrossFlows(t *testing.T) {
 
 	flows := make([]*Flow, 2)
 	senders := make([]*net.UDPConn, 2)
-	buf := make([]byte, 16)
 	for i := range flows {
 		f, err := s.NewFlow()
 		if err != nil {
@@ -350,14 +349,21 @@ func TestShaperBandwidthCapIsSharedAcrossFlows(t *testing.T) {
 		}
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	var total int64
-	for time.Now().Before(deadline) {
+	// Wait until drops stop increasing, so the three snapshots below are taken
+	// against a quiescent Shaper. Calling s.Stats(), flows[0].Stats() and
+	// flows[1].Stats() mid-burst samples three different instants and they can
+	// legitimately disagree by the number of drops still in flight.
+	var total, prev int64
+	stable := 0
+	for i := 0; i < 500 && stable < 20; i++ {
 		_, _, total = s.Stats()
-		if total > 0 {
-			break
+		if total == prev {
+			stable++
+		} else {
+			stable = 0
 		}
-		time.Sleep(5 * time.Millisecond)
+		prev = total
+		time.Sleep(10 * time.Millisecond)
 	}
 	if total == 0 {
 		t.Fatal("expected tail drop on the shared queue, got none")
@@ -368,7 +374,6 @@ func TestShaperBandwidthCapIsSharedAcrossFlows(t *testing.T) {
 	if d0+d1 != total {
 		t.Fatalf("per-flow drops %d+%d != shaper drops %d", d0, d1, total)
 	}
-	_ = buf
 }
 
 // Separate Shapers must not share accounting or capacity.
