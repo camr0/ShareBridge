@@ -24,3 +24,6 @@ agent/agent
 agent/benchdirect
 agent/forks/sctp/
 agent/forks/sctp-pristine/
+
+# local-only notes (never commit: infra details, IPs, hostnames)
+*.local.md
