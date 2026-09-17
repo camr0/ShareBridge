@@ -339,6 +339,7 @@ type timerKind int
 const (
 	timerNone timerKind = iota
 	timerStartChild
+	timerApplyArmedConfig
 	timerRetryCredentialRequest
 	timerCredentialWaitExpiry
 )
@@ -433,9 +434,14 @@ type Manager struct {
 	childLive atomic.Bool
 
 	// State below is owned by the run goroutine.
-	armedConfig       Config
-	hasArmedConfig    bool
-	armedConsumed     bool // the armed credential was already used for one Login
+	armedConfig    Config
+	hasArmedConfig bool
+	armedConsumed  bool // the armed credential was already used for one Login
+	// armedApplyPending is true while a failed armed-config write still owes a
+	// retry (timerApplyArmedConfig). It stops a stale retry from re-applying —
+	// and needlessly restarting a running child for — a configuration a newer
+	// ApplyConfig has since made effective. Owned by the run goroutine.
+	armedApplyPending bool
 	currentGeneration int
 	child             childProcess
 	childStartedAt    time.Time
@@ -764,9 +770,28 @@ func (manager *Manager) handleApplyConfig(config Config) {
 	manager.currentGeneration = config.Generation
 	manager.publishedGeneration.Store(int64(config.Generation))
 	manager.waitingForCredential = false
+	manager.applyArmedConfigOrScheduleRetry()
+}
+
+// applyArmedConfigOrScheduleRetry persists the armed configuration and makes
+// it effective: it replaces a running child (§7.4 step 5) or starts one. A
+// transient write failure MUST NOT leave the manager armed in memory but never
+// started. HasArmedCredential already reports true the instant ApplyConfig
+// queues the credential (that synchronous publish is what stops a sequential
+// caller from re-requesting a credential control just delivered), so on this
+// path nothing else would ever retry: the daemon's reconnect-based re-request
+// stays suppressed and the relay is silently down until an unrelated event.
+// The failure therefore schedules the same bounded backoff startChildNow uses;
+// the retry re-renders the armed config, so a persistent failure backs off
+// instead of hot-looping.
+func (manager *Manager) applyArmedConfigOrScheduleRetry() {
 	if err := manager.writeArmedConfig(); err != nil {
-		return // diagnostic already emitted; the start retry path re-renders
+		manager.armedApplyPending = true
+		manager.restartAttempt++
+		manager.scheduleTimer(timerApplyArmedConfig, manager.backoffDelayForAttempt())
+		return
 	}
+	manager.armedApplyPending = false
 	if manager.child != nil {
 		if err := manager.stopChildGracefullyOrKill(); err != nil {
 			// The old child could not be reaped within the bound: keep tracking
@@ -809,6 +834,10 @@ func (manager *Manager) handleTimerFired() {
 	switch kind {
 	case timerStartChild:
 		manager.startChildNow()
+	case timerApplyArmedConfig:
+		if manager.armedApplyPending {
+			manager.applyArmedConfigOrScheduleRetry()
+		}
 	case timerRetryCredentialRequest, timerCredentialWaitExpiry:
 		if manager.child == nil && manager.waitingForCredential {
 			manager.requestCredentialAndScheduleRestart()
