@@ -251,16 +251,33 @@ do; an explicit agent restart can be opted into with `LIVE_M4EXIT_ALLOW_AGENT_RE
 `LIVE_M4EXIT_AGENT_RESTART_COMMAND` (or supply a startup log via `LIVE_M4EXIT_AGENT_LOG_FILE`).
 
 Config comes only from `LIVE_M4EXIT_*` env vars — `--help` documents every one and a missing
-required value is named in the diagnostic (never guessed). Exit codes match `§3.3`: `0`
-GREEN, `1` RED (FAIL / MISSING), `2` usage or incomplete `--dry-run` config, `3` PARTIAL
-(a SKIP, or a dry run — nothing executed is never a pass). Same honesty contract: a case
-PASSes only with at least one measured PASS check; note-only, skipped and otherwise
-check-less cases never pass; check details are sanitised before console and evidence; the
-three state-changing actions are opt-in (`LIVE_M4EXIT_ALLOW_LOCKDOWN=1`,
-`LIVE_M4EXIT_ALLOW_REVOKE=1`, case-1 `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1`) and flagged in the
-run metadata. The lockdown case's unlock safety net is installed in the main process
-(EXIT/INT/TERM) and proved by `--selftest` with a stubbed admin API. Evidence defaults to
+required value is named in the diagnostic (never guessed). Exit codes: `0` GREEN, `1` RED
+(FAIL / MISSING), `2` usage or an incomplete `--dry-run` configuration, `3` PARTIAL (a SKIP,
+or a dry run — nothing executed is never a pass). Deliberate divergence from `§3.3`: that
+harness always exits `3` for `--dry-run`, while this one exits `2` when configuration is
+incomplete, because an unset required input is an operator-usage error, not "a run that
+executed nothing". Same honesty contract: a case PASSes only with at least one measured PASS
+check; note-only, skipped and otherwise check-less cases never pass; check details and the
+evidence metadata URLs/identifiers are sanitised before console and evidence (configured
+literals, key/token/password/secret/cookie/authorization/`jti` text **and JSON `"key":
+"value"` pairs**); the three state-changing actions are opt-in
+(`LIVE_M4EXIT_ALLOW_LOCKDOWN=1`, `LIVE_M4EXIT_ALLOW_REVOKE=1`, case-1
+`LIVE_M4EXIT_ALLOW_AGENT_RESTART=1`) and flagged in the run metadata. A false-positive
+hardening round added: `LIVE_M4EXIT_TARGET_CONFIRM` (must equal
+`LIVE_M4EXIT_CONTROL_BASE_URL`), required before ANY state change; the revocation case
+refuses to `DELETE` unless an in-flight transfer is proven (`0 < bytes < full size` and the
+download process still alive) and unless the gateway drain line is NEWLY observed for the
+exact relay host with a post-revoke timestamp and `streams>=1`; the lockdown case requires
+the relay URL to SERVE before locking and marks the conservative locked state *before* the
+lockdown request; the direct-path case requires the diagnostics to be updated after the
+request and tied to `LIVE_M4EXIT_AGENT_RECORD_AGENT_ID`; the STUN case analyses only
+`LIVE_M4EXIT_STUN_AGENT_ID` and requires the newest acceptance to be fresh. The lockdown
+case's unlock safety net is installed in the main process (EXIT/INT/TERM) and proved by
+`--selftest` with a stubbed admin API. Raw HTTP captures live in one 0700 scratch directory
+under `umask 077` and are deleted by the EXIT/INT/TERM cleanup hook; evidence defaults to
 `${TMPDIR:-/tmp}/sharebridge-m4exit-e2e` (a run never dirties the worktree).
+The harness was **run live against the OVH test stack and passed 6/6 cases** (ledger: "TASK
+#15 LIVE E2E — ALL SIX HARNESS CASES PASS AGAINST THE REAL DEPLOYMENT").
 
 ## 4. Operations docs index
 
@@ -343,9 +360,11 @@ design (no M6 infrastructure exists yet; all placeholders are `NOT_IMPLEMENTED`,
 - M6 acceptance (Tasks 37–44) is pending **infrastructure and user presence**: the separate
   relay VM, a non-hairpin/router surface, a cellular device, a second VM for the L4 capture,
   real NAT surfaces, and browser/device runs.
-- The M4-exit live relay e2e is deferred until the user is available and the test VPS is
-  restored; the harness for it now exists (`scripts/live-m4exit-e2e.sh`, `§3.7`) but has not
-  been run against a live deployment.
+- The M4-exit live relay e2e **ran against the live OVH test stack and passed all six
+  cases** on 2026-09-17 (ledger: "TASK #15 LIVE E2E — ALL SIX HARNESS CASES PASS AGAINST THE
+  REAL DEPLOYMENT"); the harness for it is `scripts/live-m4exit-e2e.sh` (`§3.7`). Re-runs
+  after the 2026-09 false-positive hardening round have not been performed (no credentials
+  in the fix session); the earlier 6/6 GREEN run predates that round.
 - The single-namespace-per-gateway design question above must be resolved or explicitly
   accepted before a multi-agent M6 topology.
 - The **Sol-model milestone audit over the remediation range remains OWED**: both Codex

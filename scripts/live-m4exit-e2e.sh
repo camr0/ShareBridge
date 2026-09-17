@@ -24,13 +24,40 @@
 #   stun_observe_and_rechallenge      control STUN counters match>0 with zero
 #                                     mismatch/timeout, and the §10.2 proactive
 #                                     rechallenge cadence (4m + jitter[0,15s))
-#                                     is measured from the accept timestamps.
+#                                     is measured from the accept timestamps of
+#                                     THE AGENT UNDER TEST (LIVE_M4EXIT_STUN_AGENT_ID),
+#                                     with the newest acceptance proven FRESH
+#                                     (no older than the 4m+jitter ceiling + the
+#                                     documented tolerance) so a stale journal or
+#                                     an interleaved agent cannot pass.
 #   direct_path_or_failclosed         either status=direct with a direct URL
 #                                     that serves, OR a fail-closed relay
-#                                     fallback whose control-side diagnostics
+#                                     fallback whose control-side diagnostics are
+#                                     provably CURRENT for this request (updated
+#                                     after the prepare-route call and tied to
+#                                     LIVE_M4EXIT_AGENT_RECORD_AGENT_ID) and
 #                                     record direct_status=relay_fallback and
 #                                     the expected direct_status_reason. Never
 #                                     PASS when neither is observable.
+#
+# HARDENING / FALSE-POSITIVE DISCIPLINE (added after the adversarial review):
+#   * A state-changing case refuses to run without an explicit operator target
+#     assertion (LIVE_M4EXIT_TARGET_CONFIRM == the exact control base URL).
+#   * revocation_midstream requires PROOF of an in-flight transfer (0 < bytes
+#     downloaded < full size AND the download process still alive) before it
+#     issues the DELETE, and a NEWLY OBSERVED gateway drain line whose hostname
+#     is the exact relay URL host for this run and whose streams>=1.
+#   * lockdown marks the conservative "may be locked" state BEFORE the lockdown
+#     request, so a signal in the response window still triggers the unlock.
+#   * The lockdown withdrawal baseline requires the relay URL to SERVE (200 with
+#     content) BEFORE locking, so an already-broken URL cannot "prove" it.
+#
+# Deliberate duplication: the runner, sanitiser and helpers below are close
+# siblings of scripts/live-phase4a.sh (the M6 harness). They are NOT shared on
+# purpose: each harness is an independent acceptance artifact that must be
+# checkable in isolation (a shared library would couple the M4-exit evidence to
+# M6 changes and make a failure ambiguous). Divergence is expected and any fix
+# must be applied deliberately to one harness or the other, never assumed.
 #   lockdown_withdrawal_and_recovery  OPT-IN. baseline healthy -> lockdown ->
 #                                     tunnel offline + frps proxy close +
 #                                     prepare-route suppressed + relay fetch
@@ -53,6 +80,15 @@
 #   * `--case a,b` scopes the verdict; unselected cases are NOT_RUN (excluded).
 #   * `--dry-run` executes nothing and exits 3; it is NOT a pass.
 #
+# RESULT / EXIT-CODE DIVERGENCE FROM scripts/live-phase4a.sh (deliberate):
+#   * With a COMPLETE configuration `--dry-run` exits 3 in both harnesses.
+#   * With an INCOMPLETE configuration this harness exits 2 (USAGE) after naming
+#     every missing variable, whereas live-phase4a.sh always exits 3 because it
+#     does not validate configuration in --dry-run. We keep 2 here on purpose:
+#     an unset required input is an operator-usage error (nothing can run, so
+#     "nothing executed is not a pass" would hide the real problem), and the
+#     distinct code lets a wrapper tell "fix your env" from "a dry run".
+#
 # SAFETY:
 #   * Read-only against remote systems (curl GET/POST prepare-route, ssh
 #     journalctl/curl, dig, openssl). The ONLY state-changing calls are the
@@ -60,15 +96,26 @@
 #     (LIVE_M4EXIT_ALLOW_LOCKDOWN=1), share revocation
 #     (LIVE_M4EXIT_ALLOW_REVOKE=1) and an explicit agent restart
 #     (LIVE_M4EXIT_ALLOW_AGENT_RESTART=1, case 1 only). All are reversible and
-#     agent-local (revoke never deletes an Immich share).
+#     agent-local (revoke never deletes an Immich share). Every one of them
+#     additionally refuses to run unless the operator has asserted the target
+#     with LIVE_M4EXIT_TARGET_CONFIRM (see the env section).
 #   * The lockdown safety net is registered in the MAIN process (subshells
 #     reset traps) and re-reads the locked state from a state file, so an
 #     interrupted, failing or SIGTERM-ed run re-sends POST /api/unlock instead
-#     of stranding a locked agent.
-#   * Secrets are never printed or stored: every captured line and every
-#     check() detail passes through sanitize(), which redacts configured
-#     password/share-code literals, key/token/password/secret/cookie/
-#     authorization/jti values, private-key blocks and /s/<code> paths.
+#     of stranding a locked agent. The state is marked BEFORE the lockdown
+#     request is issued and cleared only after a definitively unapplied request
+#     (a 4xx rejection) or a successful unlock — the safe "may be locked"
+#     direction.
+#   * HYGIENE (accurate contract, not an overstatement): configured secrets
+#     (admin password, share codes) and token/key/password/secret/cookie/
+#     authorization/jti-shaped text — including JSON `"key": "value"` pairs —
+#     are redacted before they reach the console, the evidence files or the
+#     captured command/output records; private-key blocks and `/s/<code>`
+#     paths are redacted too. Redaction is BEST-EFFORT pattern matching, not a
+#     cryptographic guarantee, so treat evidence as operator-internal. Raw HTTP
+#     capture bodies and headers live only in a per-run 0700 scratch directory
+#     under umask 077 and are deleted by the EXIT/INT/TERM cleanup hook (also on
+#     error); nothing is meant to survive the run.
 #   * The default evidence directory is outside the worktree
 #     (${TMPDIR:-/tmp}/sharebridge-m4exit-e2e) so a run never dirties the repo.
 #     Override with --evidence-dir or LIVE_M4EXIT_EVIDENCE_DIR.
@@ -88,7 +135,9 @@
 #                plumbing is broken
 #   2  USAGE   — bad arguments, or --dry-run with incomplete configuration
 #   3  PARTIAL — no failures, but at least one SKIP, or a dry run (nothing
-#                executed is never a pass)
+#                executed is never a pass); with an incomplete configuration
+#                --dry-run exits 2 (USAGE) instead — see the divergence note
+#                under USAGE below
 #
 # Environment (all resolved at startup; a required value that is unset FAILs the
 # affected case and is named in the diagnostic — never guessed). Values are
@@ -123,6 +172,7 @@
 #     LIVE_M4EXIT_CONTROL_UNIT          control systemd unit for the STUN timestamps (default sharebridge.service)
 #     LIVE_M4EXIT_CONTROL_METRICS_ADDR  loopback metrics addr over SSH (default 127.0.0.1:9102)
 #     LIVE_M4EXIT_STUN_JOURNAL_FILE     operator-supplied journal/evidence file containing "stun observation accepted" lines (preferred over SSH)
+#     LIVE_M4EXIT_STUN_AGENT_ID         the agent api_key_id under test; ONLY its "stun observation accepted for <id>" lines are analysed (REQUIRED for case 3)
 #     LIVE_M4EXIT_STUN_CADENCE_TOLERANCE_S   documented cadence tolerance seconds (default 5)
 #     LIVE_M4EXIT_STUN_MIN_IN_BAND_DELTAS    minimum on-cadence deltas required (default 1)
 #
@@ -149,9 +199,12 @@
 #
 #   Control-side diagnostics (case 4)
 #     LIVE_M4EXIT_AGENT_RECORD_FILE     operator-supplied agent record with direct_status/direct_status_reason (required for a relay fallback)
+#     LIVE_M4EXIT_AGENT_RECORD_AGENT_ID the agent identifier (api_key_id or record id) under test; the record must carry it (REQUIRED when the record file is used)
+#     LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S  clock-skew tolerance for "updated after the request" (default 10)
 #     LIVE_M4EXIT_EXPECTED_DIRECT_REASON  expected direct_status_reason for the fail-closed fallback (default probe_failed)
 #
 #   Opt-in state-changing cases
+#     LIVE_M4EXIT_TARGET_CONFIRM        REQUIRED for every case that changes state: set it to the EXACT control base URL of the disposable test stack (it must equal LIVE_M4EXIT_CONTROL_BASE_URL). Typing the target asserts that this is a disposable test deployment, not production or the M6 dark topology, before any lockdown/revoke/restart.
 #     LIVE_M4EXIT_ALLOW_AGENT_RESTART   1 restarts the agent inside case 1 so the "loaded N sessions from store" line is freshly observable (default 0 => no restart)
 #     LIVE_M4EXIT_AGENT_RESTART_COMMAND exact restart command, required when _ALLOW_AGENT_RESTART=1 (run on LIVE_M4EXIT_AGENT_SSH_HOST when set, else locally)
 #     LIVE_M4EXIT_AGENT_RESTART_WAIT_S  seconds to wait for the hydration line after an opted-in restart (default 30)
@@ -159,7 +212,7 @@
 #     LIVE_M4EXIT_RECOVERY_BOUND_S      documented post-unlock recovery bound (default 120)
 #     LIVE_M4EXIT_TUNNEL_OFFLINE_BOUND_S documented post-lockdown tunnel-offline bound (default 30)
 #     LIVE_M4EXIT_ALLOW_REVOKE          1 enables case 6 (revoke a share; default 0 => SKIP)
-#     LIVE_M4EXIT_REVOKE_SHARE_CODE     the share code case 6 revokes (required when ALLOW_REVOKE=1)
+#     LIVE_M4EXIT_REVOKE_SHARE_CODE     the share code case 6 revokes (required when ALLOW_REVOKE=1; MUST differ from LIVE_M4EXIT_SHARE_CODE)
 #     LIVE_M4EXIT_REVOKE_ASSET_ID       asset id to download mid-transfer (default: LIVE_M4EXIT_ASSET_ID)
 #     LIVE_M4EXIT_REVOKE_ASSET_BYTES    full asset byte count (optional; else read from /items)
 #     LIVE_M4EXIT_REVOKE_LIMIT_RATE     curl --limit-rate throttle (default 300k)
@@ -180,6 +233,11 @@
 # and environment-facts.txt.
 
 set -u -o pipefail
+
+# Everything this harness writes (scratch captures, the lock-state marker,
+# evidence files) can contain secret-bearing bytes. Restrict the umask before
+# the first mktemp; the owner can still read everything.
+umask 077
 
 usage() {
   # Print the header comment block (everything after the shebang up to the
@@ -239,6 +297,7 @@ CONTROL_SSH_HOST="${LIVE_M4EXIT_CONTROL_SSH_HOST:-}"
 CONTROL_UNIT="${LIVE_M4EXIT_CONTROL_UNIT:-sharebridge.service}"
 CONTROL_METRICS_ADDR="${LIVE_M4EXIT_CONTROL_METRICS_ADDR:-127.0.0.1:9102}"
 STUN_JOURNAL_FILE="${LIVE_M4EXIT_STUN_JOURNAL_FILE:-}"
+STUN_AGENT_ID="${LIVE_M4EXIT_STUN_AGENT_ID:-}"
 STUN_CADENCE_TOLERANCE_S="${LIVE_M4EXIT_STUN_CADENCE_TOLERANCE_S:-5}"
 STUN_MIN_IN_BAND_DELTAS="${LIVE_M4EXIT_STUN_MIN_IN_BAND_DELTAS:-1}"
 
@@ -264,7 +323,16 @@ AGENT_RESTART_COMMAND="${LIVE_M4EXIT_AGENT_RESTART_COMMAND:-}"
 AGENT_RESTART_WAIT_S="${LIVE_M4EXIT_AGENT_RESTART_WAIT_S:-30}"
 
 AGENT_RECORD_FILE="${LIVE_M4EXIT_AGENT_RECORD_FILE:-}"
+AGENT_RECORD_AGENT_ID="${LIVE_M4EXIT_AGENT_RECORD_AGENT_ID:-}"
+AGENT_RECORD_FRESHNESS_TOLERANCE_S="${LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S:-10}"
 EXPECTED_DIRECT_REASON="${LIVE_M4EXIT_EXPECTED_DIRECT_REASON:-probe_failed}"
+
+# Operator-asserted target identity for EVERY state-changing case (lockdown,
+# revoke, opt-in restart). It must equal the configured control base URL, so
+# the operator has to type the exact deployment they intend to mutate. This is
+# the guard against accidentally pointing a destructive case at production or
+# at the M6 dark topology.
+TARGET_CONFIRM="${LIVE_M4EXIT_TARGET_CONFIRM:-}"
 
 ALLOW_LOCKDOWN="${LIVE_M4EXIT_ALLOW_LOCKDOWN:-0}"
 RECOVERY_BOUND_S="${LIVE_M4EXIT_RECOVERY_BOUND_S:-120}"
@@ -437,10 +505,14 @@ sanitize() {
     }
   ' | sed -E \
     -e "s#//[^/@[:space:]]+:[^/@[:space:]]+@#//[REDACTED]@#g" \
+    -e 's#("[^"]*([Pp]assword|[Pp]asswd|[Ss]ecret|[Tt]oken|[Cc]ookie|[Aa]uthorization|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Cc]lient[_-]?[Ss]ecret|[Rr]efresh[_-]?[Tt]oken|[Aa]ccess[_-]?[Tt]oken|[Pp]rivate[_-]?[Kk]ey|[Jj][Tt][Ii])[^"]*"[[:space:]]*:[[:space:]]*")[^"]*"#\1[REDACTED]"#g' \
     -e "s#([Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Aa]uthorization|[Bb]earer|[Pp]assword|[Ss]ecret|[Cc]ookie|[Tt]oken)([[:space:]]*[=:][[:space:]]*|[[:space:]]+)[^[:space:],;\"']+#\1=[REDACTED]#g" \
     -e "s#([^A-Za-z0-9]|^)(jti|JTI)([=:][[:space:]]*)?[A-Za-z0-9._-]{8,}#\1\2=[REDACTED]#g" \
     -e "s#/s/[A-Za-z0-9_-]{6,}#/s/[REDACTED-SHARE-CODE]#g"
 }
+
+# sv: sanitise a single value for a `key=value` metadata line (newlines folded).
+sv() { printf '%s' "$1" | sanitize | tr '\n' ' ' | sed -e 's/[[:space:]]*$//'; }
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -541,6 +613,91 @@ require_config() {
   return "$missing"
 }
 
+# require_target_confirmation: REFUSE a state-changing case unless the operator
+# has explicitly asserted the target by typing its exact control base URL into
+# LIVE_M4EXIT_TARGET_CONFIRM. This is the guard against pointing a lockdown,
+# revocation or restart at production or at the M6 dark topology: the harness
+# cannot know which deployment it is talking to, so the operator must confirm
+# it deliberately, and the confirmation must match the configured target.
+# Returns 1 (recording the FAIL) when the confirmation cannot be established.
+require_target_confirmation() {
+  local prefix="$1"
+  if [[ -z "$TARGET_CONFIRM" ]]; then
+    check "${prefix}_target_confirmed" FAIL "LIVE_M4EXIT_TARGET_CONFIRM is unset — refusing to change state without an explicit operator assertion of the target; set it to the EXACT control base URL of the disposable test stack (currently '${CONTROL_BASE_URL:-<unset>}') to confirm you intend to mutate THIS deployment and not production or the M6 dark topology"
+    return 1
+  fi
+  if [[ -z "$CONTROL_BASE_URL" ]]; then
+    check "${prefix}_target_confirmed" FAIL "LIVE_M4EXIT_TARGET_CONFIRM is set but LIVE_M4EXIT_CONTROL_BASE_URL is unset — cannot verify the confirmed target; set the control base URL first"
+    return 1
+  fi
+  if [[ "$TARGET_CONFIRM" != "$CONTROL_BASE_URL" ]]; then
+    check "${prefix}_target_confirmed" FAIL "LIVE_M4EXIT_TARGET_CONFIRM='$(sv "$TARGET_CONFIRM")' does not equal the configured target '$(sv "$CONTROL_BASE_URL")' — refusing the state-changing case (type the exact control base URL to confirm the target)"
+    return 1
+  fi
+  check "${prefix}_target_confirmed" PASS "operator confirmed the test-stack target (LIVE_M4EXIT_TARGET_CONFIRM == the configured control base URL)"
+  return 0
+}
+
+# revoke_codes_distinct <integrity-code> <revoke-code> -> equal|ok
+# A pure predicate so --dry-run, the revocation case and --selftest all share
+# one definition of "the integrity-test share must never be the revoke target".
+revoke_codes_distinct() {
+  if [[ -n "$1" && "$1" == "$2" ]]; then printf 'equal'; else printf 'ok'; fi
+}
+
+# ---------------------------------------------------------------------------
+# Scratch capture files (hygiene)
+# ---------------------------------------------------------------------------
+#
+# HTTP bodies and headers are secret-bearing (Set-Cookie, tokens, share-code
+# HTML) so they must never accumulate in TMPDIR. They live in ONE per-run 0700
+# scratch directory, are overwritten by later fetches, and the directory is
+# removed by the EXIT/INT/TERM cleanup hook (also on error). This is the
+# retention half of the hygiene contract documented in the header.
+
+M4EXIT_SCRATCH_DIR=""
+
+m4exit_scratch_dir() {
+  # Create the per-run scratch directory in the MAIN process (called from
+  # m4exit_install_lockdown_trap). It is deliberately NOT created inside a
+  # command substitution: `x="$(m4exit_scratch_dir)"` would set the variable in
+  # a throwaway subshell and the main-process cleanup trap would never find the
+  # directory. Case subshells inherit the path by forking, and http_fetch only
+  # writes into it, so exactly one directory exists per run and the trap can
+  # remove it.
+  if [[ -z "${M4EXIT_SCRATCH_DIR:-}" ]]; then
+    M4EXIT_SCRATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-scratch.XXXXXX")"
+    chmod 700 "$M4EXIT_SCRATCH_DIR" 2>/dev/null || true
+  fi
+  return 0
+}
+
+m4exit_cleanup_scratch() {
+  if [[ -n "${M4EXIT_SCRATCH_DIR:-}" && -d "${M4EXIT_SCRATCH_DIR}" ]]; then
+    rm -rf "$M4EXIT_SCRATCH_DIR"
+  fi
+  M4EXIT_SCRATCH_DIR=""
+  return 0
+}
+
+m4exit_cleanup_state() {
+  if [[ -n "${M4EXIT_LOCK_STATE:-}" ]]; then rm -f "$M4EXIT_LOCK_STATE"; fi
+  return 0
+}
+
+# Per-case work directory (execute_case) holds copies of asset bodies and
+# manifests, so it too must be removed on an interrupted run, not only on the
+# normal path where run_all_cases deletes it.
+M4EXIT_CASE_TMP=""
+
+m4exit_cleanup_case_tmp() {
+  if [[ -n "${M4EXIT_CASE_TMP:-}" && -d "${M4EXIT_CASE_TMP}" ]]; then
+    rm -rf "$M4EXIT_CASE_TMP"
+  fi
+  M4EXIT_CASE_TMP=""
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Command runners
 # ---------------------------------------------------------------------------
@@ -575,10 +732,13 @@ HTTP_ERR=""
 
 http_fetch() {
   # http_fetch <curl args...> ; the last argument is the URL
-  local err
-  err="$(mktemp "${TMPDIR:-/tmp}/m4exit-curl.XXXXXX")"
-  HTTP_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/m4exit-body.XXXXXX")"
-  HTTP_HDR_FILE="$(mktemp "${TMPDIR:-/tmp}/m4exit-hdr.XXXXXX")"
+  local sdir err
+  m4exit_scratch_dir
+  sdir="$M4EXIT_SCRATCH_DIR"
+  err="$sdir/curl.err"
+  HTTP_BODY_FILE="$sdir/body"
+  HTTP_HDR_FILE="$sdir/hdr"
+  : > "$err"
   HTTP_CODE="$(curl --silent --show-error --max-time "$CURL_TIMEOUT" \
     -D "$HTTP_HDR_FILE" -o "$HTTP_BODY_FILE" -w '%{http_code}' "$@" 2>"$err")"
   HTTP_ERR="$(cat "$err")"
@@ -588,10 +748,13 @@ http_fetch() {
 }
 
 http_head() {
-  local err
-  err="$(mktemp "${TMPDIR:-/tmp}/m4exit-curl.XXXXXX")"
-  HTTP_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/m4exit-body.XXXXXX")"
-  HTTP_HDR_FILE="$(mktemp "${TMPDIR:-/tmp}/m4exit-hdr.XXXXXX")"
+  local sdir err
+  m4exit_scratch_dir
+  sdir="$M4EXIT_SCRATCH_DIR"
+  err="$sdir/curl.err"
+  HTTP_BODY_FILE="$sdir/body"
+  HTTP_HDR_FILE="$sdir/hdr"
+  : > "$err"
   HTTP_CODE="$(curl --silent --show-error --max-time "$CURL_TIMEOUT" \
     --head -D "$HTTP_HDR_FILE" -o "$HTTP_BODY_FILE" -w '%{http_code}' "$@" 2>"$err")"
   HTTP_ERR="$(cat "$err")"
@@ -778,6 +941,29 @@ frps_journal_available() {
   [[ -n "$FRPS_JOURNAL_FILE" || -n "$FRPS_SSH_HOST" ]]
 }
 
+log_line_epoch_after() {
+  # log_line_epoch_after <line> <floor-epoch> <tolerance-s>
+  # Prints yes|no|notimestamp (or python_unavailable). Used to prove a captured
+  # gateway line is post-revoke rather than a leftover from an earlier run.
+  if ! python_ok; then printf 'python_unavailable'; return 0; fi
+  python3 -c '
+import sys, re, datetime
+line, floor, tol = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?", line)
+if not m:
+    print("notimestamp")
+    sys.exit(0)
+dt = datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6)))
+tz = m.group(7)
+if tz and tz != "Z":
+    sign = -1 if tz[0] == "-" else 1
+    d = tz[1:].replace(":", "")
+    dt = dt - sign * datetime.timedelta(hours=int(d[0:2]), minutes=int(d[2:4]))
+epoch = int((dt - datetime.datetime(1970, 1, 1)).total_seconds())
+print("yes" if epoch >= floor - tol else "no")
+' "$1" "$2" "$3"
+}
+
 # ---------------------------------------------------------------------------
 # Agent admin API + prepare-route
 # ---------------------------------------------------------------------------
@@ -913,13 +1099,35 @@ m4exit_emergency_unlock() {
 }
 
 m4exit_install_lockdown_trap() {
-  # Main-process trap installation (live runs only). INT/TERM unlock first and
-  # then exit with the conventional 128+signal status; the EXIT trap then runs
-  # again but finds the state already cleared, so exactly one unlock is issued.
+  # Main-process trap installation. INT/TERM unlock first and then exit with
+  # the conventional 128+signal status; the EXIT trap then runs again but finds
+  # the state already cleared, so exactly one unlock is issued. The scratch
+  # cleanup runs after the unlock (the unlock itself performs an HTTP fetch).
   m4exit_lock_state_path >/dev/null
-  trap 'm4exit_emergency_unlock' EXIT
-  trap 'm4exit_emergency_unlock; exit 130' INT
-  trap 'm4exit_emergency_unlock; exit 143' TERM
+  m4exit_scratch_dir
+  trap 'm4exit_on_exit' EXIT
+  trap 'm4exit_on_exit; exit 130' INT
+  trap 'm4exit_on_exit; exit 143' TERM
+}
+
+m4exit_on_exit() {
+  m4exit_emergency_unlock
+  m4exit_cleanup_state
+  m4exit_cleanup_case_tmp
+  m4exit_cleanup_scratch
+}
+
+m4exit_lockdown_request() {
+  # Issue POST /api/lockdown with the conservative state marked FIRST.
+  #
+  # A SIGINT/SIGTERM that arrives after the server applied the lockdown but
+  # before the harness read the response must still find the state file, or the
+  # EXIT/INT/TERM trap would not unlock an agent that IS locked. Marking before
+  # the request is the safe (over-approximating) direction; the caller clears
+  # the marker only for a definitively unapplied request (a 4xx rejection) or
+  # after a successful unlock.
+  m4exit_mark_locked
+  agent_api POST "/api/lockdown"
 }
 
 # ===========================================================================
@@ -987,6 +1195,8 @@ enrollment_hydration_restart() {
     if [[ -z "$AGENT_RESTART_COMMAND" ]]; then
       check hydration_restart_action FAIL "LIVE_M4EXIT_ALLOW_AGENT_RESTART=1 requires LIVE_M4EXIT_AGENT_RESTART_COMMAND — set it to the exact agent restart command (e.g. 'systemctl restart sharebridge-agent')"
       restart_action="opted-in restart not executed (no command)"
+    elif ! require_target_confirmation hydration_restart; then
+      restart_action="opted-in restart REFUSED (the operator target assertion failed)"
     else
       local restart_out="" restart_rc=0
       if [[ -n "$AGENT_SSH_HOST" ]]; then
@@ -1265,6 +1475,68 @@ check_playback_416() {
 # CASE: stun_observe_and_rechallenge
 # ===========================================================================
 
+stun_analyze() {
+  # stun_analyze <agent-id> <tolerance-s> ; journal text on stdin.
+  #
+  # Analyses ONLY the lines naming the agent under test and reports the newest
+  # acceptance age, so a stale journal (rechallenging stopped) or an interleaved
+  # unrelated agent cannot satisfy the cadence. Prints parseable key=value lines:
+  #   agent_lines, accepted, newest_age_s, deltas, max_delta, in_band,
+  #   over_band, band_min, band_max, fresh, freshness_reason, error
+  # Kept as a pure function so --selftest can exercise freshness and isolation
+  # refusal without a live control host.
+  python3 -c '
+import sys, re, datetime
+agent = sys.argv[1]
+tol = int(sys.argv[2])
+def out(k, v):
+    print("%s=%s" % (k, v))
+lines = [l for l in sys.stdin.read().splitlines() if agent and agent in l]
+out("agent_lines", len(lines))
+pat = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
+ts = []
+for l in lines:
+    m = pat.search(l)
+    if not m:
+        continue
+    dt = datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6)))
+    tz = m.group(7)
+    if tz and tz != "Z":
+        sign = -1 if tz[0] == "-" else 1
+        digits = tz[1:].replace(":", "")
+        off = datetime.timedelta(hours=int(digits[0:2]), minutes=int(digits[2:4]))
+        dt = dt - sign * off
+    ts.append(dt)
+ts = sorted(set(ts))
+out("accepted", len(ts))
+band_min = 240 - tol
+band_max = 255 + tol
+out("band_min", band_min)
+out("band_max", band_max)
+if ts:
+    age = int((datetime.datetime.utcnow() - ts[-1]).total_seconds())
+    out("newest_age_s", age)
+    if age < -tol:
+        out("fresh", "no")
+        out("freshness_reason", "newest acceptance is in the future by %ds (beyond the %ds clock-skew tolerance)" % (-age, tol))
+    elif age > band_max:
+        out("fresh", "no")
+        out("freshness_reason", "newest acceptance is %ds old (> the %ds upper cadence bound); rechallenging may have stopped" % (age, band_max))
+    else:
+        out("fresh", "yes")
+        out("freshness_reason", "newest acceptance is %ds old (<= the %ds upper cadence bound)" % (age, band_max))
+else:
+    out("newest_age_s", "-")
+    out("fresh", "no")
+    out("freshness_reason", "no parseable acceptance timestamp for the agent under test")
+deltas = [int((b - a).total_seconds()) for a, b in zip(ts, ts[1:])]
+out("deltas", " ".join(str(d) for d in deltas))
+out("max_delta", max(deltas) if deltas else 0)
+out("in_band", sum(1 for d in deltas if band_min <= d <= band_max))
+out("over_band", sum(1 for d in deltas if d > band_max))
+' "$1" "$2"
+}
+
 stun_observe_and_rechallenge() {
   # (1) Counters.
   if fetch_control_metrics >/dev/null 2>&1 && [[ -n "$CONTROL_METRICS_TEXT" ]]; then
@@ -1310,68 +1582,98 @@ stun_observe_and_rechallenge() {
   fi
 
   if [[ -z "$journal" ]]; then
+    check stun_agent_isolation FAIL "no journal available — cannot isolate the agent under test (source=${source:-<unconfigured>})"
     check stun_rechallenge_observed FAIL "no 'stun observation accepted' timestamps available (set LIVE_M4EXIT_STUN_JOURNAL_FILE or LIVE_M4EXIT_CONTROL_SSH_HOST; source=${source:-<unconfigured>}) — cadence unobservable"
     check stun_rechallenge_cadence FAIL "not evaluated: no accept timestamps"
     check stun_rechallenge_no_stall FAIL "not evaluated: no accept timestamps"
+    check stun_rechallenge_fresh FAIL "not evaluated: no accept timestamps"
+    return 0
+  fi
+  if [[ -z "$STUN_AGENT_ID" ]]; then
+    check stun_agent_isolation FAIL "LIVE_M4EXIT_STUN_AGENT_ID is unset — cannot isolate the agent under test in ${source}; set it to the agent api_key_id (the value in 'stun observation accepted for <api_key_id>')"
+    check stun_rechallenge_observed FAIL "not evaluated: the agent under test is not identified"
+    check stun_rechallenge_cadence FAIL "not evaluated: the agent under test is not identified"
+    check stun_rechallenge_no_stall FAIL "not evaluated: the agent under test is not identified"
+    check stun_rechallenge_fresh FAIL "not evaluated: the agent under test is not identified"
     return 0
   fi
   if ! python_ok; then
+    check stun_agent_isolation FAIL "python3 is unavailable — cannot isolate the agent under test"
     check stun_rechallenge_observed FAIL "python3 is unavailable — cannot parse the accept timestamps"
     check stun_rechallenge_cadence FAIL "not evaluated: python3 unavailable"
     check stun_rechallenge_no_stall FAIL "not evaluated: python3 unavailable"
+    check stun_rechallenge_fresh FAIL "not evaluated: python3 unavailable"
     return 0
   fi
 
-  local deltas ts_count
-  deltas="$(printf '%s\n' "$journal" | python3 -c '
-import sys, re, datetime
-ts = []
-for line in sys.stdin:
-    m = re.search(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2}):(\d{2})", line)
-    if m:
-        ts.append(datetime.datetime(
-            int(m.group(1)[0:4]), int(m.group(1)[5:7]), int(m.group(1)[8:10]),
-            int(m.group(2)), int(m.group(3)), int(m.group(4))))
-ts = sorted(set(ts))
-for a, b in zip(ts, ts[1:]):
-    print(int((b - a).total_seconds()))
-')"
-  ts_count="$(printf '%s\n' "$deltas" | grep -cE '^-?[0-9]+$' || true)"
-  ts_count="${ts_count:-0}"
+  # Analyse ONLY the lines naming the agent under test, and require the NEWEST
+  # acceptance to be fresh (within 4m + jitter<=15s + tolerance). This closes
+  # both holes: a stale journal can no longer pass, and interleaved agents are
+  # no longer merged into one timeline.
+  local analysis agent_lines accepted newest_age deltas band_min band_max in_band over_band maxd fresh fresh_reason serr
+  analysis="$(printf '%s\n' "$journal" | stun_analyze "$STUN_AGENT_ID" "$STUN_CADENCE_TOLERANCE_S" 2>/dev/null || true)"
+  agent_lines="$(printf '%s\n' "$analysis" | sed -n 's/^agent_lines=//p')"
+  accepted="$(printf '%s\n' "$analysis" | sed -n 's/^accepted=//p')"
+  newest_age="$(printf '%s\n' "$analysis" | sed -n 's/^newest_age_s=//p')"
+  deltas="$(printf '%s\n' "$analysis" | sed -n 's/^deltas=//p')"
+  band_min="$(printf '%s\n' "$analysis" | sed -n 's/^band_min=//p')"
+  band_max="$(printf '%s\n' "$analysis" | sed -n 's/^band_max=//p')"
+  in_band="$(printf '%s\n' "$analysis" | sed -n 's/^in_band=//p')"
+  over_band="$(printf '%s\n' "$analysis" | sed -n 's/^over_band=//p')"
+  maxd="$(printf '%s\n' "$analysis" | sed -n 's/^max_delta=//p')"
+  fresh="$(printf '%s\n' "$analysis" | sed -n 's/^fresh=//p')"
+  fresh_reason="$(printf '%s\n' "$analysis" | sed -n 's/^freshness_reason=//p')"
 
-  if [[ "$ts_count" -eq 0 ]]; then
-    check stun_rechallenge_observed FAIL "only one (or zero) 'stun observation accepted' timestamp(s) in ${source} — cadence unprovable"
-    check stun_rechallenge_cadence FAIL "not evaluated: fewer than two accept timestamps"
-    check stun_rechallenge_no_stall FAIL "not evaluated: fewer than two accept timestamps"
+  if [[ -z "$analysis" || -z "$accepted" ]]; then
+    check stun_agent_isolation FAIL "could not analyse the journal for the agent under test '$STUN_AGENT_ID' (parse failure; source=${source})"
+    check stun_rechallenge_observed FAIL "not evaluated: journal analysis failed"
+    check stun_rechallenge_cadence FAIL "not evaluated: journal analysis failed"
+    check stun_rechallenge_no_stall FAIL "not evaluated: journal analysis failed"
+    check stun_rechallenge_fresh FAIL "not evaluated: journal analysis failed"
     return 0
   fi
 
-  local tol band_min band_max min_in_band d in_band=0 bad=0 maxd=0
+  if [[ "${agent_lines:-0}" -eq 0 ]]; then
+    check stun_agent_isolation FAIL "no 'stun observation accepted' line mentions LIVE_M4EXIT_STUN_AGENT_ID='$(sv "$STUN_AGENT_ID")' in ${source} — the agent id is wrong or the journal has no acceptance for it"
+    check stun_rechallenge_observed FAIL "not evaluated: the agent under test is absent from the source"
+    check stun_rechallenge_cadence FAIL "not evaluated: the agent under test is absent from the source"
+    check stun_rechallenge_no_stall FAIL "not evaluated: the agent under test is absent from the source"
+    check stun_rechallenge_fresh FAIL "not evaluated: the agent under test is absent from the source"
+    return 0
+  fi
+  check stun_agent_isolation PASS "isolated the agent under test (LIVE_M4EXIT_STUN_AGENT_ID=$(sv "$STUN_AGENT_ID")): ${agent_lines} accept line(s) in ${source}"
+
+  if [[ "${accepted:-0}" -lt 2 ]]; then
+    check stun_rechallenge_observed FAIL "only ${accepted} 'stun observation accepted' timestamp(s) for the agent under test in ${source} — cadence unprovable"
+    check stun_rechallenge_cadence FAIL "not evaluated: fewer than two accept timestamps for the agent under test"
+    check stun_rechallenge_no_stall FAIL "not evaluated: fewer than two accept timestamps for the agent under test"
+    check stun_rechallenge_fresh "$([[ "$fresh" == "yes" ]] && printf PASS || printf FAIL)" "${fresh_reason:-no freshness information}"
+    return 0
+  fi
+
+  local tol min_in_band
   tol="$STUN_CADENCE_TOLERANCE_S"
-  band_min=$(( 240 - tol ))
-  band_max=$(( 255 + tol ))
   min_in_band="$STUN_MIN_IN_BAND_DELTAS"
-  local all_deltas=""
-  while read -r d; do
-    [[ -z "$d" ]] && continue
-    all_deltas="${all_deltas}${d} "
-    [[ "$d" -gt "$maxd" ]] && maxd="$d"
-    if [[ "$d" -gt "$band_max" ]]; then bad=$(( bad + 1 )); fi
-    if [[ "$d" -ge "$band_min" ]]; then in_band=$(( in_band + 1 )); fi
-  done <<< "$deltas"
-  set_fact stun_rechallenge_deltas "${all_deltas% }"
+  local all_deltas="${deltas}"
+  set_fact stun_rechallenge_deltas "${all_deltas}"
   set_fact stun_rechallenge_max_delta "$maxd"
+  set_fact stun_newest_accept_age_s "$newest_age"
 
-  check stun_rechallenge_observed PASS "${ts_count} inter-arrival delta(s) measured from ${source}: ${all_deltas% }"
-  if [[ "$in_band" -ge "$min_in_band" ]]; then
+  check stun_rechallenge_observed PASS "$(printf '%s\n' "$deltas" | wc -w | tr -d ' ') inter-arrival delta(s) measured for the agent under test from ${source}: ${all_deltas}"
+  if [[ "${in_band:-0}" -ge "$min_in_band" ]]; then
     check stun_rechallenge_cadence PASS "${in_band} delta(s) inside the ${band_min}-${band_max}s band (4m + jitter[0,15s) +/- ${tol}s)"
   else
-    check stun_rechallenge_cadence FAIL "only ${in_band} delta(s) inside the ${band_min}-${band_max}s band, want >= ${min_in_band} (deltas: ${all_deltas% })"
+    check stun_rechallenge_cadence FAIL "only ${in_band:-0} delta(s) inside the ${band_min}-${band_max}s band, want >= ${min_in_band} (deltas: ${all_deltas})"
   fi
-  if [[ "$bad" -eq 0 ]]; then
+  if [[ "${over_band:-0}" -eq 0 ]]; then
     check stun_rechallenge_no_stall PASS "no delta exceeds ${band_max}s (proactive rechallenge never stalled; max=${maxd}s)"
   else
-    check stun_rechallenge_no_stall FAIL "${bad} delta(s) exceed ${band_max}s (max=${maxd}s; deltas: ${all_deltas% })"
+    check stun_rechallenge_no_stall FAIL "${over_band} delta(s) exceed ${band_max}s (max=${maxd}s; deltas: ${all_deltas})"
+  fi
+  if [[ "$fresh" == "yes" ]]; then
+    check stun_rechallenge_fresh PASS "${fresh_reason}"
+  else
+    check stun_rechallenge_fresh FAIL "${fresh_reason:-the newest acceptance could not be proven fresh}"
   fi
   return 0
 }
@@ -1386,12 +1688,78 @@ record_field() {
   sed -nE "s/.*\"?${key}\"?[[:space:]]*[:=][[:space:]]*\"?([^\"',}[:space:]]+).*/\1/p" "$file" | head -n1
 }
 
+direct_record_current() {
+  # direct_record_current <file> <agent-id> <floor-epoch> <tolerance-s>
+  #
+  # The direct_status/direct_status_reason fields are the LAST persisted
+  # evaluation, so a stale record can otherwise "prove" a different, current
+  # request. This checks that the artifact is provably CURRENT and CORRELATED:
+  # it must carry a diagnostic timestamp (updated / stun_observed_at /
+  # relay_last_seen_at) at or after the prepare-route request floor (minus a
+  # documented clock-skew tolerance), and it must name the agent under test
+  # (api_key_id or record id). Prints status=<ok|stale|no_timestamp|
+  # agent_mismatch|unreadable> plus the observed values; the caller fails closed
+  # on anything but ok.
+  python3 -c '
+import sys, re, datetime
+path, want, floor, tol = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+try:
+    text = open(path, "r", errors="replace").read()
+except OSError:
+    print("status=unreadable")
+    sys.exit(0)
+ts = []
+for _, s in re.findall(r"\"?(updated|stun_observed_at|relay_last_seen_at)\"?[ \t]*[:=][ \t]*\"?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", text):
+    try:
+        ts.append(datetime.datetime.strptime(s.replace("T", " "), "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        pass
+api_ids = re.findall(r"\"?api_key_id\"?[ \t]*[:=][ \t]*\"?([^\",}\s]+)", text)
+rec_ids = re.findall(r"(?:^|[\"{,\s])id\"?[ \t]*[:=][ \t]*\"?([^\",}\s]+)", text)
+if want and want in api_ids:
+    observed = want
+elif want and want in rec_ids:
+    observed = want
+elif api_ids:
+    observed = api_ids[0]
+elif rec_ids:
+    observed = rec_ids[0]
+else:
+    observed = ""
+epoch = int((max(ts) - datetime.datetime(1970, 1, 1)).total_seconds()) if ts else None
+print("observed_agent=%s" % (observed or "?"))
+print("updated_epoch=%s" % (epoch if epoch is not None else "-"))
+if want and observed != want:
+    print("status=agent_mismatch")
+    sys.exit(0)
+if epoch is None:
+    print("status=no_timestamp")
+    sys.exit(0)
+if epoch < floor - tol:
+    print("status=stale")
+    sys.exit(0)
+print("status=ok")
+' "$1" "$2" "$3" "$4"
+}
+
 direct_path_or_failclosed() {
   require_config \
     "LIVE_M4EXIT_CONTROL_BASE_URL=${CONTROL_BASE_URL}|control base URL for prepare-route" \
     "LIVE_M4EXIT_SHARE_CODE=${SHARE_CODE}|share code for the direct-path scenario" || return 0
 
+  # The diagnostics the fallback branch switches on represent the LAST
+  # evaluation, so the freshness floor is taken immediately BEFORE the request
+  # that must have produced them (see direct_record_current).
+  local prepare_floor_epoch
+  prepare_floor_epoch="$(date -u +%s)"
   prepare_route "$SHARE_CODE"
+  if [[ "$PREPARE_HTTP_CODE" != "200" ]]; then
+    check direct_prepare_status FAIL "prepare-route -> ${PREPARE_HTTP_CODE:-000} (want 200; body: $(sanitize < "$PREPARE_BODY_FILE" | tr -d '\n' | cut -c1-160)) ${HTTP_ERR:-}"
+    check direct_path_observable FAIL "not evaluated: the prepare-route request did not succeed"
+    check direct_failclosed_diagnostics FAIL "not evaluated: the prepare-route request did not succeed"
+    return 0
+  fi
+  check direct_prepare_status PASS "prepare-route -> 200"
   case "$PREPARE_STATUS" in
     direct)
       if [[ -z "$PREPARE_DIRECT_URL" ]]; then
@@ -1409,28 +1777,71 @@ direct_path_or_failclosed() {
     relay)
       check direct_path_observable PASS "prepare-route -> 200 status=relay (fail-closed fallback)"
       if [[ -z "$AGENT_RECORD_FILE" ]]; then
-        check direct_failclosed_diagnostics FAIL "prepare-route reported the fail-closed relay fallback but LIVE_M4EXIT_AGENT_RECORD_FILE is unset, so the control-side direct diagnostics cannot be verified. Expected file: the control agents record for this agent (PocketBase collection 'agents'), saved as JSON or key=value text containing direct_status and direct_status_reason (the parser accepts 'key=value', 'key: value' and JSON). Obtain it from the control admin UI (Collections -> agents -> the agent row -> copy/export) or via the control API. Verdicts: direct_status=relay_fallback AND direct_status_reason=<LIVE_M4EXIT_EXPECTED_DIRECT_REASON, default probe_failed> => PASS; a different direct_status or reason => FAIL; and this file is not needed when prepare-route returns status=direct (that is judged by direct_route_serves instead)"
+        check direct_failclosed_diagnostics FAIL "prepare-route reported the fail-closed relay fallback but LIVE_M4EXIT_AGENT_RECORD_FILE is unset, so the control-side direct diagnostics cannot be verified. Expected file: the control agents record for this agent (PocketBase collection 'agents'), saved as JSON or key=value text containing direct_status, direct_status_reason and an updated timestamp. Obtain it from the control admin UI (Collections -> agents -> the agent row -> copy/export) or via the control API IMMEDIATELY AFTER the prepare-route call, so its `updated` stamp postdates the request. Verdicts: the record must also carry the agent id given in LIVE_M4EXIT_AGENT_RECORD_AGENT_ID and an updated >= the request floor (else direct_failclosed_current FAILs); then direct_status=relay_fallback AND direct_status_reason=<LIVE_M4EXIT_EXPECTED_DIRECT_REASON, default probe_failed> => PASS; a different direct_status, reason, stale timestamp or foreign agent id => FAIL; and this file is not needed when prepare-route returns status=direct (that is judged by direct_route_serves instead)"
         return 0
       fi
       if [[ ! -r "$AGENT_RECORD_FILE" ]]; then
         check direct_failclosed_diagnostics FAIL "LIVE_M4EXIT_AGENT_RECORD_FILE=${AGENT_RECORD_FILE} is not readable"
         return 0
       fi
-      local ds dr
+      if [[ -z "$AGENT_RECORD_AGENT_ID" ]]; then
+        check direct_failclosed_current FAIL "LIVE_M4EXIT_AGENT_RECORD_AGENT_ID is unset — the supplied record cannot be tied to the agent under test, so its diagnostics could belong to a different agent; set it to the agent api_key_id (or the agent record id) under test"
+        check direct_status_relay_fallback FAIL "not evaluated: the agent under test is not identified"
+        check direct_status_reason FAIL "not evaluated: the agent under test is not identified"
+        return 0
+      fi
+      local ds dr cur cur_status updated_epoch observed_agent
       ds="$(record_field "$AGENT_RECORD_FILE" direct_status)"
       dr="$(record_field "$AGENT_RECORD_FILE" direct_status_reason)"
       set_fact direct_status "${ds:-<absent>}"
       set_fact direct_status_reason "${dr:-<absent>}"
-      if [[ "$ds" == "relay_fallback" ]]; then
-        check direct_status_relay_fallback PASS "agent record direct_status=relay_fallback"
-      else
-        check direct_status_relay_fallback FAIL "agent record direct_status='${ds:-<absent>}' (want relay_fallback)"
+      if ! python_ok; then
+        check direct_failclosed_current FAIL "python3 is unavailable — cannot prove the supplied record is current for this request; install python3 or run on a host that has it"
+        check direct_status_relay_fallback FAIL "not evaluated: freshness/correlation unprovable"
+        check direct_status_reason FAIL "not evaluated: freshness/correlation unprovable"
+        return 0
       fi
-      if [[ "$dr" == "$EXPECTED_DIRECT_REASON" ]]; then
-        check direct_status_reason PASS "agent record direct_status_reason=${dr}"
-      else
-        check direct_status_reason FAIL "agent record direct_status_reason='${dr:-<absent>}' (want ${EXPECTED_DIRECT_REASON})"
-      fi
+      cur="$(direct_record_current "$AGENT_RECORD_FILE" "$AGENT_RECORD_AGENT_ID" "$prepare_floor_epoch" "$AGENT_RECORD_FRESHNESS_TOLERANCE_S" 2>/dev/null || true)"
+      cur_status="$(printf '%s\n' "$cur" | sed -n 's/^status=//p')"
+      updated_epoch="$(printf '%s\n' "$cur" | sed -n 's/^updated_epoch=//p')"
+      observed_agent="$(printf '%s\n' "$cur" | sed -n 's/^observed_agent=//p')"
+      set_fact direct_record_updated_epoch "${updated_epoch:-<absent>}"
+      set_fact direct_record_observed_agent "${observed_agent:-<absent>}"
+      case "$cur_status" in
+        ok)
+          check direct_failclosed_current PASS "the record's newest diagnostic timestamp (updated_epoch=${updated_epoch}) is at/after the prepare-route floor ${prepare_floor_epoch} (tolerance ${AGENT_RECORD_FRESHNESS_TOLERANCE_S}s) and its agent id matches the agent under test"
+          if [[ "$ds" == "relay_fallback" ]]; then
+            check direct_status_relay_fallback PASS "agent record direct_status=relay_fallback"
+          else
+            check direct_status_relay_fallback FAIL "agent record direct_status='${ds:-<absent>}' (want relay_fallback)"
+          fi
+          if [[ "$dr" == "$EXPECTED_DIRECT_REASON" ]]; then
+            check direct_status_reason PASS "agent record direct_status_reason=${dr}"
+          else
+            check direct_status_reason FAIL "agent record direct_status_reason='${dr:-<absent>}' (want ${EXPECTED_DIRECT_REASON})"
+          fi
+          ;;
+        agent_mismatch)
+          check direct_failclosed_current FAIL "the supplied record names agent '${observed_agent:-<none>}' but LIVE_M4EXIT_AGENT_RECORD_AGENT_ID='$(sv "$AGENT_RECORD_AGENT_ID")' — refusing to attribute another agent's diagnostics; supply the record for the agent under test"
+          check direct_status_relay_fallback FAIL "not evaluated: the record belongs to a different agent"
+          check direct_status_reason FAIL "not evaluated: the record belongs to a different agent"
+          ;;
+        stale)
+          check direct_failclosed_current FAIL "the record's newest diagnostic timestamp (updated_epoch='${updated_epoch}') predates the prepare-route floor ${prepare_floor_epoch} (tolerance ${AGENT_RECORD_FRESHNESS_TOLERANCE_S}s) — it reflects an EARLIER evaluation, not this request; export the agent record immediately after the prepare-route call (probe_failed requires the probe to have run during that request)"
+          check direct_status_relay_fallback FAIL "not evaluated: the diagnostics are not provably current for this request"
+          check direct_status_reason FAIL "not evaluated: the diagnostics are not provably current for this request"
+          ;;
+        no_timestamp)
+          check direct_failclosed_current FAIL "the supplied record carries no updated/stun_observed_at/relay_last_seen_at timestamp — freshness cannot be established; export the live PocketBase agents record (it carries an `updated` stamp) rather than a hand-written key=value file"
+          check direct_status_relay_fallback FAIL "not evaluated: freshness unprovable"
+          check direct_status_reason FAIL "not evaluated: freshness unprovable"
+          ;;
+        *)
+          check direct_failclosed_current FAIL "could not evaluate the supplied record '${AGENT_RECORD_FILE}' (status='${cur_status:-<none>}') — is it the agents record for the deployment under test?"
+          check direct_status_relay_fallback FAIL "not evaluated: freshness/correlation unprovable"
+          check direct_status_reason FAIL "not evaluated: freshness/correlation unprovable"
+          ;;
+      esac
       ;;
     "")
       check direct_path_observable FAIL "prepare-route -> ${PREPARE_HTTP_CODE:-000} produced no status (body: $(sanitize < "$PREPARE_BODY_FILE" | tr -d '\n' | cut -c1-160)) — neither direct nor relay is observable"
@@ -1462,17 +1873,35 @@ lockdown_withdrawal_and_recovery() {
   # m4exit_install_lockdown_trap before the cases run); this case only records
   # the locked state in the shared state file so the trap can see it.
 
-  # (1) Baseline healthy: relay route + tunnel online.
-  local baseline_url=""
-  if prepare_relay_or_fail "$SHARE_CODE" lockdown_baseline; then
-    baseline_url="$PREPARE_RELAY_URL"
+  # (0) Operator target assertion: refuse to change state without it. A lockdown
+  # pointed at production or the M6 dark topology is exactly the accident this
+  # guard exists to prevent.
+  require_target_confirmation lockdown || return 0
+
+  # (1) Baseline healthy: relay route + tunnel online + the relay URL SERVES.
+  # Without a serving baseline the post-lock "no content" result proves
+  # nothing, so a broken baseline refuses the state change outright.
+  local baseline_url="" baseline_bytes=0
+  if ! prepare_relay_or_fail "$SHARE_CODE" lockdown_baseline; then
+    check lockdown_baseline_serves FAIL "not evaluated: no baseline relay URL was issued (prepare-route failed) — refusing to lock down without a serving baseline"
+    return 0
+  fi
+  baseline_url="$PREPARE_RELAY_URL"
+  http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$baseline_url"
+  [[ -f "$HTTP_BODY_FILE" ]] && baseline_bytes="$(file_bytes "$HTTP_BODY_FILE")"
+  if [[ "$HTTP_CODE" == "200" && "${baseline_bytes:-0}" -gt 0 ]]; then
+    check lockdown_baseline_serves PASS "pre-lockdown relay URL serves: 200 with ${baseline_bytes} bytes (baseline for the withdrawal comparison)"
+  else
+    check lockdown_baseline_serves FAIL "pre-lockdown relay URL -> ${HTTP_CODE:-000} with ${baseline_bytes:-0} bytes (want 200 with content) — an already-broken URL cannot prove withdrawal; refusing to lock down ${HTTP_ERR:-}"
+    return 0
   fi
   local online
   online="$(gateway_tunnel_online 2>/dev/null || true)"
   if [[ "${online:-0}" -ge 1 ]]; then
     check lockdown_baseline_tunnel PASS "baseline tunnel online=${online}"
   else
-    check lockdown_baseline_tunnel FAIL "baseline tunnel online=${online:-<absent>} (want >=1)"
+    check lockdown_baseline_tunnel FAIL "baseline tunnel online=${online:-<absent>} (want >=1) — refusing to lock down without an online baseline tunnel"
+    return 0
   fi
 
   # (2) frps close baseline: count matching journal lines first.
@@ -1487,13 +1916,26 @@ lockdown_withdrawal_and_recovery() {
   frps_err_before="$(frps_journal_grep "listener is closed" 2>/dev/null | grep -c . || true)"
   frps_err_before="${frps_err_before:-0}"
 
-  # (3) Lockdown.
-  agent_api POST "/api/lockdown"
+  # (3) Lockdown. The conservative "may be locked" marker is written BEFORE the
+  # request (m4exit_lockdown_request), so a SIGINT/SIGTERM arriving after the
+  # server applied the lockdown but before the response was read still leaves
+  # the state file for the EXIT/INT/TERM trap to unlock. The marker is cleared
+  # only for a definitively unapplied request (a 4xx rejection) or a successful
+  # unlock later in this case.
+  m4exit_lockdown_request
   if [[ "$AGENT_HTTP_CODE" == "200" ]]; then
-    m4exit_mark_locked
     check lockdown_applied PASS "POST /api/lockdown -> 200 ($(json_str "$(cat "$AGENT_BODY_FILE")" locked))"
   else
     check lockdown_applied FAIL "POST /api/lockdown -> ${AGENT_HTTP_CODE:-000} ${HTTP_ERR:-}"
+    case "$AGENT_HTTP_CODE" in
+      4*)
+        m4exit_mark_unlocked
+        note lockdown_lock_state "lockdown request was rejected with ${AGENT_HTTP_CODE} (definitively not applied) — conservative locked marker cleared"
+        ;;
+      *)
+        note lockdown_lock_state "lockdown result was ambiguous (${AGENT_HTTP_CODE:-000}) — keeping the conservative locked marker so the EXIT/INT/TERM trap still attempts an unlock"
+        ;;
+    esac
     return 0
   fi
 
@@ -1542,7 +1984,7 @@ lockdown_withdrawal_and_recovery() {
     local bytes=0
     [[ -f "$HTTP_BODY_FILE" ]] && bytes="$(file_bytes "$HTTP_BODY_FILE")"
     if [[ "$HTTP_CODE" != "200" && "$bytes" -eq 0 ]]; then
-      check lockdown_relay_withdrawn PASS "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes (no content served)"
+      check lockdown_relay_withdrawn PASS "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes, a change from the ${baseline_bytes}-byte serving baseline (no content served)"
     elif [[ "$HTTP_CODE" != "200" ]]; then
       check lockdown_relay_withdrawn FAIL "relay fetch while locked -> ${HTTP_CODE:-000} but ${bytes} bytes were served"
     else
@@ -1583,6 +2025,30 @@ lockdown_withdrawal_and_recovery() {
 # CASE: revocation_midstream  (OPT-IN)
 # ===========================================================================
 
+# revoke_inflight_verdict <started-bytes> <full-bytes> <alive 0|1>
+# Prints ok | zero-bytes | completed | not-alive. A pure predicate for the
+# BLOCKING-1 rule: a mid-stream revocation can only be proven when the
+# throttled download had transferred some bytes, had not finished, and the curl
+# process was still running at revoke time. Shared with --selftest.
+revoke_inflight_verdict() {
+  if [[ "${1:-0}" -le 0 ]]; then printf 'zero-bytes'; return 0; fi
+  if [[ "${1:-0}" -ge "${2:-0}" ]]; then printf 'completed'; return 0; fi
+  if [[ "${3:-0}" != "1" ]]; then printf 'not-alive'; return 0; fi
+  printf 'ok'
+}
+
+# drain_new_lines <exact-host> <baseline-text> ; candidate lines on stdin.
+# Emits only the candidate lines that mention the exact host AND are absent
+# verbatim from the pre-revoke baseline, i.e. genuinely newly observed.
+drain_new_lines() {
+  local host="$1" baseline="$2" l
+  while IFS= read -r l; do
+    [[ -n "$l" && "$l" == *"$host"* ]] || continue
+    printf '%s\n' "$baseline" | grep -qxF -- "$l" && continue
+    printf '%s\n' "$l"
+  done
+}
+
 revocation_midstream() {
   if [[ "$ALLOW_REVOKE" != "1" ]]; then
     check revoke_opt_in SKIP "LIVE_M4EXIT_ALLOW_REVOKE!=1 — this case revokes a share mid-transfer; opt in explicitly"
@@ -1598,11 +2064,32 @@ revocation_midstream() {
     "LIVE_M4EXIT_AGENT_ADMIN_USER=${AGENT_ADMIN_USER}|agent admin Basic-auth user" \
     "LIVE_M4EXIT_AGENT_ADMIN_PASSWORD=${AGENT_ADMIN_PASSWORD}|agent admin Basic-auth password" || return 0
 
+  # (0a) The integrity-test share must never be the revocation target.
+  if [[ "$(revoke_codes_distinct "$SHARE_CODE" "$REVOKE_SHARE_CODE")" == "equal" ]]; then
+    check revoke_share_code_distinct FAIL "LIVE_M4EXIT_REVOKE_SHARE_CODE equals LIVE_M4EXIT_SHARE_CODE — refusing to revoke the integrity-test share; set LIVE_M4EXIT_REVOKE_SHARE_CODE to a DIFFERENT share"
+    return 0
+  fi
+  check revoke_share_code_distinct PASS "the revocation share code differs from the integrity share code"
+
+  # (0b) Operator target assertion before any state change.
+  require_target_confirmation revoke || return 0
+
   # (1) Relay route for the share to revoke.
   if ! prepare_relay_or_fail "$REVOKE_SHARE_CODE" revoke; then
     return 0
   fi
   local relay_url="$PREPARE_RELAY_URL"
+  local revoke_relay_host
+  revoke_relay_host="$(url_host "$relay_url")"
+  if [[ -z "$revoke_relay_host" ]]; then
+    check revoke_gateway_drain FAIL "cannot determine the relay host from relay_url='$(sv "$relay_url")' — the drain line cannot be attributed to this run's route"
+    return 0
+  fi
+  # The pre-revoke baseline of matching drain lines is captured immediately
+  # BEFORE the DELETE below, so a leftover line from an earlier run (or a line
+  # emitted for any other reason during setup) can never be mistaken for the
+  # NEW close caused by this mutation.
+  local drain_baseline=""
 
   # (2) Resolve the asset id and its full size.
   local asset_id="${REVOKE_ASSET_ID:-$ASSET_ID}"
@@ -1643,11 +2130,43 @@ revocation_midstream() {
   sleep "$REVOKE_DELAY_S"
   local started_bytes=0
   [[ -f "$dl_body" ]] && started_bytes="$(file_bytes "$dl_body")"
+  local dl_alive=0
+  if kill -0 "$dl_pid" 2>/dev/null; then dl_alive=1; fi
+  record_out "revoke preflight: started=${started_bytes} alive=${dl_alive} full=${full_size} host=${revoke_relay_host}"
+
+  # PROOF OF AN IN-FLIGHT TRANSFER is a precondition for the state-changing
+  # DELETE: 0 bytes (the stale case the review found) or an already-finished
+  # transfer cannot demonstrate mid-stream revocation. Fail closed and do NOT
+  # revoke when the precondition is not met.
+  local inflight_verdict inflight_fail=""
+  inflight_verdict="$(revoke_inflight_verdict "${started_bytes:-0}" "$full_size" "$dl_alive")"
+  case "$inflight_verdict" in
+    zero-bytes)
+      inflight_fail="the throttled download had downloaded ${started_bytes} bytes after ${REVOKE_DELAY_S}s (want 0 < bytes < ${full_size}) — no in-flight transfer was established; raise LIVE_M4EXIT_REVOKE_DELAY_S or lower LIVE_M4EXIT_REVOKE_LIMIT_RATE" ;;
+    completed)
+      inflight_fail="the transfer had already completed (started=${started_bytes} >= full=${full_size}) — it was not mid-stream; decrease LIVE_M4EXIT_REVOKE_DELAY_S or lower LIVE_M4EXIT_REVOKE_LIMIT_RATE" ;;
+    not-alive)
+      inflight_fail="the download process had already exited before the revoke (started=${started_bytes}/${full_size}) — no transfer was in flight at revoke time; raise LIVE_M4EXIT_REVOKE_TIMEOUT_S or lower LIVE_M4EXIT_REVOKE_DELAY_S" ;;
+    *)
+      inflight_fail="" ;;
+  esac
+  if [[ -n "$inflight_fail" ]]; then
+    kill "$dl_pid" 2>/dev/null || true
+    wait "$dl_pid" 2>/dev/null || true
+    check revoke_inflight_transfer FAIL "${inflight_fail}. Refusing the state-changing DELETE because a mid-stream revocation cannot be proven"
+    check revoke_transfer_truncated FAIL "not evaluated: no in-flight transfer was established"
+    check revoke_gateway_drain FAIL "not evaluated: the DELETE was not issued"
+    return 0
+  fi
+  check revoke_inflight_transfer PASS "in-flight transfer proven: ${started_bytes}/${full_size} bytes downloaded and the curl process is still alive at revoke time"
 
   # (4) Revoke mid-transfer.
+  local revoke_epoch
+  drain_baseline="$(gateway_journal_grep 'revoked route closed established streams' 2>/dev/null | grep -F "$revoke_relay_host" || true)"
+  revoke_epoch="$(date -u +%s)"
   agent_api DELETE "/api/shares/${REVOKE_SHARE_CODE}"
   if [[ "$AGENT_HTTP_CODE" == "200" ]]; then
-    check revoke_applied PASS "DELETE /api/shares/<code> -> 200 mid-transfer (${started_bytes} bytes downloaded at revoke)"
+    check revoke_applied PASS "DELETE /api/shares/<code> -> 200 mid-transfer (${started_bytes} bytes downloaded and the transfer still running at revoke)"
   else
     check revoke_applied FAIL "DELETE /api/shares/<code> -> ${AGENT_HTTP_CODE:-000} ${HTTP_ERR:-}"
   fi
@@ -1675,28 +2194,35 @@ revocation_midstream() {
     check revoke_transfer_truncated FAIL "download completed ${final_bytes}/${full_size} bytes — the mid-stream revocation was not enforced"
   fi
 
-  # (7) Gateway route-revocation drain log line.
+  # (7) Gateway route-revocation drain log line. The line must be NEWLY
+  # OBSERVED (absent from the pre-revoke baseline), name the EXACT relay host
+  # for this run, report streams>=1 and - when it carries a timestamp - be
+  # post-revoke. A leftover `streams=1` line can no longer complete the case.
   local drain_line="" drain_wait=0
   if ! gateway_journal_available; then
     check revoke_gateway_drain FAIL "no gateway journal access: set LIVE_M4EXIT_GATEWAY_JOURNAL_FILE or LIVE_M4EXIT_GATEWAY_SSH_HOST"
   else
     while [[ "$drain_wait" -le 20 ]]; do
-      drain_line="$(gateway_journal_grep 'revoked route closed established streams' 2>/dev/null | tail -n1)"
+      drain_line="$(gateway_journal_grep 'revoked route closed established streams' 2>/dev/null | drain_new_lines "$revoke_relay_host" "$drain_baseline" | tail -n1)"
       [[ -n "$drain_line" ]] && break
       sleep 1
       drain_wait=$(( drain_wait + 1 ))
     done
-    if [[ -n "$drain_line" ]]; then
-      local streams
-      streams="$(printf '%s' "$drain_line" | grep -oE 'streams=[0-9]+' | grep -oE '[0-9]+' | tail -n1)"
-      set_fact revoke_drain_streams "${streams:-<absent>}"
-      if [[ -n "$streams" && "$streams" -ge 1 ]]; then
-        check revoke_gateway_drain PASS "gateway log: revoked route closed established streams ... streams=${streams}"
-      else
-        check revoke_gateway_drain FAIL "gateway drain line observed but streams='${streams:-<absent>}' (want >=1): $(printf '%s' "$drain_line" | cut -c1-200)"
-      fi
+    if [[ -z "$drain_line" ]]; then
+      check revoke_gateway_drain FAIL "no NEWLY OBSERVED 'revoked route closed established streams' line for hostname '${revoke_relay_host}' in the gateway journal within 20s (the pre-revoke baseline already held $(printf '%s\n' "$drain_baseline" | grep -c . || true) matching line(s), so an old line is not proof); remedy: capture the gateway journal during this run or verify that the exact relay URL host '${revoke_relay_host}' is the hostname logged on the drain line"
     else
-      check revoke_gateway_drain FAIL "no 'revoked route closed established streams' line in the gateway journal within 20s"
+      local streams ts_verdict
+      streams="$(printf '%s' "$drain_line" | grep -oE 'streams=[0-9]+' | grep -oE '[0-9]+' | tail -n1)"
+      ts_verdict="$(log_line_epoch_after "$drain_line" "$revoke_epoch" 10)"
+      set_fact revoke_drain_streams "${streams:-<absent>}"
+      set_fact revoke_drain_host "$revoke_relay_host"
+      if [[ "$ts_verdict" != "yes" ]]; then
+        check revoke_gateway_drain FAIL "gateway drain line for hostname '${revoke_relay_host}' is not provably post-revoke (timestamp verdict='${ts_verdict}'; revoke floor=${revoke_epoch}): $(printf '%s' "$drain_line" | cut -c1-200) — capture the journal with timestamps (journalctl -o short-iso) so recency can be proven"
+      elif [[ -n "$streams" && "$streams" -ge 1 ]]; then
+        check revoke_gateway_drain PASS "gateway log: NEW drain line for the exact hostname '${revoke_relay_host}' post-revoke: streams=${streams}"
+      else
+        check revoke_gateway_drain FAIL "gateway drain line observed for hostname '${revoke_relay_host}' but streams='${streams:-<absent>}' (want >=1): $(printf '%s' "$drain_line" | cut -c1-200)"
+      fi
     fi
   fi
 
@@ -1750,6 +2276,7 @@ execute_case() {
   # execute_case <fn-name> ; sets EXECUTE_RESULT and EXECUTE_DETAIL
   local name="$1" tmp
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-case.XXXXXX")"
+  M4EXIT_CASE_TMP="$tmp"
   GATE_CHECK_FILE="$tmp/checks"
   GATE_CMD_FILE="$tmp/cmds"
   GATE_OUT_FILE="$tmp/out"
@@ -1812,9 +2339,10 @@ write_case_evidence() {
     printf 'harness=%s\n' "scripts/live-m4exit-e2e.sh"
     printf 'destructive=%s\n' "$(case_is_destructive "$name")"
     printf 'opt_in=%s\n' "$(case_opt_in_flag "$name")"
-    printf 'control_base_url=%s\n' "${CONTROL_BASE_URL:-<unset>}"
+    printf 'control_base_url=%s\n' "$(sv "${CONTROL_BASE_URL:-<unset>}")"
     printf 'share_code=%s\n' "${SHARE_CODE:+[REDACTED-SHARE-CODE]}"
     printf 'revoke_share_code=%s\n' "${REVOKE_SHARE_CODE:+[REDACTED-SHARE-CODE]}"
+    printf 'target_confirm=%s\n' "$([[ -n "$TARGET_CONFIRM" ]] && printf 'asserted' || printf 'unset')"
     printf 'result=%s\n' "$result"
     printf 'result_detail=%s\n' "$detail"
     printf 'checks:\n'
@@ -1834,8 +2362,8 @@ run_all_cases() {
   printf 'mode=%s\n' "$MODE"
   printf 'scope=%s\n' "$([[ -z "$SELECTED_CASES" ]] && echo all-registered || echo "$SELECTED_CASES")"
   printf 'evidence_dir=%s\n' "$RUN_DIR"
-  printf 'control_base_url=%s\n' "${CONTROL_BASE_URL:-<unset>}"
-  printf 'relay_host=%s\n' "${RELAY_HOST:-<unset>}"
+  printf 'control_base_url=%s\n' "$(sv "${CONTROL_BASE_URL:-<unset>}")"
+  printf 'relay_host=%s\n' "$(sv "${RELAY_HOST:-<unset>}")"
   printf 'allow_lockdown=%s\n' "$ALLOW_LOCKDOWN"
   printf 'allow_revoke=%s\n' "$ALLOW_REVOKE"
   printf 'allow_agent_restart=%s\n' "$ALLOW_AGENT_RESTART"
@@ -1870,6 +2398,7 @@ run_all_cases() {
     if [[ -s "$EXECUTE_TMP/facts" ]]; then cat "$EXECUTE_TMP/facts" >> "$RUN_FACTS_FILE"; fi
     printf '  => %s (%s)\n' "$result" "$detail"
     rm -rf "$EXECUTE_TMP"
+    M4EXIT_CASE_TMP=""
   done
 }
 
@@ -1892,14 +2421,16 @@ write_run_metadata() {
     printf 'harness_host_platform=%s_%s\n' "$uname_s" "$(uname -m 2>/dev/null || echo unknown)"
     printf 'mode=%s\n' "$MODE"
     printf 'scope=%s\n' "$([[ -z "$SELECTED_CASES" ]] && echo all-registered || echo "$SELECTED_CASES")"
-    printf 'control_base_url=%s\n' "${CONTROL_BASE_URL:-<unset>}"
-    printf 'relay_host=%s\n' "${RELAY_HOST:-<unset>}"
-    printf 'control_ssh_host=%s\n' "${CONTROL_SSH_HOST:-<unset>}"
-    printf 'gateway_ssh_host=%s\n' "${GATEWAY_SSH_HOST:-<unset>}"
-    printf 'agent_admin_base_url=%s\n' "${AGENT_ADMIN_BASE_URL:-<unset>}"
+    printf 'control_base_url=%s\n' "$(sv "${CONTROL_BASE_URL:-<unset>}")"
+    printf 'relay_host=%s\n' "$(sv "${RELAY_HOST:-<unset>}")"
+    printf 'control_ssh_host=%s\n' "$(sv "${CONTROL_SSH_HOST:-<unset>}")"
+    printf 'gateway_ssh_host=%s\n' "$(sv "${GATEWAY_SSH_HOST:-<unset>}")"
+    printf 'agent_admin_base_url=%s\n' "$(sv "${AGENT_ADMIN_BASE_URL:-<unset>}")"
     printf 'agent_admin_password=%s\n' "$([[ -n "$AGENT_ADMIN_PASSWORD" ]] && printf '[REDACTED]' || printf '<unset>')"
     printf 'share_code=%s\n' "$([[ -n "$SHARE_CODE" ]] && printf '[REDACTED-SHARE-CODE]' || printf '<unset>')"
     printf 'revoke_share_code=%s\n' "$([[ -n "$REVOKE_SHARE_CODE" ]] && printf '[REDACTED-SHARE-CODE]' || printf '<unset>')"
+    printf 'target_confirm=%s\n' "$([[ -n "$TARGET_CONFIRM" ]] && printf 'asserted (equal to the configured control base URL)' || printf 'unset')"
+    printf 'destructive_target_confirmed=%s\n' "$([[ -n "$TARGET_CONFIRM" && "$TARGET_CONFIRM" == "$CONTROL_BASE_URL" ]] && printf yes || printf no)"
     printf 'allow_lockdown=%s (destructive-but-reversible: case lockdown_withdrawal_and_recovery)\n' "$ALLOW_LOCKDOWN"
     printf 'allow_revoke=%s (destructive-but-agent-local: case revocation_midstream)\n' "$ALLOW_REVOKE"
     printf 'allow_agent_restart=%s (opt-in agent restart inside case enrollment_hydration_restart)\n' "$ALLOW_AGENT_RESTART"
@@ -1957,8 +2488,8 @@ write_environment_facts() {
   printf 'run_id=%s\n' "$RUN_ID"
   printf 'utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'harness_git_sha=%s\n' "$GIT_SHA"
-  printf 'control_base_url=%s\n' "${CONTROL_BASE_URL:-PENDING (LIVE_M4EXIT_CONTROL_BASE_URL unset)}"
-  printf 'relay_host=%s\n' "${RELAY_HOST:-PENDING (LIVE_M4EXIT_RELAY_HOST unset)}"
+  printf 'control_base_url=%s\n' "$(sv "${CONTROL_BASE_URL:-PENDING (LIVE_M4EXIT_CONTROL_BASE_URL unset)}")"
+  printf 'relay_host=%s\n' "$(sv "${RELAY_HOST:-PENDING (LIVE_M4EXIT_RELAY_HOST unset)}")"
   printf 'enrollment_registered_shares=%s\n' "$(fact_get enrollment_registered_shares)"
   printf 'hydrated_sessions=%s\n' "$(fact_get hydration_loaded_sessions)"
   printf 'hydration_restart_action=%s\n' "$(fact_get hydration_restart_action)"
@@ -1971,13 +2502,17 @@ write_environment_facts() {
   printf 'stun_mismatch_total=%s\n' "$(fact_get stun_mismatch_total)"
   printf 'stun_timeout_total=%s\n' "$(fact_get stun_timeout_total)"
   printf 'stun_rechallenge_deltas=%s\n' "$(fact_get stun_rechallenge_deltas)"
+  printf 'stun_newest_accept_age_s=%s\n' "$(fact_get stun_newest_accept_age_s)"
   printf 'direct_status=%s\n' "$(fact_get direct_status)"
   printf 'direct_status_reason=%s\n' "$(fact_get direct_status_reason)"
+  printf 'direct_record_updated_epoch=%s\n' "$(fact_get direct_record_updated_epoch)"
+  printf 'direct_record_observed_agent=%s\n' "$(fact_get direct_record_observed_agent)"
   printf 'lockdown_tunnel_offline_seconds=%s\n' "$(fact_get lockdown_tunnel_offline_seconds)"
   printf 'lockdown_recovery_seconds=%s\n' "$(fact_get lockdown_recovery_seconds)"
   printf 'revoke_download_bytes=%s\n' "$(fact_get revoke_download_bytes)"
   printf 'revoke_asset_full_bytes=%s\n' "$(fact_get revoke_asset_full_bytes)"
   printf 'revoke_drain_streams=%s\n' "$(fact_get revoke_drain_streams)"
+  printf 'revoke_drain_host=%s\n' "$(fact_get revoke_drain_host)"
 }
 
 # ---------------------------------------------------------------------------
@@ -2011,6 +2546,17 @@ report_missing_any() {
   return 0
 }
 
+# _validate_target_confirm_match: dry-run validation helper. Increments
+# MISSING_COUNT when the asserted target does not equal the configured control
+# base URL (both set).
+_validate_target_confirm_match() {
+  if [[ -n "$TARGET_CONFIRM" && -n "$CONTROL_BASE_URL" && "$TARGET_CONFIRM" != "$CONTROL_BASE_URL" ]]; then
+    printf '  INVALID: LIVE_M4EXIT_TARGET_CONFIRM=%s does not equal LIVE_M4EXIT_CONTROL_BASE_URL=%s\n' "$(sv "$TARGET_CONFIRM")" "$(sv "$CONTROL_BASE_URL")"
+    MISSING_COUNT=$(( MISSING_COUNT + 1 ))
+  fi
+  return 0
+}
+
 validate_case_config() {
   local name="$1"
   case "$name" in
@@ -2026,6 +2572,8 @@ validate_case_config() {
       report_missing_any "agent log source" "LIVE_M4EXIT_AGENT_LOG_FILE=$AGENT_LOG_FILE" "LIVE_M4EXIT_AGENT_SSH_HOST=$AGENT_SSH_HOST"
       if [[ "$ALLOW_AGENT_RESTART" == "1" ]]; then
         report_missing LIVE_M4EXIT_AGENT_RESTART_COMMAND "$AGENT_RESTART_COMMAND" "restart command (required when LIVE_M4EXIT_ALLOW_AGENT_RESTART=1)"
+        report_missing LIVE_M4EXIT_TARGET_CONFIRM "$TARGET_CONFIRM" "operator target assertion for the opted-in restart (must equal LIVE_M4EXIT_CONTROL_BASE_URL)"
+        _validate_target_confirm_match
       fi
       ;;
     relay_content_integrity)
@@ -2041,17 +2589,22 @@ validate_case_config() {
     stun_observe_and_rechallenge)
       report_missing_any "control metrics access" "LIVE_M4EXIT_CONTROL_METRICS_URL=$CONTROL_METRICS_URL" "LIVE_M4EXIT_CONTROL_SSH_HOST=$CONTROL_SSH_HOST"
       report_missing_any "STUN accept-timestamp source" "LIVE_M4EXIT_STUN_JOURNAL_FILE=$STUN_JOURNAL_FILE" "LIVE_M4EXIT_CONTROL_SSH_HOST=$CONTROL_SSH_HOST"
+      report_missing LIVE_M4EXIT_STUN_AGENT_ID "$STUN_AGENT_ID" "agent api_key_id under test (only its accept lines are analysed)"
       if ! python_ok; then printf '  MISSING: python3 — required to parse the STUN cadence\n'; MISSING_COUNT=$(( MISSING_COUNT + 1 )); fi
       ;;
     direct_path_or_failclosed)
       report_missing LIVE_M4EXIT_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control base URL"
       report_missing LIVE_M4EXIT_SHARE_CODE "$SHARE_CODE" "share code"
       printf '  NOTE: LIVE_M4EXIT_AGENT_RECORD_FILE=%s is required only when prepare-route returns status=relay\n' "${AGENT_RECORD_FILE:-<unset>}"
+      printf '  NOTE: LIVE_M4EXIT_AGENT_RECORD_AGENT_ID=%s is required with that file so the record can be tied to the agent under test\n' "${AGENT_RECORD_AGENT_ID:-<unset>}"
+      if ! python_ok; then printf '  NOTE: python3 is unavailable — required to prove the relay-fallback record is current\n'; fi
       ;;
     lockdown_withdrawal_and_recovery)
       report_missing LIVE_M4EXIT_ALLOW_LOCKDOWN "$([[ "$ALLOW_LOCKDOWN" == "1" ]] && printf set)" "opt-in flag (requires =1)"
       report_missing LIVE_M4EXIT_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control base URL"
       report_missing LIVE_M4EXIT_SHARE_CODE "$SHARE_CODE" "share code"
+      report_missing LIVE_M4EXIT_TARGET_CONFIRM "$TARGET_CONFIRM" "operator target assertion (must equal LIVE_M4EXIT_CONTROL_BASE_URL)"
+      _validate_target_confirm_match
       report_missing LIVE_M4EXIT_AGENT_ADMIN_BASE_URL "$AGENT_ADMIN_BASE_URL" "agent admin base URL"
       report_missing LIVE_M4EXIT_AGENT_ADMIN_USER "$AGENT_ADMIN_USER" "agent admin Basic-auth user"
       report_missing LIVE_M4EXIT_AGENT_ADMIN_PASSWORD "$AGENT_ADMIN_PASSWORD" "agent admin Basic-auth password"
@@ -2061,6 +2614,12 @@ validate_case_config() {
     revocation_midstream)
       report_missing LIVE_M4EXIT_ALLOW_REVOKE "$([[ "$ALLOW_REVOKE" == "1" ]] && printf set)" "opt-in flag (requires =1)"
       report_missing LIVE_M4EXIT_REVOKE_SHARE_CODE "$REVOKE_SHARE_CODE" "share code to revoke"
+      if [[ "$(revoke_codes_distinct "$SHARE_CODE" "$REVOKE_SHARE_CODE")" == "equal" ]]; then
+        printf '  INVALID: LIVE_M4EXIT_REVOKE_SHARE_CODE equals LIVE_M4EXIT_SHARE_CODE — the integrity-test share must never be revoked\n'
+        MISSING_COUNT=$(( MISSING_COUNT + 1 ))
+      fi
+      report_missing LIVE_M4EXIT_TARGET_CONFIRM "$TARGET_CONFIRM" "operator target assertion (must equal LIVE_M4EXIT_CONTROL_BASE_URL)"
+      _validate_target_confirm_match
       report_missing LIVE_M4EXIT_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control base URL"
       report_missing LIVE_M4EXIT_AGENT_ADMIN_BASE_URL "$AGENT_ADMIN_BASE_URL" "agent admin base URL"
       report_missing LIVE_M4EXIT_AGENT_ADMIN_USER "$AGENT_ADMIN_USER" "agent admin Basic-auth user"
@@ -2073,12 +2632,13 @@ validate_case_config() {
 run_dry_run() {
   printf '=== live-m4exit-e2e.sh dry run (nothing executed) ===\n'
   printf 'git_sha=%s\n' "$GIT_SHA"
-  printf 'control_base_url=%s\n' "${CONTROL_BASE_URL:-<unset>}"
-  printf 'relay_host=%s\n' "${RELAY_HOST:-<unset>}"
-  printf 'control_ssh_host=%s\n' "${CONTROL_SSH_HOST:-<unset>}"
-  printf 'gateway_ssh_host=%s\n' "${GATEWAY_SSH_HOST:-<unset>}"
-  printf 'agent_admin_base_url=%s\n' "${AGENT_ADMIN_BASE_URL:-<unset>}"
+  printf 'control_base_url=%s\n' "$(sv "${CONTROL_BASE_URL:-<unset>}")"
+  printf 'relay_host=%s\n' "$(sv "${RELAY_HOST:-<unset>}")"
+  printf 'control_ssh_host=%s\n' "$(sv "${CONTROL_SSH_HOST:-<unset>}")"
+  printf 'gateway_ssh_host=%s\n' "$(sv "${GATEWAY_SSH_HOST:-<unset>}")"
+  printf 'agent_admin_base_url=%s\n' "$(sv "${AGENT_ADMIN_BASE_URL:-<unset>}")"
   printf 'evidence_dir=%s\n' "$RUN_DIR"
+  printf 'target_confirm=%s\n' "$([[ -n "$TARGET_CONFIRM" ]] && printf 'asserted' || printf 'unset')"
   printf 'allow_agent_restart=%s allow_lockdown=%s allow_revoke=%s\n' "$ALLOW_AGENT_RESTART" "$ALLOW_LOCKDOWN" "$ALLOW_REVOKE"
 
   MISSING_COUNT=0
@@ -2174,10 +2734,129 @@ run_selftest() {
     *) selftest_check "configured literal secret is redacted" "redacted" "redacted" || failures=$(( failures + 1 )) ;;
   esac
 
+  # IMPORTANT 7: JSON-shaped secrets (`"key":"value"`) must be redacted
+  # structurally, key by key, not only by the whitespace text patterns.
+  local json_raw json_red
+  json_raw='{"token":"SUPERSECRETTOKEN123456","password":"p@ss","nested":{"api_key":"ABCDEFGHIJKLMNOP"},"safe":"keepme"}'
+  json_red="$(printf '%s' "$json_raw" | sanitize)"
+  got="redacted"
+  printf '%s' "$json_red" | grep -qE 'SUPERSECRETTOKEN123456|p@ss|ABCDEFGHIJKLMNOP' && got="raw JSON secret leaked"
+  selftest_check "JSON key-based redaction removes secret values" "$got" "redacted" || failures=$(( failures + 1 ))
+  got="preserved"
+  printf '%s' "$json_red" | grep -q 'keepme' || got="non-secret value lost"
+  selftest_check "JSON redaction preserves non-secret values" "$got" "preserved" || failures=$(( failures + 1 ))
+
   got="$(verdict_for "PASS,")";        selftest_check "verdict(all PASS)" "$got" "GREEN" || failures=$(( failures + 1 ))
   got="$(verdict_for "PASS,FAIL,")";   selftest_check "verdict(FAIL present)" "$got" "RED" || failures=$(( failures + 1 ))
   got="$(verdict_for "PASS,SKIP,")";   selftest_check "verdict(SKIP is not a pass)" "$got" "PARTIAL" || failures=$(( failures + 1 ))
   got="$(verdict_for "PASS,MISSING,")"; selftest_check "verdict(unrun/missing)" "$got" "RED" || failures=$(( failures + 1 ))
+
+  # -------------------------------------------------------------------------
+  # IMPORTANT 4: the destructive-target confirmation guard.
+  # -------------------------------------------------------------------------
+  local tc_tmp tc_rc saved_confirm="$TARGET_CONFIRM" saved_control="$CONTROL_BASE_URL" saved_check="${GATE_CHECK_FILE:-}"
+  tc_tmp="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-selftest-tc.XXXXXX")"
+  GATE_CHECK_FILE="$tc_tmp/checks"; : > "$GATE_CHECK_FILE"
+  TARGET_CONFIRM=""; CONTROL_BASE_URL="https://control.example"
+  tc_rc=0; require_target_confirmation tc >/dev/null 2>&1 || tc_rc=$?
+  got="$(grep '^FAIL|' "$GATE_CHECK_FILE" | head -n1 | cut -d'|' -f2)"
+  selftest_check "target guard refuses an unconfirmed state change" "$tc_rc/$got" "1/tc_target_confirmed" || failures=$(( failures + 1 ))
+  : > "$GATE_CHECK_FILE"; TARGET_CONFIRM="https://wrong.example"
+  tc_rc=0; require_target_confirmation tc >/dev/null 2>&1 || tc_rc=$?
+  got="$(grep '^FAIL|' "$GATE_CHECK_FILE" | head -n1 | cut -d'|' -f2)"
+  selftest_check "target guard refuses a mismatched target assertion" "$tc_rc/$got" "1/tc_target_confirmed" || failures=$(( failures + 1 ))
+  : > "$GATE_CHECK_FILE"; TARGET_CONFIRM="https://control.example"
+  tc_rc=0; require_target_confirmation tc >/dev/null 2>&1 || tc_rc=$?
+  got="$(grep '^PASS|' "$GATE_CHECK_FILE" | head -n1 | cut -d'|' -f2)"
+  selftest_check "target guard accepts an exact target assertion" "$tc_rc/$got" "0/tc_target_confirmed" || failures=$(( failures + 1 ))
+  GATE_CHECK_FILE="$saved_check"; TARGET_CONFIRM="$saved_confirm"; CONTROL_BASE_URL="$saved_control"
+  rm -rf "$tc_tmp"
+
+  # BLOCKING 1 / IMPORTANT 4: the integrity share must never be the revoke target.
+  got="$(revoke_codes_distinct "shareA" "shareA")"
+  selftest_check "revoke code equal to the integrity code is rejected" "$got" "equal" || failures=$(( failures + 1 ))
+  got="$(revoke_codes_distinct "shareA" "shareB")"
+  selftest_check "a distinct revoke code is accepted" "$got" "ok" || failures=$(( failures + 1 ))
+  got="$(revoke_codes_distinct "" "")"
+  selftest_check "two empty codes are not treated as equal" "$got" "ok" || failures=$(( failures + 1 ))
+
+  # BLOCKING 1: the in-flight precondition and the newness/timestamp proof for
+  # the gateway drain line.
+  got="$(revoke_inflight_verdict 0 100 1)";   selftest_check "in-flight guard refuses a zero-byte transfer" "$got" "zero-bytes" || failures=$(( failures + 1 ))
+  got="$(revoke_inflight_verdict 100 100 1)"; selftest_check "in-flight guard refuses an already-finished transfer" "$got" "completed" || failures=$(( failures + 1 ))
+  got="$(revoke_inflight_verdict 50 100 0)";  selftest_check "in-flight guard refuses a dead download process" "$got" "not-alive" || failures=$(( failures + 1 ))
+  got="$(revoke_inflight_verdict 50 100 1)";  selftest_check "in-flight guard accepts a live partial transfer" "$got" "ok" || failures=$(( failures + 1 ))
+  local drain_bl drain_cand drain_out recent_ts
+  drain_bl="2026-01-01T00:00:00Z revoked route closed established streams hostname=h.example streams=1"
+  drain_cand="$(printf '%s\n%s\n%s\n' "$drain_bl" \
+    '2026-01-01T00:01:00Z revoked route closed established streams hostname=h.example streams=2' \
+    '2026-01-01T00:01:00Z revoked route closed established streams hostname=other.example streams=9')"
+  drain_out="$(printf '%s\n' "$drain_cand" | drain_new_lines h.example "$drain_bl")"
+  got="$(printf '%s\n' "$drain_out" | grep -c . || true)"; got="${got:-0}"
+  selftest_check "drain newness keeps only the new line for the exact host" "$got" "1" || failures=$(( failures + 1 ))
+  got="$(printf '%s\n' "$drain_out" | grep -c 'streams=2' || true)"; got="${got:-0}"
+  selftest_check "drain newness rejects the pre-baseline line" "$got" "1" || failures=$(( failures + 1 ))
+  recent_ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  got="$(log_line_epoch_after "$recent_ts revoked route closed established streams hostname=h.example streams=2" "$(( $(date -u +%s) - 60 ))" 10)"
+  selftest_check "post-revoke drain timestamp is accepted" "$got" "yes" || failures=$(( failures + 1 ))
+  got="$(log_line_epoch_after "2001-01-01T00:00:00Z revoked route closed established streams hostname=h.example streams=1" "$(date -u +%s)" 10)"
+  selftest_check "old drain timestamp is refused" "$got" "no" || failures=$(( failures + 1 ))
+  got="$(log_line_epoch_after "revoked route closed established streams hostname=h.example streams=1" "$(date -u +%s)" 10)"
+  selftest_check "drain line without a timestamp is refused" "$got" "notimestamp" || failures=$(( failures + 1 ))
+
+  # -------------------------------------------------------------------------
+  # BLOCKING 3: direct-diagnostics freshness and correlation refusal.
+  # -------------------------------------------------------------------------
+  local rec_dir rec_now rec_floor
+  rec_dir="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-selftest-rec.XXXXXX")"
+  rec_now="$(date -u +'%Y-%m-%d %H:%M:%S')"
+  rec_floor="$(( $(date -u +%s) - 1 ))"
+  printf '{"api_key_id":"agent-1","direct_status":"relay_fallback","direct_status_reason":"probe_failed","updated":"%s"}' "$rec_now" > "$rec_dir/fresh.json"
+  got="$(direct_record_current "$rec_dir/fresh.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "fresh + correlated agent record is accepted" "$got" "ok" || failures=$(( failures + 1 ))
+  printf '{"api_key_id":"agent-1","updated":"2001-01-01 00:00:00"}' > "$rec_dir/stale.json"
+  got="$(direct_record_current "$rec_dir/stale.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "stale agent record is refused (last-evaluation is not current)" "$got" "stale" || failures=$(( failures + 1 ))
+  printf '{"api_key_id":"agent-1","direct_status":"relay_fallback"}' > "$rec_dir/nots.json"
+  got="$(direct_record_current "$rec_dir/nots.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "record without an update timestamp is refused" "$got" "no_timestamp" || failures=$(( failures + 1 ))
+  printf '{"api_key_id":"agent-2","updated":"%s"}' "$rec_now" > "$rec_dir/other.json"
+  got="$(direct_record_current "$rec_dir/other.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "record for a different agent is refused" "$got" "agent_mismatch" || failures=$(( failures + 1 ))
+  rm -rf "$rec_dir"
+
+  # -------------------------------------------------------------------------
+  # IMPORTANT 5: STUN freshness and per-agent isolation.
+  # -------------------------------------------------------------------------
+  local stun_recent stun_4m stun_out2
+  stun_recent="$(date -u +'%Y-%m-%dT%H:%M:%S')"
+  if date -u -v-4M +%s >/dev/null 2>&1; then
+    stun_4m="$(date -u -v-4M +'%Y-%m-%dT%H:%M:%S')"
+  else
+    stun_4m="$(date -u -d '4 minutes ago' +'%Y-%m-%dT%H:%M:%S')"
+  fi
+  stun_out2="$(printf '%s\n%s\n' "$stun_4m stun observation accepted for agent-1" "$stun_recent stun observation accepted for agent-1" | stun_analyze agent-1 5)"
+  got="$(printf '%s\n' "$stun_out2" | sed -n 's/^fresh=//p')"
+  selftest_check "fresh agent acceptance yields fresh=yes" "$got" "yes" || failures=$(( failures + 1 ))
+  got="$(printf '%s\n' "$stun_out2" | sed -n 's/^agent_lines=//p')"
+  selftest_check "isolation counts only the agent's accept lines" "$got" "2" || failures=$(( failures + 1 ))
+  stun_out2="$(printf '%s\n%s\n' "2001-01-01T00:00:00 stun observation accepted for agent-1" "2001-01-01T04:00:00 stun observation accepted for agent-1" | stun_analyze agent-1 5)"
+  got="$(printf '%s\n' "$stun_out2" | sed -n 's/^fresh=//p')"
+  selftest_check "stale journal is refused (rechallenging stopped)" "$got" "no" || failures=$(( failures + 1 ))
+  stun_out2="$(printf '%s\n%s\n' "$stun_recent stun observation accepted for agent-1" "$stun_recent stun observation accepted for agent-2" | stun_analyze agent-1 5)"
+  got="$(printf '%s\n' "$stun_out2" | sed -n 's/^accepted=//p')"
+  selftest_check "interleaved agents do not merge into one timeline" "$got" "1" || failures=$(( failures + 1 ))
+
+  # -------------------------------------------------------------------------
+  # IMPORTANT 7: the scratch capture directory is removed by the cleanup hook.
+  # -------------------------------------------------------------------------
+  local cleanup_dir saved_scratch="${M4EXIT_SCRATCH_DIR:-}"
+  M4EXIT_SCRATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-selftest-scratch.XXXXXX")"
+  cleanup_dir="$M4EXIT_SCRATCH_DIR"
+  printf 'secret-bearing body' > "$M4EXIT_SCRATCH_DIR/body"
+  m4exit_cleanup_scratch
+  selftest_check "scratch capture dir removed by the cleanup hook" "$([[ -d "$cleanup_dir" ]] && printf present || printf removed)" "removed" || failures=$(( failures + 1 ))
+  M4EXIT_SCRATCH_DIR="$saved_scratch"
 
   # -------------------------------------------------------------------------
   # Lockdown safety net: the EXIT/INT/TERM unlock trap must issue exactly one
@@ -2219,6 +2898,7 @@ run_selftest() {
 n=0
 [[ -f "$M4EXIT_FAKE_CURL_COUNT" ]] && n="$(cat "$M4EXIT_FAKE_CURL_COUNT")"
 printf '%s' "$(( ${n:-0} + 1 ))" > "$M4EXIT_FAKE_CURL_COUNT"
+if [[ -n "${M4EXIT_FAKE_CURL_LOG:-}" ]]; then printf '%s\n' "$*" >> "$M4EXIT_FAKE_CURL_LOG"; fi
 out=""; hdr=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -2250,10 +2930,32 @@ FAKECURL
     child_seen="$(cat "$fake_bin/count.$trap_trigger" 2>/dev/null || printf '0')"
     selftest_check "real lockdown trap on $trap_trigger (rc=$child_rc, unlock attempts=$child_seen)" "$child_rc/$child_seen" "$fake_expected/1" || failures=$(( failures + 1 ))
   done
+
+  # BLOCKING 2 window: the state is marked BEFORE the lockdown request, the
+  # request reaches the server, and the signal arrives before the response is
+  # read. The trap must still issue exactly one unlock, and the child's TMPDIR
+  # must be left empty (IMPORTANT 7 cleanup contract).
+  local tmp_cleanup child_log unlock_attempts lockdown_attempts
+  tmp_cleanup="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-selftest-tmp.XXXXXX")"
+  child_log="$fake_bin/log.before_request"
+  printf '0' > "$fake_bin/count.before_request"; : > "$child_log"
+  child_rc=0
+  ( PATH="$fake_bin:$PATH" TMPDIR="$tmp_cleanup" M4EXIT_FAKE_CURL_COUNT="$fake_bin/count.before_request" \
+      M4EXIT_FAKE_CURL_LOG="$child_log" \
+      M4EXIT_INTERNAL_TRAP_SELFTEST=before_request \
+      M4EXIT_AGENT_ADMIN_BASE_URL="http://127.0.0.1:1" \
+      M4EXIT_AGENT_ADMIN_USER=selftest M4EXIT_AGENT_ADMIN_PASSWORD=selftest \
+      bash "$SCRIPT_SELF" ) >/dev/null 2>&1 || child_rc=$?
+  unlock_attempts="$(grep -c '/api/unlock' "$child_log" 2>/dev/null || true)"; unlock_attempts="${unlock_attempts:-0}"
+  lockdown_attempts="$(grep -c '/api/lockdown' "$child_log" 2>/dev/null || true)"; lockdown_attempts="${lockdown_attempts:-0}"
+  selftest_check "real trap unlocks when interrupted in the mark-before-request window (rc=$child_rc, lockdown=$lockdown_attempts, unlock=$unlock_attempts)" "$child_rc/$lockdown_attempts/$unlock_attempts" "143/1/1" || failures=$(( failures + 1 ))
+  got="$(find "$tmp_cleanup" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  selftest_check "no harness temp files survive a trapped run (TMPDIR empty)" "$got" "0" || failures=$(( failures + 1 ))
+  rm -rf "$tmp_cleanup"
   rm -rf "$fake_bin"
 
   if [[ "$failures" -eq 0 ]]; then
-    printf 'SELFTEST RESULT: PASS (0 failures) — the case runner refuses PASS for unexecuted, note-only, skipped or crashing cases, the sanitiser redacts secrets in console and evidence, and the lockdown EXIT/INT/TERM trap unlocks exactly once without aborting under set -u\n'
+    printf 'SELFTEST RESULT: PASS (0 failures) — the case runner refuses PASS for unexecuted, note-only, skipped or crashing cases; the sanitiser redacts configured literals, JSON key values and text-pattern secrets in console and evidence; the destructive-target guard, revoke-code guard, revoke in-flight/newness guards, direct-diagnostics freshness/correlation refusal and STUN freshness/isolation all refuse unproven cases; the lockdown EXIT/INT/TERM trap (including the mark-before-request window) unlocks exactly once; and trapped runs leave no temp files behind\n'
     exit 0
   fi
   printf 'SELFTEST RESULT: FAIL (%d assertions failed) — the harness plumbing is broken\n' "$failures"
@@ -2269,11 +2971,17 @@ FAKECURL
 # can prove the safety net fires end-to-end with a stubbed curl on PATH.
 if [[ -n "${M4EXIT_INTERNAL_TRAP_SELFTEST:-}" ]]; then
   m4exit_install_lockdown_trap
-  m4exit_mark_locked
   case "$M4EXIT_INTERNAL_TRAP_SELFTEST" in
-    exit) exit 7 ;;
-    int)  kill -INT "$$"; sleep 5; exit 200 ;;
-    term) kill -TERM "$$"; sleep 5; exit 201 ;;
+    exit) m4exit_mark_locked; exit 7 ;;
+    int)  m4exit_mark_locked; kill -INT "$$"; sleep 5; exit 200 ;;
+    term) m4exit_mark_locked; kill -TERM "$$"; sleep 5; exit 201 ;;
+    before_request)
+      # BLOCKING-2 window: the conservative locked state is marked BEFORE the
+      # lockdown request, the request reaches the server (the stub answers
+      # 200), and the signal arrives before the response is evaluated. The trap
+      # must still issue exactly one unlock.
+      m4exit_lockdown_request
+      kill -TERM "$$"; sleep 5; exit 202 ;;
     *) printf 'ERROR: unknown M4EXIT_INTERNAL_TRAP_SELFTEST=%s\n' "$M4EXIT_INTERNAL_TRAP_SELFTEST" >&2; exit 2 ;;
   esac
 fi
@@ -2286,6 +2994,11 @@ if [[ "$LIST_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
+# Install the main-process safety net for every non-list mode. It unlocks a
+# possibly-locked agent (a no-op unless the lockdown case marked it) and removes
+# the scratch capture directory on EXIT/INT/TERM, including on error.
+m4exit_install_lockdown_trap
+
 if [[ "$MODE" == "selftest" ]]; then
   run_selftest
 fi
@@ -2296,7 +3009,6 @@ fi
 
 printf '=== ShareBridge Phase 4a M4-exit live relay e2e harness (task #15) ===\n'
 printf 'Evidence root: %s (the worktree is never written)\n' "$EVIDENCE_DIR"
-m4exit_install_lockdown_trap
 run_all_cases
 print_summary
 

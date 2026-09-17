@@ -603,7 +603,10 @@ scripts/live-phase4a.sh --evidence-dir /tmp/phase4a-evidence
 
 Exit codes: `0` GREEN (every selected gate PASS; unscoped, every registered
 gate), `1` RED (any selected gate FAIL / MISSING / NOT_IMPLEMENTED), `2` usage
-error, `3` PARTIAL (no failures but at least one SKIP, or a dry run).
+error, `3` PARTIAL (no failures but at least one SKIP, or a dry run). Note: the
+sibling M4-exit harness (`§14`) additionally exits `2` for an **incomplete**
+`--dry-run` configuration after naming every missing variable; this harness does
+no config validation in `--dry-run` and therefore always exits `3` there.
 
 **Honesty contract (this project has been bitten by skip-as-PASS twice).** A
 gate that executes zero checks is `MISSING`, never PASS. A gate whose function
@@ -745,7 +748,11 @@ scripts/live-m4exit-e2e.sh --evidence-dir /tmp/m4exit-evidence
 Exit codes: `0` GREEN (every selected case PASS; unscoped, every registered
 case), `1` RED (any selected case FAIL / MISSING), `2` usage error or an
 incomplete `--dry-run` configuration, `3` PARTIAL (no failures but at least one
-SKIP, or a dry run — a run that executes nothing is never a pass).
+SKIP, or a dry run — a run that executes nothing is never a pass). This differs
+deliberately from `§13` (`scripts/live-phase4a.sh`), which always exits `3` for
+`--dry-run`: here an unset required input is an operator-usage error and exits
+`2` after naming every missing variable, so a wrapper can tell "fix your env"
+from "a dry run".
 
 **Honesty contract** (identical semantics to `§13.1`). A case PASSes only if it
 MEASURED at least one passing `check`; `note()` is informational and can never
@@ -770,19 +777,30 @@ an Immich share):
 
 All three appear as `destructive=yes` in the per-case evidence and in
 `run-metadata.txt` while enabled; without the flag the case SKIPs or simply does
-not perform the action. The lockdown case's auto-unlock safety net is installed
-in the **main** process (`EXIT`/`INT`/`TERM`), not inside the case subshell
-(where a `local` flag was unreachable under `set -u`); the locked state is kept
-in a state file so a Ctrl-C, a `SIGTERM` to the harness PID, or any failing exit
-re-sends `POST /api/unlock`. `--selftest` proves the trap with a stubbed admin
-API and nothing live.
+not perform the action. In addition, **every** state-changing case refuses to
+run unless `LIVE_M4EXIT_TARGET_CONFIRM` equals the configured
+`LIVE_M4EXIT_CONTROL_BASE_URL` — the operator has to type the exact target to
+assert it is the disposable test stack and not production or the M6 dark
+topology. The lockdown case's auto-unlock safety net is installed in the
+**main** process (`EXIT`/`INT`/`TERM`), not inside the case subshell (where a
+`local` flag was unreachable under `set -u`); the locked state is kept in a
+state file so a Ctrl-C, a `SIGTERM` to the harness PID, or any failing exit
+re-sends `POST /api/unlock`. The state is written **before** the lockdown
+request is issued and cleared only after a definitively unapplied request or a
+successful unlock. `--selftest` proves the trap (including the
+mark-before-request window) with a stubbed admin API and nothing live.
 
-Secrets are never printed or stored: every captured line and every `check()`
-detail passes through `sanitize()`, which redacts the configured admin password
-and share codes verbatim and rewrites key/token/password/secret/cookie/
-authorization/`jti` values, private-key blocks and `/s/<code>` paths. The default
-evidence root is `${TMPDIR:-/tmp}/sharebridge-m4exit-e2e`, so a run never dirties
-the worktree.
+Hygiene contract (stated accurately, not overstated): configured secrets (admin
+password, share codes) and token/key/password/secret/cookie/authorization/`jti`
+values — including JSON `"key": "value"` pairs — are redacted before they reach
+the console, the evidence files or the captured command/output records;
+private-key blocks and `/s/<code>` paths are redacted too. Redaction is
+BEST-EFFORT pattern matching (single-line JSON; multi-line pretty-printed JSON
+still relies on the text patterns), not a guarantee, so treat evidence as
+operator-internal. Raw HTTP capture bodies and headers live only in one per-run
+0700 scratch directory under `umask 077` and are deleted by the
+`EXIT`/`INT`/`TERM` cleanup hook (also on error). The default evidence root is
+`${TMPDIR:-/tmp}/sharebridge-m4exit-e2e`, so a run never dirties the worktree.
 
 ### 14.2 Cases
 
@@ -790,10 +808,10 @@ the worktree.
 |---|---|---|
 | `enrollment_hydration_restart` | agent enrollment live; the registered share count equals the operator's declared count; a `loaded N sessions from store` restart-hydration line is present; per-share content resolves over the relay afterwards. When no restart is observable the FAIL names the exact remedy (supply `LIVE_M4EXIT_AGENT_LOG_FILE`, or opt in to a restart with `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` + `LIVE_M4EXIT_AGENT_RESTART_COMMAND`); an opted-in restart never substitutes for the real line | agent admin URL + credential, `EXPECTED_SHARE_COUNT`, agent log source, gateway health/metrics |
 | `relay_content_integrity` | the full recipient path: interstitial → `prepare-route` `status=relay`, gallery `200`, `/items` `200` with the expected count, `/thumb/<id>` `200` image, full `/asset/<id>` `200` whose sha1 equals the manifest sha1 with the exact byte count, playback HEAD `200`, no-Range `200` full, ≥2 in-range `206` seeks byte-exact against the full body, plus the three documented `416` cases (suffix, multi-range, start≥total). `/asset/<id>` intentionally ignores Range — the harness asserts `200` there, never `206` | control base URL, relay gateway host, share code, item/asset/video ids, expected item count |
-| `stun_observe_and_rechallenge` | control `stun_total{match}>0` with `mismatch=0` and `timeout=0`; the `§10.2` proactive rechallenge cadence (4m + jitter[0,15s), tolerance configurable) measured from the `stun observation accepted` timestamps, with no delta exceeding the band and at least one on-cadence delta (extra restart-triggered acceptances are allowed) | control metrics access, STUN journal source |
-| `direct_path_or_failclosed` | either `status=direct` with a direct URL that serves (`200`), or a fail-closed relay fallback whose control-side agent record shows `direct_status=relay_fallback` and the expected `direct_status_reason`; FAILs when neither is observable. The FAIL for a missing record file names the file shape, how to obtain it, and the verdict for each observed combination | control base URL, share code, agent record file (for the relay case) |
-| `lockdown_withdrawal_and_recovery` (**opt-in**) | baseline healthy → lockdown → tunnel `online=0` within the bound + a frps `proxy closing` line + `prepare-route` `503` suppressed + a relay fetch yielding no content → unlock → tunnel online + `prepare-route` relay again within the bound, with the measured recovery seconds recorded | `ALLOW_LOCKDOWN=1`, agent admin, gateway metrics, frps journal |
-| `revocation_midstream` (**opt-in**) | a throttled in-flight `/asset` download revoked mid-transfer with `DELETE /api/shares/<code>` ends truncated (bytes < the full asset size) and the gateway journal shows `controlsync: revoked route closed established streams … streams=N` (`N ≥ 1`). Records the documented caveat that an Immich-mirrored share is re-registered by the Immich poll within ~1 minute | `ALLOW_REVOKE=1`, `REVOKE_SHARE_CODE`, agent admin, gateway journal |
+| `stun_observe_and_rechallenge` | control `stun_total{match}>0` with `mismatch=0` and `timeout=0`; the `§10.2` proactive rechallenge cadence (4m + jitter[0,15s), tolerance configurable) measured from the `stun observation accepted` timestamps **of the agent under test only**, with the newest acceptance proven **fresh** (≤ the 4m+jitter ceiling + tolerance) so a stale journal cannot pass | control metrics access, STUN journal source, `LIVE_M4EXIT_STUN_AGENT_ID` |
+| `direct_path_or_failclosed` | either `status=direct` with a direct URL that serves (`200`), or a fail-closed relay fallback whose control-side agent record shows `direct_status=relay_fallback` and the expected `direct_status_reason` **and is provably current** (updated at/after the prepare-route request and tied to `LIVE_M4EXIT_AGENT_RECORD_AGENT_ID`); FAILs when neither is observable. The FAIL for a missing record file names the file shape, how to obtain it, and the verdict for each observed combination | control base URL, share code, agent record file + agent id (for the relay case) |
+| `lockdown_withdrawal_and_recovery` (**opt-in**) | baseline healthy **and the relay URL actually serves (200 with content)** → lockdown (conservative "may be locked" state marked before the request) → tunnel `online=0` within the bound + a frps `proxy closing` line + `prepare-route` `503` suppressed + a relay fetch yielding no content (a change from the serving baseline) → unlock → tunnel online + `prepare-route` relay again within the bound, with the measured recovery seconds recorded. Refuses to lock down if the baseline does not serve | `ALLOW_LOCKDOWN=1`, `TARGET_CONFIRM`, agent admin, gateway metrics, frps journal |
+| `revocation_midstream` (**opt-in**) | a throttled in-flight `/asset` download (proven in flight: `0 < bytes < full size` and the process still alive) revoked mid-transfer with `DELETE /api/shares/<code>` ends truncated (bytes < the full asset size) and the gateway journal shows a **newly observed** `controlsync: revoked route closed established streams` line for the **exact** relay URL host with a post-revoke timestamp and `streams=N` (`N ≥ 1`). A zero-byte or already-finished transfer fails closed and refuses the `DELETE`. Records the documented caveat that an Immich-mirrored share is re-registered by the Immich poll within ~1 minute | `ALLOW_REVOKE=1`, `REVOKE_SHARE_CODE` (≠ `SHARE_CODE`), agent admin, gateway journal |
 
 ### 14.3 Environment surface
 
@@ -820,7 +838,9 @@ is unset FAILs the affected case and is named in the diagnostic.
 | `LIVE_M4EXIT_AGENT_LOG_FILE` or `LIVE_M4EXIT_AGENT_SSH_HOST` | — | case 1 hydration |
 | `LIVE_M4EXIT_EXPECTED_SHARE_COUNT` / `_HYDRATED_SESSIONS` | — / `1` | case 1 |
 | `LIVE_M4EXIT_ALLOW_AGENT_RESTART` / `_AGENT_RESTART_COMMAND` / `_AGENT_RESTART_WAIT_S` | `0` / — / `30` | case 1 opt-in restart (command required when enabled) |
-| `LIVE_M4EXIT_AGENT_RECORD_FILE` / `_EXPECTED_DIRECT_REASON` | — / `probe_failed` | case 4 relay fallback |
+| `LIVE_M4EXIT_AGENT_RECORD_FILE` / `LIVE_M4EXIT_AGENT_RECORD_AGENT_ID` / `LIVE_M4EXIT_EXPECTED_DIRECT_REASON` | — / — / `probe_failed` | case 4 relay fallback (the record must be updated after the request and name the agent) |
+| `LIVE_M4EXIT_TARGET_CONFIRM` | — | every state-changing case (must equal `LIVE_M4EXIT_CONTROL_BASE_URL`) |
+| `LIVE_M4EXIT_STUN_AGENT_ID` | — | case 3 (only this agent's accept lines are analysed) |
 | `LIVE_M4EXIT_ALLOW_LOCKDOWN` / `_RECOVERY_BOUND_S` / `_TUNNEL_OFFLINE_BOUND_S` | `0` / `120` / `30` | case 5 |
 | `LIVE_M4EXIT_ALLOW_REVOKE` / `_REVOKE_SHARE_CODE` / `_REVOKE_ASSET_ID` / `_REVOKE_ASSET_BYTES` / `_REVOKE_LIMIT_RATE` / `_REVOKE_DELAY_S` / `_REVOKE_TIMEOUT_S` / `_REVOKE_WAIT_REREGISTER_S` | `0` / — / — / — / `300k` / `4` / `120` / `0` | case 6 |
 | `LIVE_M4EXIT_CURL_TIMEOUT`, `_SSH_OPTS`, `_SSH_CONNECT_TIMEOUT`, `_REMOTE_TIMEOUT`, `_JOURNAL_MAX_LINES` | `30`, —, `8`, `20`, `5000` | plumbing |
