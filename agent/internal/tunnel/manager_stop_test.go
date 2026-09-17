@@ -47,6 +47,9 @@ func unkillableStopManager(t *testing.T, killGrace, killWait time.Duration) (*Ma
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
+	// Fail-closed default: arm the manager as an unlocked daemon's publication
+	// step would, so the stop-path tests reach a started child.
+	manager.SetStartPermitted(true)
 	t.Cleanup(func() { _ = manager.Stop() })
 	return manager, starter, collector
 }

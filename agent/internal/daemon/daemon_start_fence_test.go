@@ -1,28 +1,29 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"sharebridge/agent/internal/tunnel"
 )
 
 // TestLockdownFencesQueuedRelayConfigStart pins the cross-boundary half of the
-// BLOCKING start-fence finding: applyRelayConfig checks IsLocked() and then
-// calls manager.ApplyConfig. A handler that passes the pre-check just before
-// the transition can still enqueue the config, and the manager's event loop
-// then starts frpc after the transition — a pre-check in the daemon cannot
-// observe a transition that happens after it. The manager's start-permission
-// fence, flipped synchronously by Lockdown, is the authority: it is evaluated
-// atomically with the start, so a config queued in the race window can
-// neither arm nor start the tunnel.
+// BLOCKING start-fence finding at the EARLY guard: applyRelayConfig checks
+// IsLocked() and then calls manager.ApplyConfig. A handler that passes the
+// pre-check just before the transition can still enqueue the config, and the
+// pause below holds the run goroutine between the enqueue and the config's
+// processing while a full Lockdown completes. The manager's early arm guard
+// (which reads the fence flipped synchronously by Lockdown before ds.locked is
+// published) then refuses the queued config, so it is neither armed nor
+// written to disk nor started.
 //
-// The pause is deterministic: the manager's apply gate holds the run goroutine
-// between the enqueue and the config's processing while a full Lockdown
-// completes, then the pause is released and the queued config must be refused.
+// The authoritative startChildFenced check and the Lockdown deny wiring are
+// covered by the two tests below, which are positioned past the early guards.
 func TestLockdownFencesQueuedRelayConfigStart(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -59,4 +60,163 @@ func TestLockdownFencesQueuedRelayConfigStart(t *testing.T) {
 		t.Fatalf("a queued relay_config became effective on disk despite the lockdown fence: stat(%s) err = %v",
 			configPath, err)
 	}
+}
+
+// TestLockdownDeniesInFlightStartBeforeItReturns pins the GAP-1 deny wiring at
+// the moment of the start: Lockdown's synchronous SetStartPermitted(false) and
+// the manager's check-and-spawn are serialized on startMu. The start below is
+// paused AFTER its permission check and immediately before its spawn, holding
+// startMu, so the check can no longer save it. Lockdown MUST therefore block on
+// startMu until the start completes and return only with the manager denied. If
+// the Lockdown deny wiring is deleted, Lockdown returns at its lever bound
+// while the starter is still paused (the assertion fails), and the start then
+// spawns after Lockdown returned (the ordering assertion fails).
+func TestLockdownDeniesInFlightStartBeforeItReturns(t *testing.T) {
+	spawnEntered := make(chan struct{})
+	spawnRelease := make(chan struct{})
+	var enteredOnce sync.Once
+	fx := newLockdownFixture(t, tunnel.WithSpawnGate(func() {
+		enteredOnce.Do(func() { close(spawnEntered) })
+		<-spawnRelease
+	}))
+	require.False(t, fx.d.IsLocked(), "fixture must start unlocked")
+	// A short lever bound keeps a deny-less Lockdown's return within the
+	// assertion window instead of the production 10s.
+	fx.d.lockdownLeverTimeout = 100 * time.Millisecond
+
+	fx.d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-inflight-lockdown"))
+	select {
+	case <-spawnEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the start never reached the spawn gate")
+	}
+
+	lockdownDone := make(chan error, 1)
+	go func() { lockdownDone <- fx.d.Lockdown() }()
+
+	var lockdownErr error
+	lockdownCompleted := false
+	select {
+	case lockdownErr = <-lockdownDone:
+		lockdownCompleted = true
+		t.Errorf("Lockdown returned while an in-flight start was paused between its permission check and its spawn (error %v)", lockdownErr)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	close(spawnRelease)
+	if !lockdownCompleted {
+		select {
+		case lockdownErr = <-lockdownDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Lockdown did not return after the in-flight start completed")
+		}
+	}
+	require.NoError(t, lockdownErr)
+	require.True(t, fx.d.IsLocked(), "daemon must be locked")
+
+	settled := fx.starter.startCount()
+	assertConditionStays(t, "no frpc spawn after Lockdown returned",
+		initialCredentialRequestWindow, func() bool {
+			return fx.starter.startCount() == settled
+		})
+	fx.d.mu.RLock()
+	manager := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.NotNil(t, manager, "the fixture manager must still be published")
+	require.False(t, manager.StartPermitted(), "a manager denied by Lockdown must stay denied")
+}
+
+// TestTunnelManagerPublicationSerializedWithLockdown pins the GAP-1
+// construction/publication race deterministically. startTunnelManager arms and
+// publishes a manager under lockdownMu; the pause below opens that arm+publish
+// critical section (while lockdownMu is held) so a concurrent Lockdown must
+// wait. When the publication wins the race and Lockdown follows, Lockdown
+// observes the published manager and denies it; when Lockdown wins, the
+// publisher observes the locked state and publishes the manager DENIED. Either
+// way no permitted manager is ever published while locked, and no child is
+// started.
+func TestTunnelManagerPublicationSerializedWithLockdown(t *testing.T) {
+	fx := newLockdownFixture(t)
+	require.False(t, fx.d.IsLocked(), "fixture must start unlocked")
+
+	// Reset to the pre-construction state so startTunnelManager runs its
+	// construction/arm/publish path under the gate below.
+	require.NoError(t, fx.d.stopTunnelManager())
+	fx.d.mu.Lock()
+	fx.d.tunnel = nil
+	fx.d.mu.Unlock()
+
+	starter := &recordingTunnelStarter{stopsOnGraceful: true}
+	publishEntered := make(chan struct{})
+	publishRelease := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	releasePublish := func() { releaseOnce.Do(func() { close(publishRelease) }) }
+	fx.d.tunnelPublishGate = func() {
+		enteredOnce.Do(func() { close(publishEntered) })
+		<-publishRelease
+	}
+	fx.d.lockdownLeverTimeout = 100 * time.Millisecond
+	t.Cleanup(releasePublish)
+
+	constructionDone := make(chan struct{})
+	go func() {
+		fx.d.startTunnelManager(context.Background(),
+			tunnel.WithProcessStarter(starter.start),
+			tunnel.WithBackoffBase(time.Millisecond),
+			tunnel.WithKillGracePeriod(20*time.Millisecond),
+			tunnel.WithCredentialWaitTimeout(time.Hour),
+			tunnel.WithRunningStabilityWindow(time.Hour),
+		)
+		close(constructionDone)
+	}()
+
+	select {
+	case <-publishEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startTunnelManager never reached the arm/publish step")
+	}
+
+	lockdownDone := make(chan error, 1)
+	go func() { lockdownDone <- fx.d.Lockdown() }()
+
+	// The arm+publish step holds lockdownMu, so Lockdown cannot complete (nor
+	// interleave) while it is open. This is the mutual exclusion that closes
+	// the publication race.
+	var lockdownErr error
+	lockdownCompleted := false
+	select {
+	case lockdownErr = <-lockdownDone:
+		lockdownCompleted = true
+		t.Errorf("Lockdown interleaved with the arm+publish critical section: %v", lockdownErr)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	releasePublish()
+	select {
+	case <-constructionDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startTunnelManager did not finish")
+	}
+	if !lockdownCompleted {
+		select {
+		case lockdownErr = <-lockdownDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Lockdown did not finish")
+		}
+	}
+	require.NoError(t, lockdownErr)
+
+	require.True(t, fx.d.IsLocked(), "daemon must be locked")
+	fx.d.mu.RLock()
+	manager := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.NotNil(t, manager, "the manager must have been published")
+	require.False(t, manager.StartPermitted(), "a manager published into a locked daemon must be DENIED")
+
+	fx.d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-published-while-locked"))
+	assertConditionStays(t, "locked daemon never starts frpc after the publication race",
+		initialCredentialRequestWindow, func() bool {
+			return starter.startCount() == 0
+		})
 }

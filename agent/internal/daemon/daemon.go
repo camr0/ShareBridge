@@ -163,6 +163,14 @@ type Daemon struct {
 	// and prove the §13.4 transition fences. Production leaves it nil.
 	lockdownLeverGate func(name string)
 
+	// tunnelPublishGate is a TEST-ONLY seam: when non-nil it is called by
+	// publishTunnelManagerLocked after the manager's start permission has been
+	// armed from the current locked state and before the manager is published
+	// into d.tunnel, while lockdownMu is held. It lets the publication-race test
+	// hold the arm+publish critical section open and prove Lockdown cannot
+	// interleave with it. Production leaves it nil.
+	tunnelPublishGate func()
+
 	// STUN cross-check state (§10.1, Task 17 add-on): the exchange client, a
 	// test clock seam, and the one-slot bound that keeps at most a single
 	// challenge exchange in flight at a time.
@@ -466,7 +474,23 @@ type stunResultSender interface {
 // ride whichever connection (current or reconnected) is up when it fires.
 // options forwards the tunnel package's test-visible knobs; production calls
 // it without options.
+//
+// It serializes the whole construction/arm/publish sequence against the §13.4
+// Lockdown/Unlock transitions by taking lockdownMu (the locking variant; see
+// startTunnelManagerLocked and publishTunnelManagerLocked). Callers that
+// ALREADY hold lockdownMu — today only Unlock's restartTunnelManager — must
+// call startTunnelManagerLocked directly; re-acquiring here would deadlock.
 func (d *Daemon) startTunnelManager(ctx context.Context, options ...tunnel.ManagerOption) {
+	d.lockdownMu.Lock()
+	defer d.lockdownMu.Unlock()
+	d.startTunnelManagerLocked(ctx, options...)
+}
+
+// startTunnelManagerLocked is the lockdownMu-aware core of startTunnelManager.
+// The caller MUST hold lockdownMu. It constructs the manager (which is DENIED
+// by default) and hands it to publishTunnelManagerLocked, so the arm-from-lock-
+// state and the publication are atomic with respect to Lockdown/Unlock.
+func (d *Daemon) startTunnelManagerLocked(ctx context.Context, options ...tunnel.ManagerOption) {
 	d.mu.Lock()
 	// Retain the construction inputs so §13.4 unlock can rebuild a fresh
 	// manager after lockdown permanently stopped the previous one.
@@ -511,11 +535,35 @@ func (d *Daemon) startTunnelManager(ctx context.Context, options ...tunnel.Manag
 		log.Printf("relay tunnel supervision unavailable: %v", err)
 		return
 	}
-	// A freshly constructed manager defaults to permitted. Re-arm it explicitly
-	// from the daemon's current locked state: a (re)construction on an unlocked
-	// daemon (initial Start, or Unlock's post-lockdown rebuild) permits starts,
-	// while a construction that somehow observes the daemon locked stays fenced.
+	d.publishTunnelManagerLocked(manager)
+}
+
+// publishTunnelManagerLocked arms manager from the daemon's CURRENT locked
+// state and publishes it into d.tunnel. The caller MUST hold lockdownMu, which
+// makes the arm+publish step mutually exclusive with the §13.4 Lockdown
+// transition (and with Unlock's rebuild):
+//
+//   - if construction wins the race, the subsequent Lockdown observes the
+//     published manager and denies it before publishing ds.locked;
+//   - if Lockdown wins, IsLocked() is already true here, so the manager is
+//     published DENIED and never starts frpc while locked.
+//
+// The manager itself is constructed denied (fail-closed), so even a
+// publication that observed a stale unlocked state would be denied until this
+// step explicitly arms it. There is no interleaving that leaves a permitted
+// manager published while locked.
+//
+// Lock discipline: lockdownMu is held; d.mu is taken only for the assignment,
+// and IsLocked takes ds.mu and releases it before startMu is taken. No two of
+// those locks are held simultaneously with startMu/ds.mu, so no lock-order
+// inversion is possible with the start fence.
+func (d *Daemon) publishTunnelManagerLocked(manager *tunnel.Manager) {
 	manager.SetStartPermitted(!d.IsLocked())
+	// Test seam: hold the arm (+publish) critical section open so the
+	// publication-race test can prove Lockdown cannot interleave here.
+	if d.tunnelPublishGate != nil {
+		d.tunnelPublishGate()
+	}
 	d.mu.Lock()
 	d.tunnel = manager
 	d.mu.Unlock()
@@ -2981,6 +3029,15 @@ func (d *Daemon) Lockdown() error {
 	// in-flight child spawn. Fencing before publication (rather than after)
 	// means an in-flight start completes BEFORE ds.locked is set, so no child
 	// can be started after the daemon is observably locked.
+	//
+	// Publication is mutually exclusive with this transition: startTunnelManager
+	// arms and publishes a manager under this same lockdownMu (see
+	// publishTunnelManagerLocked), so either construction wins and this deny
+	// observes the published manager, or this transition wins and the publisher
+	// observes the locked flag and publishes the manager DENIED (its fail-closed
+	// construction default). No interleaving leaves a permitted manager published
+	// while locked. Lock discipline: lockdownMu is held for this whole body; it
+	// never nests with ds.mu and startMu at the same time.
 	d.mu.RLock()
 	manager := d.tunnel
 	d.mu.RUnlock()
@@ -3396,7 +3453,12 @@ func (d *Daemon) stopDirectServerForLockdown(epoch uint64, server *direct.Direct
 // restartTunnelManager builds a FRESH tunnel manager after lockdown stopped
 // the previous one. Manager.Stop is permanent (its stop/done channels close),
 // so the daemon clears d.tunnel and reconstructs with the recorded
-// construction inputs (the process context and any test options).
+// construction inputs (the process context and any test options). It is called
+// from Unlock, which holds lockdownMu for its whole body, so it MUST use the
+// ...Locked construction variant (re-acquiring lockdownMu here would
+// deadlock). Publishing the rebuilt manager from the current locked state
+// under that same lockdownMu is what arms it permitted again on a successful
+// unlock.
 func (d *Daemon) restartTunnelManager() {
 	d.mu.Lock()
 	ctx := d.tunnelCtx
@@ -3406,7 +3468,7 @@ func (d *Daemon) restartTunnelManager() {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	d.startTunnelManager(ctx, options...)
+	d.startTunnelManagerLocked(ctx, options...)
 }
 
 // requestRelayCredential asks control for a fresh relay admission credential

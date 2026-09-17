@@ -370,7 +370,12 @@ type Manager struct {
 	stopChannel chan struct{}
 	doneChannel chan struct{}
 	stopOnce    sync.Once
-	stopped     bool // set under stopOnce before stopChannel closes
+	// stopped is the manager's authoritative stopped state. It is written by
+	// Stop's stopOnce closure and read by startChildFenced, both under startMu,
+	// so the stopped transition is atomic with the check-and-spawn it fences.
+	// stopChannel is closed under the same lock (see Stop), which keeps the
+	// cheap isStopped() early exits coherent with this boolean.
+	stopped bool
 	// stopErr records the outcome of the shutdown stop so every Stop caller
 	// that observes doneChannel observes the SAME explicit error. Written by
 	// the run goroutine before doneChannel closes and read only after
@@ -456,6 +461,25 @@ type Manager struct {
 	// pause the manager deterministically between the daemon's IsLocked()
 	// pre-check and the manager's processing of the config.
 	applyGate func()
+	// startFenceGate is a test-only seam (withStartFenceGate): when non-nil the
+	// start funnel calls it at the very top of startChildFenced — after every
+	// caller's early permission guard, before the authoritative check — so a
+	// test can pause a start that already passed the early guards, withdraw the
+	// permission, and prove the startChildFenced check (not the early guard) is
+	// what denies it. Production never sets it.
+	startFenceGate func()
+	// spawnGate is a test-only seam (withSpawnGate): when non-nil the start
+	// funnel calls it after the authoritative permission check and immediately
+	// before the child spawn, WHILE HOLDING startMu, so a test can pause an
+	// in-flight start and prove that Stop and SetStartPermitted block until it
+	// completes. Production never sets it.
+	spawnGate func()
+	// timerFiredHook is a test-only seam (withTimerFiredHook): when non-nil the
+	// run loop calls it with the kind of the timer it just fired, before acting
+	// on it, so a test can prove a timer actually fired instead of asserting a
+	// negative over a window shorter than the timer's delay. It is called only
+	// on the run goroutine and must not block. Production never sets it.
+	timerFiredHook func(kind timerKind)
 
 	// State below is owned by the run goroutine.
 	armedConfig    Config
@@ -597,6 +621,35 @@ func withApplyGate(gate func()) ManagerOption {
 	return func(manager *Manager) { manager.applyGate = gate }
 }
 
+// WithStartFenceGate is the exported form of withStartFenceGate: a test-only
+// seam that pauses the start funnel after every early permission guard and
+// before the authoritative startChildFenced check. Production never sets it.
+func WithStartFenceGate(gate func()) ManagerOption {
+	return withStartFenceGate(gate)
+}
+
+func withStartFenceGate(gate func()) ManagerOption {
+	return func(manager *Manager) { manager.startFenceGate = gate }
+}
+
+// WithSpawnGate is the exported form of withSpawnGate: a test-only seam that
+// pauses the start funnel after the authoritative permission check and
+// immediately before the child spawn, while startMu is held. Production never
+// sets it.
+func WithSpawnGate(gate func()) ManagerOption {
+	return withSpawnGate(gate)
+}
+
+func withSpawnGate(gate func()) ManagerOption {
+	return func(manager *Manager) { manager.spawnGate = gate }
+}
+
+// withTimerFiredHook installs a run-goroutine hook invoked with the kind of a
+// just-fired supervision timer, before the switch acts on it (test seam).
+func withTimerFiredHook(hook func(kind timerKind)) ManagerOption {
+	return func(manager *Manager) { manager.timerFiredHook = hook }
+}
+
 // NewManager validates the fixed settings and starts the supervision loop.
 // The status callback is invoked from a dedicated emission worker (FIFO, one
 // report at a time) so a slow or blocking callback can neither reorder
@@ -633,10 +686,14 @@ func NewManager(settings Settings, requester CredentialRequester, onStatus func(
 		manager.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 	manager.publishedGeneration.Store(-1)
-	// A fresh manager is permitted to start: the daemon denies it only when it
-	// begins a lockdown transition. The shutdown arm of the same fence is the
-	// isStopped() check taken alongside this flag.
-	manager.startPermitted.Store(true)
+	// Fail-closed start-permission default: a freshly constructed manager is
+	// DENIED. Only the owning daemon arms it, and it does so under lockdownMu
+	// in the same critical section that publishes it (see
+	// daemon.publishTunnelManagerLocked), so a construction that races a
+	// §13.4 Lockdown can never be published permitted while the daemon is
+	// locked. The shutdown arm of the same fence is the stopped check taken
+	// alongside this flag under startMu.
+	manager.startPermitted.Store(false)
 	go manager.emitLoop()
 	go manager.run()
 	return manager, nil
@@ -682,6 +739,14 @@ func (manager *Manager) HasArmedCredential() bool {
 	return manager.credentialArmed.Load()
 }
 
+// StartPermitted reports this manager's current child-start permission
+// (observability for the daemon's publication/deny wiring and for tests). The
+// value is read without startMu: it is a pure diagnostic, and the
+// authoritative decision is still made under startMu in startChildFenced.
+func (manager *Manager) StartPermitted() bool {
+	return manager.startPermitted.Load()
+}
+
 // SetStartPermitted arms or denies this manager's child-start permission. The
 // daemon calls it with false SYNCHRONOUSLY at the start of the §13.4 lockdown
 // transition (before publishing the locked flag and before any best-effort
@@ -714,8 +779,18 @@ func (manager *Manager) SetStartPermitted(permitted bool) {
 // loop exits within the bound every call returns the same recorded outcome.
 func (manager *Manager) Stop() error {
 	manager.stopOnce.Do(func() {
+		// Publish the stopped state under startMu — the same mutex
+		// startChildFenced holds across its check-and-spawn. A start already in
+		// flight completes before this returns (so Stop blocks until it does),
+		// and every start that begins afterwards observes manager.stopped.
+		// Closing stopChannel under the same lock keeps the cheap isStopped()
+		// early exits coherent with the boolean. The lock is released before any
+		// of the bounded waits below, and is never held across the child wait or
+		// kill: only the state transition is serialized.
+		manager.startMu.Lock()
 		manager.stopped = true
 		close(manager.stopChannel)
+		manager.startMu.Unlock()
 	})
 	if manager.waitForSupervision(manager.stopBound()) {
 		return manager.stopErr
@@ -917,6 +992,9 @@ func (manager *Manager) handleChildExited(event managerEvent) {
 func (manager *Manager) handleTimerFired() {
 	kind := manager.pendingTimer
 	manager.pendingTimer = timerNone
+	if manager.timerFiredHook != nil {
+		manager.timerFiredHook(kind)
+	}
 	switch kind {
 	case timerStartChild:
 		manager.startChildNow()
@@ -956,21 +1034,33 @@ func (manager *Manager) startChildNow() {
 }
 
 // startChildFenced performs the child start behind the start-permission fence.
-// The permission read and the start call happen under startMu, which
-// SetStartPermitted also takes, so a flip that lands while a start is in
-// flight waits for that start to finish, and every start that begins after
-// the flip observes the new value. The mutex is never held across a graceful
-// stop/kill or any other blocking wait. A refused start schedules nothing:
-// the manager is either stopped or fenced, and a retry would only repeat the
-// refusal.
+// The permission and stopped reads and the start call happen under startMu,
+// which SetStartPermitted and Stop's state transition also take, so a flip
+// that lands while a start is in flight waits for that start to finish, and
+// every start that begins after the flip observes the new value. The mutex is
+// never held across a graceful stop/kill or any other blocking wait. A refused
+// start schedules nothing: the manager is either stopped or fenced, and a
+// retry would only repeat the refusal.
 func (manager *Manager) startChildFenced() {
 	arguments := []string{"-c", manager.settings.ConfigPath}
+	// Test seam: after every caller's early guard, before the authoritative
+	// check. A pause here lets a test withdraw the permission and prove this
+	// check is what denies the start.
+	if manager.startFenceGate != nil {
+		manager.startFenceGate()
+	}
 	manager.startMu.Lock()
-	if !manager.startPermitted.Load() || manager.isStopped() {
+	if !manager.startPermitted.Load() || manager.stopped {
 		manager.startMu.Unlock()
 		manager.emit(manager.currentGeneration, StatusError,
 			"frpc start denied: tunnel start permission withdrawn")
 		return
+	}
+	// Test seam: after the check, holding startMu, immediately before the
+	// spawn. A pause here proves Stop/SetStartPermitted block on the in-flight
+	// start instead of letting a fence land between the check and the spawn.
+	if manager.spawnGate != nil {
+		manager.spawnGate()
 	}
 	child, err := manager.startChild(context.Background(), manager.settings.FRPCBinaryPath, arguments)
 	if err != nil {

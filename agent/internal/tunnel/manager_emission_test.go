@@ -136,6 +136,9 @@ func newEmissionTestManager(t *testing.T, starter *recordingStarter, onStatus fu
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
+	// Fail-closed default: arm the manager as an unlocked daemon's publication
+	// step would, so emission tests reach a started child.
+	manager.SetStartPermitted(true)
 	t.Cleanup(func() { _ = manager.Stop() })
 	return manager
 }

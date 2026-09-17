@@ -259,6 +259,10 @@ func newTestManager(t *testing.T, settings Settings, starter *recordingStarter, 
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
+	// Managers are fail-closed by default; these tests exercise supervision on
+	// a manager the daemon would have armed (an unlocked daemon's publication
+	// step), so arm it explicitly.
+	manager.SetStartPermitted(true)
 	t.Cleanup(func() { _ = manager.Stop() })
 	return manager
 }

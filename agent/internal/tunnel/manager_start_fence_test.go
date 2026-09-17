@@ -1,45 +1,181 @@
 package tunnel
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// These tests pin the BLOCKING concurrency finding closed by the
-// start-permission fence: there was no start-permission fence consulted at the
-// moment a child was started, so two paths could start frpc on a locked agent:
+// These tests pin the start-permission fence closed by the §7.4/§13.4 fix
+// round. The manager is fail-closed: NewManager constructs it DENIED, and the
+// daemon arms it only in the unlock/start publication step that is serialized
+// against the §13.4 Lockdown/Unlock transitions. Three properties are proven
+// here, each designed so that deleting ONLY the production fence makes it FAIL:
 //
-//  1. the F1 residual race — applyRelayConfig checks IsLocked() and then calls
-//     manager.ApplyConfig; a handler that passes the check just before the
-//     transition can still enqueue, and the manager's event loop then starts
-//     the child after the transition;
-//  2. the F2 retry path — timerApplyArmedConfig can win the run loop's select
-//     and reach startChildNow without consulting stopped or daemon-lock state,
-//     so a pending armed-config retry can start a child after Stop closed the
-//     stop channel, or during the lockdown window.
+//  1. fail-closed default — TestManagerFreshManagerIsDeniedByDefault;
+//  2. the authoritative check inside startChildFenced, reached AFTER every
+//     caller's early guard, denies a start whose permission was withdrawn in
+//     the window between the early guard and the check —
+//     TestManagerStartFenceDeniesConfigPausedBeforeFencedCheck;
+//  3. the stopped-state transition is serialized with the check-and-spawn on
+//     startMu, so Stop blocks until an in-flight start completes and no child
+//     can be spawned after Stop returns —
+//     TestManagerStopSerializesWithInFlightStart.
 //
-// The fence is evaluated atomically with the start (under startMu, which
-// SetStartPermitted also takes), so every start that begins after the flip is
-// denied, including from timers.
+// The timer/retry paths are covered by
+// TestManagerArmedConfigRetryFencedByLockdown (the retry reaches the fenced
+// spawn after a transient write failure) and
+// TestManagerArmedConfigRetryFencedByStop (the start funnel is driven after
+// Stop).
 
-// gatedApplyManager builds a manager whose event-loop apply path is paused at
-// the gate until release is closed, so a test can deterministically land a
-// fence flip between the enqueue (ApplyConfig) and the manager processing the
-// config.
-func gatedApplyManager(t *testing.T, settings Settings, starter *recordingStarter, collector *statusCollector, entered, release chan struct{}) *Manager {
-	t.Helper()
-	var enteredOnce sync.Once
+// TestManagerFreshManagerIsDeniedByDefault pins the fail-closed construction
+// default: a manager the daemon has not yet armed must not start a child, and
+// only an explicit arm (the unlocked daemon's publication step) permits one.
+// Reverting the default to permitted fails the first assertion; the
+// subsequent behavioural checks fail if the fence is removed.
+func TestManagerFreshManagerIsDeniedByDefault(t *testing.T) {
+	settings := testManagerSettings(t)
+	starter := &recordingStarter{}
+	collector := &statusCollector{}
 	manager, err := NewManager(settings, &fakeCredentialRequester{}, collector.record,
 		withProcessStarter(starter.startProcess),
 		withBackoffBase(time.Millisecond),
 		withKillGracePeriod(20*time.Millisecond),
 		withCredentialWaitTimeout(time.Hour),
 		withRunningStabilityWindow(time.Hour),
-		withApplyGate(func() {
+	)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Stop() })
+
+	if manager.StartPermitted() {
+		t.Fatal("a freshly constructed manager must be DENIED (fail-closed default)")
+	}
+	if err := manager.ApplyConfig(validTestConfig()); err != nil {
+		t.Fatalf("ApplyConfig() error = %v", err)
+	}
+	assertConditionStays(t, "a denied fresh manager never starts frpc",
+		200*time.Millisecond, func() bool {
+			return starter.startCount() == 0
+		})
+
+	// The daemon's unlocked publication step arms the manager; a subsequent
+	// config must then start normally (the fence gates, it does not break).
+	manager.SetStartPermitted(true)
+	if err := manager.ApplyConfig(validTestConfig()); err != nil {
+		t.Fatalf("ApplyConfig() after arming error = %v", err)
+	}
+	waitForCondition(t, "child start after the manager was armed", time.Second, func() bool {
+		return starter.startCount() == 1
+	})
+}
+
+// TestManagerStartFenceDeniesConfigPausedBeforeFencedCheck is the
+// load-bearing regression for the authoritative check inside startChildFenced.
+// The start is paused by the start-fence seam AFTER both early guards
+// (handleApplyConfig and applyArmedConfigOrScheduleRetry) have passed and
+// immediately before the check, so the early guards cannot be what denies it.
+// The permission is then withdrawn and the start resumed: only the
+// startChildFenced check can refuse it. Deleting that check lets the spawn
+// through and fails the test.
+func TestManagerStartFenceDeniesConfigPausedBeforeFencedCheck(t *testing.T) {
+	settings := testManagerSettings(t)
+	starter := &recordingStarter{}
+	collector := &statusCollector{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(release) }) }
+
+	manager, err := NewManager(settings, &fakeCredentialRequester{}, collector.record,
+		withProcessStarter(starter.startProcess),
+		withBackoffBase(time.Millisecond),
+		withKillGracePeriod(20*time.Millisecond),
+		withCredentialWaitTimeout(time.Hour),
+		withRunningStabilityWindow(time.Hour),
+		withStartFenceGate(func() {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	// Cleanups are LIFO: release the paused start before Stop runs so a failed
+	// assertion cannot strand Stop on a wedged run goroutine.
+	t.Cleanup(func() { _ = manager.Stop() })
+	t.Cleanup(releaseGate)
+
+	// The unlocked daemon's publication step arms the manager, and the config
+	// passes both early guards before the seam pauses.
+	manager.SetStartPermitted(true)
+	if err := manager.ApplyConfig(validTestConfig()); err != nil {
+		t.Fatalf("ApplyConfig() error = %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the start never reached the fenced spawn")
+	}
+
+	// The §13.4 withdrawal lands after the early guards and before the check.
+	manager.SetStartPermitted(false)
+	releaseGate()
+
+	assertConditionStays(t, "no frpc start after the fenced check observed the withdrawal",
+		200*time.Millisecond, func() bool {
+			return starter.startCount() == 0
+		})
+}
+
+// TestManagerStopSerializesWithInFlightStart pins the GAP-2 serialization: the
+// stopped transition is published under startMu, the same mutex
+// startChildFenced holds across its check-and-spawn. The start is paused by the
+// spawn seam after its permission/stopped check, holding startMu. Stop is
+// started concurrently and MUST block until that start completes; if Stop
+// closes the stop channel without startMu (the bug), it returns at its shutdown
+// bound while the starter is still paused and the start then spawns a child
+// after Stop returned. Both the "Stop has not returned" assertion and the
+// "no spawn after Stop returned" assertion fail under that mutation.
+func TestManagerStopSerializesWithInFlightStart(t *testing.T) {
+	settings := testManagerSettings(t)
+	starter := &recordingStarter{stopsOnGraceful: true}
+	collector := &statusCollector{}
+	var stopReturned atomic.Bool
+	var spawnedAfterStopReturn atomic.Bool
+	processStarter := func(ctx context.Context, binaryPath string, arguments []string) (childProcess, error) {
+		// Sample the ordering at the exact spawn point: a spawn that happens
+		// after Stop returned flips the flag.
+		if stopReturned.Load() {
+			spawnedAfterStopReturn.Store(true)
+		}
+		return starter.startProcess(ctx, binaryPath, arguments)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(release) }) }
+
+	manager, err := NewManager(settings, &fakeCredentialRequester{}, collector.record,
+		withProcessStarter(processStarter),
+		withBackoffBase(time.Millisecond),
+		// Short child-stop bounds keep the buggy Stop's stopBound small, so the
+		// "Stop has not returned" assertion is fast and unambiguous.
+		withChildSignalTimeout(10*time.Millisecond),
+		withKillGracePeriod(10*time.Millisecond),
+		withKillWaitTimeout(10*time.Millisecond),
+		withStatusDrainTimeout(10*time.Millisecond),
+		withCredentialWaitTimeout(time.Hour),
+		withRunningStabilityWindow(time.Hour),
+		withSpawnGate(func() {
 			enteredOnce.Do(func() { close(entered) })
 			<-release
 		}),
@@ -48,48 +184,61 @@ func gatedApplyManager(t *testing.T, settings Settings, starter *recordingStarte
 		t.Fatalf("NewManager() error = %v", err)
 	}
 	t.Cleanup(func() { _ = manager.Stop() })
-	return manager
-}
+	t.Cleanup(releaseGate)
 
-// TestManagerStartFenceDeniesQueuedConfigAfterFlip is the F1-residual
-// regression at the manager boundary: a config that was accepted (queued)
-// BEFORE the transition, but processed AFTER it, must neither arm nor start.
-// Without the fence the run loop reaches startChildNow and starts frpc.
-func TestManagerStartFenceDeniesQueuedConfigAfterFlip(t *testing.T) {
-	settings := testManagerSettings(t)
-	starter := &recordingStarter{}
-	collector := &statusCollector{}
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	manager := gatedApplyManager(t, settings, starter, collector, entered, release)
-
+	manager.SetStartPermitted(true)
 	if err := manager.ApplyConfig(validTestConfig()); err != nil {
 		t.Fatalf("ApplyConfig() error = %v", err)
 	}
-	<-entered // the run goroutine is paused before processing the queued config
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the start never reached the spawn gate")
+	}
 
-	// The §13.4 transition: Lockdown flips the fence synchronously at its
-	// start; the flip itself is what the start must observe.
-	manager.SetStartPermitted(false)
-	close(release)
+	stopDone := make(chan error, 1)
+	go func() {
+		err := manager.Stop()
+		stopReturned.Store(true)
+		stopDone <- err
+	}()
 
-	assertConditionStays(t, "no frpc start after the start fence was withdrawn",
-		200*time.Millisecond, func() bool {
-			return starter.startCount() == 0
-		})
-	// "No armed config became effective": the credential-bearing generated
-	// config must not have been written at all.
-	if _, err := os.Stat(settings.ConfigPath); !os.IsNotExist(err) {
-		t.Fatalf("a fenced relay_config became effective on disk: stat(%s) err = %v",
-			settings.ConfigPath, err)
+	var stopErr error
+	stopCompleted := false
+	select {
+	case stopErr = <-stopDone:
+		stopCompleted = true
+		t.Errorf("Stop returned while an in-flight start was paused between its permission check and its spawn (error %v)", stopErr)
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	releaseGate()
+	if !stopCompleted {
+		select {
+		case stopErr = <-stopDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not return after the in-flight start completed")
+		}
+		if stopErr != nil {
+			t.Errorf("Stop() error = %v", stopErr)
+		}
+	}
+	// Release lets the in-flight start complete. Wait for the spawn before the
+	// ordering assertions so they are deterministic in both the fixed path
+	// (spawn before Stop returned) and the mutated path (spawn after).
+	waitForCondition(t, "the released in-flight start to spawn", 5*time.Second, func() bool {
+		return starter.startCount() == 1
+	})
+	if spawnedAfterStopReturn.Load() {
+		t.Fatal("frpc was spawned after Stop returned: the stopped transition was not serialized with the start")
 	}
 }
 
 // TestManagerArmedConfigRetryFencedByLockdown pins the F2 retry path under the
-// lockdown fence: with a timerApplyArmedConfig retry pending (the armed-config
-// write failed transiently) and the transient failure then cleared, the retry
-// would normally re-render, write and start. After the fence flip it must do
-// nothing — not even write the config.
+// lockdown fence: after a transient armed-config write failure, the retry
+// reaches the fenced spawn (both early guards have passed), is paused there,
+// and the permission is withdrawn. The retry must then do nothing. Deleting the
+// startChildFenced check lets the retry spawn and fails the test.
 func TestManagerArmedConfigRetryFencedByLockdown(t *testing.T) {
 	dataDirectory := t.TempDir()
 	blockerPath := filepath.Join(dataDirectory, "blocked-parent")
@@ -104,21 +253,31 @@ func TestManagerArmedConfigRetryFencedByLockdown(t *testing.T) {
 	}
 	starter := &recordingStarter{}
 	collector := &statusCollector{}
-	// A long enough backoff that the retry cannot fire before the fence flip
-	// below, but short enough that the 2s observation window covers it many
-	// times over.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(release) }) }
+	// A backoff short enough to reach the retry quickly, but long enough that
+	// the fence flip below lands after the retry's early guards.
 	manager, err := NewManager(settings, &fakeCredentialRequester{}, collector.record,
 		withProcessStarter(starter.startProcess),
-		withBackoffBase(400*time.Millisecond),
+		withBackoffBase(100*time.Millisecond),
 		withKillGracePeriod(20*time.Millisecond),
 		withCredentialWaitTimeout(time.Hour),
 		withRunningStabilityWindow(time.Hour),
+		withStartFenceGate(func() {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+		}),
 	)
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
 	t.Cleanup(func() { _ = manager.Stop() })
+	t.Cleanup(releaseGate)
 
+	manager.SetStartPermitted(true)
 	if err := manager.ApplyConfig(validTestConfig()); err != nil {
 		t.Fatalf("ApplyConfig() error = %v", err)
 	}
@@ -128,25 +287,34 @@ func TestManagerArmedConfigRetryFencedByLockdown(t *testing.T) {
 		return collector.hasReasonContaining("create tunnel data directory")
 	})
 
-	// §13.4 transition, then clear the transient failure so the retry WOULD
-	// succeed and start frpc if it were not fenced.
-	manager.SetStartPermitted(false)
+	// Clear the transient failure so the retry WOULD succeed, and let it reach
+	// the fenced spawn.
 	if err := os.Remove(blockerPath); err != nil {
 		t.Fatalf("clear blocker: %v", err)
 	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the armed-config retry never reached the fenced spawn")
+	}
+
+	// §13.4 withdrawal lands after the retry's early guards, before the check.
+	manager.SetStartPermitted(false)
+	releaseGate()
+
 	assertConditionStays(t, "no frpc start from a fenced armed-config retry",
 		2*time.Second, func() bool {
 			return starter.startCount() == 0
 		})
 }
 
-// TestManagerArmedConfigRetryFencedByStop pins the same retry path against a
-// plain Stop(): the timer case winning the run loop's select must not start a
-// child after the stop channel closed. Stop is driven for real; because the
-// run loop exits on the stop channel, the test then reproduces the
-// select-winning branch deterministically by driving the pending timer exactly
-// as the loop would have (the loop has already exited, so the run-goroutine
-// state is exclusively owned by the test goroutine).
+// TestManagerArmedConfigRetryFencedByStop pins the stop arm of the
+// startChildFenced check against a plain Stop(): a pending armed-config retry
+// must not start a child after the stop channel closed. Stop is driven for
+// real; because the run loop then exits, the test goroutine exclusively owns
+// the manager state and drives the same start funnel the timer would have
+// (startChildNow), which reaches the authoritative check directly — deleting
+// the stopped arm lets that funnel spawn and fails the test.
 func TestManagerArmedConfigRetryFencedByStop(t *testing.T) {
 	dataDirectory := t.TempDir()
 	blockerPath := filepath.Join(dataDirectory, "blocked-parent")
@@ -175,6 +343,7 @@ func TestManagerArmedConfigRetryFencedByStop(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = manager.Stop() })
 
+	manager.SetStartPermitted(true)
 	if err := manager.ApplyConfig(validTestConfig()); err != nil {
 		t.Fatalf("ApplyConfig() error = %v", err)
 	}
@@ -185,14 +354,12 @@ func TestManagerArmedConfigRetryFencedByStop(t *testing.T) {
 	if err := manager.Stop(); err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
-	// Clear the transient failure so the retry WOULD succeed if the stop fence
-	// did not deny it. shutdownChild cleared the pending timer, so restore the
-	// pending kind to reproduce the select-winning branch.
+	// Clear the transient failure so the retry WOULD succeed if the stop arm
+	// did not deny it, then drive the start funnel the retry timer calls.
 	if err := os.Remove(blockerPath); err != nil {
 		t.Fatalf("clear blocker: %v", err)
 	}
-	manager.pendingTimer = timerApplyArmedConfig
-	manager.handleTimerFired()
+	manager.startChildNow()
 
 	assertConditionStays(t, "no frpc start from an armed-config retry after Stop",
 		200*time.Millisecond, func() bool {
@@ -202,9 +369,10 @@ func TestManagerArmedConfigRetryFencedByStop(t *testing.T) {
 
 // TestManagerStaleArmedConfigRetryAfterNewerApplyIsNoOp is the first F2 MINOR:
 // a retry that fires after a newer ApplyConfig made a configuration effective
-// must not re-apply it and must not start a second child. The manager tracks
-// armedApplyPending for exactly this; the test pins it to the observable
-// behaviour (no replacement churn) rather than the flag.
+// must not re-apply it and must not start a second child. The test proves the
+// stale timer actually FIRED (via the timer-fired seam) before asserting the
+// negative, rather than relying on a window that a retry with a [1s,2s) delay
+// might not cover.
 func TestManagerStaleArmedConfigRetryAfterNewerApplyIsNoOp(t *testing.T) {
 	dataDirectory := t.TempDir()
 	blockerPath := filepath.Join(dataDirectory, "blocked-parent")
@@ -219,18 +387,26 @@ func TestManagerStaleArmedConfigRetryAfterNewerApplyIsNoOp(t *testing.T) {
 	}
 	starter := &recordingStarter{stopsOnGraceful: true}
 	collector := &statusCollector{}
+	retryFired := make(chan struct{})
+	var retryOnce sync.Once
 	manager, err := NewManager(settings, &fakeCredentialRequester{}, collector.record,
 		withProcessStarter(starter.startProcess),
 		withBackoffBase(time.Second),
 		withKillGracePeriod(20*time.Millisecond),
 		withCredentialWaitTimeout(time.Hour),
 		withRunningStabilityWindow(time.Hour),
+		withTimerFiredHook(func(kind timerKind) {
+			if kind == timerApplyArmedConfig {
+				retryOnce.Do(func() { close(retryFired) })
+			}
+		}),
 	)
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
 	t.Cleanup(func() { _ = manager.Stop() })
 
+	manager.SetStartPermitted(true)
 	generationOne := validTestConfig()
 	if err := manager.ApplyConfig(generationOne); err != nil {
 		t.Fatalf("ApplyConfig(generation 1) error = %v", err)
@@ -257,9 +433,15 @@ func TestManagerStaleArmedConfigRetryAfterNewerApplyIsNoOp(t *testing.T) {
 	})
 	firstChild := starter.recordAt(0).child
 
-	// Let the stale timerApplyArmedConfig retry fire (its delay is at most 1s).
+	// Prove the stale retry timer fired (its delay is in [1s,2s)), then assert
+	// it changed nothing.
+	select {
+	case <-retryFired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stale timerApplyArmedConfig retry never fired")
+	}
 	assertConditionStays(t, "no stale retry re-apply or second child",
-		2*time.Second, func() bool {
+		300*time.Millisecond, func() bool {
 			return starter.startCount() == 1 && firstChild.gracefulStopCount() == 0
 		})
 	if !strings.Contains(configFileContent(t, settings.ConfigPath), generationTwo.Credential) {
@@ -293,6 +475,7 @@ func TestManagerHigherGenerationReplacementViaRetryReplacesOnce(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = manager.Stop() })
 
+	manager.SetStartPermitted(true)
 	generationOne := validTestConfig()
 	generationOne.Generation = 1
 	generationOne.ProxyName = "sb-gen1"
