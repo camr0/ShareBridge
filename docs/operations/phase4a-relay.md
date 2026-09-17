@@ -31,6 +31,22 @@ are cross-checked by `relay/deploy/deploy_test.sh`, so they cannot drift.
 Control↔gateway route/presence sync is an **outbound mTLS** connection from the
 gateway to control; no inbound control port is opened on the relay VM.
 
+### Agent-host prerequisite for the direct path
+
+The direct path is negotiated on the **agent** host: the agent asks its router
+for an on-demand TCP mapping (NAT-PMP / PCP), then liveness-probes that mapped
+port from the public internet. The agent host's own inbound firewall must
+**allow that on-demand TCP range** (the router-assigned port, i.e. the
+`SHAREBRIDGE_GATEWAY_*` proxy range's peer on the agent side). If the host
+firewall rejects the mapped port the probe fails and the product **fails closed
+to the relay** with `direct_status=relay_fallback` /
+`direct_status_reason=probe_failed`. That is the correct, safe behaviour — only
+the direct path is unavailable — but it is indistinguishable from a
+misconfiguration, so operators must allow the range to get a real direct
+connection. This was the live root cause during the 2026-09 test-VPS session
+(versa `firewalld` rejected the PnP-mapped port while the router's NAT-PMP
+mapping itself worked).
+
 ---
 
 ## 2. Provisioning
@@ -446,6 +462,10 @@ audit passes.
 - The Phase 4a bandwidth throttle is intentionally disabled (deferred to
   Phase 4b); the global stream ceiling / FD budget and per-agent counters are
   the MVP safety tools.
+- **Agent-host firewall for the direct path (deployment prerequisite).** The
+  agent host must allow the on-demand TCP range the router assigns for a direct
+  mapping, or the probe fails and the path fails closed to the relay (`§1`).
+  This is an operator action on the agent host, not a relay-VM change.
 - CT/CAA monitoring remains a separate user-owned release prerequisite
   (spec §3.2); the DNS audit records CAA context but does not gate on it.
 

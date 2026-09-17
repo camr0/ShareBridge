@@ -144,7 +144,7 @@
 # URLs/hosts/paths/names, not secrets, except the explicit credential variables.
 #
 #   Control / interstitial
-#     LIVE_M4EXIT_CONTROL_BASE_URL      control base URL, e.g. https://control.example (required: cases 2,4,5)
+#     LIVE_M4EXIT_CONTROL_BASE_URL      control base URL, e.g. https://control.example (required: cases 1,2,4,5,6)
 #     LIVE_M4EXIT_CONTROL_INSECURE_TLS  1 disables control TLS verification (default 0)
 #     LIVE_M4EXIT_SHARE_CODE            share code for the relay content scenario (required: cases 1,2,4,5)
 #     LIVE_M4EXIT_MANIFEST_FILE         JSON manifest supplying share_code/item_id/asset_id/video_id/expected_item_count/asset_bytes for case 2 (optional)

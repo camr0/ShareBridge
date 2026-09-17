@@ -329,7 +329,7 @@ audits, and the per-task reviews. Dispositions: **must-fix-before-M6**, **should
 | NAT-PMP retry depth ≈ 4 attempts | Task 30 fix round 2 | should-fix | Bounded router I/O trade-off; validate on NAT-PMP hardware and consider a separate bounded budget if flaky. |
 | `ActiveStreams` briefly lags after close | Task 33 / T36 verify | done (F1 fix, `fix(relay): keep the §23.3 gate exit code free of the capacity suite`) | Bounded, self-converging; the gateway removes a stream from the registry before its deferred lease release, so the old one-shot post-close check was racy under `-race` contention. `waitForLimiterDrain` now polls the drain to zero (a lease that never releases still fails). |
 | `--case ""` semantics in the M6 harness | M6 harness verify | note-only | An empty string means "no scope" (runs all gates); an empty/unknown element exits 2. A one-line usage-error change if desired. |
-| Single-namespace vs per-agent namespace design question | Remediation verification | must-fix-before-M6 | One gateway applier serves exactly one agent namespace; a second agent or a re-enroll makes relay unreachable. Resolve or explicitly accept before M6. |
+| Single-namespace vs per-agent namespace design question | Remediation verification; whole-branch final review | must-fix-before-M6 | One gateway applier serves exactly one agent namespace; a second agent or a re-enroll makes relay unreachable. The whole-branch review sharpened this into a **foreign-namespace false-selection** finding: control publishes routes for every namespace while the gateway rejects foreign routes yet still acknowledges the global revision, so a foreign agent can look relay-selectable while its route was discarded. Resolve or explicitly accept before M6; multi-agent release is NO-GO until the gateway is multi-namespace or one isolated gateway per namespace is provisioned. |
 | `integration/controlsync` module not enumerated in CI | Cross-module ack verify | should-fix | No repo-wide workflow enumerates modules yet; the module runs via `cd integration/controlsync && go test ./...`. |
 | Misconfigured control sync listener `log.Fatalf`s at startup | Remediation verification | note-only | Fail-closed deploy-time trade-off (never silently serves); documented in the relay runbook. |
 | STUN empty / leading-trailing-hyphen host validation | Post-M5 audit | done (`4963db34`) | Validator now rejects empty, hyphen-edged, over-length, underscore, IPv6 and space hosts; `ErrMalformedChallenge` fail-closed. |
@@ -341,7 +341,23 @@ audits, and the per-task reviews. Dispositions: **must-fix-before-M6**, **should
 | Control-sync health ignored failed status acks; false lag on no-op polls; restoration anchored on emission | Post-M5 audit | done (`e15da308`, `5f0fb3e9`, `2799e882`) | Ack failure withdraws health; lag only sampled on a new revision; restoration anchors only on an accepted reset. |
 | Deployment gate could approve a nonfunctional service or a non-dedicated account | Post-M5 audit | done (`150030b8`) | `ExecStart` and `User`/`Group` are exact-value pinned, cross-checked against the installer. |
 | A later failed open tore down a healthy shared mapping | Post-M5 audit (remediation-introduced) | done (`794e2390`, `06115eec`) | Rollback now requires sole ownership (created + instance + join count) decided in the port loop. |
-| Sol-model milestone audit over the remediation range | Quota escalation | note-only | Codex `gpt-5.6-sol` was quota-exhausted; verification ran on glm-5.3 (partial) + deepseek-v4-pro (remainder). Re-run if Sol sign-off is wanted. |
+| Sol-model milestone audit over the remediation range | Quota escalation | done (satisfied by the four cross-model reviews, incl. `sol-session-audit`, `sol-harness-review`, `sol-fence-final`, `sol-whole-branch`) | The earlier "Sol review owed" note is satisfied: the whole-branch final review and the three targeted Sol reviews ran once the quota reset. |
+| Start-permission fence races (publication race + Stop/start) | Live-session Sol audit | done (`71f81c2c`, `2aa3d12e`) | Managers now construct denied and publish under `lockdownMu`; `Stop` publishes the stopped state under `startMu`; the fence tests are mutation-proven load-bearing. |
+| Fresh-boot relay credential could not start the tunnel without operator action | Live-session recon | done (`8c0cb07e`) | Cold boot now starts frpc with no operator action; live-verified on the fenced binary. |
+| Bootstrap relay credential request was one-shot and silently dropped under rate limiting | Sol session audit | done (`b53f7e53`) | Bootstrap and unlock requests route through the manager's `EnsureCredential` bounded-retry event instead of a one-shot send. |
+| Relay tunnel could not recover from a dropped frpc session (burned short-lived credential, no retry) | Live blocking defect | done (`b53f7e53`, `89dbed82`) | Detect the real pinned v0.71 reconnect-rejection line (plus a consecutive-error safety net) and replace the looping child with a fresh credential; proven live on two frps restarts, self-healing in ~5 s with no operator action. |
+| Immich-mirrored share revoke is not durable (the poll re-registers the share in ~40-60 s) | Live session; whole-branch final review | must-fix-before-release | The admin UI offers "Revoke" while the Immich poll recreates the share, making it a ~1-minute outage rather than a durable revocation. This is an authorization-semantics decision that must be explicitly resolved (UI restriction or agent-side tombstone) before release. |
+| §23.3 same-generation recredential gate flake | Live session | should-fix | `TestRealFRPSameGenerationRecredentialSurvivesOlderCredentialReplay` failed once on a full required-mode run, passed alone, and was green on re-run — the false-RED-pollutes-the-gate class. Needs a deterministic tightening or an explicit triage decision. |
+| Direct-path availability silently depends on the agent host's inbound firewall | Live root cause | should-fix (ops doc required) | The host firewall rejects the PnP-mapped on-demand TCP range; the product fails closed to relay with `direct_status_reason=probe_failed`. Now documented as an agent-host prerequisite in `docs/operations/phase4a-relay.md` §1. |
+| `direct_path_or_failclosed` expectation depends on a transient agent-record field | Live session | should-fix | The record reflects the LAST evaluation (`eligible` at rest, `relay_fallback`/`probe_failed` right after a probe); the harness reads it after its own prepare-route so it is correct in practice, but the transience deserves an ops note. |
+| M4-exit harness correlation false positives (direct-record staleness, un-scoped STUN cadence, un-correlated revocation drain line) | Sol harness review | done (`ab25cf36`) | The hardening round requires provably current, agent/share-correlated diagnostics, an in-flight transfer before revoke, a newly observed hostmatched drain line, and a pre-lockdown serving baseline. A 6/6 live re-run of the hardened harness is not yet recorded. |
+| Production `relay/config/frps.toml` plugin-shape assertion gap | Sol session audit | done (this round) | Deploy gate A20 asserts the production template's `[[httpPlugins]]` block, name, host-only `addr` and exact `path`, so the A19 path-doubling defect class can no longer recur on the production relay unnoticed. |
+| Stale `REPO-MAP` state (test VPS unavailable / harness never run live) | Sol session audit | done (`ab25cf36`, this round) | §7 and §3.7 now record the live 6/6 run and the later harness hardening. |
+| M4-exit harness `--help` says `LIVE_M4EXIT_CONTROL_BASE_URL` is required only for cases 2/4/5 | Sol session audit | done (this round) | Help now lists cases 1,2,4,5,6, matching the code and ops doc §14. |
+| `control/deploy-testing-relay.sh` committed non-executable (`100644`) while the runbook invokes `./deploy-testing-relay.sh` | Sol session audit | done (this round) | Index mode set to `100755` to match `docs/operations/phase4a-test-vps-deploy.md:93`. |
+| Dockerized agent needs `LIVE_M4EXIT_AGENT_LOG_FILE`; `agent_log_source()` description reads as a templated unit | Sol harness review | note-only | Operability/UX only; the harness diagnostic already names both remedies (supplied log or opt-in restart). |
+| `api_key_id` (non-secret, logged by production control) appears in captured journal evidence | Live session | note-only | The sanitiser redacts share codes/passwords/keys but not agent identifiers; extend only if operator-shareable evidence must be identifier-free. |
+| Two of fifteen registered Immich shares have dead share keys | Live session | note-only | Test-data issue (`Invalid share key`), not a product defect. |
 
 ## 7. Current state at HEAD
 
@@ -361,10 +377,12 @@ design (no M6 infrastructure exists yet; all placeholders are `NOT_IMPLEMENTED`,
   relay VM, a non-hairpin/router surface, a cellular device, a second VM for the L4 capture,
   real NAT surfaces, and browser/device runs.
 - The M4-exit live relay e2e **ran against the live OVH test stack and passed all six
-  cases** on 2026-09-17 (ledger: "TASK #15 LIVE E2E — ALL SIX HARNESS CASES PASS AGAINST THE
-  REAL DEPLOYMENT"); the harness for it is `scripts/live-m4exit-e2e.sh` (`§3.7`). Re-runs
-  after the 2026-09 false-positive hardening round have not been performed (no credentials
-  in the fix session); the earlier 6/6 GREEN run predates that round.
+  cases in one unscoped run** on 2026-09-17 against the harness commits
+  `da47364d`+`46773cc3`+`90b60bf3` (ledger: "TASK #15 LIVE E2E — ALL SIX HARNESS CASES PASS
+  AGAINST THE REAL DEPLOYMENT"); the harness for it is `scripts/live-m4exit-e2e.sh` (`§3.7`).
+  The harness was hardened afterwards in `ab25cf36` (the three correlation false-positive
+  holes) and no 6/6 live re-run of the hardened harness is recorded yet, so the GREEN above
+  predates that round.
 - The single-namespace-per-gateway design question above must be resolved or explicitly
   accepted before a multi-agent M6 topology.
 - The **Sol-model milestone audit over the remediation range remains OWED**: both Codex
