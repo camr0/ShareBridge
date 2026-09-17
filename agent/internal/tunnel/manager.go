@@ -1,11 +1,14 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -64,6 +67,38 @@ const (
 	// backoffCapDelay.
 	backoffCeilingGrowthLimit = 6
 )
+
+// Reconnect-failure detection bounds. The relay credential is single-use and
+// short-lived, and frp v0.71 applies loginFailExit only to the FIRST login
+// (client/service.go:262) while hard-coding false on the reconnect path
+// (:277-287) — so a rejected RE-login leaves frpc running and retrying a
+// burned credential forever, with no child exit for the supervisor to observe.
+// The supervisor therefore watches the child's output for the one line frpc
+// prints on a rejected reconnect.
+const (
+	// frpcReconnectFailureLine is the pinned frpc v0.71.0 output substring that
+	// marks a rejected reconnect Login. With detailedErrorsToClient=false frpc
+	// prints exactly this (NOT the server's "request rejected"). It is pinned to
+	// the checksum-pinned v0.71 binary and MUST be regression-tested against a
+	// live rejected reconnect on ANY FRP upgrade: if the wording changes, this
+	// detection (and with it the agent's only reactive recovery from a dropped
+	// relay session) fails silently. Keep the string in ONE place.
+	frpcReconnectFailureLine = "connect to server error: register control error"
+	// maxChildOutputLineLength bounds one retained child output line, so a
+	// pathological or hostile child stream cannot grow manager memory. A line
+	// beyond the bound is discarded (it cannot be the short pinned line).
+	maxChildOutputLineLength = 8 * 1024
+	// childOutputReadBufferSize is the fixed bufio buffer used per child stream.
+	childOutputReadBufferSize = 4096
+)
+
+// isReconnectFailureLine reports whether one captured child output line is the
+// pinned frpc v0.71 reconnect-failure line. It exists so the matching is a
+// single, directly testable predicate (the pinned substring's fragility is
+// documented on frpcReconnectFailureLine).
+func isReconnectFailureLine(line string) bool {
+	return strings.Contains(line, frpcReconnectFailureLine)
+}
 
 // errManagerStopped is returned by ApplyConfig after Stop has been called.
 var errManagerStopped = errors.New("tunnel manager stopped")
@@ -247,21 +282,118 @@ type childSignalCall struct {
 }
 
 // execChildProcess adapts an os/exec command. Wait is safe to call from
-// multiple goroutines (the exit watcher and a concurrent stop escalation).
+// multiple goroutines (the exit watcher and a concurrent stop escalation). It
+// also owns the child's captured stdout/stderr: both streams are pumped
+// through BOUNDED line readers and forwarded to the supervisor's output
+// watcher, which needs them only to detect the pinned reconnect-failure line.
+// Raw child output is never logged, persisted, or copied into telemetry.
 type execChildProcess struct {
 	command  *exec.Cmd
 	waitOnce sync.Once
 	done     chan struct{}
 	waitErr  error
+
+	// outputLines carries the child's combined stdout/stderr lines to the
+	// output watcher. The closer goroutine closes it exactly once, after both
+	// pumps return, which is what ends the watcher.
+	outputLines chan string
+	// outputDone releases a pump blocked on outputLines once the process has
+	// exited and no consumer remains. It is closed by Wait, before done.
+	outputDone chan struct{}
+	outputWG   sync.WaitGroup
 }
 
-func newExecChildProcess(command *exec.Cmd) *execChildProcess {
-	return &execChildProcess{command: command, done: make(chan struct{})}
+// newExecChildProcess builds the adapter around a started command and its
+// captured stream read ends. Each reader is drained by its own pump; the
+// closer goroutine closes outputLines after the last pump returns.
+func newExecChildProcess(command *exec.Cmd, readers []io.ReadCloser) *execChildProcess {
+	process := &execChildProcess{
+		command:     command,
+		done:        make(chan struct{}),
+		outputLines: make(chan string),
+		outputDone:  make(chan struct{}),
+	}
+	for _, reader := range readers {
+		process.outputWG.Add(1)
+		go process.pumpOutput(reader)
+	}
+	go func() {
+		process.outputWG.Wait()
+		close(process.outputLines)
+	}()
+	return process
+}
+
+// OutputLines exposes the bounded, sanitised line stream of this child. It is
+// the optional capability the supervisor's output watcher consumes.
+func (process *execChildProcess) OutputLines() <-chan string {
+	return process.outputLines
+}
+
+// pumpOutput drains one child stream to EOF, closing the read end so no
+// descriptor survives the child.
+func (process *execChildProcess) pumpOutput(reader io.ReadCloser) {
+	defer process.outputWG.Done()
+	defer reader.Close()
+	pumpBoundedLines(bufio.NewReaderSize(reader, childOutputReadBufferSize), process.outputLines, process.outputDone)
+}
+
+// pumpBoundedLines forwards each bounded line to lines until the reader ends
+// or done closes. Every line is discarded by the caller once matched; nothing
+// here logs or persists it.
+func pumpBoundedLines(reader *bufio.Reader, lines chan<- string, done <-chan struct{}) {
+	for {
+		line, truncated, err := readBoundedLine(reader)
+		if line != "" && !truncated {
+			select {
+			case lines <- line:
+			case <-done:
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// readBoundedLine reads one newline-terminated line, retaining at most
+// maxChildOutputLineLength bytes and discarding the remainder of an over-long
+// line while still draining it (the child's pipe must never block). truncated
+// reports that the returned text is not the whole line, in which case it must
+// not be matched against the pinned failure substring. err is the read error
+// (io.EOF at stream end); a partial final line is returned alongside it.
+func readBoundedLine(reader *bufio.Reader) (line string, truncated bool, err error) {
+	var retained []byte
+	for {
+		fragment, readErr := reader.ReadSlice('\n')
+		if len(fragment) > 0 {
+			if remaining := maxChildOutputLineLength - len(retained); remaining >= len(fragment) {
+				retained = append(retained, fragment...)
+			} else {
+				truncated = true
+				if remaining > 0 {
+					retained = append(retained, fragment[:remaining]...)
+				}
+			}
+		}
+		switch {
+		case readErr == nil:
+			return string(retained), truncated, nil
+		case errors.Is(readErr, bufio.ErrBufferFull):
+			continue
+		default:
+			return string(retained), truncated, readErr
+		}
+	}
 }
 
 func (process *execChildProcess) Wait() error {
 	process.waitOnce.Do(func() {
 		process.waitErr = process.command.Wait()
+		// Release any pump blocked on a line send, then signal completion. Both
+		// closes are idempotent via waitOnce.
+		close(process.outputDone)
 		close(process.done)
 	})
 	<-process.done
@@ -282,13 +414,46 @@ func (process *execChildProcess) Kill() error {
 type processStarter func(ctx context.Context, binaryPath string, arguments []string) (childProcess, error)
 
 // startFRPCProcess is the production starter: exec.CommandContext with an
-// argument array, never a shell.
+// argument array, never a shell. Both stdout and stderr are piped into bounded
+// line readers (see execChildProcess) so the supervisor can detect the pinned
+// reconnect-failure line; the parent's write-end copies are closed immediately
+// after Start so the read ends see EOF as soon as the child exits.
 func startFRPCProcess(ctx context.Context, binaryPath string, arguments []string) (childProcess, error) {
 	command := exec.CommandContext(ctx, binaryPath, arguments...)
+	stdoutReader, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create frpc stdout pipe: %w", err)
+	}
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		return nil, fmt.Errorf("create frpc stderr pipe: %w", err)
+	}
+	command.Stdout = stdoutWriter
+	command.Stderr = stderrWriter
 	if err := command.Start(); err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		_ = stderrReader.Close()
+		_ = stderrWriter.Close()
 		return nil, fmt.Errorf("start %s: %w", binaryPath, err)
 	}
-	return newExecChildProcess(command), nil
+	// The child holds duplicated write ends now. exec.Cmd does not own *os.File
+	// writers, so closing the parent's copies here is what lets the pumps see
+	// EOF on child exit without leaking a descriptor.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
+	return newExecChildProcess(command, []io.ReadCloser{stdoutReader, stderrReader}), nil
+}
+
+// childOutputStream is the optional capability of a child process whose
+// combined stdout/stderr the supervisor watches for the pinned
+// reconnect-failure line. The production execChildProcess implements it, and
+// test fakes may; a child without it simply has no output-based detection and
+// still gets exit-based recovery.
+type childOutputStream interface {
+	OutputLines() <-chan string
 }
 
 // Settings are the fixed agent-owned tunnel settings (persisted by
@@ -324,13 +489,24 @@ const (
 	eventApplyConfig eventKind = iota
 	eventChildExited
 	eventChildStable
+	// eventChildReconnectFailed is the sanitised internal signal that the
+	// CURRENT child's reconnect Login was rejected (the pinned frpc v0.71
+	// output line was seen). It carries the child identity so a stale child's
+	// output can never drive recovery for a newer child, and it exists because
+	// frp v0.71 does NOT exit frpc on a rejected reconnect.
+	eventChildReconnectFailed
+	// eventEnsureCredential is the daemon's bootstrap/unlock trigger asking the
+	// manager to ensure a usable credential is held, with the manager's bounded
+	// retry machinery behind it.
+	eventEnsureCredential
 )
 
 type managerEvent struct {
-	kind      eventKind
-	config    Config
-	child     childProcess
-	waitError error
+	kind             eventKind
+	config           Config
+	child            childProcess
+	waitError        error
+	credentialReason CredentialRequestReason
 }
 
 // timerKind discriminates the single pending restart timer.
@@ -503,6 +679,14 @@ type Manager struct {
 	pendingTimer            timerKind
 	waitingForCredential    bool
 	pendingCredentialReason CredentialRequestReason
+	// reconnectFailed is true when the CURRENT child has reported the pinned
+	// reconnect-failure line and the manager is waiting for a fresh credential
+	// to replace it. It makes output-based recovery single-flight per child
+	// (repeated failure lines are coalesced), keeps the credential-wait timer
+	// retrying while the rejected child is still ALIVE, and is cleared when the
+	// replacement credential is armed, when the child exits, or when a newer
+	// generation supersedes it. Owned by the run goroutine.
+	reconnectFailed bool
 }
 
 // ManagerOption adjusts test-visible lifecycle knobs.
@@ -739,6 +923,32 @@ func (manager *Manager) HasArmedCredential() bool {
 	return manager.credentialArmed.Load()
 }
 
+// EnsureCredential asks the manager to ensure a usable relay credential is
+// held, issuing one §11.1 relay_credential_request with the given reason when
+// none is, and arming the manager's bounded retry cycle behind it. It is the
+// daemon's bootstrap and unlock trigger: routing those through the manager —
+// instead of a one-shot direct WebSocket send — is what guarantees the request
+// is retried when control does not answer it (or when reconnect churn has
+// consumed control's burst), so the relay cannot be left down by a single lost
+// request. It is idempotent: with a credential already held it does nothing,
+// and it never requests while the start fence is withdrawn or the manager is
+// stopped (the run goroutine re-checks the fence, so a race cannot leak a
+// request).
+func (manager *Manager) EnsureCredential(reason CredentialRequestReason) error {
+	if !validCredentialRequestReason(reason) {
+		return fmt.Errorf("invalid relay credential request reason %q", string(reason))
+	}
+	if manager.isStopped() {
+		return errManagerStopped
+	}
+	select {
+	case manager.events <- managerEvent{kind: eventEnsureCredential, credentialReason: reason}:
+		return nil
+	case <-manager.doneChannel:
+		return errManagerStopped
+	}
+}
+
 // StartPermitted reports this manager's current child-start permission
 // (observability for the daemon's publication/deny wiring and for tests). The
 // value is read without startMu: it is a pure diagnostic, and the
@@ -885,6 +1095,10 @@ func (manager *Manager) run() {
 				manager.handleApplyConfig(event.config)
 			case eventChildExited:
 				manager.handleChildExited(event)
+			case eventChildReconnectFailed:
+				manager.handleChildReconnectFailed(event)
+			case eventEnsureCredential:
+				manager.handleEnsureCredential(event.credentialReason)
 			case eventChildStable:
 				if manager.child == event.child {
 					manager.emit(manager.currentGeneration, StatusRunning, "frpc process stable")
@@ -927,12 +1141,29 @@ func (manager *Manager) handleApplyConfig(config Config) {
 			if config.Credential == manager.armedConfig.Credential {
 				return // identical message: no-op
 			}
+			if !manager.acceptRefreshedCredential(config) {
+				return
+			}
 			// Same-generation credential refresh (fresh one-use jti for the
 			// current assignment, §15.2): arm and persist it for the next
 			// start, but never restart a healthy child — replacement of a
-			// running child happens only on a strictly higher generation.
+			// running child happens only on a strictly higher generation, or
+			// as reconnect recovery below.
 			manager.armedConfig = config
 			manager.armedConsumed = false
+			if manager.reconnectFailed {
+				// Reconnect recovery answer: the pinned frpc failure line armed
+				// recovery for a STILL-RUNNING child, and this fresh credential
+				// is control's answer. Rewrite the config, stop the looping
+				// child and replace it through the single start funnel (the
+				// write→stop→startChildNow sequence of
+				// applyArmedConfigOrScheduleRetry, whose retry also funnels
+				// through startChildFenced).
+				manager.reconnectFailed = false
+				manager.waitingForCredential = false
+				manager.applyArmedConfigOrScheduleRetry()
+				return
+			}
 			_ = manager.writeArmedConfig()
 			if manager.waitingForCredential && manager.child == nil {
 				manager.waitingForCredential = false
@@ -943,10 +1174,13 @@ func (manager *Manager) handleApplyConfig(config Config) {
 	}
 
 	// First configuration or a strictly higher generation: arm it and make
-	// it effective, replacing a running child (§7.4 step 5).
+	// it effective, replacing a running child (§7.4 step 5). A higher
+	// generation supersedes any in-flight reconnect recovery for the old
+	// child.
 	manager.armedConfig = config
 	manager.hasArmedConfig = true
 	manager.armedConsumed = false
+	manager.reconnectFailed = false
 	manager.currentGeneration = config.Generation
 	manager.publishedGeneration.Store(int64(config.Generation))
 	manager.waitingForCredential = false
@@ -1001,6 +1235,10 @@ func (manager *Manager) handleChildExited(event managerEvent) {
 	uptime := time.Since(manager.childStartedAt)
 	manager.child = nil
 	manager.childExited = nil
+	// An exit ends any reconnect-recovery cycle for this child: the child is
+	// gone, so the replacement half of recovery no longer applies.
+	recovering := manager.reconnectFailed
+	manager.reconnectFailed = false
 	if uptime >= stableUptimeResetThreshold {
 		manager.restartAttempt = 0
 	}
@@ -1013,7 +1251,88 @@ func (manager *Manager) handleChildExited(event managerEvent) {
 	manager.armedConsumed = true
 	manager.waitingForCredential = true
 	manager.pendingCredentialReason = ReasonReplayRejected
+	if recovering {
+		// The reconnect-failure path already requested this credential, and its
+		// bounded retry cycle is still armed. Do not issue a duplicate request:
+		// the queued or in-flight answer restarts the tunnel.
+		return
+	}
 	manager.requestCredentialAndScheduleRestart()
+}
+
+// handleChildReconnectFailed handles the sanitised internal signal that the
+// CURRENT child's reconnect Login was rejected while the child keeps running
+// (frp v0.71 never exits it). It arms one recovery cycle for that child and
+// asks control for a fresh credential; the credential-wait timer then retries
+// while the rejected child is still alive, and a fresh same-generation
+// credential replaces the child through the single start funnel. The event is
+// ignored when it names a child that is no longer current, and repeated
+// failures for the same child coalesce into one request.
+func (manager *Manager) handleChildReconnectFailed(event managerEvent) {
+	if event.child != manager.child {
+		return // stale or already-replaced child: it cannot drive recovery
+	}
+	if manager.reconnectFailed {
+		return // this child's recovery cycle is already armed
+	}
+	manager.reconnectFailed = true
+	// The rejected Login burned the child's one-use jti exactly like the
+	// exit path: no further Login with the armed credential can succeed, so
+	// the credential is spent and the next start must wait for a fresh one.
+	manager.armedConsumed = true
+	manager.waitingForCredential = true
+	manager.pendingCredentialReason = ReasonReplayRejected
+	manager.emit(manager.currentGeneration, StatusError,
+		"frpc reconnect login rejected; requesting a fresh relay credential")
+	manager.requestCredentialAndScheduleRestart()
+}
+
+// handleEnsureCredential handles the daemon's bootstrap/unlock trigger. The
+// manager owns the request so it can retry it with the same bounded machinery
+// as every other credential need: a one-shot direct send could be silently
+// dropped when control's relay_credential_request burst is exhausted by
+// reconnect churn, leaving the relay down with nothing to retry it. It is a
+// no-op when a usable credential is already held, and it never asks while the
+// start fence is withdrawn or the manager is stopped.
+func (manager *Manager) handleEnsureCredential(reason CredentialRequestReason) {
+	if !manager.startPermitted.Load() || manager.isStopped() {
+		manager.emit(manager.currentGeneration, StatusError,
+			"relay credential request suppressed: tunnel start permission withdrawn")
+		return
+	}
+	if manager.hasArmedConfig && !manager.reconnectFailed {
+		// A credential is already armed for this manager: it is either about to
+		// start the child or already in use by a running one, and a second
+		// credential could not be applied without a restart this event must not
+		// force. Nothing to ensure.
+		return
+	}
+	if !validCredentialRequestReason(reason) {
+		reason = ReasonRestart
+	}
+	manager.waitingForCredential = true
+	manager.pendingCredentialReason = reason
+	manager.requestCredentialAndScheduleRestart()
+}
+
+// acceptRefreshedCredential reports whether a same-generation credential may
+// supersede the armed one. It refuses a credential that is already expired and
+// one whose expires_at is older than the armed credential's, so a delayed or
+// reordered relay_config can never replace a newer credential — during
+// recovery that would restart the rejected child with an older, still
+// unusable credential. The credential and its expiry are never logged.
+func (manager *Manager) acceptRefreshedCredential(config Config) bool {
+	if !config.ExpiresAt.After(time.Now()) {
+		manager.emit(manager.currentGeneration, StatusError,
+			"rejected refreshed relay_config: credential is already expired")
+		return false
+	}
+	if config.ExpiresAt.Before(manager.armedConfig.ExpiresAt) {
+		manager.emit(manager.currentGeneration, StatusError,
+			"rejected refreshed relay_config: expires_at is older than the armed credential")
+		return false
+	}
+	return true
 }
 
 func (manager *Manager) handleTimerFired() {
@@ -1030,7 +1349,11 @@ func (manager *Manager) handleTimerFired() {
 			manager.applyArmedConfigOrScheduleRetry()
 		}
 	case timerRetryCredentialRequest, timerCredentialWaitExpiry:
-		if manager.child == nil && manager.waitingForCredential {
+		// Retry whether or not a child is running: output-based recovery
+		// leaves the REJECTED child alive while it waits for the replacement
+		// credential (frp v0.71 never exits it), so the pre-fix `child == nil`
+		// gate would stall here forever.
+		if manager.waitingForCredential {
 			manager.requestCredentialAndScheduleRestart()
 		}
 	}
@@ -1108,6 +1431,7 @@ func (manager *Manager) startChildFenced() {
 	manager.startMu.Unlock()
 	manager.emit(manager.currentGeneration, StatusStarting, "frpc started")
 	go manager.watchChild(child, exited)
+	go manager.watchChildOutput(child, exited)
 	if manager.runningStabilityWindow > 0 {
 		go manager.notifyRunningAfterStability(child)
 	}
@@ -1118,9 +1442,19 @@ func (manager *Manager) startChildFenced() {
 // machinery: on success a bounded wait re-requests if control never answers;
 // on failure the request itself is retried with backoff. Either way the
 // manager never restarts the child with the stale credential. The §11.1
-// reason carried is the one recorded when the wait began (replay_rejected
-// today: every current recovery state is the burned-jti path).
+// reason carried is the one recorded when the wait began (replay_rejected for
+// a burned jti, restart for a daemon bootstrap/unlock trigger).
 func (manager *Manager) requestCredentialAndScheduleRestart() {
+	// Request-side arm of the §13.4/§7.4 fence: a locked or stopped agent must
+	// not put a relay_credential_request on the wire for a credential the start
+	// funnel would refuse to use. The start itself is still denied
+	// authoritatively inside startChildFenced, so a request that races the
+	// fence is harmless; this check keeps the fenced manager from asking at all.
+	if !manager.startPermitted.Load() || manager.isStopped() {
+		manager.emit(manager.currentGeneration, StatusError,
+			"relay credential request suppressed: tunnel start permission withdrawn")
+		return
+	}
 	if manager.requester == nil {
 		manager.emit(manager.currentGeneration, StatusError, "credential requester unavailable; tunnel stays down")
 		return
@@ -1153,6 +1487,46 @@ func (manager *Manager) watchChild(child childProcess, exited chan struct{}) {
 	select {
 	case manager.events <- managerEvent{kind: eventChildExited, child: child, waitError: waitError}:
 	case <-manager.doneChannel:
+	}
+}
+
+// watchChildOutput relays a reconnect-failure signal from one child's captured
+// output into the event loop, tagged with that child's identity so a stale or
+// already-replaced child can never drive recovery for a newer one. Raw output
+// text never leaves this function: only the sanitised event is emitted. Every
+// matching line is forwarded (frpc retries on a bounded backoff, so the volume
+// is low) and the event loop's reconnectFailed guard coalesces them into one
+// recovery cycle per child; forwarding them all lets a recovery that could not
+// replace the child (e.g. a stop that timed out) be re-armed by the child's
+// next failed attempt instead of latching. The watcher ends when the child
+// exits, when its output stream closes, or when the manager stops.
+func (manager *Manager) watchChildOutput(child childProcess, exited chan struct{}) {
+	output, ok := child.(childOutputStream)
+	if !ok {
+		return // no captured output: exit-based recovery still applies
+	}
+	lines := output.OutputLines()
+	for {
+		select {
+		case line, open := <-lines:
+			if !open {
+				return
+			}
+			if !isReconnectFailureLine(line) {
+				continue
+			}
+			select {
+			case manager.events <- managerEvent{kind: eventChildReconnectFailed, child: child}:
+			case <-manager.doneChannel:
+				return
+			}
+		case <-exited:
+			// The child is gone; any pending line no longer describes a live
+			// recovery target and the exit path owns recovery from here.
+			return
+		case <-manager.doneChannel:
+			return
+		}
 	}
 }
 

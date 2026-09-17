@@ -330,9 +330,16 @@ func TestUnlockHandoffTimeoutFailsClosedWithoutLifecycleActions(t *testing.T) {
 	if managerAfterRetry == nil || managerAfterRetry == managerBefore {
 		t.Error("the retried unlock must rebuild the stopped tunnel manager")
 	}
-	if got := countSentMessages(fx.sig, "relay_credential_request", map[string]any{"reason": "restart"}); got != 1 {
-		t.Errorf("relay credential requests = %d, want exactly 1", got)
-	}
+	// The request is routed through the rebuilt manager's EnsureCredential
+	// event, so it is issued asynchronously; wait for it and then prove it is
+	// not duplicated.
+	waitForCond(t, func() bool {
+		return countSentMessages(fx.sig, "relay_credential_request", map[string]any{"reason": "restart"}) >= 1
+	})
+	assertConditionStays(t, "exactly one credential request on the retried unlock",
+		initialCredentialRequestWindow, func() bool {
+			return countSentMessages(fx.sig, "relay_credential_request", map[string]any{"reason": "restart"}) == 1
+		})
 }
 
 // TestDirectServeRebuildAndStartPropagateFailClosedHandoff pins error

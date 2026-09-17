@@ -3502,23 +3502,30 @@ func (d *Daemon) restartTunnelManager() {
 }
 
 // requestRelayCredential asks control for a fresh relay admission credential
-// after unlock (§13.4 "reacquires fresh transport presence"; §11.1). The
-// restart reason is the closed-enum value for a restart recovery.
+// after unlock (§13.4 "reacquires fresh transport presence"; §11.1). It routes
+// the request through the tunnel manager's EnsureCredential event instead of
+// sending it directly, so the manager's bounded retry machinery re-issues it
+// when control does not answer: a one-shot direct send could be silently
+// dropped once reconnect churn had consumed control's rate-limited burst (4
+// immediate requests, one refill per 15s), leaving the relay down with nothing
+// to retry it. The restart reason is the closed-enum value for a restart
+// recovery. It never requests while locked: the §13.4 pre-check here is
+// advisory, and the manager re-checks its start fence on the supervision
+// goroutine before it asks.
 func (d *Daemon) requestRelayCredential() {
 	d.mu.RLock()
-	hasManager := d.tunnel != nil
+	manager := d.tunnel
 	d.mu.RUnlock()
-	if !hasManager {
+	if manager == nil {
 		return // no supervision to arm: a fresh credential would be dropped
 	}
-	sender, ok := d.signaling.(relayCredentialRequestSender)
-	if !ok {
-		log.Printf("relay credential requester unavailable: signaling client lacks relay_credential_request")
+	// §13.4: never ask a locked daemon's manager for a credential. The manager
+	// re-checks the same fence authoritatively before requesting.
+	if d.IsLocked() {
+		log.Printf("relay credential request suppressed: daemon is locked")
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := sender.SendRelayCredentialRequest(ctx, tunnel.ReasonRestart); err != nil {
+	if err := manager.EnsureCredential(tunnel.ReasonRestart); err != nil {
 		log.Printf("request relay credential: %v", err)
 	}
 }
@@ -3529,7 +3536,9 @@ func (d *Daemon) requestRelayCredential() {
 // never start frpc. It is idempotent per credential-poor manager — once a
 // relay_config has been armed, HasArmedCredential reports true and every
 // subsequent enrollment_ready is a no-op, so a reconnect cannot spam control's
-// rate-limited relay_credential_request endpoint. It never runs while locked:
+// rate-limited relay_credential_request endpoint. The request itself goes
+// through the manager (requestRelayCredential), which owns the bounded retry
+// that re-issues it when control does not answer. It never runs while locked:
 // not only is the only caller handleEnrollmentReady's unlocked branch, the
 // function re-checks IsLocked itself immediately before the send, because a
 // lockdown can complete in the window after that branch's snapshot (§13.4).

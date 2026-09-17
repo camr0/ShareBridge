@@ -33,13 +33,31 @@ type fakeChildProcess struct {
 	killBlock         <-chan struct{}
 	exitSignal        chan struct{}
 	exitOnce          sync.Once
+	// outputLines models the child adapter's captured stdout/stderr stream
+	// (the production execChildProcess pipes both into bounded line readers).
+	// It is buffered so a test can deliver lines the supervisor may already
+	// have stopped watching (a replaced or dead child).
+	outputLines chan string
 }
 
 func newFakeChildProcess(stopsOnGraceful bool) *fakeChildProcess {
 	return &fakeChildProcess{
 		stopsOnGraceful: stopsOnGraceful,
 		exitSignal:      make(chan struct{}),
+		outputLines:     make(chan string, 64),
 	}
+}
+
+// OutputLines exposes the child's captured output to the manager's output
+// watcher (the same optional capability the production adapter implements).
+func (fake *fakeChildProcess) OutputLines() <-chan string {
+	return fake.outputLines
+}
+
+// emitOutputLine delivers one raw child output line, exactly as the real frpc
+// child would write it to stdout/stderr.
+func (fake *fakeChildProcess) emitOutputLine(line string) {
+	fake.outputLines <- line
 }
 
 func (fake *fakeChildProcess) Wait() error {
@@ -182,6 +200,14 @@ func (requester *fakeCredentialRequester) requestReasons() []CredentialRequestRe
 	return append([]CredentialRequestReason(nil), requester.reasons...)
 }
 
+// setRequestError changes the recorded send error mid-test (the reconnect
+// recovery retry tests need a send that fails and then recovers).
+func (requester *fakeCredentialRequester) setRequestError(err error) {
+	requester.mu.Lock()
+	defer requester.mu.Unlock()
+	requester.requestError = err
+}
+
 // statusCollector receives manager diagnostics from the run goroutine.
 type statusCollector struct {
 	mu      sync.Mutex
@@ -228,6 +254,22 @@ func assertReportsNeverContainCredential(t *testing.T, collector *statusCollecto
 			if credential != "" && strings.Contains(report.Reason, credential) {
 				t.Fatalf("status report %q leaked credential material", report.Reason)
 			}
+		}
+	}
+}
+
+// assertReportsNeverContainRawChildOutput scans every collected status report
+// for raw child output (/§7.2 log policy): the manager sanitises the pinned
+// frpc line into an internal event and never copies the raw text into
+// telemetry, and it never logs it.
+func assertReportsNeverContainRawChildOutput(t *testing.T, collector *statusCollector) {
+	t.Helper()
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	for _, report := range collector.reports {
+		if strings.Contains(report.Reason, realFRPCReconnectFailureLine) ||
+			strings.Contains(report.Reason, "register control error") {
+			t.Fatalf("status report %q leaked raw child output", report.Reason)
 		}
 	}
 }
