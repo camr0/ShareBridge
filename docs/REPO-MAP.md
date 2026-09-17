@@ -227,6 +227,37 @@ Runs the local capacity/plateau suite (`relay/internal/integration/load_test.go`
 (later filled in by the M6 environment record). Results do not alter route selection. This is the
 only gate that exercises the `§23.8` capacity cases; the `§23.3` gate command scopes them out (`§3.1`).
 
+### 3.7 M4-exit live relay e2e harness (task #15)
+
+```bash
+scripts/live-m4exit-e2e.sh                    # all six cases (live)
+scripts/live-m4exit-e2e.sh --case relay_content_integrity
+scripts/live-m4exit-e2e.sh --list             # print the case table
+scripts/live-m4exit-e2e.sh --dry-run          # validate config + plan; nothing executed
+scripts/live-m4exit-e2e.sh --selftest         # prove the pass/fail plumbing
+```
+
+Sibling of `§3.3` (not a replacement). It encodes the verified 2026-09-17 live-run sequence
+for the M4-exit relay scenarios so they are repeatable: `enrollment_hydration_restart`
+(registered share count + `loaded N sessions from store` + per-share relay content),
+`relay_content_integrity` (gallery/`/items` count/`/thumb` type/full `/asset` sha1 + exact
+byte count/playback HEAD+200 full+≥2 byte-exact in-range `206` seeks + the three documented
+`416` cases), `stun_observe_and_rechallenge` (`match>0`, `mismatch=timeout=0`, 4m +
+jitter\[0,15s) cadence), `direct_path_or_failclosed` (direct serves, or fail-closed relay
+fallback with `direct_status=relay_fallback` + reason; never PASS when neither is
+observable), `lockdown_withdrawal_and_recovery` (**opt-in**), and `revocation_midstream`
+(**opt-in**).
+
+Config comes only from `LIVE_M4EXIT_*` env vars — `--help` documents every one and a missing
+required value is named in the diagnostic (never guessed). Exit codes match `§3.3`: `0`
+GREEN, `1` RED (FAIL / MISSING), `2` usage or incomplete `--dry-run` config, `3` PARTIAL
+(a SKIP, or a dry run — nothing executed is never a pass). Same honesty contract: a case
+PASSes only with at least one measured PASS check; note-only, skipped and otherwise
+check-less cases never pass; check details are sanitised before console and evidence; the
+two state-changing cases are opt-in (`LIVE_M4EXIT_ALLOW_LOCKDOWN=1`,
+`LIVE_M4EXIT_ALLOW_REVOKE=1`) and flagged in the run metadata. Evidence defaults to
+`${TMPDIR:-/tmp}/sharebridge-m4exit-e2e` (a run never dirties the worktree).
+
 ## 4. Operations docs index
 
 - `docs/operations/phase4a-relay.md` — relay VM runbook: topology/ports, provisioning, hardening inventory, restart ordering, the `§17.3` metrics + listeners, the operator environment surface, and how to run/renew the gates.
@@ -296,7 +327,8 @@ audits, and the per-task reviews. Dispositions: **must-fix-before-M6**, **should
 **Landed:** M1–M5 complete, plus the M4 closeout batches, the M5 remediation rounds
 (R1–R4), and task #16 (control sync listener + presence renewal + empty-snapshot boot
 adoption), the carry-forward robustness round (signaling retry, STUN host validation), the
-cross-module ack test module, and the M6 acceptance-harness skeleton.
+cross-module ack test module, the M6 acceptance-harness skeleton, and the M4-exit live
+relay e2e harness (`scripts/live-m4exit-e2e.sh`, task #15).
 
 **Gate status:** `§23.3` required-mode gate GO (16 cases); deployment gate GREEN; `§23.5`
 STUN gate GO (7/7 local + remote against the deployed test control); M6 harness RED by
@@ -307,8 +339,9 @@ design (no M6 infrastructure exists yet; all placeholders are `NOT_IMPLEMENTED`,
 - M6 acceptance (Tasks 37–44) is pending **infrastructure and user presence**: the separate
   relay VM, a non-hairpin/router surface, a cellular device, a second VM for the L4 capture,
   real NAT surfaces, and browser/device runs.
-- The M4-exit live e2e (7 scenarios) is deferred until the user is available and the test
-  VPS is restored.
+- The M4-exit live relay e2e is deferred until the user is available and the test VPS is
+  restored; the harness for it now exists (`scripts/live-m4exit-e2e.sh`, `§3.7`) but has not
+  been run against a live deployment.
 - The single-namespace-per-gateway design question above must be resolved or explicitly
   accepted before a multi-agent M6 topology.
 - The **Sol-model milestone audit over the remediation range remains OWED**: both Codex
