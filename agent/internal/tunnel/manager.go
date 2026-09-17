@@ -416,6 +416,14 @@ type Manager struct {
 	// a first configuration is armed, otherwise the current generation. It
 	// lets ApplyConfig reject stale generations synchronously.
 	publishedGeneration atomic.Int64
+	// credentialArmed is true once ANY valid relay_config has been accepted
+	// (armed), for the lifetime of this manager. ApplyConfig sets it
+	// synchronously before returning, so a caller that just delivered a
+	// credential (or a daemon deciding whether an initial request is still
+	// owed) observes a race-free answer. A fresh manager after lockdown or a
+	// restart starts false, which is what makes the daemon's initial
+	// relay_credential_request fire exactly once per credential-poor manager.
+	credentialArmed atomic.Bool
 	// childLive is the process-liveness bookkeeping: true from the moment a
 	// child is started until its Wait returns (cleared by the watcher
 	// goroutine, even after the supervision loop has exited). Atomic because
@@ -608,10 +616,23 @@ func (manager *Manager) ApplyConfig(config Config) error {
 	}
 	select {
 	case manager.events <- managerEvent{kind: eventApplyConfig, config: config}:
+		// A credential is now held (armed for this manager). Recorded here,
+		// on the caller's goroutine, so a sequential caller cannot observe a
+		// stale false and re-request a credential control already delivered.
+		manager.credentialArmed.Store(true)
 		return nil
 	case <-manager.doneChannel:
 		return errManagerStopped
 	}
+}
+
+// HasArmedCredential reports whether this manager has accepted a relay_config
+// credential. The daemon uses it to decide whether an initial
+// relay_credential_request is still owed: false means no credential is held
+// (fresh boot, or a request control never answered), true means the tunnel is
+// armed and must not be re-requested on every reconnect.
+func (manager *Manager) HasArmedCredential() bool {
+	return manager.credentialArmed.Load()
 }
 
 // Stop shuts the tunnel down: the child is stopped gracefully and killed if

@@ -1860,6 +1860,13 @@ func (d *Daemon) handleEnrollmentReady(msg signaling.Message) error {
 	// idempotent, re-run safely on every reconnect, and are no-ops when the
 	// direct path is unavailable (e.g. no port mapper behind CGNAT).
 	d.learnAndReportPublicIP()
+	// A fresh, never-locked boot must acquire its initial relay credential
+	// here: the tunnel manager is purely reactive (it only requests one after
+	// a child exit), so without this trigger the relay path never comes up
+	// until an operator lockdown/unlock cycle. Relay is the baseline path, so
+	// the request is issued BEFORE the optional direct listener and is not
+	// suppressed by a direct-listener failure.
+	d.requestInitialRelayCredential()
 	if err := d.startDirectServer(); err != nil {
 		log.Printf("baseline enrollment ready (direct listener out of service): %v", err)
 		return err
@@ -3382,8 +3389,26 @@ func (d *Daemon) requestRelayCredential() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := sender.SendRelayCredentialRequest(ctx, tunnel.ReasonRestart); err != nil {
-		log.Printf("request relay credential on unlock: %v", err)
+		log.Printf("request relay credential: %v", err)
 	}
+}
+
+// requestInitialRelayCredential issues the bootstrap relay credential request
+// for an unlocked daemon that holds none yet: on a fresh boot (or after a
+// request control never answered) the reactive tunnel manager would otherwise
+// never start frpc. It is idempotent per credential-poor manager — once a
+// relay_config has been armed, HasArmedCredential reports true and every
+// subsequent enrollment_ready is a no-op, so a reconnect cannot spam control's
+// rate-limited relay_credential_request endpoint. It never runs while locked:
+// the only caller is handleEnrollmentReady's unlocked branch (§13.4).
+func (d *Daemon) requestInitialRelayCredential() {
+	d.mu.RLock()
+	manager := d.tunnel
+	d.mu.RUnlock()
+	if manager == nil || manager.HasArmedCredential() {
+		return
+	}
+	d.requestRelayCredential()
 }
 
 // reportLockdownState re-sends the current advisory lockdown state for a new
