@@ -120,6 +120,20 @@ per-name DNS-only/ECH claim, not a zone-wide absence proof.
 | `sharebridge-relay-frps.service` `After=`/`Wants=` include the gateway | **PENDING** |
 | Neither unit `BindsTo=`/`PartOf=` couples the pair; gateway does not `After=` frps | **PENDING** |
 | Guarded live restart drill (only when `LIVE_PHASE4A_ALLOW_RESTART=1`) | **PENDING** |
+| `acceptance_09` frps-restart recovery (only when `LIVE_PHASE4A_ALLOW_RESTART=1`) | **PENDING** (must be a measured recovery within `LIVE_PHASE4A_RECOVERY_BOUND_S`; offline observed within `LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S`) |
+| `acceptance_09` baseline relay bytes | **PENDING** |
+| `acceptance_09` tunnel-offline seconds | **PENDING** |
+| `acceptance_09` recovery seconds (measured from the frps restart) | **PENDING** |
+| `acceptance_09` new frpc child PID (before → after) | **PENDING** |
+| `acceptance_09` new tunnel session (`sharebridge_relay_tunnel_reconnects_total` before → after) | **PENDING** |
+
+`acceptance_09_restart_recovery` inputs (never values): `LIVE_PHASE4A_CONTROL_BASE_URL`,
+`LIVE_PHASE4A_SHARE_CODE`, `LIVE_PHASE4A_GATEWAY_METRICS_URL` (or
+`LIVE_PHASE4A_RELAY_HOST` + `LIVE_PHASE4A_GATEWAY_METRICS_ADDR`), `LIVE_PHASE4A_FRPS_SSH_HOST`
+(default `LIVE_PHASE4A_RELAY_HOST`), `LIVE_PHASE4A_AGENT_SSH_HOST` (optional),
+`LIVE_PHASE4A_FRPC_PID_MATCH`, `LIVE_PHASE4A_RECOVERY_BOUND_S` and
+`LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S`. The gate never restarts the agent's frpc child; it
+restarts frps only under `LIVE_PHASE4A_ALLOW_RESTART=1`.
 
 ## 7. Dark posture (§20 step 1)
 

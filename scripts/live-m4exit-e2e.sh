@@ -39,6 +39,18 @@
 #                                     record direct_status=relay_fallback and
 #                                     the expected direct_status_reason. Never
 #                                     PASS when neither is observable.
+#   tunnel_recovery_frps_restart      OPT-IN. baseline tunnel online + the
+#                                     configured share SERVES over the relay ->
+#                                     restart the pinned frps unit while the
+#                                     agent's frpc child stays ALIVE -> observe
+#                                     the tunnel go offline -> require a NEW
+#                                     child + a NEW tunnel session + online=1 +
+#                                     serving content within the bound, with no
+#                                     operator action; records the measured
+#                                     offline and recovery seconds. The exact
+#                                     release-blocking defect this encodes: a
+#                                     burned single-use credential was retried
+#                                     forever until a human locked down/unlocked.
 #
 # HARDENING / FALSE-POSITIVE DISCIPLINE (added after the adversarial review):
 #   * A state-changing case refuses to run without an explicit operator target
@@ -92,10 +104,12 @@
 # SAFETY:
 #   * Read-only against remote systems (curl GET/POST prepare-route, ssh
 #     journalctl/curl, dig, openssl). The ONLY state-changing calls are the
-#     three explicitly opt-in actions: lockdown/unlock
+#     four explicitly opt-in actions: lockdown/unlock
 #     (LIVE_M4EXIT_ALLOW_LOCKDOWN=1), share revocation
-#     (LIVE_M4EXIT_ALLOW_REVOKE=1) and an explicit agent restart
-#     (LIVE_M4EXIT_ALLOW_AGENT_RESTART=1, case 1 only). All are reversible and
+#     (LIVE_M4EXIT_ALLOW_REVOKE=1), an explicit agent restart
+#     (LIVE_M4EXIT_ALLOW_AGENT_RESTART=1, case 1 only) and an frps restart
+#     (LIVE_M4EXIT_ALLOW_FRPS_RESTART=1, tunnel_recovery_frps_restart only,
+#     which never restarts the agent's frpc child). All are reversible and
 #     agent-local (revoke never deletes an Immich share). Every one of them
 #     additionally refuses to run unless the operator has asserted the target
 #     with LIVE_M4EXIT_TARGET_CONFIRM (see the env section).
@@ -219,6 +233,9 @@
 #     LIVE_M4EXIT_REVOKE_DELAY_S        seconds into the transfer before revoking (default 4)
 #     LIVE_M4EXIT_REVOKE_TIMEOUT_S      bounded transfer wait before killing it (default 120)
 #     LIVE_M4EXIT_REVOKE_WAIT_REREGISTER_S  >0 waits this long for the Immich poll to re-register (default 0 => note only)
+#     LIVE_M4EXIT_ALLOW_FRPS_RESTART    1 enables tunnel_recovery_frps_restart (restart the pinned frps unit; default 0 => SKIP)
+#     LIVE_M4EXIT_FRPC_PID_MATCH        pgrep -f pattern for the agent's frpc child (default frpc)
+#     LIVE_M4EXIT_TUNNEL_RECOVERY_BOUND_S  automatic frps-restart recovery bound seconds (default 120; LIVE_M4EXIT_TUNNEL_OFFLINE_BOUND_S bounds the offline observation)
 #
 #   Plumbing
 #     LIVE_M4EXIT_CURL_TIMEOUT          per-request curl timeout seconds (default 30)
@@ -338,6 +355,13 @@ ALLOW_LOCKDOWN="${LIVE_M4EXIT_ALLOW_LOCKDOWN:-0}"
 RECOVERY_BOUND_S="${LIVE_M4EXIT_RECOVERY_BOUND_S:-120}"
 TUNNEL_OFFLINE_BOUND_S="${LIVE_M4EXIT_TUNNEL_OFFLINE_BOUND_S:-30}"
 
+# Opt-in frps restart (tunnel_recovery_frps_restart): the dropped-session
+# recovery scenario. It never restarts the agent's frpc child; it only restarts
+# the pinned frps unit and then requires automatic recovery.
+ALLOW_FRPS_RESTART="${LIVE_M4EXIT_ALLOW_FRPS_RESTART:-0}"
+TUNNEL_RECOVERY_BOUND_S="${LIVE_M4EXIT_TUNNEL_RECOVERY_BOUND_S:-120}"
+FRPC_PID_MATCH="${LIVE_M4EXIT_FRPC_PID_MATCH:-frpc}"
+
 ALLOW_REVOKE="${LIVE_M4EXIT_ALLOW_REVOKE:-0}"
 REVOKE_SHARE_CODE="${LIVE_M4EXIT_REVOKE_SHARE_CODE:-}"
 REVOKE_ASSET_ID="${LIVE_M4EXIT_REVOKE_ASSET_ID:-}"
@@ -390,6 +414,7 @@ CASE_TABLE=(
   "direct_path_or_failclosed|task #15|either status=direct with a serving direct URL, or a fail-closed relay fallback with direct_status=relay_fallback plus the expected reason; never PASS when neither is observable"
   "lockdown_withdrawal_and_recovery|task #15|OPT-IN: lockdown -> tunnel offline + frps proxy close + prepare-route suppressed + relay yields no content -> unlock -> recovery within bound (measured)"
   "revocation_midstream|task #15|OPT-IN: throttled in-flight download -> DELETE share mid-transfer -> transfer truncated + gateway route-revocation drain (streams>=1); records the Immich re-registration caveat"
+  "tunnel_recovery_frps_restart|task #15|OPT-IN: baseline tunnel online + serving relay -> restart the pinned frps unit with the frpc child ALIVE -> observe offline -> require a NEW child + NEW tunnel session + online=1 + serving content within the bound; records the measured offline and recovery seconds"
 )
 
 case_names=()
@@ -869,6 +894,31 @@ gateway_tunnel_online() {
   # echoes the online gauge value (or empty when unobservable)
   fetch_gateway_metrics >/dev/null 2>&1 || return 1
   metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}'
+}
+
+frpc_pids() {
+  # Space-separated, numerically sorted PIDs of the agent's frpc child. Runs on
+  # LIVE_M4EXIT_AGENT_SSH_HOST when set, else on the harness host. Empty means
+  # unobservable, never "no child".
+  local out
+  if [[ -n "$AGENT_SSH_HOST" ]]; then
+    out="$(remote_exec "$AGENT_SSH_HOST" "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
+  else
+    out="$(local_exec "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
+  fi
+  printf '%s' "$out" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+}
+
+# tunnel_recovery_verdict <online> <pid-before> <pid-after> <reconn-before> <reconn-after> <content-ok 0|1>
+# Prints ok | offline | no-child | no-session | no-content. A pure predicate so
+# the live case and --selftest share one definition of "automatically recovered".
+tunnel_recovery_verdict() {
+  local online="$1" pbefore="$2" pafter="$3" rbefore="$4" rafter="$5" content="$6"
+  if [[ ! "$online" =~ ^[0-9]+$ || "$online" -lt 1 ]]; then printf 'offline'; return 0; fi
+  if [[ -z "$pafter" || "$pafter" == "$pbefore" ]]; then printf 'no-child'; return 0; fi
+  if [[ ! "$rbefore" =~ ^[0-9]+$ || ! "$rafter" =~ ^[0-9]+$ || "$rafter" -le "$rbefore" ]]; then printf 'no-session'; return 0; fi
+  if [[ "$content" != "1" ]]; then printf 'no-content'; return 0; fi
+  printf 'ok'
 }
 
 remote_journal() {
@@ -2249,6 +2299,162 @@ revocation_midstream() {
 }
 
 # ===========================================================================
+# CASE: tunnel_recovery_frps_restart  (OPT-IN)
+#
+# Encodes the release-blocking dropped-session defect: an frps restart drops
+# the frpc session, but frp v0.71 never exits the rejected child (the reconnect
+# path hard-codes loginFailExit=false), so the agent retries a single-use,
+# now-burned credential forever and the relay stays down until an operator
+# locks down/unlocks. The corrected agent keys recovery on the real frpc client
+# rejection line and replaces the still-running child with a fresh credential.
+# This case restarts the pinned frps unit while the agent's frpc child stays
+# ALIVE and requires automatic recovery within the bound. It NEVER restarts the
+# agent or its child.
+# ===========================================================================
+
+tunnel_recovery_frps_restart() {
+  if [[ "$ALLOW_FRPS_RESTART" != "1" ]]; then
+    check tunnel_recovery_opt_in SKIP "LIVE_M4EXIT_ALLOW_FRPS_RESTART!=1 — this case restarts the pinned frps unit (a state-changing action) to force the dropped-session scenario; opt in explicitly"
+    return 0
+  fi
+  require_config \
+    "LIVE_M4EXIT_CONTROL_BASE_URL=${CONTROL_BASE_URL}|control base URL for prepare-route" \
+    "LIVE_M4EXIT_SHARE_CODE=${SHARE_CODE}|share code for the baseline and post-recovery relay fetch" || return 0
+
+  # (0) Operator target assertion before any state change (a frps restart IS a
+  # state-changing action).
+  require_target_confirmation tunnel_recovery || return 0
+
+  # (1) Baseline: tunnel online AND the configured share actually SERVES over
+  # the relay. A broken baseline cannot prove a recovery.
+  local online reconnects_before frpc_pid_before baseline_url baseline_bytes=0
+  online="$(gateway_tunnel_online 2>/dev/null || true)"
+  if [[ ! "$online" =~ ^[0-9]+$ || "$online" -lt 1 ]]; then
+    check tunnel_recovery_baseline_tunnel FAIL "baseline sharebridge_relay_tunnel_state{state=\"online\"}='${online:-<absent>}' (want >=1) — refusing to restart frps without an online baseline tunnel (metrics source: ${GATEWAY_METRICS_URL:-ssh ${GATEWAY_SSH_HOST:-<unconfigured>} ${GATEWAY_METRICS_ADDR}})"
+    return 0
+  fi
+  check tunnel_recovery_baseline_tunnel PASS "baseline sharebridge_relay_tunnel_state{state=\"online\"}=${online}"
+
+  if ! prepare_relay_or_fail "$SHARE_CODE" tunnel_recovery_baseline; then
+    check tunnel_recovery_baseline_relay FAIL "not evaluated: no serving baseline relay URL (prepare-route failed) — refusing to restart frps"
+    return 0
+  fi
+  baseline_url="$PREPARE_RELAY_URL"
+  http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$baseline_url"
+  [[ -f "$HTTP_BODY_FILE" ]] && baseline_bytes="$(file_bytes "$HTTP_BODY_FILE")"
+  if [[ "$HTTP_CODE" == "200" && "${baseline_bytes:-0}" -gt 0 ]]; then
+    check tunnel_recovery_baseline_relay PASS "baseline relay fetch $(url_host "$baseline_url") -> 200 with ${baseline_bytes} bytes"
+    set_fact tunnel_recovery_baseline_bytes "$baseline_bytes"
+  else
+    check tunnel_recovery_baseline_relay FAIL "baseline relay fetch -> ${HTTP_CODE:-000} with ${baseline_bytes:-0} bytes (want 200 with content) ${HTTP_ERR:-} — refusing to restart frps"
+    return 0
+  fi
+
+  frpc_pid_before="$(frpc_pids)"
+  if [[ -z "$frpc_pid_before" ]]; then
+    check tunnel_recovery_child_before FAIL "no process matches pgrep -f '${FRPC_PID_MATCH}' on ${AGENT_SSH_HOST:-the harness host} — cannot compare the frpc child identity across the restart (set LIVE_M4EXIT_FRPC_PID_MATCH or LIVE_M4EXIT_AGENT_SSH_HOST)"
+    return 0
+  fi
+  check tunnel_recovery_child_before PASS "agent frpc child PID before the restart: ${frpc_pid_before}"
+
+  fetch_gateway_metrics >/dev/null 2>&1 || true
+  reconnects_before="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_reconnects_total')"
+
+  # (2) Force the exact drop: restart the pinned frps unit over SSH while the
+  # agent's frpc child keeps running.
+  local frps_target="${FRPS_SSH_HOST:-${GATEWAY_SSH_HOST:-}}"
+  if [[ -z "$frps_target" ]]; then
+    check tunnel_recovery_frps_restart FAIL "no frps SSH target: set LIVE_M4EXIT_FRPS_SSH_HOST or LIVE_M4EXIT_GATEWAY_SSH_HOST"
+    return 0
+  fi
+  local t_restart restart_out restart_rc
+  t_restart="$(date +%s)"
+  restart_out="$(remote_exec "$frps_target" "systemctl restart $FRPS_UNIT")"; restart_rc=$?
+  if [[ "$restart_rc" -ne 0 ]]; then
+    check tunnel_recovery_frps_restart FAIL "systemctl restart ${FRPS_UNIT} on ${frps_target} exit=${restart_rc}: $(printf '%s' "$restart_out" | tr '\n' ' ' | cut -c1-200)"
+    return 0
+  fi
+  check tunnel_recovery_frps_restart PASS "restarted ${FRPS_UNIT} on ${frps_target} with the agent's frpc child (${frpc_pid_before}) left alive"
+
+  # (3) Observe the tunnel go offline, bounded.
+  local offline_ok=0 offline_secs=-1
+  while [[ "$(( $(date +%s) - t_restart ))" -le "$TUNNEL_OFFLINE_BOUND_S" ]]; do
+    online="$(gateway_tunnel_online 2>/dev/null || true)"
+    if [[ "$online" =~ ^[0-9]+$ && "$online" -eq 0 ]]; then
+      offline_ok=1; offline_secs="$(( $(date +%s) - t_restart ))"; break
+    fi
+    sleep 0.5
+  done
+  set_fact tunnel_recovery_offline_seconds "$offline_secs"
+  if [[ "$offline_ok" == "1" ]]; then
+    check tunnel_recovery_tunnel_offline PASS "tunnel reported online=0 ${offline_secs}s after the frps restart (bound ${TUNNEL_OFFLINE_BOUND_S}s)"
+  else
+    check tunnel_recovery_tunnel_offline FAIL "tunnel never reported online=0 within ${TUNNEL_OFFLINE_BOUND_S}s of the frps restart (last online='${online:-<absent>}')"
+  fi
+
+  # (4) Require automatic recovery within the bound, with no operator action.
+  # prepare_route (no check recording) is used inside the polling loop so a
+  # transient offline response cannot record a spurious FAIL; the measured
+  # assertions are recorded once, after the loop.
+  local rec_ok=0 rec_secs=-1 content_ok=0 frpc_pid_after="" reconnects_after="" verdict
+  local deadline=$(( t_restart + TUNNEL_RECOVERY_BOUND_S ))
+  while [[ "$(date +%s)" -le "$deadline" ]]; do
+    # fetch_gateway_metrics must run in THIS shell (not a command substitution),
+    # or its GATEWAY_METRICS_TEXT assignment would be lost to the subshell and
+    # the reconnect counter would be read stale.
+    fetch_gateway_metrics >/dev/null 2>&1 || true
+    online="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_state{state="online"}')"
+    frpc_pid_after="$(frpc_pids)"
+    reconnects_after="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_reconnects_total')"
+    content_ok=0
+    if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
+      prepare_route "$SHARE_CODE"
+      if [[ "$PREPARE_HTTP_CODE" == "200" && "$PREPARE_STATUS" == "relay" && -n "$PREPARE_RELAY_URL" ]]; then
+        http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$PREPARE_RELAY_URL"
+        local rec_bytes=0
+        [[ -f "$HTTP_BODY_FILE" ]] && rec_bytes="$(file_bytes "$HTTP_BODY_FILE")"
+        [[ "$HTTP_CODE" == "200" && "${rec_bytes:-0}" -gt 0 ]] && content_ok=1
+      fi
+    fi
+    rec_secs="$(( $(date +%s) - t_restart ))"
+    if [[ "$(tunnel_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")" == "ok" ]]; then
+      rec_ok=1; break
+    fi
+    sleep 1
+  done
+
+  set_fact tunnel_recovery_seconds "$rec_secs"
+  verdict="$(tunnel_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")"
+
+  if [[ -n "$frpc_pid_after" && "$frpc_pid_after" != "$frpc_pid_before" ]]; then
+    check tunnel_recovery_new_child PASS "frpc child replaced automatically: ${frpc_pid_before} -> ${frpc_pid_after}"
+  else
+    check tunnel_recovery_new_child FAIL "frpc child PID did not change (before='${frpc_pid_before}' after='${frpc_pid_after:-<absent>}') — the child was not replaced without operator action"
+  fi
+  if [[ "${reconnects_after:-}" =~ ^[0-9]+$ && "${reconnects_before:-}" =~ ^[0-9]+$ && "${reconnects_after}" -gt "${reconnects_before}" ]]; then
+    check tunnel_recovery_new_session PASS "a NEW tunnel session was established (sharebridge_relay_tunnel_reconnects_total ${reconnects_before} -> ${reconnects_after}) — a fresh credential was requested and accepted"
+  else
+    check tunnel_recovery_new_session FAIL "no new tunnel session observed (reconnects ${reconnects_before:-<absent>} -> ${reconnects_after:-<absent>}) — the burned credential was not replaced with a fresh one"
+  fi
+  if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
+    check tunnel_recovery_tunnel_online PASS "gateway tunnel presence restored: sharebridge_relay_tunnel_state{state=\"online\"}=${online}"
+  else
+    check tunnel_recovery_tunnel_online FAIL "gateway tunnel still offline at the end of the bound (online='${online:-<absent>}')"
+  fi
+  if [[ "$content_ok" == "1" ]]; then
+    check tunnel_recovery_relay_content PASS "relay content served after automatic recovery ($(url_host "$PREPARE_RELAY_URL") -> 200 with content)"
+  else
+    check tunnel_recovery_relay_content FAIL "relay content did not serve after recovery (prepare http=${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}')"
+  fi
+  if [[ "$rec_ok" == "1" ]]; then
+    check tunnel_recovery_within_bound PASS "automatic recovery (new child + fresh session + online + serving content) within ${rec_secs}s of the frps restart (bound ${TUNNEL_RECOVERY_BOUND_S}s)"
+  else
+    check tunnel_recovery_within_bound FAIL "no full automatic recovery within ${TUNNEL_RECOVERY_BOUND_S}s of the frps restart (verdict='${verdict}')"
+  fi
+  return 0
+}
+
+# ===========================================================================
 # Case runner (mirrors scripts/live-phase4a.sh)
 # ===========================================================================
 
@@ -2259,6 +2465,7 @@ case_is_destructive() {
   case "$1" in
     lockdown_withdrawal_and_recovery|revocation_midstream) printf 'yes' ;;
     enrollment_hydration_restart) [[ "$ALLOW_AGENT_RESTART" == "1" ]] && printf 'yes' || printf 'no' ;;
+    tunnel_recovery_frps_restart) [[ "$ALLOW_FRPS_RESTART" == "1" ]] && printf 'yes' || printf 'no' ;;
     *) printf 'no' ;;
   esac
 }
@@ -2268,6 +2475,7 @@ case_opt_in_flag() {
     enrollment_hydration_restart) printf 'LIVE_M4EXIT_ALLOW_AGENT_RESTART=%s' "$ALLOW_AGENT_RESTART" ;;
     lockdown_withdrawal_and_recovery) printf 'LIVE_M4EXIT_ALLOW_LOCKDOWN=%s' "$ALLOW_LOCKDOWN" ;;
     revocation_midstream) printf 'LIVE_M4EXIT_ALLOW_REVOKE=%s' "$ALLOW_REVOKE" ;;
+    tunnel_recovery_frps_restart) printf 'LIVE_M4EXIT_ALLOW_FRPS_RESTART=%s' "$ALLOW_FRPS_RESTART" ;;
     *) printf 'none' ;;
   esac
 }
@@ -2367,6 +2575,7 @@ run_all_cases() {
   printf 'allow_lockdown=%s\n' "$ALLOW_LOCKDOWN"
   printf 'allow_revoke=%s\n' "$ALLOW_REVOKE"
   printf 'allow_agent_restart=%s\n' "$ALLOW_AGENT_RESTART"
+  printf 'allow_frps_restart=%s\n' "$ALLOW_FRPS_RESTART"
 
   if ! mkdir -p "$RUN_DIR"; then
     printf 'ERROR: cannot create evidence directory %s\n' "$RUN_DIR" >&2
@@ -2434,6 +2643,7 @@ write_run_metadata() {
     printf 'allow_lockdown=%s (destructive-but-reversible: case lockdown_withdrawal_and_recovery)\n' "$ALLOW_LOCKDOWN"
     printf 'allow_revoke=%s (destructive-but-agent-local: case revocation_midstream)\n' "$ALLOW_REVOKE"
     printf 'allow_agent_restart=%s (opt-in agent restart inside case enrollment_hydration_restart)\n' "$ALLOW_AGENT_RESTART"
+    printf 'allow_frps_restart=%s (opt-in frps restart inside case tunnel_recovery_frps_restart; never restarts the agent child)\n' "$ALLOW_FRPS_RESTART"
     printf 'evidence_dir=%s\n' "$RUN_DIR"
     printf 'config_origin=environment (no infra identifiers are embedded in this harness)\n'
   } > "$RUN_DIR/run-metadata.txt"
@@ -2509,6 +2719,9 @@ write_environment_facts() {
   printf 'direct_record_observed_agent=%s\n' "$(fact_get direct_record_observed_agent)"
   printf 'lockdown_tunnel_offline_seconds=%s\n' "$(fact_get lockdown_tunnel_offline_seconds)"
   printf 'lockdown_recovery_seconds=%s\n' "$(fact_get lockdown_recovery_seconds)"
+  printf 'tunnel_recovery_baseline_bytes=%s\n' "$(fact_get tunnel_recovery_baseline_bytes)"
+  printf 'tunnel_recovery_offline_seconds=%s\n' "$(fact_get tunnel_recovery_offline_seconds)"
+  printf 'tunnel_recovery_seconds=%s\n' "$(fact_get tunnel_recovery_seconds)"
   printf 'revoke_download_bytes=%s\n' "$(fact_get revoke_download_bytes)"
   printf 'revoke_asset_full_bytes=%s\n' "$(fact_get revoke_asset_full_bytes)"
   printf 'revoke_drain_streams=%s\n' "$(fact_get revoke_drain_streams)"
@@ -2626,6 +2839,15 @@ validate_case_config() {
       report_missing LIVE_M4EXIT_AGENT_ADMIN_PASSWORD "$AGENT_ADMIN_PASSWORD" "agent admin Basic-auth password"
       report_missing_any "gateway journal access" "LIVE_M4EXIT_GATEWAY_JOURNAL_FILE=$GATEWAY_JOURNAL_FILE" "LIVE_M4EXIT_GATEWAY_SSH_HOST=$GATEWAY_SSH_HOST"
       ;;
+    tunnel_recovery_frps_restart)
+      report_missing LIVE_M4EXIT_ALLOW_FRPS_RESTART "$([[ "$ALLOW_FRPS_RESTART" == "1" ]] && printf set)" "opt-in flag (requires =1)"
+      report_missing LIVE_M4EXIT_TARGET_CONFIRM "$TARGET_CONFIRM" "operator target assertion (must equal LIVE_M4EXIT_CONTROL_BASE_URL)"
+      _validate_target_confirm_match
+      report_missing LIVE_M4EXIT_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control base URL"
+      report_missing LIVE_M4EXIT_SHARE_CODE "$SHARE_CODE" "share code for the baseline and post-recovery relay fetch"
+      report_missing_any "gateway metrics access" "LIVE_M4EXIT_GATEWAY_METRICS_URL=$GATEWAY_METRICS_URL" "LIVE_M4EXIT_GATEWAY_SSH_HOST=$GATEWAY_SSH_HOST"
+      report_missing_any "frps SSH target" "LIVE_M4EXIT_FRPS_SSH_HOST=$FRPS_SSH_HOST" "LIVE_M4EXIT_GATEWAY_SSH_HOST=$GATEWAY_SSH_HOST"
+      ;;
   esac
 }
 
@@ -2639,7 +2861,7 @@ run_dry_run() {
   printf 'agent_admin_base_url=%s\n' "$(sv "${AGENT_ADMIN_BASE_URL:-<unset>}")"
   printf 'evidence_dir=%s\n' "$RUN_DIR"
   printf 'target_confirm=%s\n' "$([[ -n "$TARGET_CONFIRM" ]] && printf 'asserted' || printf 'unset')"
-  printf 'allow_agent_restart=%s allow_lockdown=%s allow_revoke=%s\n' "$ALLOW_AGENT_RESTART" "$ALLOW_LOCKDOWN" "$ALLOW_REVOKE"
+  printf 'allow_agent_restart=%s allow_lockdown=%s allow_revoke=%s allow_frps_restart=%s\n' "$ALLOW_AGENT_RESTART" "$ALLOW_LOCKDOWN" "$ALLOW_REVOKE" "$ALLOW_FRPS_RESTART"
 
   MISSING_COUNT=0
   local i name
@@ -2786,6 +3008,24 @@ run_selftest() {
   got="$(revoke_inflight_verdict 100 100 1)"; selftest_check "in-flight guard refuses an already-finished transfer" "$got" "completed" || failures=$(( failures + 1 ))
   got="$(revoke_inflight_verdict 50 100 0)";  selftest_check "in-flight guard refuses a dead download process" "$got" "not-alive" || failures=$(( failures + 1 ))
   got="$(revoke_inflight_verdict 50 100 1)";  selftest_check "in-flight guard accepts a live partial transfer" "$got" "ok" || failures=$(( failures + 1 ))
+
+  # -------------------------------------------------------------------------
+  # tunnel_recovery_frps_restart: the automatic-recovery verdict predicate and
+  # the frps-restart opt-in guard.
+  # -------------------------------------------------------------------------
+  got="$(tunnel_recovery_verdict 0 old new 5 6 1)";   selftest_check "recovery verdict refuses an offline tunnel" "$got" "offline" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old old 5 6 1)";   selftest_check "recovery verdict refuses an unchanged child" "$got" "no-child" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old new 5 5 1)";   selftest_check "recovery verdict refuses an unchanged session counter" "$got" "no-session" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old new 5 6 0)";   selftest_check "recovery verdict refuses a non-serving relay" "$got" "no-content" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old new 5 6 1)";   selftest_check "recovery verdict accepts a full automatic recovery" "$got" "ok" || failures=$(( failures + 1 ))
+  local saved_allow_frps="$ALLOW_FRPS_RESTART"
+  ALLOW_FRPS_RESTART=0
+  got="$(case_is_destructive tunnel_recovery_frps_restart)/$(case_opt_in_flag tunnel_recovery_frps_restart)"
+  selftest_check "frps-restart case is non-destructive without the opt-in" "$got" "no/LIVE_M4EXIT_ALLOW_FRPS_RESTART=0" || failures=$(( failures + 1 ))
+  ALLOW_FRPS_RESTART=1
+  got="$(case_is_destructive tunnel_recovery_frps_restart)/$(case_opt_in_flag tunnel_recovery_frps_restart)"
+  selftest_check "frps-restart case is destructive with the opt-in" "$got" "yes/LIVE_M4EXIT_ALLOW_FRPS_RESTART=1" || failures=$(( failures + 1 ))
+  ALLOW_FRPS_RESTART="$saved_allow_frps"
   local drain_bl drain_cand drain_out recent_ts
   drain_bl="2026-01-01T00:00:00Z revoked route closed established streams hostname=h.example streams=1"
   drain_cand="$(printf '%s\n%s\n%s\n' "$drain_bl" \

@@ -45,6 +45,8 @@
 #     dig, openssl s_client, ip addr, grep). Nothing is written remotely.
 #   * The only writes are local evidence files under the evidence directory.
 #   * The optional restart drill is off unless LIVE_PHASE4A_ALLOW_RESTART=1.
+#     acceptance_09_restart_recovery uses the same flag to restart the pinned
+#     frps unit (it never restarts the agent's frpc child).
 #   * Secrets are never printed: every captured line and every check() detail
 #     passes through sanitize(), which redacts key/token/password/secret/
 #     cookie/authorization/jti values, private-key blocks and share codes.
@@ -104,6 +106,22 @@
 #   LIVE_PHASE4A_SSH_OPTS              extra ssh options, word-split
 #   LIVE_PHASE4A_SSH_CONNECT_TIMEOUT   ssh ConnectTimeout seconds (default 8)
 #   LIVE_PHASE4A_REMOTE_TIMEOUT        remote command timeout seconds (default 20)
+#   LIVE_PHASE4A_CONTROL_BASE_URL      control interstitial base URL for prepare-route
+#                                      (required: acceptance_09_restart_recovery)
+#   LIVE_PHASE4A_CONTROL_INSECURE_TLS  1 disables control TLS verification (default 0)
+#   LIVE_PHASE4A_RELAY_INSECURE_TLS    1 disables relay TLS verification (default 0)
+#   LIVE_PHASE4A_SHARE_CODE            share code for the restart-recovery relay fetch
+#                                      (required: acceptance_09_restart_recovery)
+#   LIVE_PHASE4A_GATEWAY_METRICS_URL   full gateway /metrics URL reachable from here
+#                                      (optional; else fetched over SSH from LIVE_PHASE4A_RELAY_HOST)
+#   LIVE_PHASE4A_GATEWAY_METRICS_ADDR  loopback gateway metrics addr over SSH (default 127.0.0.1:9101)
+#   LIVE_PHASE4A_FRPS_SSH_HOST         ssh target hosting the pinned frps unit
+#                                      (default: LIVE_PHASE4A_RELAY_HOST)
+#   LIVE_PHASE4A_AGENT_SSH_HOST        ssh target of the home agent for the frpc child PID
+#                                      (optional; unset means the harness host runs the agent)
+#   LIVE_PHASE4A_FRPC_PID_MATCH        pgrep -f pattern for the agent's frpc child (default frpc)
+#   LIVE_PHASE4A_RECOVERY_BOUND_S      automatic restart-recovery bound seconds (default 120)
+#   LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S  post-restart tunnel-offline bound seconds (default 30)
 #
 # Evidence: every gate writes docs/operations/evidence/runs/<run-id>/gate-<name>.txt
 # (timestamp, git sha, commands, sanitised output, per-check PASS/FAIL, result
@@ -173,6 +191,22 @@ EVIDENCE_DIR="${EVIDENCE_DIR_OVERRIDE:-${LIVE_PHASE4A_EVIDENCE_DIR:-docs/operati
 ALLOW_RESTART="${LIVE_PHASE4A_ALLOW_RESTART:-0}"
 SSH_CONNECT_TIMEOUT="${LIVE_PHASE4A_SSH_CONNECT_TIMEOUT:-8}"
 REMOTE_TIMEOUT="${LIVE_PHASE4A_REMOTE_TIMEOUT:-20}"
+CONTROL_BASE_URL="${LIVE_PHASE4A_CONTROL_BASE_URL:-}"
+CONTROL_INSECURE_TLS="${LIVE_PHASE4A_CONTROL_INSECURE_TLS:-0}"
+RELAY_INSECURE_TLS="${LIVE_PHASE4A_RELAY_INSECURE_TLS:-0}"
+SHARE_CODE="${LIVE_PHASE4A_SHARE_CODE:-}"
+GATEWAY_METRICS_URL="${LIVE_PHASE4A_GATEWAY_METRICS_URL:-}"
+GATEWAY_METRICS_ADDR="${LIVE_PHASE4A_GATEWAY_METRICS_ADDR:-127.0.0.1:9101}"
+FRPS_SSH_HOST="${LIVE_PHASE4A_FRPS_SSH_HOST:-}"
+AGENT_SSH_HOST="${LIVE_PHASE4A_AGENT_SSH_HOST:-}"
+FRPC_PID_MATCH="${LIVE_PHASE4A_FRPC_PID_MATCH:-frpc}"
+RECOVERY_BOUND_S="${LIVE_PHASE4A_RECOVERY_BOUND_S:-120}"
+TUNNEL_OFFLINE_BOUND_S="${LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S:-30}"
+
+CONTROL_TLS_ARGS=()
+[[ "$CONTROL_INSECURE_TLS" == "1" ]] && CONTROL_TLS_ARGS=(-k)
+RELAY_TLS_ARGS=()
+[[ "$RELAY_INSECURE_TLS" == "1" ]] && RELAY_TLS_ARGS=(-k)
 
 SSH_EXTRA=()
 if [[ -n "${LIVE_PHASE4A_SSH_OPTS:-}" ]]; then
@@ -207,7 +241,7 @@ GATE_TABLE=(
   "acceptance_13_stun_cadence_cold_budget|Task 42|§19 #13 immediate post-reconnect + four-minute cadence, no warm repeat, cold budget within four seconds"
   "acceptance_07_no_relay_open_signal|Task 43|§19 #7 route=relay emits no open_signal/open_ack/direct probe/mapper call"
   "acceptance_08_exact_routing|Task 43|§19 #8 unknown/random/bare/tombstoned SNI never reaches an agent; exact route reaches only its owner"
-  "acceptance_09_restart_recovery|Task 43|§19 #9 gateway/frps/agent restart restores availability only after fresh authoritative presence"
+  "acceptance_09_restart_recovery|Task 43|§19 #9 restart recovery: baseline tunnel online + serving relay; restart frps with the frpc child ALIVE; observe online=0; then require a NEW child + fresh session/credential + online=1 + serving content within the bound, with no operator action"
   "acceptance_10_lockdown|Task 43|§19 #10 lockdown drops direct mapping + tunnel, closes both connection kinds, unlock with fresh credential"
   "acceptance_15_heartbeat_tunnel_dns|Task 43|§19 #15 tunnel DNS + dedicated transport cert, 10s Pings, one delayed Ping tolerated, true 45s expiry"
   "release_go_no_go_rollback|Task 44|§20 steps 5–7 + §23 blocking rule: release manifest gate + staged fallback + rollback drill"
@@ -623,6 +657,9 @@ write_environment_facts() {
   printf 'base_domain=%s\n' "$BASE_DOMAIN"
   printf 'namespace=%s\n' "${NAMESPACE:-PENDING (LIVE_PHASE4A_NAMESPACE unset)}"
   printf 'immich_url=%s\n' "${IMMICH_URL:-PENDING (LIVE_PHASE4A_IMMICH_URL unset)}"
+  printf 'control_base_url=%s\n' "${CONTROL_BASE_URL:-PENDING (LIVE_PHASE4A_CONTROL_BASE_URL unset)}"
+  printf 'allow_restart=%s\n' "$ALLOW_RESTART"
+  printf 'recovery_bound_s=%s\n' "$RECOVERY_BOUND_S"
   printf 'hetzner_instance_id_control=%s\n' "$(fact_get hetzner_instance_id_control)"
   printf 'hetzner_instance_id_relay=%s\n' "$(fact_get hetzner_instance_id_relay)"
   printf 'hetzner_region_control=%s\n' "$(fact_get hetzner_region_control)"
@@ -637,6 +674,9 @@ write_environment_facts() {
   printf 'gateway_route_ready=%s\n' "$(fact_get gateway_route_ready)"
   printf 'gateway_frps_process_healthy=%s\n' "$(fact_get gateway_frps_process_healthy)"
   printf 'selection_flag_observed=%s\n' "$(fact_get selection_flag_observed)"
+  printf 'restart_recovery_baseline_bytes=%s\n' "$(fact_get restart_recovery_baseline_bytes)"
+  printf 'restart_recovery_offline_seconds=%s\n' "$(fact_get restart_recovery_offline_seconds)"
+  printf 'restart_recovery_seconds=%s\n' "$(fact_get restart_recovery_seconds)"
 }
 
 # ---------------------------------------------------------------------------
@@ -648,6 +688,90 @@ host_only() {
   t="${t##*@}"
   t="${t%%:*}"
   printf '%s' "$t"
+}
+
+url_host() {
+  # url_host <url> -> host[:port] without the scheme/path
+  local u="$1"
+  u="${u#*://}"
+  u="${u%%/*}"
+  printf '%s' "$u"
+}
+
+metric_value() {
+  # metric_value <metrics-text> <exact-metric-with-labels>
+  printf '%s\n' "$1" | grep -F "$2" | tail -n1 | awk '{print $NF}'
+}
+
+gate_tmpdir() {
+  # The runner's per-gate temp dir (removed by execute_gate); files written
+  # here are cleaned up with the gate, so gates never leak captures in TMPDIR.
+  printf '%s' "$(dirname "${GATE_CHECK_FILE:-${TMPDIR:-/tmp}/live-phase4a-gate}")"
+}
+
+fetch_gateway_metrics() {
+  # Sets GATEWAY_METRICS_TEXT (empty on failure). A full URL wins; otherwise
+  # the loopback /metrics is read over SSH from the relay VM.
+  GATEWAY_METRICS_TEXT=""
+  local out st
+  if [[ -n "$GATEWAY_METRICS_URL" ]]; then
+    record_cmd "curl ${GATEWAY_METRICS_URL} (gateway /metrics)"
+    out="$(local_exec "curl -fsS --max-time 5 '${GATEWAY_METRICS_URL}'")"; st=$?
+    [[ "$st" -eq 0 ]] && GATEWAY_METRICS_TEXT="$out"
+    return "$st"
+  fi
+  if [[ -n "$RELAY_HOST" ]]; then
+    out="$(remote_exec "$RELAY_HOST" "curl -fsS --max-time 5 'http://${GATEWAY_METRICS_ADDR}/metrics'")"; st=$?
+    [[ "$st" -eq 0 ]] && GATEWAY_METRICS_TEXT="$out"
+    return "$st"
+  fi
+  return 1
+}
+
+gateway_tunnel_online() {
+  # echoes the online gauge value (or empty when unobservable)
+  fetch_gateway_metrics >/dev/null 2>&1 || return 1
+  metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}'
+}
+
+prepare_route() {
+  # prepare_route <share-code> ; sets PREPARE_HTTP_CODE / PREPARE_STATUS /
+  # PREPARE_RELAY_URL / PREPARE_BODY_FILE. The body lives under the gate temp
+  # dir so the runner's cleanup removes it.
+  local code="$1" url body_file
+  url="${CONTROL_BASE_URL%/}/api/shares/${code}/prepare-route"
+  body_file="$(gate_tmpdir)/prepare-route.json"
+  record_cmd "curl -X POST ${url} (interstitial prepare-route)"
+  PREPARE_HTTP_CODE="$(curl --silent --show-error --max-time 15 -X POST ${CONTROL_TLS_ARGS[@]+"${CONTROL_TLS_ARGS[@]}"} -o "$body_file" -w '%{http_code}' "$url" 2>/dev/null)"
+  PREPARE_BODY_FILE="$body_file"
+  PREPARE_STATUS="$(json_str "$(cat "$body_file" 2>/dev/null)" status)"
+  PREPARE_RELAY_URL="$(json_str "$(cat "$body_file" 2>/dev/null)" relay_url)"
+  record_out "prepare-route http=${PREPARE_HTTP_CODE:-000} status=${PREPARE_STATUS:-<none>}"
+}
+
+frpc_pids() {
+  # Space-separated, numerically sorted PIDs of the agent's frpc child. Runs on
+  # LIVE_PHASE4A_AGENT_SSH_HOST when set, else on the harness host (which is the
+  # home Mac in the M6 topology). Empty means unobservable, never "no child".
+  local out
+  if [[ -n "$AGENT_SSH_HOST" ]]; then
+    out="$(remote_exec "$AGENT_SSH_HOST" "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
+  else
+    out="$(local_exec "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
+  fi
+  printf '%s' "$out" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+}
+
+# restart_recovery_verdict <online> <pid-before> <pid-after> <reconn-before> <reconn-after> <content-ok 0|1>
+# Prints ok | offline | no-child | no-session | no-content. A pure predicate so
+# the live gate and --selftest share one definition of "automatically recovered".
+restart_recovery_verdict() {
+  local online="$1" pbefore="$2" pafter="$3" rbefore="$4" rafter="$5" content="$6"
+  if [[ ! "$online" =~ ^[0-9]+$ || "$online" -lt 1 ]]; then printf 'offline'; return 0; fi
+  if [[ -z "$pafter" || "$pafter" == "$pbefore" ]]; then printf 'no-child'; return 0; fi
+  if [[ ! "$rbefore" =~ ^[0-9]+$ || ! "$rafter" =~ ^[0-9]+$ || "$rafter" -le "$rbefore" ]]; then printf 'no-session'; return 0; fi
+  if [[ "$content" != "1" ]]; then printf 'no-content'; return 0; fi
+  printf 'ok'
 }
 
 # Record Hetzner metadata facts into FACT_* (used by the environment record).
@@ -1192,7 +1316,176 @@ acceptance_12_stun_mismatch()        { gate_not_implemented "Task 42" "§19 #12 
 acceptance_13_stun_cadence_cold_budget() { gate_not_implemented "Task 42" "§19 #13 immediate post-reconnect challenge, ~4-minute refresh, no warm repeat, cold preparation within four seconds or relay fallback, later warm direct succeeds"; }
 acceptance_07_no_relay_open_signal() { gate_not_implemented "Task 43" "§19 #7 route=relay generates no open_signal/open_ack/direct probe/port-mapper call"; }
 acceptance_08_exact_routing()        { gate_not_implemented "Task 43" "§19 #8 random/bare/tombstoned SNI never reaches any agent; a valid exact route reaches only its owning agent"; }
-acceptance_09_restart_recovery()     { gate_not_implemented "Task 43" "§19 #9 gateway/frps/agent restarts restore availability only after fresh authoritative presence, never on stale DB state"; }
+# ===========================================================================
+# GATE: acceptance_09_restart_recovery — Task 43 (spec §19 #9)
+#
+# The release-blocking defect this gate exists to prevent: an frps restart
+# drops the frpc session, but frp v0.71 never exits the rejected child (its
+# reconnect path hard-codes loginFailExit=false), so the agent retries a
+# single-use, now-burned credential forever and the relay stays down until an
+# operator locks down and unlocks. The corrected fix keys recovery on the real
+# frpc client rejection line and replaces the still-running child with a fresh
+# credential. This gate restarts the pinned frps unit while leaving the agent's
+# frpc child ALIVE and then requires, WITHOUT any operator action, a NEW child,
+# a NEW tunnel session, gateway `online=1` and serving relay content within the
+# documented bound. `LIVE_PHASE4A_ALLOW_RESTART=1` is the operator opt-in for
+# the state-changing restart (the same guarded flag as the ordering drill);
+# without it the gate fails closed rather than skipping, because
+# acceptance_09 is a required M6 gate and cannot be measured without the drop.
+# ===========================================================================
+
+acceptance_09_restart_recovery() {
+  # (0) Operator opt-in and required inputs.
+  if [[ "$ALLOW_RESTART" != "1" ]]; then
+    check restart_recovery_opt_in FAIL "LIVE_PHASE4A_ALLOW_RESTART!=1 — acceptance_09 restarts the pinned frps unit to force the exact dropped-session scenario; set LIVE_PHASE4A_ALLOW_RESTART=1 to opt in (the harness never restarts the agent's frpc child)"
+    return 0
+  fi
+  check restart_recovery_opt_in PASS "LIVE_PHASE4A_ALLOW_RESTART=1 — operator opted in to the frps restart (the agent's frpc child is never restarted by the harness)"
+
+  local frps_target="${FRPS_SSH_HOST:-$RELAY_HOST}"
+  local cfg_ok=1
+  need_cfg restart_recovery_control LIVE_PHASE4A_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control interstitial base URL for prepare-route" || cfg_ok=0
+  need_cfg restart_recovery_share LIVE_PHASE4A_SHARE_CODE "$SHARE_CODE" "share code for the baseline and post-recovery relay fetch" || cfg_ok=0
+  need_cfg restart_recovery_frps_target LIVE_PHASE4A_FRPS_SSH_HOST "$frps_target" "ssh target hosting the pinned frps unit (LIVE_PHASE4A_FRPS_SSH_HOST unset and LIVE_PHASE4A_RELAY_HOST unset)" || cfg_ok=0
+  if ! fetch_gateway_metrics >/dev/null 2>&1; then
+    check restart_recovery_metrics FAIL "gateway /metrics unobservable — set LIVE_PHASE4A_GATEWAY_METRICS_URL, or LIVE_PHASE4A_RELAY_HOST for the loopback addr ${GATEWAY_METRICS_ADDR}"
+    cfg_ok=0
+  fi
+  [[ "$cfg_ok" == "1" ]] || return 0
+
+  # (1) Baseline: tunnel online AND the configured share actually serves over
+  # the relay. A broken baseline cannot prove a recovery, so it refuses the
+  # state change outright.
+  local online reconnects_before frpc_pid_before
+  online="$(metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}')"
+  reconnects_before="$(metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_reconnects_total')"
+  if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
+    check restart_recovery_baseline_tunnel PASS "baseline sharebridge_relay_tunnel_state{state=\"online\"}=${online}"
+  else
+    check restart_recovery_baseline_tunnel FAIL "baseline online='${online:-<absent>}' (want >=1) — refusing to restart frps without an online baseline tunnel"
+    return 0
+  fi
+
+  prepare_route "$SHARE_CODE"
+  if [[ "$PREPARE_HTTP_CODE" != "200" || "$PREPARE_STATUS" != "relay" || -z "$PREPARE_RELAY_URL" ]]; then
+    check restart_recovery_baseline_prepare FAIL "prepare-route -> ${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}' relay_url='${PREPARE_RELAY_URL:+present}' — refusing to restart frps without a serving baseline"
+    return 0
+  fi
+  check restart_recovery_baseline_prepare PASS "prepare-route -> 200 status=relay host=$(url_host "$PREPARE_RELAY_URL")"
+
+  local baseline_url="$PREPARE_RELAY_URL" baseline_file baseline_bytes=0 baseline_code
+  baseline_file="$(gate_tmpdir)/baseline.bin"
+  baseline_code="$(curl --silent --show-error --max-time 20 ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} -o "$baseline_file" -w '%{http_code}' "$baseline_url" 2>/dev/null)"
+  [[ -f "$baseline_file" ]] && baseline_bytes="$(wc -c < "$baseline_file" | tr -d ' ')"
+  if [[ "$baseline_code" == "200" && "${baseline_bytes:-0}" -gt 0 ]]; then
+    check restart_recovery_baseline_relay PASS "baseline relay fetch $(url_host "$baseline_url") -> 200 with ${baseline_bytes} bytes"
+    set_fact restart_recovery_baseline_bytes "$baseline_bytes"
+  else
+    check restart_recovery_baseline_relay FAIL "baseline relay fetch $(url_host "$baseline_url") -> ${baseline_code:-000} with ${baseline_bytes:-0} bytes (want 200 with content) — refusing to restart frps"
+    return 0
+  fi
+
+  frpc_pid_before="$(frpc_pids)"
+  if [[ -z "$frpc_pid_before" ]]; then
+    check restart_recovery_child_before FAIL "no process matches pgrep -f '${FRPC_PID_MATCH}' on ${AGENT_SSH_HOST:-the harness host} — cannot compare the frpc child identity across the restart (set LIVE_PHASE4A_FRPC_PID_MATCH or LIVE_PHASE4A_AGENT_SSH_HOST)"
+    return 0
+  fi
+  check restart_recovery_child_before PASS "agent frpc child PID before the restart: ${frpc_pid_before}"
+
+  # (2) Force the EXACT drop: restart the pinned frps unit over SSH while the
+  # agent's frpc child keeps running. The harness never restarts the child.
+  local t_restart restart_out restart_rc
+  t_restart="$(date +%s)"
+  restart_out="$(remote_exec "$frps_target" "systemctl restart $FRPS_UNIT")"; restart_rc=$?
+  if [[ "$restart_rc" -ne 0 ]]; then
+    check restart_recovery_frps_restart FAIL "systemctl restart ${FRPS_UNIT} on ${frps_target} exit=${restart_rc}: $(printf '%s' "$restart_out" | tr '\n' ' ' | cut -c1-200)"
+    return 0
+  fi
+  check restart_recovery_frps_restart PASS "restarted ${FRPS_UNIT} on ${frps_target} with the agent's frpc child (${frpc_pid_before}) left alive"
+
+  # (3) Observe the tunnel go offline, bounded, with a clear failure.
+  local offline_ok=0 offline_secs=-1
+  while [[ "$(( $(date +%s) - t_restart ))" -le "$TUNNEL_OFFLINE_BOUND_S" ]]; do
+    online="$(gateway_tunnel_online 2>/dev/null || true)"
+    if [[ "$online" =~ ^[0-9]+$ && "$online" -eq 0 ]]; then
+      offline_ok=1; offline_secs="$(( $(date +%s) - t_restart ))"; break
+    fi
+    sleep 0.5
+  done
+  set_fact restart_recovery_offline_seconds "$offline_secs"
+  if [[ "$offline_ok" == "1" ]]; then
+    check restart_recovery_tunnel_offline PASS "tunnel reported online=0 ${offline_secs}s after the frps restart (bound ${TUNNEL_OFFLINE_BOUND_S}s)"
+  else
+    check restart_recovery_tunnel_offline FAIL "tunnel never reported online=0 within ${TUNNEL_OFFLINE_BOUND_S}s of the frps restart (last online='${online:-<absent>}') — the dropped-session scenario was unobservable"
+  fi
+
+  # (4) Without any operator action, require a NEW child, a NEW tunnel session
+  # (the observable proof that a fresh credential was requested and accepted),
+  # gateway online=1 and serving relay content, all within the bound measured
+  # from the frps restart.
+  local rec_ok=0 rec_secs=-1 content_ok=0 frpc_pid_after="" reconnects_after="" verdict
+  local deadline=$(( t_restart + RECOVERY_BOUND_S ))
+  while [[ "$(date +%s)" -le "$deadline" ]]; do
+    # fetch_gateway_metrics must run in THIS shell (not a command substitution),
+    # or its GATEWAY_METRICS_TEXT assignment would be lost to the subshell and
+    # the reconnect counter would be read stale.
+    if fetch_gateway_metrics >/dev/null 2>&1; then
+      online="$(metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}')"
+    else
+      online=""
+    fi
+    frpc_pid_after="$(frpc_pids)"
+    reconnects_after="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_reconnects_total')"
+    content_ok=0
+    if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
+      # Only attempt the content fetch once presence is back, so the bounded
+      # loop stays cheap; the fetch is still inside the window.
+      prepare_route "$SHARE_CODE"
+      if [[ "$PREPARE_HTTP_CODE" == "200" && "$PREPARE_STATUS" == "relay" && -n "$PREPARE_RELAY_URL" ]]; then
+        local rec_file rec_code rec_bytes=0
+        rec_file="$(gate_tmpdir)/recovered.bin"
+        rec_code="$(curl --silent --show-error --max-time 20 ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} -o "$rec_file" -w '%{http_code}' "$PREPARE_RELAY_URL" 2>/dev/null)"
+        [[ -f "$rec_file" ]] && rec_bytes="$(wc -c < "$rec_file" | tr -d ' ')"
+        [[ "$rec_code" == "200" && "${rec_bytes:-0}" -gt 0 ]] && content_ok=1
+      fi
+    fi
+    rec_secs="$(( $(date +%s) - t_restart ))"
+    if [[ "$(restart_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")" == "ok" ]]; then
+      rec_ok=1; break
+    fi
+    sleep 1
+  done
+
+  set_fact restart_recovery_seconds "$rec_secs"
+  verdict="$(restart_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")"
+
+  if [[ -n "$frpc_pid_after" && "$frpc_pid_after" != "$frpc_pid_before" ]]; then
+    check restart_recovery_new_child PASS "frpc child replaced automatically: ${frpc_pid_before} -> ${frpc_pid_after}"
+  else
+    check restart_recovery_new_child FAIL "frpc child PID did not change (before='${frpc_pid_before}' after='${frpc_pid_after:-<absent>}') — the child was not replaced without operator action"
+  fi
+  if [[ "${reconnects_after:-}" =~ ^[0-9]+$ && "${reconnects_before:-}" =~ ^[0-9]+$ && "${reconnects_after}" -gt "${reconnects_before}" ]]; then
+    check restart_recovery_new_session PASS "a NEW tunnel session was established after the restart (sharebridge_relay_tunnel_reconnects_total ${reconnects_before} -> ${reconnects_after}) — a fresh credential was requested and accepted"
+  else
+    check restart_recovery_new_session FAIL "no new tunnel session observed (reconnects ${reconnects_before:-<absent>} -> ${reconnects_after:-<absent>}) — the burned credential was not replaced with a fresh one"
+  fi
+  if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
+    check restart_recovery_tunnel_online PASS "gateway tunnel presence restored: sharebridge_relay_tunnel_state{state=\"online\"}=${online}"
+  else
+    check restart_recovery_tunnel_online FAIL "gateway tunnel still offline at the end of the bound (online='${online:-<absent>}')"
+  fi
+  if [[ "$content_ok" == "1" ]]; then
+    check restart_recovery_relay_content PASS "relay content served after automatic recovery ($(url_host "$PREPARE_RELAY_URL") -> 200 with content)"
+  else
+    check restart_recovery_relay_content FAIL "relay content did not serve after recovery (prepare http=${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}')"
+  fi
+  if [[ "$rec_ok" == "1" ]]; then
+    check restart_recovery_within_bound PASS "automatic recovery (new child + fresh session + online + serving content) within ${rec_secs}s of the frps restart (bound ${RECOVERY_BOUND_S}s)"
+  else
+    check restart_recovery_within_bound FAIL "no full automatic recovery within ${RECOVERY_BOUND_S}s of the frps restart (verdict='${verdict}')"
+  fi
+  return 0
+}
 acceptance_10_lockdown()             { gate_not_implemented "Task 43" "§19 #10 lockdown drops direct mapping + FRP tunnel, closes both active connection kinds, unlock requires fresh credential"; }
 acceptance_15_heartbeat_tunnel_dns() { gate_not_implemented "Task 43" "§19 #15 tunnel DNS + dedicated transport cert, 10s Pings, one delayed Ping tolerated, unavailable after a true 45s lease expiry"; }
 release_go_no_go_rollback()          { gate_not_implemented "Task 44" "§20 steps 5–7 + §23 blocking rule: release-manifest gate, staged automatic fallback, rollback drill with RELAY_SELECTION_ENABLED=false"; }
@@ -1263,6 +1556,14 @@ run_selftest() {
   got="$(verdict_for "PASS,NOT_IMPLEMENTED,")"; selftest_check "verdict(placeholder present)" "$got" "RED" || failures=$((failures + 1))
   got="$(verdict_for "PASS,MISSING,")";         selftest_check "verdict(unrun/missing)" "$got" "RED" || failures=$((failures + 1))
 
+  # Restart-recovery verdict predicate: the live gate and this selftest share
+  # one definition of "automatically recovered", so every branch is proven.
+  got="$(restart_recovery_verdict 0 old new 5 6 1)";   selftest_check "recovery verdict refuses an offline tunnel" "$got" "offline" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old old 5 6 1)";   selftest_check "recovery verdict refuses an unchanged child" "$got" "no-child" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old new 5 5 1)";   selftest_check "recovery verdict refuses an unchanged session counter" "$got" "no-session" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old new 5 6 0)";   selftest_check "recovery verdict refuses a non-serving relay" "$got" "no-content" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old new 5 6 1)";   selftest_check "recovery verdict accepts a full automatic recovery" "$got" "ok" || failures=$((failures + 1))
+
   if [[ "$failures" -eq 0 ]]; then
     printf 'SELFTEST RESULT: PASS (0 failures) — the gate runner refuses PASS for unexecuted, note-only, skipped, crashing or unimplemented gates\n'
     exit 0
@@ -1296,6 +1597,11 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   printf 'relay_tunnel_host=%s\n' "${RELAY_TUNNEL_HOST:-<unset>}"
   printf 'namespace=%s\n' "${NAMESPACE:-<unset>}"
   printf 'transport_port=%s\n' "$TRANSPORT_PORT"
+  printf 'control_base_url=%s\n' "${CONTROL_BASE_URL:-<unset>}"
+  printf 'share_code=%s\n' "$([[ -n "$SHARE_CODE" ]] && printf 'set' || printf '<unset>')"
+  printf 'gateway_metrics_url=%s\n' "${GATEWAY_METRICS_URL:-<unset>}"
+  printf 'allow_restart=%s\n' "$ALLOW_RESTART"
+  printf 'recovery_bound_s=%s\n' "$RECOVERY_BOUND_S"
   printf 'evidence_dir=%s\n' "$RUN_DIR"
   printf '\nGates that would run:\n'
   for i in "${!gate_names[@]}"; do

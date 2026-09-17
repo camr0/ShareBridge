@@ -644,7 +644,9 @@ on control or the relay VM. The only writes are local evidence files. Every
 captured line passes through a sanitizer that redacts key/token/password/
 secret/cookie/authorization/`jti` values, private-key blocks and share codes.
 The optional live restart drill runs only with
-`LIVE_PHASE4A_ALLOW_RESTART=1`. The collocated test VPS (`178.156.174.47` by
+`LIVE_PHASE4A_ALLOW_RESTART=1` (the same opt-in gates
+`acceptance_09_restart_recovery`'s frps restart; that gate never restarts the
+agent's frpc child). The collocated test VPS (`178.156.174.47` by
 default) is explicitly rejected as the M6 relay target
 (`LIVE_PHASE4A_EXCLUDED_RELAY_IPS`); the M6 gate needs the new separate VM.
 
@@ -689,6 +691,16 @@ the variable. No host is hard-coded.
 | `LIVE_PHASE4A_CONTROL_ENV_FILE` | `/opt/sharebridge/.env` | `RELAY_SELECTION_ENABLED`, `CONTROL_SYNC_*` |
 | `LIVE_PHASE4A_GATEWAY_ENV_FILE` | `/etc/sharebridge/relay/gateway.env` | gateway sync + namespace |
 | `LIVE_PHASE4A_HEALTHZ_URL` | `http://127.0.0.1:9101/healthz` | `route_ready` (private, probed over SSH) |
+| `LIVE_PHASE4A_CONTROL_BASE_URL` | — | `acceptance_09` interstitial `prepare-route` |
+| `LIVE_PHASE4A_CONTROL_INSECURE_TLS` / `LIVE_PHASE4A_RELAY_INSECURE_TLS` | `0` / `0` | `acceptance_09` TLS verification for the control/relay fetch |
+| `LIVE_PHASE4A_SHARE_CODE` | — | `acceptance_09` baseline/post-recovery relay fetch |
+| `LIVE_PHASE4A_GATEWAY_METRICS_URL` | — | `acceptance_09` tunnel presence/reconnect metric (else read over SSH) |
+| `LIVE_PHASE4A_GATEWAY_METRICS_ADDR` | `127.0.0.1:9101` | `acceptance_09` loopback `/metrics` over SSH |
+| `LIVE_PHASE4A_FRPS_SSH_HOST` | `LIVE_PHASE4A_RELAY_HOST` | `acceptance_09` frps restart target |
+| `LIVE_PHASE4A_AGENT_SSH_HOST` | — | `acceptance_09` frpc child PID (unset = the harness host runs the agent) |
+| `LIVE_PHASE4A_FRPC_PID_MATCH` | `frpc` | `acceptance_09` `pgrep -f` pattern for the child |
+| `LIVE_PHASE4A_RECOVERY_BOUND_S` | `120` | `acceptance_09` automatic-recovery bound |
+| `LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S` | `30` | `acceptance_09` post-restart offline-observation bound |
 | `LIVE_PHASE4A_EVIDENCE_DIR` | `docs/operations/evidence/runs` | evidence output root |
 | `LIVE_PHASE4A_ALLOW_RESTART` | `0` | enables the guarded live restart drill |
 | `LIVE_PHASE4A_EXCLUDED_RELAY_IPS` | `178.156.174.47` | refuses the collocated test VPS |
@@ -715,7 +727,7 @@ observation — never extrapolated.
 | `acceptance_13_stun_cadence_cold_budget` | 42 | §19 #13 cadence and four-second cold budget | user (NAT) |
 | `acceptance_07_no_relay_open_signal` | 43 | §19 #7 no open signal/probe/mapper on route=relay | instrumented run |
 | `acceptance_08_exact_routing` | 43 | §19 #8 exact SNI routing, no cross-agent routing | live topology |
-| `acceptance_09_restart_recovery` | 43 | §19 #9 availability only after fresh presence | live topology |
+| `acceptance_09_restart_recovery` | 43 | §19 #9: baseline tunnel online + the configured share serves over the relay; restart the pinned frps unit over SSH with the agent's frpc child ALIVE; observe `online=0`; then, with **no operator action**, require a NEW frpc child PID, a NEW tunnel session (`sharebridge_relay_tunnel_reconnects_total` increase — the fresh-credential proof), gateway `online=1` and serving relay content within `LIVE_PHASE4A_RECOVERY_BOUND_S`, recording the measured offline/recovery seconds. Opt-in `LIVE_PHASE4A_ALLOW_RESTART=1`; fails closed with a named reason when any stage is unobservable | control base URL + share code, gateway metrics, frps/agent SSH targets |
 | `acceptance_10_lockdown` | 43 | §19 #10 lockdown closes both connection kinds; fresh-credential unlock | live topology |
 | `acceptance_15_heartbeat_tunnel_dns` | 43 | §19 #15 tunnel DNS/cert, 10 s Pings, 45 s expiry | live topology |
 | `release_go_no_go_rollback` | 44 | §20 steps 5–7 + §23 blocking rule; manifest gate + rollback drill | all evidence + user GO |
@@ -791,11 +803,14 @@ an Immich share):
 - `lockdown_withdrawal_and_recovery` requires `LIVE_M4EXIT_ALLOW_LOCKDOWN=1`.
 - `revocation_midstream` requires `LIVE_M4EXIT_ALLOW_REVOKE=1` **and**
   `LIVE_M4EXIT_REVOKE_SHARE_CODE`.
+- `tunnel_recovery_frps_restart` requires `LIVE_M4EXIT_ALLOW_FRPS_RESTART=1` and
+  restarts the pinned frps unit only; it never restarts the agent or its frpc
+  child.
 - `enrollment_hydration_restart` restarts the agent only when
   `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` (and `LIVE_M4EXIT_AGENT_RESTART_COMMAND`
   is set); without the flag it never restarts anything.
 
-All three appear as `destructive=yes` in the per-case evidence and in
+All four appear as `destructive=yes` in the per-case evidence and in
 `run-metadata.txt` while enabled; without the flag the case SKIPs or simply does
 not perform the action. In addition, **every** state-changing case refuses to
 run unless `LIVE_M4EXIT_TARGET_CONFIRM` equals the configured
@@ -832,6 +847,7 @@ operator-internal. Raw HTTP capture bodies and headers live only in one per-run
 | `direct_path_or_failclosed` | either `status=direct` with a direct URL that serves (`200`), or a fail-closed relay fallback whose control-side agent record shows `direct_status=relay_fallback` and the expected `direct_status_reason` **and is provably current** (updated at/after the prepare-route request and tied to `LIVE_M4EXIT_AGENT_RECORD_AGENT_ID`); FAILs when neither is observable. The FAIL for a missing record file names the file shape, how to obtain it, and the verdict for each observed combination | control base URL, share code, agent record file + agent id (for the relay case) |
 | `lockdown_withdrawal_and_recovery` (**opt-in**) | baseline healthy **and the relay URL actually serves (200 with content)** → lockdown (conservative "may be locked" state marked before the request) → tunnel `online=0` within the bound + a frps `proxy closing` line + `prepare-route` `503` suppressed + a relay fetch yielding no content (a change from the serving baseline) → unlock → tunnel online + `prepare-route` relay again within the bound, with the measured recovery seconds recorded. Refuses to lock down if the baseline does not serve | `ALLOW_LOCKDOWN=1`, `TARGET_CONFIRM`, agent admin, gateway metrics, frps journal |
 | `revocation_midstream` (**opt-in**) | a throttled in-flight `/asset` download (proven in flight: `0 < bytes < full size` and the process still alive) revoked mid-transfer with `DELETE /api/shares/<code>` ends truncated (bytes < the full asset size) and the gateway journal shows a **newly observed** `controlsync: revoked route closed established streams` line for the **exact** relay URL host with a post-revoke timestamp and `streams=N` (`N ≥ 1`). A zero-byte or already-finished transfer fails closed and refuses the `DELETE`. Records the documented caveat that an Immich-mirrored share is re-registered by the Immich poll within ~1 minute | `ALLOW_REVOKE=1`, `REVOKE_SHARE_CODE` (≠ `SHARE_CODE`), agent admin, gateway journal |
+| `tunnel_recovery_frps_restart` (**opt-in**) | the release-blocking dropped-session scenario: baseline tunnel `online=1` **and** the configured share actually serves over the relay → restart the pinned frps unit while the agent's frpc child stays ALIVE → tunnel `online=0` observed within the bound → then, with **no operator action**, a NEW frpc child PID, a NEW tunnel session (`sharebridge_relay_tunnel_reconnects_total` increase — the fresh-credential proof), `online=1` and serving relay content within the bound, with the measured offline and recovery seconds recorded. The harness never restarts the agent or its child | `ALLOW_FRPS_RESTART=1`, `TARGET_CONFIRM`, control base URL + share code, gateway metrics, frps SSH target |
 
 ### 14.3 Environment surface
 
@@ -852,9 +868,9 @@ is unset FAILs the affected case and is named in the diagnostic.
 | `LIVE_M4EXIT_CONTROL_METRICS_URL` or `LIVE_M4EXIT_CONTROL_SSH_HOST` | — | case 3 |
 | `LIVE_M4EXIT_STUN_JOURNAL_FILE` or `LIVE_M4EXIT_CONTROL_SSH_HOST` | — | case 3 cadence |
 | `LIVE_M4EXIT_STUN_CADENCE_TOLERANCE_S` / `_MIN_IN_BAND_DELTAS` | `5` / `1` | case 3 |
-| `LIVE_M4EXIT_GATEWAY_HEALTH_URL` / `_METRICS_URL` or `LIVE_M4EXIT_GATEWAY_SSH_HOST` | — | cases 1,5 |
+| `LIVE_M4EXIT_GATEWAY_HEALTH_URL` / `_METRICS_URL` or `LIVE_M4EXIT_GATEWAY_SSH_HOST` | — | cases 1,5,7 |
 | `LIVE_M4EXIT_GATEWAY_JOURNAL_FILE` or `_SSH_HOST` | — | cases 5,6 |
-| `LIVE_M4EXIT_FRPS_JOURNAL_FILE` or `LIVE_M4EXIT_FRPS_SSH_HOST` | — | case 5 |
+| `LIVE_M4EXIT_FRPS_JOURNAL_FILE` or `LIVE_M4EXIT_FRPS_SSH_HOST` | — | cases 5,7 |
 | `LIVE_M4EXIT_AGENT_LOG_FILE` or `LIVE_M4EXIT_AGENT_SSH_HOST` | — | case 1 hydration |
 | `LIVE_M4EXIT_EXPECTED_SHARE_COUNT` / `_HYDRATED_SESSIONS` | — / `1` | case 1 |
 | `LIVE_M4EXIT_ALLOW_AGENT_RESTART` / `_AGENT_RESTART_COMMAND` / `_AGENT_RESTART_WAIT_S` | `0` / — / `30` | case 1 opt-in restart (command required when enabled) |
@@ -862,6 +878,7 @@ is unset FAILs the affected case and is named in the diagnostic.
 | `LIVE_M4EXIT_TARGET_CONFIRM` | — | every state-changing case (must equal `LIVE_M4EXIT_CONTROL_BASE_URL`) |
 | `LIVE_M4EXIT_STUN_AGENT_ID` | — | case 3 (only this agent's accept lines are analysed) |
 | `LIVE_M4EXIT_ALLOW_LOCKDOWN` / `_RECOVERY_BOUND_S` / `_TUNNEL_OFFLINE_BOUND_S` | `0` / `120` / `30` | case 5 |
+| `LIVE_M4EXIT_ALLOW_FRPS_RESTART` / `_TUNNEL_RECOVERY_BOUND_S` / `_FRPC_PID_MATCH` | `0` / `120` / `frpc` | case 7 (`tunnel_recovery_frps_restart`; opt-in frps restart) |
 | `LIVE_M4EXIT_ALLOW_REVOKE` / `_REVOKE_SHARE_CODE` / `_REVOKE_ASSET_ID` / `_REVOKE_ASSET_BYTES` / `_REVOKE_LIMIT_RATE` / `_REVOKE_DELAY_S` / `_REVOKE_TIMEOUT_S` / `_REVOKE_WAIT_REREGISTER_S` | `0` / — / — / — / `300k` / `4` / `120` / `0` | case 6 |
 | `LIVE_M4EXIT_CURL_TIMEOUT`, `_SSH_OPTS`, `_SSH_CONNECT_TIMEOUT`, `_REMOTE_TIMEOUT`, `_JOURNAL_MAX_LINES` | `30`, —, `8`, `20`, `5000` | plumbing |
 | `LIVE_M4EXIT_EVIDENCE_DIR` | `${TMPDIR:-/tmp}/sharebridge-m4exit-e2e` | evidence output root |

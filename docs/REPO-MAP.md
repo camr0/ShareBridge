@@ -192,6 +192,18 @@ not PASS; a registered-but-unimplemented gate is `NOT_IMPLEMENTED`, never PASS; 
 details are sanitised before console and evidence; the dark-posture selection flag must be
 *observed*, never assumed from a code default.
 
+`acceptance_09_restart_recovery` encodes the release-blocking dropped-session defect (an
+frps restart leaves the frpc child retrying a burned single-use credential; the fix keys
+recovery on the real frpc client rejection line and replaces the child with a fresh
+credential). It needs `LIVE_PHASE4A_CONTROL_BASE_URL` and `LIVE_PHASE4A_SHARE_CODE` for the
+baseline/serving check, gateway metrics (`LIVE_PHASE4A_GATEWAY_METRICS_URL`, or
+`LIVE_PHASE4A_RELAY_HOST` + `LIVE_PHASE4A_GATEWAY_METRICS_ADDR`), and the restart targets
+(`LIVE_PHASE4A_FRPS_SSH_HOST`, default `LIVE_PHASE4A_RELAY_HOST`; `LIVE_PHASE4A_AGENT_SSH_HOST`
+optional; `LIVE_PHASE4A_FRPC_PID_MATCH`, default `frpc`). It restarts frps **only** under
+`LIVE_PHASE4A_ALLOW_RESTART=1` (it never restarts the agent's child) and bounds the run with
+`LIVE_PHASE4A_RECOVERY_BOUND_S` (default 120) and `LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S`
+(default 30). The full surface is `§13.2` of `docs/operations/phase4a-relay.md`.
+
 ### 3.4 STUN real-NAT gate (`§23.5`, BLOCKING)
 
 ```bash
@@ -245,8 +257,11 @@ byte count/playback HEAD+200 full+≥2 byte-exact in-range `206` seeks + the thr
 `416` cases), `stun_observe_and_rechallenge` (`match>0`, `mismatch=timeout=0`, 4m +
 jitter\[0,15s) cadence), `direct_path_or_failclosed` (direct serves, or fail-closed relay
 fallback with `direct_status=relay_fallback` + reason; never PASS when neither is
-observable), `lockdown_withdrawal_and_recovery` (**opt-in**), and `revocation_midstream`
-(**opt-in**). When the restart-hydration line cannot be observed, case 1 says exactly what to
+observable), `lockdown_withdrawal_and_recovery` (**opt-in**), `revocation_midstream`
+(**opt-in**), and `tunnel_recovery_frps_restart` (**opt-in**: baseline tunnel online + serving
+relay -> restart the pinned frps unit with the frpc child ALIVE -> observe offline -> require
+a NEW child + NEW tunnel session + `online=1` + serving content within the bound, recording
+the measured seconds). When the restart-hydration line cannot be observed, case 1 says exactly what to
 do; an explicit agent restart can be opted into with `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` +
 `LIVE_M4EXIT_AGENT_RESTART_COMMAND` (or supply a startup log via `LIVE_M4EXIT_AGENT_LOG_FILE`).
 
@@ -260,9 +275,10 @@ executed nothing". Same honesty contract: a case PASSes only with at least one m
 check; note-only, skipped and otherwise check-less cases never pass; check details and the
 evidence metadata URLs/identifiers are sanitised before console and evidence (configured
 literals, key/token/password/secret/cookie/authorization/`jti` text **and JSON `"key":
-"value"` pairs**); the three state-changing actions are opt-in
+"value"` pairs**); the four state-changing actions are opt-in
 (`LIVE_M4EXIT_ALLOW_LOCKDOWN=1`, `LIVE_M4EXIT_ALLOW_REVOKE=1`, case-1
-`LIVE_M4EXIT_ALLOW_AGENT_RESTART=1`) and flagged in the run metadata. A false-positive
+`LIVE_M4EXIT_ALLOW_AGENT_RESTART=1`, and `LIVE_M4EXIT_ALLOW_FRPS_RESTART=1` for
+`tunnel_recovery_frps_restart`) and flagged in the run metadata. A false-positive
 hardening round added: `LIVE_M4EXIT_TARGET_CONFIRM` (must equal
 `LIVE_M4EXIT_CONTROL_BASE_URL`), required before ANY state change; the revocation case
 refuses to `DELETE` unless an in-flight transfer is proven (`0 < bytes < full size` and the
