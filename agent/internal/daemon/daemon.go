@@ -489,8 +489,13 @@ func (d *Daemon) startTunnelManager(ctx context.Context, options ...tunnel.Manag
 // startTunnelManagerLocked is the lockdownMu-aware core of startTunnelManager.
 // The caller MUST hold lockdownMu. It constructs the manager (which is DENIED
 // by default) and hands it to publishTunnelManagerLocked, so the arm-from-lock-
-// state and the publication are atomic with respect to Lockdown/Unlock.
-func (d *Daemon) startTunnelManagerLocked(ctx context.Context, options ...tunnel.ManagerOption) {
+// state and the publication are atomic with respect to Lockdown/Unlock. It
+// reports whether a manager is published in d.tunnel on return: true for a
+// freshly published manager (or one already present), false when construction
+// returns early without one (missing/degenerate configuration, or a manager
+// constructor error). restartTunnelManager relies on that report to fail its
+// unlock restore closed rather than silently leaving the tunnel down.
+func (d *Daemon) startTunnelManagerLocked(ctx context.Context, options ...tunnel.ManagerOption) bool {
 	d.mu.Lock()
 	// Retain the construction inputs so §13.4 unlock can rebuild a fresh
 	// manager after lockdown permanently stopped the previous one.
@@ -498,14 +503,14 @@ func (d *Daemon) startTunnelManagerLocked(ctx context.Context, options ...tunnel
 	d.tunnelOptions = append([]tunnel.ManagerOption(nil), options...)
 	if d.tunnel != nil {
 		d.mu.Unlock()
-		return
+		return true
 	}
 	d.mu.Unlock()
 
 	cfg := d.GetConfig()
 	if cfg == nil {
 		log.Printf("relay tunnel supervision disabled: no configuration available")
-		return
+		return false
 	}
 	settings := tunnel.Settings{
 		FRPCBinaryPath: cfg.TunnelFRPCPath,
@@ -517,7 +522,7 @@ func (d *Daemon) startTunnelManagerLocked(ctx context.Context, options ...tunnel
 		// Degenerate configuration (unit tests, hand-built configs): relay
 		// supervision stays off rather than failing daemon construction.
 		log.Printf("relay tunnel supervision disabled: frpc binary or config path not configured")
-		return
+		return false
 	}
 
 	// The credential requester (§7.2/§11.1) sends over the signaling client's
@@ -533,9 +538,10 @@ func (d *Daemon) startTunnelManagerLocked(ctx context.Context, options ...tunnel
 	manager, err := tunnel.NewManager(settings, requester, d.handleTunnelStatus, options...)
 	if err != nil {
 		log.Printf("relay tunnel supervision unavailable: %v", err)
-		return
+		return false
 	}
 	d.publishTunnelManagerLocked(manager)
+	return true
 }
 
 // publishTunnelManagerLocked arms manager from the daemon's CURRENT locked
@@ -3241,12 +3247,16 @@ func (d *Daemon) runLockdownLevers(levers []lockdownLever) {
 // emits NONE of the unlocked-success lifecycle actions — no tunnel restart, no
 // credential request, no unlocked status report — so the daemon stays out of
 // service (the latched start guard keeps the replacement from binding and the
-// binder keeps its withdrawn admissions). Direct-open admission stays FENCED
-// (locked port stamp + locked SignalGate) until the ordered handoff and the
-// listener start both succeed, so a failed unlock cannot be followed by an
-// open that creates a router mapping and acks OK. ds.restorePending records the
-// owed relay restore, so a later Unlock retries it instead of short-circuiting
-// as an idempotent no-op and falsely reporting success.
+// binder keeps its withdrawn admissions). The relay tunnel rebuild has the same
+// contract: restartTunnelManager reports an unsuccessful teardown (the old
+// manager could not be stopped) or a construction that published no
+// replacement, and Unlock then returns that error with NONE of the success
+// actions. Direct-open admission stays FENCED (locked port stamp + locked
+// SignalGate) until the ordered handoff and the listener start both succeed, so
+// a failed unlock cannot be followed by an open that creates a router mapping
+// and acks OK. ds.restorePending records the owed relay restore, so a later
+// Unlock retries it instead of short-circuiting as an idempotent no-op and
+// falsely reporting success.
 func (d *Daemon) Unlock() error {
 	d.lockdownMu.Lock()
 	defer d.lockdownMu.Unlock()
@@ -3347,7 +3357,20 @@ func (d *Daemon) Unlock() error {
 	// fenced against a stale locked stamp.
 	openDirectAdmission(port, gate, epoch)
 	d.learnAndReportPublicIP()
-	d.restartTunnelManager()
+	// The relay restore is the last failure arm of the unlock: if the
+	// superseded manager could not be stopped, or no replacement manager was
+	// published, the tunnel is NOT restored. Do not emit the
+	// unlocked-success lifecycle actions and do not clear restorePending —
+	// Unlock reports the failure to its caller (non-2xx) and a later Unlock
+	// retries the owed restore instead of short-circuiting as an idempotent
+	// success.
+	if err := d.restartTunnelManager(); err != nil {
+		ds.mu.Lock()
+		ds.restorePending = true
+		ds.mu.Unlock()
+		log.Printf("unlock: relay tunnel restore failed; the owed restore stays pending: %v", err)
+		return fmt.Errorf("unlock: %w", err)
+	}
 	d.sendLockdownStatus(d.nextLockdownGeneration(), false)
 	d.requestRelayCredential()
 	ds.mu.Lock()
@@ -3460,6 +3483,29 @@ func (d *Daemon) stopDirectServerForLockdown(epoch uint64, server *direct.Direct
 // under that same lockdownMu is what arms it permitted again on a successful
 // unlock.
 //
+// It returns an error — and leaves the daemon fail-closed — in either of the
+// two ways the restore can fail, so Unlock never reports a success that did
+// not happen:
+//
+//   - The superseded manager could not be stopped (an unkillable child, an
+//     unfinished supervision loop). A replacement MUST NOT be constructed or
+//     published in that case: the old manager/child would keep running with no
+//     owner and overlap the new manager, and a later Lockdown would only know
+//     about the replacement. The old manager stays retained in d.tunnel and the
+//     error is surfaced so Unlock keeps restorePending set and a later attempt
+//     retries.
+//   - The replacement construction returned without publishing (missing or
+//     degenerate configuration, or a constructor error) while a manager WAS
+//     superseded. That is verified via startTunnelManagerLocked's report so a
+//     silent tunnel loss cannot be reported as an unlocked success. When no
+//     manager was superseded (relay supervision was never enabled or never
+//     constructed) there is no running tunnel to lose, so a missing
+//     replacement is not an error and unlock is not failed for it.
+//
+// Teardown ordering: d.tunnel is cleared only AFTER the superseded manager is
+// successfully stopped (never before), so a failed teardown leaves the old
+// manager in place to be retried.
+//
 // The superseded manager is STOPPED before its replacement is published, never
 // merely dropped: an unstopped manager keeps its supervision loop, child
 // watcher, restart timer and status emission goroutines alive with no owner,
@@ -3475,30 +3521,45 @@ func (d *Daemon) stopDirectServerForLockdown(epoch uint64, server *direct.Direct
 // only the OLD manager's startMu and then waits for that manager's own
 // supervision loop, and neither that loop nor its status emission worker ever
 // acquires lockdownMu or d.mu (shutdown emits onto the non-blocking queue, and
-// the daemon's status callback only touches the signaling sender). The wait is
-// bounded by Stop's own stopBound once startMu is held; the sole unbounded
-// part is the startMu acquisition if a child start is wedged in the process
-// starter, which is the residual documented on Manager.Stop and is the same
+// the daemon's status callback only touches the signaling sender). Stopping
+// before construction also keeps the replacement from overlapping the old
+// manager's child, config writes, and credential activity. See Manager.Stop for
+// the startMu acquisition's boundedness residual, which is the same
 // acquisition Lockdown's synchronous SetStartPermitted(false) already makes
-// while holding lockdownMu. Stopping before construction also keeps the
-// replacement from overlapping the old manager's child, config writes, and
-// credential activity.
-func (d *Daemon) restartTunnelManager() {
+// while holding lockdownMu.
+func (d *Daemon) restartTunnelManager() error {
 	d.mu.Lock()
 	ctx := d.tunnelCtx
 	options := append([]tunnel.ManagerOption(nil), d.tunnelOptions...)
 	superseded := d.tunnel
-	d.tunnel = nil
 	d.mu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if superseded != nil {
 		if err := superseded.Stop(); err != nil {
-			log.Printf("restart tunnel manager: stopping the superseded manager: %v", err)
+			// Fail closed: do NOT clear d.tunnel or publish a replacement. The
+			// superseded manager stays retained and the caller keeps its restore
+			// pending so a later Unlock retries once the child can be stopped.
+			return fmt.Errorf("restart tunnel manager: stopping the superseded manager: %w", err)
 		}
 	}
-	d.startTunnelManagerLocked(ctx, options...)
+	d.mu.Lock()
+	if d.tunnel == superseded {
+		d.tunnel = nil
+	}
+	d.mu.Unlock()
+	published := d.startTunnelManagerLocked(ctx, options...)
+	// A replacement that was not published is only a failure when a manager
+	// was actually superseded: with no prior manager (relay supervision was
+	// never enabled or never constructed) there is no running tunnel to lose,
+	// so unlock must not be failed closed for it. When a manager WAS running,
+	// a missing replacement is the silent tunnel loss this check exists to
+	// catch.
+	if superseded != nil && !published {
+		return errors.New("restart tunnel manager: no replacement manager was published")
+	}
+	return nil
 }
 
 // requestRelayCredential asks control for a fresh relay admission credential

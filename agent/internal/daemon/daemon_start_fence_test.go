@@ -347,3 +347,92 @@ func TestRestartTunnelManagerStopsSupersededManager(t *testing.T) {
 	require.True(t, replacement.StartPermitted(),
 		"a restart on an unlocked daemon must re-arm the replacement")
 }
+
+// TestRestartTunnelManagerFailsClosedWhenTeardownFails pins the fix-round
+// finding that restartTunnelManager LOGGED a superseded Stop() failure but
+// still constructed and published a replacement. A Stop that returns with an
+// unkillable child (or an unfinished supervision loop) leaves the old
+// manager/child alive with no owner; publishing a fresh manager on top of it
+// overlaps the two and hides the live orphan from every later Lockdown, which
+// only knows about the replacement. The restart must instead surface the
+// teardown failure and retain the superseded manager so Unlock can fail closed
+// and a later attempt can retry.
+func TestRestartTunnelManagerFailsClosedWhenTeardownFails(t *testing.T) {
+	unkillable := &recordingTunnelStarter{stopsOnGraceful: false, ignoresKill: true}
+	fx := newLockdownFixture(t,
+		tunnel.WithProcessStarter(unkillable.start),
+		tunnel.WithKillGracePeriod(10*time.Millisecond),
+		tunnel.WithKillWaitTimeout(50*time.Millisecond),
+		tunnel.WithStatusDrainTimeout(50*time.Millisecond),
+	)
+	require.False(t, fx.d.IsLocked(), "fixture must start unlocked")
+
+	// Run a child that survives both the graceful stop and the kill, so the
+	// superseded manager's Stop cannot complete.
+	fx.d.handleSignalingMessage(relayConfigMessage(t, 1, "credential-unkillable"))
+	waitForCond(t, func() bool { return unkillable.startCount() == 1 })
+
+	fx.d.mu.RLock()
+	superseded := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.NotNil(t, superseded, "the fixture must own a tunnel manager")
+
+	err := fx.d.restartTunnelManager()
+	require.Error(t, err, "a restart must surface a teardown failure rather than silently replace the manager")
+	require.ErrorIs(t, err, tunnel.ErrChildKillTimeout)
+
+	fx.d.mu.RLock()
+	after := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.Same(t, superseded, after,
+		"a failed teardown must retain the superseded manager, never publish an overlapping replacement")
+	require.False(t, unkillable.startCount() == 0,
+		"the retained manager still owns the unkillable child the teardown could not stop")
+}
+
+// TestUnlockFailsClosedWhenReplacementTunnelNotPublished pins the second
+// fix-round finding: restartTunnelManager cleared d.tunnel BEFORE teardown and
+// startTunnelManagerLocked could return without publishing a replacement, yet
+// Unlock still emitted the unlocked-success lifecycle and cleared
+// restorePending — a silent tunnel loss reported as success. The rebuild is now
+// verified: when no replacement is published, Unlock returns the failure, emits
+// no success actions, and keeps restorePending set so a later Unlock retries
+// the owed restore.
+func TestUnlockFailsClosedWhenReplacementTunnelNotPublished(t *testing.T) {
+	fx := newLockdownFixture(t)
+	require.NoError(t, fx.d.Lockdown())
+	require.True(t, fx.d.IsLocked(), "the fixture must be locked before the unlock")
+
+	// Make the rebuild unable to construct a replacement: blank the frpc path so
+	// startTunnelManagerLocked takes its degenerate-configuration early return
+	// without publishing anything.
+	degenerate := *fx.d.GetConfig()
+	degenerate.TunnelFRPCPath = ""
+	fx.d.mu.Lock()
+	fx.d.config = &degenerate
+	fx.d.mu.Unlock()
+
+	err := fx.d.Unlock()
+	require.Error(t, err, "unlock must report an un-restorable tunnel, not success")
+	require.Contains(t, err.Error(), "unlock")
+
+	ds := fx.d.direct
+	ds.mu.Lock()
+	restorePending := ds.restorePending
+	ds.mu.Unlock()
+	require.True(t, restorePending,
+		"a failed relay restore must keep restorePending so a later unlock retries")
+
+	fx.d.mu.RLock()
+	manager := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.Nil(t, manager, "the failed rebuild must not leave a manager published")
+
+	// No unlocked-success lifecycle action ran.
+	if fx.sig.hasSentMessage("relay_credential_request", map[string]any{"reason": "restart"}) {
+		t.Error("a failed relay restore must not request a fresh relay credential")
+	}
+	if got := countSentMessages(fx.sig, "lockdown_status", map[string]any{"locked": false}); got != 0 {
+		t.Errorf("a failed relay restore reported an unlocked status: %d report(s), want 0", got)
+	}
+}
