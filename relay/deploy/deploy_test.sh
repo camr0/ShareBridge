@@ -1462,6 +1462,28 @@ require_contains "$test_vps_script" '^PLUGIN_USER="sharebridge-frps"' \
 require_contains "$test_vps_script" '^PLUGIN_API_PATH="/frp/authorize"' \
   "test deploy frps plugin path is the pinned frpplugin.APIPath"
 
+printf -- '-- A20: production frps template plugin endpoint is host-only and exact\n'
+# The SAME frps v0.71 addr+path concatenation defect A19 pins on the
+# collocated test-VPS script also applies to the PRODUCTION relay VM, which
+# renders relay/config/frps.toml. A19 greps the test script's TEXT, so it can
+# never catch a regression in this other template: an addr that embeds the
+# plugin path here would double to /frp/authorize/frp/authorize on the
+# production relay and reject every Login, silently, while A19 stayed green.
+# Pin this template's block, name, host-only addr and exact path too.
+require_contains "$frps_config" '^\[\[httpPlugins\]\]$' \
+  "production frps template declares the frps httpPlugins block"
+require_contains "$frps_config" '^name = "sharebridge-authorize-presence"$' \
+  "production frps template names the frps authorize/presence plugin"
+# The addr must be HOST-ONLY: frps appends `path` itself, so the addr must not
+# carry the plugin path (an addr ending in /frp/authorize fails even though the
+# separate path line would still grep).
+require_not_contains "$frps_config" '^addr = .*/frp/authorize' \
+  "production frps plugin addr must not embed the plugin path (frps appends it itself)"
+require_contains "$frps_config" '^addr = "http://sharebridge-frps:\{\{ \.Envs\.SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET \}\}@127\.0\.0\.1:9001"$' \
+  "production frps plugin addr is the exact host-only basic-auth URL"
+require_contains "$frps_config" '^path = "/frp/authorize"$' \
+  "production frps plugin path is the pinned frpplugin.APIPath, separate from the addr"
+
 printf '\n== %d checks, %d failure(s) ==\n' "$checks" "$failures"
 if [[ $failures -gt 0 ]]; then
   printf 'RESULT: RED\n'
