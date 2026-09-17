@@ -122,9 +122,34 @@
 #   LIVE_PHASE4A_GATEWAY_METRICS_ADDR  loopback gateway metrics addr over SSH (default 127.0.0.1:9101)
 #   LIVE_PHASE4A_FRPS_SSH_HOST         ssh target hosting the pinned frps unit
 #                                      (default: LIVE_PHASE4A_RELAY_HOST)
-#   LIVE_PHASE4A_AGENT_SSH_HOST        ssh target of the home agent for the frpc child PID
+#   LIVE_PHASE4A_AGENT_SSH_HOST        ssh target of the home agent for the frpc child identity
 #                                      (optional; unset means the harness host runs the agent)
-#   LIVE_PHASE4A_FRPC_PID_MATCH        pgrep -f pattern for the agent's frpc child (default frpc)
+#   LIVE_PHASE4A_FRPC_PID_MATCH        pgrep -f PRE-FILTER for the agent's frpc child
+#                                      (default frpc). It is only a candidate filter: the
+#                                      identity is restricted to processes whose exact name is
+#                                      LIVE_PHASE4A_FRPC_PID_NAME, so the harness's own
+#                                      shell/timeout/pgrep wrapper command lines can never enter
+#                                      the recorded identity
+#   LIVE_PHASE4A_FRPC_PID_NAME         exact process name (comm) of the frpc child for the default
+#                                      identity discovery (default frpc)
+#   LIVE_PHASE4A_FRPC_IDENTITY_CMD     OPTIONAL operator override: a shell command run on the agent
+#                                      host (over LIVE_PHASE4A_AGENT_SSH_HOST when set, else locally)
+#                                      whose stdout is EXACTLY ONE `PID:STARTTIME` line for the
+#                                      agent's frpc child (e.g. `docker exec agent pgrep -x frpc`
+#                                      plus a start-time read). Use this for containerised agents
+#                                      where the default discovery cannot see the process. The
+#                                      identity must be stable across reads and change on restart
+#   LIVE_PHASE4A_FRPS_JOURNAL_FILE     operator-supplied frps journal/evidence file (preferred over
+#                                      SSH; used for the post-restart fresh-session proof)
+#   LIVE_PHASE4A_JOURNAL_MAX_LINES     journal tail line budget for SSH reads (default 5000)
+#   LIVE_PHASE4A_AGENT_PROXY_NAME      the frps proxy name for the agent under test, used as the
+#                                      agent-specific post-restart session proof (default:
+#                                      sb-<LIVE_PHASE4A_NAMESPACE> when the namespace is set)
+#   LIVE_PHASE4A_FRPS_RESTART_CONFIRM  REQUIRED for acceptance_09: the EXACT `<ssh-host>|<systemd-unit>`
+#                                      the harness intends to restart (it must equal
+#                                      `<LIVE_PHASE4A_FRPS_SSH_HOST>|<LIVE_PHASE4A_FRPS_UNIT>`),
+#                                      e.g. `root@10.0.0.5|sharebridge-relay-frps.service`. Never
+#                                      restarts an unconfirmed target
 #   LIVE_PHASE4A_RECOVERY_BOUND_S      automatic restart-recovery bound seconds (default 120)
 #   LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S  post-restart tunnel-offline bound seconds (default 30)
 #
@@ -205,6 +230,12 @@ GATEWAY_METRICS_ADDR="${LIVE_PHASE4A_GATEWAY_METRICS_ADDR:-127.0.0.1:9101}"
 FRPS_SSH_HOST="${LIVE_PHASE4A_FRPS_SSH_HOST:-}"
 AGENT_SSH_HOST="${LIVE_PHASE4A_AGENT_SSH_HOST:-}"
 FRPC_PID_MATCH="${LIVE_PHASE4A_FRPC_PID_MATCH:-frpc}"
+FRPC_PID_NAME="${LIVE_PHASE4A_FRPC_PID_NAME:-frpc}"
+FRPC_IDENTITY_CMD="${LIVE_PHASE4A_FRPC_IDENTITY_CMD:-}"
+FRPS_JOURNAL_FILE="${LIVE_PHASE4A_FRPS_JOURNAL_FILE:-}"
+JOURNAL_MAX_LINES="${LIVE_PHASE4A_JOURNAL_MAX_LINES:-5000}"
+AGENT_PROXY_NAME="${LIVE_PHASE4A_AGENT_PROXY_NAME:-}"
+FRPS_RESTART_CONFIRM="${LIVE_PHASE4A_FRPS_RESTART_CONFIRM:-}"
 RECOVERY_BOUND_S="${LIVE_PHASE4A_RECOVERY_BOUND_S:-120}"
 TUNNEL_OFFLINE_BOUND_S="${LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S:-30}"
 
@@ -246,7 +277,7 @@ GATE_TABLE=(
   "acceptance_13_stun_cadence_cold_budget|Task 42|§19 #13 immediate post-reconnect + four-minute cadence, no warm repeat, cold budget within four seconds"
   "acceptance_07_no_relay_open_signal|Task 43|§19 #7 route=relay emits no open_signal/open_ack/direct probe/mapper call"
   "acceptance_08_exact_routing|Task 43|§19 #8 unknown/random/bare/tombstoned SNI never reaches an agent; exact route reaches only its owner"
-  "acceptance_09_restart_recovery|Task 43|§19 #9 restart recovery: baseline tunnel online + serving relay; restart frps with the frpc child ALIVE; observe online=0; then require a NEW child + fresh session/credential + online=1 + serving content within the bound, with no operator action"
+  "acceptance_09_restart_recovery|Task 43|§19 #9 restart recovery: exact restart-target confirmation; baseline tunnel online + serving relay; restart frps with the frpc child ALIVE (identity re-measured after the restart); observe online=0; then require a REPLACED PID:STARTTIME child + a NEW agent-specific frps proxy-registration session (global counter corroborates) + online=1 + serving content, elapsed measured after all stages and within the monotonic bound, with no operator action"
   "acceptance_10_lockdown|Task 43|§19 #10 lockdown drops direct mapping + tunnel, closes both connection kinds, unlock with fresh credential"
   "acceptance_15_heartbeat_tunnel_dns|Task 43|§19 #15 tunnel DNS + dedicated transport cert, 10s Pings, one delayed Ping tolerated, true 45s expiry"
   "release_go_no_go_rollback|Task 44|§20 steps 5–7 + §23 blocking rule: release manifest gate + staged fallback + rollback drill"
@@ -307,7 +338,8 @@ sanitize() {
   ' | sed -E \
     -e "s#([Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Aa]uthorization|[Bb]earer|[Pp]assword|[Ss]ecret|[Cc]ookie|[Tt]oken)([[:space:]]*[=:][[:space:]]*|[[:space:]]+)[^[:space:],;\"']+#\1=[REDACTED]#g" \
     -e "s#([^A-Za-z0-9]|^)(jti|JTI)([=:][[:space:]]*)?[A-Za-z0-9._-]{8,}#\1\2=[REDACTED]#g" \
-    -e "s#/s/[A-Za-z0-9_-]{6,}#/s/[REDACTED-SHARE-CODE]#g"
+    -e "s#/s/[A-Za-z0-9_-]{6,}#/s/[REDACTED-SHARE-CODE]#g" \
+    -e "s#(/api/shares/|/shares/)[A-Za-z0-9_-]{4,}#\1[REDACTED-SHARE-CODE]#g"
 }
 
 sha256_file() {
@@ -345,8 +377,11 @@ check() {
 note() { check "$1" NOTE "$2"; }
 
 record_cmd() {
+  # Command evidence is secret-bearing: a recorded prepare-route URL carries the
+  # share code, and the sanitiser redacts it (`/s/<code>` plus key/value-shaped
+  # secrets) before anything reaches the evidence file.
   [[ -n "${GATE_CMD_FILE:-}" ]] || return 0
-  printf '%s\n' "$1" >> "$GATE_CMD_FILE"
+  printf '%s\n' "$1" | sanitize >> "$GATE_CMD_FILE"
 }
 
 record_out() {
@@ -715,18 +750,21 @@ gate_tmpdir() {
 }
 
 fetch_gateway_metrics() {
-  # Sets GATEWAY_METRICS_TEXT (empty on failure). A full URL wins; otherwise
-  # the loopback /metrics is read over SSH from the relay VM.
+  # fetch_gateway_metrics [max-time-seconds] ; sets GATEWAY_METRICS_TEXT (empty
+  # on failure). A full URL wins; otherwise the loopback /metrics is read over
+  # SSH from the relay VM. The optional max-time lets the bounded recovery loop
+  # cap this stage by the time remaining before its monotonic deadline.
   GATEWAY_METRICS_TEXT=""
-  local out st
+  local out st max_time="${1:-5}"
+  [[ "$max_time" =~ ^[0-9]+$ && "$max_time" -ge 1 ]] || max_time=1
   if [[ -n "$GATEWAY_METRICS_URL" ]]; then
     record_cmd "curl ${GATEWAY_METRICS_URL} (gateway /metrics)"
-    out="$(local_exec "curl -fsS --max-time 5 '${GATEWAY_METRICS_URL}'")"; st=$?
+    out="$(local_exec "curl -fsS --max-time ${max_time} '${GATEWAY_METRICS_URL}'")"; st=$?
     [[ "$st" -eq 0 ]] && GATEWAY_METRICS_TEXT="$out"
     return "$st"
   fi
   if [[ -n "$RELAY_HOST" ]]; then
-    out="$(remote_exec "$RELAY_HOST" "curl -fsS --max-time 5 'http://${GATEWAY_METRICS_ADDR}/metrics'")"; st=$?
+    out="$(remote_exec "$RELAY_HOST" "curl -fsS --max-time ${max_time} 'http://${GATEWAY_METRICS_ADDR}/metrics'")"; st=$?
     [[ "$st" -eq 0 ]] && GATEWAY_METRICS_TEXT="$out"
     return "$st"
   fi
@@ -734,47 +772,160 @@ fetch_gateway_metrics() {
 }
 
 gateway_tunnel_online() {
-  # echoes the online gauge value (or empty when unobservable)
-  fetch_gateway_metrics >/dev/null 2>&1 || return 1
+  # gateway_tunnel_online [max-time-seconds] ; echoes the online gauge value (or
+  # empty when unobservable)
+  fetch_gateway_metrics "${1:-5}" >/dev/null 2>&1 || return 1
   metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}'
 }
 
 prepare_route() {
-  # prepare_route <share-code> ; sets PREPARE_HTTP_CODE / PREPARE_STATUS /
-  # PREPARE_RELAY_URL / PREPARE_BODY_FILE. The body lives under the gate temp
-  # dir so the runner's cleanup removes it.
-  local code="$1" url body_file
+  # prepare_route <share-code> [max-time-seconds] ; sets PREPARE_HTTP_CODE /
+  # PREPARE_STATUS / PREPARE_RELAY_URL / PREPARE_BODY_FILE. The body lives under
+  # the gate temp dir so the runner's cleanup removes it. The optional max-time
+  # lets the bounded recovery loop cap this stage by the remaining time.
+  local code="$1" max_time="${2:-15}" url body_file
+  [[ "$max_time" =~ ^[0-9]+$ && "$max_time" -ge 1 ]] || max_time=1
   url="${CONTROL_BASE_URL%/}/api/shares/${code}/prepare-route"
   body_file="$(gate_tmpdir)/prepare-route.json"
   record_cmd "curl -X POST ${url} (interstitial prepare-route)"
-  PREPARE_HTTP_CODE="$(curl --silent --show-error --max-time 15 -X POST ${CONTROL_TLS_ARGS[@]+"${CONTROL_TLS_ARGS[@]}"} -o "$body_file" -w '%{http_code}' "$url" 2>/dev/null)"
+  PREPARE_HTTP_CODE="$(curl --silent --show-error --max-time "$max_time" -X POST ${CONTROL_TLS_ARGS[@]+"${CONTROL_TLS_ARGS[@]}"} -o "$body_file" -w '%{http_code}' "$url" 2>/dev/null)"
   PREPARE_BODY_FILE="$body_file"
   PREPARE_STATUS="$(json_str "$(cat "$body_file" 2>/dev/null)" status)"
   PREPARE_RELAY_URL="$(json_str "$(cat "$body_file" 2>/dev/null)" relay_url)"
   record_out "prepare-route http=${PREPARE_HTTP_CODE:-000} status=${PREPARE_STATUS:-<none>}"
 }
 
-frpc_pids() {
-  # Space-separated, numerically sorted PIDs of the agent's frpc child. Runs on
-  # LIVE_PHASE4A_AGENT_SSH_HOST when set, else on the harness host (which is the
-  # home Mac in the M6 topology). Empty means unobservable, never "no child".
-  local out
-  if [[ -n "$AGENT_SSH_HOST" ]]; then
-    out="$(remote_exec "$AGENT_SSH_HOST" "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
-  else
-    out="$(local_exec "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
+# frpc_identity_cmd: prints the POSIX-sh snippet that emits one `PID:STARTTIME`
+# line per matching frpc process on the agent host. It is built here so the live
+# gate and the -f pre-filter share one definition, and an operator override
+# (LIVE_PHASE4A_FRPC_IDENTITY_CMD) replaces it entirely for containerised agents.
+frpc_identity_cmd() {
+  if [[ -n "$FRPC_IDENTITY_CMD" ]]; then
+    printf '%s' "$FRPC_IDENTITY_CMD"
+    return 0
   fi
-  printf '%s' "$out" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+  # 'pgrep -f' is ONLY a candidate pre-filter: the harness's own shell/timeout/
+  # pgrep wrappers inherit a command line that contains the pattern, so the
+  # identity is then restricted to processes whose exact name (comm) is
+  # FRPC_PID_NAME. STARTTIME prefers /proc/<pid>/stat field 22 (stable, no
+  # restart collision) and falls back to `ps -o lstart=` on hosts without procfs.
+  cat <<EOF
+pids="\$(pgrep -f '$FRPC_PID_MATCH' 2>/dev/null)"
+for p in \$pids; do
+  c=""
+  if [ -r "/proc/\$p/comm" ]; then c="\$(cat "/proc/\$p/comm" 2>/dev/null)"; else c="\$(ps -o comm= -p "\$p" 2>/dev/null)"; c="\${c##*/}"; fi
+  [ "\$c" = '$FRPC_PID_NAME' ] || continue
+  st=""
+  if [ -r "/proc/\$p/stat" ]; then st="\$(sed 's/.*) //' "/proc/\$p/stat" 2>/dev/null | awk '{print \$20}')"; fi
+  [ -n "\$st" ] || st="\$(ps -o lstart= -p "\$p" 2>/dev/null | tr -s ' ' '_')"
+  [ -n "\$st" ] && printf '%s:%s\n' "\$p" "\$st"
+done
+EOF
 }
 
-# restart_recovery_verdict <online> <pid-before> <pid-after> <reconn-before> <reconn-after> <content-ok 0|1>
-# Prints ok | offline | no-child | no-session | no-content. A pure predicate so
-# the live gate and --selftest share one definition of "automatically recovered".
+# frpc_identities: newline-separated, sorted, unique `PID:STARTTIME` identities
+# of the agent's frpc child. Empty means unobservable, never "no child".
+frpc_identities() {
+  local cmd out
+  cmd="$(frpc_identity_cmd)"
+  if [[ -n "$AGENT_SSH_HOST" ]]; then
+    out="$(remote_exec "$AGENT_SSH_HOST" "$cmd" 2>/dev/null)"
+  else
+    out="$(local_exec "$cmd" 2>/dev/null)"
+  fi
+  printf '%s\n' "$out" | grep -E '^[0-9]+:[^[:space:]].*$' | sed -e 's/[[:space:]]*$//' | sort -u
+}
+
+# frpc_identity_status <identities-text> -> one | none | many. The identity is
+# only usable when EXACTLY ONE frpc child exists; anything else fails closed.
+frpc_identity_status() {
+  local n
+  n="$(printf '%s\n' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -cE '^[0-9]+:[^[:space:]].*$' || true)"
+  n="${n:-0}"
+  case "$n" in
+    1) printf 'one' ;;
+    0) printf 'none' ;;
+    *) printf 'many' ;;
+  esac
+}
+
+# frps_journal_grep <fixed-pattern> ; empty pattern reads the whole journal.
+# Uses LIVE_PHASE4A_FRPS_JOURNAL_FILE when supplied, else journalctl -u over SSH
+# to the frps target.
+frps_journal_grep() {
+  local pat="$1" target="${FRPS_SSH_HOST:-$RELAY_HOST}"
+  if [[ -n "$FRPS_JOURNAL_FILE" ]]; then
+    [[ -r "$FRPS_JOURNAL_FILE" ]] || return 0
+    if [[ -n "$pat" ]]; then grep -F "$pat" "$FRPS_JOURNAL_FILE" || true; else cat "$FRPS_JOURNAL_FILE"; fi
+    return 0
+  fi
+  [[ -n "$target" ]] || return 1
+  if [[ -n "$pat" ]]; then
+    remote_exec "$target" "journalctl -u '$FRPS_UNIT' --no-pager -o short-iso -n ${JOURNAL_MAX_LINES} 2>/dev/null | grep -F '$pat' || true"
+  else
+    remote_exec "$target" "journalctl -u '$FRPS_UNIT' --no-pager -o short-iso -n ${JOURNAL_MAX_LINES} 2>/dev/null || true"
+  fi
+}
+
+frps_journal_available() {
+  [[ -n "$FRPS_JOURNAL_FILE" || -n "${FRPS_SSH_HOST:-$RELAY_HOST}" ]]
+}
+
+# counter_increased_verdict <before> <after> -> ok | unobservable | no-increase.
+# One definition for BOTH the global reconnect counter and the agent-specific
+# frps proxy-registration line count; the global counter is never the sole proof.
+counter_increased_verdict() {
+  local before="$1" after="$2"
+  if [[ ! "$before" =~ ^[0-9]+$ || ! "$after" =~ ^[0-9]+$ ]]; then printf 'unobservable'; return 0; fi
+  if [[ "$after" -gt "$before" ]]; then printf 'ok'; return 0; fi
+  printf 'no-increase'
+}
+
+# bound_elapsed_verdict <elapsed-s> <bound-s> -> ok | over-bound | unobservable.
+# IMPORTANT 5: the recovery verdict measures elapsed time AFTER every stage has
+# completed and refuses a recovery that finished late, not merely one whose loop
+# happened to start before the deadline.
+bound_elapsed_verdict() {
+  local elapsed="$1" bound="$2"
+  if [[ ! "$elapsed" =~ ^[0-9]+$ || ! "$bound" =~ ^[0-9]+$ ]]; then printf 'unobservable'; return 0; fi
+  if [[ "$elapsed" -le "$bound" ]]; then printf 'ok'; return 0; fi
+  printf 'over-bound'
+}
+
+# deadline_remaining <deadline-epoch> -> seconds left (0 when the deadline has
+# passed). Used to cap every stage of a bounded loop by the remaining time.
+deadline_remaining() {
+  local deadline="$1" now rem
+  now="$(date +%s)"
+  rem=$(( deadline - now ))
+  if [[ "$rem" -lt 0 ]]; then rem=0; fi
+  printf '%s' "$rem"
+}
+
+# frps_restart_target_verdict <confirm> <host> <unit> -> unset|target-unset|mismatch|ok.
+# IMPORTANT 6: the destructive-target guard must cover the host + unit that will
+# actually be restarted, not only the control URL. The operator must type the
+# exact `<host>|<unit>` pair the harness intends to restart.
+frps_restart_target_verdict() {
+  local confirm="$1" host="$2" unit="$3"
+  if [[ -z "$confirm" ]]; then printf 'unset'; return 0; fi
+  if [[ -z "$host" || -z "$unit" ]]; then printf 'target-unset'; return 0; fi
+  if [[ "$confirm" == "$host|$unit" ]]; then printf 'ok'; return 0; fi
+  printf 'mismatch'
+}
+
+# restart_recovery_verdict <online> <pid-before> <pid-after> <reconn-before> <reconn-after> <content-ok 0|1> <agent-session-ok 0|1>
+# Prints ok | offline | no-child | no-session | no-agent-session | no-content.
+# A pure predicate so the live gate and --selftest share one definition of
+# "automatically recovered". The global reconnect counter is a corroborating
+# signal; the agent-specific frps proxy-registration proof is REQUIRED in
+# addition, never replaced by it.
 restart_recovery_verdict() {
-  local online="$1" pbefore="$2" pafter="$3" rbefore="$4" rafter="$5" content="$6"
+  local online="$1" pbefore="$2" pafter="$3" rbefore="$4" rafter="$5" content="$6" agent_session="$7"
   if [[ ! "$online" =~ ^[0-9]+$ || "$online" -lt 1 ]]; then printf 'offline'; return 0; fi
   if [[ -z "$pafter" || "$pafter" == "$pbefore" ]]; then printf 'no-child'; return 0; fi
   if [[ ! "$rbefore" =~ ^[0-9]+$ || ! "$rafter" =~ ^[0-9]+$ || "$rafter" -le "$rbefore" ]]; then printf 'no-session'; return 0; fi
+  if [[ "$agent_session" != "1" ]]; then printf 'no-agent-session'; return 0; fi
   if [[ "$content" != "1" ]]; then printf 'no-content'; return 0; fi
   printf 'ok'
 }
@@ -1348,10 +1499,37 @@ acceptance_09_restart_recovery() {
   check restart_recovery_opt_in PASS "LIVE_PHASE4A_ALLOW_RESTART=1 — operator opted in to the frps restart (the agent's frpc child is never restarted by the harness)"
 
   local frps_target="${FRPS_SSH_HOST:-$RELAY_HOST}"
+  local proxy_name="${AGENT_PROXY_NAME:-}"
+  if [[ -z "$proxy_name" && -n "$NAMESPACE" ]]; then proxy_name="sb-${NAMESPACE}"; fi
   local cfg_ok=1
   need_cfg restart_recovery_control LIVE_PHASE4A_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control interstitial base URL for prepare-route" || cfg_ok=0
   need_cfg restart_recovery_share LIVE_PHASE4A_SHARE_CODE "$SHARE_CODE" "share code for the baseline and post-recovery relay fetch" || cfg_ok=0
   need_cfg restart_recovery_frps_target LIVE_PHASE4A_FRPS_SSH_HOST "$frps_target" "ssh target hosting the pinned frps unit (LIVE_PHASE4A_FRPS_SSH_HOST unset and LIVE_PHASE4A_RELAY_HOST unset)" || cfg_ok=0
+  need_cfg restart_recovery_proxy LIVE_PHASE4A_AGENT_PROXY_NAME "$proxy_name" "frps proxy name for the agent under test (set LIVE_PHASE4A_AGENT_PROXY_NAME, or LIVE_PHASE4A_NAMESPACE to derive sb-<namespace>) — required for the agent-specific fresh-session proof" || cfg_ok=0
+  if ! frps_journal_available; then
+    check restart_recovery_frps_journal FAIL "no frps journal source: set LIVE_PHASE4A_FRPS_JOURNAL_FILE, or LIVE_PHASE4A_FRPS_SSH_HOST / LIVE_PHASE4A_RELAY_HOST for `journalctl -u ${FRPS_UNIT}` — the agent-specific post-restart session proof is unobservable without it"
+    cfg_ok=0
+  fi
+  # IMPORTANT 6: the frps SSH host + systemd unit that will be restarted each
+  # need a SEPARATE, exact operator confirmation. A control-URL confirmation
+  # alone does not cover the destructive target.
+  local target_verdict
+  target_verdict="$(frps_restart_target_verdict "$FRPS_RESTART_CONFIRM" "$frps_target" "$FRPS_UNIT")"
+  case "$target_verdict" in
+    ok)
+      check restart_recovery_target_confirmed PASS "operator confirmed the exact restart target '${frps_target}|${FRPS_UNIT}' (LIVE_PHASE4A_FRPS_RESTART_CONFIRM)" ;;
+    unset)
+      check restart_recovery_target_confirmed FAIL "LIVE_PHASE4A_FRPS_RESTART_CONFIRM is unset — refusing to restart frps without an explicit assertion of the SSH host + systemd unit; set it to the EXACT '${frps_target}|${FRPS_UNIT}'"
+      cfg_ok=0 ;;
+    target-unset)
+      check restart_recovery_target_confirmed FAIL "LIVE_PHASE4A_FRPS_RESTART_CONFIRM is set but the restart target is unset (host='${frps_target}' unit='${FRPS_UNIT}') — cannot verify the confirmation"
+      cfg_ok=0 ;;
+    *)
+      check restart_recovery_target_confirmed FAIL "LIVE_PHASE4A_FRPS_RESTART_CONFIRM='${FRPS_RESTART_CONFIRM}' does not equal the intended restart target '${frps_target}|${FRPS_UNIT}' — refusing the state-changing restart"
+      cfg_ok=0 ;;
+  esac
+  set_fact restart_recovery_frps_restart_target "${frps_target}|${FRPS_UNIT}"
+  set_fact restart_recovery_agent_proxy_name "${proxy_name:-<unset>}"
   if ! fetch_gateway_metrics >/dev/null 2>&1; then
     check restart_recovery_metrics FAIL "gateway /metrics unobservable — set LIVE_PHASE4A_GATEWAY_METRICS_URL, or LIVE_PHASE4A_RELAY_HOST for the loopback addr ${GATEWAY_METRICS_ADDR}"
     cfg_ok=0
@@ -1361,7 +1539,8 @@ acceptance_09_restart_recovery() {
   # (1) Baseline: tunnel online AND the configured share actually serves over
   # the relay. A broken baseline cannot prove a recovery, so it refuses the
   # state change outright.
-  local online reconnects_before frpc_pid_before
+  local online reconnects_before frpc_before_raw frpc_before_status frpc_pid_before
+  local proxy_lines_before="" proxy_pat="new proxy [${proxy_name}] type [tcp] success"
   online="$(metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}')"
   reconnects_before="$(metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_reconnects_total')"
   if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
@@ -1390,12 +1569,34 @@ acceptance_09_restart_recovery() {
     return 0
   fi
 
-  frpc_pid_before="$(frpc_pids)"
-  if [[ -z "$frpc_pid_before" ]]; then
-    check restart_recovery_child_before FAIL "no process matches pgrep -f '${FRPC_PID_MATCH}' on ${AGENT_SSH_HOST:-the harness host} — cannot compare the frpc child identity across the restart (set LIVE_PHASE4A_FRPC_PID_MATCH or LIVE_PHASE4A_AGENT_SSH_HOST)"
+  # BLOCKING 1: a STABLE single-child identity. The pre-filter may return wrapper
+  # PIDs, so the identity is restricted to the exact frpc process name and carries
+  # its start time; more than one (or zero) candidate fails closed instead of
+  # comparing whatever the pgrep happened to return.
+  frpc_before_raw="$(frpc_identities)"
+  frpc_before_status="$(frpc_identity_status "$frpc_before_raw")"
+  if [[ "$frpc_before_status" != "one" ]]; then
+    check restart_recovery_child_before FAIL "expected EXACTLY ONE frpc child identity on ${AGENT_SSH_HOST:-the harness host} (pre-filter '${FRPC_PID_MATCH}', exact name '${FRPC_PID_NAME}'), observed status=${frpc_before_status} identities='$(printf '%s' "$frpc_before_raw" | tr '\n' ' ')' — refusing the restart because the child identity is ambiguous; set LIVE_PHASE4A_FRPC_PID_NAME, LIVE_PHASE4A_FRPC_PID_MATCH, or LIVE_PHASE4A_FRPC_IDENTITY_CMD"
     return 0
   fi
-  check restart_recovery_child_before PASS "agent frpc child PID before the restart: ${frpc_pid_before}"
+  frpc_pid_before="$(printf '%s\n' "$frpc_before_raw" | head -n1)"
+  check restart_recovery_child_before PASS "exactly one agent frpc child identity before the restart: ${frpc_pid_before}"
+
+  # Baseline agent-specific session evidence: frps logs a post-authorization
+  # `new proxy [<proxy>] type [tcp] success` line only after the authorization
+  # plugin admitted the login for THIS agent's proxy name (§7.2/§7.3).
+  proxy_lines_before="$(frps_journal_grep "$proxy_pat" 2>/dev/null | grep -F "$proxy_pat" | grep -c . || true)"
+  proxy_lines_before="${proxy_lines_before:-0}"
+  set_fact restart_recovery_frps_proxy_lines_before "$proxy_lines_before"
+  # A zero baseline is not itself a failure: the agent's registration may simply
+  # be older than the journal tail window, and the proof is the INCREASE after
+  # the restart (a genuinely unreadable journal yields 0 after as well and still
+  # fails the agent-specific check).
+  if [[ "$proxy_lines_before" -ge 1 ]]; then
+    check restart_recovery_baseline_agent_session PASS "baseline frps proxy-registration count for '${proxy_name}' is ${proxy_lines_before}"
+  else
+    note restart_recovery_baseline_agent_session "no '${proxy_pat}' line in the current frps journal window (count=0) — the agent-specific proof is the increase after the restart"
+  fi
 
   # (2) Force the EXACT drop: restart the pinned frps unit over SSH while the
   # agent's frpc child keeps running. The harness never restarts the child.
@@ -1406,12 +1607,32 @@ acceptance_09_restart_recovery() {
     check restart_recovery_frps_restart FAIL "systemctl restart ${FRPS_UNIT} on ${frps_target} exit=${restart_rc}: $(printf '%s' "$restart_out" | tr '\n' ' ' | cut -c1-200)"
     return 0
   fi
-  check restart_recovery_frps_restart PASS "restarted ${FRPS_UNIT} on ${frps_target} with the agent's frpc child (${frpc_pid_before}) left alive"
+  check restart_recovery_frps_restart PASS "restarted ${FRPS_UNIT} on ${frps_target}"
+
+  # BLOCKING 1: the 'child left alive' claim is RE-MEASURED immediately after the
+  # restart (never inferred from the pre-restart value). Recovery can replace the
+  # child very quickly, so the sample is taken as the first readable identity
+  # (retrying only while it is unobservable) and must still be the pre-restart one.
+  local alive_raw="" alive_status="none" alive_id="" alive_try
+  for alive_try in 1 2 3; do
+    alive_raw="$(frpc_identities)"
+    alive_status="$(frpc_identity_status "$alive_raw")"
+    [[ "$alive_status" == "one" ]] && break
+    sleep 0.2
+  done
+  alive_id="$(printf '%s\n' "$alive_raw" | head -n1)"
+  if [[ "$alive_status" != "one" ]]; then
+    check restart_recovery_child_alive FAIL "could not observe EXACTLY ONE frpc child identity immediately after the restart (status=${alive_status}, identities='$(printf '%s' "$alive_raw" | tr '\n' ' ')')"
+  elif [[ "$alive_id" == "$frpc_pid_before" ]]; then
+    check restart_recovery_child_alive PASS "the pre-restart frpc child (${frpc_pid_before}) was still alive when first re-measured after the frps restart — the harness left it running"
+  else
+    check restart_recovery_child_alive FAIL "the frpc child identity changed to '${alive_id}' before it could be re-measured after the restart (was '${frpc_pid_before}') — cannot prove the pre-restart child was left alive"
+  fi
 
   # (3) Observe the tunnel go offline, bounded, with a clear failure.
-  local offline_ok=0 offline_secs=-1
-  while [[ "$(( $(date +%s) - t_restart ))" -le "$TUNNEL_OFFLINE_BOUND_S" ]]; do
-    online="$(gateway_tunnel_online 2>/dev/null || true)"
+  local offline_ok=0 offline_secs=-1 offline_deadline=$(( t_restart + TUNNEL_OFFLINE_BOUND_S ))
+  while [[ "$(deadline_remaining "$offline_deadline")" -gt 0 ]]; do
+    online="$(gateway_tunnel_online "$(deadline_remaining "$offline_deadline")" 2>/dev/null || true)"
     if [[ "$online" =~ ^[0-9]+$ && "$online" -eq 0 ]]; then
       offline_ok=1; offline_secs="$(( $(date +%s) - t_restart ))"; break
     fi
@@ -1424,55 +1645,85 @@ acceptance_09_restart_recovery() {
     check restart_recovery_tunnel_offline FAIL "tunnel never reported online=0 within ${TUNNEL_OFFLINE_BOUND_S}s of the frps restart (last online='${online:-<absent>}') — the dropped-session scenario was unobservable"
   fi
 
-  # (4) Without any operator action, require a NEW child, a NEW tunnel session
-  # (the observable proof that a fresh credential was requested and accepted),
-  # gateway online=1 and serving relay content, all within the bound measured
-  # from the frps restart.
-  local rec_ok=0 rec_secs=-1 content_ok=0 frpc_pid_after="" reconnects_after="" verdict
+  # (4) Without any operator action, require a REPLACED child, a NEW tunnel
+  # session, an agent-specific fresh admitted session for proxy '${proxy_name}',
+  # gateway online=1 and serving relay content, all within a MONOTONIC bound
+  # measured from the frps restart. Every stage is capped by the remaining time,
+  # and the elapsed time is re-measured after all stages complete.
+  local rec_ok=0 rec_secs=-1 content_ok=0 frpc_after_raw="" frpc_after_status="none" frpc_after=""
+  local reconnects_after="" proxy_lines_after="" agent_session_ok=0 remaining
   local deadline=$(( t_restart + RECOVERY_BOUND_S ))
-  while [[ "$(date +%s)" -le "$deadline" ]]; do
+  while :; do
+    remaining="$(deadline_remaining "$deadline")"
+    [[ "$remaining" -gt 0 ]] || break
     # fetch_gateway_metrics must run in THIS shell (not a command substitution),
     # or its GATEWAY_METRICS_TEXT assignment would be lost to the subshell and
     # the reconnect counter would be read stale.
-    if fetch_gateway_metrics >/dev/null 2>&1; then
+    if fetch_gateway_metrics "$remaining" >/dev/null 2>&1; then
       online="$(metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}')"
     else
       online=""
     fi
-    frpc_pid_after="$(frpc_pids)"
+    frpc_after_raw="$(frpc_identities)"
+    frpc_after_status="$(frpc_identity_status "$frpc_after_raw")"
+    frpc_after=""
+    [[ "$frpc_after_status" == "one" ]] && frpc_after="$(printf '%s\n' "$frpc_after_raw" | head -n1)"
     reconnects_after="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_reconnects_total')"
     content_ok=0
     if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
       # Only attempt the content fetch once presence is back, so the bounded
-      # loop stays cheap; the fetch is still inside the window.
-      prepare_route "$SHARE_CODE"
+      # loop stays cheap; the fetch is still capped by the remaining time.
+      remaining="$(deadline_remaining "$deadline")"
+      if [[ "$remaining" -gt 0 ]]; then
+        prepare_route "$SHARE_CODE" "$remaining"
+      fi
       if [[ "$PREPARE_HTTP_CODE" == "200" && "$PREPARE_STATUS" == "relay" && -n "$PREPARE_RELAY_URL" ]]; then
-        local rec_file rec_code rec_bytes=0
-        rec_file="$(gate_tmpdir)/recovered.bin"
-        rec_code="$(curl --silent --show-error --max-time 20 ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} -o "$rec_file" -w '%{http_code}' "$PREPARE_RELAY_URL" 2>/dev/null)"
-        [[ -f "$rec_file" ]] && rec_bytes="$(wc -c < "$rec_file" | tr -d ' ')"
-        [[ "$rec_code" == "200" && "${rec_bytes:-0}" -gt 0 ]] && content_ok=1
+        remaining="$(deadline_remaining "$deadline")"
+        if [[ "$remaining" -gt 0 ]]; then
+          local rec_file rec_code rec_bytes=0
+          rec_file="$(gate_tmpdir)/recovered.bin"
+          rec_code="$(curl --silent --show-error --max-time "$remaining" ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} -o "$rec_file" -w '%{http_code}' "$PREPARE_RELAY_URL" 2>/dev/null)"
+          [[ -f "$rec_file" ]] && rec_bytes="$(wc -c < "$rec_file" | tr -d ' ')"
+          [[ "$rec_code" == "200" && "${rec_bytes:-0}" -gt 0 ]] && content_ok=1
+        fi
+      fi
+      remaining="$(deadline_remaining "$deadline")"
+      if [[ "$remaining" -gt 0 ]]; then
+        proxy_lines_after="$(frps_journal_grep "$proxy_pat" 2>/dev/null | grep -F "$proxy_pat" | grep -c . || true)"
+        proxy_lines_after="${proxy_lines_after:-0}"
       fi
     fi
-    rec_secs="$(( $(date +%s) - t_restart ))"
-    if [[ "$(restart_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")" == "ok" ]]; then
+    agent_session_ok=0
+    [[ "$(counter_increased_verdict "$proxy_lines_before" "${proxy_lines_after:-}")" == "ok" ]] && agent_session_ok=1
+    if [[ "$(restart_recovery_verdict "$online" "$frpc_pid_before" "$frpc_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok" "$agent_session_ok")" == "ok" ]]; then
       rec_ok=1; break
     fi
     sleep 1
   done
+  # IMPORTANT 5: measure elapsed AFTER every stage has completed, so a recovery
+  # that only finished after the bound cannot be reported as within it.
+  rec_secs="$(( $(date +%s) - t_restart ))"
 
   set_fact restart_recovery_seconds "$rec_secs"
-  verdict="$(restart_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")"
+  set_fact restart_recovery_frps_proxy_lines_after "${proxy_lines_after:-<absent>}"
+  verdict="$(restart_recovery_verdict "$online" "$frpc_pid_before" "$frpc_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok" "$agent_session_ok")"
 
-  if [[ -n "$frpc_pid_after" && "$frpc_pid_after" != "$frpc_pid_before" ]]; then
-    check restart_recovery_new_child PASS "frpc child replaced automatically: ${frpc_pid_before} -> ${frpc_pid_after}"
+  if [[ "$frpc_after_status" == "one" && -n "$frpc_after" && "$frpc_after" != "$frpc_pid_before" ]]; then
+    check restart_recovery_new_child PASS "frpc child replaced automatically: ${frpc_pid_before} -> ${frpc_after}"
+  elif [[ "$frpc_after_status" != "one" ]]; then
+    check restart_recovery_new_child FAIL "the post-recovery frpc child identity is ambiguous (status=${frpc_after_status}, identities='$(printf '%s' "$frpc_after_raw" | tr '\n' ' ')')"
   else
-    check restart_recovery_new_child FAIL "frpc child PID did not change (before='${frpc_pid_before}' after='${frpc_pid_after:-<absent>}') — the child was not replaced without operator action"
+    check restart_recovery_new_child FAIL "frpc child identity did not change (before='${frpc_pid_before}' after='${frpc_after:-<absent>}') — the child was not replaced without operator action"
   fi
-  if [[ "${reconnects_after:-}" =~ ^[0-9]+$ && "${reconnects_before:-}" =~ ^[0-9]+$ && "${reconnects_after}" -gt "${reconnects_before}" ]]; then
-    check restart_recovery_new_session PASS "a NEW tunnel session was established after the restart (sharebridge_relay_tunnel_reconnects_total ${reconnects_before} -> ${reconnects_after}) — a fresh credential was requested and accepted"
+  if [[ "$(counter_increased_verdict "${reconnects_before:-}" "${reconnects_after:-}")" == "ok" ]]; then
+    check restart_recovery_new_session PASS "a NEW tunnel session was established after the restart (sharebridge_relay_tunnel_reconnects_total ${reconnects_before} -> ${reconnects_after}) — corroborating evidence that a fresh credential was requested and accepted"
   else
-    check restart_recovery_new_session FAIL "no new tunnel session observed (reconnects ${reconnects_before:-<absent>} -> ${reconnects_after:-<absent>}) — the burned credential was not replaced with a fresh one"
+    check restart_recovery_new_session FAIL "no new tunnel session observed (reconnects ${reconnects_before:-<absent>} -> ${reconnects_after:-<absent>})"
+  fi
+  if [[ "$agent_session_ok" == "1" ]]; then
+    check restart_recovery_agent_session PASS "agent-specific fresh session: a NEW frps '${proxy_pat}' line was logged after the restart (count ${proxy_lines_before} -> ${proxy_lines_after}); frps logs this only after the authorization plugin admitted a login for this agent's proxy name"
+  else
+    check restart_recovery_agent_session FAIL "no NEW frps '${proxy_pat}' line after the restart (before=${proxy_lines_before} after='${proxy_lines_after:-<unobservable>}') — the global reconnect counter alone can be another agent's session, so the agent-specific admission proof is required; check LIVE_PHASE4A_AGENT_PROXY_NAME and the frps journal source"
   fi
   if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
     check restart_recovery_tunnel_online PASS "gateway tunnel presence restored: sharebridge_relay_tunnel_state{state=\"online\"}=${online}"
@@ -1484,10 +1735,14 @@ acceptance_09_restart_recovery() {
   else
     check restart_recovery_relay_content FAIL "relay content did not serve after recovery (prepare http=${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}')"
   fi
-  if [[ "$rec_ok" == "1" ]]; then
-    check restart_recovery_within_bound PASS "automatic recovery (new child + fresh session + online + serving content) within ${rec_secs}s of the frps restart (bound ${RECOVERY_BOUND_S}s)"
+  local bound_verdict
+  bound_verdict="$(bound_elapsed_verdict "$rec_secs" "$RECOVERY_BOUND_S")"
+  if [[ "$rec_ok" == "1" && "$bound_verdict" == "ok" ]]; then
+    check restart_recovery_within_bound PASS "automatic recovery (new child + fresh session + agent-specific session + online + serving content) completed ${rec_secs}s after the frps restart, measured after all stages (bound ${RECOVERY_BOUND_S}s)"
+  elif [[ "$rec_ok" == "1" ]]; then
+    check restart_recovery_within_bound FAIL "all recovery conditions were observed, but the measured elapsed time (${rec_secs}s, after every stage completed) exceeds the bound ${RECOVERY_BOUND_S}s — refusing a late recovery"
   else
-    check restart_recovery_within_bound FAIL "no full automatic recovery within ${RECOVERY_BOUND_S}s of the frps restart (verdict='${verdict}')"
+    check restart_recovery_within_bound FAIL "no full automatic recovery within ${RECOVERY_BOUND_S}s of the frps restart (elapsed ${rec_secs}s, verdict='${verdict}')"
   fi
   return 0
 }
@@ -1563,11 +1818,64 @@ run_selftest() {
 
   # Restart-recovery verdict predicate: the live gate and this selftest share
   # one definition of "automatically recovered", so every branch is proven.
-  got="$(restart_recovery_verdict 0 old new 5 6 1)";   selftest_check "recovery verdict refuses an offline tunnel" "$got" "offline" || failures=$((failures + 1))
-  got="$(restart_recovery_verdict 1 old old 5 6 1)";   selftest_check "recovery verdict refuses an unchanged child" "$got" "no-child" || failures=$((failures + 1))
-  got="$(restart_recovery_verdict 1 old new 5 5 1)";   selftest_check "recovery verdict refuses an unchanged session counter" "$got" "no-session" || failures=$((failures + 1))
-  got="$(restart_recovery_verdict 1 old new 5 6 0)";   selftest_check "recovery verdict refuses a non-serving relay" "$got" "no-content" || failures=$((failures + 1))
-  got="$(restart_recovery_verdict 1 old new 5 6 1)";   selftest_check "recovery verdict accepts a full automatic recovery" "$got" "ok" || failures=$((failures + 1))
+  # The 7th argument is the agent-specific fresh-session proof (BLOCKING 2).
+  got="$(restart_recovery_verdict 0 old new 5 6 1 1)";   selftest_check "recovery verdict refuses an offline tunnel" "$got" "offline" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old old 5 6 1 1)";   selftest_check "recovery verdict refuses an unchanged child" "$got" "no-child" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old new 5 5 1 1)";   selftest_check "recovery verdict refuses an unchanged session counter" "$got" "no-session" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old new 5 6 1 0)";   selftest_check "recovery verdict refuses a session not proven against the agent under test" "$got" "no-agent-session" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old new 5 6 0 1)";   selftest_check "recovery verdict refuses a non-serving relay" "$got" "no-content" || failures=$((failures + 1))
+  got="$(restart_recovery_verdict 1 old new 5 6 1 1)";   selftest_check "recovery verdict accepts a full automatic recovery" "$got" "ok" || failures=$((failures + 1))
+
+  # BLOCKING 1: one stable frpc identity (PID:STARTTIME). Wrapper command lines
+  # must never count, and 0 or >1 identities must fail closed.
+  got="$(frpc_identity_status '878807:1700000000')";        selftest_check "one frpc identity is usable" "$got" "one" || failures=$((failures + 1))
+  got="$(frpc_identity_status '')";                          selftest_check "zero frpc identities is ambiguous (none)" "$got" "none" || failures=$((failures + 1))
+  got="$(frpc_identity_status '1:10
+2:20')";                selftest_check "two frpc identities is ambiguous (many)" "$got" "many" || failures=$((failures + 1))
+  got="$(frpc_identity_status '917087:1700000000
+917088:1700000001
+917089:1700000002')"; selftest_check "three frpc identities is ambiguous (many)" "$got" "many" || failures=$((failures + 1))
+  got="$(frpc_identity_status '  917087:1700000000  ')";     selftest_check "a whitespace-padded identity is still one" "$got" "one" || failures=$((failures + 1))
+
+  # BLOCKING 2: increases are a pure predicate, shared by the global counter and
+  # the agent-specific frps proxy-registration line count.
+  got="$(counter_increased_verdict 5 6)";       selftest_check "an increased counter is proven" "$got" "ok" || failures=$((failures + 1))
+  got="$(counter_increased_verdict 6 6)";       selftest_check "an unchanged counter is not a new session" "$got" "no-increase" || failures=$((failures + 1))
+  got="$(counter_increased_verdict x 6)";       selftest_check "an unparseable counter fails closed" "$got" "unobservable" || failures=$((failures + 1))
+  got="$(counter_increased_verdict 1 '')";      selftest_check "a missing after-count fails closed" "$got" "unobservable" || failures=$((failures + 1))
+
+  # IMPORTANT 5: the bound is enforced after all stages, not only before an
+  # iteration, and each stage can be capped by the remaining time.
+  got="$(bound_elapsed_verdict 12 120)";        selftest_check "an in-bound elapsed time is accepted" "$got" "ok" || failures=$((failures + 1))
+  got="$(bound_elapsed_verdict 121 120)";       selftest_check "a late recovery fails the bound" "$got" "over-bound" || failures=$((failures + 1))
+  got="$(bound_elapsed_verdict '' 120)";        selftest_check "an unmeasurable elapsed time fails closed" "$got" "unobservable" || failures=$((failures + 1))
+  local past_deadline future_deadline rem_past rem_future
+  past_deadline=$(( $(date +%s) - 5 )); future_deadline=$(( $(date +%s) + 30 ))
+  rem_past="$(deadline_remaining "$past_deadline")"; rem_future="$(deadline_remaining "$future_deadline")"
+  selftest_check "an expired deadline leaves no time" "$rem_past" "0" || failures=$((failures + 1))
+  got="$([[ "$rem_future" =~ ^[0-9]+$ && "$rem_future" -gt 0 && "$rem_future" -le 30 ]] && printf ok || printf bad)"
+  selftest_check "a live deadline yields the remaining seconds" "$got" "ok" || failures=$((failures + 1))
+
+  # IMPORTANT 6: the frps SSH host + systemd unit need their own exact
+  # confirmation, separate from the control-URL target assertion.
+  got="$(frps_restart_target_verdict '' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard refuses no confirmation" "$got" "unset" || failures=$((failures + 1))
+  got="$(frps_restart_target_verdict 'root@10.0.0.9|sharebridge-relay-frps.service' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard refuses a different host" "$got" "mismatch" || failures=$((failures + 1))
+  got="$(frps_restart_target_verdict 'root@10.0.0.5|other.service' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard refuses a different unit" "$got" "mismatch" || failures=$((failures + 1))
+  got="$(frps_restart_target_verdict 'root@10.0.0.5|sharebridge-relay-frps.service' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard accepts the exact host|unit" "$got" "ok" || failures=$((failures + 1))
+
+  # IMPORTANT 7: command evidence must be sanitised before it is recorded; the
+  # prepare-route URL carries the share code.
+  local cmd_evidence cmd_file="$(mktemp)" cmd_saved="${GATE_CMD_FILE:-}"
+  GATE_CMD_FILE="$cmd_file"
+  record_cmd "curl -X POST https://control.example/api/shares/SECRETSHARE99/prepare-route"
+  cmd_evidence="$(cat "$cmd_file")"
+  GATE_CMD_FILE="$cmd_saved"; rm -f "$cmd_file"
+  got="redacted"
+  printf '%s' "$cmd_evidence" | grep -q 'SECRETSHARE99' && got="raw share code leaked into command evidence"
+  selftest_check "recorded command evidence redacts the share code" "$got" "redacted" || failures=$((failures + 1))
+  got="redacted"
+  printf '%s' "$cmd_evidence" | grep -q 'REDACTED' || got="no redaction marker in command evidence"
+  selftest_check "recorded command evidence carries a redaction marker" "$got" "redacted" || failures=$((failures + 1))
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'SELFTEST RESULT: PASS (0 failures) — the gate runner refuses PASS for unexecuted, note-only, skipped, crashing or unimplemented gates\n'
@@ -1606,6 +1914,12 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   printf 'share_code=%s\n' "$([[ -n "$SHARE_CODE" ]] && printf 'set' || printf '<unset>')"
   printf 'gateway_metrics_url=%s\n' "${GATEWAY_METRICS_URL:-<unset>}"
   printf 'allow_restart=%s\n' "$ALLOW_RESTART"
+  printf 'frps_restart_target=%s|%s\n' "${FRPS_SSH_HOST:-$RELAY_HOST}" "$FRPS_UNIT"
+  printf 'frps_restart_confirm=%s\n' "$([[ -n "$FRPS_RESTART_CONFIRM" ]] && printf asserted || printf unset)"
+  printf 'agent_proxy_name=%s\n' "${AGENT_PROXY_NAME:-$([[ -n "$NAMESPACE" ]] && printf 'sb-%s' "$NAMESPACE" || printf '<unset>')}"
+  printf 'frps_journal_file=%s\n' "${FRPS_JOURNAL_FILE:-<unset>}"
+  printf 'frpc_identity_cmd=%s\n' "$([[ -n "$FRPC_IDENTITY_CMD" ]] && printf override || printf default)"
+  printf 'frpc_prefilter=%s frpc_exact_name=%s\n' "$FRPC_PID_MATCH" "$FRPC_PID_NAME"
   printf 'recovery_bound_s=%s\n' "$RECOVERY_BOUND_S"
   printf 'evidence_dir=%s\n' "$RUN_DIR"
   printf '\nGates that would run:\n'

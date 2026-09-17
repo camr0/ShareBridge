@@ -56,7 +56,7 @@ Home side (the harness host is the home Mac):
 | Field | Value |
 |---|---|
 | Home Mac platform | **PENDING** |
-| Agent process match (`pgrep -f`) | **PENDING** |
+| Agent process match (`pgrep -f` pre-filter / exact name) | **PENDING** / `frpc` |
 | Agent version (git sha or image digest) | **PENDING** |
 | Real Immich URL + observed `/api/server/ping` | **PENDING** |
 
@@ -124,16 +124,25 @@ per-name DNS-only/ECH claim, not a zone-wide absence proof.
 | `acceptance_09` baseline relay bytes | **PENDING** |
 | `acceptance_09` tunnel-offline seconds | **PENDING** |
 | `acceptance_09` recovery seconds (measured from the frps restart) | **PENDING** |
-| `acceptance_09` new frpc child PID (before → after) | **PENDING** |
-| `acceptance_09` new tunnel session (`sharebridge_relay_tunnel_reconnects_total` before → after) | **PENDING** |
+| `acceptance_09` new frpc child identity (before → after, `PID:STARTTIME`) | **PENDING** |
+| `acceptance_09` frpc child still alive immediately after the restart (identity unchanged) | **PENDING** |
+| `acceptance_09` new tunnel session (`sharebridge_relay_tunnel_reconnects_total` before → after, corroboration) | **PENDING** |
+| `acceptance_09` agent-specific fresh session (frps `new proxy [<proxy>] type [tcp] success` count before → after, for `LIVE_PHASE4A_AGENT_PROXY_NAME`) | **PENDING** |
+| `acceptance_09` exact restart target confirmed (`LIVE_PHASE4A_FRPS_RESTART_CONFIRM` == `<host>`\|<unit>) | **PENDING** |
+| `acceptance_09` recovery seconds measured after all stages (must be ≤ `LIVE_PHASE4A_RECOVERY_BOUND_S`) | **PENDING** |
 
 `acceptance_09_restart_recovery` inputs (never values): `LIVE_PHASE4A_CONTROL_BASE_URL`,
 `LIVE_PHASE4A_SHARE_CODE`, `LIVE_PHASE4A_GATEWAY_METRICS_URL` (or
 `LIVE_PHASE4A_RELAY_HOST` + `LIVE_PHASE4A_GATEWAY_METRICS_ADDR`), `LIVE_PHASE4A_FRPS_SSH_HOST`
 (default `LIVE_PHASE4A_RELAY_HOST`), `LIVE_PHASE4A_AGENT_SSH_HOST` (optional),
-`LIVE_PHASE4A_FRPC_PID_MATCH`, `LIVE_PHASE4A_RECOVERY_BOUND_S` and
-`LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S`. The gate never restarts the agent's frpc child; it
-restarts frps only under `LIVE_PHASE4A_ALLOW_RESTART=1`.
+`LIVE_PHASE4A_FRPS_RESTART_CONFIRM` (exact `<host>|<unit>`), `LIVE_PHASE4A_AGENT_PROXY_NAME`
+(default `sb-<LIVE_PHASE4A_NAMESPACE>`), the frps journal source
+(`LIVE_PHASE4A_FRPS_JOURNAL_FILE`, else `journalctl -u LIVE_PHASE4A_FRPS_UNIT` over SSH), the
+frpc identity configuration (`LIVE_PHASE4A_FRPC_PID_MATCH` pre-filter,
+`LIVE_PHASE4A_FRPC_PID_NAME`, optional `LIVE_PHASE4A_FRPC_IDENTITY_CMD`),
+`LIVE_PHASE4A_RECOVERY_BOUND_S` and `LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S`. The gate never
+restarts the agent's frpc child; it restarts frps only under `LIVE_PHASE4A_ALLOW_RESTART=1`
+and only when the restart target is exactly confirmed.
 
 ## 7. Dark posture (§20 step 1)
 

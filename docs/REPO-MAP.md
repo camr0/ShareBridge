@@ -197,16 +197,27 @@ frps restart leaves the frpc child retrying a burned single-use credential; the 
 recovery on the real frpc client rejection line and replaces the child with a fresh
 credential). It needs `LIVE_PHASE4A_CONTROL_BASE_URL` and `LIVE_PHASE4A_SHARE_CODE` for the
 baseline/serving check, gateway metrics (`LIVE_PHASE4A_GATEWAY_METRICS_URL`, or
-`LIVE_PHASE4A_RELAY_HOST` + `LIVE_PHASE4A_GATEWAY_METRICS_ADDR`), and the restart targets
+`LIVE_PHASE4A_RELAY_HOST` + `LIVE_PHASE4A_GATEWAY_METRICS_ADDR`), the restart targets
 (`LIVE_PHASE4A_FRPS_SSH_HOST`, default `LIVE_PHASE4A_RELAY_HOST`; `LIVE_PHASE4A_AGENT_SSH_HOST`
-optional; `LIVE_PHASE4A_FRPC_PID_MATCH`, default `frpc`). Because the harness reads the
+optional), and an frps journal source (`LIVE_PHASE4A_FRPS_JOURNAL_FILE`, else `journalctl -u`
+over SSH) for the agent-specific session proof. Because the harness reads the
 gateway's loopback `/metrics` **over SSH to `LIVE_PHASE4A_RELAY_HOST` itself** whenever
 `LIVE_PHASE4A_GATEWAY_METRICS_URL` is unset, that variable must be **user-qualified** when the
 harness host has no default user for the machine (e.g. `root@10.0.0.5`, not a bare IP) — a bare
 IP makes the metrics read unobservable and fails the gate. It restarts frps **only** under
-`LIVE_PHASE4A_ALLOW_RESTART=1` (it never restarts the agent's child) and bounds the run with
-`LIVE_PHASE4A_RECOVERY_BOUND_S` (default 120) and `LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S`
-(default 30). The full surface is `§13.2` of `docs/operations/phase4a-relay.md`.
+`LIVE_PHASE4A_ALLOW_RESTART=1` (it never restarts the agent's child) **and only after the
+exact restart target is confirmed** with `LIVE_PHASE4A_FRPS_RESTART_CONFIRM`
+(`<ssh-host>|<systemd-unit>`, e.g. `root@10.0.0.5|sharebridge-relay-frps.service`); it
+bounds the run with `LIVE_PHASE4A_RECOVERY_BOUND_S` (default 120) and
+`LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S` (default 30). The child identity is the stable
+`PID:STARTTIME` of exactly one process whose exact name is `LIVE_PHASE4A_FRPC_PID_NAME`
+(default `frpc`; `LIVE_PHASE4A_FRPC_PID_MATCH` is only the `pgrep -f` pre-filter, and
+`LIVE_PHASE4A_FRPC_IDENTITY_CMD` overrides the discovery for containerised agents), so the
+harness's own wrapper command lines can never enter it; 0 or >1 candidates fail closed. The
+fresh session must be proven **for this agent** by a NEW frps
+`new proxy [<proxy>] type [tcp] success` line for `LIVE_PHASE4A_AGENT_PROXY_NAME` (default
+`sb-<LIVE_PHASE4A_NAMESPACE>`), with the global reconnect counter as corroboration only. The
+full surface is `§13.2` of `docs/operations/phase4a-relay.md`.
 
 ### 3.4 STUN real-NAT gate (`§23.5`, BLOCKING)
 
@@ -264,8 +275,8 @@ fallback with `direct_status=relay_fallback` + reason; never PASS when neither i
 observable), `lockdown_withdrawal_and_recovery` (**opt-in**), `revocation_midstream`
 (**opt-in**), and `tunnel_recovery_frps_restart` (**opt-in**: baseline tunnel online + serving
 relay -> restart the pinned frps unit with the frpc child ALIVE -> observe offline -> require
-a NEW child + NEW tunnel session + `online=1` + serving content within the bound, recording
-the measured seconds). When the restart-hydration line cannot be observed, case 1 says exactly what to
+a NEW child + a fresh session proven **for this agent** + `online=1` + serving content within
+the bound, recording the measured seconds). When the restart-hydration line cannot be observed, case 1 says exactly what to
 do; an explicit agent restart can be opted into with `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` +
 `LIVE_M4EXIT_AGENT_RESTART_COMMAND` (or supply a startup log via `LIVE_M4EXIT_AGENT_LOG_FILE`).
 
@@ -289,9 +300,24 @@ refuses to `DELETE` unless an in-flight transfer is proven (`0 < bytes < full si
 download process still alive) and unless the gateway drain line is NEWLY observed for the
 exact relay host with a post-revoke timestamp and `streams>=1`; the lockdown case requires
 the relay URL to SERVE before locking and marks the conservative locked state *before* the
-lockdown request; the direct-path case requires the diagnostics to be updated after the
-request and tied to `LIVE_M4EXIT_AGENT_RECORD_AGENT_ID`; the STUN case analyses only
-`LIVE_M4EXIT_STUN_AGENT_ID` and requires the newest acceptance to be fresh. The lockdown
+lockdown request; the direct-path case requires the diagnostics to be parsed as **exactly one** structured record, tied to
+`LIVE_M4EXIT_AGENT_RECORD_AGENT_ID` as an **exact field**, and timestamped **strictly after** the
+prepare-route request (default tolerance `0`); the STUN case analyses only
+`LIVE_M4EXIT_STUN_AGENT_ID` and requires the newest acceptance to be fresh. A second
+hardening round (after the adversarial gate review) added: a **stable single-child identity**
+(`PID:STARTTIME` of exactly one process whose exact name is `LIVE_M4EXIT_FRPC_PID_NAME`;
+`LIVE_M4EXIT_FRPC_PID_MATCH` is only the `pgrep -f` pre-filter and
+`LIVE_M4EXIT_FRPC_IDENTITY_CMD` overrides it; 0 or >1 candidates fail closed) that must be
+re-measured **after** the restart (still the old child) and then replaced; an
+**agent-specific** fresh-session proof (a NEW frps `new proxy [<proxy>] type [tcp] success`
+line for `LIVE_M4EXIT_AGENT_PROXY_NAME`, default `sb-<namespace>` derived from the relay URL
+host) with the global reconnect counter as corroboration only; a **monotonic recovery bound**
+measured after every stage (each stage capped by the remaining time, so a late recovery
+FAILs); a separate, exact `LIVE_M4EXIT_FRPS_RESTART_CONFIRM` (`<host>|<unit>`) before the
+frps restart; a **bounded withdrawal tolerance**
+(`LIVE_M4EXIT_WITHDRAWAL_MAX_ARTIFACT_BYTES`, default 64) that rejects any non-2xx body which
+is the baseline, a prefix of it, the same length, or carries a baseline marker; and
+share-code redaction of `/api/shares/<code>` paths in recorded evidence. The lockdown
 case's unlock safety net is installed in the main process (EXIT/INT/TERM) and proved by
 `--selftest` with a stubbed admin API. Raw HTTP captures live in one 0700 scratch directory
 under `umask 077` and are deleted by the EXIT/INT/TERM cleanup hook; evidence defaults to

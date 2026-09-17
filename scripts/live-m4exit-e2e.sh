@@ -39,17 +39,21 @@
 #                                     record direct_status=relay_fallback and
 #                                     the expected direct_status_reason. Never
 #                                     PASS when neither is observable.
-#   tunnel_recovery_frps_restart      OPT-IN. baseline tunnel online + the
-#                                     configured share SERVES over the relay ->
-#                                     restart the pinned frps unit while the
-#                                     agent's frpc child stays ALIVE -> observe
-#                                     the tunnel go offline -> require a NEW
-#                                     child + a NEW tunnel session + online=1 +
-#                                     serving content within the bound, with no
-#                                     operator action; records the measured
-#                                     offline and recovery seconds. The exact
-#                                     release-blocking defect this encodes: a
-#                                     burned single-use credential was retried
+#   tunnel_recovery_frps_restart      OPT-IN. exact restart-target confirmation;
+#                                     baseline tunnel online + the configured
+#                                     share SERVES over the relay -> restart the
+#                                     pinned frps unit while the agent's frpc
+#                                     child stays ALIVE (identity re-measured
+#                                     after the restart) -> observe the tunnel go
+#                                     offline -> require a REPLACED PID:STARTTIME
+#                                     child + a NEW agent-specific frps
+#                                     proxy-registration session + online=1 +
+#                                     serving content, elapsed measured after
+#                                     every stage and within the monotonic bound,
+#                                     with no operator action; records the
+#                                     measured offline and recovery seconds. The
+#                                     exact release-blocking defect this encodes:
+#                                     a burned single-use credential was retried
 #                                     forever until a human locked down/unlocked.
 #
 # HARDENING / FALSE-POSITIVE DISCIPLINE (added after the adversarial review):
@@ -214,17 +218,18 @@
 #   Control-side diagnostics (case 4)
 #     LIVE_M4EXIT_AGENT_RECORD_FILE     operator-supplied agent record with direct_status/direct_status_reason (required for a relay fallback when no command is set)
 #     LIVE_M4EXIT_AGENT_RECORD_COMMAND  shell command whose STDOUT is the live agent record; the harness runs it AFTER the case's prepare-route, so a fresh record can postdate that request (preferred over the static file when both are set)
-#     LIVE_M4EXIT_AGENT_RECORD_AGENT_ID the agent identifier (api_key_id or record id) under test; the record must carry it (REQUIRED whenever a record source is used)
-#     LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S  clock-skew tolerance for "updated after the request" (default 10)
+#     LIVE_M4EXIT_AGENT_RECORD_AGENT_ID the agent identifier (api_key_id or record id) under test; the record must carry it as an EXACT FIELD (REQUIRED whenever a record source is used)
+#     LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S  clock-skew allowance for "updated after the request" in seconds (default 0 = strict: the record's chosen timestamp must not predate the prepare-route floor). A positive value widens the window BEFORE the request and is not recommended
 #     LIVE_M4EXIT_EXPECTED_DIRECT_REASON  expected direct_status_reason for the fail-closed fallback (default probe_failed)
 #       Record shape (from the control PocketBase 'agents' collection for the agent
 #       under test, as JSON or key=value text): direct_status,
 #       direct_status_reason, an api_key_id (or the record id) and a timestamp in
 #       updated / stun_observed_at / relay_last_seen_at ("YYYY-MM-DD HH:MM:SS").
-#       A record whose newest timestamp is older than the prepare-route request
-#       (minus the tolerance) is refused as stale, and one naming a different
-#       agent is refused as a mismatch — supply the record for THIS agent, fetched
-#       after the request.
+#       Exactly ONE record is required (a multi-record dump, a JSON list with more
+#       than one item, or a key=value dump repeating an identity/timestamp key is
+#       refused as ambiguous), the agent id must be an exact FIELD, and the chosen
+#       timestamp must not predate the prepare-route request (minus the tolerance).
+#       direct_status/direct_status_reason are read from that same record only.
 #
 #   Opt-in state-changing cases
 #     LIVE_M4EXIT_TARGET_CONFIRM        REQUIRED for every case that changes state: set it to the EXACT control base URL of the disposable test stack (it must equal LIVE_M4EXIT_CONTROL_BASE_URL). Typing the target asserts that this is a disposable test deployment, not production or the M6 dark topology, before any lockdown/revoke/restart.
@@ -243,7 +248,26 @@
 #     LIVE_M4EXIT_REVOKE_TIMEOUT_S      bounded transfer wait before killing it (default 120)
 #     LIVE_M4EXIT_REVOKE_WAIT_REREGISTER_S  >0 waits this long for the Immich poll to re-register (default 0 => note only)
 #     LIVE_M4EXIT_ALLOW_FRPS_RESTART    1 enables tunnel_recovery_frps_restart (restart the pinned frps unit; default 0 => SKIP)
-#     LIVE_M4EXIT_FRPC_PID_MATCH        pgrep -f pattern for the agent's frpc child (default frpc)
+#     LIVE_M4EXIT_FRPS_RESTART_CONFIRM  REQUIRED for tunnel_recovery_frps_restart: the EXACT
+#                                       `<ssh-host>|<systemd-unit>` the harness intends to restart
+#                                       (must equal `<LIVE_M4EXIT_FRPS_SSH_HOST>|<LIVE_M4EXIT_FRPS_UNIT>`),
+#                                       e.g. `root@10.0.0.5|sharebridge-relay-frps.service`. Never
+#                                       restarts an unconfirmed target
+#     LIVE_M4EXIT_FRPC_PID_MATCH        pgrep -f PRE-FILTER for the agent's frpc child (default frpc);
+#                                       the identity is restricted to processes whose exact name is
+#                                       LIVE_M4EXIT_FRPC_PID_NAME, so the harness's own wrapper
+#                                       command lines can never enter the recorded identity
+#     LIVE_M4EXIT_FRPC_PID_NAME         exact process name (comm) of the frpc child (default frpc)
+#     LIVE_M4EXIT_FRPC_IDENTITY_CMD     OPTIONAL operator override: a shell command run on the agent
+#                                       host whose stdout is EXACTLY ONE `PID:STARTTIME` line for the
+#                                       agent's frpc child (use for containerised agents)
+#     LIVE_M4EXIT_AGENT_PROXY_NAME      frps proxy name for the agent under test (default: derived from
+#                                       the relay URL namespace as sb-<namespace>) — required for the
+#                                       agent-specific post-restart fresh-session proof (the frps
+#                                       `new proxy [<name>] type [tcp] success` line, logged only after
+#                                       the authorization plugin admitted a fresh login)
+#     LIVE_M4EXIT_WITHDRAWAL_MAX_ARTIFACT_BYTES  maximum non-2xx body bytes tolerated as a TLS teardown
+#                                       artifact while locked (default 64)
 #     LIVE_M4EXIT_TUNNEL_RECOVERY_BOUND_S  automatic frps-restart recovery bound seconds (default 120; LIVE_M4EXIT_TUNNEL_OFFLINE_BOUND_S bounds the offline observation)
 #
 #   Plumbing
@@ -351,7 +375,7 @@ AGENT_RESTART_WAIT_S="${LIVE_M4EXIT_AGENT_RESTART_WAIT_S:-30}"
 AGENT_RECORD_FILE="${LIVE_M4EXIT_AGENT_RECORD_FILE:-}"
 AGENT_RECORD_COMMAND="${LIVE_M4EXIT_AGENT_RECORD_COMMAND:-}"
 AGENT_RECORD_AGENT_ID="${LIVE_M4EXIT_AGENT_RECORD_AGENT_ID:-}"
-AGENT_RECORD_FRESHNESS_TOLERANCE_S="${LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S:-10}"
+AGENT_RECORD_FRESHNESS_TOLERANCE_S="${LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S:-0}"
 EXPECTED_DIRECT_REASON="${LIVE_M4EXIT_EXPECTED_DIRECT_REASON:-probe_failed}"
 
 # Operator-asserted target identity for EVERY state-changing case (lockdown,
@@ -371,6 +395,11 @@ TUNNEL_OFFLINE_BOUND_S="${LIVE_M4EXIT_TUNNEL_OFFLINE_BOUND_S:-30}"
 ALLOW_FRPS_RESTART="${LIVE_M4EXIT_ALLOW_FRPS_RESTART:-0}"
 TUNNEL_RECOVERY_BOUND_S="${LIVE_M4EXIT_TUNNEL_RECOVERY_BOUND_S:-120}"
 FRPC_PID_MATCH="${LIVE_M4EXIT_FRPC_PID_MATCH:-frpc}"
+FRPC_PID_NAME="${LIVE_M4EXIT_FRPC_PID_NAME:-frpc}"
+FRPC_IDENTITY_CMD="${LIVE_M4EXIT_FRPC_IDENTITY_CMD:-}"
+AGENT_PROXY_NAME="${LIVE_M4EXIT_AGENT_PROXY_NAME:-}"
+FRPS_RESTART_CONFIRM="${LIVE_M4EXIT_FRPS_RESTART_CONFIRM:-}"
+WITHDRAWAL_MAX_ARTIFACT_BYTES="${LIVE_M4EXIT_WITHDRAWAL_MAX_ARTIFACT_BYTES:-64}"
 
 ALLOW_REVOKE="${LIVE_M4EXIT_ALLOW_REVOKE:-0}"
 REVOKE_SHARE_CODE="${LIVE_M4EXIT_REVOKE_SHARE_CODE:-}"
@@ -424,7 +453,7 @@ CASE_TABLE=(
   "direct_path_or_failclosed|task #15|either status=direct with a serving direct URL, or a fail-closed relay fallback with direct_status=relay_fallback plus the expected reason; never PASS when neither is observable"
   "lockdown_withdrawal_and_recovery|task #15|OPT-IN: lockdown -> tunnel offline + frps proxy close + prepare-route suppressed + relay yields no content -> unlock -> recovery within bound (measured)"
   "revocation_midstream|task #15|OPT-IN: throttled in-flight download -> DELETE share mid-transfer -> transfer truncated + gateway route-revocation drain (streams>=1); records the Immich re-registration caveat"
-  "tunnel_recovery_frps_restart|task #15|OPT-IN: baseline tunnel online + serving relay -> restart the pinned frps unit with the frpc child ALIVE -> observe offline -> require a NEW child + NEW tunnel session + online=1 + serving content within the bound; records the measured offline and recovery seconds"
+  "tunnel_recovery_frps_restart|task #15|OPT-IN: exact restart-target confirmation; baseline tunnel online + serving relay -> restart the pinned frps unit with the frpc child ALIVE (identity re-measured after the restart) -> observe offline -> require a REPLACED PID:STARTTIME child + a NEW agent-specific frps proxy-registration session (global counter corroborates) + online=1 + serving content, elapsed measured after all stages and within the monotonic bound; records the measured offline and recovery seconds"
 )
 
 case_names=()
@@ -543,7 +572,8 @@ sanitize() {
     -e 's#("[^"]*([Pp]assword|[Pp]asswd|[Ss]ecret|[Tt]oken|[Cc]ookie|[Aa]uthorization|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Cc]lient[_-]?[Ss]ecret|[Rr]efresh[_-]?[Tt]oken|[Aa]ccess[_-]?[Tt]oken|[Pp]rivate[_-]?[Kk]ey|[Jj][Tt][Ii])[^"]*"[[:space:]]*:[[:space:]]*")[^"]*"#\1[REDACTED]"#g' \
     -e "s#([Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Aa]uthorization|[Bb]earer|[Pp]assword|[Ss]ecret|[Cc]ookie|[Tt]oken)([[:space:]]*[=:][[:space:]]*|[[:space:]]+)[^[:space:],;\"']+#\1=[REDACTED]#g" \
     -e "s#([^A-Za-z0-9]|^)(jti|JTI)([=:][[:space:]]*)?[A-Za-z0-9._-]{8,}#\1\2=[REDACTED]#g" \
-    -e "s#/s/[A-Za-z0-9_-]{6,}#/s/[REDACTED-SHARE-CODE]#g"
+    -e "s#/s/[A-Za-z0-9_-]{6,}#/s/[REDACTED-SHARE-CODE]#g" \
+    -e "s#(/api/shares/|/shares/)[A-Za-z0-9_-]{4,}#\1[REDACTED-SHARE-CODE]#g"
 }
 
 # sv: sanitise a single value for a `key=value` metadata line (newlines folded).
@@ -766,15 +796,18 @@ HTTP_HDR_FILE=""
 HTTP_ERR=""
 
 http_fetch() {
-  # http_fetch <curl args...> ; the last argument is the URL
-  local sdir err
+  # http_fetch <curl args...> ; the last argument is the URL. HTTP_FETCH_MAX_TIME,
+  # when set by a bounded recovery loop, caps this call by the time remaining
+  # before that loop's monotonic deadline (defaults to CURL_TIMEOUT).
+  local sdir err max_time="${HTTP_FETCH_MAX_TIME:-$CURL_TIMEOUT}"
+  [[ "$max_time" =~ ^[0-9]+$ && "$max_time" -ge 1 ]] || max_time="$CURL_TIMEOUT"
   m4exit_scratch_dir
   sdir="$M4EXIT_SCRATCH_DIR"
   err="$sdir/curl.err"
   HTTP_BODY_FILE="$sdir/body"
   HTTP_HDR_FILE="$sdir/hdr"
   : > "$err"
-  HTTP_CODE="$(curl --silent --show-error --max-time "$CURL_TIMEOUT" \
+  HTTP_CODE="$(curl --silent --show-error --max-time "$max_time" \
     -D "$HTTP_HDR_FILE" -o "$HTTP_BODY_FILE" -w '%{http_code}' "$@" 2>"$err")"
   HTTP_ERR="$(cat "$err")"
   rm -f "$err"
@@ -886,72 +919,205 @@ fetch_gateway_health() {
 }
 
 fetch_gateway_metrics() {
+  # fetch_gateway_metrics [max-time-seconds]
   GATEWAY_METRICS_TEXT=""
+  local max_time="${1:-5}"
+  [[ "$max_time" =~ ^[0-9]+$ && "$max_time" -ge 1 ]] || max_time=1
   if [[ -n "$GATEWAY_METRICS_URL" ]]; then
     record_cmd "curl ${GATEWAY_METRICS_URL} (gateway /metrics)"
-    http_fetch "$GATEWAY_METRICS_URL"
+    HTTP_FETCH_MAX_TIME="$max_time" http_fetch "$GATEWAY_METRICS_URL"
     GATEWAY_METRICS_TEXT="$(cat "$HTTP_BODY_FILE")"
     return 0
   fi
   if [[ -n "$GATEWAY_SSH_HOST" ]]; then
-    GATEWAY_METRICS_TEXT="$(remote_exec "$GATEWAY_SSH_HOST" "curl -fsS --max-time 5 'http://${GATEWAY_METRICS_ADDR}/metrics'")"
+    GATEWAY_METRICS_TEXT="$(remote_exec "$GATEWAY_SSH_HOST" "curl -fsS --max-time ${max_time} 'http://${GATEWAY_METRICS_ADDR}/metrics'")"
     return 0
   fi
   return 1
 }
 
 gateway_tunnel_online() {
-  # echoes the online gauge value (or empty when unobservable)
-  fetch_gateway_metrics >/dev/null 2>&1 || return 1
+  # gateway_tunnel_online [max-time-seconds] ; echoes the online gauge value (or
+  # empty when unobservable)
+  fetch_gateway_metrics "${1:-5}" >/dev/null 2>&1 || return 1
   metric_value "$GATEWAY_METRICS_TEXT" 'sharebridge_relay_tunnel_state{state="online"}'
 }
 
-frpc_pids() {
-  # Space-separated, numerically sorted PIDs of the agent's frpc child. Runs on
-  # LIVE_M4EXIT_AGENT_SSH_HOST when set, else on the harness host. Empty means
-  # unobservable, never "no child".
-  local out
-  if [[ -n "$AGENT_SSH_HOST" ]]; then
-    out="$(remote_exec "$AGENT_SSH_HOST" "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
-  else
-    out="$(local_exec "pgrep -f '$FRPC_PID_MATCH' 2>/dev/null | sort -n | tr '\\n' ' '" 2>/dev/null)"
+# frpc_identity_cmd: prints the POSIX-sh snippet that emits one `PID:STARTTIME`
+# line per matching frpc process on the agent host. `pgrep -f` is ONLY a
+# candidate pre-filter (the harness's own shell/timeout/pgrep wrappers inherit a
+# command line containing the pattern); the identity is restricted to processes
+# whose exact name (comm) is FRPC_PID_NAME. STARTTIME prefers /proc/<pid>/stat
+# field 22 and falls back to `ps -o lstart=`. LIVE_M4EXIT_FRPC_IDENTITY_CMD
+# replaces the default discovery entirely for containerised agents.
+frpc_identity_cmd() {
+  if [[ -n "$FRPC_IDENTITY_CMD" ]]; then
+    printf '%s' "$FRPC_IDENTITY_CMD"
+    return 0
   fi
-  printf '%s' "$out" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+  cat <<EOF
+pids="\$(pgrep -f '$FRPC_PID_MATCH' 2>/dev/null)"
+for p in \$pids; do
+  c=""
+  if [ -r "/proc/\$p/comm" ]; then c="\$(cat "/proc/\$p/comm" 2>/dev/null)"; else c="\$(ps -o comm= -p "\$p" 2>/dev/null)"; c="\${c##*/}"; fi
+  [ "\$c" = '$FRPC_PID_NAME' ] || continue
+  st=""
+  if [ -r "/proc/\$p/stat" ]; then st="\$(sed 's/.*) //' "/proc/\$p/stat" 2>/dev/null | awk '{print \$20}')"; fi
+  [ -n "\$st" ] || st="\$(ps -o lstart= -p "\$p" 2>/dev/null | tr -s ' ' '_')"
+  [ -n "\$st" ] && printf '%s:%s\n' "\$p" "\$st"
+done
+EOF
 }
 
-# tunnel_recovery_verdict <online> <pid-before> <pid-after> <reconn-before> <reconn-after> <content-ok 0|1>
-# Prints ok | offline | no-child | no-session | no-content. A pure predicate so
-# the live case and --selftest share one definition of "automatically recovered".
+# frpc_identities: newline-separated, sorted, unique `PID:STARTTIME` identities
+# of the agent's frpc child. Empty means unobservable, never "no child".
+frpc_identities() {
+  local cmd out
+  cmd="$(frpc_identity_cmd)"
+  if [[ -n "$AGENT_SSH_HOST" ]]; then
+    out="$(remote_exec "$AGENT_SSH_HOST" "$cmd" 2>/dev/null)"
+  else
+    out="$(local_exec "$cmd" 2>/dev/null)"
+  fi
+  printf '%s\n' "$out" | grep -E '^[0-9]+:[^[:space:]].*$' | sed -e 's/[[:space:]]*$//' | sort -u
+}
+
+# frpc_identity_status <identities-text> -> one | none | many. The identity is
+# only usable when EXACTLY ONE frpc child exists; anything else fails closed.
+frpc_identity_status() {
+  local n
+  n="$(printf '%s\n' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -cE '^[0-9]+:[^[:space:]].*$' || true)"
+  n="${n:-0}"
+  case "$n" in
+    1) printf 'one' ;;
+    0) printf 'none' ;;
+    *) printf 'many' ;;
+  esac
+}
+
+# counter_increased_verdict <before> <after> -> ok | unobservable | no-increase.
+# Shared by the global reconnect counter and the agent-specific frps proxy
+# registration line count; the global counter is never the sole proof.
+counter_increased_verdict() {
+  local before="$1" after="$2"
+  if [[ ! "$before" =~ ^[0-9]+$ || ! "$after" =~ ^[0-9]+$ ]]; then printf 'unobservable'; return 0; fi
+  if [[ "$after" -gt "$before" ]]; then printf 'ok'; return 0; fi
+  printf 'no-increase'
+}
+
+# bound_elapsed_verdict <elapsed-s> <bound-s> -> ok | over-bound | unobservable.
+# IMPORTANT 5: elapsed is measured AFTER every stage completes, so a recovery
+# that only finished after the bound cannot be reported as within it.
+bound_elapsed_verdict() {
+  local elapsed="$1" bound="$2"
+  if [[ ! "$elapsed" =~ ^[0-9]+$ || ! "$bound" =~ ^[0-9]+$ ]]; then printf 'unobservable'; return 0; fi
+  if [[ "$elapsed" -le "$bound" ]]; then printf 'ok'; return 0; fi
+  printf 'over-bound'
+}
+
+# deadline_remaining <deadline-epoch> -> seconds left (0 once passed). Every
+# stage of a bounded loop is capped by this remaining time.
+deadline_remaining() {
+  local deadline="$1" now rem
+  now="$(date +%s)"
+  rem=$(( deadline - now ))
+  if [[ "$rem" -lt 0 ]]; then rem=0; fi
+  printf '%s' "$rem"
+}
+
+# frps_restart_target_verdict <confirm> <host> <unit> -> unset|target-unset|mismatch|ok.
+# IMPORTANT 6: the state-changing frps restart needs its OWN exact host|unit
+# confirmation, separate from the control-URL target assertion.
+frps_restart_target_verdict() {
+  local confirm="$1" host="$2" unit="$3"
+  if [[ -z "$confirm" ]]; then printf 'unset'; return 0; fi
+  if [[ -z "$host" || -z "$unit" ]]; then printf 'target-unset'; return 0; fi
+  if [[ "$confirm" == "$host|$unit" ]]; then printf 'ok'; return 0; fi
+  printf 'mismatch'
+}
+
+# namespace_from_relay_host <host> -> the namespace label immediately after the
+# `relay` label of `<origin>.relay.<namespace>.<zone>`, or empty.
+namespace_from_relay_host() {
+  local host="$1" i rest
+  local -a labels
+  IFS='.' read -r -a labels <<< "$host"
+  for i in "${!labels[@]}"; do
+    if [[ "${labels[$i]}" == "relay" ]]; then
+      rest="${labels[$((i + 1))]:-}"
+      printf '%s' "$rest"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+# tunnel_recovery_verdict <online> <pid-before> <pid-after> <reconn-before> <reconn-after> <content-ok 0|1> <agent-session-ok 0|1>
+# Prints ok | offline | no-child | no-session | no-agent-session | no-content.
+# A pure predicate so the live case and --selftest share one definition of
+# "automatically recovered". The global reconnect counter is corroborating;
+# the agent-specific frps proxy-registration proof is REQUIRED in addition.
 tunnel_recovery_verdict() {
-  local online="$1" pbefore="$2" pafter="$3" rbefore="$4" rafter="$5" content="$6"
+  local online="$1" pbefore="$2" pafter="$3" rbefore="$4" rafter="$5" content="$6" agent_session="$7"
   if [[ ! "$online" =~ ^[0-9]+$ || "$online" -lt 1 ]]; then printf 'offline'; return 0; fi
   if [[ -z "$pafter" || "$pafter" == "$pbefore" ]]; then printf 'no-child'; return 0; fi
   if [[ ! "$rbefore" =~ ^[0-9]+$ || ! "$rafter" =~ ^[0-9]+$ || "$rafter" -le "$rbefore" ]]; then printf 'no-session'; return 0; fi
+  if [[ "$agent_session" != "1" ]]; then printf 'no-agent-session'; return 0; fi
   if [[ "$content" != "1" ]]; then printf 'no-content'; return 0; fi
   printf 'ok'
 }
 
-# lockdown_withdrawal_verdict <http-code> <body-bytes> <body-matches-baseline 0|1>
-# Prints withdrawn | leaked | served | unreadable. A pure predicate so the live
-# case and --selftest share one definition of "the locked relay URL no longer
-# serves content".
+# lockdown_withdrawal_verdict <http-code> <body-bytes> <baseline-exact 0|1> <baseline-prefix 0|1> <baseline-same-length 0|1> <baseline-marker 0|1> <baseline-bytes> <max-artifact-bytes>
+# Prints withdrawn | leaked | served | oversize | unreadable. A pure predicate so
+# the live case and --selftest share one definition of "the locked relay URL no
+# longer serves content".
 #
 # The REAL property is: while locked, a previously-issued relay URL must not
 # serve its content. A curl transport failure reports http=000 but can still
 # leave a small TLS-level teardown artifact in the body (observed live: 30
 # bytes, curl exit 35, TLS handshake refused), so the check must NOT require
-# exactly zero bytes. It requires (a) no HTTP success (status not 2xx) and
-# (b) the body NOT to equal the serving baseline, so the TLS artifact is
-# tolerated while any served baseline content fails. Any response carrying the
-# baseline body is a leak regardless of status. An unparseable byte count or
-# baseline flag fails closed (unreadable).
+# exactly zero bytes. But the tolerance is BOUNDED (BLOCKING 4): the predicate
+# requires (a) no HTTP success (status not 2xx), (b) the body not to equal the
+# serving baseline, (c) the body not to be a non-empty PREFIX of the baseline
+# (a truncated copy), (d) the body not to have the baseline's exact length, and
+# (e) the body not to contain a baseline content marker (its first 64 bytes),
+# AND (f) a byte count no larger than the documented small maximum. Anything
+# bigger, or carrying baseline content in any of those shapes, is a leak.
 lockdown_withdrawal_verdict() {
-  local code="${1:-000}" bytes="$2" matches="$3"
-  if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then printf 'unreadable'; return 0; fi
-  if [[ "$matches" != "0" && "$matches" != "1" ]]; then printf 'unreadable'; return 0; fi
-  if [[ "$matches" == "1" ]]; then printf 'leaked'; return 0; fi
+  local code="${1:-000}" bytes="$2" exact="$3" prefix="$4" same_length="$5" marker="$6" baseline_bytes="${7:-0}" max_bytes="${8:-64}"
+  if [[ ! "$bytes" =~ ^[0-9]+$ || ! "$baseline_bytes" =~ ^[0-9]+$ || ! "$max_bytes" =~ ^[0-9]+$ ]]; then printf 'unreadable'; return 0; fi
+  local flag
+  for flag in "$exact" "$prefix" "$same_length" "$marker"; do
+    if [[ "$flag" != "0" && "$flag" != "1" ]]; then printf 'unreadable'; return 0; fi
+  done
+  if [[ "$exact" == "1" || "$prefix" == "1" || "$marker" == "1" || ( "$same_length" == "1" && "$baseline_bytes" -gt 0 ) ]]; then printf 'leaked'; return 0; fi
   if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then printf 'served'; return 0; fi
+  if [[ "$bytes" -gt "$max_bytes" ]]; then printf 'oversize'; return 0; fi
   printf 'withdrawn'
+}
+
+# withdrawal_body_flags <body-file> <baseline-file> ; prints one `key=value` per
+# line: bytes, exact, prefix, same_length, marker, baseline_bytes. Byte-safe
+# (python reads bytes), so binary baselines are handled without shell quoting.
+withdrawal_body_flags() {
+  python3 -c '
+import sys
+try:
+    body = open(sys.argv[1], "rb").read()
+except OSError:
+    print("bytes=0"); print("exact=0"); print("prefix=0"); print("same_length=0"); print("marker=0"); print("baseline_bytes=0"); sys.exit(0)
+try:
+    base = open(sys.argv[2], "rb").read()
+except OSError:
+    print("bytes=%d" % len(body)); print("exact=0"); print("prefix=0"); print("same_length=0"); print("marker=0"); print("baseline_bytes=0"); sys.exit(0)
+print("bytes=%d" % len(body))
+print("exact=%d" % (1 if (body and body == base) else 0))
+print("prefix=%d" % (1 if (0 < len(body) < len(base) and base.startswith(body)) else 0))
+print("same_length=%d" % (1 if (len(body) > 0 and len(body) == len(base)) else 0))
+marker = base[:64]
+print("marker=%d" % (1 if (len(body) > 0 and len(marker) > 0 and marker in body) else 0))
+print("baseline_bytes=%d" % len(base))
+' "$1" "$2" 2>/dev/null
 }
 
 remote_journal() {
@@ -1765,64 +1931,152 @@ stun_observe_and_rechallenge() {
 # CASE: direct_path_or_failclosed
 # ===========================================================================
 
-record_field() {
-  # record_field <file> <key> ; accepts key=value, key: value or "key": "value"
-  local file="$1" key="$2"
-  sed -nE "s/.*\"?${key}\"?[[:space:]]*[:=][[:space:]]*\"?([^\"',}[:space:]]+).*/\1/p" "$file" | head -n1
-}
-
 direct_record_current() {
-  # direct_record_current <file> <agent-id> <floor-epoch> <tolerance-s>
+  # direct_record_current <file> <agent-id> <floor-epoch> <tolerance-s> [field-priority]
   #
   # The direct_status/direct_status_reason fields are the LAST persisted
   # evaluation, so a stale record can otherwise "prove" a different, current
-  # request. This checks that the artifact is provably CURRENT and CORRELATED:
-  # it must carry a diagnostic timestamp (updated / stun_observed_at /
-  # relay_last_seen_at) at or after the prepare-route request floor (minus a
-  # documented clock-skew tolerance), and it must name the agent under test
-  # (api_key_id or record id). Prints status=<ok|stale|no_timestamp|
-  # agent_mismatch|unreadable> plus the observed values; the caller fails closed
-  # on anything but ok.
+  # request. This parses EXACTLY ONE structured record and proves it is both
+  # CURRENT and CORRELATED (BLOCKING 3):
+  #   * a multi-record JSON list, a PocketBase `{"items":[...]}` list with more
+  #     than one item, or a key=value dump repeating an identity/timestamp key
+  #     is refused as `ambiguous`;
+  #   * the agent under test must be an EXACT FIELD (`api_key_id` or `id`), never
+  #     a substring of some other text;
+  #   * the timestamp is taken from ONE field in priority order (default
+  #     updated, stun_observed_at, relay_last_seen_at) — never the maximum found
+  #     anywhere in the text — and must not predate the prepare-route floor
+  #     (minus the documented clock-skew tolerance, default 0 = strict);
+  #   * direct_status/direct_status_reason are emitted from THAT record only.
+  # Prints status=<ok|ambiguous|no_agent_id|agent_mismatch|no_timestamp|stale|
+  # unreadable> plus the observed values; the caller fails closed on anything but
+  # ok. `field-priority` lets the frps-restart case require relay_last_seen_at.
   python3 -c '
-import sys, re, datetime
+import sys, re, json, datetime
+
 path, want, floor, tol = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+priority = sys.argv[5].split(",") if len(sys.argv) > 5 else ["updated", "stun_observed_at", "relay_last_seen_at"]
+
+def finish(status, count=None, observed=None, agent_field=None, ts_field=None, epoch=None, ds="", dr=""):
+    out = ["status=%s" % status]
+    if count is not None:
+        out.append("record_count=%s" % count)
+    out.append("observed_agent=%s" % (observed if observed else "?"))
+    out.append("agent_field=%s" % (agent_field if agent_field else "?"))
+    out.append("timestamp_field=%s" % (ts_field if ts_field else "?"))
+    out.append("updated_epoch=%s" % (epoch if epoch is not None else "-"))
+    out.append("direct_status=%s" % (ds if ds is not None else ""))
+    out.append("direct_status_reason=%s" % (dr if dr is not None else ""))
+    print("\n".join(out))
+    sys.exit(0)
+
 try:
     text = open(path, "r", errors="replace").read()
 except OSError:
-    print("status=unreadable")
-    sys.exit(0)
-ts = []
-for _, s in re.findall(r"\"?(updated|stun_observed_at|relay_last_seen_at)\"?[ \t]*[:=][ \t]*\"?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", text):
-    try:
-        ts.append(datetime.datetime.strptime(s.replace("T", " "), "%Y-%m-%d %H:%M:%S"))
-    except ValueError:
-        pass
-api_ids = re.findall(r"\"?api_key_id\"?[ \t]*[:=][ \t]*\"?([^\",}\s]+)", text)
-rec_ids = re.findall(r"(?:^|[\"{,\s])id\"?[ \t]*[:=][ \t]*\"?([^\",}\s]+)", text)
-if want and want in api_ids:
-    observed = want
-elif want and want in rec_ids:
-    observed = want
-elif api_ids:
-    observed = api_ids[0]
-elif rec_ids:
-    observed = rec_ids[0]
+    finish("unreadable")
+
+record = None
+count = None
+parsed = None
+try:
+    parsed = json.loads(text)
+except Exception:
+    parsed = None
+
+if parsed is not None:
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        items = parsed["items"]
+        count = len(items)
+        if count == 1:
+            record = items[0]
+    elif isinstance(parsed, list):
+        count = len(parsed)
+        if count == 1:
+            record = parsed[0]
+    elif isinstance(parsed, dict):
+        count = 1
+        record = parsed
+    else:
+        count = 0
+    if record is not None and not isinstance(record, dict):
+        record = None
+    if count != 1 or record is None:
+        finish("ambiguous", count=(count if count is not None else 0))
 else:
-    observed = ""
-epoch = int((max(ts) - datetime.datetime(1970, 1, 1)).total_seconds()) if ts else None
-print("observed_agent=%s" % (observed or "?"))
-print("updated_epoch=%s" % (epoch if epoch is not None else "-"))
-if want and observed != want:
-    print("status=agent_mismatch")
-    sys.exit(0)
-if epoch is None:
-    print("status=no_timestamp")
-    sys.exit(0)
+    kv = {}
+    counts = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^\"?([A-Za-z_][A-Za-z0-9_]*)\"?[ \t]*[:=][ \t]*(.*)$", line)
+        if not m:
+            continue
+        k = m.group(1)
+        v = m.group(2).strip().strip(",").strip()
+        if len(v) >= 2 and v[0] == "\"" and v[-1] == "\"":
+            v = v[1:-1]
+        counts[k] = counts.get(k, 0) + 1
+        kv[k] = v
+    key_fields = ["api_key_id", "id", "updated", "stun_observed_at", "relay_last_seen_at"]
+    repeats = [counts.get(k, 0) for k in key_fields]
+    if any(n > 1 for n in repeats):
+        finish("ambiguous", count=max(repeats))
+    if not kv:
+        finish("unreadable", count=0)
+    count = 1
+    record = kv
+
+def field(name):
+    v = record.get(name)
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    return str(v)
+
+agent_field = None
+observed = None
+matched_field = None
+for f in ("api_key_id", "id"):
+    v = field(f)
+    if v is not None and observed is None:
+        observed = v
+        agent_field = f
+    if want and v == want:
+        matched_field = f
+if want:
+    if observed is None:
+        finish("no_agent_id", count=count)
+    if matched_field is None:
+        finish("agent_mismatch", count=count, observed=observed, agent_field=agent_field)
+    agent_field = matched_field
+    observed = want
+
+ts_field = None
+ts_val = None
+for f in priority:
+    v = field(f)
+    if v:
+        ts_field = f
+        ts_val = v
+        break
+ds = field("direct_status") or ""
+dr = field("direct_status_reason") or ""
+if not ts_val:
+    finish("no_timestamp", count=count, observed=observed, agent_field=agent_field, ds=ds, dr=dr)
+m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})", ts_val.strip())
+if not m:
+    finish("no_timestamp", count=count, observed=observed, agent_field=agent_field, ds=ds, dr=dr)
+try:
+    dt = datetime.datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S")
+except ValueError:
+    finish("no_timestamp", count=count, observed=observed, agent_field=agent_field, ds=ds, dr=dr)
+epoch = int((dt - datetime.datetime(1970, 1, 1)).total_seconds())
 if epoch < floor - tol:
-    print("status=stale")
-    sys.exit(0)
-print("status=ok")
-' "$1" "$2" "$3" "$4"
+    finish("stale", count=count, observed=observed, agent_field=agent_field, ts_field=ts_field, epoch=epoch, ds=ds, dr=dr)
+finish("ok", count=count, observed=observed, agent_field=agent_field, ts_field=ts_field, epoch=epoch, ds=ds, dr=dr)
+' "$1" "$2" "$3" "$4" "${5:-updated,stun_observed_at,relay_last_seen_at}"
 }
 
 # direct_record_fetch_live <command> <destination-file>
@@ -1898,7 +2152,7 @@ direct_path_or_failclosed() {
         note direct_record_source "operator-supplied LIVE_M4EXIT_AGENT_RECORD_FILE (must already be current for this request)"
       fi
       if [[ -z "$AGENT_RECORD_FILE" ]]; then
-        check direct_failclosed_diagnostics FAIL "prepare-route reported the fail-closed relay fallback but neither LIVE_M4EXIT_AGENT_RECORD_COMMAND (live fetch, preferred) nor LIVE_M4EXIT_AGENT_RECORD_FILE (operator-supplied static record) is set, so the control-side direct diagnostics cannot be verified. Expected record shape: JSON or key=value text from the control agents record (PocketBase collection 'agents') containing direct_status, direct_status_reason, an api_key_id (or the record id) and an updated/stun_observed_at/relay_last_seen_at timestamp. With the command, its stdout is written to a temp file and validated after the prepare-route above so the timestamp can postdate the request; with the file, the operator must export it IMMEDIATELY AFTER the prepare-route call. Verdicts: the record must carry the agent id given in LIVE_M4EXIT_AGENT_RECORD_AGENT_ID and an updated >= the request floor minus LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S (else direct_failclosed_current FAILs); then direct_status=relay_fallback AND direct_status_reason=<LIVE_M4EXIT_EXPECTED_DIRECT_REASON, default probe_failed> => PASS; a different direct_status, reason, stale timestamp or foreign agent id => FAIL; and neither is needed when prepare-route returns status=direct (that is judged by direct_route_serves instead)"
+        check direct_failclosed_diagnostics FAIL "prepare-route reported the fail-closed relay fallback but neither LIVE_M4EXIT_AGENT_RECORD_COMMAND (live fetch, preferred) nor LIVE_M4EXIT_AGENT_RECORD_FILE (operator-supplied static record) is set, so the control-side direct diagnostics cannot be verified. Expected record shape: JSON or key=value text from the control agents record (PocketBase collection 'agents') containing direct_status, direct_status_reason, an api_key_id (or the record id) and an updated/stun_observed_at/relay_last_seen_at timestamp. EXACTLY ONE record is required (a multi-record JSON list, an {\"items\":[...]} list with more than one item, or a key=value dump repeating an identity/timestamp key is refused as ambiguous); the agent id must be an exact api_key_id/id FIELD. With the command, its stdout is written to a temp file and validated after the prepare-route above so the timestamp can postdate the request; with the file, the operator must export it IMMEDIATELY AFTER the prepare-route call. Verdicts: the record must carry the agent id given in LIVE_M4EXIT_AGENT_RECORD_AGENT_ID and the chosen timestamp field (updated first) must not predate the request floor minus LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S (default 0 = strict; else direct_failclosed_current FAILs); then direct_status=relay_fallback AND direct_status_reason=<LIVE_M4EXIT_EXPECTED_DIRECT_REASON, default probe_failed> => PASS; a different direct_status, reason, stale timestamp, foreign agent id or ambiguous dump => FAIL; and neither is needed when prepare-route returns status=direct (that is judged by direct_route_serves instead)"
         return 0
       fi
       if [[ ! -r "$AGENT_RECORD_FILE" ]]; then
@@ -1911,11 +2165,7 @@ direct_path_or_failclosed() {
         check direct_status_reason FAIL "not evaluated: the agent under test is not identified"
         return 0
       fi
-      local ds dr cur cur_status updated_epoch observed_agent
-      ds="$(record_field "$AGENT_RECORD_FILE" direct_status)"
-      dr="$(record_field "$AGENT_RECORD_FILE" direct_status_reason)"
-      set_fact direct_status "${ds:-<absent>}"
-      set_fact direct_status_reason "${dr:-<absent>}"
+      local ds dr cur cur_status updated_epoch observed_agent timestamp_field record_count
       if ! python_ok; then
         check direct_failclosed_current FAIL "python3 is unavailable — cannot prove the supplied record is current for this request; install python3 or run on a host that has it"
         check direct_status_relay_fallback FAIL "not evaluated: freshness/correlation unprovable"
@@ -1926,11 +2176,20 @@ direct_path_or_failclosed() {
       cur_status="$(printf '%s\n' "$cur" | sed -n 's/^status=//p')"
       updated_epoch="$(printf '%s\n' "$cur" | sed -n 's/^updated_epoch=//p')"
       observed_agent="$(printf '%s\n' "$cur" | sed -n 's/^observed_agent=//p')"
+      timestamp_field="$(printf '%s\n' "$cur" | sed -n 's/^timestamp_field=//p')"
+      record_count="$(printf '%s\n' "$cur" | sed -n 's/^record_count=//p')"
+      # BLOCKING 3: direct_status/direct_status_reason come from the SAME parsed
+      # record the freshness/correlation proof validated, never from a separate
+      # first-match scan over the whole file.
+      ds="$(printf '%s\n' "$cur" | sed -n 's/^direct_status=//p')"
+      dr="$(printf '%s\n' "$cur" | sed -n 's/^direct_status_reason=//p')"
       set_fact direct_record_updated_epoch "${updated_epoch:-<absent>}"
       set_fact direct_record_observed_agent "${observed_agent:-<absent>}"
+      set_fact direct_status "${ds:-<absent>}"
+      set_fact direct_status_reason "${dr:-<absent>}"
       case "$cur_status" in
         ok)
-          check direct_failclosed_current PASS "the record's newest diagnostic timestamp (updated_epoch=${updated_epoch}) is at/after the prepare-route floor ${prepare_floor_epoch} (tolerance ${AGENT_RECORD_FRESHNESS_TOLERANCE_S}s) and its agent id matches the agent under test"
+          check direct_failclosed_current PASS "the single record's ${timestamp_field} timestamp (updated_epoch=${updated_epoch}) is at/after the prepare-route floor ${prepare_floor_epoch} (tolerance ${AGENT_RECORD_FRESHNESS_TOLERANCE_S}s) and its agent id is the exact field value for the agent under test"
           if [[ "$ds" == "relay_fallback" ]]; then
             check direct_status_relay_fallback PASS "agent record direct_status=relay_fallback"
           else
@@ -1943,17 +2202,27 @@ direct_path_or_failclosed() {
           fi
           ;;
         agent_mismatch)
-          check direct_failclosed_current FAIL "the supplied record names agent '${observed_agent:-<none>}' but LIVE_M4EXIT_AGENT_RECORD_AGENT_ID='$(sv "$AGENT_RECORD_AGENT_ID")' — refusing to attribute another agent's diagnostics; supply the record for the agent under test"
+          check direct_failclosed_current FAIL "the supplied record's agent field ('${observed_agent:-<none>}') is not the agent under test '$(sv "$AGENT_RECORD_AGENT_ID")' — refusing to attribute another agent's diagnostics; supply the record for the agent under test"
           check direct_status_relay_fallback FAIL "not evaluated: the record belongs to a different agent"
           check direct_status_reason FAIL "not evaluated: the record belongs to a different agent"
           ;;
+        no_agent_id)
+          check direct_failclosed_current FAIL "the supplied record carries no api_key_id/id field, so it cannot be tied to the agent under test '$(sv "$AGENT_RECORD_AGENT_ID")'"
+          check direct_status_relay_fallback FAIL "not evaluated: the record has no agent field"
+          check direct_status_reason FAIL "not evaluated: the record has no agent field"
+          ;;
+        ambiguous)
+          check direct_failclosed_current FAIL "the supplied record source is not exactly ONE structured record (record_count='${record_count:-?}') — a multi-record dump or a repeated identity/timestamp key cannot be attributed to this request; export the single agents record for the agent under test"
+          check direct_status_relay_fallback FAIL "not evaluated: the record source is ambiguous"
+          check direct_status_reason FAIL "not evaluated: the record source is ambiguous"
+          ;;
         stale)
-          check direct_failclosed_current FAIL "the record's newest diagnostic timestamp (updated_epoch='${updated_epoch}') predates the prepare-route floor ${prepare_floor_epoch} (tolerance ${AGENT_RECORD_FRESHNESS_TOLERANCE_S}s) — it reflects an EARLIER evaluation, not this request; export the agent record immediately after the prepare-route call (probe_failed requires the probe to have run during that request)"
+          check direct_failclosed_current FAIL "the record's ${timestamp_field:-chosen} timestamp (updated_epoch='${updated_epoch}') predates the prepare-route floor ${prepare_floor_epoch} (tolerance ${AGENT_RECORD_FRESHNESS_TOLERANCE_S}s) — it reflects an EARLIER evaluation, not this request; export the agent record immediately after the prepare-route call (probe_failed requires the probe to have run during that request)"
           check direct_status_relay_fallback FAIL "not evaluated: the diagnostics are not provably current for this request"
           check direct_status_reason FAIL "not evaluated: the diagnostics are not provably current for this request"
           ;;
         no_timestamp)
-          check direct_failclosed_current FAIL "the supplied record carries no updated/stun_observed_at/relay_last_seen_at timestamp — freshness cannot be established; export the live PocketBase agents record (it carries an `updated` stamp) rather than a hand-written key=value file"
+          check direct_failclosed_current FAIL "the single record carries no usable updated/stun_observed_at/relay_last_seen_at timestamp — freshness cannot be established; export the live PocketBase agents record (it carries an `updated` stamp) rather than a hand-written key=value file"
           check direct_status_relay_fallback FAIL "not evaluated: freshness unprovable"
           check direct_status_reason FAIL "not evaluated: freshness unprovable"
           ;;
@@ -2110,24 +2379,31 @@ lockdown_withdrawal_and_recovery() {
   # the pre-fix byte-exact-zero requirement false-REDded on it).
   if [[ -n "$baseline_url" ]]; then
     http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$baseline_url"
-    local bytes=0 matches=0
-    if [[ -f "$HTTP_BODY_FILE" ]]; then
-      bytes="$(file_bytes "$HTTP_BODY_FILE")"
-      if [[ -n "$baseline_body_file" && -r "$baseline_body_file" ]] && cmp -s "$HTTP_BODY_FILE" "$baseline_body_file"; then
-        matches=1
-      fi
+    # BLOCKING 4: a bounded tolerance, and any shape that carries (or truncates)
+    # the real baseline content is a leak regardless of HTTP status.
+    local bytes=0 flags="" exact=0 prefix=0 same_length=0 marker=0 baseline_b=0
+    if [[ -f "$HTTP_BODY_FILE" && -n "$baseline_body_file" && -r "$baseline_body_file" ]] && python_ok; then
+      flags="$(withdrawal_body_flags "$HTTP_BODY_FILE" "$baseline_body_file")"
+      bytes="$(printf '%s\n' "$flags" | sed -n 's/^bytes=//p')"
+      exact="$(printf '%s\n' "$flags" | sed -n 's/^exact=//p')"
+      prefix="$(printf '%s\n' "$flags" | sed -n 's/^prefix=//p')"
+      same_length="$(printf '%s\n' "$flags" | sed -n 's/^same_length=//p')"
+      marker="$(printf '%s\n' "$flags" | sed -n 's/^marker=//p')"
+      baseline_b="$(printf '%s\n' "$flags" | sed -n 's/^baseline_bytes=//p')"
     fi
     local withdrawal_verdict
-    withdrawal_verdict="$(lockdown_withdrawal_verdict "${HTTP_CODE:-000}" "$bytes" "$matches")"
+    withdrawal_verdict="$(lockdown_withdrawal_verdict "${HTTP_CODE:-000}" "$bytes" "$exact" "$prefix" "$same_length" "$marker" "$baseline_b" "$WITHDRAWAL_MAX_ARTIFACT_BYTES")"
     case "$withdrawal_verdict" in
       withdrawn)
-        check lockdown_relay_withdrawn PASS "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes, no ${baseline_bytes}-byte baseline content served (a small TLS-level teardown artifact is tolerated)" ;;
+        check lockdown_relay_withdrawn PASS "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes (<= ${WITHDRAWAL_MAX_ARTIFACT_BYTES} tolerated), no ${baseline_bytes}-byte baseline content served (a small TLS-level teardown artifact is tolerated)" ;;
       leaked)
-        check lockdown_relay_withdrawn FAIL "relay fetch while locked served the ${baseline_bytes}-byte baseline body (http ${HTTP_CODE:-000}, ${bytes} bytes) — content leaked while locked" ;;
+        check lockdown_relay_withdrawn FAIL "relay fetch while locked still carried baseline content (http ${HTTP_CODE:-000}, ${bytes} bytes, baseline=${baseline_b:-${baseline_bytes}} bytes, exact=${exact} prefix=${prefix} same_length=${same_length} marker=${marker}) — content leaked while locked" ;;
       served)
         check lockdown_relay_withdrawn FAIL "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes: an HTTP success while locked (want non-2xx/absent)" ;;
+      oversize)
+        check lockdown_relay_withdrawn FAIL "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes, larger than the documented ${WITHDRAWAL_MAX_ARTIFACT_BYTES}-byte teardown-artifact maximum — refusing to tolerate a large non-2xx body" ;;
       *)
-        check lockdown_relay_withdrawn FAIL "relay fetch while locked was not evaluable (http='${HTTP_CODE:-}' bytes='${bytes}' matches='${matches}') — failing closed" ;;
+        check lockdown_relay_withdrawn FAIL "relay fetch while locked was not evaluable (http='${HTTP_CODE:-}' bytes='${bytes}' exact='${exact}' prefix='${prefix}' marker='${marker}') — failing closed" ;;
     esac
   else
     check lockdown_relay_withdrawn FAIL "not evaluated: no baseline relay URL was issued"
@@ -2140,21 +2416,35 @@ lockdown_withdrawal_and_recovery() {
     return 0
   fi
   m4exit_mark_unlocked
-  local rec_wait=0 rec_ok=0 rec_secs=-1 stage=""
-  while [[ "$rec_wait" -le "$RECOVERY_BOUND_S" ]]; do
-    online="$(gateway_tunnel_online 2>/dev/null || true)"
-    prepare_route "$SHARE_CODE"
+  # IMPORTANT 5 (same defect class as the frps-recovery loop): enforce a
+  # monotonic deadline, cap each stage by the remaining time, and measure the
+  # elapsed seconds AFTER every stage has completed.
+  local rec_ok=0 rec_secs=-1 stage="" remaining t_unlock
+  t_unlock="$(date +%s)"
+  local rec_deadline=$(( t_unlock + RECOVERY_BOUND_S ))
+  while :; do
+    remaining="$(deadline_remaining "$rec_deadline")"
+    [[ "$remaining" -gt 0 ]] || break
+    online="$(gateway_tunnel_online "$remaining" 2>/dev/null || true)"
+    remaining="$(deadline_remaining "$rec_deadline")"
+    if [[ "$remaining" -gt 0 ]]; then
+      HTTP_FETCH_MAX_TIME="$remaining" prepare_route "$SHARE_CODE"
+    fi
     if [[ -n "$online" && "$online" -ge 1 && "$PREPARE_HTTP_CODE" == "200" && "$PREPARE_STATUS" == "relay" ]]; then
-      rec_ok=1; rec_secs="$rec_wait"; stage="tunnel online + prepare-route relay"; break
+      rec_ok=1; stage="tunnel online + prepare-route relay"; break
     fi
     sleep 1
-    rec_wait=$(( rec_wait + 1 ))
   done
+  rec_secs="$(( $(date +%s) - t_unlock ))"
   set_fact lockdown_recovery_seconds "$rec_secs"
-  if [[ "$rec_ok" == "1" ]]; then
-    check lockdown_recovery PASS "recovered ${rec_secs}s after unlock (${stage}; bound ${RECOVERY_BOUND_S}s)"
+  local rec_bound_verdict
+  rec_bound_verdict="$(bound_elapsed_verdict "$rec_secs" "$RECOVERY_BOUND_S")"
+  if [[ "$rec_ok" == "1" && "$rec_bound_verdict" == "ok" ]]; then
+    check lockdown_recovery PASS "recovered ${rec_secs}s after unlock (${stage}; measured after all stages, bound ${RECOVERY_BOUND_S}s)"
+  elif [[ "$rec_ok" == "1" ]]; then
+    check lockdown_recovery FAIL "all recovery conditions were observed, but the measured elapsed time (${rec_secs}s, after every stage completed) exceeds the bound ${RECOVERY_BOUND_S}s — refusing a late recovery"
   else
-    check lockdown_recovery FAIL "no recovery within ${RECOVERY_BOUND_S}s after unlock (last tunnel online=${online:-<absent>}, prepare http=${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}')"
+    check lockdown_recovery FAIL "no recovery within ${RECOVERY_BOUND_S}s after unlock (elapsed ${rec_secs}s, last tunnel online=${online:-<absent>}, prepare http=${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}')"
   fi
   note lockdown_recovery_reference "the live run measured ~3s warm and ~60s cold for post-unlock recovery"
   return 0
@@ -2414,9 +2704,35 @@ tunnel_recovery_frps_restart() {
   # state-changing action).
   require_target_confirmation tunnel_recovery || return 0
 
+  # (0b) IMPORTANT 6: a SEPARATE, exact confirmation of the SSH host + systemd
+  # unit that will actually be restarted. The control-URL assertion above does
+  # not cover the destructive target.
+  local frps_target="${FRPS_SSH_HOST:-${GATEWAY_SSH_HOST:-}}"
+  local target_verdict
+  target_verdict="$(frps_restart_target_verdict "$FRPS_RESTART_CONFIRM" "$frps_target" "$FRPS_UNIT")"
+  case "$target_verdict" in
+    ok)
+      check tunnel_recovery_frps_target_confirmed PASS "operator confirmed the exact restart target '${frps_target}|${FRPS_UNIT}' (LIVE_M4EXIT_FRPS_RESTART_CONFIRM)" ;;
+    unset)
+      check tunnel_recovery_frps_target_confirmed FAIL "LIVE_M4EXIT_FRPS_RESTART_CONFIRM is unset — refusing to restart frps without an explicit assertion of the SSH host + systemd unit; set it to the EXACT '${frps_target}|${FRPS_UNIT}'"
+      return 0 ;;
+    target-unset)
+      check tunnel_recovery_frps_target_confirmed FAIL "LIVE_M4EXIT_FRPS_RESTART_CONFIRM is set but no frps SSH target is configured (set LIVE_M4EXIT_FRPS_SSH_HOST or LIVE_M4EXIT_GATEWAY_SSH_HOST)"
+      return 0 ;;
+    *)
+      check tunnel_recovery_frps_target_confirmed FAIL "LIVE_M4EXIT_FRPS_RESTART_CONFIRM='$(sv "$FRPS_RESTART_CONFIRM")' does not equal the intended restart target '${frps_target}|${FRPS_UNIT}' — refusing the state-changing restart"
+      return 0 ;;
+  esac
+  set_fact tunnel_recovery_frps_restart_target "${frps_target}|${FRPS_UNIT}"
+  if ! frps_journal_available; then
+    check tunnel_recovery_frps_journal FAIL "no frps journal source: set LIVE_M4EXIT_FRPS_JOURNAL_FILE, or LIVE_M4EXIT_FRPS_SSH_HOST / LIVE_M4EXIT_GATEWAY_SSH_HOST for `journalctl -u ${FRPS_UNIT}` — the agent-specific post-restart session proof is unobservable without it"
+    return 0
+  fi
+
   # (1) Baseline: tunnel online AND the configured share actually SERVES over
   # the relay. A broken baseline cannot prove a recovery.
-  local online reconnects_before frpc_pid_before baseline_url baseline_bytes=0
+  local online reconnects_before baseline_url baseline_bytes=0
+  local frpc_before_raw frpc_before_status frpc_before
   online="$(gateway_tunnel_online 2>/dev/null || true)"
   if [[ ! "$online" =~ ^[0-9]+$ || "$online" -lt 1 ]]; then
     check tunnel_recovery_baseline_tunnel FAIL "baseline sharebridge_relay_tunnel_state{state=\"online\"}='${online:-<absent>}' (want >=1) — refusing to restart frps without an online baseline tunnel (metrics source: ${GATEWAY_METRICS_URL:-ssh ${GATEWAY_SSH_HOST:-<unconfigured>} ${GATEWAY_METRICS_ADDR}})"
@@ -2439,23 +2755,51 @@ tunnel_recovery_frps_restart() {
     return 0
   fi
 
-  frpc_pid_before="$(frpc_pids)"
-  if [[ -z "$frpc_pid_before" ]]; then
-    check tunnel_recovery_child_before FAIL "no process matches pgrep -f '${FRPC_PID_MATCH}' on ${AGENT_SSH_HOST:-the harness host} — cannot compare the frpc child identity across the restart (set LIVE_M4EXIT_FRPC_PID_MATCH or LIVE_M4EXIT_AGENT_SSH_HOST)"
+  # BLOCKING 1: a STABLE single-child identity. The -f pre-filter can return the
+  # harness's own wrapper PIDs, so the identity is restricted to the exact frpc
+  # process name and carries its start time; 0 or >1 candidates fail closed.
+  frpc_before_raw="$(frpc_identities)"
+  frpc_before_status="$(frpc_identity_status "$frpc_before_raw")"
+  if [[ "$frpc_before_status" != "one" ]]; then
+    check tunnel_recovery_child_before FAIL "expected EXACTLY ONE frpc child identity on ${AGENT_SSH_HOST:-the harness host} (pre-filter '${FRPC_PID_MATCH}', exact name '${FRPC_PID_NAME}'), observed status=${frpc_before_status} identities='$(printf '%s' "$frpc_before_raw" | tr '\n' ' ')' — refusing the restart because the child identity is ambiguous; set LIVE_M4EXIT_FRPC_PID_NAME, LIVE_M4EXIT_FRPC_PID_MATCH, or LIVE_M4EXIT_FRPC_IDENTITY_CMD"
     return 0
   fi
-  check tunnel_recovery_child_before PASS "agent frpc child PID before the restart: ${frpc_pid_before}"
+  frpc_before="$(printf '%s\n' "$frpc_before_raw" | head -n1)"
+  check tunnel_recovery_child_before PASS "exactly one agent frpc child identity before the restart: ${frpc_before}"
+
+  # BLOCKING 2: the agent-specific fresh-session proof. frps logs
+  # `new proxy [<proxy>] type [tcp] success` only AFTER the authorization plugin
+  # admitted the login for THIS agent's proxy name. The proxy name defaults to
+  # sb-<namespace> derived from the baseline relay URL host.
+  local proxy_name="${AGENT_PROXY_NAME:-}" namespace="" proxy_pat proxy_lines_before=""
+  if [[ -z "$proxy_name" ]]; then
+    namespace="$(namespace_from_relay_host "$(url_host "$baseline_url")")"
+    [[ -n "$namespace" ]] && proxy_name="sb-${namespace}"
+  fi
+  if [[ -z "$proxy_name" ]]; then
+    check tunnel_recovery_agent_proxy_name FAIL "could not determine the frps proxy name for the agent under test: set LIVE_M4EXIT_AGENT_PROXY_NAME (expected sb-<namespace>), or use a relay URL host of the form <origin>.relay.<namespace>.<zone> — required for the agent-specific post-restart session proof"
+    return 0
+  fi
+  proxy_pat="new proxy [${proxy_name}] type [tcp] success"
+  set_fact tunnel_recovery_agent_proxy_name "$proxy_name"
+  proxy_lines_before="$(frps_journal_grep "$proxy_pat" 2>/dev/null | grep -F "$proxy_pat" | grep -c . || true)"
+  proxy_lines_before="${proxy_lines_before:-0}"
+  set_fact tunnel_recovery_frps_proxy_lines_before "$proxy_lines_before"
+  # A zero baseline is not itself a failure: the agent's registration may simply
+  # be older than the journal tail window, and the proof is the INCREASE after
+  # the restart (a genuinely unreadable journal yields 0 after as well and still
+  # fails the agent-specific check).
+  if [[ "$proxy_lines_before" -ge 1 ]]; then
+    check tunnel_recovery_baseline_agent_session PASS "baseline frps proxy-registration count for '${proxy_name}' is ${proxy_lines_before}"
+  else
+    note tunnel_recovery_baseline_agent_session "no '${proxy_pat}' line in the current frps journal window (count=0) — the agent-specific proof is the increase after the restart"
+  fi
 
   fetch_gateway_metrics >/dev/null 2>&1 || true
   reconnects_before="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_reconnects_total')"
 
   # (2) Force the exact drop: restart the pinned frps unit over SSH while the
   # agent's frpc child keeps running.
-  local frps_target="${FRPS_SSH_HOST:-${GATEWAY_SSH_HOST:-}}"
-  if [[ -z "$frps_target" ]]; then
-    check tunnel_recovery_frps_restart FAIL "no frps SSH target: set LIVE_M4EXIT_FRPS_SSH_HOST or LIVE_M4EXIT_GATEWAY_SSH_HOST"
-    return 0
-  fi
   local t_restart restart_out restart_rc
   t_restart="$(date +%s)"
   restart_out="$(remote_exec "$frps_target" "systemctl restart $FRPS_UNIT")"; restart_rc=$?
@@ -2463,12 +2807,31 @@ tunnel_recovery_frps_restart() {
     check tunnel_recovery_frps_restart FAIL "systemctl restart ${FRPS_UNIT} on ${frps_target} exit=${restart_rc}: $(printf '%s' "$restart_out" | tr '\n' ' ' | cut -c1-200)"
     return 0
   fi
-  check tunnel_recovery_frps_restart PASS "restarted ${FRPS_UNIT} on ${frps_target} with the agent's frpc child (${frpc_pid_before}) left alive"
+  check tunnel_recovery_frps_restart PASS "restarted ${FRPS_UNIT} on ${frps_target}"
 
-  # (3) Observe the tunnel go offline, bounded.
-  local offline_ok=0 offline_secs=-1
-  while [[ "$(( $(date +%s) - t_restart ))" -le "$TUNNEL_OFFLINE_BOUND_S" ]]; do
-    online="$(gateway_tunnel_online 2>/dev/null || true)"
+  # BLOCKING 1: re-measure the child identity immediately after the restart
+  # (never infer 'left alive' from the stale pre-restart value).
+  local alive_raw="" alive_status="none" alive_id="" alive_try
+  for alive_try in 1 2 3; do
+    alive_raw="$(frpc_identities)"
+    alive_status="$(frpc_identity_status "$alive_raw")"
+    [[ "$alive_status" == "one" ]] && break
+    sleep 0.2
+  done
+  alive_id="$(printf '%s\n' "$alive_raw" | head -n1)"
+  if [[ "$alive_status" != "one" ]]; then
+    check tunnel_recovery_child_alive FAIL "could not observe EXACTLY ONE frpc child identity immediately after the restart (status=${alive_status}, identities='$(printf '%s' "$alive_raw" | tr '\n' ' ')')"
+  elif [[ "$alive_id" == "$frpc_before" ]]; then
+    check tunnel_recovery_child_alive PASS "the pre-restart frpc child (${frpc_before}) was still alive when first re-measured after the frps restart — the harness left it running"
+  else
+    check tunnel_recovery_child_alive FAIL "the frpc child identity changed to '${alive_id}' before it could be re-measured after the restart (was '${frpc_before}') — cannot prove the pre-restart child was left alive"
+  fi
+
+  # (3) Observe the tunnel go offline, bounded, with every stage capped by the
+  # remaining time.
+  local offline_ok=0 offline_secs=-1 offline_deadline=$(( t_restart + TUNNEL_OFFLINE_BOUND_S ))
+  while [[ "$(deadline_remaining "$offline_deadline")" -gt 0 ]]; do
+    online="$(gateway_tunnel_online "$(deadline_remaining "$offline_deadline")" 2>/dev/null || true)"
     if [[ "$online" =~ ^[0-9]+$ && "$online" -eq 0 ]]; then
       offline_ok=1; offline_secs="$(( $(date +%s) - t_restart ))"; break
     fi
@@ -2481,49 +2844,78 @@ tunnel_recovery_frps_restart() {
     check tunnel_recovery_tunnel_offline FAIL "tunnel never reported online=0 within ${TUNNEL_OFFLINE_BOUND_S}s of the frps restart (last online='${online:-<absent>}')"
   fi
 
-  # (4) Require automatic recovery within the bound, with no operator action.
-  # prepare_route (no check recording) is used inside the polling loop so a
-  # transient offline response cannot record a spurious FAIL; the measured
-  # assertions are recorded once, after the loop.
-  local rec_ok=0 rec_secs=-1 content_ok=0 frpc_pid_after="" reconnects_after="" verdict
+  # (4) Require automatic recovery within a MONOTONIC bound, with no operator
+  # action. prepare_route (no check recording) is used inside the polling loop
+  # so a transient offline response cannot record a spurious FAIL; the measured
+  # assertions are recorded once, after the loop. Every stage is capped by the
+  # remaining time and the elapsed seconds are measured after all stages.
+  local rec_ok=0 rec_secs=-1 content_ok=0 frpc_after_raw="" frpc_after_status="none" frpc_after=""
+  local reconnects_after="" proxy_lines_after="" agent_session_ok=0 remaining verdict
   local deadline=$(( t_restart + TUNNEL_RECOVERY_BOUND_S ))
-  while [[ "$(date +%s)" -le "$deadline" ]]; do
+  while :; do
+    remaining="$(deadline_remaining "$deadline")"
+    [[ "$remaining" -gt 0 ]] || break
     # fetch_gateway_metrics must run in THIS shell (not a command substitution),
     # or its GATEWAY_METRICS_TEXT assignment would be lost to the subshell and
     # the reconnect counter would be read stale.
-    fetch_gateway_metrics >/dev/null 2>&1 || true
+    fetch_gateway_metrics "$remaining" >/dev/null 2>&1 || true
     online="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_state{state="online"}')"
-    frpc_pid_after="$(frpc_pids)"
+    frpc_after_raw="$(frpc_identities)"
+    frpc_after_status="$(frpc_identity_status "$frpc_after_raw")"
+    frpc_after=""
+    [[ "$frpc_after_status" == "one" ]] && frpc_after="$(printf '%s\n' "$frpc_after_raw" | head -n1)"
     reconnects_after="$(metric_value "${GATEWAY_METRICS_TEXT:-}" 'sharebridge_relay_tunnel_reconnects_total')"
     content_ok=0
     if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
-      prepare_route "$SHARE_CODE"
+      remaining="$(deadline_remaining "$deadline")"
+      if [[ "$remaining" -gt 0 ]]; then
+        HTTP_FETCH_MAX_TIME="$remaining" prepare_route "$SHARE_CODE"
+      fi
       if [[ "$PREPARE_HTTP_CODE" == "200" && "$PREPARE_STATUS" == "relay" && -n "$PREPARE_RELAY_URL" ]]; then
-        http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$PREPARE_RELAY_URL"
-        local rec_bytes=0
-        [[ -f "$HTTP_BODY_FILE" ]] && rec_bytes="$(file_bytes "$HTTP_BODY_FILE")"
-        [[ "$HTTP_CODE" == "200" && "${rec_bytes:-0}" -gt 0 ]] && content_ok=1
+        remaining="$(deadline_remaining "$deadline")"
+        if [[ "$remaining" -gt 0 ]]; then
+          http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$PREPARE_RELAY_URL"
+          local rec_bytes=0
+          [[ -f "$HTTP_BODY_FILE" ]] && rec_bytes="$(file_bytes "$HTTP_BODY_FILE")"
+          [[ "$HTTP_CODE" == "200" && "${rec_bytes:-0}" -gt 0 ]] && content_ok=1
+        fi
+      fi
+      remaining="$(deadline_remaining "$deadline")"
+      if [[ "$remaining" -gt 0 ]]; then
+        proxy_lines_after="$(frps_journal_grep "$proxy_pat" 2>/dev/null | grep -F "$proxy_pat" | grep -c . || true)"
+        proxy_lines_after="${proxy_lines_after:-0}"
       fi
     fi
-    rec_secs="$(( $(date +%s) - t_restart ))"
-    if [[ "$(tunnel_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")" == "ok" ]]; then
+    agent_session_ok=0
+    [[ "$(counter_increased_verdict "$proxy_lines_before" "${proxy_lines_after:-}")" == "ok" ]] && agent_session_ok=1
+    if [[ "$(tunnel_recovery_verdict "$online" "$frpc_before" "$frpc_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok" "$agent_session_ok")" == "ok" ]]; then
       rec_ok=1; break
     fi
     sleep 1
   done
+  # IMPORTANT 5: measure elapsed AFTER every stage has completed.
+  rec_secs="$(( $(date +%s) - t_restart ))"
 
   set_fact tunnel_recovery_seconds "$rec_secs"
-  verdict="$(tunnel_recovery_verdict "$online" "$frpc_pid_before" "$frpc_pid_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok")"
+  set_fact tunnel_recovery_frps_proxy_lines_after "${proxy_lines_after:-<absent>}"
+  verdict="$(tunnel_recovery_verdict "$online" "$frpc_before" "$frpc_after" "${reconnects_before:-}" "${reconnects_after:-}" "$content_ok" "$agent_session_ok")"
 
-  if [[ -n "$frpc_pid_after" && "$frpc_pid_after" != "$frpc_pid_before" ]]; then
-    check tunnel_recovery_new_child PASS "frpc child replaced automatically: ${frpc_pid_before} -> ${frpc_pid_after}"
+  if [[ "$frpc_after_status" == "one" && -n "$frpc_after" && "$frpc_after" != "$frpc_before" ]]; then
+    check tunnel_recovery_new_child PASS "frpc child replaced automatically: ${frpc_before} -> ${frpc_after}"
+  elif [[ "$frpc_after_status" != "one" ]]; then
+    check tunnel_recovery_new_child FAIL "the post-recovery frpc child identity is ambiguous (status=${frpc_after_status}, identities='$(printf '%s' "$frpc_after_raw" | tr '\n' ' ')')"
   else
-    check tunnel_recovery_new_child FAIL "frpc child PID did not change (before='${frpc_pid_before}' after='${frpc_pid_after:-<absent>}') — the child was not replaced without operator action"
+    check tunnel_recovery_new_child FAIL "frpc child identity did not change (before='${frpc_before}' after='${frpc_after:-<absent>}') — the child was not replaced without operator action"
   fi
-  if [[ "${reconnects_after:-}" =~ ^[0-9]+$ && "${reconnects_before:-}" =~ ^[0-9]+$ && "${reconnects_after}" -gt "${reconnects_before}" ]]; then
-    check tunnel_recovery_new_session PASS "a NEW tunnel session was established (sharebridge_relay_tunnel_reconnects_total ${reconnects_before} -> ${reconnects_after}) — a fresh credential was requested and accepted"
+  if [[ "$(counter_increased_verdict "${reconnects_before:-}" "${reconnects_after:-}")" == "ok" ]]; then
+    check tunnel_recovery_new_session PASS "a NEW tunnel session was established (sharebridge_relay_tunnel_reconnects_total ${reconnects_before} -> ${reconnects_after}) — corroborating evidence that a fresh credential was requested and accepted"
   else
-    check tunnel_recovery_new_session FAIL "no new tunnel session observed (reconnects ${reconnects_before:-<absent>} -> ${reconnects_after:-<absent>}) — the burned credential was not replaced with a fresh one"
+    check tunnel_recovery_new_session FAIL "no new tunnel session observed (reconnects ${reconnects_before:-<absent>} -> ${reconnects_after:-<absent>})"
+  fi
+  if [[ "$agent_session_ok" == "1" ]]; then
+    check tunnel_recovery_agent_session PASS "agent-specific fresh session: a NEW frps '${proxy_pat}' line was logged after the restart (count ${proxy_lines_before} -> ${proxy_lines_after}); frps logs this only after the authorization plugin admitted a login for this agent's proxy name"
+  else
+    check tunnel_recovery_agent_session FAIL "no NEW frps '${proxy_pat}' line after the restart (before=${proxy_lines_before} after='${proxy_lines_after:-<unobservable>}') — the global reconnect counter alone can be another agent's session, so the agent-specific admission proof is required; check LIVE_M4EXIT_AGENT_PROXY_NAME and the frps journal source"
   fi
   if [[ "$online" =~ ^[0-9]+$ && "$online" -ge 1 ]]; then
     check tunnel_recovery_tunnel_online PASS "gateway tunnel presence restored: sharebridge_relay_tunnel_state{state=\"online\"}=${online}"
@@ -2535,10 +2927,14 @@ tunnel_recovery_frps_restart() {
   else
     check tunnel_recovery_relay_content FAIL "relay content did not serve after recovery (prepare http=${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}')"
   fi
-  if [[ "$rec_ok" == "1" ]]; then
-    check tunnel_recovery_within_bound PASS "automatic recovery (new child + fresh session + online + serving content) within ${rec_secs}s of the frps restart (bound ${TUNNEL_RECOVERY_BOUND_S}s)"
+  local bound_verdict
+  bound_verdict="$(bound_elapsed_verdict "$rec_secs" "$TUNNEL_RECOVERY_BOUND_S")"
+  if [[ "$rec_ok" == "1" && "$bound_verdict" == "ok" ]]; then
+    check tunnel_recovery_within_bound PASS "automatic recovery (new child + fresh session + agent-specific session + online + serving content) completed ${rec_secs}s after the frps restart, measured after all stages (bound ${TUNNEL_RECOVERY_BOUND_S}s)"
+  elif [[ "$rec_ok" == "1" ]]; then
+    check tunnel_recovery_within_bound FAIL "all recovery conditions were observed, but the measured elapsed time (${rec_secs}s, after every stage completed) exceeds the bound ${TUNNEL_RECOVERY_BOUND_S}s — refusing a late recovery"
   else
-    check tunnel_recovery_within_bound FAIL "no full automatic recovery within ${TUNNEL_RECOVERY_BOUND_S}s of the frps restart (verdict='${verdict}')"
+    check tunnel_recovery_within_bound FAIL "no full automatic recovery within ${TUNNEL_RECOVERY_BOUND_S}s of the frps restart (elapsed ${rec_secs}s, verdict='${verdict}')"
   fi
   return 0
 }
@@ -2932,10 +3328,15 @@ validate_case_config() {
       report_missing LIVE_M4EXIT_ALLOW_FRPS_RESTART "$([[ "$ALLOW_FRPS_RESTART" == "1" ]] && printf set)" "opt-in flag (requires =1)"
       report_missing LIVE_M4EXIT_TARGET_CONFIRM "$TARGET_CONFIRM" "operator target assertion (must equal LIVE_M4EXIT_CONTROL_BASE_URL)"
       _validate_target_confirm_match
+      report_missing LIVE_M4EXIT_FRPS_RESTART_CONFIRM "$FRPS_RESTART_CONFIRM" "exact '<frps-ssh-host>|<frps-unit>' restart-target assertion (must equal LIVE_M4EXIT_FRPS_SSH_HOST|LIVE_M4EXIT_FRPS_UNIT)"
       report_missing LIVE_M4EXIT_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control base URL"
       report_missing LIVE_M4EXIT_SHARE_CODE "$SHARE_CODE" "share code for the baseline and post-recovery relay fetch"
       report_missing_any "gateway metrics access" "LIVE_M4EXIT_GATEWAY_METRICS_URL=$GATEWAY_METRICS_URL" "LIVE_M4EXIT_GATEWAY_SSH_HOST=$GATEWAY_SSH_HOST"
       report_missing_any "frps SSH target" "LIVE_M4EXIT_FRPS_SSH_HOST=$FRPS_SSH_HOST" "LIVE_M4EXIT_GATEWAY_SSH_HOST=$GATEWAY_SSH_HOST"
+      report_missing_any "frps journal access" "LIVE_M4EXIT_FRPS_JOURNAL_FILE=$FRPS_JOURNAL_FILE" "LIVE_M4EXIT_FRPS_SSH_HOST=$FRPS_SSH_HOST"
+      if [[ -z "$AGENT_PROXY_NAME" ]]; then
+        printf '  NOTE: LIVE_M4EXIT_AGENT_PROXY_NAME is unset; the case derives sb-<namespace> from the relay URL host (set it explicitly when the host shape is non-standard)\n'
+      fi
       ;;
   esac
 }
@@ -2950,6 +3351,11 @@ run_dry_run() {
   printf 'agent_admin_base_url=%s\n' "$(sv "${AGENT_ADMIN_BASE_URL:-<unset>}")"
   printf 'evidence_dir=%s\n' "$RUN_DIR"
   printf 'target_confirm=%s\n' "$([[ -n "$TARGET_CONFIRM" ]] && printf 'asserted' || printf 'unset')"
+  printf 'frps_restart_target=%s|%s\n' "${FRPS_SSH_HOST:-${GATEWAY_SSH_HOST:-<unset>}}" "$FRPS_UNIT"
+  printf 'frps_restart_confirm=%s\n' "$([[ -n "$FRPS_RESTART_CONFIRM" ]] && printf asserted || printf unset)"
+  printf 'agent_proxy_name=%s\n' "${AGENT_PROXY_NAME:-<derive sb-<namespace> from the relay URL host>}"
+  printf 'frpc_prefilter=%s frpc_exact_name=%s identity_cmd=%s\n' "$FRPC_PID_MATCH" "$FRPC_PID_NAME" "$([[ -n "$FRPC_IDENTITY_CMD" ]] && printf override || printf default)"
+  printf 'withdrawal_max_artifact_bytes=%s\n' "$WITHDRAWAL_MAX_ARTIFACT_BYTES"
   printf 'allow_agent_restart=%s allow_lockdown=%s allow_revoke=%s allow_frps_restart=%s\n' "$ALLOW_AGENT_RESTART" "$ALLOW_LOCKDOWN" "$ALLOW_REVOKE" "$ALLOW_FRPS_RESTART"
 
   MISSING_COUNT=0
@@ -3102,23 +3508,100 @@ run_selftest() {
   # tunnel_recovery_frps_restart: the automatic-recovery verdict predicate and
   # the frps-restart opt-in guard.
   # -------------------------------------------------------------------------
-  got="$(tunnel_recovery_verdict 0 old new 5 6 1)";   selftest_check "recovery verdict refuses an offline tunnel" "$got" "offline" || failures=$(( failures + 1 ))
-  got="$(tunnel_recovery_verdict 1 old old 5 6 1)";   selftest_check "recovery verdict refuses an unchanged child" "$got" "no-child" || failures=$(( failures + 1 ))
-  got="$(tunnel_recovery_verdict 1 old new 5 5 1)";   selftest_check "recovery verdict refuses an unchanged session counter" "$got" "no-session" || failures=$(( failures + 1 ))
-  got="$(tunnel_recovery_verdict 1 old new 5 6 0)";   selftest_check "recovery verdict refuses a non-serving relay" "$got" "no-content" || failures=$(( failures + 1 ))
-  got="$(tunnel_recovery_verdict 1 old new 5 6 1)";   selftest_check "recovery verdict accepts a full automatic recovery" "$got" "ok" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 0 old new 5 6 1 1)";   selftest_check "recovery verdict refuses an offline tunnel" "$got" "offline" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old old 5 6 1 1)";   selftest_check "recovery verdict refuses an unchanged child" "$got" "no-child" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old new 5 5 1 1)";   selftest_check "recovery verdict refuses an unchanged session counter" "$got" "no-session" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old new 5 6 1 0)";   selftest_check "recovery verdict refuses a session not proven against the agent under test" "$got" "no-agent-session" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old new 5 6 0 1)";   selftest_check "recovery verdict refuses a non-serving relay" "$got" "no-content" || failures=$(( failures + 1 ))
+  got="$(tunnel_recovery_verdict 1 old new 5 6 1 1)";   selftest_check "recovery verdict accepts a full automatic recovery" "$got" "ok" || failures=$(( failures + 1 ))
+
+  # BLOCKING 1: one stable frpc identity (PID:STARTTIME); wrapper command lines
+  # must never count and 0 or >1 identities must fail closed.
+  got="$(frpc_identity_status '878807:1700000000')";        selftest_check "one frpc identity is usable" "$got" "one" || failures=$(( failures + 1 ))
+  got="$(frpc_identity_status '')";                          selftest_check "zero frpc identities is ambiguous (none)" "$got" "none" || failures=$(( failures + 1 ))
+  got="$(frpc_identity_status $'1:10\n2:20')";              selftest_check "two frpc identities is ambiguous (many)" "$got" "many" || failures=$(( failures + 1 ))
+  got="$(frpc_identity_status '  917087:1700000000  ')";     selftest_check "a whitespace-padded identity is still one" "$got" "one" || failures=$(( failures + 1 ))
+
+  # BLOCKING 2: increases are a pure predicate; the global counter and the
+  # agent-specific frps proxy-registration line count share it.
+  got="$(counter_increased_verdict 5 6)";   selftest_check "an increased counter is proven" "$got" "ok" || failures=$(( failures + 1 ))
+  got="$(counter_increased_verdict 6 6)";   selftest_check "an unchanged counter is not a new session" "$got" "no-increase" || failures=$(( failures + 1 ))
+  got="$(counter_increased_verdict x 6)";   selftest_check "an unparseable counter fails closed" "$got" "unobservable" || failures=$(( failures + 1 ))
+  got="$(counter_increased_verdict 1 '')";  selftest_check "a missing after-count fails closed" "$got" "unobservable" || failures=$(( failures + 1 ))
+
+  # IMPORTANT 5: the bound is enforced after all stages (not just before an
+  # iteration) and each stage can be capped by the remaining time.
+  got="$(bound_elapsed_verdict 12 120)";   selftest_check "an in-bound elapsed time is accepted" "$got" "ok" || failures=$(( failures + 1 ))
+  got="$(bound_elapsed_verdict 121 120)";  selftest_check "a late recovery fails the bound" "$got" "over-bound" || failures=$(( failures + 1 ))
+  got="$(bound_elapsed_verdict '' 120)";   selftest_check "an unmeasurable elapsed time fails closed" "$got" "unobservable" || failures=$(( failures + 1 ))
+  local past_deadline future_deadline rem_past rem_future
+  past_deadline=$(( $(date +%s) - 5 )); future_deadline=$(( $(date +%s) + 30 ))
+  rem_past="$(deadline_remaining "$past_deadline")"; rem_future="$(deadline_remaining "$future_deadline")"
+  selftest_check "an expired deadline leaves no time" "$rem_past" "0" || failures=$(( failures + 1 ))
+  got="$([[ "$rem_future" =~ ^[0-9]+$ && "$rem_future" -gt 0 && "$rem_future" -le 30 ]] && printf ok || printf bad)"
+  selftest_check "a live deadline yields the remaining seconds" "$got" "ok" || failures=$(( failures + 1 ))
+
+  # IMPORTANT 6: a separate, exact confirmation of the SSH host + systemd unit
+  # that will be restarted.
+  got="$(frps_restart_target_verdict '' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard refuses no confirmation" "$got" "unset" || failures=$(( failures + 1 ))
+  got="$(frps_restart_target_verdict 'root@10.0.0.9|sharebridge-relay-frps.service' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard refuses a different host" "$got" "mismatch" || failures=$(( failures + 1 ))
+  got="$(frps_restart_target_verdict 'root@10.0.0.5|other.service' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard refuses a different unit" "$got" "mismatch" || failures=$(( failures + 1 ))
+  got="$(frps_restart_target_verdict 'root@10.0.0.5|sharebridge-relay-frps.service' root@10.0.0.5 sharebridge-relay-frps.service)"; selftest_check "restart target guard accepts the exact host|unit" "$got" "ok" || failures=$(( failures + 1 ))
 
   # -------------------------------------------------------------------------
-  # BLOCKING 4: lockdown withdrawal predicate (TLS-artifact tolerance).
+  # BLOCKING 4: lockdown withdrawal predicate (BOUNDED TLS-artifact tolerance).
+  # Signature: <code> <bytes> <exact> <prefix> <same-length> <marker> <baseline-bytes> <max-bytes>
   # -------------------------------------------------------------------------
-  got="$(lockdown_withdrawal_verdict 000 30 0)";   selftest_check "withdrawal accepts a 000 TLS artifact (body != baseline)" "$got" "withdrawn" || failures=$(( failures + 1 ))
-  got="$(lockdown_withdrawal_verdict 000 0 0)";    selftest_check "withdrawal accepts a clean 000 no-content result" "$got" "withdrawn" || failures=$(( failures + 1 ))
-  got="$(lockdown_withdrawal_verdict 503 0 0)";    selftest_check "withdrawal accepts a non-2xx status with no baseline body" "$got" "withdrawn" || failures=$(( failures + 1 ))
-  got="$(lockdown_withdrawal_verdict 200 4096 1)"; selftest_check "withdrawal rejects a 200 serving the baseline body" "$got" "leaked" || failures=$(( failures + 1 ))
-  got="$(lockdown_withdrawal_verdict 000 4096 1)"; selftest_check "withdrawal rejects the baseline body even at http 000" "$got" "leaked" || failures=$(( failures + 1 ))
-  got="$(lockdown_withdrawal_verdict 200 512 0)";  selftest_check "withdrawal rejects any 2xx while locked" "$got" "served" || failures=$(( failures + 1 ))
-  got="$(lockdown_withdrawal_verdict 000 not-a-number 0)"; selftest_check "withdrawal fails closed on an unparseable byte count" "$got" "unreadable" || failures=$(( failures + 1 ))
-  got="$(lockdown_withdrawal_verdict 000 30 bogus)"; selftest_check "withdrawal fails closed on an unknown baseline flag" "$got" "unreadable" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 30 0 0 0 0 4096 64)";   selftest_check "withdrawal accepts a small 000 TLS artifact (body != baseline)" "$got" "withdrawn" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 0 0 0 0 0 4096 64)";    selftest_check "withdrawal accepts a clean 000 no-content result" "$got" "withdrawn" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 503 0 0 0 0 0 4096 64)";    selftest_check "withdrawal accepts a non-2xx status with no baseline body" "$got" "withdrawn" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 200 4096 1 0 0 0 4096 64)"; selftest_check "withdrawal rejects a 200 serving the baseline body" "$got" "leaked" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 4096 1 0 0 0 4096 64)"; selftest_check "withdrawal rejects the baseline body even at http 000" "$got" "leaked" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 20 0 1 0 0 4096 64)";   selftest_check "withdrawal rejects a truncated PREFIX of the baseline" "$got" "leaked" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 4096 0 0 1 0 4096 64)"; selftest_check "withdrawal rejects a body with the baseline length" "$got" "leaked" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 200 0 0 0 1 4096 64)";  selftest_check "withdrawal rejects a body containing a baseline content marker" "$got" "leaked" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 100000 0 0 0 0 4096 64)"; selftest_check "withdrawal rejects a non-2xx body over the artifact cap" "$got" "oversize" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 200 512 0 0 0 0 4096 64)";  selftest_check "withdrawal rejects any 2xx while locked" "$got" "served" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 not-a-number 0 0 0 0 4096 64)"; selftest_check "withdrawal fails closed on an unparseable byte count" "$got" "unreadable" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 30 bogus 0 0 0 4096 64)"; selftest_check "withdrawal fails closed on an unknown baseline flag" "$got" "unreadable" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 30 0 0 0 0 4096 bogus)"; selftest_check "withdrawal fails closed on an unparseable cap" "$got" "unreadable" || failures=$(( failures + 1 ))
+  # The byte-level flag computation is real (not just the predicate): an exact
+  # copy, a truncated prefix, a same-length body and a body containing the
+  # baseline's first 64 bytes each register.
+  local wf_dir="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-selftest-wf.XXXXXX")" wf_flags
+  printf 'BASELINE-CONTENT-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-END' > "$wf_dir/base"
+  cp "$wf_dir/base" "$wf_dir/exact"
+  printf 'BASELINE-CONTENT-0123' > "$wf_dir/prefix"
+  wf_flags="$(withdrawal_body_flags "$wf_dir/exact" "$wf_dir/base")"
+  got="$(printf '%s\n' "$wf_flags" | sed -n 's/^exact=//p')"
+  selftest_check "withdrawal flags detect an exact baseline copy" "$got" "1" || failures=$(( failures + 1 ))
+  wf_flags="$(withdrawal_body_flags "$wf_dir/prefix" "$wf_dir/base")"
+  got="$(printf '%s\n' "$wf_flags" | sed -n 's/^prefix=//p')"
+  selftest_check "withdrawal flags detect a truncated baseline prefix" "$got" "1" || failures=$(( failures + 1 ))
+  printf 'XXXX-' > "$wf_dir/marker"; head -c 64 "$wf_dir/base" >> "$wf_dir/marker"; printf -- '-TAIL' >> "$wf_dir/marker"
+  wf_flags="$(withdrawal_body_flags "$wf_dir/marker" "$wf_dir/base")"
+  got="$(printf '%s\n' "$wf_flags" | sed -n 's/^marker=//p')"
+  selftest_check "withdrawal flags detect a baseline content marker" "$got" "1" || failures=$(( failures + 1 ))
+  rm -rf "$wf_dir"
+
+  # IMPORTANT 7 (sibling): a share-code-bearing command URL must be redacted in
+  # the recorded command evidence.
+  local m4_cmd_file="$(mktemp)" m4_cmd_saved="${GATE_CMD_FILE:-}" m4_cmd_evidence
+  GATE_CMD_FILE="$m4_cmd_file"
+  record_cmd "curl -X POST https://control.example/api/shares/SECRETSHARE99/prepare-route"
+  m4_cmd_evidence="$(cat "$m4_cmd_file")"
+  GATE_CMD_FILE="$m4_cmd_saved"; rm -f "$m4_cmd_file"
+  got="redacted"
+  printf '%s' "$m4_cmd_evidence" | grep -q 'SECRETSHARE99' && got="raw share code leaked into command evidence"
+  selftest_check "recorded command evidence redacts the share code" "$got" "redacted" || failures=$(( failures + 1 ))
+  got="redacted"
+  printf '%s' "$m4_cmd_evidence" | grep -q 'REDACTED' || got="no redaction marker in command evidence"
+  selftest_check "recorded command evidence carries a redaction marker" "$got" "redacted" || failures=$(( failures + 1 ))
+  local ns_get
+  ns_get="$(namespace_from_relay_host 'photo.relay.sb12345678.example.com')"
+  selftest_check "the relay namespace is derived from the relay URL host" "$ns_get" "sb12345678" || failures=$(( failures + 1 ))
+  got="$(namespace_from_relay_host 'photo.example.com')"
+  selftest_check "a host without a relay label derives no namespace" "$got" "" || failures=$(( failures + 1 ))
   local saved_allow_frps="$ALLOW_FRPS_RESTART"
   ALLOW_FRPS_RESTART=0
   got="$(case_is_destructive tunnel_recovery_frps_restart)/$(case_opt_in_flag tunnel_recovery_frps_restart)"
@@ -3148,10 +3631,16 @@ run_selftest() {
   # -------------------------------------------------------------------------
   # BLOCKING 3: direct-diagnostics freshness and correlation refusal.
   # -------------------------------------------------------------------------
-  local rec_dir rec_now rec_floor
+  local rec_dir rec_now rec_floor rec_old rec_now_epoch
   rec_dir="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-selftest-rec.XXXXXX")"
   rec_now="$(date -u +'%Y-%m-%d %H:%M:%S')"
-  rec_floor="$(( $(date -u +%s) - 1 ))"
+  rec_now_epoch="$(date -u +%s)"
+  rec_floor="$(( rec_now_epoch - 1 ))"
+  if date -u -v-5S +%s >/dev/null 2>&1; then
+    rec_old="$(date -u -v-5S +'%Y-%m-%d %H:%M:%S')"
+  else
+    rec_old="$(date -u -d '5 seconds ago' +'%Y-%m-%d %H:%M:%S')"
+  fi
   printf '{"api_key_id":"agent-1","direct_status":"relay_fallback","direct_status_reason":"probe_failed","updated":"%s"}' "$rec_now" > "$rec_dir/fresh.json"
   got="$(direct_record_current "$rec_dir/fresh.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
   selftest_check "fresh + correlated agent record is accepted" "$got" "ok" || failures=$(( failures + 1 ))
@@ -3164,6 +3653,50 @@ run_selftest() {
   printf '{"api_key_id":"agent-2","updated":"%s"}' "$rec_now" > "$rec_dir/other.json"
   got="$(direct_record_current "$rec_dir/other.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
   selftest_check "record for a different agent is refused" "$got" "agent_mismatch" || failures=$(( failures + 1 ))
+  # BLOCKING 3a: EXACTLY ONE structured record. A multi-record dump must never
+  # be scanned for convenient fields.
+  printf '[{"api_key_id":"agent-1","updated":"%s"},{"api_key_id":"agent-2","updated":"%s"}]' "$rec_now" "$rec_now" > "$rec_dir/list2.json"
+  got="$(direct_record_current "$rec_dir/list2.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "a two-record JSON list is refused as ambiguous" "$got" "ambiguous" || failures=$(( failures + 1 ))
+  printf '{"items":[{"api_key_id":"agent-1","updated":"%s"},{"api_key_id":"agent-2","updated":"%s"}]}' "$rec_now" "$rec_now" > "$rec_dir/items2.json"
+  got="$(direct_record_current "$rec_dir/items2.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "a PocketBase items list with two records is refused as ambiguous" "$got" "ambiguous" || failures=$(( failures + 1 ))
+  printf '{"items":[{"api_key_id":"agent-1","direct_status":"relay_fallback","updated":"%s"}]}' "$rec_now" > "$rec_dir/items1.json"
+  got="$(direct_record_current "$rec_dir/items1.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "a PocketBase items list with exactly one record is accepted" "$got" "ok" || failures=$(( failures + 1 ))
+  # BLOCKING 3b: the agent id must be an exact FIELD, not a substring anywhere.
+  printf '{"api_key_id":"agent-2","note":"this record is about agent-1","updated":"%s"}' "$rec_now" > "$rec_dir/substr.json"
+  got="$(direct_record_current "$rec_dir/substr.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "an agent id appearing only in a substring is refused" "$got" "agent_mismatch" || failures=$(( failures + 1 ))
+  printf '{"record_id":"agent-1","updated":"%s"}' "$rec_now" > "$rec_dir/nofield.json"
+  got="$(direct_record_current "$rec_dir/nofield.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "a record with no api_key_id/id field is refused" "$got" "no_agent_id" || failures=$(( failures + 1 ))
+  # BLOCKING 3c: STRICT freshness — a pre-request timestamp is refused at
+  # tolerance 0 even by one second.
+  printf '{"api_key_id":"agent-1","updated":"%s"}' "$rec_old" > "$rec_dir/pre.json"
+  got="$(direct_record_current "$rec_dir/pre.json" agent-1 "$rec_now_epoch" 0 | sed -n 's/^status=//p')"
+  selftest_check "a timestamp before the request floor is refused at tolerance 0" "$got" "stale" || failures=$(( failures + 1 ))
+  got="$(direct_record_current "$rec_dir/pre.json" agent-1 "$rec_now_epoch" 10 | sed -n 's/^status=//p')"
+  selftest_check "a small clock-skew tolerance can admit the same record" "$got" "ok" || failures=$(( failures + 1 ))
+  # BLOCKING 3d: no MAX-anywhere. A stale `updated` must lose even when a
+  # different (recent) timestamp field is present, unless the field priority
+  # explicitly puts that field first.
+  printf '{"api_key_id":"agent-1","direct_status":"relay_fallback","updated":"2001-01-01 00:00:00","stun_observed_at":"%s"}' "$rec_now" > "$rec_dir/max.json"
+  got="$(direct_record_current "$rec_dir/max.json" agent-1 "$rec_now_epoch" 0 | sed -n 's/^status=//p')"
+  selftest_check "a stale updated field loses even with a recent stun_observed_at" "$got" "stale" || failures=$(( failures + 1 ))
+  got="$(direct_record_current "$rec_dir/max.json" agent-1 "$rec_now_epoch" 0 'stun_observed_at,updated' | sed -n 's/^status=//p')"
+  selftest_check "an explicit field priority can select stun_observed_at" "$got" "ok" || failures=$(( failures + 1 ))
+  # Pretty-printed single-record JSON and key=value text are both accepted; a
+  # key=value dump repeating an identity key is ambiguous.
+  printf '{\n  "api_key_id": "agent-1",\n  "direct_status": "relay_fallback",\n  "direct_status_reason": "probe_failed",\n  "updated": "%s"\n}\n' "$rec_now" > "$rec_dir/pretty.json"
+  got="$(direct_record_current "$rec_dir/pretty.json" agent-1 "$rec_floor" 0 | sed -n 's/^status=//p')"
+  selftest_check "a pretty-printed single-record JSON is accepted" "$got" "ok" || failures=$(( failures + 1 ))
+  printf 'api_key_id=agent-1\ndirect_status=relay_fallback\ndirect_status_reason=probe_failed\nupdated=%s\n' "$rec_now" > "$rec_dir/kv.txt"
+  got="$(direct_record_current "$rec_dir/kv.txt" agent-1 "$rec_floor" 0 | sed -n 's/^status=//p')"
+  selftest_check "a single key=value record is accepted" "$got" "ok" || failures=$(( failures + 1 ))
+  printf 'api_key_id=agent-1\napi_key_id=agent-2\nupdated=%s\n' "$rec_now" > "$rec_dir/kv2.txt"
+  got="$(direct_record_current "$rec_dir/kv2.txt" agent-1 "$rec_floor" 0 | sed -n 's/^status=//p')"
+  selftest_check "a key=value dump repeating the agent key is refused as ambiguous" "$got" "ambiguous" || failures=$(( failures + 1 ))
 
   # -------------------------------------------------------------------------
   # BLOCKING 5: live agent-record fetch makes the freshness requirement
