@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"sharebridge/agent/internal/signaling"
 	"sharebridge/agent/internal/tunnel"
 )
 
@@ -219,4 +220,130 @@ func TestTunnelManagerPublicationSerializedWithLockdown(t *testing.T) {
 		initialCredentialRequestWindow, func() bool {
 			return starter.startCount() == 0
 		})
+}
+
+// TestLockdownWinsTunnelManagerPublicationRace pins the opposite ordering from
+// TestTunnelManagerPublicationSerializedWithLockdown: Lockdown completes FIRST
+// and the manager construction then observes the locked daemon. Lockdown holds
+// lockdownMu for its whole body while its levers fan out, so pausing a lever
+// deterministically holds the transition open past the end of the synchronous
+// deny; a construction started in that window blocks on lockdownMu and can
+// only be denied by publishTunnelManagerLocked's own arm-from-IsLocked() step,
+// because the Lockdown deny already ran against a nil/old manager. This is the
+// fail-closed branch of the publication race.
+func TestLockdownWinsTunnelManagerPublicationRace(t *testing.T) {
+	fx := newLockdownFixture(t)
+	require.False(t, fx.d.IsLocked(), "fixture must start unlocked")
+
+	// Reset to the pre-construction state so startTunnelManager below runs its
+	// construction/arm/publish path after the lockdown transition.
+	require.NoError(t, fx.d.stopTunnelManager())
+	fx.d.mu.Lock()
+	fx.d.tunnel = nil
+	fx.d.mu.Unlock()
+
+	// Pause Lockdown inside its lever fan-out. Lockdown holds lockdownMu for
+	// its entire body (the levers run under it), so a construction started now
+	// blocks on that mutex until the transition completes. The locked flag is
+	// already published at this point: it is set under ds.mu before any lever
+	// is started.
+	leverEntered := make(chan struct{})
+	leverRelease := make(chan struct{})
+	var enteredOnce sync.Once
+	fx.d.lockdownLeverGate = func(string) {
+		enteredOnce.Do(func() { close(leverEntered) })
+		<-leverRelease
+	}
+
+	lockdownDone := make(chan error, 1)
+	go func() { lockdownDone <- fx.d.Lockdown() }()
+	select {
+	case <-leverEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Lockdown never reached its lever fan-out")
+	}
+	require.True(t, fx.d.IsLocked(), "lockdown must publish the locked state before its levers")
+
+	starter := &recordingTunnelStarter{stopsOnGraceful: true}
+	constructionDone := make(chan struct{})
+	go func() {
+		fx.d.startTunnelManager(context.Background(),
+			tunnel.WithProcessStarter(starter.start),
+			tunnel.WithBackoffBase(time.Millisecond),
+			tunnel.WithKillGracePeriod(20*time.Millisecond),
+			tunnel.WithCredentialWaitTimeout(time.Hour),
+			tunnel.WithRunningStabilityWindow(time.Hour),
+		)
+		close(constructionDone)
+	}()
+
+	// The construction MUST wait for the transition: lockdownMu is held until
+	// Lockdown returns.
+	select {
+	case <-constructionDone:
+		t.Fatal("manager construction completed while Lockdown still held lockdownMu")
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	close(leverRelease)
+	select {
+	case err := <-lockdownDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Lockdown did not finish")
+	}
+	select {
+	case <-constructionDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startTunnelManager did not finish after Lockdown released lockdownMu")
+	}
+
+	require.True(t, fx.d.IsLocked(), "daemon must be locked")
+	fx.d.mu.RLock()
+	manager := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.NotNil(t, manager, "the manager must have been published")
+	require.False(t, manager.StartPermitted(),
+		"a manager constructed after Lockdown won the race must be published DENIED")
+
+	// Bypass the daemon's IsLocked() pre-check and drive the parsed config
+	// straight into the published manager: the manager's own fence must be what
+	// refuses the start.
+	config, err := signaling.ParseRelayConfig(relayConfigMessage(t, 1, "credential-lockdown-wins").Raw)
+	require.NoError(t, err)
+	require.NoError(t, manager.ApplyConfig(config))
+	assertConditionStays(t, "a denied manager never starts frpc for a config applied while locked",
+		initialCredentialRequestWindow, func() bool {
+			return starter.startCount() == 0
+		})
+}
+
+// TestRestartTunnelManagerStopsSupersededManager pins the restart path's
+// teardown obligation: restartTunnelManager replaces d.tunnel with a freshly
+// constructed manager, and the superseded manager must be STOPPED, not merely
+// dropped. An unstopped manager keeps its supervision loop, child watcher,
+// restart timer and status emission goroutines alive with no owner, and its
+// frpc child can outlive the manager that was supposed to fence it.
+func TestRestartTunnelManagerStopsSupersededManager(t *testing.T) {
+	fx := newLockdownFixture(t)
+	require.False(t, fx.d.IsLocked(), "fixture must start unlocked")
+
+	fx.d.mu.RLock()
+	superseded := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.NotNil(t, superseded, "the fixture must own a tunnel manager")
+	require.False(t, superseded.Stopped(), "the fixture manager must start live")
+
+	fx.d.restartTunnelManager()
+
+	fx.d.mu.RLock()
+	replacement := fx.d.tunnel
+	fx.d.mu.RUnlock()
+	require.NotNil(t, replacement, "the restart must publish a replacement manager")
+	require.NotSame(t, superseded, replacement, "the restart must publish a fresh manager")
+	require.True(t, superseded.Stopped(),
+		"the superseded manager must be stopped, not silently orphaned")
+	require.False(t, replacement.Stopped(), "the replacement manager must be live")
+	require.True(t, replacement.StartPermitted(),
+		"a restart on an unlocked daemon must re-arm the replacement")
 }

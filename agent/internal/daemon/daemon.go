@@ -3459,14 +3459,44 @@ func (d *Daemon) stopDirectServerForLockdown(epoch uint64, server *direct.Direct
 // deadlock). Publishing the rebuilt manager from the current locked state
 // under that same lockdownMu is what arms it permitted again on a successful
 // unlock.
+//
+// The superseded manager is STOPPED before its replacement is published, never
+// merely dropped: an unstopped manager keeps its supervision loop, child
+// watcher, restart timer and status emission goroutines alive with no owner,
+// and a live frpc child can outlive the fence that was supposed to stop it.
+// The normal §13.4 ordering has already stopped this manager from Lockdown's
+// "stop tunnel manager" lever, which makes the call here a fast idempotent
+// no-op (stopOnce fired, doneChannel closed); the guarantee matters for the
+// restorePending retry path, where Unlock can run without a freshly completed
+// lockdown.
+//
+// Lock discipline: Unlock holds lockdownMu across this call, so Stop runs with
+// lockdownMu held. That cannot deadlock — no cycle exists — because Stop takes
+// only the OLD manager's startMu and then waits for that manager's own
+// supervision loop, and neither that loop nor its status emission worker ever
+// acquires lockdownMu or d.mu (shutdown emits onto the non-blocking queue, and
+// the daemon's status callback only touches the signaling sender). The wait is
+// bounded by Stop's own stopBound once startMu is held; the sole unbounded
+// part is the startMu acquisition if a child start is wedged in the process
+// starter, which is the residual documented on Manager.Stop and is the same
+// acquisition Lockdown's synchronous SetStartPermitted(false) already makes
+// while holding lockdownMu. Stopping before construction also keeps the
+// replacement from overlapping the old manager's child, config writes, and
+// credential activity.
 func (d *Daemon) restartTunnelManager() {
 	d.mu.Lock()
 	ctx := d.tunnelCtx
 	options := append([]tunnel.ManagerOption(nil), d.tunnelOptions...)
+	superseded := d.tunnel
 	d.tunnel = nil
 	d.mu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if superseded != nil {
+		if err := superseded.Stop(); err != nil {
+			log.Printf("restart tunnel manager: stopping the superseded manager: %v", err)
+		}
 	}
 	d.startTunnelManagerLocked(ctx, options...)
 }

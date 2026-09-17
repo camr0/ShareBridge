@@ -747,6 +747,16 @@ func (manager *Manager) StartPermitted() bool {
 	return manager.startPermitted.Load()
 }
 
+// Stopped reports whether Stop has published the permanent stopped state (its
+// stop channel is closed). Like StartPermitted it is pure observability: it
+// takes no lock and is not the authoritative decision — startChildFenced still
+// reads the stopped boolean under startMu — so it must never be used to gate a
+// start. The daemon's restart path uses it to assert that a superseded manager
+// was stopped rather than dropped.
+func (manager *Manager) Stopped() bool {
+	return manager.isStopped()
+}
+
 // SetStartPermitted arms or denies this manager's child-start permission. The
 // daemon calls it with false SYNCHRONOUSLY at the start of the §13.4 lockdown
 // transition (before publishing the locked flag and before any best-effort
@@ -778,6 +788,23 @@ func (manager *Manager) SetStartPermitted(permitted bool) {
 // its remaining teardown levers regardless. Stop is idempotent: as long as the
 // loop exits within the bound every call returns the same recorded outcome.
 func (manager *Manager) Stop() error {
+	// Boundedness note: the startMu acquisition below sits deliberately
+	// OUTSIDE the stopBound budget, which starts only after the state is
+	// published. Go's sync.Mutex cannot be acquired with a timeout, and this
+	// acquisition IS part of the fence: startChildFenced holds startMu across
+	// its check-and-spawn, so Stop must block here until an in-flight start
+	// finishes, exactly as SetStartPermitted's flip does for the daemon's
+	// synchronous Lockdown deny. If the process starter is wedged inside exec,
+	// this wait lasts as long as that start, not merely stopBound. The daemon
+	// bounds the caller instead: shutdown waits shutdownLeverTimeout for its
+	// tunnel-stop lever and Lockdown waits lockdownLeverTimeout for its lever
+	// fan-out (daemon.go), so the residual is a leaked Stop goroutine that
+	// completes when the wedged start does — not a daemon hang. Publishing
+	// `stopped` from a detached goroutine or adding a cooperative stop to the
+	// process starter would restore boundedness only by letting a start begin
+	// after Stop returned, which is precisely the check-and-spawn atomicity the
+	// verified start fence (and TestLockdownDeniesInFlightStartBeforeItReturns)
+	// depends on; the acquisition therefore stays here.
 	manager.stopOnce.Do(func() {
 		// Publish the stopped state under startMu — the same mutex
 		// startChildFenced holds across its check-and-spawn. A start already in
