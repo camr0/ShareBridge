@@ -1083,34 +1083,46 @@ func (manager *Manager) SetStartPermitted(permitted bool) {
 }
 
 // Stop shuts the tunnel down: the child is stopped gracefully and killed if
-// it ignores the graceful stop. Every wait is BOUNDED by a Manager-owned
-// timer: the graceful/kill signal calls, the post-kill wait, the delivery of
-// the queued status reports, and — here — the wait for the supervision loop
-// itself. If the child has still not exited, Stop returns ErrChildKillTimeout
-// (wrapped); a signal call that never returns returns ErrChildSignalTimeout. A
-// status callback that blocks is never waited on: emission is asynchronous,
-// and Stop stops waiting for the loop at stopBound regardless (Round D
-// fix-round, audit A). The daemon treats the failure as best-effort and runs
-// its remaining teardown levers regardless. Stop is idempotent: as long as the
-// loop exits within the bound every call returns the same recorded outcome.
+// it ignores the graceful stop. Every wait AFTER the startMu acquisition is
+// BOUNDED by a Manager-owned timer: the graceful/kill signal calls, the
+// post-kill wait, the delivery of the queued status reports, and the wait for
+// the supervision loop itself (stopBound). If the child has still not exited,
+// Stop returns ErrChildKillTimeout (wrapped); a signal call that never returns
+// returns ErrChildSignalTimeout. A status callback that blocks is never waited
+// on: emission is asynchronous, and Stop stops waiting for the loop at
+// stopBound regardless (Round D fix-round, audit A). The daemon treats the
+// failure as best-effort and runs its remaining teardown levers regardless.
+// Stop is idempotent: as long as the loop exits within the bound every call
+// returns the same recorded outcome.
+//
+// The startMu acquisition is deliberately OUTSIDE stopBound and is NOT bounded
+// by it. Go's sync.Mutex cannot be acquired with a timeout, and this
+// acquisition IS part of the fence: startChildFenced holds startMu across its
+// check-and-spawn, so Stop must block here until an in-flight start finishes,
+// exactly as SetStartPermitted's flip does for the daemon's synchronous
+// Lockdown deny. If the process starter is wedged inside exec.Cmd.Start, this
+// wait lasts as long as that start, not merely stopBound.
+//
+// Operational consequence (independently verified): a wedged process start
+// delays Stop AND the daemon's emergency Lockdown/Unlock rebuilds. Lockdown
+// calls SetStartPermitted(false) SYNCHRONOUSLY on this SAME mutex BEFORE it
+// publishes ds.locked or starts its lever timer (daemon.go), so a wedged exec
+// can block the lockdown transition itself, not merely leak a Stop goroutine;
+// Unlock's restartTunnelManager calls Stop and can block the same way. Neither
+// shutdownLeverTimeout nor lockdownLeverTimeout covers this mutex wait: they
+// bound only the daemon's waits around its detached tunnel-stop lever and the
+// post-publication best-effort levers, so a daemon caller whose bound fires
+// returns while this goroutine is still parked here. The residual is therefore
+// a goroutine leaked until the wedged start completes, plus a delayed
+// lockdown/unlock while it is wedged.
+//
+// Publishing `stopped` from a detached goroutine or adding a cooperative stop
+// to the process starter would restore boundedness only by letting a start
+// begin after Stop returned, which is precisely the check-and-spawn atomicity
+// the verified start fence (and TestLockdownDeniesInFlightStartBeforeItReturns)
+// depends on; the acquisition therefore stays here and the residual is
+// documented rather than restructured.
 func (manager *Manager) Stop() error {
-	// Boundedness note: the startMu acquisition below sits deliberately
-	// OUTSIDE the stopBound budget, which starts only after the state is
-	// published. Go's sync.Mutex cannot be acquired with a timeout, and this
-	// acquisition IS part of the fence: startChildFenced holds startMu across
-	// its check-and-spawn, so Stop must block here until an in-flight start
-	// finishes, exactly as SetStartPermitted's flip does for the daemon's
-	// synchronous Lockdown deny. If the process starter is wedged inside exec,
-	// this wait lasts as long as that start, not merely stopBound. The daemon
-	// bounds the caller instead: shutdown waits shutdownLeverTimeout for its
-	// tunnel-stop lever and Lockdown waits lockdownLeverTimeout for its lever
-	// fan-out (daemon.go), so the residual is a leaked Stop goroutine that
-	// completes when the wedged start does — not a daemon hang. Publishing
-	// `stopped` from a detached goroutine or adding a cooperative stop to the
-	// process starter would restore boundedness only by letting a start begin
-	// after Stop returned, which is precisely the check-and-spawn atomicity the
-	// verified start fence (and TestLockdownDeniesInFlightStartBeforeItReturns)
-	// depends on; the acquisition therefore stays here.
 	manager.stopOnce.Do(func() {
 		// Publish the stopped state under startMu — the same mutex
 		// startChildFenced holds across its check-and-spawn. A start already in
