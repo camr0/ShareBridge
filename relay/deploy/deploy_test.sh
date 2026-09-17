@@ -19,7 +19,7 @@
 # Usage:  bash relay/deploy/deploy_test.sh
 # Exit:   0 = every assertion passed (GREEN); 1 = at least one failed (RED).
 #
-# The assertion IDs (A1…A18) are referenced by the Task 35 report so each
+# The assertion IDs (A1…A19) are referenced by the Task 35 report so each
 # published hardening claim maps to the check that enforces it. A3/A4/A6/A15
 # are strict-parsing assertions: a duplicate, redefined or extra directive is a
 # failure, never silently ignored, and A12/A13 prove their properties by
@@ -1431,6 +1431,36 @@ require_contains "$test_vps_doc" 'route_ready' "test-VPS runbook names the route
 require_contains "$test_vps_doc" 'sync-ca\.key' "test-VPS runbook states the CA key never leaves the workstation"
 require_contains "$test_vps_doc" 'never probed over the network|never curl|loopback-private' \
   "test-VPS runbook marks the sync listener private"
+
+printf -- '-- A19: collocated test-VPS frps plugin endpoint is host-only and exact\n'
+# frps v0.71 concatenates the httpPlugins `addr` and `path` (rpkg/frps
+# pkg/plugin/server/http.go: addr = addr + path). The pre-fix deploy render put
+# PLUGIN_API_PATH in BOTH, so every plugin call landed on
+# /frp/authorize/frp/authorize and the plugin (which compares the request path
+# against frpplugin.APIPath exactly) rejected every Login generically — while
+# this hermetic gate stayed green because it never asserted the block. Pin the
+# block and its shape so that regression cannot recur.
+require_contains "$test_vps_script" '^\[\[httpPlugins\]\]$' \
+  "test deploy declares the frps httpPlugins block"
+require_contains "$test_vps_script" '^name = "sharebridge-authorize-presence"$' \
+  "test deploy names the frps authorize/presence plugin"
+# The addr must be HOST-ONLY, exactly like the hermetic gate fixture: no path
+# component, so an addr that embeds the path fails even if the value happens to
+# still grep elsewhere.
+require_not_contains "$test_vps_script" '^addr = .*\$\{PLUGIN_API_PATH\}' \
+  "test deploy frps plugin addr must not embed PLUGIN_API_PATH (frps appends the path itself)"
+require_contains "$test_vps_script" '^addr = "http://\$\{PLUGIN_USER\}:\$\{SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET\}@\$\{PLUGIN_LISTEN\}"$' \
+  "test deploy frps plugin addr is the exact host-only basic-auth URL"
+require_contains "$test_vps_script" '^path = "\$\{PLUGIN_API_PATH\}"$' \
+  "test deploy configures the frps plugin path separately from the addr"
+# The addr variables themselves must stay pinned: a public listener or a
+# renamed user would be a real regression even with the right shape.
+require_contains "$test_vps_script" '^PLUGIN_LISTEN="127\.0\.0\.1:9001"$' \
+  "test deploy frps plugin listener is the gateway numeric loopback endpoint"
+require_contains "$test_vps_script" '^PLUGIN_USER="sharebridge-frps"' \
+  "test deploy frps plugin basic-auth user is the pinned name"
+require_contains "$test_vps_script" '^PLUGIN_API_PATH="/frp/authorize"' \
+  "test deploy frps plugin path is the pinned frpplugin.APIPath"
 
 printf '\n== %d checks, %d failure(s) ==\n' "$checks" "$failures"
 if [[ $failures -gt 0 ]]; then
