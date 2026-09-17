@@ -135,6 +135,20 @@ type Daemon struct {
 	tunnelCtx     context.Context
 	tunnelOptions []tunnel.ManagerOption
 
+	// tunnelRequesterCancel ends the lifecycle of the credential requester
+	// built for the CURRENT manager epoch (under mu). Each unlock rebuild used
+	// to construct a requester whose worker parked until the PROCESS context
+	// ended, leaking one goroutine per lockdown/unlock cycle; cancelling this
+	// derived context when the epoch's manager is superseded or stopped makes
+	// the worker exit. Nil when the epoch has no requester.
+	tunnelRequesterCancel context.CancelFunc
+
+	// tunnelRequesterObserver is a TEST-ONLY seam: when non-nil it is called
+	// with the lifecycle context of each credential requester the daemon
+	// constructs, so a test can prove the worker's lifecycle ends with its
+	// manager epoch. Production leaves it nil.
+	tunnelRequesterObserver func(context.Context)
+
 	// lockdownGen is the monotonic §11.1 lockdown_status generation (under
 	// mu). It increments on every lockdown/unlock transition so control can
 	// reject a stale report within the current connection epoch.
@@ -527,21 +541,67 @@ func (d *Daemon) startTunnelManagerLocked(ctx context.Context, options ...tunnel
 
 	// The credential requester (§7.2/§11.1) sends over the signaling client's
 	// CURRENT connection: the send path re-resolves the WebSocket per call, so
-	// a request enqueued before a reconnect rides the reconnected socket.
+	// a request enqueued before a reconnect rides the reconnected socket. Its
+	// lifecycle is a CANCELLABLE child of the construction context, scoped to
+	// this manager epoch: when the epoch's manager is superseded or stopped the
+	// daemon cancels it so the requester's worker goroutine exits instead of
+	// parking until process exit (one leaked goroutine per lockdown/unlock
+	// cycle).
 	var requester tunnel.CredentialRequester
+	var cancelRequester context.CancelFunc
 	if sender, ok := d.signaling.(relayCredentialRequestSender); ok {
-		requester = tunnel.NewControlCredentialRequester(ctx, sender.SendRelayCredentialRequest)
+		requesterCtx, cancel := context.WithCancel(ctx)
+		cancelRequester = cancel
+		if d.tunnelRequesterObserver != nil {
+			d.tunnelRequesterObserver(requesterCtx)
+		}
+		requester = tunnel.NewControlCredentialRequester(requesterCtx, sender.SendRelayCredentialRequest)
 	} else {
 		log.Printf("relay credential requester unavailable: signaling client lacks relay_credential_request")
 	}
 
 	manager, err := tunnel.NewManager(settings, requester, d.handleTunnelStatus, options...)
 	if err != nil {
+		if cancelRequester != nil {
+			cancelRequester()
+		}
 		log.Printf("relay tunnel supervision unavailable: %v", err)
 		return false
 	}
+	// Record the epoch's requester lifecycle so stopTunnelManager (lockdown /
+	// shutdown) and restartTunnelManager (unlock rebuild) can cancel it. Any
+	// prior cancel is invoked defensively: it should already have been cleared
+	// by the stop that preceded this rebuild.
+	d.mu.Lock()
+	previousCancel := d.tunnelRequesterCancel
+	d.tunnelRequesterCancel = cancelRequester
+	d.mu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
 	d.publishTunnelManagerLocked(manager)
 	return true
+}
+
+// cancelTunnelRequesterFor ends the lifecycle of the credential requester that
+// belongs to the given manager epoch, so its worker goroutine exits. It is a
+// no-op when manager is not the currently published manager — a stale lockdown
+// lever that overran its aggregation bound must never cancel a newer Unlock's
+// requester — and when no requester is recorded. The cancel is cleared before
+// it is invoked so a concurrent stop cannot double-cancel (CancelFunc is
+// idempotent, but clearing keeps the epoch bookkeeping exact).
+func (d *Daemon) cancelTunnelRequesterFor(manager *tunnel.Manager) {
+	d.mu.Lock()
+	if d.tunnel != manager {
+		d.mu.Unlock()
+		return
+	}
+	cancel := d.tunnelRequesterCancel
+	d.tunnelRequesterCancel = nil
+	d.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // publishTunnelManagerLocked arms manager from the daemon's CURRENT locked
@@ -585,9 +645,17 @@ func (d *Daemon) stopTunnelManager() error {
 	manager := d.tunnel
 	d.mu.RUnlock()
 	if manager == nil {
+		// A retained-but-cleared manager can still own a requester lifecycle;
+		// cancel it (d.tunnel is nil, so the manager-scoped guard matches) so no
+		// worker outlives its epoch.
+		d.cancelTunnelRequesterFor(nil)
 		return nil
 	}
-	return manager.Stop()
+	err := manager.Stop()
+	// The epoch is over whether or not its bounded stop succeeded: the manager
+	// can no longer enqueue requests, so the requester's worker must exit.
+	d.cancelTunnelRequesterFor(manager)
+	return err
 }
 
 // applyRelayConfig routes one control relay_config message into the tunnel
@@ -3134,7 +3202,12 @@ func (d *Daemon) Lockdown() error {
 			if manager == nil {
 				return nil
 			}
-			return manager.Stop()
+			err := manager.Stop()
+			// End the requester lifecycle scoped to this snapshotted manager. A
+			// stale lever that overran past an Unlock sees d.tunnel != manager
+			// and leaves the newer epoch's requester alone.
+			d.cancelTunnelRequesterFor(manager)
+			return err
 		}},
 		{name: "report lockdown status", run: func() error {
 			d.sendLockdownStatus(generation, true)
@@ -3537,11 +3610,16 @@ func (d *Daemon) restartTunnelManager() error {
 		ctx = context.Background()
 	}
 	if superseded != nil {
-		if err := superseded.Stop(); err != nil {
+		stopErr := superseded.Stop()
+		// The superseded epoch is over regardless of the bounded-stop outcome:
+		// its credential-requester worker must not outlive it (one leaked
+		// goroutine per lockdown/unlock cycle before this).
+		d.cancelTunnelRequesterFor(superseded)
+		if stopErr != nil {
 			// Fail closed: do NOT clear d.tunnel or publish a replacement. The
 			// superseded manager stays retained and the caller keeps its restore
 			// pending so a later Unlock retries once the child can be stopped.
-			return fmt.Errorf("restart tunnel manager: stopping the superseded manager: %w", err)
+			return fmt.Errorf("restart tunnel manager: stopping the superseded manager: %w", stopErr)
 		}
 	}
 	d.mu.Lock()

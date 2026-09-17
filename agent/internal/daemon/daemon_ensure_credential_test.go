@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -20,6 +21,44 @@ import (
 // Both the initial-boot request and the unlock request now go through the
 // tunnel manager's EnsureCredential event, which owns the existing bounded
 // retry machinery (30-second credential-wait timeout, capped backoff).
+
+// TestUnlockRebuildEndsTheSupersededCredentialRequesterWorker pins the
+// lifecycle fix for the per-epoch ControlCredentialRequester: each unlock
+// rebuild used to construct a requester whose worker parked until the PROCESS
+// context ended, leaking one goroutine per lockdown/unlock cycle. The daemon
+// now derives a cancellable epoch context; stopping that epoch MUST close it so
+// the worker exits, while a live epoch's lifecycle stays open.
+func TestUnlockRebuildEndsTheSupersededCredentialRequesterWorker(t *testing.T) {
+	fx := newLockdownFixture(t)
+	lifecycles := make(chan context.Context, 8)
+	fx.d.tunnelRequesterObserver = func(ctx context.Context) { lifecycles <- ctx }
+
+	// Rebuild once: the fresh manager's requester lifecycle is a new epoch.
+	require.NoError(t, fx.d.Lockdown())
+	require.NoError(t, fx.d.Unlock())
+
+	var rebuildCtx context.Context
+	select {
+	case rebuildCtx = <-lifecycles:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unlock rebuild did not construct a credential requester")
+	}
+	select {
+	case <-rebuildCtx.Done():
+		t.Fatal("the rebuilt requester lifecycle ended while its manager is still live")
+	default:
+	}
+
+	// The next lockdown ends that epoch. Without the epoch-scoped cancel the
+	// lifecycle is the process context's, whose Done never fires here, so this
+	// blocks until the timeout and the worker leaks until process exit.
+	require.NoError(t, fx.d.Lockdown())
+	select {
+	case <-rebuildCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("lockdown did not end the superseded requester lifecycle; its worker leaks until process exit")
+	}
+}
 
 // TestBootstrapEnsureCredentialRetriesUntilControlAnswers proves the bootstrap
 // path is no longer one-shot: control ignores the first request, and the
