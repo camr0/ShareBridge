@@ -55,10 +55,16 @@
 #
 # SAFETY:
 #   * Read-only against remote systems (curl GET/POST prepare-route, ssh
-#     journalctl/curl, dig, openssl). The ONLY state-changing calls are the two
-#     explicitly opt-in actions: lockdown/unlock (LIVE_M4EXIT_ALLOW_LOCKDOWN=1)
-#     and share revocation (LIVE_M4EXIT_ALLOW_REVOKE=1). Both are reversible
-#     and agent-local (revoke never deletes an Immich share).
+#     journalctl/curl, dig, openssl). The ONLY state-changing calls are the
+#     three explicitly opt-in actions: lockdown/unlock
+#     (LIVE_M4EXIT_ALLOW_LOCKDOWN=1), share revocation
+#     (LIVE_M4EXIT_ALLOW_REVOKE=1) and an explicit agent restart
+#     (LIVE_M4EXIT_ALLOW_AGENT_RESTART=1, case 1 only). All are reversible and
+#     agent-local (revoke never deletes an Immich share).
+#   * The lockdown safety net is registered in the MAIN process (subshells
+#     reset traps) and re-reads the locked state from a state file, so an
+#     interrupted, failing or SIGTERM-ed run re-sends POST /api/unlock instead
+#     of stranding a locked agent.
 #   * Secrets are never printed or stored: every captured line and every
 #     check() detail passes through sanitize(), which redacts configured
 #     password/share-code literals, key/token/password/secret/cookie/
@@ -138,12 +144,17 @@
 #     LIVE_M4EXIT_AGENT_JOURNAL_UNIT    agent systemd unit for journalctl (default sharebridge-agent)
 #     LIVE_M4EXIT_EXPECTED_SHARE_COUNT  declared registered share count (required: case 1)
 #     LIVE_M4EXIT_EXPECTED_HYDRATED_SESSIONS  minimum restart-hydrated sessions (default 1)
+#     (when no restart is observable, either point LIVE_M4EXIT_AGENT_LOG_FILE at
+#      a startup log that contains the line, or use the opt-in restart vars below)
 #
 #   Control-side diagnostics (case 4)
 #     LIVE_M4EXIT_AGENT_RECORD_FILE     operator-supplied agent record with direct_status/direct_status_reason (required for a relay fallback)
 #     LIVE_M4EXIT_EXPECTED_DIRECT_REASON  expected direct_status_reason for the fail-closed fallback (default probe_failed)
 #
 #   Opt-in state-changing cases
+#     LIVE_M4EXIT_ALLOW_AGENT_RESTART   1 restarts the agent inside case 1 so the "loaded N sessions from store" line is freshly observable (default 0 => no restart)
+#     LIVE_M4EXIT_AGENT_RESTART_COMMAND exact restart command, required when _ALLOW_AGENT_RESTART=1 (run on LIVE_M4EXIT_AGENT_SSH_HOST when set, else locally)
+#     LIVE_M4EXIT_AGENT_RESTART_WAIT_S  seconds to wait for the hydration line after an opted-in restart (default 30)
 #     LIVE_M4EXIT_ALLOW_LOCKDOWN        1 enables case 5 (lockdown/unlock; default 0 => SKIP)
 #     LIVE_M4EXIT_RECOVERY_BOUND_S      documented post-unlock recovery bound (default 120)
 #     LIVE_M4EXIT_TUNNEL_OFFLINE_BOUND_S documented post-lockdown tunnel-offline bound (default 30)
@@ -248,6 +259,10 @@ AGENT_JOURNAL_UNIT="${LIVE_M4EXIT_AGENT_JOURNAL_UNIT:-sharebridge-agent}"
 EXPECTED_SHARE_COUNT="${LIVE_M4EXIT_EXPECTED_SHARE_COUNT:-}"
 EXPECTED_HYDRATED_SESSIONS="${LIVE_M4EXIT_EXPECTED_HYDRATED_SESSIONS:-1}"
 
+ALLOW_AGENT_RESTART="${LIVE_M4EXIT_ALLOW_AGENT_RESTART:-0}"
+AGENT_RESTART_COMMAND="${LIVE_M4EXIT_AGENT_RESTART_COMMAND:-}"
+AGENT_RESTART_WAIT_S="${LIVE_M4EXIT_AGENT_RESTART_WAIT_S:-30}"
+
 AGENT_RECORD_FILE="${LIVE_M4EXIT_AGENT_RECORD_FILE:-}"
 EXPECTED_DIRECT_REASON="${LIVE_M4EXIT_EXPECTED_DIRECT_REASON:-probe_failed}"
 
@@ -280,6 +295,7 @@ if [[ -z "$AGENT_ADMIN_ORIGIN" && -n "$AGENT_ADMIN_BASE_URL" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SELF="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 GIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
@@ -834,6 +850,79 @@ prepare_relay_or_fail() {
 }
 
 # ===========================================================================
+# Lockdown safety net (shared by the main process trap and case 5)
+# ===========================================================================
+#
+# The lockdown case runs inside `( ... )` (see execute_case), and bash resets
+# traps in subshells, so a flag set inside the case can never be read by a
+# trap registered in the main process. It is also why the original
+# `local locked=0` was unbound in the EXIT trap under `set -u`: the case's own
+# function scope had already ended. The locked state therefore lives in a
+# small state FILE that the case writes/removes, and the MAIN process owns the
+# trap. That survives a normal EXIT, an `exit` from any code path, and INT or
+# TERM sent to the harness PID (including a Ctrl-C delivered to the process
+# group).
+
+M4EXIT_LOCK_STATE=""
+
+m4exit_lock_state_path() {
+  # Resolve the per-run state-file path exactly once (in the main process, so
+  # the case's subshell inherits the same path). The file only exists while the
+  # harness believes the agent is locked.
+  if [[ -z "${M4EXIT_LOCK_STATE:-}" ]]; then
+    M4EXIT_LOCK_STATE="$(mktemp "${TMPDIR:-/tmp}/m4exit-lockdown.XXXXXX")"
+    rm -f "$M4EXIT_LOCK_STATE"
+  fi
+  printf '%s' "$M4EXIT_LOCK_STATE"
+}
+
+m4exit_mark_locked() {
+  printf 'locked\n' > "$(m4exit_lock_state_path)"
+}
+
+m4exit_mark_unlocked() {
+  if [[ -n "${M4EXIT_LOCK_STATE:-}" ]]; then rm -f "$M4EXIT_LOCK_STATE"; fi
+  return 0
+}
+
+m4exit_lockdown_maybe_active() {
+  [[ -n "${M4EXIT_LOCK_STATE:-}" && -f "${M4EXIT_LOCK_STATE:-/nonexistent}" ]]
+}
+
+m4exit_emergency_unlock() {
+  # Trap body: re-send POST /api/unlock whenever the harness still believes the
+  # agent is locked. Never masks the original exit status (always returns 0)
+  # and is defensive under `set -u` (the state global may be unset).
+  if ! m4exit_lockdown_maybe_active; then
+    return 0
+  fi
+  local rc=0 code=""
+  if declare -f agent_api >/dev/null 2>&1; then
+    agent_api POST "/api/unlock" >/dev/null 2>&1 || rc=$?
+    code="${AGENT_HTTP_CODE:-}"
+  else
+    rc=127
+  fi
+  if [[ "$rc" -eq 0 && ( "$code" == "200" || "$code" == "204" ) ]]; then
+    m4exit_mark_unlocked
+    log "EMERGENCY UNLOCK: POST /api/unlock -> ${code} — the agent is no longer locked"
+  else
+    log "EMERGENCY UNLOCK FAILED: $(printf 'POST /api/unlock rc=%s http=%s via %s' "$rc" "${code:-<none>}" "${AGENT_ADMIN_BASE_URL:-<unset>}" | sanitize) — the agent may STILL be locked; unlock it by hand"
+  fi
+  return 0
+}
+
+m4exit_install_lockdown_trap() {
+  # Main-process trap installation (live runs only). INT/TERM unlock first and
+  # then exit with the conventional 128+signal status; the EXIT trap then runs
+  # again but finds the state already cleared, so exactly one unlock is issued.
+  m4exit_lock_state_path >/dev/null
+  trap 'm4exit_emergency_unlock' EXIT
+  trap 'm4exit_emergency_unlock; exit 130' INT
+  trap 'm4exit_emergency_unlock; exit 143' TERM
+}
+
+# ===========================================================================
 # CASE: enrollment_hydration_restart
 # ===========================================================================
 
@@ -889,11 +978,45 @@ enrollment_hydration_restart() {
     check enrollment_tunnel_online FAIL "no gateway metrics access: set LIVE_M4EXIT_GATEWAY_METRICS_URL or LIVE_M4EXIT_GATEWAY_SSH_HOST"
   fi
 
-  # (3) Restart hydration observed in the agent log.
-  local line n
+  # (3) Restart hydration observed in the agent log. When the operator opts in,
+  # first perform an explicit restart so the line is freshly observable. The
+  # restart is ONLY an observability action: it can never substitute for the
+  # real hydration line, so a genuine hydration failure still fails closed.
+  local line n restart_action="no restart requested"
+  if [[ "$ALLOW_AGENT_RESTART" == "1" ]]; then
+    if [[ -z "$AGENT_RESTART_COMMAND" ]]; then
+      check hydration_restart_action FAIL "LIVE_M4EXIT_ALLOW_AGENT_RESTART=1 requires LIVE_M4EXIT_AGENT_RESTART_COMMAND — set it to the exact agent restart command (e.g. 'systemctl restart sharebridge-agent')"
+      restart_action="opted-in restart not executed (no command)"
+    else
+      local restart_out="" restart_rc=0
+      if [[ -n "$AGENT_SSH_HOST" ]]; then
+        restart_out="$(remote_exec "$AGENT_SSH_HOST" "$AGENT_RESTART_COMMAND")" || restart_rc=$?
+      else
+        restart_out="$(local_exec "$AGENT_RESTART_COMMAND")" || restart_rc=$?
+      fi
+      if [[ "$restart_rc" -eq 0 ]]; then
+        check hydration_restart_action PASS "opted-in agent restart executed (${AGENT_SSH_HOST:+on ${AGENT_SSH_HOST} }rc=0)"
+        restart_action="opted-in restart executed (rc=0)"
+      else
+        check hydration_restart_action FAIL "opted-in agent restart exited rc=${restart_rc}: $(printf '%s' "$restart_out" | tr '\n' ' ' | cut -c1-200)"
+        restart_action="opted-in restart failed (rc=${restart_rc})"
+      fi
+      # Bounded wait for the (real) hydration line to appear after a restart.
+      if [[ "$restart_rc" -eq 0 ]]; then
+        local waited=0
+        while [[ "$waited" -le "$AGENT_RESTART_WAIT_S" ]]; do
+          line="$(agent_log_grep 'loaded [0-9]+ sessions from store' 2>/dev/null | tail -n1)"
+          [[ -n "$line" ]] && break
+          sleep 2
+          waited=$(( waited + 2 ))
+        done
+      fi
+    fi
+  fi
+  set_fact hydration_restart_action "$restart_action"
   line="$(agent_log_grep 'loaded [0-9]+ sessions from store' 2>/dev/null | tail -n1)"
   if [[ -z "$line" ]]; then
-    check hydration_restart_observed FAIL "no 'loaded N sessions from store' line in the agent log (source: $(agent_log_source)) — restart hydration unobservable"
+    check hydration_restart_observed FAIL "no 'loaded N sessions from store' line in the agent log (source: $(agent_log_source); ${restart_action}) — remedy: either set LIVE_M4EXIT_AGENT_LOG_FILE=<path to a startup log that contains the line>, or opt in to an agent restart with LIVE_M4EXIT_ALLOW_AGENT_RESTART=1 and LIVE_M4EXIT_AGENT_RESTART_COMMAND='<exact restart command>' (plus LIVE_M4EXIT_AGENT_SSH_HOST=<target> for a remote agent), then re-run --case enrollment_hydration_restart"
     check hydration_session_count FAIL "not evaluated: no restart hydration line"
   else
     n="$(printf '%s' "$line" | grep -oE 'loaded [0-9]+ sessions' | grep -oE '[0-9]+' | head -n1)"
@@ -1286,7 +1409,7 @@ direct_path_or_failclosed() {
     relay)
       check direct_path_observable PASS "prepare-route -> 200 status=relay (fail-closed fallback)"
       if [[ -z "$AGENT_RECORD_FILE" ]]; then
-        check direct_failclosed_diagnostics FAIL "LIVE_M4EXIT_AGENT_RECORD_FILE is unset — status=relay but the control-side direct diagnostics are unobservable"
+        check direct_failclosed_diagnostics FAIL "prepare-route reported the fail-closed relay fallback but LIVE_M4EXIT_AGENT_RECORD_FILE is unset, so the control-side direct diagnostics cannot be verified. Expected file: the control agents record for this agent (PocketBase collection 'agents'), saved as JSON or key=value text containing direct_status and direct_status_reason (the parser accepts 'key=value', 'key: value' and JSON). Obtain it from the control admin UI (Collections -> agents -> the agent row -> copy/export) or via the control API. Verdicts: direct_status=relay_fallback AND direct_status_reason=<LIVE_M4EXIT_EXPECTED_DIRECT_REASON, default probe_failed> => PASS; a different direct_status or reason => FAIL; and this file is not needed when prepare-route returns status=direct (that is judged by direct_route_serves instead)"
         return 0
       fi
       if [[ ! -r "$AGENT_RECORD_FILE" ]]; then
@@ -1335,10 +1458,9 @@ lockdown_withdrawal_and_recovery() {
     "LIVE_M4EXIT_AGENT_ADMIN_USER=${AGENT_ADMIN_USER}|agent admin Basic-auth user" \
     "LIVE_M4EXIT_AGENT_ADMIN_PASSWORD=${AGENT_ADMIN_PASSWORD}|agent admin Basic-auth password" || return 0
 
-  # Always try to unlock on exit so an interrupted case cannot strand a locked agent.
-  local locked=0
-  # shellcheck disable=SC2064
-  trap 'if [[ "$locked" == "1" ]]; then agent_api POST "/api/unlock" >/dev/null 2>&1 || true; fi' EXIT
+  # The main process owns the EXIT/INT/TERM unlock trap (installed by
+  # m4exit_install_lockdown_trap before the cases run); this case only records
+  # the locked state in the shared state file so the trap can see it.
 
   # (1) Baseline healthy: relay route + tunnel online.
   local baseline_url=""
@@ -1368,7 +1490,7 @@ lockdown_withdrawal_and_recovery() {
   # (3) Lockdown.
   agent_api POST "/api/lockdown"
   if [[ "$AGENT_HTTP_CODE" == "200" ]]; then
-    locked=1
+    m4exit_mark_locked
     check lockdown_applied PASS "POST /api/lockdown -> 200 ($(json_str "$(cat "$AGENT_BODY_FILE")" locked))"
   else
     check lockdown_applied FAIL "POST /api/lockdown -> ${AGENT_HTTP_CODE:-000} ${HTTP_ERR:-}"
@@ -1436,7 +1558,7 @@ lockdown_withdrawal_and_recovery() {
     check lockdown_recovery FAIL "POST /api/unlock -> ${AGENT_HTTP_CODE:-000} ${HTTP_ERR:-}"
     return 0
   fi
-  locked=0
+  m4exit_mark_unlocked
   local rec_wait=0 rec_ok=0 rec_secs=-1 stage=""
   while [[ "$rec_wait" -le "$RECOVERY_BOUND_S" ]]; do
     online="$(gateway_tunnel_online 2>/dev/null || true)"
@@ -1610,12 +1732,14 @@ declare -a RESULT_SELECTED=()
 case_is_destructive() {
   case "$1" in
     lockdown_withdrawal_and_recovery|revocation_midstream) printf 'yes' ;;
+    enrollment_hydration_restart) [[ "$ALLOW_AGENT_RESTART" == "1" ]] && printf 'yes' || printf 'no' ;;
     *) printf 'no' ;;
   esac
 }
 
 case_opt_in_flag() {
   case "$1" in
+    enrollment_hydration_restart) printf 'LIVE_M4EXIT_ALLOW_AGENT_RESTART=%s' "$ALLOW_AGENT_RESTART" ;;
     lockdown_withdrawal_and_recovery) printf 'LIVE_M4EXIT_ALLOW_LOCKDOWN=%s' "$ALLOW_LOCKDOWN" ;;
     revocation_midstream) printf 'LIVE_M4EXIT_ALLOW_REVOKE=%s' "$ALLOW_REVOKE" ;;
     *) printf 'none' ;;
@@ -1641,6 +1765,14 @@ execute_case() {
     ( "$name" ) || status=$?
   else
     status=127
+  fi
+
+  # If the case left the agent marked locked (failed/early-returned explicit
+  # unlock), re-unlock before any later case runs. The main-process EXIT trap
+  # remains the final backstop for interruption right here.
+  if m4exit_lockdown_maybe_active; then
+    log "WARNING: case ${name} left the agent marked locked — attempting the emergency unlock before continuing"
+    m4exit_emergency_unlock
   fi
 
   if [[ ! -s "$GATE_CHECK_FILE" ]]; then
@@ -1706,6 +1838,7 @@ run_all_cases() {
   printf 'relay_host=%s\n' "${RELAY_HOST:-<unset>}"
   printf 'allow_lockdown=%s\n' "$ALLOW_LOCKDOWN"
   printf 'allow_revoke=%s\n' "$ALLOW_REVOKE"
+  printf 'allow_agent_restart=%s\n' "$ALLOW_AGENT_RESTART"
 
   if ! mkdir -p "$RUN_DIR"; then
     printf 'ERROR: cannot create evidence directory %s\n' "$RUN_DIR" >&2
@@ -1769,6 +1902,7 @@ write_run_metadata() {
     printf 'revoke_share_code=%s\n' "$([[ -n "$REVOKE_SHARE_CODE" ]] && printf '[REDACTED-SHARE-CODE]' || printf '<unset>')"
     printf 'allow_lockdown=%s (destructive-but-reversible: case lockdown_withdrawal_and_recovery)\n' "$ALLOW_LOCKDOWN"
     printf 'allow_revoke=%s (destructive-but-agent-local: case revocation_midstream)\n' "$ALLOW_REVOKE"
+    printf 'allow_agent_restart=%s (opt-in agent restart inside case enrollment_hydration_restart)\n' "$ALLOW_AGENT_RESTART"
     printf 'evidence_dir=%s\n' "$RUN_DIR"
     printf 'config_origin=environment (no infra identifiers are embedded in this harness)\n'
   } > "$RUN_DIR/run-metadata.txt"
@@ -1827,6 +1961,7 @@ write_environment_facts() {
   printf 'relay_host=%s\n' "${RELAY_HOST:-PENDING (LIVE_M4EXIT_RELAY_HOST unset)}"
   printf 'enrollment_registered_shares=%s\n' "$(fact_get enrollment_registered_shares)"
   printf 'hydrated_sessions=%s\n' "$(fact_get hydration_loaded_sessions)"
+  printf 'hydration_restart_action=%s\n' "$(fact_get hydration_restart_action)"
   printf 'gateway_tunnel_online=%s\n' "$(fact_get gateway_tunnel_online)"
   printf 'relay_items_count=%s\n' "$(fact_get relay_items_count)"
   printf 'relay_asset_sha1=%s\n' "$(fact_get relay_asset_sha1)"
@@ -1889,6 +2024,9 @@ validate_case_config() {
       report_missing_any "gateway health access" "LIVE_M4EXIT_GATEWAY_HEALTH_URL=$GATEWAY_HEALTH_URL" "LIVE_M4EXIT_GATEWAY_SSH_HOST=$GATEWAY_SSH_HOST"
       report_missing_any "gateway metrics access" "LIVE_M4EXIT_GATEWAY_METRICS_URL=$GATEWAY_METRICS_URL" "LIVE_M4EXIT_GATEWAY_SSH_HOST=$GATEWAY_SSH_HOST"
       report_missing_any "agent log source" "LIVE_M4EXIT_AGENT_LOG_FILE=$AGENT_LOG_FILE" "LIVE_M4EXIT_AGENT_SSH_HOST=$AGENT_SSH_HOST"
+      if [[ "$ALLOW_AGENT_RESTART" == "1" ]]; then
+        report_missing LIVE_M4EXIT_AGENT_RESTART_COMMAND "$AGENT_RESTART_COMMAND" "restart command (required when LIVE_M4EXIT_ALLOW_AGENT_RESTART=1)"
+      fi
       ;;
     relay_content_integrity)
       report_missing LIVE_M4EXIT_CONTROL_BASE_URL "$CONTROL_BASE_URL" "control base URL"
@@ -1941,7 +2079,7 @@ run_dry_run() {
   printf 'gateway_ssh_host=%s\n' "${GATEWAY_SSH_HOST:-<unset>}"
   printf 'agent_admin_base_url=%s\n' "${AGENT_ADMIN_BASE_URL:-<unset>}"
   printf 'evidence_dir=%s\n' "$RUN_DIR"
-  printf 'allow_lockdown=%s allow_revoke=%s\n' "$ALLOW_LOCKDOWN" "$ALLOW_REVOKE"
+  printf 'allow_agent_restart=%s allow_lockdown=%s allow_revoke=%s\n' "$ALLOW_AGENT_RESTART" "$ALLOW_LOCKDOWN" "$ALLOW_REVOKE"
 
   MISSING_COUNT=0
   local i name
@@ -2041,8 +2179,81 @@ run_selftest() {
   got="$(verdict_for "PASS,SKIP,")";   selftest_check "verdict(SKIP is not a pass)" "$got" "PARTIAL" || failures=$(( failures + 1 ))
   got="$(verdict_for "PASS,MISSING,")"; selftest_check "verdict(unrun/missing)" "$got" "RED" || failures=$(( failures + 1 ))
 
+  # -------------------------------------------------------------------------
+  # Lockdown safety net: the EXIT/INT/TERM unlock trap must issue exactly one
+  # unlock attempt, clear the locked state, and never error under `set -u`.
+  # -------------------------------------------------------------------------
+  local unlock_calls=0 saved_lock_state="${M4EXIT_LOCK_STATE:-}"
+  M4EXIT_LOCK_STATE="$(mktemp "${TMPDIR:-/tmp}/m4exit-selftest-lock.XXXXXX")"
+  printf 'locked\n' > "$M4EXIT_LOCK_STATE"
+  agent_api() { unlock_calls=$(( unlock_calls + 1 )); AGENT_HTTP_CODE=200; return 0; }
+  m4exit_emergency_unlock
+  selftest_check "lockdown trap issues exactly one unlock attempt" "$unlock_calls" "1" || failures=$(( failures + 1 ))
+  selftest_check "lockdown trap clears the locked state on success" "$([[ -f "$M4EXIT_LOCK_STATE" ]] && printf present || printf cleared)" "cleared" || failures=$(( failures + 1 ))
+  # A second trap firing in the same shutdown (INT handler, then EXIT) must not
+  # unlock a second time once the state has been cleared.
+  m4exit_emergency_unlock
+  selftest_check "lockdown trap does not double-unlock" "$unlock_calls" "1" || failures=$(( failures + 1 ))
+  # No unlock attempt when the agent was never marked locked.
+  M4EXIT_LOCK_STATE="$(mktemp "${TMPDIR:-/tmp}/m4exit-selftest-lock.XXXXXX")"; rm -f "$M4EXIT_LOCK_STATE"
+  m4exit_emergency_unlock
+  selftest_check "lockdown trap is a no-op when not locked" "$unlock_calls" "1" || failures=$(( failures + 1 ))
+  rm -f "$M4EXIT_LOCK_STATE"
+  M4EXIT_LOCK_STATE="$saved_lock_state"
+
+  # The trap body reads the state defensively, so an unset global (the exact
+  # shape of the original `local`-scope bug) must not abort under `set -u`.
+  local u_rc=0 u_err=""
+  u_err="$( ( unset M4EXIT_LOCK_STATE; m4exit_emergency_unlock ) 2>&1 )" || u_rc=$?
+  selftest_check "lockdown trap is safe under set -u with the state global unset" "${u_rc}:${u_err}" "0:" || failures=$(( failures + 1 ))
+
+  # End-to-end proof of the REAL trap: run this script as a child with a stub
+  # `curl` first on PATH and the internal trigger, then assert the trap fired
+  # (conventional 128+signal status) and called the unlock endpoint exactly
+  # once for each of EXIT, INT and TERM.
+  local fake_bin trap_trigger child_rc child_seen fake_expected
+  fake_bin="$(mktemp -d "${TMPDIR:-/tmp}/m4exit-selftest-bin.XXXXXX")"
+  cat > "$fake_bin/curl" <<'FAKECURL'
+#!/usr/bin/env bash
+# Stub curl for the lockdown-trap selftest: count invocations and emit a 200.
+n=0
+[[ -f "$M4EXIT_FAKE_CURL_COUNT" ]] && n="$(cat "$M4EXIT_FAKE_CURL_COUNT")"
+printf '%s' "$(( ${n:-0} + 1 ))" > "$M4EXIT_FAKE_CURL_COUNT"
+out=""; hdr=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -D) hdr="$2"; shift 2 ;;
+    -X|-H|-u|--data|--max-time|-w) shift 2 ;;
+    --silent|--show-error|--head) shift ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$out" ]] && printf '{"locked":false}' > "$out"
+[[ -n "$hdr" ]] && printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n' > "$hdr"
+printf '200'
+FAKECURL
+  chmod +x "$fake_bin/curl"
+  for trap_trigger in exit int term; do
+    case "$trap_trigger" in
+      exit) fake_expected=7 ;;
+      int)  fake_expected=130 ;;
+      term) fake_expected=143 ;;
+    esac
+    printf '0' > "$fake_bin/count.$trap_trigger"
+    child_rc=0
+    ( PATH="$fake_bin:$PATH" M4EXIT_FAKE_CURL_COUNT="$fake_bin/count.$trap_trigger" \
+        M4EXIT_INTERNAL_TRAP_SELFTEST="$trap_trigger" \
+        M4EXIT_AGENT_ADMIN_BASE_URL="http://127.0.0.1:1" \
+        M4EXIT_AGENT_ADMIN_USER=selftest M4EXIT_AGENT_ADMIN_PASSWORD=selftest \
+        bash "$SCRIPT_SELF" ) >/dev/null 2>&1 || child_rc=$?
+    child_seen="$(cat "$fake_bin/count.$trap_trigger" 2>/dev/null || printf '0')"
+    selftest_check "real lockdown trap on $trap_trigger (rc=$child_rc, unlock attempts=$child_seen)" "$child_rc/$child_seen" "$fake_expected/1" || failures=$(( failures + 1 ))
+  done
+  rm -rf "$fake_bin"
+
   if [[ "$failures" -eq 0 ]]; then
-    printf 'SELFTEST RESULT: PASS (0 failures) — the case runner refuses PASS for unexecuted, note-only, skipped or crashing cases, and the sanitiser redacts secrets in console and evidence\n'
+    printf 'SELFTEST RESULT: PASS (0 failures) — the case runner refuses PASS for unexecuted, note-only, skipped or crashing cases, the sanitiser redacts secrets in console and evidence, and the lockdown EXIT/INT/TERM trap unlocks exactly once without aborting under set -u\n'
     exit 0
   fi
   printf 'SELFTEST RESULT: FAIL (%d assertions failed) — the harness plumbing is broken\n' "$failures"
@@ -2052,6 +2263,20 @@ run_selftest() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+# Internal selftest hook (never operator-facing): install the real lockdown
+# trap, mark the agent locked, then terminate via EXIT/INT/TERM so --selftest
+# can prove the safety net fires end-to-end with a stubbed curl on PATH.
+if [[ -n "${M4EXIT_INTERNAL_TRAP_SELFTEST:-}" ]]; then
+  m4exit_install_lockdown_trap
+  m4exit_mark_locked
+  case "$M4EXIT_INTERNAL_TRAP_SELFTEST" in
+    exit) exit 7 ;;
+    int)  kill -INT "$$"; sleep 5; exit 200 ;;
+    term) kill -TERM "$$"; sleep 5; exit 201 ;;
+    *) printf 'ERROR: unknown M4EXIT_INTERNAL_TRAP_SELFTEST=%s\n' "$M4EXIT_INTERNAL_TRAP_SELFTEST" >&2; exit 2 ;;
+  esac
+fi
 
 if [[ "$LIST_ONLY" -eq 1 ]]; then
   printf '%-38s %-9s %s\n' "CASE" "OWNER" "PURPOSE"
@@ -2071,6 +2296,7 @@ fi
 
 printf '=== ShareBridge Phase 4a M4-exit live relay e2e harness (task #15) ===\n'
 printf 'Evidence root: %s (the worktree is never written)\n' "$EVIDENCE_DIR"
+m4exit_install_lockdown_trap
 run_all_cases
 print_summary
 

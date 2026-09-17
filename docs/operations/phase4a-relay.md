@@ -757,18 +757,25 @@ verdict to the cases it ran. Every remote failure records the observed value and
 fails closed.
 
 **Safety.** Remote commands are read-only (`curl` GET / `prepare-route` POST,
-`ssh` journalctl/curl). The ONLY state-changing calls are the two explicitly
-opt-in actions, both reversible and agent-local (revoking a share never deletes
+`ssh` journalctl/curl). The ONLY state-changing calls are the three explicitly
+opt-in actions, all reversible and agent-local (revoking a share never deletes
 an Immich share):
 
 - `lockdown_withdrawal_and_recovery` requires `LIVE_M4EXIT_ALLOW_LOCKDOWN=1`.
 - `revocation_midstream` requires `LIVE_M4EXIT_ALLOW_REVOKE=1` **and**
   `LIVE_M4EXIT_REVOKE_SHARE_CODE`.
+- `enrollment_hydration_restart` restarts the agent only when
+  `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` (and `LIVE_M4EXIT_AGENT_RESTART_COMMAND`
+  is set); without the flag it never restarts anything.
 
-Both appear as `destructive=yes` in the per-case evidence and in
-`run-metadata.txt`; without the flag the case SKIPs. The lockdown case installs
-an `EXIT` trap that re-sends `POST /api/unlock` if the case is interrupted while
-locked.
+All three appear as `destructive=yes` in the per-case evidence and in
+`run-metadata.txt` while enabled; without the flag the case SKIPs or simply does
+not perform the action. The lockdown case's auto-unlock safety net is installed
+in the **main** process (`EXIT`/`INT`/`TERM`), not inside the case subshell
+(where a `local` flag was unreachable under `set -u`); the locked state is kept
+in a state file so a Ctrl-C, a `SIGTERM` to the harness PID, or any failing exit
+re-sends `POST /api/unlock`. `--selftest` proves the trap with a stubbed admin
+API and nothing live.
 
 Secrets are never printed or stored: every captured line and every `check()`
 detail passes through `sanitize()`, which redacts the configured admin password
@@ -781,10 +788,10 @@ the worktree.
 
 | Case | Proves | Needs |
 |---|---|---|
-| `enrollment_hydration_restart` | agent enrollment live; the registered share count equals the operator's declared count; a `loaded N sessions from store` restart-hydration line is present; per-share content resolves over the relay afterwards | agent admin URL + credential, `EXPECTED_SHARE_COUNT`, agent log source, gateway health/metrics |
+| `enrollment_hydration_restart` | agent enrollment live; the registered share count equals the operator's declared count; a `loaded N sessions from store` restart-hydration line is present; per-share content resolves over the relay afterwards. When no restart is observable the FAIL names the exact remedy (supply `LIVE_M4EXIT_AGENT_LOG_FILE`, or opt in to a restart with `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` + `LIVE_M4EXIT_AGENT_RESTART_COMMAND`); an opted-in restart never substitutes for the real line | agent admin URL + credential, `EXPECTED_SHARE_COUNT`, agent log source, gateway health/metrics |
 | `relay_content_integrity` | the full recipient path: interstitial → `prepare-route` `status=relay`, gallery `200`, `/items` `200` with the expected count, `/thumb/<id>` `200` image, full `/asset/<id>` `200` whose sha1 equals the manifest sha1 with the exact byte count, playback HEAD `200`, no-Range `200` full, ≥2 in-range `206` seeks byte-exact against the full body, plus the three documented `416` cases (suffix, multi-range, start≥total). `/asset/<id>` intentionally ignores Range — the harness asserts `200` there, never `206` | control base URL, relay gateway host, share code, item/asset/video ids, expected item count |
 | `stun_observe_and_rechallenge` | control `stun_total{match}>0` with `mismatch=0` and `timeout=0`; the `§10.2` proactive rechallenge cadence (4m + jitter[0,15s), tolerance configurable) measured from the `stun observation accepted` timestamps, with no delta exceeding the band and at least one on-cadence delta (extra restart-triggered acceptances are allowed) | control metrics access, STUN journal source |
-| `direct_path_or_failclosed` | either `status=direct` with a direct URL that serves (`200`), or a fail-closed relay fallback whose control-side agent record shows `direct_status=relay_fallback` and the expected `direct_status_reason`; FAILs when neither is observable | control base URL, share code, agent record file (for the relay case) |
+| `direct_path_or_failclosed` | either `status=direct` with a direct URL that serves (`200`), or a fail-closed relay fallback whose control-side agent record shows `direct_status=relay_fallback` and the expected `direct_status_reason`; FAILs when neither is observable. The FAIL for a missing record file names the file shape, how to obtain it, and the verdict for each observed combination | control base URL, share code, agent record file (for the relay case) |
 | `lockdown_withdrawal_and_recovery` (**opt-in**) | baseline healthy → lockdown → tunnel `online=0` within the bound + a frps `proxy closing` line + `prepare-route` `503` suppressed + a relay fetch yielding no content → unlock → tunnel online + `prepare-route` relay again within the bound, with the measured recovery seconds recorded | `ALLOW_LOCKDOWN=1`, agent admin, gateway metrics, frps journal |
 | `revocation_midstream` (**opt-in**) | a throttled in-flight `/asset` download revoked mid-transfer with `DELETE /api/shares/<code>` ends truncated (bytes < the full asset size) and the gateway journal shows `controlsync: revoked route closed established streams … streams=N` (`N ≥ 1`). Records the documented caveat that an Immich-mirrored share is re-registered by the Immich poll within ~1 minute | `ALLOW_REVOKE=1`, `REVOKE_SHARE_CODE`, agent admin, gateway journal |
 
@@ -812,6 +819,7 @@ is unset FAILs the affected case and is named in the diagnostic.
 | `LIVE_M4EXIT_FRPS_JOURNAL_FILE` or `LIVE_M4EXIT_FRPS_SSH_HOST` | — | case 5 |
 | `LIVE_M4EXIT_AGENT_LOG_FILE` or `LIVE_M4EXIT_AGENT_SSH_HOST` | — | case 1 hydration |
 | `LIVE_M4EXIT_EXPECTED_SHARE_COUNT` / `_HYDRATED_SESSIONS` | — / `1` | case 1 |
+| `LIVE_M4EXIT_ALLOW_AGENT_RESTART` / `_AGENT_RESTART_COMMAND` / `_AGENT_RESTART_WAIT_S` | `0` / — / `30` | case 1 opt-in restart (command required when enabled) |
 | `LIVE_M4EXIT_AGENT_RECORD_FILE` / `_EXPECTED_DIRECT_REASON` | — / `probe_failed` | case 4 relay fallback |
 | `LIVE_M4EXIT_ALLOW_LOCKDOWN` / `_RECOVERY_BOUND_S` / `_TUNNEL_OFFLINE_BOUND_S` | `0` / `120` / `30` | case 5 |
 | `LIVE_M4EXIT_ALLOW_REVOKE` / `_REVOKE_SHARE_CODE` / `_REVOKE_ASSET_ID` / `_REVOKE_ASSET_BYTES` / `_REVOKE_LIMIT_RATE` / `_REVOKE_DELAY_S` / `_REVOKE_TIMEOUT_S` / `_REVOKE_WAIT_REREGISTER_S` | `0` / — / — / — / `300k` / `4` / `120` / `0` | case 6 |
@@ -829,6 +837,11 @@ The relay content, STUN and direct scenarios depend on the `§11.3` sync wiring
 being live (`docs/operations/phase4a-test-vps-deploy.md`), and on a fresh-boot
 agent having requested its initial relay credential (fixed at `8c0cb07e`). Run
 `--dry-run` first: it names every missing input and exits 2 without touching
-anything. The lockdown and revocation cases change live state; leave the opt-in
-flags unset for a non-destructive pass, which yields PARTIAL (their SKIPs are
-reported, never hidden).
+anything. The lockdown and revocation cases change live state, and case 1
+restarts the agent only when explicitly opted in; leave the opt-in flags unset
+for a non-destructive pass, which yields PARTIAL (their SKIPs are reported, never
+hidden). For case 1, either point `LIVE_M4EXIT_AGENT_LOG_FILE` at a startup log
+that already contains `loaded N sessions from store`, or set
+`LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` with `LIVE_M4EXIT_AGENT_RESTART_COMMAND` (and
+`LIVE_M4EXIT_AGENT_SSH_HOST` when the agent is remote) so a fresh restart makes
+the line observable.

@@ -246,7 +246,9 @@ byte count/playback HEAD+200 full+≥2 byte-exact in-range `206` seeks + the thr
 jitter\[0,15s) cadence), `direct_path_or_failclosed` (direct serves, or fail-closed relay
 fallback with `direct_status=relay_fallback` + reason; never PASS when neither is
 observable), `lockdown_withdrawal_and_recovery` (**opt-in**), and `revocation_midstream`
-(**opt-in**).
+(**opt-in**). When the restart-hydration line cannot be observed, case 1 says exactly what to
+do; an explicit agent restart can be opted into with `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1` +
+`LIVE_M4EXIT_AGENT_RESTART_COMMAND` (or supply a startup log via `LIVE_M4EXIT_AGENT_LOG_FILE`).
 
 Config comes only from `LIVE_M4EXIT_*` env vars — `--help` documents every one and a missing
 required value is named in the diagnostic (never guessed). Exit codes match `§3.3`: `0`
@@ -254,8 +256,10 @@ GREEN, `1` RED (FAIL / MISSING), `2` usage or incomplete `--dry-run` config, `3`
 (a SKIP, or a dry run — nothing executed is never a pass). Same honesty contract: a case
 PASSes only with at least one measured PASS check; note-only, skipped and otherwise
 check-less cases never pass; check details are sanitised before console and evidence; the
-two state-changing cases are opt-in (`LIVE_M4EXIT_ALLOW_LOCKDOWN=1`,
-`LIVE_M4EXIT_ALLOW_REVOKE=1`) and flagged in the run metadata. Evidence defaults to
+three state-changing actions are opt-in (`LIVE_M4EXIT_ALLOW_LOCKDOWN=1`,
+`LIVE_M4EXIT_ALLOW_REVOKE=1`, case-1 `LIVE_M4EXIT_ALLOW_AGENT_RESTART=1`) and flagged in the
+run metadata. The lockdown case's unlock safety net is installed in the main process
+(EXIT/INT/TERM) and proved by `--selftest` with a stubbed admin API. Evidence defaults to
 `${TMPDIR:-/tmp}/sharebridge-m4exit-e2e` (a run never dirties the worktree).
 
 ## 4. Operations docs index
