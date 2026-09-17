@@ -199,7 +199,11 @@ credential). It needs `LIVE_PHASE4A_CONTROL_BASE_URL` and `LIVE_PHASE4A_SHARE_CO
 baseline/serving check, gateway metrics (`LIVE_PHASE4A_GATEWAY_METRICS_URL`, or
 `LIVE_PHASE4A_RELAY_HOST` + `LIVE_PHASE4A_GATEWAY_METRICS_ADDR`), and the restart targets
 (`LIVE_PHASE4A_FRPS_SSH_HOST`, default `LIVE_PHASE4A_RELAY_HOST`; `LIVE_PHASE4A_AGENT_SSH_HOST`
-optional; `LIVE_PHASE4A_FRPC_PID_MATCH`, default `frpc`). It restarts frps **only** under
+optional; `LIVE_PHASE4A_FRPC_PID_MATCH`, default `frpc`). Because the harness reads the
+gateway's loopback `/metrics` **over SSH to `LIVE_PHASE4A_RELAY_HOST` itself** whenever
+`LIVE_PHASE4A_GATEWAY_METRICS_URL` is unset, that variable must be **user-qualified** when the
+harness host has no default user for the machine (e.g. `root@10.0.0.5`, not a bare IP) — a bare
+IP makes the metrics read unobservable and fails the gate. It restarts frps **only** under
 `LIVE_PHASE4A_ALLOW_RESTART=1` (it never restarts the agent's child) and bounds the run with
 `LIVE_PHASE4A_RECOVERY_BOUND_S` (default 120) and `LIVE_PHASE4A_TUNNEL_OFFLINE_BOUND_S`
 (default 30). The full surface is `§13.2` of `docs/operations/phase4a-relay.md`.

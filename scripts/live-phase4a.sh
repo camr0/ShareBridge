@@ -79,7 +79,12 @@
 # are named in the diagnostic — never guessed). Values are paths/names, not
 # secrets; never put credentials in them.
 #   LIVE_PHASE4A_CONTROL_HOST          ssh target of the control VM (required)
-#   LIVE_PHASE4A_RELAY_HOST            ssh target of the NEW relay VM (required)
+#   LIVE_PHASE4A_RELAY_HOST            ssh target of the NEW relay VM (required).
+#                                      It is ALSO used DIRECTLY as an SSH target for the
+#                                      loopback /metrics read (when LIVE_PHASE4A_GATEWAY_METRICS_URL
+#                                      is unset), so it must be user-qualified whenever the harness
+#                                      host has no default user for that machine (e.g. root@10.0.0.5,
+#                                      not a bare IP).
 #   LIVE_PHASE4A_CONTROL_PUBLIC_HOST   optional public control host for probes
 #   LIVE_PHASE4A_CONTROL_PORT          control public port for agent-connection info (default 8080)
 #   LIVE_PHASE4A_RELAY_PUBLIC_IP       relay public IPv4 (required for firewall/DNS)
