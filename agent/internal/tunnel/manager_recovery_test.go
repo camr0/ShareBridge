@@ -24,8 +24,10 @@ import (
 // credential, and replaces the still-running child through the existing single
 // start funnel.
 
-// Real frpc v0.71.0 client output, captured from the checksum-pinned v0.71.0
-// binary against the live relay with a deliberately invalid credential. frpc
+// Real frpc v0.71.0 client output, captured from the DEPLOYED gitignored
+// build-context artifact agent/frpc
+// (sha256 f79fff8de3089ec711ff8bdd4b73e00dfe491a1c3d754983c8b0f8d58c21b068)
+// against the live relay with a deliberately invalid credential. frpc
 // wraps these lines in ANSI SGR colour codes even when stdout/stderr is a pipe,
 // which does not affect a substring match, so ansiWrap below covers the
 // coloured form. The fixtures are spelled as literals here on purpose: the tests

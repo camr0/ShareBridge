@@ -84,17 +84,30 @@ const (
 // change from silently disabling recovery entirely.
 const (
 	// frpcReconnectFailureLine is the EXACT frpc v0.71.0 CLIENT-side text of a
-	// rejected reconnect Login, captured from the real checksum-pinned v0.71.0
-	// client binary (sha256 3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48)
-	// by running it against the live relay with a deliberately invalid
-	// credential. frpc's own format string is "connect to server error: %v"
-	// (client/service.go:323), the relay plugin's "request rejected" refusal
-	// reason reaches that %v, and frpc logs one such line per failed Login
-	// attempt on the reconnect path. NOTE: "register control error" is the frps
-	// SERVER-side wording (it does not occur in the client binary) — keying on
-	// it made the previous detection inert. This is the single canonical
+	// rejected reconnect Login, captured by running the DEPLOYED client against
+	// the live relay with a deliberately invalid credential. The binary actually
+	// probed is this deployment's gitignored build-context artifact agent/frpc
+	// (sha256 f79fff8de3089ec711ff8bdd4b73e00dfe491a1c3d754983c8b0f8d58c21b068,
+	// verified against the container's /app/frpc). The text is CLIENT-source-
+	// derived (not build-specific), so it should hold for ANY v0.71.0 frpc
+	// build; the earlier attribution to
+	// 3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48 was wrong
+	// for this deployment — that hash is the RELAY-side release binary cited in
+	// relay/frp/GATE-EVIDENCE.md. frpc's own format string is "connect to server
+	// error: %v" (client/service.go:323), the relay plugin's "request rejected"
+	// refusal reason reaches that %v, and frpc logs one such line per failed
+	// Login attempt on the reconnect path. NOTE: "register control error" is the
+	// frps SERVER-side wording (it does not occur in the client binary) — keying
+	// on it made the previous detection inert. This is the single canonical
 	// spelling of the pinned phrase; it MUST be re-captured and regression-tested
 	// against a live rejected reconnect on ANY FRP upgrade.
+	//
+	// Supply-chain note: agent/frpc is a gitignored build-context artifact (see
+	// .gitignore) that the Dockerfile copies into the image WITHOUT verifying
+	// it. CI verifies the pinned tarball digest before staging it
+	// (.github/workflows/agent-container.yml:97-116), so a CI-staged binary is
+	// verified; a LOCALLY-staged binary (as used for local/test builds) has no
+	// such check and is therefore UNVERIFIED.
 	frpcReconnectFailureLine = "connect to server error: request rejected"
 	// frpcConnectionErrorPrefix is the invariant part of frpc's failed-Login
 	// report; the %v it wraps differs by cause, so this prefix alone is NOT a
