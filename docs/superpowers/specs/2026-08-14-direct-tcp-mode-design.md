@@ -241,6 +241,43 @@ Failure of the UPnP spike does not block the overall direction (relay remains th
 - DNS: Cloudflare (registrar Porkbun, DNS managed on Cloudflare). ACME DNS-01 via lego's built-in Cloudflare provider; DDNS A-record updates via `github.com/cloudflare/cloudflare-go`; TTL 60s.
 - Service naming: relay path is `sharebridge-relay` (components `sharebridge-relay-gateway` for L4 SNI routing + `sharebridge-relay-frps` for the tunnel); control plane is `sharebridge-control` (accounts + direct-mode negotiation + share lifecycle).
 
+### 14.1 Recorded limitation (2026-09-17): direct mode requires host-level cooperation
+
+Phase-4a live acceptance exposed a deployment constraint the design above did not account for.
+The §14 bullet "Reachability via UPnP/NAT-PMP/PCP automatic port mapping — no manual router
+configuration, ever" holds for the **router**, but not for the **agent host**. Three conditions
+must all be true for direct mode, and the product controls none of them:
+
+1. **The agent container must use `network_mode: host`.** With bridge networking, UPnP/NAT-PMP
+discovery targets the Docker bridge instead of the LAN router (so no mapping is ever created),
+and a router port-forward to the host cannot reach the container (Docker's NAT cannot publish a
+port chosen at runtime). Consequence: compose `-p` mappings are irrelevant in host mode and
+insufficient in bridge mode — **bridge networking ⇒ relay-only**.
+2. **The host firewall must allow the mapped port.** The container shares the host's network
+namespace but cannot manage the host firewall, and neither Docker nor compose can either. The
+router's PnP forward lands on a host port that `firewalld`/`ufw`/`nft` drops unless an operator
+explicitly opens it. Observed live: NAT-PMP granted external port 49152 and the agent reported its
+endpoint successfully, yet control's probe failed (`direct_status_reason=probe_failed`) **solely**
+because the host firewall rejected the inbound connection. The product behaved correctly
+(fail-closed to relay) but nothing in the product creates — or even mentions — the required rule.
+3. **The router must support UPnP/NAT-PMP, or be manually forwarded.** A meaningful share of the
+self-hosting audience deliberately disables UPnP as a security risk, and CGNAT makes mapping
+impossible regardless.
+
+Aggravating factor: the agent picks its external port dynamically from the whole IANA range
+(`firstFreePort`, `agent/internal/direct/portmap.go` — 49152–65535, hard-coded), so "open the
+firewall for the agent" currently means opening 16,384 ports. A narrow, configurable range and/or
+an operator-declared preferred port is a prerequisite for any host-firewall guidance.
+
+**Consequence recorded: relay is the default and the optimization target; direct is best-effort
+and requires an opted-in host.** Relay needs nothing inbound — no port, no UPnP, no firewall rule —
+and works behind CGNAT and double NAT. Measured on the live test deployment, relay delivered
+~20 MB/s (~160 Mbps) end-to-end with zero configuration, versus direct's best-case ~130–278 Mbps
+that varies with the recipient's peering. If direct is pursued later it must be (a) explicitly
+opt-in, (b) documented with its host-networking/firewall/UPnP prerequisites per platform, and
+(c) diagnosed explicitly — a distinct "mapping succeeded but the mapped port is unreachable; check
+the host firewall" reason rather than a generic `probe_failed`.
+
 ## 15. Open Questions
 
 1. Select and register the content domain (`sharebridgeusercontent.com` is the working name but not yet purchased — FRP §27.1); add it to Cloudflare once bought.

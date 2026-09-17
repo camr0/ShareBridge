@@ -379,6 +379,15 @@ audits, and the per-task reviews. Dispositions: **must-fix-before-M6**, **should
 | `api_key_id` (non-secret, logged by production control) appears in captured journal evidence | Live session | note-only | The sanitiser redacts share codes/passwords/keys but not agent identifiers; extend only if operator-shareable evidence must be identifier-free. |
 | Two of fifteen registered Immich shares have dead share keys | Live session | note-only | Test-data issue (`Invalid share key`), not a product defect. |
 
+### 6.1 Known product limitations (not code defects)
+
+These are product/deployment constraints, deliberately recorded so they are not rediscovered as
+bugs. They are not fixable by hardening the current code alone.
+
+| Limitation | Recorded in | Effect / disposition |
+|---|---|---|
+| **Direct mode requires host-level cooperation.** The agent container must use `network_mode: host` (bridge networking breaks UPnP discovery and the inbound path); the **host firewall** must allow the mapped port — a container cannot manage the host firewall and neither can Docker or compose; and the router must support UPnP/NAT-PMP or be manually forwarded. The agent's external port is chosen from the hard-coded IANA range 49152–65535, so "open the firewall for the agent" currently means opening 16,384 ports. | `docs/superpowers/specs/2026-08-14-direct-tcp-mode-design.md` §14.1 | **Best-effort, opt-in only.** Relay is the default and the optimization target: it needs nothing inbound (no port, no UPnP, no firewall rule) and works behind CGNAT and double NAT. Live-measured relay ≈ 20 MB/s with zero configuration. Any future direct work must be opt-in, documented per platform, and diagnosed explicitly (a distinct "mapped port unreachable — check the host firewall" reason, not a generic `probe_failed`). |
+
 ## 7. Current state at HEAD
 
 **Landed:** M1–M5 complete, plus the M4 closeout batches, the M5 remediation rounds
