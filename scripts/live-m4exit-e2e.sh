@@ -212,10 +212,19 @@
 #      a startup log that contains the line, or use the opt-in restart vars below)
 #
 #   Control-side diagnostics (case 4)
-#     LIVE_M4EXIT_AGENT_RECORD_FILE     operator-supplied agent record with direct_status/direct_status_reason (required for a relay fallback)
-#     LIVE_M4EXIT_AGENT_RECORD_AGENT_ID the agent identifier (api_key_id or record id) under test; the record must carry it (REQUIRED when the record file is used)
+#     LIVE_M4EXIT_AGENT_RECORD_FILE     operator-supplied agent record with direct_status/direct_status_reason (required for a relay fallback when no command is set)
+#     LIVE_M4EXIT_AGENT_RECORD_COMMAND  shell command whose STDOUT is the live agent record; the harness runs it AFTER the case's prepare-route, so a fresh record can postdate that request (preferred over the static file when both are set)
+#     LIVE_M4EXIT_AGENT_RECORD_AGENT_ID the agent identifier (api_key_id or record id) under test; the record must carry it (REQUIRED whenever a record source is used)
 #     LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S  clock-skew tolerance for "updated after the request" (default 10)
 #     LIVE_M4EXIT_EXPECTED_DIRECT_REASON  expected direct_status_reason for the fail-closed fallback (default probe_failed)
+#       Record shape (from the control PocketBase 'agents' collection for the agent
+#       under test, as JSON or key=value text): direct_status,
+#       direct_status_reason, an api_key_id (or the record id) and a timestamp in
+#       updated / stun_observed_at / relay_last_seen_at ("YYYY-MM-DD HH:MM:SS").
+#       A record whose newest timestamp is older than the prepare-route request
+#       (minus the tolerance) is refused as stale, and one naming a different
+#       agent is refused as a mismatch — supply the record for THIS agent, fetched
+#       after the request.
 #
 #   Opt-in state-changing cases
 #     LIVE_M4EXIT_TARGET_CONFIRM        REQUIRED for every case that changes state: set it to the EXACT control base URL of the disposable test stack (it must equal LIVE_M4EXIT_CONTROL_BASE_URL). Typing the target asserts that this is a disposable test deployment, not production or the M6 dark topology, before any lockdown/revoke/restart.
@@ -340,6 +349,7 @@ AGENT_RESTART_COMMAND="${LIVE_M4EXIT_AGENT_RESTART_COMMAND:-}"
 AGENT_RESTART_WAIT_S="${LIVE_M4EXIT_AGENT_RESTART_WAIT_S:-30}"
 
 AGENT_RECORD_FILE="${LIVE_M4EXIT_AGENT_RECORD_FILE:-}"
+AGENT_RECORD_COMMAND="${LIVE_M4EXIT_AGENT_RECORD_COMMAND:-}"
 AGENT_RECORD_AGENT_ID="${LIVE_M4EXIT_AGENT_RECORD_AGENT_ID:-}"
 AGENT_RECORD_FRESHNESS_TOLERANCE_S="${LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S:-10}"
 EXPECTED_DIRECT_REASON="${LIVE_M4EXIT_EXPECTED_DIRECT_REASON:-probe_failed}"
@@ -919,6 +929,29 @@ tunnel_recovery_verdict() {
   if [[ ! "$rbefore" =~ ^[0-9]+$ || ! "$rafter" =~ ^[0-9]+$ || "$rafter" -le "$rbefore" ]]; then printf 'no-session'; return 0; fi
   if [[ "$content" != "1" ]]; then printf 'no-content'; return 0; fi
   printf 'ok'
+}
+
+# lockdown_withdrawal_verdict <http-code> <body-bytes> <body-matches-baseline 0|1>
+# Prints withdrawn | leaked | served | unreadable. A pure predicate so the live
+# case and --selftest share one definition of "the locked relay URL no longer
+# serves content".
+#
+# The REAL property is: while locked, a previously-issued relay URL must not
+# serve its content. A curl transport failure reports http=000 but can still
+# leave a small TLS-level teardown artifact in the body (observed live: 30
+# bytes, curl exit 35, TLS handshake refused), so the check must NOT require
+# exactly zero bytes. It requires (a) no HTTP success (status not 2xx) and
+# (b) the body NOT to equal the serving baseline, so the TLS artifact is
+# tolerated while any served baseline content fails. Any response carrying the
+# baseline body is a leak regardless of status. An unparseable byte count or
+# baseline flag fails closed (unreadable).
+lockdown_withdrawal_verdict() {
+  local code="${1:-000}" bytes="$2" matches="$3"
+  if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then printf 'unreadable'; return 0; fi
+  if [[ "$matches" != "0" && "$matches" != "1" ]]; then printf 'unreadable'; return 0; fi
+  if [[ "$matches" == "1" ]]; then printf 'leaked'; return 0; fi
+  if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then printf 'served'; return 0; fi
+  printf 'withdrawn'
 }
 
 remote_journal() {
@@ -1792,6 +1825,24 @@ print("status=ok")
 ' "$1" "$2" "$3" "$4"
 }
 
+# direct_record_fetch_live <command> <destination-file>
+# Runs an operator-supplied command whose STDOUT is the live control-side agent
+# record (PocketBase collection 'agents', as JSON or key=value text — the same
+# shape record_field/direct_record_current accept: direct_status,
+# direct_status_reason, an api_key_id (or record id) and an updated/
+# stun_observed_at/relay_last_seen_at timestamp) and writes it to destination.
+# Prints ok | failed | empty | write-failed. It is run AFTER the case's
+# prepare-route so the record it returns can postdate the request floor. Any
+# unusable result refuses; the caller must not fall back to a stale artifact.
+direct_record_fetch_live() {
+  local cmd="$1" dest="$2" out rc
+  out="$(sh -c "$cmd" 2>/dev/null)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then printf 'failed'; return 0; fi
+  if [[ -z "$out" ]]; then printf 'empty'; return 0; fi
+  if ! printf '%s' "$out" > "$dest" 2>/dev/null; then printf 'write-failed'; return 0; fi
+  printf 'ok'
+}
+
 direct_path_or_failclosed() {
   require_config \
     "LIVE_M4EXIT_CONTROL_BASE_URL=${CONTROL_BASE_URL}|control base URL for prepare-route" \
@@ -1826,12 +1877,32 @@ direct_path_or_failclosed() {
       ;;
     relay)
       check direct_path_observable PASS "prepare-route -> 200 status=relay (fail-closed fallback)"
+      # Live-fetch path: when an operator supplies LIVE_M4EXIT_AGENT_RECORD_COMMAND
+      # it is run HERE (after the prepare-route above) and its stdout is the
+      # record under test, so the freshness requirement is satisfiable without
+      # hand-exporting a transient record. It takes precedence over a static
+      # LIVE_M4EXIT_AGENT_RECORD_FILE when both are set.
+      if [[ -n "$AGENT_RECORD_COMMAND" ]]; then
+        local live_record_file="$M4EXIT_SCRATCH_DIR/agent-record-live" fetch_status
+        fetch_status="$(direct_record_fetch_live "$AGENT_RECORD_COMMAND" "$live_record_file")"
+        if [[ "$fetch_status" != "ok" ]]; then
+          check direct_failclosed_diagnostics FAIL "LIVE_M4EXIT_AGENT_RECORD_COMMAND did not produce a usable live record (${fetch_status}); expected its stdout to be the control agent record (PocketBase 'agents') for this agent, fetched AFTER the prepare-route call"
+          check direct_failclosed_current FAIL "not evaluated: live record fetch ${fetch_status}"
+          check direct_status_relay_fallback FAIL "not evaluated: live record fetch ${fetch_status}"
+          check direct_status_reason FAIL "not evaluated: live record fetch ${fetch_status}"
+          return 0
+        fi
+        AGENT_RECORD_FILE="$live_record_file"
+        note direct_record_source "live fetch via LIVE_M4EXIT_AGENT_RECORD_COMMAND (run after prepare-route)"
+      elif [[ -n "$AGENT_RECORD_FILE" ]]; then
+        note direct_record_source "operator-supplied LIVE_M4EXIT_AGENT_RECORD_FILE (must already be current for this request)"
+      fi
       if [[ -z "$AGENT_RECORD_FILE" ]]; then
-        check direct_failclosed_diagnostics FAIL "prepare-route reported the fail-closed relay fallback but LIVE_M4EXIT_AGENT_RECORD_FILE is unset, so the control-side direct diagnostics cannot be verified. Expected file: the control agents record for this agent (PocketBase collection 'agents'), saved as JSON or key=value text containing direct_status, direct_status_reason and an updated timestamp. Obtain it from the control admin UI (Collections -> agents -> the agent row -> copy/export) or via the control API IMMEDIATELY AFTER the prepare-route call, so its `updated` stamp postdates the request. Verdicts: the record must also carry the agent id given in LIVE_M4EXIT_AGENT_RECORD_AGENT_ID and an updated >= the request floor (else direct_failclosed_current FAILs); then direct_status=relay_fallback AND direct_status_reason=<LIVE_M4EXIT_EXPECTED_DIRECT_REASON, default probe_failed> => PASS; a different direct_status, reason, stale timestamp or foreign agent id => FAIL; and this file is not needed when prepare-route returns status=direct (that is judged by direct_route_serves instead)"
+        check direct_failclosed_diagnostics FAIL "prepare-route reported the fail-closed relay fallback but neither LIVE_M4EXIT_AGENT_RECORD_COMMAND (live fetch, preferred) nor LIVE_M4EXIT_AGENT_RECORD_FILE (operator-supplied static record) is set, so the control-side direct diagnostics cannot be verified. Expected record shape: JSON or key=value text from the control agents record (PocketBase collection 'agents') containing direct_status, direct_status_reason, an api_key_id (or the record id) and an updated/stun_observed_at/relay_last_seen_at timestamp. With the command, its stdout is written to a temp file and validated after the prepare-route above so the timestamp can postdate the request; with the file, the operator must export it IMMEDIATELY AFTER the prepare-route call. Verdicts: the record must carry the agent id given in LIVE_M4EXIT_AGENT_RECORD_AGENT_ID and an updated >= the request floor minus LIVE_M4EXIT_AGENT_RECORD_FRESHNESS_TOLERANCE_S (else direct_failclosed_current FAILs); then direct_status=relay_fallback AND direct_status_reason=<LIVE_M4EXIT_EXPECTED_DIRECT_REASON, default probe_failed> => PASS; a different direct_status, reason, stale timestamp or foreign agent id => FAIL; and neither is needed when prepare-route returns status=direct (that is judged by direct_route_serves instead)"
         return 0
       fi
       if [[ ! -r "$AGENT_RECORD_FILE" ]]; then
-        check direct_failclosed_diagnostics FAIL "LIVE_M4EXIT_AGENT_RECORD_FILE=${AGENT_RECORD_FILE} is not readable"
+        check direct_failclosed_diagnostics FAIL "the agent record source is not readable (LIVE_M4EXIT_AGENT_RECORD_FILE=${AGENT_RECORD_FILE:-<unset>})"
         return 0
       fi
       if [[ -z "$AGENT_RECORD_AGENT_ID" ]]; then
@@ -1931,7 +2002,7 @@ lockdown_withdrawal_and_recovery() {
   # (1) Baseline healthy: relay route + tunnel online + the relay URL SERVES.
   # Without a serving baseline the post-lock "no content" result proves
   # nothing, so a broken baseline refuses the state change outright.
-  local baseline_url="" baseline_bytes=0
+  local baseline_url="" baseline_bytes=0 baseline_body_file=""
   if ! prepare_relay_or_fail "$SHARE_CODE" lockdown_baseline; then
     check lockdown_baseline_serves FAIL "not evaluated: no baseline relay URL was issued (prepare-route failed) — refusing to lock down without a serving baseline"
     return 0
@@ -1940,6 +2011,11 @@ lockdown_withdrawal_and_recovery() {
   http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$baseline_url"
   [[ -f "$HTTP_BODY_FILE" ]] && baseline_bytes="$(file_bytes "$HTTP_BODY_FILE")"
   if [[ "$HTTP_CODE" == "200" && "${baseline_bytes:-0}" -gt 0 ]]; then
+    # Preserve the SERVING baseline body: the withdrawal check compares the
+    # post-lock body against it, and HTTP_BODY_FILE is overwritten by the next
+    # fetch.
+    baseline_body_file="$M4EXIT_SCRATCH_DIR/lockdown-baseline-body"
+    cp "$HTTP_BODY_FILE" "$baseline_body_file"
     check lockdown_baseline_serves PASS "pre-lockdown relay URL serves: 200 with ${baseline_bytes} bytes (baseline for the withdrawal comparison)"
   else
     check lockdown_baseline_serves FAIL "pre-lockdown relay URL -> ${HTTP_CODE:-000} with ${baseline_bytes:-0} bytes (want 200 with content) — an already-broken URL cannot prove withdrawal; refusing to lock down ${HTTP_ERR:-}"
@@ -2028,18 +2104,31 @@ lockdown_withdrawal_and_recovery() {
     check lockdown_prepare_suppressed FAIL "prepare-route while locked -> ${PREPARE_HTTP_CODE:-000} status='${PREPARE_STATUS:-<none>}' (want 503 suppressed)"
   fi
 
-  # (7) A fetch of the previously-issued relay URL yields no content.
+  # (7) A fetch of the previously-issued relay URL yields no content. The REAL
+  # property is asserted by lockdown_withdrawal_verdict: no HTTP success AND no
+  # serving-baseline body (a small TLS-level teardown artifact is tolerated —
+  # the pre-fix byte-exact-zero requirement false-REDded on it).
   if [[ -n "$baseline_url" ]]; then
     http_fetch ${RELAY_TLS_ARGS[@]+"${RELAY_TLS_ARGS[@]}"} "$baseline_url"
-    local bytes=0
-    [[ -f "$HTTP_BODY_FILE" ]] && bytes="$(file_bytes "$HTTP_BODY_FILE")"
-    if [[ "$HTTP_CODE" != "200" && "$bytes" -eq 0 ]]; then
-      check lockdown_relay_withdrawn PASS "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes, a change from the ${baseline_bytes}-byte serving baseline (no content served)"
-    elif [[ "$HTTP_CODE" != "200" ]]; then
-      check lockdown_relay_withdrawn FAIL "relay fetch while locked -> ${HTTP_CODE:-000} but ${bytes} bytes were served"
-    else
-      check lockdown_relay_withdrawn FAIL "relay fetch while locked -> 200 with ${bytes} bytes — content leaked while locked"
+    local bytes=0 matches=0
+    if [[ -f "$HTTP_BODY_FILE" ]]; then
+      bytes="$(file_bytes "$HTTP_BODY_FILE")"
+      if [[ -n "$baseline_body_file" && -r "$baseline_body_file" ]] && cmp -s "$HTTP_BODY_FILE" "$baseline_body_file"; then
+        matches=1
+      fi
     fi
+    local withdrawal_verdict
+    withdrawal_verdict="$(lockdown_withdrawal_verdict "${HTTP_CODE:-000}" "$bytes" "$matches")"
+    case "$withdrawal_verdict" in
+      withdrawn)
+        check lockdown_relay_withdrawn PASS "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes, no ${baseline_bytes}-byte baseline content served (a small TLS-level teardown artifact is tolerated)" ;;
+      leaked)
+        check lockdown_relay_withdrawn FAIL "relay fetch while locked served the ${baseline_bytes}-byte baseline body (http ${HTTP_CODE:-000}, ${bytes} bytes) — content leaked while locked" ;;
+      served)
+        check lockdown_relay_withdrawn FAIL "relay fetch while locked -> ${HTTP_CODE:-000} with ${bytes} bytes: an HTTP success while locked (want non-2xx/absent)" ;;
+      *)
+        check lockdown_relay_withdrawn FAIL "relay fetch while locked was not evaluable (http='${HTTP_CODE:-}' bytes='${bytes}' matches='${matches}') — failing closed" ;;
+    esac
   else
     check lockdown_relay_withdrawn FAIL "not evaluated: no baseline relay URL was issued"
   fi
@@ -3018,6 +3107,18 @@ run_selftest() {
   got="$(tunnel_recovery_verdict 1 old new 5 5 1)";   selftest_check "recovery verdict refuses an unchanged session counter" "$got" "no-session" || failures=$(( failures + 1 ))
   got="$(tunnel_recovery_verdict 1 old new 5 6 0)";   selftest_check "recovery verdict refuses a non-serving relay" "$got" "no-content" || failures=$(( failures + 1 ))
   got="$(tunnel_recovery_verdict 1 old new 5 6 1)";   selftest_check "recovery verdict accepts a full automatic recovery" "$got" "ok" || failures=$(( failures + 1 ))
+
+  # -------------------------------------------------------------------------
+  # BLOCKING 4: lockdown withdrawal predicate (TLS-artifact tolerance).
+  # -------------------------------------------------------------------------
+  got="$(lockdown_withdrawal_verdict 000 30 0)";   selftest_check "withdrawal accepts a 000 TLS artifact (body != baseline)" "$got" "withdrawn" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 0 0)";    selftest_check "withdrawal accepts a clean 000 no-content result" "$got" "withdrawn" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 503 0 0)";    selftest_check "withdrawal accepts a non-2xx status with no baseline body" "$got" "withdrawn" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 200 4096 1)"; selftest_check "withdrawal rejects a 200 serving the baseline body" "$got" "leaked" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 4096 1)"; selftest_check "withdrawal rejects the baseline body even at http 000" "$got" "leaked" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 200 512 0)";  selftest_check "withdrawal rejects any 2xx while locked" "$got" "served" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 not-a-number 0)"; selftest_check "withdrawal fails closed on an unparseable byte count" "$got" "unreadable" || failures=$(( failures + 1 ))
+  got="$(lockdown_withdrawal_verdict 000 30 bogus)"; selftest_check "withdrawal fails closed on an unknown baseline flag" "$got" "unreadable" || failures=$(( failures + 1 ))
   local saved_allow_frps="$ALLOW_FRPS_RESTART"
   ALLOW_FRPS_RESTART=0
   got="$(case_is_destructive tunnel_recovery_frps_restart)/$(case_opt_in_flag tunnel_recovery_frps_restart)"
@@ -3063,6 +3164,27 @@ run_selftest() {
   printf '{"api_key_id":"agent-2","updated":"%s"}' "$rec_now" > "$rec_dir/other.json"
   got="$(direct_record_current "$rec_dir/other.json" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
   selftest_check "record for a different agent is refused" "$got" "agent_mismatch" || failures=$(( failures + 1 ))
+
+  # -------------------------------------------------------------------------
+  # BLOCKING 5: live agent-record fetch makes the freshness requirement
+  # satisfiable (and still refuses what it cannot prove).
+  # -------------------------------------------------------------------------
+  local live_rec_file="$rec_dir/live.json" live_status
+  live_status="$(direct_record_fetch_live "printf '{\"api_key_id\":\"agent-1\",\"direct_status\":\"relay_fallback\",\"direct_status_reason\":\"probe_failed\",\"updated\":\"%s\"}' '$rec_now'" "$live_rec_file")"
+  selftest_check "live-record fetch accepts a command that prints the record" "$live_status" "ok" || failures=$(( failures + 1 ))
+  got="$(direct_record_current "$live_rec_file" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "a live-fetched fresh record passes the currency/correlation gate" "$got" "ok" || failures=$(( failures + 1 ))
+  live_status="$(direct_record_fetch_live "exit 3" "$live_rec_file")"
+  selftest_check "live-record fetch refuses a failing command" "$live_status" "failed" || failures=$(( failures + 1 ))
+  live_status="$(direct_record_fetch_live "true" "$live_rec_file")"
+  selftest_check "live-record fetch refuses empty output" "$live_status" "empty" || failures=$(( failures + 1 ))
+  live_status="$(direct_record_fetch_live "printf '{\"api_key_id\":\"agent-1\",\"updated\":\"2001-01-01 00:00:00\"}'" "$live_rec_file")"
+  selftest_check "a live-fetched record is still fetched ok" "$live_status" "ok" || failures=$(( failures + 1 ))
+  got="$(direct_record_current "$live_rec_file" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "a live-fetched STALE record is still refused" "$got" "stale" || failures=$(( failures + 1 ))
+  live_status="$(direct_record_fetch_live "printf '{\"api_key_id\":\"agent-2\",\"updated\":\"%s\"}' '$rec_now'" "$live_rec_file")"
+  got="$(direct_record_current "$live_rec_file" agent-1 "$rec_floor" 10 | sed -n 's/^status=//p')"
+  selftest_check "a live-fetched record for another agent is still refused" "$got" "agent_mismatch" || failures=$(( failures + 1 ))
   rm -rf "$rec_dir"
 
   # -------------------------------------------------------------------------
