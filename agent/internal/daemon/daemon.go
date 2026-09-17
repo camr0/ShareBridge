@@ -537,6 +537,20 @@ func (d *Daemon) stopTunnelManager() error {
 // daemon only on the authenticated current epoch; an absent manager (relay
 // supervision never enabled) drops it with a diagnostic.
 func (d *Daemon) applyRelayConfig(msg signaling.Message) {
+	// §13.4 fence: a relay_config that arrives while the daemon is locked must
+	// never arm or start the tunnel. Lockdown publishes the locked flag as its
+	// first action (under ds.mu), before any best-effort lever runs, so this
+	// check refuses every config delivered after the transition even while the
+	// asynchronous "stop tunnel manager" lever is still in flight. Without it a
+	// late reply could reach ApplyConfig ahead of that stop and briefly start
+	// frpc on a locked agent: the local binder/listener fences would keep it
+	// from serving, but "a locked agent cannot start a tunnel" must be
+	// literally true, not merely narrow. Fail closed, like every other
+	// post-lockdown signal; the credential itself is never logged.
+	if d.IsLocked() {
+		log.Printf("relay_config ignored: daemon is locked")
+		return
+	}
 	d.mu.RLock()
 	manager := d.tunnel
 	d.mu.RUnlock()
@@ -3400,8 +3414,22 @@ func (d *Daemon) requestRelayCredential() {
 // relay_config has been armed, HasArmedCredential reports true and every
 // subsequent enrollment_ready is a no-op, so a reconnect cannot spam control's
 // rate-limited relay_credential_request endpoint. It never runs while locked:
-// the only caller is handleEnrollmentReady's unlocked branch (§13.4).
+// not only is the only caller handleEnrollmentReady's unlocked branch, the
+// function re-checks IsLocked itself immediately before the send, because a
+// lockdown can complete in the window after that branch's snapshot (§13.4).
 func (d *Daemon) requestInitialRelayCredential() {
+	// §13.4: re-check the locked state immediately before the send. The only
+	// caller runs on handleEnrollmentReady's unlocked branch, but that branch
+	// snapshots the flag under ds.mu, releases the lock, and does public-IP
+	// work first, so a lockdown can complete inside the window. This check
+	// cannot be atomic with the asynchronous send (control answers later with a
+	// separate relay_config); the fence in applyRelayConfig is what makes a
+	// request that still escapes this window harmless, because the late reply
+	// is refused while locked and can neither arm nor start the tunnel.
+	if d.IsLocked() {
+		log.Printf("initial relay credential request suppressed: daemon is locked")
+		return
+	}
 	d.mu.RLock()
 	manager := d.tunnel
 	d.mu.RUnlock()
