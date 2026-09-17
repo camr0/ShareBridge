@@ -511,6 +511,11 @@ func (d *Daemon) startTunnelManager(ctx context.Context, options ...tunnel.Manag
 		log.Printf("relay tunnel supervision unavailable: %v", err)
 		return
 	}
+	// A freshly constructed manager defaults to permitted. Re-arm it explicitly
+	// from the daemon's current locked state: a (re)construction on an unlocked
+	// daemon (initial Start, or Unlock's post-lockdown rebuild) permits starts,
+	// while a construction that somehow observes the daemon locked stays fenced.
+	manager.SetStartPermitted(!d.IsLocked())
 	d.mu.Lock()
 	d.tunnel = manager
 	d.mu.Unlock()
@@ -2958,6 +2963,31 @@ func (d *Daemon) Lockdown() error {
 		return nil
 	}
 
+	// §7.4/§13.4 tunnel start fence: deny the tunnel manager any further child
+	// start SYNCHRONOUSLY at the transition start — before the locked flag is
+	// published below and long before the best-effort/asynchronous levers
+	// (including the "stop tunnel manager" lever). The check inside the manager
+	// and this flip are serialized on the manager's start mu, so when this
+	// returns any start already in flight has completed and every start that
+	// begins afterwards is denied. That is what makes "while the daemon is
+	// locked, no child is ever started" literally true: the pre-check in
+	// applyRelayConfig cannot observe a transition that lands after it, but the
+	// manager's fence is the authority at the moment of the start.
+	//
+	// The call is made outside ds.mu deliberately: SetStartPermitted takes only
+	// the manager's own start mutex and never calls back into the daemon, so it
+	// cannot invert the daemon's lock order, and holding ds.mu across it would
+	// block IsLocked (and every other ds reader) for the duration of an
+	// in-flight child spawn. Fencing before publication (rather than after)
+	// means an in-flight start completes BEFORE ds.locked is set, so no child
+	// can be started after the daemon is observably locked.
+	d.mu.RLock()
+	manager := d.tunnel
+	d.mu.RUnlock()
+	if manager != nil {
+		manager.SetStartPermitted(false)
+	}
+
 	ds.mu.Lock()
 	if ds.locked {
 		ds.mu.Unlock()
@@ -2993,12 +3023,6 @@ func (d *Daemon) Lockdown() error {
 	if gate != nil {
 		gate.SetLockdown(true)
 	}
-
-	// Snapshot the tunnel manager so a late stop lever can only stop the
-	// pre-lockdown manager, never a fresh one built by Unlock.
-	d.mu.RLock()
-	manager := d.tunnel
-	d.mu.RUnlock()
 
 	// 6. Report the advisory locked state; the generation is assigned here so
 	// a delayed report still loses to a later Unlock's higher generation.

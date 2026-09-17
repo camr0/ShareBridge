@@ -433,6 +433,30 @@ type Manager struct {
 	// permanently set (audit I4).
 	childLive atomic.Bool
 
+	// startMu serializes the start-permission decision with the child start it
+	// guards. SetStartPermitted takes the same mutex, so a permission flip
+	// either waits for an in-flight start to finish (and then applies to every
+	// later start) or is already visible to a start that has not yet acquired
+	// the mutex. It is held ONLY across the permission check, the child start
+	// call and the bookkeeping that publishes the started child — never across
+	// a graceful stop/kill, a credential wait, a status emission, or any other
+	// blocking wait.
+	startMu sync.Mutex
+	// startPermitted is the start-permission fence (§7.4/§13.4): false from
+	// the instant the daemon's Lockdown transition begins, until a legitimate
+	// re-arm (unlock, or a manager rebuilt on an unlocked daemon) sets it back.
+	// It is read under startMu for the authoritative decision, together with
+	// the isStopped() arm that covers shutdown; the atomic also lets the run
+	// goroutine take cheap early exits without the mutex. A fresh manager
+	// starts permitted so an unlocked daemon's first relay_config can start the
+	// tunnel.
+	startPermitted atomic.Bool
+	// applyGate is a test-only seam (withApplyGate): when non-nil the run
+	// goroutine calls it before handling a queued relay_config, so a test can
+	// pause the manager deterministically between the daemon's IsLocked()
+	// pre-check and the manager's processing of the config.
+	applyGate func()
+
 	// State below is owned by the run goroutine.
 	armedConfig    Config
 	hasArmedConfig bool
@@ -560,6 +584,19 @@ func withRunningStabilityWindow(window time.Duration) ManagerOption {
 	return func(manager *Manager) { manager.runningStabilityWindow = window }
 }
 
+// WithApplyGate is the exported form of withApplyGate: a test-only seam. When
+// set, the supervision loop calls gate before handling a queued relay_config,
+// so a test can pause the manager deterministically between the daemon's
+// IsLocked() pre-check and the manager's processing of the config. Production
+// never sets it.
+func WithApplyGate(gate func()) ManagerOption {
+	return withApplyGate(gate)
+}
+
+func withApplyGate(gate func()) ManagerOption {
+	return func(manager *Manager) { manager.applyGate = gate }
+}
+
 // NewManager validates the fixed settings and starts the supervision loop.
 // The status callback is invoked from a dedicated emission worker (FIFO, one
 // report at a time) so a slow or blocking callback can neither reorder
@@ -596,6 +633,10 @@ func NewManager(settings Settings, requester CredentialRequester, onStatus func(
 		manager.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 	manager.publishedGeneration.Store(-1)
+	// A fresh manager is permitted to start: the daemon denies it only when it
+	// begins a lockdown transition. The shutdown arm of the same fence is the
+	// isStopped() check taken alongside this flag.
+	manager.startPermitted.Store(true)
 	go manager.emitLoop()
 	go manager.run()
 	return manager, nil
@@ -639,6 +680,25 @@ func (manager *Manager) ApplyConfig(config Config) error {
 // armed and must not be re-requested on every reconnect.
 func (manager *Manager) HasArmedCredential() bool {
 	return manager.credentialArmed.Load()
+}
+
+// SetStartPermitted arms or denies this manager's child-start permission. The
+// daemon calls it with false SYNCHRONOUSLY at the start of the §13.4 lockdown
+// transition (before publishing the locked flag and before any best-effort
+// lever), and with true on a legitimate re-arm (unlock, or a manager rebuilt
+// on an unlocked daemon).
+//
+// It takes startMu so the flip is serialized with the check-and-start it
+// governs: when it returns, any start already in flight has completed and
+// every start that BEGINS afterwards sees the new value. That is what makes
+// the §7.4/§13.4 invariant literally true — a locked (or stopped) agent never
+// starts or replaces a tunnel child, including from the armed-config retry
+// timer — without the daemon's pre-check having to observe the transition
+// (it cannot; a pre-check is not atomic with the start).
+func (manager *Manager) SetStartPermitted(permitted bool) {
+	manager.startMu.Lock()
+	manager.startPermitted.Store(permitted)
+	manager.startMu.Unlock()
 }
 
 // Stop shuts the tunnel down: the child is stopped gracefully and killed if
@@ -735,6 +795,24 @@ func (manager *Manager) run() {
 }
 
 func (manager *Manager) handleApplyConfig(config Config) {
+	// Test seam: pause before processing so a daemon-level test can land a
+	// lockdown transition between ApplyConfig's enqueue and this handling.
+	if manager.applyGate != nil {
+		manager.applyGate()
+	}
+	// §7.4/§13.4 start-permission fence (early arm guard): a config that was
+	// queued before a lockdown transition (or before Stop) must neither arm
+	// nor start the tunnel. The authoritative fence is still evaluated
+	// atomically with the start in startChildFenced; this early check keeps a
+	// fenced manager from even writing the credential-bearing config to disk
+	// after the transition. It reads the atomic without startMu: a flip racing
+	// this check can only let the config be armed, and the start is still
+	// denied under startMu.
+	if !manager.startPermitted.Load() || manager.isStopped() {
+		manager.emit(manager.currentGeneration, StatusError,
+			"relay_config ignored: tunnel start permission withdrawn")
+		return
+	}
 	if manager.hasArmedConfig {
 		switch {
 		case config.Generation < manager.currentGeneration:
@@ -785,6 +863,14 @@ func (manager *Manager) handleApplyConfig(config Config) {
 // the retry re-renders the armed config, so a persistent failure backs off
 // instead of hot-looping.
 func (manager *Manager) applyArmedConfigOrScheduleRetry() {
+	// A retry that fires after the start-permission fence was withdrawn (or
+	// after Stop) must not re-apply the armed config, must not stop a healthy
+	// child, and must not start one. The authoritative fence is taken
+	// atomically with the start; this early check avoids mutating the on-disk
+	// config or the child at all.
+	if !manager.startPermitted.Load() || manager.isStopped() {
+		return
+	}
 	if err := manager.writeArmedConfig(); err != nil {
 		manager.armedApplyPending = true
 		manager.restartAttempt++
@@ -846,7 +932,13 @@ func (manager *Manager) handleTimerFired() {
 }
 
 // startChildNow starts the armed configuration if it has not been consumed;
-// a consumed credential must first be refreshed (§15.2).
+// a consumed credential must first be refreshed (§15.2). It is the single
+// funnel through which EVERY child start passes — the event-loop apply path
+// (handleApplyConfig), the timerStartChild backoff retry, the
+// timerApplyArmedConfig armed-config retry, and the child != nil
+// higher-generation replacement — so fencing its actual start fences all of
+// them. The start itself is performed by startChildFenced, which consults the
+// fence atomically with the start.
 func (manager *Manager) startChildNow() {
 	if manager.child != nil || !manager.hasArmedConfig {
 		return
@@ -860,9 +952,29 @@ func (manager *Manager) startChildNow() {
 		manager.scheduleTimer(timerStartChild, manager.backoffDelayForAttempt())
 		return
 	}
+	manager.startChildFenced()
+}
+
+// startChildFenced performs the child start behind the start-permission fence.
+// The permission read and the start call happen under startMu, which
+// SetStartPermitted also takes, so a flip that lands while a start is in
+// flight waits for that start to finish, and every start that begins after
+// the flip observes the new value. The mutex is never held across a graceful
+// stop/kill or any other blocking wait. A refused start schedules nothing:
+// the manager is either stopped or fenced, and a retry would only repeat the
+// refusal.
+func (manager *Manager) startChildFenced() {
 	arguments := []string{"-c", manager.settings.ConfigPath}
+	manager.startMu.Lock()
+	if !manager.startPermitted.Load() || manager.isStopped() {
+		manager.startMu.Unlock()
+		manager.emit(manager.currentGeneration, StatusError,
+			"frpc start denied: tunnel start permission withdrawn")
+		return
+	}
 	child, err := manager.startChild(context.Background(), manager.settings.FRPCBinaryPath, arguments)
 	if err != nil {
+		manager.startMu.Unlock()
 		manager.emit(manager.currentGeneration, StatusError, fmt.Sprintf("frpc start failed: %v", err))
 		manager.restartAttempt++
 		manager.scheduleTimer(timerStartChild, manager.backoffDelayForAttempt())
@@ -876,6 +988,7 @@ func (manager *Manager) startChildNow() {
 	exited := make(chan struct{})
 	manager.childExited = exited
 	manager.childLive.Store(true)
+	manager.startMu.Unlock()
 	manager.emit(manager.currentGeneration, StatusStarting, "frpc started")
 	go manager.watchChild(child, exited)
 	if manager.runningStabilityWindow > 0 {

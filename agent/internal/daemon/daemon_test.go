@@ -1304,10 +1304,10 @@ type lockdownFixture struct {
 	relayOrigin string
 }
 
-func newLockdownFixture(t *testing.T) *lockdownFixture {
+func newLockdownFixture(t *testing.T, extra ...tunnel.ManagerOption) *lockdownFixture {
 	t.Helper()
 	rec := &recordingDirectMapper{ip: "203.0.113.7"}
-	return newLockdownFixtureWithPortMapper(t, rec, rec)
+	return newLockdownFixtureWithPortMapper(t, rec, rec, extra...)
 }
 
 // blockingCloseMapper stalls DeletePortMapping until release. The OnDemandPort
@@ -1332,7 +1332,7 @@ func (m *blockingCloseMapper) DeletePortMapping(ext int) error {
 // caller substitute the OnDemandPort's PortMapper (rec still backs fx.mapper
 // and its delete accounting). Used by the bounded fan-out test to stall the
 // mapping-close lever.
-func newLockdownFixtureWithPortMapper(t *testing.T, rec *recordingDirectMapper, portMapper direct.PortMapper) *lockdownFixture {
+func newLockdownFixtureWithPortMapper(t *testing.T, rec *recordingDirectMapper, portMapper direct.PortMapper, extra ...tunnel.ManagerOption) *lockdownFixture {
 	t.Helper()
 	cfg := tunnelTestConfig(t)
 	st := newMockStore()
@@ -1361,7 +1361,7 @@ func newLockdownFixtureWithPortMapper(t *testing.T, rec *recordingDirectMapper, 
 	ds.server.SetResolver(stubResolver{})
 	t.Cleanup(func() { _ = port.Close() })
 
-	starter := startTunnelForTest(t, d)
+	starter := startTunnelForTest(t, d, extra...)
 
 	const code = "LOCKDOWN1"
 	origin := testOriginFor("sblockdwn1")

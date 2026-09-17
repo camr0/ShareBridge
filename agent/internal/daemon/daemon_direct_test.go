@@ -2141,17 +2141,20 @@ func relayConfigMessage(t *testing.T, generation int, credential string) signali
 // process starter and fast timing knobs, then returns the starter for
 // assertions. The daemon must own the manager exactly as production Start
 // does (requester wired to the signaling client, status callback wired to
-// relay_client_state telemetry).
-func startTunnelForTest(t *testing.T, d *Daemon) *recordingTunnelStarter {
+// relay_client_state telemetry). extra options are appended for tests that
+// need an additional seam (e.g. WithApplyGate).
+func startTunnelForTest(t *testing.T, d *Daemon, extra ...tunnel.ManagerOption) *recordingTunnelStarter {
 	t.Helper()
 	starter := &recordingTunnelStarter{stopsOnGraceful: true}
-	d.startTunnelManager(context.Background(),
+	options := []tunnel.ManagerOption{
 		tunnel.WithProcessStarter(starter.start),
 		tunnel.WithBackoffBase(time.Millisecond),
-		tunnel.WithKillGracePeriod(20*time.Millisecond),
+		tunnel.WithKillGracePeriod(20 * time.Millisecond),
 		tunnel.WithCredentialWaitTimeout(time.Hour),
 		tunnel.WithRunningStabilityWindow(time.Hour),
-	)
+	}
+	options = append(options, extra...)
+	d.startTunnelManager(context.Background(), options...)
 	if d.tunnel == nil {
 		t.Fatalf("tunnel manager must be constructed when tunnel settings are configured")
 	}
