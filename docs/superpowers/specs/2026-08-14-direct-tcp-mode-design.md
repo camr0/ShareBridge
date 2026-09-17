@@ -269,14 +269,17 @@ Aggravating factor: the agent picks its external port dynamically from the whole
 firewall for the agent" currently means opening 16,384 ports. A narrow, configurable range and/or
 an operator-declared preferred port is a prerequisite for any host-firewall guidance.
 
-**Consequence recorded: relay is the default and the optimization target; direct is best-effort
-and requires an opted-in host.** Relay needs nothing inbound — no port, no UPnP, no firewall rule —
-and works behind CGNAT and double NAT. Measured on the live test deployment, relay delivered
-~20 MB/s (~160 Mbps) end-to-end with zero configuration, versus direct's best-case ~130–278 Mbps
-that varies with the recipient's peering. If direct is pursued later it must be (a) explicitly
-opt-in, (b) documented with its host-networking/firewall/UPnP prerequisites per platform, and
-(c) diagnosed explicitly — a distinct "mapping succeeded but the mapped port is unreachable; check
-the host firewall" reason rather than a generic `probe_failed`.
+**Consequence for product direction (OPEN — this is a recorded trade-off, not a decision).** Relay
+needs nothing inbound — no port, no UPnP, no firewall rule — and works behind CGNAT and double NAT.
+Measured on the live test deployment, relay delivered ~20 MB/s (~160 Mbps) end-to-end with zero
+configuration, versus direct's best-case ~130–278 Mbps that varies with the recipient's peering
+(and in congested cross-carrier cases direct measured *slower* than a well-peered relay). So relay
+is the robust zero-config floor and direct is a conditional fast path, but whether the product
+should commit to relay-first (and treat direct as opt-in best-effort) or keep investing in direct
+is an open decision to be made on evidence — see §15. If direct is pursued it must be (a)
+explicitly opt-in, (b) documented with its host-networking/firewall/UPnP prerequisites per
+platform, and (c) diagnosed explicitly — a distinct "mapping succeeded but the mapped port is
+unreachable; check the host firewall" reason rather than a generic `probe_failed`.
 
 ## 15. Open Questions
 
