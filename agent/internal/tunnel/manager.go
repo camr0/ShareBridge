@@ -131,10 +131,13 @@ const (
 	// attempts (jittered 1s base, doubling, capped at 20s — client/service.go:355-361),
 	// so three consecutive failures span several backoff steps and cannot be one
 	// transient blip (e.g. a brief frps restart), while recovery still completes
-	// well inside the ten-minute credential lifetime. The trade-off is that
-	// sustained transport failures (a long frps outage) also reach the threshold
-	// and request a credential; the primary pair is unaffected and a single
-	// downtime line never trips the net.
+	// well inside the ten-minute credential lifetime. A failed-Login line whose
+	// cause is TRANSPORT-ONLY (the relay was never reached: refused/timeout/DNS/
+	// TLS, see frpcTransportFailurePhrases) does NOT count toward the threshold,
+	// so a sustained frps outage never discards a freshly minted credential or
+	// consumes control's per-agent token burst; an unknown-wording REJECTION
+	// still counts, which is the safety net's whole purpose. The primary pair is
+	// unaffected.
 	frpcConsecutiveConnectionErrorThreshold = 3
 
 	// maxChildOutputLineLength bounds one retained child output line, so a
@@ -168,6 +171,42 @@ func isRetryAttemptLine(line string) bool {
 	return strings.Contains(line, frpcRetryAttemptLine)
 }
 
+// frpcTransportFailurePhrases are the substrings frpc v0.71 wraps in its
+// "connect to server error:" line when the RELAY WAS NEVER REACHED: the
+// failure happened at the transport layer (dial/DNS/TLS) before any Login was
+// presented, so it cannot be a burned or rejected credential. They are
+// external-binary strings; RE-CHECK THIS LIST ON ANY FRP UPGRADE (a reworded
+// transport error that is not recognised here would count toward the
+// consecutive-failure safety net and could still request a credential during
+// an outage — the conservative direction, but avoidable churn). Keep every
+// phrase specific to a transport cause: do NOT add a bare "connect" or
+// "error", and do not add rejection wording here.
+var frpcTransportFailurePhrases = []string{
+	"connection refused",
+	"i/o timeout",
+	"no such host",
+	"connection reset",
+	"network is unreachable",
+	"no route to host",
+	"tls: handshake failure",
+	"tls: failed to verify certificate",
+	"x509: certificate",
+	"remote error: tls",
+}
+
+// isTransportFailureLine reports whether a failed-Login line names a
+// TRANSPORT-only cause, i.e. the relay was not reached. Such a line is not a
+// credential rejection and must not count toward the safety net. It is also
+// not progress, so the caller leaves the consecutive run untouched.
+func isTransportFailureLine(line string) bool {
+	for _, phrase := range frpcTransportFailurePhrases {
+		if strings.Contains(line, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // reconnectFailureDetector decides when one child's captured output should
 // drive credential-refresh recovery. It is owned by that child's output watcher
 // goroutine, so a replacement child starts with a FRESH detector: the
@@ -194,6 +233,12 @@ func (detector *reconnectFailureDetector) observe(line string) bool {
 		// The rejection is definitive: recover now and end the run.
 		detector.consecutiveConnectionErrors = 0
 		return true
+	case isTransportFailureLine(line):
+		// The relay was never reached (refused/timeout/DNS/TLS): this is not a
+		// rejection, so it must not consume the credential budget during a
+		// sustained outage. It is also not progress, so a run of genuine
+		// rejections is left intact rather than reset.
+		return false
 	case isConnectionErrorLine(line):
 		detector.consecutiveConnectionErrors++
 		return detector.consecutiveConnectionErrors >= frpcConsecutiveConnectionErrorThreshold

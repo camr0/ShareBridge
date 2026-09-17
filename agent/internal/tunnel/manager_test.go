@@ -178,14 +178,41 @@ type fakeCredentialRequester struct {
 	requests     int
 	reasons      []CredentialRequestReason
 	requestError error
+	// requested is signalled (non-blocking, buffered) on every request so a
+	// negative test can react to the request EVENT instead of polling a
+	// wall-clock window for the absence of one.
+	requested chan struct{}
 }
 
 func (requester *fakeCredentialRequester) RequestCredential(ctx context.Context, reason CredentialRequestReason) error {
 	requester.mu.Lock()
-	defer requester.mu.Unlock()
 	requester.requests++
 	requester.reasons = append(requester.reasons, reason)
-	return requester.requestError
+	err := requester.requestError
+	if requester.requested == nil {
+		requester.requested = make(chan struct{}, 64)
+	}
+	ch := requester.requested
+	requester.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	return err
+}
+
+// requestSignal returns the channel that receives one token per credential
+// request, creating it on first use. Tests wait on it so a negative assertion
+// is driven by the request event rather than by a fixed observation sleep.
+func (requester *fakeCredentialRequester) requestSignal() <-chan struct{} {
+	requester.mu.Lock()
+	defer requester.mu.Unlock()
+	if requester.requested == nil {
+		requester.requested = make(chan struct{}, 64)
+	}
+	return requester.requested
 }
 
 func (requester *fakeCredentialRequester) requestCount() int {
@@ -335,6 +362,19 @@ func assertConditionStays(t *testing.T, description string, observeWindow time.D
 			t.Fatalf("condition violated while observing %s", description)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// assertNoCredentialRequest fails as soon as the requester signals a request,
+// and otherwise returns after the bounded wait. The wait only guards against a
+// request arriving after the caller's other observations; the assertion itself
+// is event-driven and does not poll.
+func assertNoCredentialRequest(t *testing.T, requester *fakeCredentialRequester, bound time.Duration, description string) {
+	t.Helper()
+	select {
+	case <-requester.requestSignal():
+		t.Fatalf("unexpected credential request while observing %s", description)
+	case <-time.After(bound):
 	}
 }
 

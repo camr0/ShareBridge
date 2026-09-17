@@ -189,6 +189,106 @@ func TestReconnectFailureDetectorCountBasedSafetyNet(t *testing.T) {
 	})
 }
 
+// realFRPCTransportOutageLines are real-shaped frps-DOWNTIME failed-Login
+// lines: the same frpc prefix with a TRANSPORT-only cause and no rejection
+// marker. They are spelled as literals here so the test fails if the pinned
+// production phrase list drifts away from the causes it must ignore.
+var realFRPCTransportOutageLines = []string{
+	"connect to server error: dial tcp 203.0.113.7:7000: connect: connection refused",
+	"connect to server error: dial tcp 203.0.113.7:7000: i/o timeout",
+	"connect to server error: dial tcp: lookup relay.example: no such host",
+	"connect to server error: read tcp 10.0.0.2:51000->203.0.113.7:7000: read: connection reset by peer",
+	"connect to server error: dial tcp 203.0.113.7:7000: connect: network is unreachable",
+	"connect to server error: dial tcp 203.0.113.7:7000: connect: no route to host",
+	"connect to server error: remote error: tls: handshake failure",
+}
+
+// TestReconnectFailureDetectorSustainedOutageNeverTripsTheNet is the budget
+// guard: a sustained frps outage produces a long run of transport-only
+// failed-Login lines. None of them means the relay was REACHED, so none may
+// count toward the consecutive-failure safety net — otherwise a plain outage
+// would discard freshly minted credentials and consume control's per-agent
+// token burst, pushing recovery out to the 30s retry.
+func TestReconnectFailureDetectorSustainedOutageNeverTripsTheNet(t *testing.T) {
+	detector := &reconnectFailureDetector{}
+	for attempt := 1; attempt <= 20; attempt++ {
+		detector.observe(realFRPCRetryAttemptLine)
+		line := realFRPCTransportOutageLines[(attempt-1)%len(realFRPCTransportOutageLines)]
+		if detector.observe(line) {
+			t.Fatalf("transport-only outage line %d (%q) tripped the credential net; a plain outage must not request a credential", attempt, line)
+		}
+	}
+	if detector.consecutiveConnectionErrors != 0 {
+		t.Fatalf("transport-only failures left the consecutive count at %d, want 0", detector.consecutiveConnectionErrors)
+	}
+}
+
+// TestReconnectFailureDetectorUnknownWordingStillTripsDespiteTransportNoise is
+// the safety net's whole purpose: a future FRP rewording of the rejection text
+// must still trigger recovery, and transport-only noise must neither count nor
+// reset a run of unknown-wording rejections (a flapping relay must not mask a
+// burned credential).
+func TestReconnectFailureDetectorUnknownWordingStillTripsDespiteTransportNoise(t *testing.T) {
+	detector := &reconnectFailureDetector{}
+	for attempt := 1; attempt <= frpcConsecutiveConnectionErrorThreshold; attempt++ {
+		// The relay was reached for the rejection, then briefly unreachable:
+		// the transport line must not mask the rejection count.
+		detector.observe(realFRPCConnectionRefusedLine)
+		trigger := detector.observe(realFRPCRewordedRejectionLine)
+		wantTrigger := attempt == frpcConsecutiveConnectionErrorThreshold
+		if trigger != wantTrigger {
+			t.Fatalf("attempt %d trigger = %v, want %v (transport noise must not mask an unknown-wording rejection)", attempt, trigger, wantTrigger)
+		}
+	}
+}
+
+// TestReconnectFailureDetectorBenignProgressResetsTheRun pins the reset arm for
+// the transport-aware detector: any unrelated benign line still ends the
+// consecutive-failure run, so a recovered child is never mistaken for a
+// sustained outage.
+func TestReconnectFailureDetectorBenignProgressResetsTheRun(t *testing.T) {
+	detector := &reconnectFailureDetector{}
+	for attempt := 1; attempt < frpcConsecutiveConnectionErrorThreshold; attempt++ {
+		detector.observe(realFRPCRewordedRejectionLine)
+	}
+	// A successful Login is progress and must reset the run.
+	if detector.observe("login to server success, get run id [run-1]") {
+		t.Fatal("a successful login must not itself trigger recovery")
+	}
+	if detector.consecutiveConnectionErrors != 0 {
+		t.Fatalf("benign progress left the consecutive count at %d, want 0", detector.consecutiveConnectionErrors)
+	}
+	for attempt := 1; attempt < frpcConsecutiveConnectionErrorThreshold; attempt++ {
+		if detector.observe(realFRPCRewordedRejectionLine) {
+			t.Fatalf("post-progress attempt %d tripped below the threshold (benign line did not reset)", attempt)
+		}
+	}
+}
+
+// TestIsTransportFailureLineRecognisesDowntimeCauses pins the transport-cause
+// list against real-shaped downtime lines and guards the other direction: a
+// reworded REJECTION must not be classified as a transport failure (it is the
+// safety net's trigger), and a successful login is neither.
+func TestIsTransportFailureLineRecognisesDowntimeCauses(t *testing.T) {
+	for _, line := range realFRPCTransportOutageLines {
+		if !isTransportFailureLine(line) {
+			t.Errorf("isTransportFailureLine(%q) = false, want true (a sustained outage must not count toward the safety net)", line)
+		}
+	}
+	notTransport := []string{
+		realFRPCRewordedRejectionLine,
+		realFRPCReconnectFailureLine,
+		realFRPCRetryAttemptLine,
+		"login to server success, get run id [abc]",
+		"",
+	}
+	for _, line := range notTransport {
+		if isTransportFailureLine(line) {
+			t.Errorf("isTransportFailureLine(%q) = true, want false (a rejection must still count)", line)
+		}
+	}
+}
+
 // TestReconnectRecoveryMatchesANSIColouredRejection proves the real captured
 // line still drives recovery when frpc wraps it in ANSI colour codes (which it
 // does even when piped).
@@ -210,12 +310,13 @@ func TestReconnectRecoveryMatchesANSIColouredRejection(t *testing.T) {
 	}
 }
 
-// TestReconnectRecoveryIgnoresFRPSDowntimeConnectionRefused is the explicit
-// negative: during frps downtime frpc prints the same failed-Login prefix with
-// a transport error and no rejection marker. That is not a burned credential,
-// so a single such line must NOT request one or stop the child; only the
-// bounded consecutive-failure net can ever act on sustained downtime.
-func TestReconnectRecoveryIgnoresFRPSDowntimeConnectionRefused(t *testing.T) {
+// TestReconnectRecoveryIgnoresSustainedFRPSDowntime is the explicit negative:
+// during a sustained frps outage frpc prints the same failed-Login prefix with
+// transport errors and no rejection marker, many more times than the safety-net
+// threshold. That is not a burned credential, so the run must NOT request one
+// or stop the child — proving the transport-cause exclusion, not just "below
+// the threshold".
+func TestReconnectRecoveryIgnoresSustainedFRPSDowntime(t *testing.T) {
 	settings := testManagerSettings(t)
 	starter := &recordingStarter{stopsOnGraceful: true}
 	requester := &fakeCredentialRequester{}
@@ -224,13 +325,20 @@ func TestReconnectRecoveryIgnoresFRPSDowntimeConnectionRefused(t *testing.T) {
 
 	generationOne := recoveryGenerationOne()
 	child := startRecoveryChild(t, manager, starter, generationOne)
+	// Arm the request-event channel before any output is emitted so a request
+	// cannot be missed between emission and assertion.
+	_ = requester.requestSignal()
 
-	// Exactly what a dropped frps produces while it restarts: the benign
-	// pre-attempt line followed by one connection-refused report.
-	child.emitOutputLine(realFRPCRetryAttemptLine)
-	child.emitOutputLine(realFRPCConnectionRefusedLine)
+	// Exactly what a sustained frps outage produces: the benign pre-attempt
+	// line followed by more refused reports than the safety-net threshold (and
+	// more than enough for the unpatched fallback to request a credential).
+	for attempt := 1; attempt <= frpcConsecutiveConnectionErrorThreshold+3; attempt++ {
+		child.emitOutputLine(realFRPCRetryAttemptLine)
+		child.emitOutputLine(realFRPCConnectionRefusedLine)
+	}
 
-	assertConditionStays(t, "an frps-downtime line never requests a credential", 300*time.Millisecond, func() bool {
+	assertNoCredentialRequest(t, requester, 300*time.Millisecond, "a sustained frps outage")
+	assertConditionStays(t, "a sustained outage never stops or replaces the child", 200*time.Millisecond, func() bool {
 		return requester.requestCount() == 0 &&
 			starter.startCount() == 1 &&
 			child.gracefulStopCount() == 0
