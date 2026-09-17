@@ -4,7 +4,7 @@
 #
 # This is the SIBLING of scripts/live-phase4a.sh (the M6 acceptance harness). It
 # encodes the verified sequence of the 2026-09-17 live run against a deployed
-# test stack (OVH control/relay box + a home agent behind a NAT) so the same
+# test stack (a control/relay host plus a home agent behind a NAT) so the same
 # scenarios can be re-run repeatably. It does not replace the M6 harness and it
 # does not target the M6 dark separate-VM topology.
 #
@@ -104,7 +104,7 @@
 #     LIVE_M4EXIT_MIN_RANGE_REQUESTS    minimum in-range 206 seeks to prove (default 2)
 #     LIVE_M4EXIT_RELAY_INSECURE_TLS    1 disables relay TLS verification (default 0)
 #
-#   Agent admin API (cases 1,5,6; the live run used 127.0.0.1:7879)
+#   Agent admin API (cases 1,5,6; typically a loopback admin URL)
 #     LIVE_M4EXIT_AGENT_ADMIN_BASE_URL  agent admin base URL (required: cases 1,5,6)
 #     LIVE_M4EXIT_AGENT_ADMIN_USER      agent admin Basic-auth user (required: cases 1,5,6)
 #     LIVE_M4EXIT_AGENT_ADMIN_PASSWORD  agent admin Basic-auth password (required: cases 1,5,6; never logged)
