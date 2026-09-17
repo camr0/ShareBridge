@@ -472,10 +472,15 @@ transport.tls.certFile = "${REMOTE_DIR}/relay-transport/frps.crt"
 transport.tls.keyFile = "${REMOTE_DIR}/relay-transport/frps.key"
 
 # Mandatory fail-closed authorization + presence plugin: the collocated
-# gateway's loopback endpoint (relay/internal/frpplugin).
+# gateway's loopback endpoint (relay/internal/frpplugin). The addr is
+# HOST-ONLY exactly like the hermetic gate fixture (relay/internal/frptest
+# gate_fixture_test.go: pluginAddr has no path; path is configured
+# separately): frps v0.71 treats addr as a base URL and appends the path
+# itself, so a path in addr doubles to /frp/authorize/frp/authorize and the
+# plugin rejects every op generically.
 [[httpPlugins]]
 name = "sharebridge-authorize-presence"
-addr = "http://${PLUGIN_USER}:${SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET}@${PLUGIN_LISTEN}${PLUGIN_API_PATH}"
+addr = "http://${PLUGIN_USER}:${SHAREBRIDGE_FRP_PLUGIN_SHARED_SECRET}@${PLUGIN_LISTEN}"
 path = "${PLUGIN_API_PATH}"
 ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewUserConn"]
 EOF
