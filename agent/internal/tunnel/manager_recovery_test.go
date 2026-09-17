@@ -24,11 +24,41 @@ import (
 // credential, and replaces the still-running child through the existing single
 // start funnel.
 
-// realFRPCReconnectFailureLine is the EXACT line frpc v0.71.0 prints (with
-// detailedErrorsToClient=false) when a reconnect Login is rejected. It is
-// spelled as a literal here on purpose: the test must fail if the pinned
-// production substring drifts, so it cannot reuse the production constant.
-const realFRPCReconnectFailureLine = "connect to server error: register control error"
+// Real frpc v0.71.0 client output, captured from the checksum-pinned v0.71.0
+// binary against the live relay with a deliberately invalid credential. frpc
+// wraps these lines in ANSI SGR colour codes even when stdout/stderr is a pipe,
+// which does not affect a substring match, so ansiWrap below covers the
+// coloured form. The fixtures are spelled as literals here on purpose: the tests
+// must fail if the pinned production substrings drift, so they cannot reuse the
+// production constants.
+const (
+	// realFRPCReconnectFailureLine is the EXACT captured client line on the
+	// reconnect/retry path (frpc logs one per failed Login attempt).
+	realFRPCReconnectFailureLine = "connect to server error: request rejected"
+	// realFRPCFirstLoginFailureLine is the captured first-login form
+	// (loginFailExit=true). frpc logs it immediately before the child EXITS, so
+	// the exit path — not output detection — owns that recovery, and it must not
+	// be mistaken for a reconnect rejection.
+	realFRPCFirstLoginFailureLine = "login to the server failed: request rejected. With loginFailExit enabled, no additional retries will be attempted"
+	// realFRPCRewordedRejectionLine is a HYPOTHETICAL future wording for the same
+	// plugin rejection: the failed-Login prefix is unchanged but the rejection
+	// text differs, so only the count-based safety net can recover. It exercises
+	// graceful degradation on an FRP wording change.
+	realFRPCRewordedRejectionLine = "connect to server error: login rejected by relay plugin"
+	// realFRPCConnectionRefusedLine is a real frps-DOWNTIME line: the same
+	// prefix with a transport error and no rejection marker. It must not, on its
+	// own, request a credential.
+	realFRPCConnectionRefusedLine = "connect to server error: dial tcp 203.0.113.7:7000: connect: connection refused"
+	// realFRPCRetryAttemptLine is the benign line frpc logs before every
+	// attempt (client/service.go:312).
+	realFRPCRetryAttemptLine = "try to connect to server..."
+)
+
+// ansiWrap reproduces the ANSI SGR colour codes frpc v0.71 emits around its log
+// lines even when its output is piped.
+func ansiWrap(line string) string {
+	return "\x1b[1;33m" + line + "\x1b[0m"
+}
 
 // newRecoveryManager builds a manager with the fast knobs the recovery tests
 // need, plus any extra options (later options win). The manager is armed the
@@ -74,18 +104,27 @@ func startRecoveryChild(t *testing.T, manager *Manager, starter *recordingStarte
 	return starter.recordAt(0).child
 }
 
-// TestFRPCReconnectFailureLineMatchesPinnedV071Output pins the one detection
-// string in the package: the literal above MUST be recognised, and lines that
-// are merely nearby (the raw frps rejection, a truncated prefix) must NOT be,
-// so the recovery cannot be triggered by unrelated log traffic.
+// TestFRPCReconnectFailureLineMatchesPinnedV071Output pins the matcher against
+// the REAL captured v0.71.0 client bytes: the exact reconnect line and its
+// ANSI-coloured form MUST be recognised, while the frps server-side wording,
+// the first-login exit line, a plain connection-refused (frps downtime) line
+// and a reworded rejection MUST NOT match the primary pair, so recovery cannot
+// be triggered by unrelated log traffic.
 func TestFRPCReconnectFailureLineMatchesPinnedV071Output(t *testing.T) {
+	// The one pinned spelling must be exactly the real captured client text and
+	// must agree with the prefix/marker pair the matcher actually uses.
 	if frpcReconnectFailureLine != realFRPCReconnectFailureLine {
-		t.Fatalf("pinned reconnect-failure substring = %q, want the v0.71 literal %q",
+		t.Fatalf("pinned reconnect-failure substring = %q, want the real v0.71 client text %q",
 			frpcReconnectFailureLine, realFRPCReconnectFailureLine)
 	}
+	if want := frpcConnectionErrorPrefix + " " + frpcRejectionMarker; frpcReconnectFailureLine != want {
+		t.Fatalf("pinned literal %q disagrees with the matcher pair %q", frpcReconnectFailureLine, want)
+	}
+
 	matching := []string{
 		realFRPCReconnectFailureLine,
-		"2026/09/03 15:25:11 [E] [control.go:123] " + realFRPCReconnectFailureLine,
+		"2026/09/03 15:25:11 [W] [client/service.go:323] " + realFRPCReconnectFailureLine,
+		ansiWrap(realFRPCReconnectFailureLine),
 		realFRPCReconnectFailureLine + ": context deadline exceeded",
 	}
 	for _, line := range matching {
@@ -95,16 +134,149 @@ func TestFRPCReconnectFailureLineMatchesPinnedV071Output(t *testing.T) {
 	}
 	nonMatching := []string{
 		"",
-		"register control error",
-		"connect to server error",
-		"login to server success",
-		"connect to server error: request rejected",
+		"register control error", // the frps SERVER-side wording: never on the client
+		realFRPCFirstLoginFailureLine,
+		realFRPCConnectionRefusedLine,
+		realFRPCRewordedRejectionLine, // only the count-based safety net may catch this
+		"connect to server error:",
+		realFRPCRetryAttemptLine,
+		"login to server success, get run id [abc]",
 	}
 	for _, line := range nonMatching {
 		if isReconnectFailureLine(line) {
 			t.Errorf("isReconnectFailureLine(%q) = true, want false", line)
 		}
 	}
+}
+
+// TestReconnectFailureDetectorCountBasedSafetyNet pins the bounded fallback:
+// three consecutive failed-Login lines with a CHANGED rejection wording trigger
+// a refresh, frpc's interleaved pre-attempt line does not break the run, and a
+// progress line (a successful login) resets it.
+func TestReconnectFailureDetectorCountBasedSafetyNet(t *testing.T) {
+	t.Run("reworded rejection trips after the threshold", func(t *testing.T) {
+		detector := &reconnectFailureDetector{}
+		for attempt := 1; attempt <= frpcConsecutiveConnectionErrorThreshold; attempt++ {
+			detector.observe(realFRPCRetryAttemptLine)
+			trigger := detector.observe(realFRPCRewordedRejectionLine)
+			wantTrigger := attempt == frpcConsecutiveConnectionErrorThreshold
+			if trigger != wantTrigger {
+				t.Fatalf("attempt %d trigger = %v, want %v", attempt, trigger, wantTrigger)
+			}
+		}
+	})
+
+	t.Run("successful login resets the run", func(t *testing.T) {
+		detector := &reconnectFailureDetector{}
+		for attempt := 1; attempt < frpcConsecutiveConnectionErrorThreshold; attempt++ {
+			detector.observe(realFRPCRetryAttemptLine)
+			if detector.observe(realFRPCRewordedRejectionLine) {
+				t.Fatalf("attempt %d triggered below the threshold", attempt)
+			}
+		}
+		// A successful Login is progress and must reset the run.
+		if detector.observe("login to server success, get run id [run-1]") {
+			t.Fatal("a successful login must not itself trigger recovery")
+		}
+		for attempt := 1; attempt < frpcConsecutiveConnectionErrorThreshold; attempt++ {
+			detector.observe(realFRPCRetryAttemptLine)
+			if detector.observe(realFRPCRewordedRejectionLine) {
+				t.Fatalf("post-reset attempt %d triggered below the threshold", attempt)
+			}
+		}
+	})
+}
+
+// TestReconnectRecoveryMatchesANSIColouredRejection proves the real captured
+// line still drives recovery when frpc wraps it in ANSI colour codes (which it
+// does even when piped).
+func TestReconnectRecoveryMatchesANSIColouredRejection(t *testing.T) {
+	settings := testManagerSettings(t)
+	starter := &recordingStarter{stopsOnGraceful: true}
+	requester := &fakeCredentialRequester{}
+	collector := &statusCollector{}
+	manager := newRecoveryManager(t, settings, starter, requester, collector)
+
+	child := startRecoveryChild(t, manager, starter, recoveryGenerationOne())
+	child.emitOutputLine(ansiWrap(realFRPCReconnectFailureLine))
+
+	waitForCondition(t, "ANSI-coloured rejection credential request", time.Second, func() bool {
+		return requester.requestCount() == 1
+	})
+	if reasons := requester.requestReasons(); len(reasons) != 1 || reasons[0] != ReasonReplayRejected {
+		t.Fatalf("recovery credential request reasons = %v, want exactly [%s]", reasons, ReasonReplayRejected)
+	}
+}
+
+// TestReconnectRecoveryIgnoresFRPSDowntimeConnectionRefused is the explicit
+// negative: during frps downtime frpc prints the same failed-Login prefix with
+// a transport error and no rejection marker. That is not a burned credential,
+// so a single such line must NOT request one or stop the child; only the
+// bounded consecutive-failure net can ever act on sustained downtime.
+func TestReconnectRecoveryIgnoresFRPSDowntimeConnectionRefused(t *testing.T) {
+	settings := testManagerSettings(t)
+	starter := &recordingStarter{stopsOnGraceful: true}
+	requester := &fakeCredentialRequester{}
+	collector := &statusCollector{}
+	manager := newRecoveryManager(t, settings, starter, requester, collector)
+
+	generationOne := recoveryGenerationOne()
+	child := startRecoveryChild(t, manager, starter, generationOne)
+
+	// Exactly what a dropped frps produces while it restarts: the benign
+	// pre-attempt line followed by one connection-refused report.
+	child.emitOutputLine(realFRPCRetryAttemptLine)
+	child.emitOutputLine(realFRPCConnectionRefusedLine)
+
+	assertConditionStays(t, "an frps-downtime line never requests a credential", 300*time.Millisecond, func() bool {
+		return requester.requestCount() == 0 &&
+			starter.startCount() == 1 &&
+			child.gracefulStopCount() == 0
+	})
+	assertReportsNeverContainRawChildOutput(t, collector)
+}
+
+// TestReconnectRecoveryFromCountBasedFallbackOnRewordedRejection is the
+// graceful-degradation path end to end: a future FRP wording change makes the
+// primary pair go dark, but the bounded count-based net still detects three
+// consecutive failed Logins, requests a fresh credential and replaces the
+// still-running child through the single start funnel.
+func TestReconnectRecoveryFromCountBasedFallbackOnRewordedRejection(t *testing.T) {
+	settings := testManagerSettings(t)
+	starter := &recordingStarter{stopsOnGraceful: true}
+	requester := &fakeCredentialRequester{}
+	collector := &statusCollector{}
+	manager := newRecoveryManager(t, settings, starter, requester, collector)
+
+	generationOne := recoveryGenerationOne()
+	child := startRecoveryChild(t, manager, starter, generationOne)
+
+	for attempt := 1; attempt <= frpcConsecutiveConnectionErrorThreshold; attempt++ {
+		child.emitOutputLine(realFRPCRetryAttemptLine)
+		child.emitOutputLine(realFRPCRewordedRejectionLine)
+	}
+
+	waitForCondition(t, "count-based fallback credential request", time.Second, func() bool {
+		return requester.requestCount() == 1
+	})
+	if got := starter.startCount(); got != 1 {
+		t.Fatalf("child was replaced before a fresh credential arrived: %d starts, want 1", got)
+	}
+
+	refreshed := generationOne
+	refreshed.Credential = "credential-count-fallback"
+	refreshed.ExpiresAt = time.Now().Add(20 * time.Minute).UTC().Truncate(time.Second)
+	if err := manager.ApplyConfig(refreshed); err != nil {
+		t.Fatalf("ApplyConfig(refreshed) error = %v", err)
+	}
+	waitForCondition(t, "replacement child start after the count-based fallback", 2*time.Second, func() bool {
+		return starter.startCount() == 2
+	})
+	if got := child.gracefulStopCount(); got != 1 {
+		t.Errorf("rejected child graceful stops = %d, want 1", got)
+	}
+	assertReportsNeverContainCredential(t, collector, generationOne.Credential, refreshed.Credential)
+	assertReportsNeverContainRawChildOutput(t, collector)
 }
 
 // TestReconnectFailureOnLiveChildReplacesChildWithFreshCredential is the

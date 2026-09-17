@@ -73,17 +73,57 @@ const (
 // (client/service.go:262) while hard-coding false on the reconnect path
 // (:277-287) — so a rejected RE-login leaves frpc running and retrying a
 // burned credential forever, with no child exit for the supervisor to observe.
-// The supervisor therefore watches the child's output for the one line frpc
-// prints on a rejected reconnect.
+// The supervisor therefore watches the child's output for a rejected
+// reconnect Login. It matches a PAIR of substrings rather than one long pinned
+// phrase: the prefix frpc prints for ANY failed Login attempt, plus the
+// rejection marker that means the relay plugin refused the credential. A plain
+// connection failure (frps down: refused, timed out, DNS failure) carries the
+// same prefix but no rejection marker, and must not on its own trigger a
+// credential refresh — an unreachable server is not a burned credential. A
+// bounded consecutive-failure safety net (below) keeps a future FRP wording
+// change from silently disabling recovery entirely.
 const (
-	// frpcReconnectFailureLine is the pinned frpc v0.71.0 output substring that
-	// marks a rejected reconnect Login. With detailedErrorsToClient=false frpc
-	// prints exactly this (NOT the server's "request rejected"). It is pinned to
-	// the checksum-pinned v0.71 binary and MUST be regression-tested against a
-	// live rejected reconnect on ANY FRP upgrade: if the wording changes, this
-	// detection (and with it the agent's only reactive recovery from a dropped
-	// relay session) fails silently. Keep the string in ONE place.
-	frpcReconnectFailureLine = "connect to server error: register control error"
+	// frpcReconnectFailureLine is the EXACT frpc v0.71.0 CLIENT-side text of a
+	// rejected reconnect Login, captured from the real checksum-pinned v0.71.0
+	// client binary (sha256 3ce4ba70ffce7da4026940586c5f3454df50814f4c050d6560efc556b3adef48)
+	// by running it against the live relay with a deliberately invalid
+	// credential. frpc's own format string is "connect to server error: %v"
+	// (client/service.go:323), the relay plugin's "request rejected" refusal
+	// reason reaches that %v, and frpc logs one such line per failed Login
+	// attempt on the reconnect path. NOTE: "register control error" is the frps
+	// SERVER-side wording (it does not occur in the client binary) — keying on
+	// it made the previous detection inert. This is the single canonical
+	// spelling of the pinned phrase; it MUST be re-captured and regression-tested
+	// against a live rejected reconnect on ANY FRP upgrade.
+	frpcReconnectFailureLine = "connect to server error: request rejected"
+	// frpcConnectionErrorPrefix is the invariant part of frpc's failed-Login
+	// report; the %v it wraps differs by cause, so this prefix alone is NOT a
+	// rejection (an unreachable frps produces it too).
+	frpcConnectionErrorPrefix = "connect to server error:"
+	// frpcRejectionMarker is the rejection text the relay plugin's Login
+	// refusal carries through frpc's %v. The primary matcher requires BOTH this
+	// marker and frpcConnectionErrorPrefix, which is what keeps frps downtime
+	// from triggering a credential refresh.
+	frpcRejectionMarker = "request rejected"
+	// frpcRetryAttemptLine is the benign INFO line frpc logs immediately before
+	// EVERY Login attempt (client/service.go:312). The consecutive-error counter
+	// ignores it so the interleaved "try to connect" line cannot break a run of
+	// real failures.
+	frpcRetryAttemptLine = "try to connect to server..."
+	// frpcConsecutiveConnectionErrorThreshold is the bounded safety net that
+	// keeps recovery alive if a future FRP release renames the rejection text:
+	// after this many CONSECUTIVE failed-Login lines for the current child (no
+	// intervening progress line), a refresh is requested even though the primary
+	// pair did not match. Three attempts is deliberate: frpc backs off between
+	// attempts (jittered 1s base, doubling, capped at 20s — client/service.go:355-361),
+	// so three consecutive failures span several backoff steps and cannot be one
+	// transient blip (e.g. a brief frps restart), while recovery still completes
+	// well inside the ten-minute credential lifetime. The trade-off is that
+	// sustained transport failures (a long frps outage) also reach the threshold
+	// and request a credential; the primary pair is unaffected and a single
+	// downtime line never trips the net.
+	frpcConsecutiveConnectionErrorThreshold = 3
+
 	// maxChildOutputLineLength bounds one retained child output line, so a
 	// pathological or hostile child stream cannot grow manager memory. A line
 	// beyond the bound is discarded (it cannot be the short pinned line).
@@ -93,11 +133,66 @@ const (
 )
 
 // isReconnectFailureLine reports whether one captured child output line is the
-// pinned frpc v0.71 reconnect-failure line. It exists so the matching is a
-// single, directly testable predicate (the pinned substring's fragility is
-// documented on frpcReconnectFailureLine).
+// PRIMARY reconnect-rejection signal: frpc's failed-Login prefix AND the
+// server-side rejection marker. Requiring both is what keeps an unreachable
+// relay (a plain "connect to server error: ... connection refused") from
+// requesting a credential refresh. It exists so the matching is a single,
+// directly testable predicate.
 func isReconnectFailureLine(line string) bool {
-	return strings.Contains(line, frpcReconnectFailureLine)
+	return isConnectionErrorLine(line) && strings.Contains(line, frpcRejectionMarker)
+}
+
+// isConnectionErrorLine reports whether the line is ANY failed-Login report,
+// whatever the wrapped error text. Used only by the bounded
+// consecutive-failure safety net.
+func isConnectionErrorLine(line string) bool {
+	return strings.Contains(line, frpcConnectionErrorPrefix)
+}
+
+// isRetryAttemptLine reports whether the line is frpc's benign pre-attempt INFO
+// line, which must not reset the consecutive-failure run.
+func isRetryAttemptLine(line string) bool {
+	return strings.Contains(line, frpcRetryAttemptLine)
+}
+
+// reconnectFailureDetector decides when one child's captured output should
+// drive credential-refresh recovery. It is owned by that child's output watcher
+// goroutine, so a replacement child starts with a FRESH detector: the
+// consecutive-failure count is per current child and cannot leak across a
+// replacement. observe reports whether the line is a recovery trigger, either:
+//
+//   - the primary pair (frpc's failed-Login prefix + the rejection marker), or
+//   - the safety net tripping after frpcConsecutiveConnectionErrorThreshold
+//     consecutive failed-Login lines for this child.
+//
+// A run is reset by any line that is neither a connection error nor frpc's
+// interleaved "try to connect" pre-attempt line: such a line means the child
+// made progress — notably frpc's "login to server success" line, which a child
+// that reaches the stability window must have emitted — so the earlier failures
+// are no longer consecutive. A reset therefore covers both a successful login
+// and a stable child.
+type reconnectFailureDetector struct {
+	consecutiveConnectionErrors int
+}
+
+func (detector *reconnectFailureDetector) observe(line string) bool {
+	switch {
+	case isReconnectFailureLine(line):
+		// The rejection is definitive: recover now and end the run.
+		detector.consecutiveConnectionErrors = 0
+		return true
+	case isConnectionErrorLine(line):
+		detector.consecutiveConnectionErrors++
+		return detector.consecutiveConnectionErrors >= frpcConsecutiveConnectionErrorThreshold
+	case isRetryAttemptLine(line):
+		// Interleaved with every attempt: neither progress nor a new failure.
+		return false
+	default:
+		// Any other output is progress (a successful Login, or traffic after it):
+		// the consecutive-failure run is over.
+		detector.consecutiveConnectionErrors = 0
+		return false
+	}
 }
 
 // errManagerStopped is returned by ApplyConfig after Stop has been called.
@@ -490,10 +585,11 @@ const (
 	eventChildExited
 	eventChildStable
 	// eventChildReconnectFailed is the sanitised internal signal that the
-	// CURRENT child's reconnect Login was rejected (the pinned frpc v0.71
-	// output line was seen). It carries the child identity so a stale child's
-	// output can never drive recovery for a newer child, and it exists because
-	// frp v0.71 does NOT exit frpc on a rejected reconnect.
+	// CURRENT child needs credential-refresh recovery: either its reconnect
+	// Login was rejected (the pinned frpc v0.71 pair was seen) or its output hit
+	// the bounded consecutive-failure safety net. It carries the child identity
+	// so a stale child's output can never drive recovery for a newer child, and
+	// it exists because frp v0.71 does NOT exit frpc on a rejected reconnect.
 	eventChildReconnectFailed
 	// eventEnsureCredential is the daemon's bootstrap/unlock trigger asking the
 	// manager to ensure a usable credential is held, with the manager's bounded
@@ -1490,21 +1586,24 @@ func (manager *Manager) watchChild(child childProcess, exited chan struct{}) {
 	}
 }
 
-// watchChildOutput relays a reconnect-failure signal from one child's captured
-// output into the event loop, tagged with that child's identity so a stale or
+// watchChildOutput relays a recovery signal from one child's captured output
+// into the event loop, tagged with that child's identity so a stale or
 // already-replaced child can never drive recovery for a newer one. Raw output
-// text never leaves this function: only the sanitised event is emitted. Every
-// matching line is forwarded (frpc retries on a bounded backoff, so the volume
-// is low) and the event loop's reconnectFailed guard coalesces them into one
-// recovery cycle per child; forwarding them all lets a recovery that could not
-// replace the child (e.g. a stop that timed out) be re-armed by the child's
-// next failed attempt instead of latching. The watcher ends when the child
-// exits, when its output stream closes, or when the manager stops.
+// text never leaves this function: only the sanitised event is emitted. The
+// detector is created fresh per child, so its consecutive-failure counter is
+// scoped to the CURRENT child and is reset by child replacement. Every trigger
+// line is forwarded (frpc retries on a bounded backoff, so the volume is low)
+// and the event loop's reconnectFailed guard coalesces them into one recovery
+// cycle per child; forwarding them all lets a recovery that could not replace
+// the child (e.g. a stop that timed out) be re-armed by the child's next failed
+// attempt instead of latching. The watcher ends when the child exits, when its
+// output stream closes, or when the manager stops.
 func (manager *Manager) watchChildOutput(child childProcess, exited chan struct{}) {
 	output, ok := child.(childOutputStream)
 	if !ok {
 		return // no captured output: exit-based recovery still applies
 	}
+	detector := &reconnectFailureDetector{}
 	lines := output.OutputLines()
 	for {
 		select {
@@ -1512,7 +1611,7 @@ func (manager *Manager) watchChildOutput(child childProcess, exited chan struct{
 			if !open {
 				return
 			}
-			if !isReconnectFailureLine(line) {
+			if !detector.observe(line) {
 				continue
 			}
 			select {

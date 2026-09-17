@@ -259,7 +259,7 @@ func assertReportsNeverContainCredential(t *testing.T, collector *statusCollecto
 }
 
 // assertReportsNeverContainRawChildOutput scans every collected status report
-// for raw child output (/§7.2 log policy): the manager sanitises the pinned
+// for raw child output (/§7.2 log policy): the manager sanitises the matched
 // frpc line into an internal event and never copies the raw text into
 // telemetry, and it never logs it.
 func assertReportsNeverContainRawChildOutput(t *testing.T, collector *statusCollector) {
@@ -268,7 +268,9 @@ func assertReportsNeverContainRawChildOutput(t *testing.T, collector *statusColl
 	defer collector.mu.Unlock()
 	for _, report := range collector.reports {
 		if strings.Contains(report.Reason, realFRPCReconnectFailureLine) ||
-			strings.Contains(report.Reason, "register control error") {
+			strings.Contains(report.Reason, realFRPCRewordedRejectionLine) ||
+			strings.Contains(report.Reason, realFRPCConnectionRefusedLine) ||
+			strings.Contains(report.Reason, frpcConnectionErrorPrefix) {
 			t.Fatalf("status report %q leaked raw child output", report.Reason)
 		}
 	}
