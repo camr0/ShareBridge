@@ -341,6 +341,72 @@ func TestReconnectFailureOnLiveChildReplacesChildWithFreshCredential(t *testing.
 	assertReportsNeverContainRawChildOutput(t, collector)
 }
 
+// TestReconnectRecoveryKillTimeoutRequestsCredentialOnce pins the single-
+// credential property across a replacement whose stop hits the kill bound: the
+// rejected child cannot be reaped within killWait, so the recovery credential
+// is armed but unused when the child exits LATE. That exit must finish the
+// cycle with the credential already in hand — exactly one request, one
+// replacement — never a second relay_credential_request (which would burn
+// another credential and consume control's limiter). It also pins the output
+// path: a repeat of the rejected reconnect line in this state coalesces instead
+// of asking again.
+func TestReconnectRecoveryKillTimeoutRequestsCredentialOnce(t *testing.T) {
+	settings := testManagerSettings(t)
+	// The child ignores the graceful stop and the kill: the manager's bounded
+	// post-kill wait expires and the child stays alive until the test exits it.
+	starter := &recordingStarter{stopsOnGraceful: false, ignoresKill: true}
+	requester := &fakeCredentialRequester{}
+	collector := &statusCollector{}
+	manager := newRecoveryManager(t, settings, starter, requester, collector,
+		withKillWaitTimeout(60*time.Millisecond),
+	)
+
+	generationOne := recoveryGenerationOne()
+	child := startRecoveryChild(t, manager, starter, generationOne)
+	child.emitOutputLine(realFRPCReconnectFailureLine)
+	waitForCondition(t, "recovery credential request", time.Second, func() bool {
+		return requester.requestCount() == 1
+	})
+
+	// Control answers: the recovery branch rewrites the config and tries to
+	// replace the still-running child.
+	refreshed := generationOne
+	refreshed.Credential = "credential-kill-timeout"
+	refreshed.ExpiresAt = time.Now().Add(20 * time.Minute).UTC().Truncate(time.Second)
+	if err := manager.ApplyConfig(refreshed); err != nil {
+		t.Fatalf("ApplyConfig(refreshed) error = %v", err)
+	}
+
+	// The replacement cannot reap the child: the bounded post-kill wait expires.
+	waitForCondition(t, "kill-timeout replacement failure", 2*time.Second, func() bool {
+		return collector.hasReasonContaining("did not exit within")
+	})
+	if got := starter.startCount(); got != 1 {
+		t.Fatalf("replacement started despite the failed stop: %d starts, want 1 (never double-start)", got)
+	}
+
+	// A repeat of the rejected reconnect line while the credential is armed but
+	// unused must coalesce, not request another credential (the retry reuses the
+	// credential in hand).
+	child.emitOutputLine(realFRPCReconnectFailureLine)
+	assertConditionStays(t, "armed recovery credential is never re-requested", 250*time.Millisecond, func() bool {
+		return requester.requestCount() == 1 && starter.startCount() == 1
+	})
+
+	// The rejected child exits AFTER the kill bound. The already-armed fresh
+	// credential must start the replacement; control is NOT asked again.
+	child.signalExit(errors.New("exit status 1"))
+	waitForCondition(t, "replacement child from the armed recovery credential", 2*time.Second, func() bool {
+		return starter.startCount() == 2
+	})
+	if reasons := requester.requestReasons(); len(reasons) != 1 {
+		t.Fatalf("credential requests = %v, want exactly one for the failure", reasons)
+	}
+	if content := configFileContent(t, settings.ConfigPath); !strings.Contains(content, refreshed.Credential) {
+		t.Errorf("replacement config does not carry the recovery credential")
+	}
+}
+
 // TestReconnectRecoveryRetriesWhenCredentialReplyIsLost covers a reply control
 // never sends: the credential-wait timer must keep re-requesting WHILE the
 // rejected child is still alive (the pre-fix timer only retried once the child

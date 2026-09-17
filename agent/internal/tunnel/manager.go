@@ -779,9 +779,12 @@ type Manager struct {
 	// reconnect-failure line and the manager is waiting for a fresh credential
 	// to replace it. It makes output-based recovery single-flight per child
 	// (repeated failure lines are coalesced), keeps the credential-wait timer
-	// retrying while the rejected child is still ALIVE, and is cleared when the
-	// replacement credential is armed, when the child exits, or when a newer
-	// generation supersedes it. Owned by the run goroutine.
+	// retrying while the rejected child is still ALIVE, and is cleared only when
+	// the replacement child is actually started (startChildFenced), when the
+	// rejected child exits without a replacement credential in hand, or when a
+	// newer generation supersedes it. Keeping it set across a replacement whose
+	// stop hit the kill bound is what guarantees exactly ONE credential request
+	// per failure. Owned by the run goroutine.
 	reconnectFailed bool
 }
 
@@ -1267,7 +1270,12 @@ func (manager *Manager) handleApplyConfig(config Config) {
 				// write→stop→startChildNow sequence of
 				// applyArmedConfigOrScheduleRetry, whose retry also funnels
 				// through startChildFenced).
-				manager.reconnectFailed = false
+				// The recovery flag STAYS SET until startChildFenced actually
+				// starts the replacement: if the stop below cannot reap the
+				// rejected child within the kill bound, the child's eventual exit
+				// (or its next rejected reconnect line) would otherwise arm a
+				// SECOND credential request. Exactly one request/recovery cycle
+				// is outstanding per failure.
 				manager.waitingForCredential = false
 				manager.applyArmedConfigOrScheduleRetry()
 				return
@@ -1346,11 +1354,25 @@ func (manager *Manager) handleChildExited(event managerEvent) {
 	// An exit ends any reconnect-recovery cycle for this child: the child is
 	// gone, so the replacement half of recovery no longer applies.
 	recovering := manager.reconnectFailed
-	manager.reconnectFailed = false
+	// A recovery whose replacement credential is already armed but unused means
+	// the previous stop attempt could not reap the rejected child: its exit must
+	// finish that cycle with the credential in hand, never by asking for a
+	// second one.
+	credentialReadyForReplacement := manager.recoveryCredentialArmedUnused()
 	if uptime >= stableUptimeResetThreshold {
 		manager.restartAttempt = 0
 	}
 	manager.emit(manager.currentGeneration, StatusStopped, fmt.Sprintf("frpc exited: %v", event.waitError))
+	if credentialReadyForReplacement {
+		// The rejected child ran the PREVIOUS, burned credential; the fresh one
+		// armed by the recovery answer is still unused, so start the replacement
+		// with it. No second credential request. startChildFenced clears the
+		// recovery flag on the successful start.
+		manager.waitingForCredential = false
+		manager.startChildNow()
+		return
+	}
+	manager.reconnectFailed = false
 	// The credential's one-use jti may now be burned at the relay plugin:
 	// never re-login with it (§15.2). Any restart goes through a fresh
 	// relay_credential_request first, with the replay_rejected reason: the
@@ -1360,9 +1382,8 @@ func (manager *Manager) handleChildExited(event managerEvent) {
 	manager.waitingForCredential = true
 	manager.pendingCredentialReason = ReasonReplayRejected
 	if recovering {
-		// The reconnect-failure path already requested this credential, and its
-		// bounded retry cycle is still armed. Do not issue a duplicate request:
-		// the queued or in-flight answer restarts the tunnel.
+		// The recovery request is still outstanding (not yet answered): its
+		// bounded retry cycle restarts the tunnel. Do not issue a duplicate.
 		return
 	}
 	manager.requestCredentialAndScheduleRestart()
@@ -1381,7 +1402,15 @@ func (manager *Manager) handleChildReconnectFailed(event managerEvent) {
 		return // stale or already-replaced child: it cannot drive recovery
 	}
 	if manager.reconnectFailed {
-		return // this child's recovery cycle is already armed
+		// This child's recovery cycle is already armed: coalesce repeated failure
+		// lines so exactly one credential request is outstanding. When the
+		// recovery credential has already arrived but the last replacement could
+		// not reap the child within the kill bound, retry the replacement with
+		// that credential instead of asking control for another one.
+		if manager.recoveryCredentialArmedUnused() {
+			manager.applyArmedConfigOrScheduleRetry()
+		}
+		return
 	}
 	manager.reconnectFailed = true
 	// The rejected Login burned the child's one-use jti exactly like the
@@ -1408,11 +1437,12 @@ func (manager *Manager) handleEnsureCredential(reason CredentialRequestReason) {
 			"relay credential request suppressed: tunnel start permission withdrawn")
 		return
 	}
-	if manager.hasArmedConfig && !manager.reconnectFailed {
+	if manager.hasArmedConfig && (!manager.reconnectFailed || manager.recoveryCredentialArmedUnused()) {
 		// A credential is already armed for this manager: it is either about to
-		// start the child or already in use by a running one, and a second
-		// credential could not be applied without a restart this event must not
-		// force. Nothing to ensure.
+		// start the child, already in use by a running one, or a completed
+		// recovery's answer still waiting to replace the rejected child (armed
+		// but not yet consumed). A second credential could not be applied
+		// without a restart this event must not force. Nothing to ensure.
 		return
 	}
 	if !validCredentialRequestReason(reason) {
@@ -1421,6 +1451,17 @@ func (manager *Manager) handleEnsureCredential(reason CredentialRequestReason) {
 	manager.waitingForCredential = true
 	manager.pendingCredentialReason = reason
 	manager.requestCredentialAndScheduleRestart()
+}
+
+// recoveryCredentialArmedUnused reports whether the current reconnect-recovery
+// cycle has already received its replacement credential (a same-generation
+// config was armed) but no child has started with it yet. That is the state
+// left when the previous replacement could not reap the rejected child within
+// the kill bound. In this state the recovery must finish by reusing the
+// credential in hand — never by requesting a second one. Owned by the run
+// goroutine, like every field it reads.
+func (manager *Manager) recoveryCredentialArmedUnused() bool {
+	return manager.reconnectFailed && manager.hasArmedConfig && !manager.armedConsumed
 }
 
 // acceptRefreshedCredential reports whether a same-generation credential may
@@ -1531,6 +1572,11 @@ func (manager *Manager) startChildFenced() {
 	manager.child = child
 	manager.childStartedAt = time.Now()
 	manager.armedConsumed = true
+	// A started child means any in-flight reconnect-recovery cycle is complete:
+	// its replacement is now armed. This is the ONLY point at which a recovery
+	// answer clears the flag (a recovery that could not stop the child leaves it
+	// set so the retry reuses the credential already in hand).
+	manager.reconnectFailed = false
 	// The exit channel is owned by this child's watcher: the stop path waits
 	// on it instead of spawning a second Wait helper goroutine (Round D).
 	exited := make(chan struct{})
@@ -1606,9 +1652,10 @@ func (manager *Manager) watchChild(child childProcess, exited chan struct{}) {
 // scoped to the CURRENT child and is reset by child replacement. Every trigger
 // line is forwarded (frpc retries on a bounded backoff, so the volume is low)
 // and the event loop's reconnectFailed guard coalesces them into one recovery
-// cycle per child; forwarding them all lets a recovery that could not replace
-// the child (e.g. a stop that timed out) be re-armed by the child's next failed
-// attempt instead of latching. The watcher ends when the child exits, when its
+// cycle per child; forwarding them all lets a recovery whose replacement could
+// not stop the child (e.g. a stop that timed out) retry that replacement with
+// the credential already in hand on the child's next failed attempt instead of
+// latching — without issuing a second credential request. The watcher ends when the child exits, when its
 // output stream closes, or when the manager stops.
 func (manager *Manager) watchChildOutput(child childProcess, exited chan struct{}) {
 	output, ok := child.(childOutputStream)
