@@ -7,6 +7,98 @@ single home for the plan, the exact method for each experiment, and its results 
 **Status:** plan written; infra bring-up started. Results are appended per experiment (each has an
 empty `Result` block until it runs).
 
+## OVERNIGHT RESULTS SUMMARY (2026-09-18) — read this before the experiment sections
+
+This section supersedes the interpretation in **Appendix A (Experiment 9)**, which is partly wrong.
+Exp 9's *measurements* stand; its *conclusions* do not. Everything below is field-measured on the v1/v2
+test rig unless marked lab.
+
+### 1. Headline: the v2 relay transport is 2.1–3.8× faster than v1, reproducibly
+
+| path | v1 (WebRTC DataChannel) | v2 (relay: TLS/HTTP over gateway + FRP TCP) | ratio |
+|---|---|---|---|
+| CLIENT-EAST ~12 ms | **102–111 Mbps** (n=3) | **233.3–233.7 Mbps** (n=3, spread 0.18%) | **2.1–2.3×** |
+| CLIENT-WEST ~71 ms | **60.2 Mbps** (n=2–3) | **214.9–228.4 Mbps** (n=2) | **3.6–3.8×** |
+
+- v2 with a **real browser download sink** (Chromium, no Download API): **239.05 Mbps** — *above* the
+  curl cells, so the earlier curl-vs-browser asymmetry was not flattering v2. The result is not a
+  curl artefact.
+- v2 sits at **87–97% of the path's measured UDP capacity**; v1 at **25–45%**.
+- **v1 halves as RTT rises (111 → 60 Mbps); v2 barely moves (233.6 → 221.6).**
+- Client VMs were ~100% idle throughout the v2 cells; v2's agent used ~0.18 cores vs v1's ~1.0.
+
+### 2. v1's ceiling is software-side — not the path, the client, or the NIC
+
+- **The path carries ~246 Mbps of UDP** (single flow: 246.6 Mbps @ 0.90% loss EAST, 245.8 @ 0.84%
+  WEST; four flows do not raise it) and **240 Mbps over 4 TCP flows**. There is no ~100 Mbps policer;
+  the earlier "300 offered → 243 received at 18% loss" is exactly a 246 Mbps ceiling.
+- **Two independent client hosts do not add:** 1 tab on each = **89.9 Mbps**, with *both* hosts slowing
+  at once (EAST 97.3→88.8, WEST 61.4→45.4) and WEST 85% idle; 2+2 across hosts = **99.1 Mbps**, 4/4.
+  The cap is shared upstream of the clients.
+- **Striping is counterproductive, not merely neutral:** v1 cross-host N=2 (83.5–89.9) is *below* v1
+  N=1 (102–122).
+- Agent CPU during v1 cells: **90–122% (2 peers), 126–157% (4 peers)** in Docker units where 100% = one
+  logical core (the host has 6), spread across 8–9 threads with **no pinned thread**. (Exp 9's "1.53%"
+  was invalid — see below.)
+
+### 3. v1 collapses under loss — it goes *idle* rather than congesting (lab, E1)
+
+Lab wire/payload is **1.08× (L4) / 1.12× (incl. IP+UDP)** — established three independent ways — with
+**no spurious retransmission** (loss 0.001 adds +0.8% bytes, loss 0.01 adds +1.2%: one-for-one
+recovery). Yet **goodput collapses 16–62× while the wire stays ~1.1×**: the sender stops rather than
+filling the link. Stalls are 0.9–1.2 s chunks — the hard-coded 1 s RTO floor. Real-world lossy paths
+should therefore be much worse for v1 than this clean test path suggests.
+
+### 4. The old "wire ÷ 3 = goodput" field claim was a measurement artefact
+
+It cannot be protocol framing (1.08–1.12×) and is almost certainly not retransmission. It needs a
+**per-5-tuple field capture** to attribute (most likely NIC counters including both directions or
+unrelated host traffic). Do not repeat the ÷3 figure as a transport property.
+
+### 5. Corrections to Appendix A (Experiment 9)
+
+- **"The client-side sink is the binding constraint" — FALSIFIED.** Cross-host striping shows the cap is
+  shared upstream; the client hosts are not the limit.
+- **"Agent CPU 1.53%" — INVALID.** Correct live values are 90–157% in Docker units (0.9–1.6 cores of 6).
+  A post-completion sample of 7.57% Docker units = 1.26% of six cores reproduces how 1.53% arose.
+- **"At N=4 one of four sessions dies early" — DID NOT REPRODUCE** (4/4 clean in two independent
+  cells, no mid-transfer closes, no takeover evidence). Unexplained, but now doubtful.
+- Exp 9's *numbers* (windows, throughputs, CPU idle%) remain valid; the interpretation built on them does not.
+
+### 6. Retired hypotheses
+
+- **RTO floor has no effect on a clean path** (E2, 91 runs): ceilings identical at every RTT
+  (12/25/71/100 ms → 503/510/512, 470/456/456, 328/329/331, 243/243/243 Mbps), wire datagrams/MiB
+  constant, `shim_drop=0` in all runs. Remaining question under *loss* is E11's job.
+- **No long mid-transfer plateaus exist** in these configurations: 128 runs, longest stall 1.2 s. The
+  Sept-15 "long plateau" story does not reproduce.
+- Also found: the harness's `--mode prod` never wires `--rtomax` (`rawbench.go:225` only), so prod-mode
+  RTO sweeps are silent no-ops — E5 needs the wiring added before it can measure anything.
+
+### 7. Bench and method notes (for anyone re-running this)
+
+- **The lab Mac cannot produce trustworthy throughput *means*** while it is busy: a sanity config
+  spread **12.8×** (Time Machine + `mds` + load 3–7.4). **Rate-capped (`--bandwidth`) runs are
+  bit-for-bit reproducible** because the token bucket rather than the CPU is the limit — use those.
+  Ceilings, wire volume, `shim_drop` and stall structure are robust; mean deltas are not.
+- Field metric discipline: agent-side windows only (`lanes ready` → `download complete`); **never** call
+  Playwright's Download API (it aborts the transfers it measures); client-side artefacts are unreliable.
+- Path capacity is **time-varying** (4 TCP flows measured 156 Mbps one hour and 240 the next).
+  Single control readings are weak evidence; re-measure in the same session as the cell you compare.
+- v1 single-session rates are noisy (EAST N=1 measured 97.3, 110.97, 122.2 across the night); n≥3 and
+  same-session baselines are required for any claim.
+
+### 8. Still open after tonight
+
+- **v2 DIRECT mode was never measured** — all v2 cells above are **relay** mode. Direct mode is the
+  architecturally interesting one (no third-party relay in the data path) and is untested for throughput.
+- The field per-5-tuple loss capture (item 4) is unrun.
+- E11 (loss-sensitivity ladder, incl. whether the RTO floor matters under loss) was in flight when this
+  summary was written.
+- Everything above is single-file, single-share, n=1–3; no statistical treatment beyond spread reporting.
+
+---
+
 ## Goal, in one line
 
 Determine whether the clean-path ceiling (goodput ~50 Mbps at ~12 ms while the same path carries
