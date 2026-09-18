@@ -206,6 +206,41 @@ capacity:
   server's) — but the previously failed fork (BBR-style pacing) attacked the wrong layer, since E19 shows the
   field rides its 0.27–0.68% loss with ~1 retransmission per loss.
 
+## F12 — Where the send path's CPU goes (E23): crypto and the app layer are free — but two harness artifacts bound the result
+- **E23 (63 cells, 0 failures, lab only).** Sender cost at 128 MiB @ 80 Mbps, CPU-s/GB: **app layer +1.3…+2.9
+  (2.4–5.5 %)**; **pion datagram path + in-process shim ≈50.3 (94 %)**. Inside that: plain-UDP sender+relay
+  floor **11.4 (unpaced) / 39.9 (paced)**; per-datagram Go timer **+16**; **DTLS AES-128-GCM crypto 0.16
+  (0.3 % — 6.0–6.5 GB/s/core)**; bench poll 3–5; **residual (SCTP chunking / DTLS framing / queue plumbing /
+  GC) ≈23–40, undecomposed.** Receiver (Chrome) 27.6–31.1 capped / 17.5–20.9 uncapped.
+- **So these are NOT fork targets:** AES-GCM crypto (0.3 % — any "offload the crypto" idea is dead), the app
+  layer (2.4–5.5 %), and **chunk size** (16/64/256 KiB moves CPU-s/GB <4 %, i.e. noise, **because SCTP
+  re-fragments to the same datagrams**). That last one closes the question E6 left open.
+- **Artifact 1 — the prod-mode shim is UNCONDITIONAL** (`agent/cmd/benchdirect/prodbench.go:113`; there is no
+  flag to bypass it). Every lab datagram is relayed in-process with a per-datagram allocation
+  (`shim.go packet{data []byte, …}`) and, when `--bandwidth` is set, a **spin-loop token bucket**
+  (`shim.go rateLimiter.take`, which calls `time.Now()` in a retry loop). **Therefore every lab CPU-s/GB figure
+  is an UPPER BOUND that includes harness machinery production never runs** — the 11.4→39.9 paced penalty is
+  mostly the token-bucket spin. Consequence: do **not** read the lab's 46 CPU-s/GB as production's send cost,
+  and do **not** present VERSA's 63–113 CPU-s/GB (a real field measurement) as "1.4–2.4× the lab's pion cost".
+- **Artifact 2 (UNVERIFIED, and it contradicts the field) — E23's per-datagram size.** E23 reports 1.377 M
+  datagrams/GB at **779.7 B** each (~40 % below MTU), and derives its headline fork recommendation from it
+  ("collapse datagram count"). **The field says otherwise:** E1 measured **896 data datagrams/MiB at
+  1228-B SCTP packets / 1265-B wire (1200-B payload + 28 SCTP + 37 DTLS)** — i.e. production is already at
+  pion's MTU. No prod-mode JSON even carries a packet count (`shim_fwd` exists only in raw mode), so the claim
+  could not be reproduced from E22's raw data. **Until E24 resolves it, the "collapse datagram count" lever is
+  NOT established for production**; if the lab really emits 780-B datagrams that is a lab artifact to fix, not
+  a production win.
+- **What survives:** the *ratios* — crypto free, app layer free, chunk size irrelevant, cost is **per datagram**
+  (syscalls, copies, queue plumbing). The only fork direction with support is therefore **reducing per-datagram
+  overhead itself — syscall batching (GSO / `sendmmsg` / `writev`) and allocation removal — not record size or
+  crypto.** Even that cannot be sized from this harness, and production is already MTU-efficient, so its
+  headroom is limited to syscall count, not bytes.
+- **Environment caveat for E23 itself:** its sanity gate FAILED (10.7/13.7 vs ≈100 Mbps expected), load rose
+  3.6→6.4 and swap was 6.2/7.2 GB — its absolutes run ~1.25× E22's. Use E23's **ratios only**; do not compare
+  its absolutes against E22's or the field's.
+- **Practical upshot:** further lab work on the fork question has low value because the instrument, not the
+  product, is now the limiting factor. The answer lives in the field (E21's `--cpus` sweep).
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the

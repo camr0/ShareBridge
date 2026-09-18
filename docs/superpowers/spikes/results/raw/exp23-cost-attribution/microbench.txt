@@ -1,0 +1,38 @@
+--- crypto (AES-128-GCM, 1140B records, seal+open per record) ---
+aes128gcm rec=1140B records=1000000 bytes=1.156GB wall=0.383s cpu=0.383s
+{"bench":"aesgcm","rec":1140,"bytes":1156000000,"wall_s":0.3825,"cpu_s":0.3828,"seal_open_cpu_s_per_gb":0.331,"seal_only_cpu_s_per_gb":0.166,"seal_only_gbps_per_core":6.04}
+aes128gcm rec=1140B records=1000000 bytes=1.156GB wall=0.367s cpu=0.367s
+{"bench":"aesgcm","rec":1140,"bytes":1156000000,"wall_s":0.3667,"cpu_s":0.3668,"seal_open_cpu_s_per_gb":0.317,"seal_only_cpu_s_per_gb":0.159,"seal_only_gbps_per_core":6.30}
+aes128gcm rec=1140B records=1000000 bytes=1.156GB wall=0.356s cpu=0.356s
+{"bench":"aesgcm","rec":1140,"bytes":1156000000,"wall_s":0.3560,"cpu_s":0.3562,"seal_open_cpu_s_per_gb":0.308,"seal_only_cpu_s_per_gb":0.154,"seal_only_gbps_per_core":6.49}
+--- udp sendonly_send_side : -mode sendonly -port 9321 -total 67108864 -dg 780 ---
+--- udp relay_no_timer :  ---
+mode=sendrelay bytes=16777216 wall=0.114s cpu=0.191s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":0,"rate_bps":0,"bytes":16777216,"wall_s":0.1137,"cpu_s":0.1912,"cpu_s_per_gb":11.396,"us_per_datagram":8.8889}
+mode=sendrelay bytes=16777216 wall=0.117s cpu=0.199s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":0,"rate_bps":0,"bytes":16777216,"wall_s":0.1167,"cpu_s":0.1987,"cpu_s_per_gb":11.844,"us_per_datagram":9.2382}
+--- udp relay_timer50us : -delayus 50 ---
+--- udp relay_pace100us : -sendpaceus 100 ---
+/bin/bash: line 6: timeout: command not found
+/bin/bash: line 6: timeout: command not found
+--- udp relay_pace100us_timer50us : -sendpaceus 100 -delayus 50 ---
+/bin/bash: line 6: timeout: command not found
+/bin/bash: line 6: timeout: command not found
+--- udp relay_pace100us_rate10MB : -sendpaceus 100 -rate 10000000 ---
+/bin/bash: line 6: timeout: command not found
+/bin/bash: line 6: timeout: command not found
+--- udp relay_pace100us : -sendpaceus 100 ---
+mode=sendrelay bytes=16777216 wall=3.080s cpu=0.669s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":0,"rate_bps":0,"bytes":16777216,"wall_s":3.0803,"cpu_s":0.6688,"cpu_s_per_gb":39.865,"us_per_datagram":31.0946}
+mode=sendrelay bytes=16777216 wall=3.083s cpu=0.668s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":0,"rate_bps":0,"bytes":16777216,"wall_s":3.0832,"cpu_s":0.6679,"cpu_s_per_gb":39.808,"us_per_datagram":31.0501}
+--- udp relay_pace100us_timer50us : -sendpaceus 100 -delayus 50 ---
+mode=sendrelay bytes=16777216 wall=2.592s cpu=0.939s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":50,"rate_bps":0,"bytes":16777216,"wall_s":2.5925,"cpu_s":0.9395,"cpu_s_per_gb":55.996,"us_per_datagram":43.6772}
+mode=sendrelay bytes=16777216 wall=2.600s cpu=0.949s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":50,"rate_bps":0,"bytes":16777216,"wall_s":2.6005,"cpu_s":0.9490,"cpu_s_per_gb":56.562,"us_per_datagram":44.1186}
+--- udp relay_pace100us_rate10MB : -sendpaceus 100 -rate 10000000 ---
+mode=sendrelay bytes=16777216 wall=3.071s cpu=0.662s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":0,"rate_bps":10000000,"bytes":16777216,"wall_s":3.0713,"cpu_s":0.6623,"cpu_s_per_gb":39.476,"us_per_datagram":30.7914}
+mode=sendrelay bytes=16777216 wall=3.071s cpu=0.665s drop=0
+{"bench":"udprelay","mode":"sendrelay","dg":780,"delay_us":0,"rate_bps":10000000,"bytes":16777216,"wall_s":3.0706,"cpu_s":0.6649,"cpu_s_per_gb":39.630,"us_per_datagram":30.9111}

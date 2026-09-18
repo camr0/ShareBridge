@@ -1,0 +1,45 @@
+=== arms (all cells, no exclusions) ===
+cap=10000000  prod chunk=fixed64K rtt=12 n=3 mbps=74.9  sender cs/GB mean=58.84 min=51.55 max=62.50 | receiver(chrome) cs/GB mean=29.67
+cap=10000000  prod chunk=fixed64K rtt=71 n=3 mbps=73.0  sender cs/GB mean=55.35 min=53.65 max=57.21 | receiver(chrome) cs/GB mean=27.65
+cap=10000000  raw  chunk=16KiB  rtt=12 n=3 mbps=67.6  sender cs/GB mean=54.70 min=51.33 max=61.07 | receiver(chrome) cs/GB mean=26.92
+cap=10000000  raw  chunk=16KiB  rtt=71 n=2 mbps=10.0  sender cs/GB mean=67.55 min=67.19 max=67.90 | receiver(chrome) cs/GB mean=28.71
+cap=10000000  raw  chunk=64KiB  rtt=12 n=3 mbps=74.9  sender cs/GB mean=56.91 min=55.77 max=58.43 | receiver(chrome) cs/GB mean=30.39
+cap=10000000  raw  chunk=64KiB  rtt=71 n=2 mbps=28.6  sender cs/GB mean=56.09 min=54.02 max=58.17 | receiver(chrome) cs/GB mean=29.08
+cap=10000000  raw  chunk=256KiB rtt=12 n=3 mbps=75.2  sender cs/GB mean=56.08 min=54.61 max=57.14 | receiver(chrome) cs/GB mean=29.68
+cap=10000000  raw  chunk=256KiB rtt=71 n=2 mbps=18.8  sender cs/GB mean=61.02 min=57.14 max=64.90 | receiver(chrome) cs/GB mean=28.70
+cap=0         prod chunk=fixed64K rtt=12 n=3 mbps=496.9  sender cs/GB mean=53.96 min=52.01 max=55.65 | receiver(chrome) cs/GB mean=18.97
+cap=0         raw  chunk=16KiB  rtt=12 n=2 mbps=428.8  sender cs/GB mean=51.91 min=51.42 max=52.41 | receiver(chrome) cs/GB mean=20.88
+cap=0         raw  chunk=64KiB  rtt=12 n=2 mbps=452.1  sender cs/GB mean=51.82 min=50.82 max=52.82 | receiver(chrome) cs/GB mean=18.81
+cap=0         raw  chunk=256KiB rtt=12 n=2 mbps=476.3  sender cs/GB mean=51.74 min=51.56 max=51.93 | receiver(chrome) cs/GB mean=17.55
+
+=== prod vs raw paired deltas (per-byte app layer) ===
+64MiB cap10 rtt12 (prod first)             prod mean=58.84 raw mean=51.76  delta mean=+7.08 (paired +8.53,+1.88,+10.83)  => app layer 12.0% of prod
+64MiB cap10 rtt71 (prod first)             prod mean=55.35 raw mean=58.04  delta mean=-2.69 (paired +8.12,-5.03,-11.16)  => app layer -4.9% of prod
+128MiB cap10 rtt12 (prod first)            prod mean=53.23 raw mean=50.33  delta mean=+2.90 (paired +2.74,+3.23,+2.73)  => app layer 5.5% of prod
+128MiB cap10 rtt12 (RAW first)             prod mean=52.37 raw mean=51.10  delta mean=+1.27 (paired +2.27,+0.28)  => app layer 2.4% of prod
+128MiB cap10 rtt71 (RAW first, collapsed)  prod mean=65.75 raw mean=68.49  delta mean=-2.74 (paired -3.56,-1.91)  => app layer -4.2% of prod
+64MiB cap30 rtt12 (prod first)             prod mean=46.19 raw mean=44.46  delta mean=+1.73 (paired -0.70,+2.75,+3.13)  => app layer 3.7% of prod
+64MiB uncap rtt12 (prod first)             prod mean=53.96 raw mean=52.66  delta mean=+1.30 (paired +2.24,-0.06,+1.73)  => app layer 2.4% of prod
+
+=== chunk sweep, raw, cs/GB (CPU per byte) and throughput ===
+  cap10MB(80Mbps) rtt12  chunk=16KiB   n=5 mbps=44.6 cs/GB=59.84  ceilings: 17 Mbps
+  cap10MB(80Mbps) rtt12  chunk=64KiB   n=5 mbps=56.4 cs/GB=56.58  ceilings: 18 Mbps
+  cap10MB(80Mbps) rtt12  chunk=256KiB  n=5 mbps=52.6 cs/GB=58.06  ceilings: 17 Mbps
+  cap10MB(80Mbps) rtt71  chunk=16KiB   n=5 mbps=44.6 cs/GB=59.84  ceilings: 17 Mbps
+  cap10MB(80Mbps) rtt71  chunk=64KiB   n=5 mbps=56.4 cs/GB=56.58  ceilings: 18 Mbps
+  cap10MB(80Mbps) rtt71  chunk=256KiB  n=5 mbps=52.6 cs/GB=58.06  ceilings: 17 Mbps
+  uncap rtt12            chunk=16KiB   n=2 mbps=428.8 cs/GB=51.91  ceilings: 19 Mbps
+  uncap rtt12            chunk=64KiB   n=2 mbps=452.1 cs/GB=51.82  ceilings: 19 Mbps
+  uncap rtt12            chunk=256KiB  n=2 mbps=476.3 cs/GB=51.74  ceilings: 19 Mbps
+
+=== expected wire footprint (per GB), rtt12 cap10 prod/raw ===
+  e23-prod-rtt12-cap10MB-r1      datagrams/MiB=1344.8 payload/dg=779.7 B  dg per GB=1376973  dg per CPU-s=22031
+  e23-raw64-rtt12-cap10MB-r1     datagrams/MiB=1344.7 payload/dg=779.8 B  dg per GB=1376973  dg per CPU-s=25513
+
+=== chrome (receiver) per-GB cost, key arms ===
+  e23-prod-rtt12-cap10MB-r1          chrome cs/GB=31.1  cores=0.292  (sender cs/GB=62.5)
+  e23-raw64-rtt12-cap10MB-r1         chrome cs/GB=28.2  cores=0.264  (sender cs/GB=54.0)
+  e23-prod-rtt12-uncap-r1            chrome cs/GB=18.6  cores=1.165  (sender cs/GB=54.2)
+  e23-raw64-rtt12-uncap-r1           chrome cs/GB=18.5  cores=1.077  (sender cs/GB=52.0)
+  e23-deep-prod-rtt12-cap10MB-r1     chrome cs/GB=30.3  cores=0.282  (sender cs/GB=53.4)
+  e23-deep-raw64-rtt12-cap10MB-r1    chrome cs/GB=29.9  cores=0.278  (sender cs/GB=50.6)

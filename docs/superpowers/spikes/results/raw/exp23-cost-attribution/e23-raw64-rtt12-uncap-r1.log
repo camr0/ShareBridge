@@ -1,0 +1,2 @@
+trace raw conns=1 rtt=12 loss=0 mbps/100ms: 0 0 0 0 0 73 503 514 446 477 482 451 509 509 509 451 446 | shim fwd=87173 writeErr=0 drop=0 | chrome_cpu=1.45s (1.08 cores) go_cpu=3.49s
+mode=raw conns=1 sharing=shared rtt=12ms jitter=0ms bw=0 loss=0 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=466.16 Mbps wall=434.08 Mbps chrome_cores=1.08 go_cpu=3.49s

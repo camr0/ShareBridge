@@ -1,0 +1,135 @@
+PHASES=sanity 17:53:20
+START e23-sanity-raw-rtt71 17:53:21 --mode raw --rtt 71 --size 32MiB --chunk 64KiB
+OK    e23-sanity-raw-rtt71 17:53:48
+START e23-sanity-raw-rtt71-b 17:53:49 --mode raw --rtt 71 --size 32MiB --chunk 64KiB
+OK    e23-sanity-raw-rtt71-b 17:54:10
+DONE  17:54:10
+PHASES=layer 17:54:18
+START e23-prod-rtt12-cap10MB-r1 17:54:18 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 12 --bandwidth 10MB
+OK    e23-prod-rtt12-cap10MB-r1 17:54:27
+START e23-raw64-rtt12-cap10MB-r1 17:54:27 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12 --bandwidth 10MB
+OK    e23-raw64-rtt12-cap10MB-r1 17:54:36
+START e23-prod-rtt71-cap10MB-r1 17:54:36 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 71 --bandwidth 10MB
+OK    e23-prod-rtt71-cap10MB-r1 17:54:46
+START e23-raw64-rtt71-cap10MB-r1 17:54:46 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 71 --bandwidth 10MB
+OK    e23-raw64-rtt71-cap10MB-r1 17:54:55
+START e23-prod-rtt12-cap10MB-r2 17:54:55 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 12 --bandwidth 10MB
+OK    e23-prod-rtt12-cap10MB-r2 17:55:04
+START e23-raw64-rtt12-cap10MB-r2 17:55:04 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12 --bandwidth 10MB
+OK    e23-raw64-rtt12-cap10MB-r2 17:55:16
+START e23-prod-rtt71-cap10MB-r2 17:55:16 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 71 --bandwidth 10MB
+OK    e23-prod-rtt71-cap10MB-r2 17:55:25
+START e23-raw64-rtt71-cap10MB-r2 17:55:25 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 71 --bandwidth 10MB
+OK    e23-raw64-rtt71-cap10MB-r2 17:55:56
+START e23-prod-rtt12-cap10MB-r3 17:55:56 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 12 --bandwidth 10MB
+OK    e23-prod-rtt12-cap10MB-r3 17:56:05
+START e23-raw64-rtt12-cap10MB-r3 17:56:05 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12 --bandwidth 10MB
+OK    e23-raw64-rtt12-cap10MB-r3 17:56:14
+START e23-prod-rtt71-cap10MB-r3 17:56:14 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 71 --bandwidth 10MB
+OK    e23-prod-rtt71-cap10MB-r3 17:56:23
+START e23-raw64-rtt71-cap10MB-r3 17:56:23 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 71 --bandwidth 10MB
+OK    e23-raw64-rtt71-cap10MB-r3 17:57:09
+DONE  17:57:09
+PHASES=uncap chunk prodchunk 17:57:19
+START e23-prod-rtt12-uncap-r1 17:57:19 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 12
+OK    e23-prod-rtt12-uncap-r1 17:57:22
+START e23-raw64-rtt12-uncap-r1 17:57:22 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12
+OK    e23-raw64-rtt12-uncap-r1 17:57:24
+START e23-prod-rtt12-uncap-r2 17:57:24 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 12
+OK    e23-prod-rtt12-uncap-r2 17:57:27
+START e23-raw64-rtt12-uncap-r2 17:57:27 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12
+OK    e23-raw64-rtt12-uncap-r2 17:57:29
+START e23-prod-rtt12-uncap-r3 17:57:29 --size 64MiB --queue 5MB --deadline 300 --mode prod --chunk 16KiB --rtt 12
+OK    e23-prod-rtt12-uncap-r3 17:57:32
+START e23-raw64-rtt12-uncap-r3 17:57:32 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12
+OK    e23-raw64-rtt12-uncap-r3 17:57:35
+START e23-rawchunk16KiB-rtt12-cap10MB-r1 17:57:35 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 16KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk16KiB-rtt12-cap10MB-r1 17:57:44
+START e23-rawchunk64KiB-rtt12-cap10MB-r1 17:57:44 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk64KiB-rtt12-cap10MB-r1 17:57:52
+START e23-rawchunk256KiB-rtt12-cap10MB-r1 17:57:52 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 256KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk256KiB-rtt12-cap10MB-r1 17:58:01
+START e23-rawchunk16KiB-rtt12-cap10MB-r2 17:58:01 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 16KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk16KiB-rtt12-cap10MB-r2 17:58:13
+START e23-rawchunk64KiB-rtt12-cap10MB-r2 17:58:13 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk64KiB-rtt12-cap10MB-r2 17:58:21
+START e23-rawchunk256KiB-rtt12-cap10MB-r2 17:58:21 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 256KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk256KiB-rtt12-cap10MB-r2 17:58:30
+START e23-rawchunk16KiB-rtt12-cap10MB-r3 17:58:30 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 16KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk16KiB-rtt12-cap10MB-r3 17:58:39
+START e23-rawchunk64KiB-rtt12-cap10MB-r3 17:58:39 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk64KiB-rtt12-cap10MB-r3 17:58:48
+START e23-rawchunk256KiB-rtt12-cap10MB-r3 17:58:48 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 256KiB --rtt 12 --bandwidth 10MB
+OK    e23-rawchunk256KiB-rtt12-cap10MB-r3 17:58:57
+START e23-rawchunk16KiB-rtt71-cap10MB-r1 17:58:57 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 16KiB --rtt 71 --bandwidth 10MB
+OK    e23-rawchunk16KiB-rtt71-cap10MB-r1 17:59:50
+START e23-rawchunk64KiB-rtt71-cap10MB-r1 17:59:50 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 71 --bandwidth 10MB
+OK    e23-rawchunk64KiB-rtt71-cap10MB-r1 18:00:19
+START e23-rawchunk256KiB-rtt71-cap10MB-r1 18:00:19 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 256KiB --rtt 71 --bandwidth 10MB
+OK    e23-rawchunk256KiB-rtt71-cap10MB-r1 18:01:11
+START e23-rawchunk16KiB-rtt71-cap10MB-r2 18:01:12 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 16KiB --rtt 71 --bandwidth 10MB
+OK    e23-rawchunk16KiB-rtt71-cap10MB-r2 18:02:10
+START e23-rawchunk64KiB-rtt71-cap10MB-r2 18:02:10 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 71 --bandwidth 10MB
+OK    e23-rawchunk64KiB-rtt71-cap10MB-r2 18:02:26
+START e23-rawchunk256KiB-rtt71-cap10MB-r2 18:02:26 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 256KiB --rtt 71 --bandwidth 10MB
+OK    e23-rawchunk256KiB-rtt71-cap10MB-r2 18:02:48
+START e23-rawchunk16KiB-rtt12-uncap-r1 18:02:49 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 16KiB --rtt 12
+OK    e23-rawchunk16KiB-rtt12-uncap-r1 18:02:51
+START e23-rawchunk64KiB-rtt12-uncap-r1 18:02:51 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12
+OK    e23-rawchunk64KiB-rtt12-uncap-r1 18:02:54
+START e23-rawchunk256KiB-rtt12-uncap-r1 18:02:54 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 256KiB --rtt 12
+OK    e23-rawchunk256KiB-rtt12-uncap-r1 18:02:56
+START e23-rawchunk16KiB-rtt12-uncap-r2 18:02:57 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 16KiB --rtt 12
+OK    e23-rawchunk16KiB-rtt12-uncap-r2 18:02:59
+START e23-rawchunk64KiB-rtt12-uncap-r2 18:02:59 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 64KiB --rtt 12
+OK    e23-rawchunk64KiB-rtt12-uncap-r2 18:03:02
+START e23-rawchunk256KiB-rtt12-uncap-r2 18:03:02 --size 64MiB --queue 5MB --deadline 300 --mode raw --chunk 256KiB --rtt 12
+OK    e23-rawchunk256KiB-rtt12-uncap-r2 18:03:05
+START e23-prodchunk16KiB-rtt12-cap10MB 18:03:05 --mode prod --chunk 16KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 10MB
+OK    e23-prodchunk16KiB-rtt12-cap10MB 18:03:13
+START e23-prodchunk256KiB-rtt12-cap10MB 18:03:13 --mode prod --chunk 256KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 10MB
+OK    e23-prodchunk256KiB-rtt12-cap10MB 18:03:22
+DONE  18:03:22
+START e23-deep-prod-rtt12-cap10MB-r1 18:04:17 --mode prod --chunk 16KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-deep-prod-rtt12-cap10MB-r1 18:04:34
+START e23-deep-raw64-rtt12-cap10MB-r1 18:04:34 --mode raw --chunk 64KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-deep-raw64-rtt12-cap10MB-r1 18:04:50
+START e23-deep-prod-rtt12-cap10MB-r2 18:04:50 --mode prod --chunk 16KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-deep-prod-rtt12-cap10MB-r2 18:05:06
+START e23-deep-raw64-rtt12-cap10MB-r2 18:05:06 --mode raw --chunk 64KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-deep-raw64-rtt12-cap10MB-r2 18:05:22
+START e23-deep-prod-rtt12-cap10MB-r3 18:05:22 --mode prod --chunk 16KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-deep-prod-rtt12-cap10MB-r3 18:05:38
+START e23-deep-raw64-rtt12-cap10MB-r3 18:05:38 --mode raw --chunk 64KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-deep-raw64-rtt12-cap10MB-r3 18:05:54
+DONE deep 18:05:54
+START e23-mid-prod-rtt12-cap30MB-r1 18:05:54 --mode prod --chunk 16KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 30MB
+OK    e23-mid-prod-rtt12-cap30MB-r1 18:06:03
+START e23-mid-raw64-rtt12-cap30MB-r1 18:06:03 --mode raw --chunk 64KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 30MB
+OK    e23-mid-raw64-rtt12-cap30MB-r1 18:06:07
+START e23-mid-prod-rtt12-cap30MB-r2 18:06:07 --mode prod --chunk 16KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 30MB
+OK    e23-mid-prod-rtt12-cap30MB-r2 18:06:10
+START e23-mid-raw64-rtt12-cap30MB-r2 18:06:10 --mode raw --chunk 64KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 30MB
+OK    e23-mid-raw64-rtt12-cap30MB-r2 18:06:20
+START e23-mid-prod-rtt12-cap30MB-r3 18:06:20 --mode prod --chunk 16KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 30MB
+OK    e23-mid-prod-rtt12-cap30MB-r3 18:06:24
+START e23-mid-raw64-rtt12-cap30MB-r3 18:06:24 --mode raw --chunk 64KiB --size 64MiB --queue 5MB --deadline 300 --rtt 12 --bandwidth 30MB
+OK    e23-mid-raw64-rtt12-cap30MB-r3 18:06:27
+DONE mid 18:06:27
+START e23-abba-raw64-rtt12-cap10MB-r1 18:07:06 --mode raw --chunk 64KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-abba-raw64-rtt12-cap10MB-r1 18:07:22
+START e23-abba-prod-rtt12-cap10MB-r1 18:07:22 --mode prod --chunk 16KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-abba-prod-rtt12-cap10MB-r1 18:07:38
+START e23-abba-raw64-rtt71-cap10MB-r1 18:07:38 --mode raw --chunk 64KiB --size 128MiB --queue 5MB --deadline 600 --rtt 71 --bandwidth 10MB
+OK    e23-abba-raw64-rtt71-cap10MB-r1 18:09:36
+START e23-abba-prod-rtt71-cap10MB-r1 18:09:36 --mode prod --chunk 16KiB --size 128MiB --queue 5MB --deadline 600 --rtt 71 --bandwidth 10MB
+OK    e23-abba-prod-rtt71-cap10MB-r1 18:11:25
+START e23-abba-raw64-rtt12-cap10MB-r2 18:11:25 --mode raw --chunk 64KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-abba-raw64-rtt12-cap10MB-r2 18:11:41
+START e23-abba-prod-rtt12-cap10MB-r2 18:11:41 --mode prod --chunk 16KiB --size 128MiB --queue 5MB --deadline 600 --rtt 12 --bandwidth 10MB
+OK    e23-abba-prod-rtt12-cap10MB-r2 18:11:57
+START e23-abba-raw64-rtt71-cap10MB-r2 18:11:57 --mode raw --chunk 64KiB --size 128MiB --queue 5MB --deadline 600 --rtt 71 --bandwidth 10MB
+OK    e23-abba-raw64-rtt71-cap10MB-r2 18:13:53
+START e23-abba-prod-rtt71-cap10MB-r2 18:13:53 --mode prod --chunk 16KiB --size 128MiB --queue 5MB --deadline 600 --rtt 71 --bandwidth 10MB
+OK    e23-abba-prod-rtt71-cap10MB-r2 18:15:48
+DONE abba 18:15:48
