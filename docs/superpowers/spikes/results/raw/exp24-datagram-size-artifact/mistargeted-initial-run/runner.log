@@ -1,0 +1,12 @@
+=== exp24-raw16-r1 2026-09-18T22:42:56Z
+18:42  up 19 days,  1:01, 24 users, load averages: 2.68 2.82 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+OK exp24-raw16-r1 mbps=48.08 sent=67108864 recv=67108864 fwd=87027 drop=0 go_cpu=2.9939 chrome_cpu=1.330
+=== exp24-raw16-r2 2026-09-18T22:43:10Z
+18:43  up 19 days,  1:01, 24 users, load averages: 2.88 2.86 3.00
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+OK exp24-raw16-r2 mbps=40.95 sent=67108864 recv=67108864 fwd=87666 drop=1245 go_cpu=3.1728 chrome_cpu=1.510
+=== exp24-raw16-r3 2026-09-18T22:43:24Z
+18:43  up 19 days,  1:01, 24 users, load averages: 2.75 2.83 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+OK exp24-raw16-r3 mbps=45.36 sent=67108864 recv=67108864 fwd=86927 drop=0 go_cpu=3.0384 chrome_cpu=1.530

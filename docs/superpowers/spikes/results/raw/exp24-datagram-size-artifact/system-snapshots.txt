@@ -1,0 +1,9 @@
+=== host snapshot 2026-09-18T22:41:26Z (pre-block)
+18:41  up 19 days, 59 mins, 24 users, load averages: 2.68 2.85 3.02
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ %CPU COMM
+ 60.2 /System/Library/Frameworks/CoreSpotlight.framework/spotlightknowledged
+ 22.2 /usr/sbin/cfprefsd
+ 15.4 pi
+ 12.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 10.7 /Applications/cmux.app/Contents/MacOS/cmux

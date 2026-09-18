@@ -268,6 +268,35 @@ capacity:
 - Rig restored and independently verified after the sweep (`sb-agent:pristine`, `NanoCpus=0`, `UI_PORT=7879`,
   `SB_SCTP_CA_STEP=32768`, no `SB_SCTP_MIN_CWND`, signalling 200, clients clean).
 
+## F14 — E24 resolves the datagram contradiction: there was **no** lab/field difference — E23's number was an averaging error
+- **Measured (lab, `--mode raw`, 16 KiB chunk, rate-capped): strongly bimodal.** DATA **53,260 × 1237 B wire**
+  (1200-B SCTP = 28 header + **1172 payload**, + 37 DTLS) and **4,097 × 1213 B** (the last fragment; 13.00:1, as
+  predicted); SACK **28,551 × 65 B**. **Nothing between 70 and 1150 B.** pion's own `Association.MTU()` reads
+  **1200**. Payload per *data* datagram **1169.6 B**.
+- **The field agrees with the lab to within 0.4 %:** lab **896.6 data + 450.3 SACK = 1346.8 datagrams/MiB** vs the
+  field's measured **896 data + 448.7 SACK** (E1). So the harness **is** representative on packet structure —
+  a lab/field corroboration worth having, and the opposite of the discrepancy I suspected.
+- **E23's "779.7 B per datagram" was payload ÷ ALL datagrams (67,108,864 / 86,198 = 778.5 B) — a mixed average
+  including SACKs, not a size.** With that corrected, **E23's headline fork recommendation ("collapse datagram
+  count") does not survive**: the only count headroom is the fragment tail (~0.1 %). F12's artifact-2 flag was
+  right to withhold it.
+- **Correction to E1's packet model (small, ~2 %):** E1's "1228-B SCTP packet" came from reading the *overridden*
+  `initialMTU`. pion/webrtc v4 applies **`WithMTU(outboundMTU=1200)` in both roles
+  (`sctptransport.go:120,164`)**, so the real packet is **1200 B SCTP (1172 payload + 28 header) on a 1237-B wire
+  datagram**. E1's *datagram counts* were correct; its *size attribution* was high by ~2 %. Also note this is a
+  **hard-coded 1200**, i.e. production leaves path-MTU headroom unused by design.
+- **Corrected production-representative cost: ≈32–43 CPU-s/GB (central ≈37)**, down from the 46 headline, after
+  subtracting the shim's per-datagram relay (10–10.5) and the chromedp poll (3–5). VERSA's field figure
+  (63–113 CPU-s/GB) is then **1.7–3×** the corrected lab number — consistent with a server core being ~2× an
+  Apple-silicon core, which is the same story F11 told.
+- **Fork headroom, honestly bounded — this is everything left after E22 + E23 + E24:** (i) **MTU 1200 → path MTU
+  (~7–10 %** of rate, and PMTU-discovery-risky — the hard-coded 1200 is the reason); (ii) **GSO / syscall
+  batching (≤10 CPU-s/GB** of ~37, unquantified); (iii) **per-datagram allocations** (needs `pprof` to size).
+  **Combined, that is ≈1.2–1.4× at best — not the ~2× v1 direct would need to reach relay class, and it cannot
+  be the whole story anyway, because E21 shows the sender sitting on unused CPU headroom at the plateau.**
+- **Caveat:** E24's sanity gate also failed (8.4/9.6 Mbps vs ≈100 expected) — absolutes are banded; the
+  *structural* findings (bimodality, `MTU()=1200`, and the field-matching counts) are load-independent.
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the

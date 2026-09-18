@@ -1,0 +1,3 @@
+exp24 sctp conn=0 mtu=1200 bytes_sent=68893300 bytes_recv=946172 cwnd=451632
+trace raw conns=1 rtt=0 loss=0 mbps/100ms: 0 0 0 105 64 83 73 73 75 37 0 0 0 0 0 0 0 0 0 0 469 75 73 73 75 73 73 75 73 75 73 73 73 75 73 73 75 73 75 73 73 73 75 73 73 75 73 73 75 73 75 73 73 73 75 75 73 73 73 75 73 73 75 73 73 75 73 73 75 73 73 75 73 75 73 73 75 73 73 75 31 | shim fwd=88263 writeErr=0 drop=149 | chrome_cpu=2.06s (0.26 cores) go_cpu=3.67s
+mode=raw conns=1 sharing=shared rtt=0ms jitter=0ms bw=10000000 loss=0 queue=0 rtomax=0ms sent=67108864 received=67108864 throughput=69.87 Mbps wall=69.13 Mbps chrome_cores=0.26 go_cpu=3.67s

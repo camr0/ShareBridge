@@ -1,0 +1,11 @@
+/bin/bash: line 4: ./udprelay: No such file or directory
+/bin/bash: line 4: ./udprelay: No such file or directory
+/bin/bash: line 4: ./udprelay: No such file or directory
+/bin/bash: line 4: ./udprelay: No such file or directory
+=== exp24 microbench (E23 instrument, corrected dg=1237) 2026-09-18T22:46:58Z
+18:46  up 19 days,  1:05, 24 users, load averages: 3.47 3.17 3.09
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+{"bench":"udprelay","mode":"sendrelay","dg":1237,"delay_us":0,"rate_bps":10000000,"bytes":16777216,"wall_s":1.9498,"cpu_s":0.4353,"cpu_s_per_gb":25.945,"us_per_datagram":32.0935}
+{"bench":"udprelay","mode":"sendrelay","dg":1237,"delay_us":0,"rate_bps":10000000,"bytes":16777216,"wall_s":1.9529,"cpu_s":0.4434,"cpu_s_per_gb":26.426,"us_per_datagram":32.6891}
+{"bench":"udprelay","mode":"sendrelay","dg":1237,"delay_us":0,"rate_bps":0,"bytes":16777216,"wall_s":0.0599,"cpu_s":0.1059,"cpu_s_per_gb":6.310,"us_per_datagram":7.8051}
+{"bench":"udprelay","mode":"sendrelay","dg":1237,"delay_us":0,"rate_bps":0,"bytes":16777216,"wall_s":0.0598,"cpu_s":0.1001,"cpu_s_per_gb":5.964,"us_per_datagram":7.3779}
