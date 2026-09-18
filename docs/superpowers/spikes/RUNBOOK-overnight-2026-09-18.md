@@ -51,6 +51,10 @@ then the ones that need a small harness change. Order of dispatch is easiest-win
    cleanup `pkill -x node|chrome|Xvfb` destroys whatever cell is in flight — including another
    agent's. This actually happened on 2026-09-18: a stuck agent's exit cleanup killed the live
    agent's just-started cross-host cell. If you are not sure, leave the processes and report them.
+13. **WRITE YOUR RESULTS FILE INCREMENTALLY — after every cell, not at the end.** Two agents tonight
+   died on provider rate limits mid-run; one had taken 135 tool calls' worth of measurements and lost
+   all of it because the results file was never written. Append each cell (raw numbers + timestamps)
+   to your results file as soon as you have it. A crash must cost at most one cell.
 10. **If the rig is unhealthy** (agent 7879 down, signalling not HTTP 200, a client VM unreachable):
     STOP and report. Do not improvise infrastructure changes.
 
