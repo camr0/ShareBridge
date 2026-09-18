@@ -43,6 +43,17 @@ test rig unless marked lab.
 
 ### 1. Headline: the v2 relay transport is 2.1–3.8× faster than v1, reproducibly
 
+> **CONFOUND — added 2026-09-18 (F18). Read before quoting this table.** The v2 arms were measured through the
+> browser's **native HTTP download** (`Content-Disposition: attachment`, **zero page-JS** —
+> `phase-4a/agent/internal/direct/static/app.js:1-7`, `gallery.js:157`, `handlers.go:347`), while every v1 arm
+> had to use the app's **JS** receive path (DataChannel + SHA-1 + StreamSaver). **The ratios below therefore
+> compare transport AND client implementation together, not transport alone** — they are not a pure transport
+> result and the v1-vs-v2 decision must not rest on them as if they were. v1's transport ceiling is *not*
+> established at ~120 Mbps: the same pion stack reaches **521–533 Mbps uncapped** on loopback (E22) and the field
+> path carries ~246 Mbps, so with a client that keeps up v1 direct could sit near the path limit. The
+> fair-transport experiment is **E28** (bare receive path); until it lands, treat the multipliers here as an
+> upper bound on the transport difference, with an unknown client contribution inside them.
+
 | path | v1 (WebRTC DataChannel) | v2 (relay: TLS/HTTP over gateway + FRP TCP) | ratio |
 |---|---|---|---|
 | CLIENT-EAST ~12 ms | **102–111 Mbps** (n=3) | **233.3–233.7 Mbps** (n=3, spread 0.18%) | **2.1–2.3×** |

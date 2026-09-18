@@ -1,5 +1,11 @@
 # Experiment 10b — v1 arms (salvaged) and the v2-phase failure — 2026-09-18
 
+> **CONFOUND (found 2026-09-18, F18).** The v1 arms here are legitimate **v1** measurements (app JS receive
+> path), but any comparison against E10/E10c's v2 arms compares **transport and client implementation
+> together**: those v2 numbers came from the browser's **native HTTP download** (`Content-Disposition:
+> attachment`, zero page-JS), not from a JS receive path. Do not quote v1-vs-v2 ratios from these files as a
+> pure transport result. See `ACTIONABLE-FINDINGS-2026-09-18.md` F18.
+
 **Status:** this agent died on a provider usage limit (`openai-codex`) after ~135 tool calls and ~11
 minutes, and wrote **no results file**. Its four v1 cells are recovered from the v1 agent's own log
 (`sb-run`, UTC timestamps) and are valid measurements. Its v2 phase produced **no measurement**. The

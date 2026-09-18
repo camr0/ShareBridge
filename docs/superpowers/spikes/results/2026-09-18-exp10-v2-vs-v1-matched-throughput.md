@@ -1,5 +1,13 @@
 # Experiment 10 — matched v2 vs v1 field throughput — 2026-09-18
 
+> **CONFOUND — read before quoting the ratio (found 2026-09-18, F18).** The v2 arms here were measured through
+> the browser's **native HTTP download** (`Content-Disposition: attachment`, **zero page-JS** — see
+> `phase-4a/agent/internal/direct/static/app.js:1-7`, `gallery.js:157`, `handlers.go:347`), while every v1 arm
+> had to use the app's **JS** receive path (DataChannel + SHA-1 + StreamSaver). These ratios therefore compare
+> **transport and client implementation together** and must not be quoted as a pure transport result. v1's
+> transport ceiling is **not** established at ~120 Mbps: the same pion stack does 521–533 Mbps uncapped on
+> loopback (E22) and the field path carries ~246 Mbps. The fair-transport comparison is E28 (bare receive path).
+
 **Verdict:** On CLIENT-EAST, v1 delivered **112.034 Mbps** and the v2 **relay** delivered **233.285 Mbps** for exactly 790,626,304 client bytes: v2 was **2.082× v1**, or **94.60%** of the EAST 246.6 Mbps UDP path reference versus v1's **45.43%**. This is a byte-volume/direction match, not a byte-identical-content or browser-sink match (details below).
 
 **Setup:** Both arms delivered 754 MiB (790,626,304 bytes = 6,325.01 Mb) agent → CLIENT-EAST in the same field session. v1 used one `drive_click.js` tab and the required agent-side window from first `DataChannel lanes ready` to `download complete`. v2 used the already-deployed phase-4a TEST systemd stack plus `docker compose start sharebridge-agent-test` from its existing TEST compose project, then the existing harness's relay-content request shape (`prepare-route` → relay origin → full asset curl). The v2 client stopped a larger TEST Immich original after exactly 790,626,304 received bytes; its wall interval used nanosecond timestamps around curl-to-sink. Hosts are named only as VERSA, TESTBOX, CLIENT-EAST, and CLIENT-WEST.
