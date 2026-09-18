@@ -28,6 +28,9 @@ func main() {
 	queue := flag.String("queue", "0", "bottleneck buffer depth (e.g. 5MB), 0 = derive from -bandwidth (100ms)")
 	rtoMax := flag.String("rtomax", "0", "SCTP max RTO (e.g. 200ms). Below 1s this also lowers the effective RTO floor, 0 = pion default (60s)")
 	cwndCAStep := flag.String("cwndcastep", "0", "SCTP congestion-avoidance cwnd step (e.g. 32KB), 0 = default (1 MTU)")
+	fastRtxWnd := flag.String("fastrtxwnd", "0", "SCTP fast-retransmit burst window in bytes (e.g. 64KiB), 0 = pion default (1 MTU = 1200 B)")
+	maxRxBuf := flag.String("maxrxbuf", "0", "SCTP max receive buffer size in bytes (e.g. 4MiB), 0 = pion default (1MiB)")
+	maxMsg := flag.String("maxmsg", "0", "SCTP max message size in bytes (e.g. 256KiB), 0 = pion default")
 	conns := flag.Int("conns", 1, "number of parallel PeerConnections (raw mode)")
 	sharing := flag.String("sharing", "shared", "shared|independent bottleneck across connections")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
@@ -77,6 +80,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid -cwndcastep:", cwndCAStepErr)
 		os.Exit(2)
 	}
+	fastRtxWndBytes, fastRtxWndErr := parseByteSize(*fastRtxWnd)
+	if fastRtxWndErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -fastrtxwnd:", fastRtxWndErr)
+		os.Exit(2)
+	}
+	maxRxBufBytes, maxRxBufErr := parseByteSize(*maxRxBuf)
+	if maxRxBufErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -maxrxbuf:", maxRxBufErr)
+		os.Exit(2)
+	}
+	maxMsgBytes, maxMsgErr := parseByteSize(*maxMsg)
+	if maxMsgErr != nil {
+		fmt.Fprintln(os.Stderr, "invalid -maxmsg:", maxMsgErr)
+		os.Exit(2)
+	}
 
 	cfg := runConfig{
 		mode:         *mode,
@@ -93,6 +111,9 @@ func main() {
 		queue:        queueBytes,
 		rtoMax:       rtoMaxDur,
 		cwndCAStep:   cwndCAStepBytes,
+		fastRtxWnd:   fastRtxWndBytes,
+		maxRxBuf:     maxRxBufBytes,
+		maxMsg:       maxMsgBytes,
 		conns:        *conns,
 		sharing:      *sharing,
 	}
@@ -166,6 +187,18 @@ func validateRunConfig(cfg runConfig) error {
 	}
 	if cfg.cwndCAStep < 0 {
 		return fmt.Errorf("invalid -cwndcastep %d: must be >= 0", cfg.cwndCAStep)
+	}
+	for _, sctpSetting := range []struct {
+		flag string
+		val  int64
+	}{
+		{"-fastrtxwnd", cfg.fastRtxWnd},
+		{"-maxrxbuf", cfg.maxRxBuf},
+		{"-maxmsg", cfg.maxMsg},
+	} {
+		if sctpSetting.val < 0 || sctpSetting.val > int64(math.MaxUint32) {
+			return fmt.Errorf("invalid %s %d: must be between 0 and %d (uint32)", sctpSetting.flag, sctpSetting.val, int64(math.MaxUint32))
+		}
 	}
 	if cfg.deadline <= 0 {
 		return fmt.Errorf("invalid -deadline %v: must be > 0", cfg.deadline)

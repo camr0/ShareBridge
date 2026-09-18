@@ -1,0 +1,165 @@
+START e14-base-loss0-mc0-r1 2026-09-18T17:50:39Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0
+OK e14-base-loss0-mc0-r1 2026-09-18T17:50:50Z
+trace prod rtt=12 loss=0 mbps/100ms: 0 0 0 0 16 110 68 68 79 42 47 47 58 58 63 73 68 68 52 52 26 37 26 47 42 52 52 58 63 52 37 47 47 52 52 63 37 42 42 47 52 52 58 63 73 73 73 42 47 52 58 63 37 42 42 47 52 58 52 68 73 73 52 47 47 63 63 52 68 5 0 0 0 0 0 0 0 0 0 377 16 26 31 37 37 42 52 52 58 58 42 42 47 47 58 58 68 68 73 73 73 52 47 52 63 63 68 | shim fwd=88881 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=52.24 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-base-loss0-mc0-r2 2026-09-18T17:50:51Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0
+OK e14-base-loss0-mc0-r2 2026-09-18T17:50:54Z
+trace prod rtt=12 loss=0 mbps/100ms: 0 0 0 0 16 419 225 215 225 220 225 220 220 220 220 225 220 225 215 225 220 220 225 220 220 220 220 225 | shim fwd=86060 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=228.96 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+PHASE base done 2026-09-18T17:50:55Z
+START e14-loss0.001-mc0-r1 2026-09-18T17:50:58Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001
+OK e14-loss0.001-mc0-r1 2026-09-18T17:51:19Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 16 131 115 63 68 52 42 37 26 31 42 26 16 21 16 16 21 26 16 21 26 16 21 21 16 26 21 37 16 16 21 21 26 21 26 47 37 37 26 31 21 16 16 21 10 21 21 26 31 37 42 42 26 31 21 21 26 31 31 37 21 26 21 26 26 16 21 21 21 21 31 31 26 16 16 21 26 31 31 21 16 21 21 26 21 26 26 21 26 26 31 31 37 26 26 16 21 16 21 21 21 16 26 21 16 16 16 21 16 21 26 21 21 26 31 42 37 21 31 26 21 26 31 42 26 31 26 37 47 37 10 16 10 10 21 26 26 37 37 26 21 37 37 42 47 52 42 26 26 26 26 37 37 26 31 26 31 21 16 21 21 31 31 42 42 47 47 31 37 26 26 31 37 21 26 21 16 16 16 21 21 31 21 26 21 16 26 21 21 21 21 21 21 21 26 | shim fwd=87459 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=27.61 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc2MiB-r1 2026-09-18T17:51:19Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 2MiB
+OK e14-loss0.001-mc2MiB-r1 2026-09-18T17:51:23Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 231 372 58 210 246 320 115 257 163 346 94 241 325 210 94 178 225 367 89 210 189 220 372 210 | shim fwd=109571 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=224.23 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc4MiB-r1 2026-09-18T17:51:23Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 4MiB
+OK e14-loss0.001-mc4MiB-r1 2026-09-18T17:51:26Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 5 488 0 388 16 540 21 199 199 409 0 414 42 0 524 0 551 79 0 425 0 440 0 519 110 | shim fwd=109012 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=222.31 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc8MiB-r1 2026-09-18T17:51:27Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 8MiB
+OK e14-loss0.001-mc8MiB-r1 2026-09-18T17:51:30Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 0 446 0 393 0 561 121 0 404 0 383 73 409 0 388 31 346 10 472 257 52 336 231 0 456 | shim fwd=111053 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=230.58 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc0-r1 2026-09-18T17:51:31Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002
+OK e14-loss0.0002-mc0-r1 2026-09-18T17:51:39Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 31 425 220 220 220 147 152 110 68 47 52 52 52 63 73 68 79 89 73 52 52 58 63 73 79 52 42 52 52 58 73 68 68 89 84 84 84 52 58 58 68 47 37 47 47 58 58 63 68 68 47 47 47 63 58 47 37 47 47 52 58 58 68 68 73 79 63 42 26 37 37 42 47 | shim fwd=87528 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=73.81 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc2MiB-r1 2026-09-18T17:51:39Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 2MiB
+OK e14-loss0.0002-mc2MiB-r1 2026-09-18T17:51:43Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 362 246 220 147 0 503 142 299 220 220 157 283 220 105 336 220 126 309 220 184 157 315 126 | shim fwd=95143 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=229.00 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc4MiB-r1 2026-09-18T17:51:43Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 4MiB
+OK e14-loss0.0002-mc4MiB-r1 2026-09-18T17:51:46Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 136 435 0 467 37 372 246 58 372 225 220 225 163 0 488 0 430 215 0 393 0 477 225 184 | shim fwd=100514 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=227.40 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc8MiB-r1 2026-09-18T17:51:47Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 8MiB
+OK e14-loss0.0002-mc8MiB-r1 2026-09-18T17:51:50Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 262 346 220 225 215 58 372 0 0 231 21 561 0 456 173 0 477 136 0 367 325 0 472 121 0 | shim fwd=102701 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=216.01 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc0-r2 2026-09-18T17:51:51Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001
+OK e14-loss0.001-mc0-r2 2026-09-18T17:52:11Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 16 184 110 42 42 37 16 16 26 26 21 26 26 16 16 21 16 16 21 21 31 37 42 31 26 31 37 42 42 31 26 16 16 10 16 16 21 26 5 16 21 21 26 26 16 16 21 21 26 31 16 0 0 0 0 0 0 0 0 0 105 5 10 16 21 21 21 16 26 31 26 10 16 21 26 16 21 26 26 16 10 21 21 31 31 37 37 26 26 37 42 47 47 52 58 63 58 52 42 42 47 52 37 37 37 47 47 58 47 21 21 21 16 10 10 16 21 10 21 10 21 16 10 21 21 31 37 42 37 31 26 31 21 26 31 31 26 26 16 21 16 21 21 31 31 37 47 42 58 52 31 37 42 31 31 31 31 21 26 37 37 42 47 52 58 52 26 21 31 31 37 16 16 21 10 16 10 16 21 10 21 21 26 10 10 10 16 21 16 10 21 26 26 16 26 | shim fwd=88191 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=27.65 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc2MiB-r2 2026-09-18T17:52:11Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 2MiB
+OK e14-loss0.001-mc2MiB-r2 2026-09-18T17:52:15Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 346 73 84 372 257 131 336 110 257 168 383 84 178 220 278 320 105 168 236 199 367 63 299 283 | shim fwd=109354 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=224.98 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc4MiB-r2 2026-09-18T17:52:15Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 4MiB
+OK e14-loss0.001-mc4MiB-r2 2026-09-18T17:52:21Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 0 0 0 0 0 0 0 0 42 435 0 383 0 435 131 288 157 325 304 68 37 325 419 0 430 10 398 136 0 383 5 0 0 0 0 0 0 0 0 0 0 372 0 21 | shim fwd=111752 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=149.58 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc8MiB-r2 2026-09-18T17:52:21Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 8MiB
+OK e14-loss0.001-mc8MiB-r2 2026-09-18T17:52:25Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 115 315 105 288 246 288 0 393 346 37 63 367 105 309 241 315 126 163 320 0 388 0 430 0 | shim fwd=110409 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=223.71 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc0-r2 2026-09-18T17:52:25Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002
+OK e14-loss0.0002-mc0-r2 2026-09-18T17:52:35Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 16 168 168 142 94 100 94 63 37 37 31 21 31 42 37 42 52 52 58 73 63 73 58 42 42 26 37 37 47 21 16 26 26 31 37 42 47 52 52 63 63 79 73 79 94 79 63 52 58 63 68 79 84 89 89 89 94 105 84 52 63 68 42 42 42 52 52 37 31 47 37 47 52 58 52 68 63 42 42 47 52 58 63 47 31 21 31 31 37 42 47 52 52 52 | shim fwd=87041 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=57.34 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc2MiB-r2 2026-09-18T17:52:36Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 2MiB
+OK e14-loss0.0002-mc2MiB-r2 2026-09-18T17:52:39Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 351 0 461 220 220 73 362 94 346 84 189 383 79 288 283 220 225 204 231 220 220 220 225 | shim fwd=95645 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=228.19 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc4MiB-r2 2026-09-18T17:52:39Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 4MiB
+OK e14-loss0.0002-mc4MiB-r2 2026-09-18T17:52:43Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 357 231 157 0 493 225 220 225 220 220 178 0 425 0 482 225 5 220 425 10 372 121 37 498 | shim fwd=97941 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=226.19 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc8MiB-r2 2026-09-18T17:52:43Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 8MiB
+OK e14-loss0.0002-mc8MiB-r2 2026-09-18T17:52:47Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 398 42 267 346 225 215 220 142 0 0 440 477 63 10 362 0 215 73 535 225 10 372 0 0 440 16 | shim fwd=99604 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=205.08 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc0-r3 2026-09-18T17:52:47Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001
+OK e14-loss0.001-mc0-r3 2026-09-18T17:53:07Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 21 63 47 58 63 63 68 68 68 42 47 47 58 68 68 63 63 58 42 26 16 21 26 31 37 37 42 42 58 31 21 10 21 21 26 31 21 26 26 37 26 47 31 21 10 16 16 26 26 26 31 37 26 21 16 26 21 31 31 21 26 37 42 37 42 26 31 37 31 21 31 31 37 26 10 10 16 21 26 5 16 5 10 16 16 21 26 31 26 26 21 16 26 26 31 31 21 26 31 26 16 16 21 26 31 16 10 16 10 21 16 21 21 26 26 16 21 31 31 37 42 21 31 31 16 16 21 21 16 5 16 16 16 10 10 10 16 21 26 26 37 37 21 31 26 21 26 37 31 26 26 31 37 16 26 26 26 21 31 31 37 42 42 26 31 37 26 26 31 37 16 16 21 21 16 16 26 21 21 26 16 21 21 26 16 26 26 31 37 42 | shim fwd=87340 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=28.37 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc2MiB-r3 2026-09-18T17:53:07Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 2MiB
+OK e14-loss0.001-mc2MiB-r3 2026-09-18T17:53:12Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 252 299 100 294 126 372 73 225 330 236 131 283 142 199 157 320 184 173 309 63 0 0 0 0 0 0 0 0 0 0 556 231 315 | shim fwd=110320 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=165.08 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc4MiB-r3 2026-09-18T17:53:12Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 4MiB
+OK e14-loss0.001-mc4MiB-r3 2026-09-18T17:53:15Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 147 336 0 440 0 388 142 257 84 299 5 509 5 556 73 204 189 0 0 383 383 372 246 0 | shim fwd=109596 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=218.79 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.001-mc8MiB-r3 2026-09-18T17:53:16Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 8MiB
+OK e14-loss0.001-mc8MiB-r3 2026-09-18T17:53:19Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 351 31 383 0 440 31 246 419 220 10 398 5 446 47 105 377 0 430 0 393 47 357 42 357 | shim fwd=110751 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=223.47 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc0-r3 2026-09-18T17:53:19Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002
+OK e14-loss0.0002-mc0-r3 2026-09-18T17:53:29Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 5 262 320 225 157 94 79 63 58 68 68 73 79 79 52 47 52 37 31 42 31 26 31 42 42 42 37 26 37 21 26 21 31 37 42 47 47 52 31 37 42 47 52 52 63 63 79 73 68 42 52 52 68 63 37 42 47 52 58 63 68 73 79 84 79 47 58 52 63 68 73 79 42 26 31 31 42 42 52 52 58 63 68 68 47 42 52 52 58 | shim fwd=87563 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=61.05 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc2MiB-r3 2026-09-18T17:53:30Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 2MiB
+OK e14-loss0.0002-mc2MiB-r3 2026-09-18T17:53:33Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 262 304 220 63 0 372 0 383 220 225 220 131 304 220 220 215 225 220 215 220 225 184 252 220 225 | shim fwd=92296 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=217.92 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc4MiB-r3 2026-09-18T17:53:34Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 4MiB
+OK e14-loss0.0002-mc4MiB-r3 2026-09-18T17:53:37Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 199 393 147 0 498 0 440 225 26 231 393 220 26 336 0 409 0 383 362 52 157 278 372 215 | shim fwd=104345 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=226.38 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.0002-mc8MiB-r3 2026-09-18T17:53:37Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.0002 --mincwnd 8MiB
+OK e14-loss0.0002-mc8MiB-r3 2026-09-18T17:53:41Z
+trace prod rtt=12 loss=0.0002 mbps/100ms: 0 0 0 0 393 110 0 545 225 31 37 577 204 0 435 236 220 220 220 231 215 21 37 351 372 0 0 105 446 | shim fwd=98864 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.0002 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=214.35 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+PHASE sweep done 2026-09-18T17:53:41Z
+START e14-loss0-mc2MiB-r1 2026-09-18T17:53:51Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0 --mincwnd 2MiB
+OK e14-loss0-mc2MiB-r1 2026-09-18T17:53:54Z
+trace prod rtt=12 loss=0 mbps/100ms: 0 0 0 0 299 262 220 225 215 225 220 225 220 220 225 215 225 220 220 225 215 225 220 225 220 220 220 157 | shim fwd=86064 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=231.26 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0-mc8MiB-r1 2026-09-18T17:53:55Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0 --mincwnd 8MiB
+OK e14-loss0-mc8MiB-r1 2026-09-18T17:53:58Z
+trace prod rtt=12 loss=0 mbps/100ms: 0 0 0 0 288 283 225 220 220 225 220 225 215 225 220 220 225 215 225 220 220 225 220 225 215 225 220 142 | shim fwd=86061 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=231.27 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+PHASE ctl done 2026-09-18T17:53:58Z
+START e14-tail-loss0-mc0-r1 2026-09-18T17:53:58Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0
+OK e14-tail-loss0-mc0-r1 2026-09-18T17:54:02Z
+trace prod rtt=12 loss=0 mbps/100ms: 0 0 0 0 10 404 231 215 225 220 225 215 225 220 220 225 215 225 220 220 225 220 225 215 225 220 220 225 | shim fwd=86062 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=228.78 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-tail-loss0-mc0-r2 2026-09-18T17:54:02Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0
+OK e14-tail-loss0-mc0-r2 2026-09-18T17:54:06Z
+trace prod rtt=12 loss=0 mbps/100ms: 0 0 0 0 16 398 241 215 225 220 225 220 220 220 220 225 220 225 215 225 225 215 225 220 220 220 220 225 | shim fwd=86061 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=229.03 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-tail-loss0.001-mc0-r4 2026-09-18T17:54:06Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001
+OK e14-tail-loss0.001-mc0-r4 2026-09-18T17:54:28Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 21 52 37 31 37 31 26 26 21 21 10 16 16 21 16 16 26 26 21 21 31 26 31 21 26 31 37 26 10 10 16 21 21 21 10 16 21 21 31 16 10 21 16 31 26 21 26 26 21 26 26 16 21 26 16 21 26 21 21 26 26 37 37 37 42 47 26 21 10 21 21 26 31 37 37 42 52 16 21 26 26 31 26 21 31 26 37 47 47 52 58 26 21 26 26 37 31 26 26 16 21 31 16 10 21 16 16 10 16 16 26 31 31 37 42 31 31 37 31 21 37 26 26 26 10 16 16 26 26 31 31 42 42 37 26 31 37 42 37 26 31 37 31 21 31 31 37 10 21 21 21 31 21 21 26 16 21 16 21 21 16 21 26 21 21 21 26 26 31 37 37 21 21 21 26 21 21 21 16 21 16 16 16 16 26 5 10 21 10 16 21 26 26 31 42 37 42 52 37 31 21 16 16 21 26 31 26 | shim fwd=87299 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=25.93 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-tail-loss0.001-mc8MiB-r4 2026-09-18T17:54:28Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.001 --mincwnd 8MiB
+OK e14-tail-loss0.001-mc8MiB-r4 2026-09-18T17:54:31Z
+trace prod rtt=12 loss=0.001 mbps/100ms: 0 0 0 0 309 225 0 419 5 509 31 241 189 68 545 0 393 0 404 0 472 0 383 47 451 31 58 566 | shim fwd=109023 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.001 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=224.81 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+PHASE tail done 2026-09-18T17:54:32Z
+START e14-loss0.009-mc0-r1 2026-09-18T17:54:43Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009
+OK e14-loss0.009-mc0-r1 2026-09-18T17:55:48Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 10 16 10 16 10 5 10 16 16 10 10 5 5 5 10 10 5 5 5 5 10 5 10 10 5 10 5 10 10 5 5 10 10 10 5 5 5 10 10 16 10 16 10 5 5 5 5 10 16 10 10 16 10 16 5 10 10 10 10 5 5 5 5 10 10 5 10 0 5 10 16 5 10 0 10 10 10 5 10 10 5 10 10 5 10 10 5 5 5 5 10 5 5 5 5 5 10 10 10 10 5 5 5 10 5 16 10 16 5 10 10 5 10 10 16 10 5 5 10 5 5 5 10 10 5 5 10 5 5 5 5 5 5 10 10 10 5 5 10 10 10 10 10 10 5 10 5 5 0 5 10 5 16 5 5 5 10 5 10 5 10 16 10 5 10 16 21 16 5 5 16 5 5 16 16 10 10 5 10 0 5 5 5 10 10 10 16 16 21 10 16 10 5 5 5 10 0 10 5 5 5 10 5 5 0 0 5 5 10 10 10 21 16 10 10 10 16 16 16 16 16 5 5 5 10 16 5 5 10 5 5 5 10 16 16 16 16 10 16 16 10 10 5 10 5 10 0 0 0 0 0 0 0 0 0 0 58 5 10 5 5 5 5 5 5 5 10 10 5 10 5 5 5 10 5 5 10 5 16 10 16 16 10 10 5 5 5 0 5 10 10 16 16 16 10 10 10 16 10 10 10 10 0 10 10 5 5 10 5 10 5 16 5 16 5 5 5 5 10 10 10 10 10 0 5 5 5 10 10 5 10 10 5 10 10 21 16 10 5 5 5 5 10 5 10 10 16 10 5 10 10 5 10 10 5 10 5 16 16 5 5 5 10 5 10 10 10 5 5 5 5 5 10 10 10 5 5 10 5 10 16 21 10 5 10 10 10 5 5 10 10 10 16 0 0 0 0 0 0 0 0 0 0 52 5 5 5 5 10 5 10 5 5 5 10 10 5 10 10 10 21 5 10 5 10 10 10 5 5 5 5 5 10 5 10 5 5 5 5 0 5 5 10 5 10 5 5 10 5 16 10 0 0 0 0 0 0 0 0 0 0 52 5 5 5 10 10 10 10 16 10 10 5 5 10 5 5 5 5 5 10 5 10 10 16 5 5 10 5 5 5 5 10 5 5 5 5 5 10 5 10 5 5 5 10 5 5 16 5 10 10 5 5 5 10 10 10 16 5 10 21 10 10 10 5 5 5 5 10 5 5 5 5 5 10 5 5 10 10 10 10 10 10 5 16 10 5 5 5 10 10 5 10 5 10 5 0 10 5 5 5 5 10 5 16 10 16 10 10 10 5 10 10 21 21 5 5 16 10 10 5 5 10 10 5 10 10 5 10 16 16 5 5 5 10 5 0 10 5 5 5 5 5 5 5 10 16 10 5 5 5 10 5 10 5 10 5 10 10 16 5 5 0 0 0 0 0 0 0 0 0 26 5 10 5 5 5 10 5 10 10 10 10 | shim fwd=90183 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=8.35 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.009-mc2MiB-r1 2026-09-18T17:55:48Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009 --mincwnd 2MiB
+OK e14-loss0.009-mc2MiB-r1 2026-09-18T17:55:59Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 210 5 0 0 0 0 0 0 0 0 0 372 0 0 0 0 0 0 0 0 0 0 26 383 220 168 294 100 236 225 215 89 121 94 94 168 47 184 215 10 0 0 0 0 0 0 0 0 0 357 26 383 136 47 0 0 0 0 0 0 0 0 0 0 157 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 220 357 131 0 0 0 0 | shim fwd=140351 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=58.85 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.009-mc4MiB-r1 2026-09-18T17:55:59Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009 --mincwnd 4MiB
+OK e14-loss0.009-mc4MiB-r1 2026-09-18T17:56:03Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 189 225 152 225 31 346 10 330 47 336 47 73 325 26 0 105 398 231 168 252 147 31 126 152 73 100 204 115 89 110 215 79 5 94 | shim fwd=143608 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=157.40 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.009-mc8MiB-r1 2026-09-18T17:56:04Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009 --mincwnd 8MiB
+OK e14-loss0.009-mc8MiB-r1 2026-09-18T17:56:13Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 31 0 0 0 0 0 0 0 0 0 0 377 10 367 0 0 0 0 0 0 0 0 0 0 0 126 157 0 0 0 0 0 0 0 0 0 136 52 372 294 84 320 63 79 341 52 325 73 336 5 377 31 100 246 409 0 26 0 0 0 0 0 0 0 0 0 26 47 100 173 5 0 0 0 0 0 0 10 184 | shim fwd=120511 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=68.09 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.009-mc0-r2 2026-09-18T17:56:13Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009
+OK e14-loss0.009-mc0-r2 2026-09-18T17:57:20Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 0 0 0 0 0 5 47 10 5 5 10 0 5 5 10 16 10 5 5 16 10 16 5 16 5 5 5 10 10 5 10 10 5 10 5 10 5 5 5 10 5 5 5 5 5 16 10 10 16 5 10 10 5 10 5 10 5 10 5 5 10 5 5 5 5 10 5 5 10 10 5 5 5 10 16 10 5 10 10 10 10 16 10 10 16 21 16 10 10 10 10 5 16 10 10 10 5 16 10 5 5 10 5 10 5 5 10 10 5 5 5 10 10 5 16 5 10 5 10 5 10 10 10 5 5 10 5 5 10 16 5 5 0 5 10 5 16 10 5 5 5 10 10 5 5 10 5 0 0 0 0 0 0 0 0 0 0 47 0 5 0 5 10 5 10 5 10 5 5 5 5 10 16 5 0 0 0 0 0 0 0 0 0 0 37 5 5 5 5 10 5 10 5 5 10 5 10 5 10 5 5 5 5 10 16 10 5 0 0 0 0 0 0 0 0 0 16 37 5 10 10 5 10 10 10 10 5 5 10 5 10 5 10 10 16 10 10 16 10 16 5 10 10 16 10 16 10 10 10 10 10 5 10 5 5 5 5 5 10 10 10 5 5 5 5 10 5 10 5 5 10 10 16 16 10 10 5 5 10 16 5 5 5 5 10 10 10 5 10 5 5 10 10 10 16 16 10 5 16 16 10 10 10 5 10 10 5 10 10 10 5 16 10 5 5 5 0 10 5 10 10 10 16 10 16 16 5 5 5 10 5 16 10 0 5 10 10 5 5 10 5 10 5 5 5 5 5 10 10 10 10 5 10 5 5 10 10 5 5 5 10 5 10 10 10 10 10 10 10 10 5 5 10 10 10 10 5 5 10 5 5 10 10 5 5 10 16 10 10 5 5 0 10 5 10 10 10 10 16 10 10 5 5 5 5 10 5 10 5 10 5 10 5 5 5 10 0 5 10 5 10 16 5 5 5 10 16 5 5 5 5 5 5 5 5 5 0 10 10 10 5 10 5 10 5 5 5 5 16 10 10 10 10 16 10 10 10 5 10 10 10 5 5 5 5 5 5 10 5 10 5 16 10 5 16 10 5 5 5 10 10 5 10 5 10 10 10 5 5 10 16 10 10 10 5 5 0 0 0 0 0 0 0 0 0 0 31 5 5 5 5 10 5 10 16 5 5 10 10 5 5 10 5 5 5 5 10 10 16 5 5 5 10 10 10 5 5 5 10 5 10 5 10 10 10 5 10 10 5 10 10 5 5 10 10 10 5 5 10 5 0 10 5 5 10 16 5 0 5 5 5 5 10 5 10 5 10 5 5 0 10 5 16 16 5 16 5 5 10 5 10 10 10 10 10 5 10 10 10 5 10 5 5 10 10 10 10 10 16 10 5 10 16 5 10 10 5 5 5 5 10 10 10 16 16 5 10 5 5 5 10 5 10 16 10 16 5 10 16 10 10 5 5 5 5 5 5 5 5 10 5 5 16 10 5 10 10 5 5 10 10 16 | shim fwd=90277 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=8.17 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.009-mc2MiB-r2 2026-09-18T17:57:21Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009 --mincwnd 2MiB
+OK e14-loss0.009-mc2MiB-r2 2026-09-18T17:57:27Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 152 252 204 189 89 110 136 68 204 121 0 0 0 0 0 0 0 0 0 115 262 330 173 58 157 115 136 252 115 0 0 0 0 0 0 0 0 0 0 377 278 110 42 315 204 225 231 184 | shim fwd=132304 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=112.00 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.009-mc4MiB-r2 2026-09-18T17:57:27Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009 --mincwnd 4MiB
+OK e14-loss0.009-mc4MiB-r2 2026-09-18T17:57:36Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 26 430 0 126 31 0 0 0 0 0 0 0 0 0 21 273 0 0 0 0 0 0 0 0 0 105 10 84 294 110 278 115 383 257 5 372 5 372 21 267 0 0 0 0 0 0 0 0 0 94 157 0 0 0 0 0 0 0 0 0 184 0 100 0 0 0 0 0 0 0 0 0 315 110 63 325 73 | shim fwd=125174 writeErr=0 drop=882
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=69.75 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+START e14-loss0.009-mc8MiB-r2 2026-09-18T17:57:36Z --mode prod --rtt 12 --size 64MiB --chunk 16KiB --bandwidth 30MB --queue 5MB --deadline 300 --loss 0.009 --mincwnd 8MiB
+OK e14-loss0.009-mc8MiB-r2 2026-09-18T17:57:46Z
+trace prod rtt=12 loss=0.009 mbps/100ms: 0 0 0 0 0 0 0 16 304 94 362 0 377 52 330 21 336 5 404 5 377 10 31 0 0 0 0 0 0 0 0 0 31 5 0 0 0 0 0 0 0 0 0 309 16 283 0 0 0 0 0 0 0 0 0 0 388 37 309 0 0 0 0 0 0 0 0 0 0 372 0 0 0 0 0 0 0 0 0 31 10 0 0 0 0 0 0 0 0 0 0 157 215 26 362 89 | shim fwd=122484 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0.009 queue=5000000 rtomax=0ms sent=67108864 received=67108864 throughput=60.97 Mbps wall=0.00 Mbps chrome_cores=0.00 go_cpu=0.00s
+PHASE fieldcap done 2026-09-18T17:57:46Z

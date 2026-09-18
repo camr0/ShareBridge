@@ -105,7 +105,9 @@ func (e *benchEndpoint) SendBinaryClass(class multilane.TrafficClass, b []byte) 
 }
 
 func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
-	res := rawResult{Mode: "prod", RTT: cfg.rttMs}
+	res := rawResult{Mode: "prod", RTT: cfg.rttMs, FastRtxWnd: cfg.fastRtxWnd, MaxRxBuf: cfg.maxRxBuf, MaxMsg: cfg.maxMsg,
+		Bandwidth: cfg.bandwidth, Queue: cfg.queue, Loss: cfg.loss, JitterMs: int(cfg.jitter / time.Millisecond),
+		MinCwnd: cfg.minCwnd, Chunk: int64(cfg.chunk)}
 	delay := time.Duration(cfg.rttMs) * time.Millisecond / 2
 
 	shim, err := NewShim(delay, cfg.loss)
@@ -114,12 +116,22 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 	}
 	shim.SetJitter(cfg.jitter)
 	shim.SetBandwidth(cfg.bandwidth)
+	shim.SetQueueBytes(cfg.queue)
 	defer shim.Close()
 
 	se := webrtc.SettingEngine{}
 	se.SetIncludeLoopbackCandidate(true)
 	if cfg.minCwnd > 0 {
 		se.SetSCTPMinCwnd(uint32(cfg.minCwnd))
+	}
+	if cfg.fastRtxWnd > 0 {
+		se.SetSCTPFastRtxWnd(uint32(cfg.fastRtxWnd))
+	}
+	if cfg.maxRxBuf > 0 {
+		se.SetSCTPMaxReceiveBufferSize(uint32(cfg.maxRxBuf))
+	}
+	if cfg.maxMsg > 0 {
+		se.SetSCTPMaxMessageSize(uint32(cfg.maxMsg))
 	}
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})

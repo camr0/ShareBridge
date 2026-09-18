@@ -1,0 +1,2424 @@
+===== block-sanity 2026-09-18T16:54:00Z =====
+12:54  up 18 days, 19:12, 24 users, load averages: 4.72 3.90 3.09
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  16.6  2.4 pi
+  PID  %CPU %MEM COMM
+85242   7.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   6.2  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   5.7  1.3 /Applications/cmux.app/Contents/MacOS/cmux
+  829   2.8  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+41550   1.4  0.3 /Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent
+
+===== before-sanity-raw-rtt71-r1 2026-09-18T16:54:00Z =====
+12:54  up 18 days, 19:12, 24 users, load averages: 4.72 3.90 3.09
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  12.6  2.4 pi
+  PID  %CPU %MEM COMM
+85242   7.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   6.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   5.7  1.3 /Applications/cmux.app/Contents/MacOS/cmux
+  829   2.8  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  410   1.3  0.1 /usr/sbin/coreaudiod
+
+===== after-sanity-raw-rtt71-r1 2026-09-18T16:54:06Z =====
+12:54  up 18 days, 19:12, 24 users, load averages: 4.50 3.87 3.08
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  28.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  PID  %CPU %MEM COMM
+10571   9.4  2.3 pi
+85242   6.6  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   5.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   4.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+47448   3.5  0.4 /Applications/Docker.app/Contents/MacOS/com.docker.backend
+  829   2.0  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+
+===== before-sanity-raw-rtt71-r2 2026-09-18T16:54:08Z =====
+12:54  up 18 days, 19:12, 24 users, load averages: 4.22 3.82 3.07
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+90387  55.1  0.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  397  47.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  407  36.6  0.0 /usr/libexec/trustd
+  505  31.9  0.1 /usr/libexec/syspolicyd
+90413  20.2  0.1 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  10.6  2.3 pi
+  PID  %CPU %MEM COMM
+90414   7.7  0.0 /usr/libexec/containermanagerd_system
+
+===== after-sanity-raw-rtt71-r2 2026-09-18T16:54:34Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 4.21 3.85 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  44.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 7496  17.5  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  10.0  2.3 pi
+  PID  %CPU %MEM COMM
+85242   8.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   6.2  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  829   4.7  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  539   2.9  0.9 /System/Library/CoreServices/TimeMachine/backupd
+
+===== block-end-sanity 2026-09-18T16:54:35Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 4.21 3.85 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  43.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  23.7  0.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 7496  16.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  407  13.5  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+10571   9.7  2.3 pi
+  434   9.2  0.1 /usr/libexec/airportd
+ 6487   8.4  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+
+===== block-base 2026-09-18T16:54:37Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 4.03 3.82 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  43.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  795  19.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  16.8  2.3 pi
+  PID  %CPU %MEM COMM
+85242   9.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  799   5.3  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+  829   3.7  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+
+===== before-e5-base-rtt12-r1 2026-09-18T16:54:37Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 4.03 3.82 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  36.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  16.8  2.3 pi
+  795  13.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   9.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 6556   3.6  0.1 /System/Library/ExtensionKit/Extensions/VPN.appex/Contents/MacOS/VPN
+32675   3.4  0.2 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/152.0.7977.64/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)
+
+===== after-e5-base-rtt12-r1 2026-09-18T16:54:40Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 4.03 3.82 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  37.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 7496  28.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  539  16.8  0.9 /System/Library/CoreServices/TimeMachine/backupd
+10571  11.4  2.3 pi
+  PID  %CPU %MEM COMM
+85242   5.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   5.4  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  829   4.4  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+
+===== before-e5-base-rtt71-r1 2026-09-18T16:54:41Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 4.03 3.82 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  40.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 7496  33.3  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  539  19.6  0.9 /System/Library/CoreServices/TimeMachine/backupd
+90387  13.0  0.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  PID  %CPU %MEM COMM
+10571   9.2  2.3 pi
+  407   7.8  0.0 /usr/libexec/trustd
+85242   6.6  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-base-rtt71-r1 2026-09-18T16:54:45Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 3.87 3.79 3.09
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  36.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  PID  %CPU %MEM COMM
+10571   9.7  2.1 pi
+91764   9.7  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+91762   8.2  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+  434   8.1  0.1 /usr/libexec/airportd
+91761   7.9  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+91763   7.9  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+
+===== before-e5-base-rtt12-r2 2026-09-18T16:54:45Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 3.87 3.79 3.09
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  39.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  19.2  0.1 /usr/libexec/airportd
+90387  14.0  0.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  10.8  2.1 pi
+  PID  %CPU %MEM COMM
+  407   8.8  0.0 /usr/libexec/trustd
+90413   7.2  0.1 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+85242   7.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-base-rtt12-r2 2026-09-18T16:54:49Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 3.96 3.81 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.3  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  14.2  0.1 /usr/libexec/airportd
+10571  10.2  2.0 pi
+  PID  %CPU %MEM COMM
+  366   6.2  0.0 /System/Library/CoreServices/launchservicesd
+ 6487   5.9  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+85242   5.6  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   4.7  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-base-rtt71-r2 2026-09-18T16:54:49Z =====
+12:54  up 18 days, 19:13, 24 users, load averages: 3.96 3.81 3.10
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  39.9  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  19.9  0.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  434  16.5  0.1 /usr/libexec/airportd
+  407  12.7  0.0 /usr/libexec/trustd
+90413  10.7  0.1 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  10.0  2.0 pi
+  PID  %CPU %MEM COMM
+85242   6.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-base-rtt71-r2 2026-09-18T16:55:13Z =====
+12:55  up 18 days, 19:13, 24 users, load averages: 3.82 3.79 3.11
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  40.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  20.9  2.0 pi
+ 7496  18.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795  10.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   8.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  829   4.4  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  366   4.4  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-base-rtt12-r3 2026-09-18T16:55:13Z =====
+12:55  up 18 days, 19:13, 24 users, load averages: 3.82 3.79 3.11
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  37.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  21.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 7496  15.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  14.2  2.0 pi
+  407  12.0  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+85242   8.9  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-base-rtt12-r3 2026-09-18T16:55:17Z =====
+12:55  up 18 days, 19:13, 24 users, load averages: 4.08 3.84 3.13
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  27.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  11.5  2.0 pi
+  PID  %CPU %MEM COMM
+ 7496   9.9  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  539   9.2  1.0 /System/Library/CoreServices/TimeMachine/backupd
+  795   6.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   5.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  327   4.7  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== before-e5-base-rtt71-r3 2026-09-18T16:55:17Z =====
+12:55  up 18 days, 19:13, 24 users, load averages: 4.08 3.84 3.13
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  30.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  17.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  11.7  0.0 /usr/libexec/trustd
+ 7496  11.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  10.5  2.0 pi
+  PID  %CPU %MEM COMM
+90413   8.9  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+85242   6.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-base-rtt71-r3 2026-09-18T16:55:21Z =====
+12:55  up 18 days, 19:13, 24 users, load averages: 4.08 3.84 3.13
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  28.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  19.0  1.0 /System/Library/CoreServices/TimeMachine/backupd
+10571  12.2  2.1 pi
+  822  11.5  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  PID  %CPU %MEM COMM
+  795   7.2  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   6.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   6.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== block-end-base 2026-09-18T16:55:22Z =====
+12:55  up 18 days, 19:13, 24 users, load averages: 4.08 3.84 3.13
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  34.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  23.0  1.0 /System/Library/CoreServices/TimeMachine/backupd
+90387  22.3  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  822  14.6  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  407  14.2  0.0 /usr/libexec/trustd
+90413  11.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  10.6  2.1 pi
+  PID  %CPU %MEM COMM
+
+===== block-fastrtxwnd 2026-09-18T16:55:56Z =====
+12:55  up 18 days, 19:14, 24 users, load averages: 3.83 3.80 3.15
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735  95.9  0.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  47.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 1484  37.8  0.4 /usr/libexec/remindd
+66450  25.9  0.3 /Applications/CodexBar.app/Contents/MacOS/CodexBar
+10571  21.6  2.2 pi
+  795  11.2  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+14044  10.0  0.1 /usr/libexec/coreduetd
+  PID  %CPU %MEM COMM
+
+===== before-e5-fw16KiB-rtt12-r1 2026-09-18T16:55:56Z =====
+12:55  up 18 days, 19:14, 24 users, load averages: 3.83 3.80 3.15
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 103.7  0.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 1484  50.5  0.4 /usr/libexec/remindd
+  397  45.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+66450  25.9  0.3 /Applications/CodexBar.app/Contents/MacOS/CodexBar
+10571  22.5  2.2 pi
+  795  10.8  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+14044  10.0  0.1 /usr/libexec/coreduetd
+  PID  %CPU %MEM COMM
+
+===== after-e5-fw16KiB-rtt12-r1 2026-09-18T16:55:59Z =====
+12:55  up 18 days, 19:14, 24 users, load averages: 3.92 3.82 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 105.2  0.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  21.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  10.1  2.2 pi
+  PID  %CPU %MEM COMM
+  795   4.7  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   4.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  659   3.6  0.1 /System/Library/PrivateFrameworks/ChronoCore.framework/Support/chronod
+ 7496   3.3  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== before-e5-fw64KiB-rtt12-r1 2026-09-18T16:55:59Z =====
+12:55  up 18 days, 19:14, 24 users, load averages: 3.92 3.82 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 102.1  1.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  22.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  21.1  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  13.2  0.0 /usr/libexec/trustd
+90413  12.3  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+10571   9.3  2.2 pi
+85242   5.4  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-fw64KiB-rtt12-r1 2026-09-18T16:56:03Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.93 3.82 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 104.3  0.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  34.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  PID  %CPU %MEM COMM
+10571   9.7  2.2 pi
+  434   6.7  0.1 /usr/libexec/airportd
+85242   5.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   4.7  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  327   3.1  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== before-e5-fw256KiB-rtt12-r1 2026-09-18T16:56:03Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.93 3.82 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 103.3  0.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  39.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  17.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  434  14.4  0.1 /usr/libexec/airportd
+  407  11.2  0.0 /usr/libexec/trustd
+90413  11.1  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  10.2  2.2 pi
+  PID  %CPU %MEM COMM
+
+===== after-e5-fw256KiB-rtt12-r1 2026-09-18T16:56:07Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.93 3.82 3.17
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 113.4  0.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  32.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  PID  %CPU %MEM COMM
+10571   8.9  2.2 pi
+94216   6.8  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+85242   4.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  586   4.3  0.3 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+  795   4.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-fw1MiB-rtt12-r1 2026-09-18T16:56:07Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.93 3.82 3.17
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 111.7  0.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  30.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  16.9  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  10.9  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+90413   9.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571   9.1  2.2 pi
+85242   4.9  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-fw1MiB-rtt12-r1 2026-09-18T16:56:11Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.93 3.82 3.17
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735 100.9  1.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  34.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  24.9  0.2 /System/Library/CoreServices/TimeMachine/backupd
+  434  19.6  0.1 /usr/libexec/airportd
+  822  15.5  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+10571  10.2  2.2 pi
+  PID  %CPU %MEM COMM
+85242   5.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-fw16KiB-rtt71-r1 2026-09-18T16:56:11Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.93 3.82 3.17
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  735  69.8  0.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  397  33.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  31.1  0.2 /System/Library/CoreServices/TimeMachine/backupd
+90387  24.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  822  18.7  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  407  16.1  0.0 /usr/libexec/trustd
+90413  13.9  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  434  12.8  0.1 /usr/libexec/airportd
+
+===== after-e5-fw16KiB-rtt71-r1 2026-09-18T16:56:15Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.70 3.77 3.15
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  36.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  10.9  2.2 pi
+  PID  %CPU %MEM COMM
+85242   6.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   6.1  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 7496   5.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  327   4.4  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  366   4.3  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-fw64KiB-rtt71-r1 2026-09-18T16:56:15Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.70 3.77 3.15
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  21.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  13.1  0.0 /usr/libexec/trustd
+90413  11.3  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  11.1  2.2 pi
+  PID  %CPU %MEM COMM
+85242   8.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   6.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-fw64KiB-rtt71-r1 2026-09-18T16:56:20Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.56 3.74 3.15
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  55.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  658  33.7  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+10476  16.5  0.1 /Applications/DockDoor.app/Contents/MacOS/DockDoor
+  434  15.3  0.1 /usr/libexec/airportd
+  366  13.5  0.0 /System/Library/CoreServices/launchservicesd
+10571  12.4  2.2 pi
+  PID  %CPU %MEM COMM
+  795   9.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-fw256KiB-rtt71-r1 2026-09-18T16:56:20Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.56 3.74 3.15
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  54.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  658  21.1  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+90387  18.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  16.3  0.0 /usr/libexec/trustd
+10476  13.4  0.1 /Applications/DockDoor.app/Contents/MacOS/DockDoor
+90413  13.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  795  12.2  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  11.6  2.2 pi
+
+===== after-e5-fw256KiB-rtt71-r1 2026-09-18T16:56:25Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.84 3.80 3.17
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  49.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+94689  35.2  1.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+10571  13.0  1.5 pi
+  434  11.6  0.1 /usr/libexec/airportd
+  799  10.1  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+  PID  %CPU %MEM COMM
+ 6487   8.5  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+85242   6.4  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-fw1MiB-rtt71-r1 2026-09-18T16:56:25Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.84 3.80 3.17
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  47.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  32.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  19.0  0.0 /usr/libexec/trustd
+94689  16.4  1.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+90413  15.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  11.8  1.5 pi
+  PID  %CPU %MEM COMM
+  799   8.8  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== after-e5-fw1MiB-rtt71-r1 2026-09-18T16:56:30Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.69 3.77 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  44.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  16.7  0.1 /usr/libexec/airportd
+10571  10.5  1.5 pi
+  PID  %CPU %MEM COMM
+  799   7.7  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+ 7496   7.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   5.7  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   5.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-fw16KiB-rtt12-r2 2026-09-18T16:56:30Z =====
+12:56  up 18 days, 19:14, 24 users, load averages: 3.69 3.77 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  39.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  26.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  434  21.6  0.1 /usr/libexec/airportd
+  407  16.9  0.0 /usr/libexec/trustd
+90413  14.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  11.0  1.5 pi
+  PID  %CPU %MEM COMM
+  799   9.4  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== after-e5-fw16KiB-rtt12-r2 2026-09-18T16:56:33Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 3.63 3.75 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  42.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  18.1  0.2 /System/Library/CoreServices/TimeMachine/backupd
+ 7496  13.3  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  12.9  1.5 pi
+  799  11.9  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+  PID  %CPU %MEM COMM
+ 8428   9.5  0.2 /System/Library/ExtensionKit/Extensions/TGOnDeviceInferenceProviderService.appex/Contents/MacOS/TGOnDeviceInferenceProviderService
+85242   6.3  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-fw64KiB-rtt12-r2 2026-09-18T16:56:34Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 3.63 3.75 3.16
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  26.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 7496  24.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  407  17.8  0.0 /usr/libexec/trustd
+10476  13.9  0.1 /Applications/DockDoor.app/Contents/MacOS/DockDoor
+90413  13.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  366  13.7  0.0 /System/Library/CoreServices/launchservicesd
+10571  10.6  1.5 pi
+
+===== after-e5-fw64KiB-rtt12-r2 2026-09-18T16:56:37Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 3.90 3.81 3.18
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  40.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10476  11.8  0.1 /Applications/DockDoor.app/Contents/MacOS/DockDoor
+10571  11.1  1.4 pi
+  PID  %CPU %MEM COMM
+  799   8.2  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+86154   6.0  0.1 /usr/libexec/replayd
+  366   6.0  0.0 /System/Library/CoreServices/launchservicesd
+  795   5.2  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-fw256KiB-rtt12-r2 2026-09-18T16:56:37Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 3.90 3.81 3.18
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  21.5  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  15.6  0.0 /usr/libexec/trustd
+90413  13.2  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  12.2  1.4 pi
+10476  11.3  0.1 /Applications/DockDoor.app/Contents/MacOS/DockDoor
+  PID  %CPU %MEM COMM
+  799   8.6  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== after-e5-fw256KiB-rtt12-r2 2026-09-18T16:56:41Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 3.90 3.81 3.18
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  36.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  13.0  1.4 pi
+10476  10.1  0.1 /Applications/DockDoor.app/Contents/MacOS/DockDoor
+  PID  %CPU %MEM COMM
+  799   8.4  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+  366   6.8  0.0 /System/Library/CoreServices/launchservicesd
+  795   5.9  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   5.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-fw1MiB-rtt12-r2 2026-09-18T16:56:41Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 3.90 3.81 3.18
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  43.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  29.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  18.3  0.0 /usr/libexec/trustd
+90413  13.2  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  11.2  1.4 pi
+  799  10.2  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+  PID  %CPU %MEM COMM
+  434   7.2  0.1 /usr/libexec/airportd
+
+===== after-e5-fw1MiB-rtt12-r2 2026-09-18T16:56:45Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 4.31 3.89 3.22
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  42.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  12.2  0.1 /usr/libexec/airportd
+  799  12.1  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+  PID  %CPU %MEM COMM
+10571   9.0  1.4 pi
+  795   5.7  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   5.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+94689   4.3  1.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-fw16KiB-rtt71-r2 2026-09-18T16:56:45Z =====
+12:56  up 18 days, 19:15, 24 users, load averages: 4.31 3.89 3.22
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  36.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  23.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  14.7  0.0 /usr/libexec/trustd
+90413  12.3  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  799  12.0  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+10571  10.2  1.4 pi
+  PID  %CPU %MEM COMM
+85242   5.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-fw16KiB-rtt71-r2 2026-09-18T16:57:06Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 4.18 3.89 3.23
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  51.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  20.5  1.4 pi
+ 7496  15.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+85242   9.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  883   9.4  0.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+  795   8.8  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+94689   6.8  1.3 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-fw64KiB-rtt71-r2 2026-09-18T16:57:07Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 4.18 3.89 3.23
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  45.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  29.3  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 7496  18.9  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  407  18.7  0.0 /usr/libexec/trustd
+90413  17.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  14.7  1.4 pi
+  883  10.2  0.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+  PID  %CPU %MEM COMM
+
+===== after-e5-fw64KiB-rtt71-r2 2026-09-18T16:57:11Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 4.40 3.94 3.25
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  44.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  606  14.7  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+ 7496  13.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  799  11.9  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+10571  10.8  1.4 pi
+  PID  %CPU %MEM COMM
+  883   7.9  0.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+  795   4.9  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-fw256KiB-rtt71-r2 2026-09-18T16:57:11Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 4.40 3.94 3.25
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  39.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  23.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 7496  22.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  407  14.4  0.0 /usr/libexec/trustd
+90413  13.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  11.4  1.4 pi
+  606  11.2  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  799  10.1  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== after-e5-fw256KiB-rtt71-r2 2026-09-18T16:57:16Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 4.37 3.94 3.25
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  39.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+96438  12.1  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+ 7496  11.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+10571   8.7  1.4 pi
+85242   6.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   4.6  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  799   4.1  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== before-e5-fw1MiB-rtt71-r2 2026-09-18T16:57:16Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 4.37 3.94 3.25
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  36.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+47448  23.3  0.4 /Applications/Docker.app/Contents/MacOS/com.docker.backend
+  407  19.3  0.0 /usr/libexec/trustd
+ 7496  11.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+90387   8.9  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571   8.1  1.4 pi
+96438   7.6  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+
+===== after-e5-fw1MiB-rtt71-r2 2026-09-18T16:57:30Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 3.91 3.86 3.24
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  36.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  823  27.1  0.3 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+10571  16.2  1.4 pi
+  692  14.9  0.1 /System/Library/PrivateFrameworks/FileProvider.framework/Support/fileproviderd
+10369  12.4  0.1 /System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Support/bird
+75207  10.8  0.7 /System/Applications/Mail.app/Contents/MacOS/Mail
+  PID  %CPU %MEM COMM
+  829   9.0  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+
+===== block-end-fw 2026-09-18T16:57:31Z =====
+12:57  up 18 days, 19:15, 24 users, load averages: 3.91 3.86 3.24
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  45.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  823  33.8  0.3 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+10369  23.1  0.1 /System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Support/bird
+  407  17.5  0.0 /usr/libexec/trustd
+90387  14.1  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  14.0  1.4 pi
+  692  10.6  0.1 /System/Library/PrivateFrameworks/FileProvider.framework/Support/fileproviderd
+  PID  %CPU %MEM COMM
+
+===== block-loss-arm 2026-09-18T16:57:35Z =====
+12:57  up 18 days, 19:16, 24 users, load averages: 3.83 3.84 3.24
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  52.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  823  33.1  0.7 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+10571  25.6  1.5 pi
+ 7496  22.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+  795   9.2  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+94894   9.0  0.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 6487   7.6  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+
+===== before-e5-loss0.001-fwdefault-rtt12-r1 2026-09-18T16:57:35Z =====
+12:57  up 18 days, 19:16, 24 users, load averages: 3.83 3.84 3.24
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  52.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  823  33.1  0.7 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+10571  25.6  1.5 pi
+ 7496  22.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+  795   9.2  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+94894   9.0  0.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 6487   7.6  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+
+===== after-e5-loss0.001-fwdefault-rtt12-r1 2026-09-18T16:57:56Z =====
+12:57  up 18 days, 19:16, 24 users, load averages: 5.71 4.22 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  52.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  606  16.7  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+10571  15.7  1.4 pi
+  799  13.9  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+85242  10.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  PID  %CPU %MEM COMM
+94689   9.6  1.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  883   7.1  0.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+
+===== before-e5-loss0.001-fw64KiB-rtt12-r1 2026-09-18T16:57:56Z =====
+12:57  up 18 days, 19:16, 24 users, load averages: 5.71 4.22 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  39.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  22.9  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  14.3  0.0 /usr/libexec/trustd
+  795  13.4  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+10571  12.9  1.4 pi
+90413  10.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  606  10.0  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  PID  %CPU %MEM COMM
+
+===== after-e5-loss0.001-fw64KiB-rtt12-r1 2026-09-18T16:58:15Z =====
+12:58  up 18 days, 19:16, 24 users, load averages: 5.45 4.27 3.42
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+10571 100.9  2.3 pi
+  397  34.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 7496  17.4  0.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+85242   7.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  434   5.1  0.1 /usr/libexec/airportd
+ 6487   4.3  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+  829   3.6  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+
+===== before-e5-loss0.001-fw256KiB-rtt12-r1 2026-09-18T16:58:16Z =====
+12:58  up 18 days, 19:16, 24 users, load averages: 5.45 4.27 3.42
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+10571 106.8  2.3 pi
+  397  34.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  24.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  16.2  0.0 /usr/libexec/trustd
+ 7496  14.2  0.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  434  14.1  0.1 /usr/libexec/airportd
+90413  13.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+26780  12.2  0.2 /usr/libexec/diskimagesiod
+
+===== after-e5-loss0.001-fw256KiB-rtt12-r1 2026-09-18T16:58:34Z =====
+12:58  up 18 days, 19:17, 24 users, load averages: 4.57 4.14 3.39
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  19.9  2.4 pi
+  PID  %CPU %MEM COMM
+  795   8.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+12356   8.6  0.1 /usr/libexec/searchpartyuseragent
+85242   8.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  580   5.6  0.1 /usr/libexec/searchpartyd
+
+===== before-e5-loss0.001-fw1MiB-rtt12-r1 2026-09-18T16:58:34Z =====
+12:58  up 18 days, 19:17, 24 users, load averages: 4.57 4.14 3.39
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  43.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  30.5  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  17.6  0.0 /usr/libexec/trustd
+90413  14.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  13.3  2.4 pi
+  PID  %CPU %MEM COMM
+85242   8.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.2  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-loss0.001-fw1MiB-rtt12-r1 2026-09-18T16:58:53Z =====
+12:58  up 18 days, 19:17, 24 users, load averages: 4.11 4.06 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  45.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  795  17.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  13.4  2.4 pi
+  PID  %CPU %MEM COMM
+ 7496   8.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+85242   7.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  366   5.5  0.0 /System/Library/CoreServices/launchservicesd
+41550   2.5  0.3 /Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent
+
+===== before-e5-loss0.0002-fwdefault-rtt12-r1 2026-09-18T16:58:53Z =====
+12:58  up 18 days, 19:17, 24 users, load averages: 4.11 4.06 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  44.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  407  18.4  0.0 /usr/libexec/trustd
+10571  12.8  2.4 pi
+  795  12.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 7496  10.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+90387   9.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+85242   7.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-loss0.0002-fwdefault-rtt12-r1 2026-09-18T16:59:01Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 3.94 4.03 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  43.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  25.4  0.4 /System/Library/CoreServices/TimeMachine/backupd
+  822  15.4  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+10571  14.5  2.4 pi
+ 7496  11.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+66450   7.3  0.4 /Applications/CodexBar.app/Contents/MacOS/CodexBar
+85242   6.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-loss0.0002-fw64KiB-rtt12-r1 2026-09-18T16:59:01Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 3.94 4.03 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  539  40.9  0.4 /System/Library/CoreServices/TimeMachine/backupd
+  397  38.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  24.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  822  19.0  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+90413  14.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  13.4  2.4 pi
+  407  12.6  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+
+===== after-e5-loss0.0002-fw64KiB-rtt12-r1 2026-09-18T16:59:09Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 4.25 4.09 3.40
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+97137 145.3  1.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+41179  92.5  1.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  397  48.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  799  44.6  1.8 /Applications/Helium.app/Contents/MacOS/Helium
+ 5460  29.3  0.3 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+10571  15.4  2.2 pi
+  327  15.1  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  883  11.7  0.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+
+===== before-e5-loss0.0002-fw256KiB-rtt12-r1 2026-09-18T16:59:10Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 4.25 4.09 3.40
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+97137  94.0  1.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+41179  91.5  1.1 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  397  49.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+99677  42.7  0.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  799  35.9  1.8 /Applications/Helium.app/Contents/MacOS/Helium
+99688  33.1  0.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+90387  27.1  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  23.3  0.0 /usr/libexec/trustd
+
+===== after-e5-loss0.0002-fw256KiB-rtt12-r1 2026-09-18T16:59:18Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 3.75 3.99 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+41179  43.3  1.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  397  40.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  799  24.4  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+10571  15.0  2.0 pi
+  PID  %CPU %MEM COMM
+97137   9.4  1.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  434   8.9  0.1 /usr/libexec/airportd
+  795   6.9  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-loss0.0002-fw1MiB-rtt12-r1 2026-09-18T16:59:18Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 3.75 3.99 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  41.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  30.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  18.1  0.0 /usr/libexec/trustd
+41179  16.9  1.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+90413  14.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  434  14.0  0.1 /usr/libexec/airportd
+  799  12.8  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+10571  10.2  2.0 pi
+
+===== after-e5-loss0.0002-fw1MiB-rtt12-r1 2026-09-18T16:59:25Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 3.61 3.96 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+97137  62.8  1.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  397  45.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  44.6  0.1 /System/Library/CoreServices/TimeMachine/backupd
+  822  14.9  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+10571  14.8  2.0 pi
+    1  13.4  0.1 /sbin/launchd
+  883  10.2  0.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+  PID  %CPU %MEM COMM
+
+===== before-e5-loss0.001-fwdefault-rtt12-r2 2026-09-18T16:59:26Z =====
+12:59  up 18 days, 19:17, 24 users, load averages: 3.61 3.96 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  539  46.0  0.1 /System/Library/CoreServices/TimeMachine/backupd
+  397  42.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+97137  41.5  1.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+90387  26.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  822  18.1  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  407  17.6  0.0 /usr/libexec/trustd
+10571  14.4  2.0 pi
+90413  14.3  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+
+===== after-e5-loss0.001-fwdefault-rtt12-r2 2026-09-18T16:59:48Z =====
+12:59  up 18 days, 19:18, 24 users, load averages: 3.65 3.94 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  33.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  19.9  2.1 pi
+  PID  %CPU %MEM COMM
+  795   9.0  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  108   7.6  1.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+85242   6.9  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   6.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+97137   3.3  1.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-loss0.001-fw64KiB-rtt12-r2 2026-09-18T16:59:48Z =====
+12:59  up 18 days, 19:18, 24 users, load averages: 3.65 3.94 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  38.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  22.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  15.2  0.0 /usr/libexec/trustd
+90413  14.6  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  14.3  2.1 pi
+  108  14.1  1.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  PID  %CPU %MEM COMM
+ 7496   7.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== after-e5-loss0.001-fw64KiB-rtt12-r2 2026-09-18T17:00:07Z =====
+13:00  up 18 days, 19:18, 24 users, load averages: 3.41 3.86 3.36
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  539  62.7  0.1 /System/Library/CoreServices/TimeMachine/backupd
+  397  48.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  822  21.9  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+10571  16.3  2.1 pi
+  799  12.2  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+  PID  %CPU %MEM COMM
+85242   7.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-loss0.001-fw256KiB-rtt12-r2 2026-09-18T17:00:08Z =====
+13:00  up 18 days, 19:18, 24 users, load averages: 3.41 3.86 3.36
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  539  56.4  0.1 /System/Library/CoreServices/TimeMachine/backupd
+  397  44.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  22.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  822  21.7  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  407  15.7  0.0 /usr/libexec/trustd
+90413  14.1  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  13.0  2.1 pi
+  PID  %CPU %MEM COMM
+
+===== after-e5-loss0.001-fw256KiB-rtt12-r2 2026-09-18T17:00:26Z =====
+13:00  up 18 days, 19:18, 24 users, load averages: 3.48 3.85 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  49.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+97137  23.1  1.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 7496  22.5  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  15.6  2.1 pi
+  PID  %CPU %MEM COMM
+  795   9.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  434   8.8  0.1 /usr/libexec/airportd
+85242   8.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-loss0.001-fw1MiB-rtt12-r2 2026-09-18T17:00:26Z =====
+13:00  up 18 days, 19:18, 24 users, load averages: 3.48 3.85 3.37
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  40.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+97137  23.9  1.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+90387  22.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 7496  17.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  407  15.4  0.0 /usr/libexec/trustd
+90413  11.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  11.4  2.1 pi
+  PID  %CPU %MEM COMM
+
+===== after-e5-loss0.001-fw1MiB-rtt12-r2 2026-09-18T17:00:47Z =====
+13:00  up 18 days, 19:19, 24 users, load averages: 3.19 3.77 3.34
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  42.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  16.9  2.0 pi
+  PID  %CPU %MEM COMM
+  617   8.1  0.0 /usr/libexec/ContinuityCaptureAgent
+  658   7.0  0.3 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  434   6.8  0.1 /usr/libexec/airportd
+85242   6.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 6487   6.7  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+
+===== before-e5-loss0.0002-fwdefault-rtt12-r2 2026-09-18T17:00:47Z =====
+13:00  up 18 days, 19:19, 24 users, load averages: 3.34 3.79 3.35
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  44.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  20.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  14.7  2.0 pi
+  407  13.6  0.0 /usr/libexec/trustd
+90413  10.1  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   7.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   5.5  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-loss0.0002-fwdefault-rtt12-r2 2026-09-18T17:00:56Z =====
+13:00  up 18 days, 19:19, 24 users, load averages: 3.71 3.85 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  327  65.0  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  397  48.3  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+66450  45.4  0.4 /Applications/CodexBar.app/Contents/MacOS/CodexBar
+    1  26.0  0.1 /sbin/launchd
+10571  15.2  1.0 pi
+  539  11.2  0.1 /System/Library/CoreServices/TimeMachine/backupd
+  PID  %CPU %MEM COMM
+ 2863   8.6  0.1 /System/Library/PrivateFrameworks/PhotoLibraryServices.framework/Versions/A/Support/photolibraryd
+
+===== before-e5-loss0.0002-fw64KiB-rtt12-r2 2026-09-18T17:00:56Z =====
+13:00  up 18 days, 19:19, 24 users, load averages: 3.71 3.85 3.38
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  327  82.8  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  397  38.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+66450  31.6  0.4 /Applications/CodexBar.app/Contents/MacOS/CodexBar
+  539  12.1  0.1 /System/Library/CoreServices/TimeMachine/backupd
+10571  11.2  1.0 pi
+    1  10.2  0.1 /sbin/launchd
+  PID  %CPU %MEM COMM
+  822   7.5  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+
+===== after-e5-loss0.0002-fw64KiB-rtt12-r2 2026-09-18T17:01:01Z =====
+13:01  up 18 days, 19:19, 24 users, load averages: 4.37 3.99 3.43
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+14045  37.8  0.2 /System/Library/PrivateFrameworks/CoreSuggestions.framework/Versions/A/Support/suggestd
+  397  37.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  15.3  1.1 pi
+78705  10.8  0.1 /System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd
+  PID  %CPU %MEM COMM
+ 7496   8.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   8.3  1.0 /Applications/cmux.app/Contents/MacOS/cmux
+  735   8.2  0.6 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+
+===== before-e5-loss0.0002-fw256KiB-rtt12-r2 2026-09-18T17:01:02Z =====
+13:01  up 18 days, 19:19, 24 users, load averages: 4.37 3.99 3.43
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  47.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  735  33.8  0.6 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+90387  20.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  14.4  0.0 /usr/libexec/trustd
+14045  13.9  0.2 /System/Library/PrivateFrameworks/CoreSuggestions.framework/Versions/A/Support/suggestd
+90413  13.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  11.9  1.1 pi
+78705  11.6  0.1 /System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd
+
+===== after-e5-loss0.0002-fw256KiB-rtt12-r2 2026-09-18T17:01:08Z =====
+13:01  up 18 days, 19:19, 24 users, load averages: 5.21 4.19 3.51
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+52375  56.0  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+82933  48.2  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+  397  46.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  732  26.4  0.3 /System/Library/CoreServices/NotificationCenter.app/Contents/MacOS/NotificationCenter
+  815  11.8  2.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+10571  11.8  1.0 pi
+  PID  %CPU %MEM COMM
+  434   9.8  0.1 /usr/libexec/airportd
+
+===== before-e5-loss0.0002-fw1MiB-rtt12-r2 2026-09-18T17:01:08Z =====
+13:01  up 18 days, 19:19, 24 users, load averages: 5.21 4.19 3.51
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+52375  58.9  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+82933  50.5  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+  397  46.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  35.2  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+90413  17.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  434  13.3  0.1 /usr/libexec/airportd
+  732  12.0  0.3 /System/Library/CoreServices/NotificationCenter.app/Contents/MacOS/NotificationCenter
+10571  11.7  1.0 pi
+
+===== after-e5-loss0.0002-fw1MiB-rtt12-r2 2026-09-18T17:01:19Z =====
+13:01  up 18 days, 19:19, 24 users, load averages: 4.72 4.11 3.49
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  43.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+24907  29.1  0.2 /usr/libexec/duetexpertd
+ 7496  22.9  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  16.6  1.1 pi
+ 1484  12.3  0.2 /usr/libexec/remindd
+  PID  %CPU %MEM COMM
+85242   9.4  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.0  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== before-e5-loss0.0002-fwdefault-rtt71-r1 2026-09-18T17:01:19Z =====
+13:01  up 18 days, 19:19, 24 users, load averages: 4.72 4.11 3.49
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  44.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+24907  44.9  0.2 /usr/libexec/duetexpertd
+ 7496  20.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 1484  18.9  0.2 /usr/libexec/remindd
+10571  16.2  1.1 pi
+90387  15.2  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  PID  %CPU %MEM COMM
+  407   9.6  0.0 /usr/libexec/trustd
+
+===== after-e5-loss0.0002-fwdefault-rtt71-r1 2026-09-18T17:02:00Z =====
+13:02  up 18 days, 19:20, 24 users, load averages: 4.75 4.18 3.54
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  48.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  19.8  1.1 pi
+ 7496  10.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+  795   9.0  1.0 /Applications/cmux.app/Contents/MacOS/cmux
+85242   8.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  539   7.4  0.1 /System/Library/CoreServices/TimeMachine/backupd
+  822   6.3  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+
+===== before-e5-loss0.0002-fw256KiB-rtt71-r1 2026-09-18T17:02:01Z =====
+13:02  up 18 days, 19:20, 24 users, load averages: 4.75 4.18 3.54
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  39.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  21.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  13.5  1.1 pi
+  407  11.7  0.0 /usr/libexec/trustd
+  539  10.1  0.1 /System/Library/CoreServices/TimeMachine/backupd
+  PID  %CPU %MEM COMM
+  822   9.5  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+85242   9.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-loss0.0002-fw256KiB-rtt71-r1 2026-09-18T17:02:38Z =====
+13:02  up 18 days, 19:21, 24 users, load averages: 4.80 4.27 3.60
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  51.7  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  658  24.7  0.3 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+10571  16.6  1.1 pi
+  PID  %CPU %MEM COMM
+  795   7.7  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+ 7496   6.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+85242   6.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  815   4.7  1.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-loss0.001-fwdefault-rtt71-r1 2026-09-18T17:02:38Z =====
+13:02  up 18 days, 19:21, 24 users, load averages: 4.80 4.27 3.60
+vm.swapusage: total = 7168.00M  used = 6278.31M  free = 889.69M  (encrypted)
+  397  42.2  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  18.2  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  12.3  0.0 /usr/libexec/trustd
+10571  11.7  1.1 pi
+  PID  %CPU %MEM COMM
+  658   9.6  0.3 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 7496   8.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+90413   8.4  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+
+===== after-e5-loss0.001-fwdefault-rtt71-r1 2026-09-18T17:04:34Z =====
+13:04  up 18 days, 19:23, 24 users, load averages: 4.47 4.26 3.68
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  37.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  19.9  1.2 pi
+  434  14.8  0.1 /usr/libexec/airportd
+97137  14.4  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  658  11.7  0.3 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  PID  %CPU %MEM COMM
+  795   9.2  1.0 /Applications/cmux.app/Contents/MacOS/cmux
+  883   8.8  0.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+
+===== before-e5-loss0.001-fw256KiB-rtt71-r1 2026-09-18T17:04:35Z =====
+13:04  up 18 days, 19:23, 24 users, load averages: 4.47 4.26 3.68
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  23.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+97137  16.4  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+10571  15.6  1.2 pi
+  407  15.1  0.0 /usr/libexec/trustd
+90413  11.4  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+  883   8.3  0.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+
+===== after-e5-loss0.001-fw256KiB-rtt71-r1 2026-09-18T17:05:58Z =====
+13:05  up 18 days, 19:24, 24 users, load averages: 3.30 3.98 3.63
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  20.2  1.2 pi
+  410  10.7  0.2 /usr/sbin/coreaudiod
+  PID  %CPU %MEM COMM
+ 7496   9.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  815   9.0  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  795   8.1  1.0 /Applications/cmux.app/Contents/MacOS/cmux
+85242   7.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-loss0.0002-fwdefault-rtt71-r2 2026-09-18T17:05:59Z =====
+13:05  up 18 days, 19:24, 24 users, load averages: 3.30 3.98 3.63
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  23.9  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  16.5  0.0 /usr/libexec/trustd
+10571  14.7  1.2 pi
+10476  13.2  0.1 /Applications/DockDoor.app/Contents/MacOS/DockDoor
+  PID  %CPU %MEM COMM
+90413   9.6  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  366   9.3  0.0 /System/Library/CoreServices/launchservicesd
+
+===== after-e5-loss0.0002-fwdefault-rtt71-r2 2026-09-18T17:06:20Z =====
+13:06  up 18 days, 19:24, 24 users, load averages: 3.21 3.91 3.61
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  45.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  815  27.1  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+10571  18.6  1.2 pi
+    1  11.3  0.1 /sbin/launchd
+  PID  %CPU %MEM COMM
+  795   8.8  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   8.7  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  327   5.7  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== before-e5-loss0.0002-fw256KiB-rtt71-r2 2026-09-18T17:06:20Z =====
+13:06  up 18 days, 19:24, 24 users, load averages: 3.21 3.91 3.61
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  39.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  18.3  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  815  17.3  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+10571  15.3  1.2 pi
+  407  12.0  0.0 /usr/libexec/trustd
+90413  11.3  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   8.1  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-loss0.0002-fw256KiB-rtt71-r2 2026-09-18T17:07:04Z =====
+13:07  up 18 days, 19:25, 24 users, load averages: 3.82 3.96 3.64
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  49.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  352  28.2  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+  815  27.1  2.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+10571  16.0  1.2 pi
+  883  15.2  0.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+  606  14.9  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  PID  %CPU %MEM COMM
+  799   9.5  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== before-e5-loss0.001-fwdefault-rtt71-r2 2026-09-18T17:07:04Z =====
+13:07  up 18 days, 19:25, 24 users, load averages: 3.82 3.96 3.64
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  46.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  407  21.6  0.0 /usr/libexec/trustd
+  815  19.6  2.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+90387  19.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  352  15.2  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+90413  13.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  883  12.6  0.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+10571  11.8  1.2 pi
+
+===== after-e5-loss0.001-fwdefault-rtt71-r2 2026-09-18T17:08:39Z =====
+13:08  up 18 days, 19:27, 24 users, load averages: 4.18 3.99 3.68
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+52375  61.9  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+82933  49.2  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+  397  48.8  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+13813  23.7  1.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  883  18.3  0.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+10571  17.2  2.1 pi
+  799  13.5  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+  815  13.2  1.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-loss0.001-fw256KiB-rtt71-r2 2026-09-18T17:08:40Z =====
+13:08  up 18 days, 19:27, 24 users, load averages: 4.18 3.99 3.68
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+41179  59.8  0.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  397  56.6  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+52375  54.2  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+82933  43.1  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+90387  37.2  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+90413  23.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  799  23.2  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+  407  22.1  0.0 /usr/libexec/trustd
+
+===== after-e5-loss0.001-fw256KiB-rtt71-r2 2026-09-18T17:10:07Z =====
+13:10  up 18 days, 19:28, 24 users, load averages: 4.21 4.04 3.73
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.8  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  21.5  1.2 pi
+  815  12.0  1.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  799  10.8  1.5 /Applications/Helium.app/Contents/MacOS/Helium
+  PID  %CPU %MEM COMM
+  434   9.4  0.1 /usr/libexec/airportd
+  795   7.6  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   7.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== block-end-loss 2026-09-18T17:10:08Z =====
+13:10  up 18 days, 19:28, 24 users, load averages: 4.21 4.04 3.73
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  39.3  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  26.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  17.8  0.0 /usr/libexec/trustd
+10571  13.5  1.2 pi
+90413  12.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  815  10.7  1.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  799  10.1  1.5 /Applications/Helium.app/Contents/MacOS/Helium
+  PID  %CPU %MEM COMM
+
+===== block-topup 2026-09-18T17:10:20Z =====
+13:10  up 18 days, 19:28, 24 users, load averages: 3.87 3.97 3.71
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  33.9  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  20.9  1.3 pi
+  434  20.1  0.1 /usr/libexec/airportd
+  PID  %CPU %MEM COMM
+  815   8.7  1.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  795   8.7  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   6.7  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  799   5.9  1.5 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== before-e5-topup-loss0.001-fwdefault-rtt71-r3 2026-09-18T17:10:20Z =====
+13:10  up 18 days, 19:28, 24 users, load averages: 3.87 3.97 3.71
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  34.9  0.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  24.1  0.1 /usr/libexec/airportd
+10571  18.7  1.3 pi
+  PID  %CPU %MEM COMM
+  815   9.8  1.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  795   8.6  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   6.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  799   6.1  1.5 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== after-e5-topup-loss0.001-fwdefault-rtt71-r3 2026-09-18T17:12:06Z =====
+13:12  up 18 days, 19:30, 24 users, load averages: 3.36 3.80 3.67
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  36.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  21.9  1.4 pi
+  PID  %CPU %MEM COMM
+85242   7.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.2  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+ 7496   5.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  815   5.6  1.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  366   5.1  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-topup-loss0.001-fw256KiB-rtt71-r3 2026-09-18T17:12:06Z =====
+13:12  up 18 days, 19:30, 24 users, load averages: 3.36 3.80 3.67
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  35.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  24.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  17.3  0.0 /usr/libexec/trustd
+10571  17.2  1.4 pi
+90413  12.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   8.4  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   6.5  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== after-e5-topup-loss0.001-fw256KiB-rtt71-r3 2026-09-18T17:13:50Z =====
+13:13  up 18 days, 19:32, 24 users, load averages: 3.57 3.81 3.69
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  41.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  19.2  2.2 pi
+  434  19.0  0.1 /usr/libexec/airportd
+ 8261  10.5  1.1 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  795  10.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   7.4  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  371   4.9  0.1 /usr/libexec/locationd
+
+===== before-e5-topup-loss0.001-fw1MiB-rtt71-r3 2026-09-18T17:13:51Z =====
+13:13  up 18 days, 19:32, 24 users, load averages: 3.57 3.81 3.69
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  42.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  13.8  2.2 pi
+  PID  %CPU %MEM COMM
+90387   9.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+85242   8.4  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  434   6.9  0.1 /usr/libexec/airportd
+  327   6.1  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== after-e5-topup-loss0.001-fw1MiB-rtt71-r3 2026-09-18T17:15:17Z =====
+13:15  up 18 days, 19:33, 24 users, load averages: 2.36 3.37 3.53
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  50.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  28.9  2.2 pi
+  658  15.4  0.3 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  795  12.8  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   7.6  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  580   4.5  0.1 /usr/libexec/searchpartyd
+ 7496   4.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== before-e5-topup-loss0.001-fwdefault-rtt12-r3 2026-09-18T17:15:17Z =====
+13:15  up 18 days, 19:33, 24 users, load averages: 2.36 3.37 3.53
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  49.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  658  35.8  0.3 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+10571  31.5  2.2 pi
+90387  20.5  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  13.0  0.0 /usr/libexec/trustd
+  795  12.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+90413  12.6  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+
+===== after-e5-topup-loss0.001-fwdefault-rtt12-r3 2026-09-18T17:15:34Z =====
+13:15  up 18 days, 19:34, 24 users, load averages: 3.18 3.49 3.57
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  45.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+26348  39.4  0.0 grep
+10571  17.1  2.2 pi
+  PID  %CPU %MEM COMM
+  795   7.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   7.3  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   4.6  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  815   4.4  1.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-topup-loss0.001-fw64KiB-rtt12-r3 2026-09-18T17:15:34Z =====
+13:15  up 18 days, 19:34, 24 users, load averages: 3.18 3.49 3.57
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  42.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+26348  39.7  0.0 grep
+10571  16.0  2.2 pi
+  PID  %CPU %MEM COMM
+85242   8.3  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.1  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 7496   5.5  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  799   4.1  1.7 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== after-e5-topup-loss0.001-fw64KiB-rtt12-r3 2026-09-18T17:15:50Z =====
+13:15  up 18 days, 19:34, 24 users, load averages: 2.92 3.42 3.54
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+26348  84.8  0.1 grep
+  397  31.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  15.8  2.2 pi
+  PID  %CPU %MEM COMM
+85242   8.3  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   6.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 7496   6.9  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  815   2.8  1.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-topup-loss0.001-fw256KiB-rtt12-r3 2026-09-18T17:15:50Z =====
+13:15  up 18 days, 19:34, 24 users, load averages: 2.92 3.42 3.54
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+26348  94.4  0.1 grep
+  397  35.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  22.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  17.0  2.2 pi
+  407  12.6  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+85242   8.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-topup-loss0.001-fw256KiB-rtt12-r3 2026-09-18T17:16:11Z =====
+13:16  up 18 days, 19:34, 24 users, load averages: 3.34 3.49 3.56
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  46.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  31.8  2.1 pi
+  795  19.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   8.8  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   8.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  829   4.0  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  799   3.3  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== before-e5-topup-loss0.001-fw1MiB-rtt12-r3 2026-09-18T17:16:11Z =====
+13:16  up 18 days, 19:34, 24 users, load averages: 3.34 3.49 3.56
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  46.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  35.0  2.1 pi
+90387  23.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  795  18.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  407  13.4  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+85242   8.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   8.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== after-e5-topup-loss0.001-fw1MiB-rtt12-r3 2026-09-18T17:16:30Z =====
+13:16  up 18 days, 19:34, 24 users, load averages: 2.88 3.37 3.52
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  32.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  17.2  2.2 pi
+  PID  %CPU %MEM COMM
+85242   7.5  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   6.2  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 7496   6.2  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  815   3.6  1.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 6556   3.3  0.1 /System/Library/ExtensionKit/Extensions/VPN.appex/Contents/MacOS/VPN
+
+===== block-end-topup 2026-09-18T17:16:30Z =====
+13:16  up 18 days, 19:34, 24 users, load averages: 2.88 3.37 3.52
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  30.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  24.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  16.8  0.0 /usr/libexec/trustd
+10571  14.1  2.2 pi
+90413  13.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   8.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== block-maxrxbuf 2026-09-18T17:16:30Z =====
+13:16  up 18 days, 19:34, 24 users, load averages: 2.88 3.37 3.52
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  30.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  24.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  16.8  0.0 /usr/libexec/trustd
+10571  14.1  2.2 pi
+90413  13.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   8.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== before-e5-rx256KiB-rtt12-r1 2026-09-18T17:16:30Z =====
+13:16  up 18 days, 19:34, 24 users, load averages: 2.88 3.37 3.52
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  30.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  24.4  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  23.6  0.0 /usr/libexec/trustd
+10571  14.1  2.2 pi
+90413  13.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   8.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== after-e5-rx256KiB-rtt12-r1 2026-09-18T17:16:34Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.37 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  37.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  12.2  2.2 pi
+  PID  %CPU %MEM COMM
+85242   5.8  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   4.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  658   4.6  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  327   4.5  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+ 7496   4.3  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== before-e5-rx4MiB-rtt12-r1 2026-09-18T17:16:34Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.37 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  36.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  19.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  10.0  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+10571   9.2  2.2 pi
+90413   8.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+85242   7.2  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  400   5.5  0.1 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+
+===== after-e5-rx4MiB-rtt12-r1 2026-09-18T17:16:37Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.37 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  14.4  2.2 pi
+  606  13.4  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  795  13.1  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+  434   6.0  0.1 /usr/libexec/airportd
+26035   5.6  0.1 /System/Library/PrivateFrameworks/HelpData.framework/Versions/A/Resources/helpd
+85242   5.5  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-rx16MiB-rtt12-r1 2026-09-18T17:16:38Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.37 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  45.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  25.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  16.8  0.0 /usr/libexec/trustd
+90413  15.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  795  14.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  12.9  2.2 pi
+  606  11.5  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  PID  %CPU %MEM COMM
+
+===== after-e5-rx16MiB-rtt12-r1 2026-09-18T17:16:41Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.34 3.46 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+52375  60.3  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+82933  50.9  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+  397  46.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+14044  29.1  0.2 /usr/libexec/coreduetd
+  795  16.7  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  16.3  2.2 pi
+  606  14.4  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+84947  14.0  0.1 /System/Library/Frameworks/CoreSpotlight.framework/spotlightknowledged
+
+===== before-e5-rx64MiB-rtt12-r1 2026-09-18T17:16:41Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.34 3.46 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  45.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+52375  38.3  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+82933  32.9  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+90387  26.9  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  606  17.8  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  407  16.6  0.0 /usr/libexec/trustd
+10571  14.7  2.2 pi
+  795  14.7  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-rx64MiB-rtt12-r1 2026-09-18T17:16:45Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.39 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+52375  58.5  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+82933  50.2  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+  397  42.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+26035  42.3  0.1 /System/Library/PrivateFrameworks/HelpData.framework/Versions/A/Resources/helpd
+  606  20.7  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  795  17.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  15.4  2.1 pi
+  PID  %CPU %MEM COMM
+
+===== before-e5-rx256KiB-rtt71-r1 2026-09-18T17:16:45Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.39 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+26035  48.6  0.2 /System/Library/PrivateFrameworks/HelpData.framework/Versions/A/Resources/helpd
+52375  41.5  0.1 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+  397  41.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+82933  34.5  0.1 /System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex/Contents/MacOS/Messages Assistant Extension
+  606  21.8  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+90387  18.1  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  795  15.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 2833  14.9  0.1 /usr/libexec/textcomposerd
+
+===== after-e5-rx256KiB-rtt71-r1 2026-09-18T17:16:50Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.44 3.48 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  47.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  735  24.9  1.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  606  17.0  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+10571  14.2  2.0 pi
+  795  13.4  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   5.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  815   3.6  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-rx4MiB-rtt71-r1 2026-09-18T17:16:50Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.44 3.48 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  43.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  29.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  735  28.8  1.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  606  22.3  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  407  18.4  0.0 /usr/libexec/trustd
+90413  14.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  795  14.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  12.6  2.0 pi
+
+===== after-e5-rx4MiB-rtt71-r1 2026-09-18T17:16:56Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.40 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  42.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  11.6  1.4 pi
+  PID  %CPU %MEM COMM
+85242   6.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   4.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  658   4.2  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  815   3.7  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  366   3.1  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-rx16MiB-rtt71-r1 2026-09-18T17:16:56Z =====
+13:16  up 18 days, 19:35, 24 users, load averages: 3.40 3.47 3.55
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  42.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  13.3  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  10.3  1.4 pi
+  PID  %CPU %MEM COMM
+  407   8.2  0.0 /usr/libexec/trustd
+85242   7.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+90413   6.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  400   5.6  0.1 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+
+===== after-e5-rx16MiB-rtt71-r1 2026-09-18T17:17:01Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.21 3.43 3.53
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  46.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  14.5  1.4 pi
+  795  12.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  434  11.1  0.1 /usr/libexec/airportd
+  PID  %CPU %MEM COMM
+  606   9.3  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+85242   6.0  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  371   5.3  0.1 /usr/libexec/locationd
+
+===== before-e5-rx64MiB-rtt71-r1 2026-09-18T17:17:01Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.21 3.43 3.53
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  45.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  407  19.0  0.0 /usr/libexec/trustd
+  606  16.1  0.1 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  795  15.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+10571  13.6  1.4 pi
+  PID  %CPU %MEM COMM
+90387   9.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+85242   5.9  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-rx64MiB-rtt71-r1 2026-09-18T17:17:19Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.78 3.54 3.57
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  44.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  30.2  0.1 /usr/libexec/airportd
+10571  23.1  1.4 pi
+  795  10.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 6487  10.3  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+  PID  %CPU %MEM COMM
+  371   8.1  0.1 /usr/libexec/locationd
+85242   6.5  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-rx256KiB-rtt12-r2 2026-09-18T17:17:19Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.78 3.54 3.57
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  44.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  23.4  1.4 pi
+90387  20.3  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  434  18.7  0.1 /usr/libexec/airportd
+  407  13.7  0.0 /usr/libexec/trustd
+90413  13.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+  795   9.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-rx256KiB-rtt12-r2 2026-09-18T17:17:22Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.78 3.54 3.57
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  46.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  35.1  1.4 pi
+  795  17.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   5.8  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  815   3.7  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  366   3.7  0.0 /System/Library/CoreServices/launchservicesd
+  327   3.6  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== before-e5-rx4MiB-rtt12-r2 2026-09-18T17:17:23Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.78 3.54 3.57
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  46.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  35.1  1.4 pi
+90387  21.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  795  16.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  407  13.5  0.0 /usr/libexec/trustd
+90413  12.4  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   5.6  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-rx4MiB-rtt12-r2 2026-09-18T17:17:26Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.80 3.55 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  30.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  17.7  1.5 pi
+ 3262  15.9  0.2 /Applications/WhatsApp.localized/WhatsApp.app/Contents/PlugIns/ServiceExtension.appex/Contents/MacOS/ServiceExtension
+  PID  %CPU %MEM COMM
+  795   7.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   6.5  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  327   6.0  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  366   5.6  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-rx16MiB-rtt12-r2 2026-09-18T17:17:26Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.80 3.55 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  31.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  20.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  17.7  1.5 pi
+  407  14.5  0.0 /usr/libexec/trustd
+90413  12.3  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+  795   7.8  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   6.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-rx16MiB-rtt12-r2 2026-09-18T17:17:30Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.89 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  37.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  30.1  1.4 pi
+  795  11.1  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+  658   7.0  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+85242   6.1  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   3.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  366   2.9  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-rx64MiB-rtt12-r2 2026-09-18T17:17:30Z =====
+13:17  up 18 days, 19:35, 24 users, load averages: 3.89 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.3  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  29.8  1.4 pi
+90387  13.5  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  795  11.2  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+  407   8.8  0.0 /usr/libexec/trustd
+90413   8.1  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+85242   7.2  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-rx64MiB-rtt12-r2 2026-09-18T17:17:34Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.82 3.56 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  52.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  32.5  1.5 pi
+  434  13.5  0.1 /usr/libexec/airportd
+  PID  %CPU %MEM COMM
+  795   9.8  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  658   6.3  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+85242   5.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  799   5.2  1.5 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== before-e5-rx256KiB-rtt71-r2 2026-09-18T17:17:34Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.82 3.56 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  49.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  30.0  1.5 pi
+90387  14.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  PID  %CPU %MEM COMM
+  795   9.8  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  407   9.7  0.0 /usr/libexec/trustd
+  434   8.2  0.1 /usr/libexec/airportd
+90413   7.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+
+===== after-e5-rx256KiB-rtt71-r2 2026-09-18T17:17:38Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.84 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  40.0  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  25.1  1.5 pi
+  PID  %CPU %MEM COMM
+  795   8.9  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   6.1  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  815   3.9  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  708   1.6  0.0 /usr/libexec/secinitd
+  434   1.4  0.1 /usr/libexec/airportd
+
+===== before-e5-rx4MiB-rtt71-r2 2026-09-18T17:17:39Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.84 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  44.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  27.8  1.5 pi
+90387  24.1  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  15.5  0.0 /usr/libexec/trustd
+90413  13.3  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+  795   9.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  434   8.9  0.1 /usr/libexec/airportd
+
+===== after-e5-rx4MiB-rtt71-r2 2026-09-18T17:17:43Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.93 3.59 3.59
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+10571  38.2  1.5 pi
+  397  36.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  795  20.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  434  16.5  0.1 /usr/libexec/airportd
+  PID  %CPU %MEM COMM
+  918   7.8  0.1 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent
+85242   6.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   5.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== before-e5-rx16MiB-rtt71-r2 2026-09-18T17:17:43Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.93 3.59 3.59
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+10571  42.6  1.6 pi
+  397  37.2  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  795  21.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+90387  18.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  434  10.3  0.1 /usr/libexec/airportd
+  407  10.0  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+90413   8.7  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+
+===== after-e5-rx16MiB-rtt71-r2 2026-09-18T17:17:48Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.77 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  40.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  37.9  1.6 pi
+  795  23.0  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+85242   5.0  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   4.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  829   2.8  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  815   2.5  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+
+===== before-e5-rx64MiB-rtt71-r2 2026-09-18T17:17:48Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.77 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  44.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  34.8  1.6 pi
+90387  25.9  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  795  19.5  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  407  18.0  0.0 /usr/libexec/trustd
+90413  16.9  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+ 7496   8.9  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== after-e5-rx64MiB-rtt71-r2 2026-09-18T17:17:53Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.77 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  48.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  27.4  1.6 pi
+  795  19.5  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+  434   9.7  0.1 /usr/libexec/airportd
+  658   5.5  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+85242   5.3  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 6487   4.6  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+
+===== block-end-rx 2026-09-18T17:17:53Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.77 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  48.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  29.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  23.9  1.6 pi
+  407  17.0  0.0 /usr/libexec/trustd
+  795  16.3  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+90413  14.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   5.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== block-maxmsg 2026-09-18T17:17:53Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.79 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  48.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  29.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  23.9  1.6 pi
+  407  17.0  0.0 /usr/libexec/trustd
+  795  16.3  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+90413  14.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   5.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-mm16KiB-rtt12-r1 2026-09-18T17:17:53Z =====
+13:17  up 18 days, 19:36, 24 users, load averages: 3.79 3.57 3.58
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  48.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  29.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  23.9  1.6 pi
+  407  17.0  0.0 /usr/libexec/trustd
+  795  16.3  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+90413  14.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   5.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-mm16KiB-rtt12-r1 2026-09-18T17:20:54Z =====
+13:20  up 18 days, 19:39, 24 users, load averages: 5.67 4.06 3.75
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+35168  62.1  0.2 /usr/sbin/spindump
+  397  32.8  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  18.9  1.3 pi
+  PID  %CPU %MEM COMM
+ 7496   9.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+85242   8.5  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  327   7.0  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  400   6.2  0.1 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+
+===== before-e5-mm64KiB-rtt12-r1 2026-09-18T17:20:54Z =====
+13:20  up 18 days, 19:39, 24 users, load averages: 5.67 4.06 3.75
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+35168  41.3  0.2 /usr/sbin/spindump
+  397  37.2  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  19.3  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  14.2  1.3 pi
+  407  10.9  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+ 7496   9.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 6487   8.2  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+
+===== after-e5-mm64KiB-rtt12-r1 2026-09-18T17:23:56Z =====
+13:23  up 18 days, 19:42, 24 users, load averages: 2.05 3.29 3.50
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+ 9480  67.4  1.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  397  50.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  19.8  2.2 pi
+33016  14.2  1.2 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/152.0.7977.64/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)
+  434  10.0  0.1 /usr/libexec/airportd
+  PID  %CPU %MEM COMM
+  795   8.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+85242   7.2  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-mm256KiB-rtt12-r1 2026-09-18T17:23:56Z =====
+13:23  up 18 days, 19:42, 24 users, load averages: 2.05 3.29 3.50
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  52.4  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 9480  39.4  1.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+90387  33.3  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  23.0  2.2 pi
+  407  18.7  0.0 /usr/libexec/trustd
+  434  13.1  0.1 /usr/libexec/airportd
+  795  11.3  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+
+===== after-e5-mm256KiB-rtt12-r1 2026-09-18T17:24:00Z =====
+13:24  up 18 days, 19:42, 24 users, load averages: 2.29 3.32 3.51
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  16.0  0.1 /usr/libexec/airportd
+10571  12.8  2.3 pi
+  PID  %CPU %MEM COMM
+85242   5.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   4.8  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  371   4.5  0.1 /usr/libexec/locationd
+  829   3.6  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+
+===== before-e5-mm1MiB-rtt12-r1 2026-09-18T17:24:00Z =====
+13:24  up 18 days, 19:42, 24 users, load averages: 2.29 3.32 3.51
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  38.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  18.6  0.1 /usr/libexec/airportd
+10571  14.0  2.3 pi
+40302  13.6  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+90387  12.1  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  PID  %CPU %MEM COMM
+90413   7.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  407   6.8  0.0 /usr/libexec/trustd
+
+===== after-e5-mm1MiB-rtt12-r1 2026-09-18T17:24:03Z =====
+13:24  up 18 days, 19:42, 24 users, load averages: 2.42 3.33 3.51
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  41.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  39.5  2.2 pi
+  410  39.1  0.2 /usr/sbin/coreaudiod
+  795  12.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+71720  11.5  0.0 /System/Library/Frameworks/CoreMediaIO.framework/Versions/A/Resources/com.apple.cmio.registerassistantservice
+  PID  %CPU %MEM COMM
+  328   9.1  0.0 /System/Library/PrivateFrameworks/MediaRemote.framework/Support/mediaremoted
+85242   7.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-mm16KiB-rtt71-r1 2026-09-18T17:24:04Z =====
+13:24  up 18 days, 19:42, 24 users, load averages: 2.42 3.33 3.51
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  48.6  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  31.4  2.2 pi
+  410  24.7  0.2 /usr/sbin/coreaudiod
+90387  19.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  12.5  0.0 /usr/libexec/trustd
+40421  12.3  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+  795  11.5  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+90413  10.8  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+
+===== after-e5-mm16KiB-rtt71-r1 2026-09-18T17:27:05Z =====
+13:27  up 18 days, 19:45, 24 users, load averages: 2.64 3.04 3.35
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  45.4  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  19.5  2.2 pi
+  PID  %CPU %MEM COMM
+85242   8.1  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   6.7  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  434   4.3  0.1 /usr/libexec/airportd
+  371   2.9  0.1 /usr/libexec/locationd
+  829   2.8  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+
+===== before-e5-mm64KiB-rtt71-r1 2026-09-18T17:27:05Z =====
+13:27  up 18 days, 19:45, 24 users, load averages: 2.64 3.04 3.35
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  39.5  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  15.7  2.2 pi
+  434  15.4  0.1 /usr/libexec/airportd
+90387  10.2  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  PID  %CPU %MEM COMM
+85242   8.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 6487   7.1  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+  407   5.6  0.0 /usr/libexec/trustd
+
+===== after-e5-mm64KiB-rtt71-r1 2026-09-18T17:30:07Z =====
+13:30  up 18 days, 19:48, 24 users, load averages: 2.78 3.01 3.28
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  41.6  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  20.2  2.2 pi
+  PID  %CPU %MEM COMM
+85242   7.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.2  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   5.9  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  366   4.8  0.0 /System/Library/CoreServices/launchservicesd
+  763   4.4  0.1 /System/Library/CoreServices/Batteries.app/Contents/PlugIns/BatteriesAvocadoWidgetExtension.appex/Contents/MacOS/BatteriesAvocadoWidgetExtension
+
+===== before-e5-mm256KiB-rtt71-r1 2026-09-18T17:30:07Z =====
+13:30  up 18 days, 19:48, 24 users, load averages: 2.78 3.01 3.28
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  35.7  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  24.8  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  14.7  2.2 pi
+  407  14.3  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+85242   8.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   7.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   5.4  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== after-e5-mm256KiB-rtt71-r1 2026-09-18T17:30:12Z =====
+13:30  up 18 days, 19:48, 24 users, load averages: 2.72 3.00 3.27
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  49.0  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  11.2  2.2 pi
+  PID  %CPU %MEM COMM
+85242   6.3  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   5.3  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  795   4.9  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+94689   3.6  0.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  327   3.6  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== before-e5-mm1MiB-rtt71-r1 2026-09-18T17:30:12Z =====
+13:30  up 18 days, 19:48, 24 users, load averages: 2.72 3.00 3.27
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  46.3  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  17.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  11.7  0.0 /usr/libexec/trustd
+10571  10.5  2.2 pi
+  PID  %CPU %MEM COMM
+90413   9.0  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+85242   6.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   5.3  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+
+===== after-e5-mm1MiB-rtt71-r1 2026-09-18T17:30:38Z =====
+13:30  up 18 days, 19:49, 24 users, load averages: 2.88 3.01 3.27
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  43.2  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  17.7  2.2 pi
+  PID  %CPU %MEM COMM
+85242   8.1  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.5  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  327   7.4  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  815   4.4  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+89659   3.4  0.0 /usr/libexec/sysmond
+
+===== before-e5-mm16KiB-rtt12-r2 2026-09-18T17:30:39Z =====
+13:30  up 18 days, 19:49, 24 users, load averages: 2.81 3.00 3.26
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  49.9  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  407  20.4  0.0 /usr/libexec/trustd
+  821  17.3  0.1 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+90387  16.5  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  14.4  2.2 pi
+  PID  %CPU %MEM COMM
+  434   8.4  0.1 /usr/libexec/airportd
+85242   7.9  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-mm16KiB-rtt12-r2 2026-09-18T17:33:40Z =====
+13:33  up 18 days, 19:52, 24 users, load averages: 2.66 2.87 3.15
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+33016  70.3  1.1 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/152.0.7977.64/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)
+  397  36.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  20.3  2.1 pi
+  PID  %CPU %MEM COMM
+ 7496   8.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+85242   8.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  795   7.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  366   5.4  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-mm64KiB-rtt12-r2 2026-09-18T17:33:40Z =====
+13:33  up 18 days, 19:52, 24 users, load averages: 2.66 2.87 3.15
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  31.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+33016  26.0  1.1 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/152.0.7977.64/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)
+10571  14.1  2.1 pi
+  PID  %CPU %MEM COMM
+85242   8.2  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   8.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+90387   8.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  327   6.2  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== after-e5-mm64KiB-rtt12-r2 2026-09-18T17:36:41Z =====
+13:36  up 18 days, 19:55, 24 users, load averages: 3.07 2.94 3.13
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  50.5  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  23.4  2.2 pi
+  PID  %CPU %MEM COMM
+  795   9.6  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   8.6  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  815   6.3  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  327   6.3  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  366   5.6  0.0 /System/Library/CoreServices/launchservicesd
+
+===== before-e5-mm256KiB-rtt12-r2 2026-09-18T17:36:42Z =====
+13:36  up 18 days, 19:55, 24 users, load averages: 3.07 2.94 3.13
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  49.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+90387  23.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  20.1  2.2 pi
+  407  12.4  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+  795   8.4  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+85242   7.4  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  799   5.3  1.6 /Applications/Helium.app/Contents/MacOS/Helium
+
+===== after-e5-mm256KiB-rtt12-r2 2026-09-18T17:36:45Z =====
+13:36  up 18 days, 19:55, 24 users, load averages: 3.31 3.00 3.14
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  43.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  26.6  2.2 pi
+  PID  %CPU %MEM COMM
+  795   9.5  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+    1   9.0  0.1 /sbin/launchd
+85242   5.6  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  815   2.9  1.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  434   2.8  0.1 /usr/libexec/airportd
+
+===== before-e5-mm1MiB-rtt12-r2 2026-09-18T17:36:46Z =====
+13:36  up 18 days, 19:55, 24 users, load averages: 3.31 3.00 3.14
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  45.8  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  24.7  2.2 pi
+  434  16.3  0.1 /usr/libexec/airportd
+90387  12.0  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  PID  %CPU %MEM COMM
+  795   9.0  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  407   7.5  0.0 /usr/libexec/trustd
+90413   6.6  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+
+===== after-e5-mm1MiB-rtt12-r2 2026-09-18T17:36:49Z =====
+13:36  up 18 days, 19:55, 24 users, load averages: 3.36 3.01 3.15
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  41.7  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  40.8  2.2 pi
+  795  11.9  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+  366   6.4  0.0 /System/Library/CoreServices/launchservicesd
+85242   6.1  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  327   4.8  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  400   3.2  0.1 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+
+===== before-e5-mm16KiB-rtt71-r2 2026-09-18T17:36:49Z =====
+13:36  up 18 days, 19:55, 24 users, load averages: 3.36 3.01 3.15
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  43.9  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+10571  37.8  2.2 pi
+90387  18.7  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  12.6  0.0 /usr/libexec/trustd
+  795  11.5  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+90413  11.4  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+85242   7.0  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-mm16KiB-rtt71-r2 2026-09-18T17:39:51Z =====
+13:39  up 18 days, 19:58, 24 users, load averages: 2.00 2.61 2.95
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  50.2  0.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  539  27.4  0.1 /System/Library/CoreServices/TimeMachine/backupd
+10571  18.3  2.1 pi
+  586  13.8  0.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+ 7496  13.2  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+ 6487   9.6  0.2 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+85242   9.4  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-mm64KiB-rtt71-r2 2026-09-18T17:39:51Z =====
+13:39  up 18 days, 19:58, 24 users, load averages: 2.00 2.61 2.95
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  397  50.1  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  23.7  0.1 /usr/libexec/airportd
+  539  17.0  0.1 /System/Library/CoreServices/TimeMachine/backupd
+10571  16.5  2.1 pi
+  PID  %CPU %MEM COMM
+ 7496   9.3  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  371   8.8  0.1 /usr/libexec/locationd
+  586   8.4  0.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+
+===== after-e5-mm64KiB-rtt71-r2 2026-09-18T17:42:53Z =====
+13:42  up 18 days, 20:01, 24 users, load averages: 4.27 3.11 3.08
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+24907  93.6  0.2 /usr/libexec/duetexpertd
+  434  30.9  0.1 /usr/libexec/airportd
+  352  30.6  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+10571  16.4  1.1 pi
+  918  11.9  0.1 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent
+  PID  %CPU %MEM COMM
+  795   9.0  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+  327   9.0  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== before-e5-mm256KiB-rtt71-r2 2026-09-18T17:42:53Z =====
+13:42  up 18 days, 20:01, 24 users, load averages: 4.27 3.11 3.08
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+24907  75.4  0.2 /usr/libexec/duetexpertd
+  352  14.8  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+10571  13.8  1.1 pi
+  434  12.1  0.1 /usr/libexec/airportd
+ 7496  11.0  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+90387   9.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  397   7.7  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== after-e5-mm256KiB-rtt71-r2 2026-09-18T17:43:16Z =====
+13:43  up 18 days, 20:01, 24 users, load averages: 3.60 3.05 3.06
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559  36.0  0.6 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+  352  23.2  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+69561  16.8  0.0 /System/Library/PrivateFrameworks/CacheDelete.framework/deleted_helper
+10571  16.3  1.1 pi
+ 7496  11.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  PID  %CPU %MEM COMM
+85242   9.1  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  397   7.9  0.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== before-e5-mm1MiB-rtt71-r2 2026-09-18T17:43:16Z =====
+13:43  up 18 days, 20:01, 24 users, load averages: 3.60 3.05 3.06
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559  20.3  0.7 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+ 7496  13.4  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  12.9  1.1 pi
+  352  12.3  0.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+70012  10.3  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+  PID  %CPU %MEM COMM
+69561   8.9  0.0 /System/Library/PrivateFrameworks/CacheDelete.framework/deleted_helper
+85242   7.5  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== after-e5-mm1MiB-rtt71-r2 2026-09-18T17:44:00Z =====
+13:44  up 18 days, 20:02, 24 users, load averages: 4.10 3.31 3.15
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559  40.2  1.1 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+10571  20.2  1.0 pi
+  539  19.7  0.3 /System/Library/CoreServices/TimeMachine/backupd
+  795  15.5  1.0 /Applications/cmux.app/Contents/MacOS/cmux
+  400  14.8  0.2 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  397  10.8  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  434  10.4  0.1 /usr/libexec/airportd
+  PID  %CPU %MEM COMM
+
+===== block-end-msg 2026-09-18T17:44:01Z =====
+13:44  up 18 days, 20:02, 24 users, load averages: 4.10 3.31 3.15
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559  64.9  1.1 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+  539  49.3  0.3 /System/Library/CoreServices/TimeMachine/backupd
+90387  22.1  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  822  18.7  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+78705  16.4  0.1 /System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd
+  795  14.2  1.0 /Applications/cmux.app/Contents/MacOS/cmux
+10571  13.5  1.0 pi
+  400  10.8  0.2 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+
+===== block-tail 2026-09-18T17:45:42Z =====
+13:45  up 18 days, 20:04, 24 users, load averages: 3.35 3.20 3.12
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+ 7496  50.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+69559  44.1  1.5 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+10571  28.1  1.2 pi
+  795  19.6  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  539  13.6  0.2 /System/Library/CoreServices/TimeMachine/backupd
+  PID  %CPU %MEM COMM
+  829   8.2  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  397   8.1  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== before-e5-tail-rtt12-r1 2026-09-18T17:45:42Z =====
+13:45  up 18 days, 20:04, 24 users, load averages: 3.35 3.20 3.12
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+ 7496  50.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+69559  44.1  1.5 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+10571  28.1  1.2 pi
+  795  19.6  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  539  13.6  0.2 /System/Library/CoreServices/TimeMachine/backupd
+  PID  %CPU %MEM COMM
+  829   8.2  0.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  397   8.1  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== after-e5-tail-rtt12-r1 2026-09-18T17:45:46Z =====
+13:45  up 18 days, 20:04, 24 users, load averages: 3.24 3.18 3.12
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+  795  14.9  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+10571  11.5  1.2 pi
+  PID  %CPU %MEM COMM
+  397   7.9  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  375   7.7  0.1 /usr/libexec/dasd
+  400   5.5  0.2 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+ 7496   5.2  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+85242   5.0  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-tail-rtt71-r1 2026-09-18T17:45:46Z =====
+13:45  up 18 days, 20:04, 24 users, load averages: 3.24 3.18 3.12
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+90387  28.5  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  16.9  0.0 /usr/libexec/trustd
+  795  16.0  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  822  12.4  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+10571  10.6  1.2 pi
+  PID  %CPU %MEM COMM
+ 7496   9.5  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  397   8.0  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== after-e5-tail-rtt71-r1 2026-09-18T17:46:29Z =====
+13:46  up 18 days, 20:04, 24 users, load averages: 5.07 3.62 3.28
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+14044 101.5  0.2 /usr/libexec/coreduetd
+  735  69.5  0.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 7496  58.9  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+10571  15.1  1.1 pi
+  539  14.7  0.5 /System/Library/CoreServices/TimeMachine/backupd
+  397  12.0  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  658  10.3  0.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  PID  %CPU %MEM COMM
+
+===== before-e5-tail-rtt12-r2 2026-09-18T17:46:29Z =====
+13:46  up 18 days, 20:04, 24 users, load averages: 5.07 3.62 3.28
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+14044 106.6  0.2 /usr/libexec/coreduetd
+ 7496  38.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  735  34.7  0.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+10571  14.8  1.1 pi
+  822  12.9  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  539  10.0  0.5 /System/Library/CoreServices/TimeMachine/backupd
+  PID  %CPU %MEM COMM
+  397   8.9  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== after-e5-tail-rtt12-r2 2026-09-18T17:46:40Z =====
+13:46  up 18 days, 20:05, 24 users, load averages: 5.67 3.83 3.36
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+14044  94.8  0.2 /usr/libexec/coreduetd
+ 2863  83.8  0.1 /System/Library/PrivateFrameworks/PhotoLibraryServices.framework/Versions/A/Support/photolibraryd
+  735  74.5  0.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+10571  15.7  1.1 pi
+  PID  %CPU %MEM COMM
+ 7496   9.7  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  397   8.3  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  327   7.6  0.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+
+===== before-e5-tail-rtt71-r2 2026-09-18T17:46:41Z =====
+13:46  up 18 days, 20:05, 24 users, load averages: 5.67 3.83 3.36
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+14044  96.4  0.2 /usr/libexec/coreduetd
+  735  75.3  0.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 2863  67.0  0.1 /System/Library/PrivateFrameworks/PhotoLibraryServices.framework/Versions/A/Support/photolibraryd
+90387  17.5  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+10571  13.6  1.1 pi
+  407  11.1  0.0 /usr/libexec/trustd
+90413  10.9  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+
+===== after-e5-tail-rtt71-r2 2026-09-18T17:47:37Z =====
+13:47  up 18 days, 20:06, 24 users, load averages: 5.11 4.03 3.46
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559  93.5  1.2 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+  539  18.9  1.2 /System/Library/CoreServices/TimeMachine/backupd
+10571  18.4  1.1 pi
+84947  14.5  0.1 /System/Library/Frameworks/CoreSpotlight.framework/spotlightknowledged
+  397  11.9  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  735  11.1  0.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  PID  %CPU %MEM COMM
+85242   8.9  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+
+===== before-e5-tail-rtt12-r3 2026-09-18T17:47:37Z =====
+13:47  up 18 days, 20:06, 24 users, load averages: 5.11 4.03 3.46
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559  87.5  1.2 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+90387  24.6  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  539  19.6  1.2 /System/Library/CoreServices/TimeMachine/backupd
+90413  16.5  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+10571  15.9  1.1 pi
+  407  14.8  0.0 /usr/libexec/trustd
+  PID  %CPU %MEM COMM
+  397   8.8  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== after-e5-tail-rtt12-r3 2026-09-18T17:47:41Z =====
+13:47  up 18 days, 20:06, 24 users, load averages: 5.10 4.05 3.47
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559 104.1  1.1 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+10571  11.1  1.1 pi
+  795  10.7  1.1 /Applications/cmux.app/Contents/MacOS/cmux
+  PID  %CPU %MEM COMM
+  397   7.5  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 7496   5.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+85242   5.2  0.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  822   5.0  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+
+===== before-e5-tail-rtt71-r3 2026-09-18T17:47:41Z =====
+13:47  up 18 days, 20:06, 24 users, load averages: 5.10 4.05 3.47
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559 108.4  1.1 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+90387  24.2  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  407  15.2  0.0 /usr/libexec/trustd
+90413  13.1  0.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  PID  %CPU %MEM COMM
+10571   9.3  1.1 pi
+  822   7.3  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  397   7.2  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+
+===== after-e5-tail-rtt71-r3 2026-09-18T17:48:39Z =====
+13:48  up 18 days, 20:07, 24 users, load averages: 6.18 4.51 3.68
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559 110.1  0.8 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+10571  21.3  1.1 pi
+  PID  %CPU %MEM COMM
+  822   9.8  0.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+85242   6.7  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 7496   6.1  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  397   6.0  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  795   5.6  1.2 /Applications/cmux.app/Contents/MacOS/cmux
+
+===== block-end-tail 2026-09-18T17:48:39Z =====
+13:48  up 18 days, 20:07, 24 users, load averages: 6.18 4.51 3.68
+vm.swapusage: total = 7168.00M  used = 6270.31M  free = 897.69M  (encrypted)
+69559  95.9  0.8 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+10571  14.8  1.1 pi
+90387  11.2  0.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  PID  %CPU %MEM COMM
+  397   7.2  0.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 7496   5.8  0.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  407   5.7  0.0 /usr/libexec/trustd
+85242   5.5  0.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+

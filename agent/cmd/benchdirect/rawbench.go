@@ -29,6 +29,9 @@ type runConfig struct {
 	queue        int64
 	rtoMax       time.Duration
 	cwndCAStep   int64
+	fastRtxWnd   int64
+	maxRxBuf     int64
+	maxMsg       int64
 	conns        int
 	sharing      string
 }
@@ -56,11 +59,16 @@ type rawResult struct {
 	Mode         string     `json:"mode"`
 	RTT          int        `json:"rtt_ms"`
 	Loss         float64    `json:"loss"`
+	Chunk        int64      `json:"chunk"`
 	JitterMs     int        `json:"jitter_ms"`
 	Bandwidth    int64      `json:"bandwidth_bps"`
 	Queue        int64      `json:"queue_bytes"`
 	RtoMaxMs     int64      `json:"rto_max_ms"`
 	CwndCAStep   int64      `json:"cwnd_ca_step"`
+	MinCwnd      int64      `json:"min_cwnd"`
+	FastRtxWnd   int64      `json:"fast_rtx_wnd"`
+	MaxRxBuf     int64      `json:"max_rx_buf"`
+	MaxMsg       int64      `json:"max_msg"`
 	Conns        int        `json:"conns"`
 	Sharing      string     `json:"sharing"`
 	SentBytes    int64      `json:"sent_bytes"`
@@ -194,7 +202,9 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		Mode: "raw", RTT: cfg.rttMs, Loss: cfg.loss, Conns: n, Sharing: cfg.sharing,
 		JitterMs: int(cfg.jitter / time.Millisecond), Bandwidth: cfg.bandwidth,
 		Queue: cfg.queue, RtoMaxMs: int64(cfg.rtoMax / time.Millisecond),
-		CwndCAStep: cfg.cwndCAStep,
+		Chunk: int64(cfg.chunk),
+		CwndCAStep: cfg.cwndCAStep, FastRtxWnd: cfg.fastRtxWnd,
+		MaxRxBuf: cfg.maxRxBuf, MaxMsg: cfg.maxMsg, MinCwnd: cfg.minCwnd,
 	}
 	delay := time.Duration(cfg.rttMs) * time.Millisecond / 2
 
@@ -226,6 +236,15 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		}
 		if cfg.cwndCAStep > 0 {
 			se.SetSCTPCwndCAStep(uint32(cfg.cwndCAStep))
+		}
+		if cfg.fastRtxWnd > 0 {
+			se.SetSCTPFastRtxWnd(uint32(cfg.fastRtxWnd))
+		}
+		if cfg.maxRxBuf > 0 {
+			se.SetSCTPMaxReceiveBufferSize(uint32(cfg.maxRxBuf))
+		}
+		if cfg.maxMsg > 0 {
+			se.SetSCTPMaxMessageSize(uint32(cfg.maxMsg))
 		}
 		api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
 		pc, err := api.NewPeerConnection(webrtc.Configuration{})

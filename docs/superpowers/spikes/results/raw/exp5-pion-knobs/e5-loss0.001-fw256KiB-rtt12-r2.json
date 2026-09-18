@@ -1,0 +1,1 @@
+{"mode":"prod","rtt_ms":12,"loss":0,"jitter_ms":0,"bandwidth_bps":30000000,"queue_bytes":5000000,"rto_max_ms":0,"cwnd_ca_step":0,"fast_rtx_wnd":262144,"max_rx_buf":0,"max_msg":0,"conns":0,"sharing":"","sent_bytes":67108864,"received_bytes":67108864,"mbps":32.10777601665807,"wall_mbps":0,"elapsed_ms":0,"chrome_cpu_seconds":0,"chrome_cores":0,"go_cpu_seconds":0}
