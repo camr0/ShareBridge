@@ -29,8 +29,19 @@ The highest value/effort item in this document; it needs no new engineering.
   **no `SB_SCTP_*` variables set at all**; the test rig `sb-run` has `SB_SCTP_CA_STEP=32768`.
 - **Consequence:** *every throughput number in this directory was measured with the tune ON.* The product's
   out-of-the-box direct-transfer performance is expected to be roughly half.
-- **Field value of the tune:** `.worktrees/e2e-v1/docs/superpowers/spikes/2026-09-15-e2e-campus-home-field-test.md`
-  records direct **49.6 → 93.6 Mbps (1.89×)** from CA-step alone.
+- **Field value of the tune — now measured in THIS configuration (2026-09-18, E13):** stock
+  (`run-variant.sh u`) vs tuned (`c`), n=2 per client, 754 MiB, click-only, agent-side windows:
+  **CLIENT-EAST 84.45 / 86.68 Mbps stock (mean 85.6) → 102–111 tuned = 1.19–1.30×**;
+  **CLIENT-WEST 50.38 / 48.90 stock (mean 49.6) → 60.2–61.4 tuned = 1.21–1.24×.**
+  Rep spread ≤1.5% and no overlap between the stock and tuned cells — though the tuned baseline is a
+  different session rather than an interleaved same-session A/B (caveat noted in the report).
+- **So the honest multiplier is ~1.2×, not the 1.89× recorded in the 2026-09-15 campus session**
+  (`.worktrees/e2e-v1/docs/superpowers/spikes/2026-09-15-e2e-campus-home-field-test.md`, direct
+  49.6 → 93.6 Mbps). **That figure does not generalise to this path** — quote the 1.2× when justifying
+  the change.
+- **What users currently get:** production ships stock (see the direct evidence above), so out-of-the-box
+  direct throughput is **~86 Mbps (CLIENT-EAST) / ~50 Mbps (CLIENT-WEST)**, and ~86% of every number
+  quoted elsewhere in these documents (102–111 / 60.2) already has the tune applied.
 - **Action:** enable `SB_SCTP_CA_STEP=32768` in the production deployment **or** make it the code default,
   then re-measure with the same field methodology. Note it is a **production** change — requires operator
   approval, not an autonomous edit.
@@ -85,10 +96,11 @@ direct on the fast path. Any decision that assumes "if direct fails we can fall 
 is wrong without separate work. (Also: relay was *slower on the lower-RTT path*, pointing at the relay server or
 its per-message framing rather than RTT.)
 
-## F6 — **(c)** Unquantified: stock vs CA-step in the current configuration
-The rig supports variant `u` (stock, no CA-step) vs `c` (CA-step). Tonight only `c` was measured. Running one
-`u` cell per path (~10 minutes; container recreate + two downloads) would quantify exactly what production is
-currently losing on the paths we measured.
+## F6 — **RESOLVED (2026-09-18, E13)** — the stock baseline is now quantified
+The rig supports variant `u` (stock, no CA-step) vs `c` (CA-step); E13 measured **both** on both clients:
+stock **85.6 Mbps** CLIENT-EAST / **49.6 Mbps** CLIENT-WEST versus tuned **102–111** / **60.2–61.4**
+⇒ **1.19–1.30× / 1.21–1.24×**. Rep spread ≤1.5%, no overlap. Full detail in
+`results/2026-09-18-exp13-stock-vs-ca-step.md`. See F1 for what this means for the product.
 
 ## F7 — Context: the architecture comparison (for prioritization, not a code change)
 Matched field cells, same clients/paths/hour, 754 MiB per cell, v1 measured agent-side, v2 at 87–97% of path
