@@ -49,6 +49,38 @@ recovery). Yet **goodput collapses 16–62× while the wire stays ~1.1×**: the 
 filling the link. Stalls are 0.9–1.2 s chunks — the hard-coded 1 s RTO floor. Real-world lossy paths
 should therefore be much worse for v1 than this clean test path suggests.
 
+**E11 mapped the cliff precisely** (rtt 12, bottleneck capped at 240 Mbps, n=3–5 per cell):
+
+| loss | 0 | 1e-4 | **2e-4** | 3e-4 | 1e-3 | 9e-3 | 1e-2 |
+|---|---|---|---|---|---|---|---|
+| Mbps | **225.2** | **211.0** | **96.5** | 60.1 | 28.3 | 8.6 | 8.2 |
+
+The collapse is a **cliff between 1e-4 and 2e-4** (~0.015%), not a gradient. Wire ratio drifts only
+1.089→1.140, `shim_drop` stays 0, and Chrome's CPU falls 0.70→0.04 cores as loss rises — the sender
+**idles, it does not congest**. The collapsed rate scales as **1/RTT** (5.0–5.6× for a 5.9× RTT step),
+which identifies it as **window-limited with W ≈ 10 datagrams**: v1's send window collapses to a tiny
+constant and throughput becomes window/RTT. That single mechanism explains why v1 halves as RTT doubles
+(111 → 60 Mbps in the field), why striping cannot help, and why v2's kernel-TCP path — with real
+congestion control — wins.
+
+**E11's RTO verdict (the last place a cheap fix could hide): not a fix.** Lowering the RTO floor gives
++13.8%/+14.8% at 1e-3 loss but only +2.4%/+5.6% at 9e-3 (inside spread), and the entire gain is the
+removal of the 1 s stall time (4.5 s → 1.2 s). The sender idles less; it does not send more.
+
+**Honest disagreement to carry forward.** E11's analyst argues the field's 112 Mbps cap is *not* explained
+by loss: the ladder only reaches 112 Mbps at ~1.7e-4 effective loss, ~50× below the 0.90% measured at
+250 Mbps offered, while 0.9% gives 8.6 Mbps — 13× *below* the field. So the field's effective loss must be
+far lower than 0.9% (consistent: that figure was measured well past the 246 Mbps ceiling), and loss alone
+does not set the 112 cap. Its analyst then leans back toward a client-sink explanation. **I weight E8b's
+cross-host result above that**: two independent client hosts did not add throughput, which a per-client
+sink cannot produce (see §2). The best-supported remaining explanation is therefore **the v1 agent-side
+userspace send path** (pion DTLS/SCTP crypto in one process, ~0.9–1.6 cores spread over 8–9 threads with no
+pinned thread, on a host that also runs a GPU LLM server, Jellyfin, Immich and more).
+
+**The decisive follow-up that would separate them (unrun):** in the *field*, measure v1 with the
+application download sink removed (a bare byte-counting bench page, or a Go receiver) against the real
+app on the same share and hour. Fast bare-page ≈ agent-side limit; fast app-only-when-bare ≈ client sink.
+
 ### 4. The old "wire ÷ 3 = goodput" field claim was a measurement artefact
 
 It cannot be protocol framing (1.08–1.12×) and is almost certainly not retransmission. It needs a

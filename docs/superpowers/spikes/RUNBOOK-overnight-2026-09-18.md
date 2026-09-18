@@ -95,10 +95,12 @@ JSON: `mbps`, `wall_mbps`, `received_bytes`, `samples` (cumulative bytes each 10
 `shim_fwd` (datagrams forwarded) / `shim_drop` / `shim_write_err`, `chrome_cpu_seconds` /
 `chrome_cores`, `go_cpu_seconds`.
 
-**Roles matter for interpretation:** in the lab the **sender is a real Chrome tab** (chromedp) and the
-**receiver is Go** (`window.__bench.received`), shimmed by a UDP-loopback bottleneck that models
-delay/loss/jitter/bandwidth/queue. In the field the **receiver is Chrome + the app's download sink**.
-So lab numbers are an upper bound for anything involving the client-side sink — say so when reporting.
+**Roles matter for interpretation (CORRECTED 2026-09-18 — this was inverted here and in E1's caveat 3):**
+in the lab **Go/pion is the DATA SENDER** (`cmd/benchdirect/rawbench.go:151` `dc.Send`) and **Chrome is the
+RECEIVER** (`cmd/benchdirect/web/bench.js:42` counts `window.__bench.received`) — the same direction as the
+field. The shim is a UDP-loopback bottleneck modelling delay/loss/jitter/bandwidth/queue. Note the lab's
+Chrome page only *counts bytes*: it does **not** run the application's download sink (SHA-1 verify +
+service-worker writes), so the lab is an upper bound for anything involving the real client sink.
 
 **Method rules:** n≥3 per cell; report mean/min/max; **run lab cells strictly one at a time** (a single
 `benchdirect` process at a time — throughput here is CPU-sensitive); discard a cell with
