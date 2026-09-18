@@ -348,6 +348,32 @@ file; `go build ./...` and `go vet` pass.)
 - Rig restored and verified afterwards (`sb-agent:pristine`, `NanoCpus=0`, `UI_PORT=7879`, `CA_STEP=32768`,
   no `MIN_CWND`, API 200, signalling 200, clients clean).
 
+## F17 — The client's cost is **66 % WebRTC receive path / 34 % app sink** (E27) — and that first bucket is UNSEPARATED
+- **Sink-free (E15's technique), all direct, pin-verified:** **1 vCPU → 56.35 Mbps** (56.21/56.50, n=2); **4 vCPU →
+  119.45** (122.65/116.24, n=2). **Sink-ON control, same session, 4 vCPU → 108.76**, which reproduces E25's 107.84
+  to **0.9 %** ⇒ no session drift, and that is what justifies comparing the 1-vCPU arm against E25's 37.19 (all
+  three fresh pinned sink-ON controls fell to relay).
+- **Ratios: 1.52× at 1 vCPU, 1.098× at 4 vCPU.** With cores to spare the sink costs ~10 % of throughput; it only
+  becomes decisive when the client is CPU-starved.
+- **The cost is in the chrome RENDERER**: sink-free **0.66–0.86 cores** vs sink-ON **1.95–2.01 cores**; the network
+  service is flat (0.38–0.51), GPU 0.06, node ≤0.06. So the sink (hash-wasm + StreamSaver) is in-renderer JS — not
+  network, GPU or driver.
+- **But 66 % of the client's per-byte cost is not the sink.** Deciding number: a sink-free 1-core client does
+  **56.35 Mbps**, still ~**1.5× worse per core** than the sender's 85–100 Mbps/core. That remainder is bucketed as
+  "the WebRTC receive path" — which is **browser-internal DataChannel receive PLUS the app's own onmessage /
+  chunk-assembly JS, and E27 does not separate them.** Whether v1 can be lifted by app-code changes (no fork, no
+  v2) hinges entirely on that split, so it is the next experiment (E28, a bare receive path).
+- **Do not conflate two quantities from E27's wording:** the sink's share of *renderer CPU* (34 % at 1 vCPU, 48 %
+  at 4 vCPU) and its share of *throughput* (52 % at 1 vCPU, 9.8 % at 4 vCPU). Different denominators.
+- **Methodological catch worth keeping:** pinned (1-vCPU) attempts **fell to relay in 4 of 8 tries, at +10.0 s**
+  (0 of 4 unpinned). CPU starvation delays the handshake past the direct-mode timeout, so **pinning the client
+  CAUSES silent relay fallback** — any future pinned-client experiment must budget retries and assert the mode.
+- **Web root restored and verified byte-for-byte** (`cmp` identical, 91,308 B, 0 markers, HTTP matches).
+- **E25's TESTBOX alert-80 did NOT reproduce** (Chromium 3/3 loads, curl 6/6 across 3 hosts; the front was never
+  restarted, NRestarts=0) — that hazard was transient. No operator action needed, but it stays on record.
+- **Benchmark to beat, unchanged:** this same client VM did **239 Mbps through the v2 relay** (E10c), so the client
+  is not inherently limited to ~120 — the limit is in the v1 client's path, not the hardware.
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the
