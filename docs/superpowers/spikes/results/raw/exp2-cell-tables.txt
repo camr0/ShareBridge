@@ -1,0 +1,125 @@
+
+## raw
+| rtt | rtomax | n | mean | median | min | max | ceil | fwd/MiB mean | load range | contaminated |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 12 | 0 | 5 | 409.7 | 495.5 | 58.6 | 503.0 | 503.0 | 1368.0 | 3.09,3.23 3.58 3.47,3.42 3.62 3.49,3.53,4.00 3.72 3.52 | 1/5 collapse |
+| 12 | 500ms | 4 | 485.3 | 496.2 | 438.9 | 509.9 | 509.9 | 1354.7 | 3.13 3.55 3.46,3.42 3.62 3.49,3.59,4.00 3.73 3.53 | 0/4 collapse |
+| 12 | 200ms | 5 | 492.5 | 491.3 | 472.3 | 511.6 | 511.6 | 1369.4 | 3.09,3.23 3.58 3.47,3.76 3.68 3.51,3.91,4.00 3.72 3.52 | 0/5 collapse |
+| 25 | 0 | 5 | 451.3 | 449.9 | 432.0 | 470.2 | 470.2 | 1356.5 | 3.59,4.30 3.84 3.57,4.40,4.53 3.87 3.58,4.98 3.94 3.60 | 0/5 collapse |
+| 25 | 500ms | 5 | 317.7 | 425.7 | 27.6 | 455.6 | 455.6 | 1379.1 | 3.76 3.68 3.51,4.17,4.33 3.84 3.57,4.40,4.66 3.89 3.59 | 1/5 collapse |
+| 25 | 200ms | 4 | 437.8 | 445.0 | 405.5 | 455.8 | 455.8 | 1366.6 | 3.59,4.30 3.84 3.57,4.53 3.87 3.58,4.98 3.94 3.60 | 0/4 collapse |
+| 71 | 0 | 5 | 221.7 | 256.5 | 12.0 | 328.3 | 328.3 | 1363.8 | 3.23,3.67,5.00 4.01 3.64,5.29 4.14 3.69,6.11 4.37 3.78 | 1/5 collapse |
+| 71 | 500ms | 5 | 180.6 | 146.2 | 39.0 | 328.8 | 328.8 | 1380.0 | 3.25,3.38,5.00 4.01 3.64,5.75 4.25 3.73,6.58 4.50 3.83 | 3/5 collapse |
+| 71 | 200ms | 4 | 232.4 | 247.9 | 103.4 | 330.5 | 330.5 | 1378.2 | 3.71,5.00 3.99 3.63,5.29 4.14 3.69,5.69 4.26 3.74 | 1/4 collapse |
+| 100 | 0 | 4 | 138.0 | 136.7 | 35.7 | 242.9 | 242.9 | 1361.0 | 3.53,5.05 4.42 3.83,5.60 4.49 3.85,7.26 4.67 3.90 | 2/4 collapse |
+| 100 | 500ms | 5 | 141.6 | 125.2 | 10.7 | 243.3 | 243.3 | 1361.1 | 3.47,4.29,5.23 4.43 3.83,6.00 4.63 3.91,6.17 4.56 3.87 | 2/5 collapse |
+| 100 | 200ms | 4 | 202.9 | 203.5 | 161.5 | 243.1 | 243.1 | 1360.0 | 3.86,5.05 4.41 3.83,5.84 4.64 3.92,5.91 4.53 3.86 | 0/4 collapse |
+
+## prod
+| rtt | rtomax | n | mean | median | min | max | ceil | fwd/MiB mean | load range | contaminated |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 12 | 0 | 3 | 534.3 | 532.0 | 531.5 | 539.4 | 539.4 | 1356.4 | 5.69 4.67 3.95,6.17 4.73 3.96,6.51 4.86 4.02 | 0/3 collapse |
+| 12 | 500ms | 3 | 533.5 | 535.2 | 519.8 | 545.4 | 545.4 | 1353.9 | 5.69 4.67 3.95,6.15 4.81 4.01,6.17 4.73 3.96 | 0/3 collapse |
+| 12 | 200ms | 3 | 535.0 | 535.3 | 532.5 | 537.3 | 537.3 | 1344.2 | 5.84 4.68 3.95,6.30 4.86 4.03,6.51 4.86 4.02 | 0/3 collapse |
+| 25 | 0 | 3 | 493.8 | 488.5 | 488.2 | 504.7 | 504.7 | 1359.6 | 5.98 4.87 4.04,6.52 4.93 4.06,6.76 5.07 4.13 | 0/3 collapse |
+| 25 | 500ms | 3 | 491.7 | 492.5 | 488.5 | 494.2 | 494.2 | 1359.9 | 6.22 4.94 4.07,6.23 4.90 4.05,6.30 4.86 4.03 | 0/3 collapse |
+| 25 | 200ms | 3 | 497.4 | 495.5 | 494.8 | 502.1 | 502.1 | 1349.9 | 5.98 4.87 4.04,6.22 4.94 4.07,6.52 4.93 4.06 | 0/3 collapse |
+| 71 | 0 | 3 | 271.7 | 257.2 | 184.3 | 373.6 | 373.6 | 1369.6 | 6.61 5.32 4.27,7.40 5.37 4.26,7.41 5.26 4.21 | 1/3 collapse |
+| 71 | 500ms | 3 | 237.5 | 185.7 | 154.2 | 372.6 | 372.6 | 1365.8 | 6.88 5.40 4.30,7.37 5.39 4.28,7.41 5.26 4.21 | 2/3 collapse |
+| 71 | 200ms | 3 | 111.1 | 107.5 | 53.0 | 172.8 | 172.8 | 1387.6 | 7.10 5.17 4.17,7.10 5.37 4.27,7.22 5.26 4.21 | 1/3 collapse |
+| 100 | 0 | 3 | 136.3 | 112.1 | 26.2 | 270.6 | 270.6 | 1368.8 | 5.51 5.20 4.27,6.57 5.36 4.29,6.79 5.50 4.40 | 2/3 collapse |
+| 100 | 500ms | 3 | 104.8 | 99.8 | 34.1 | 180.6 | 180.6 | 1374.7 | 5.39 5.18 4.27,5.86 5.37 4.38,6.28 5.32 4.29 | 1/3 collapse |
+| 100 | 200ms | 3 | 53.5 | 56.7 | 22.5 | 81.2 | 81.2 | 1370.5 | 5.42 5.31 4.38,5.62 5.21 4.26,5.68 5.25 4.29 | 1/3 collapse |
+
+## per-run detail
+ raw rtt=12  rto=0      r1  mbps=  503.0 wall=  3s fwd/MiB= 1344.5 cores=1.21 load=3.42 3.62 3.49 
+ raw rtt=12  rto=0      r2  mbps=  490.2 wall=  3s fwd/MiB= 1388.9 cores=1.23 load=3.23 3.58 3.47 
+ raw rtt=12  rto=0      r3  mbps=  495.5 wall=  3s fwd/MiB= 1379.2 cores=1.25 load=4.00 3.72 3.52 
+ raw rtt=12  rto=0      r4  mbps=  501.2 wall=  3s fwd/MiB= 1370.3 cores=1.20 load=3.53  
+ raw rtt=12  rto=0      r5  mbps=   58.6 wall= 11s fwd/MiB= 1357.0 cores=0.15 load=3.09  
+ raw rtt=12  rto=500ms  r1  mbps=  491.6 wall=  3s fwd/MiB= 1357.2 cores=1.19 load=3.42 3.62 3.49 
+ raw rtt=12  rto=500ms  r2  mbps=  438.9 wall=  3s fwd/MiB= 1372.6 cores=1.15 load=3.13 3.55 3.46 
+ raw rtt=12  rto=500ms  r3  mbps=  500.7 wall=  3s fwd/MiB= 1344.5 cores=1.20 load=4.00 3.73 3.53 
+ raw rtt=12  rto=500ms  r4  mbps=  509.9 wall=  3s fwd/MiB= 1344.5 cores=1.17 load=3.59  
+ raw rtt=12  rto=200ms  r1  mbps=  472.3 wall=  3s fwd/MiB= 1376.5 cores=1.14 load=3.23 3.58 3.47 
+ raw rtt=12  rto=200ms  r2  mbps=  491.3 wall=  3s fwd/MiB= 1370.8 cores=1.23 load=4.00 3.72 3.52 
+ raw rtt=12  rto=200ms  r3  mbps=  483.3 wall=  3s fwd/MiB= 1390.2 cores=1.22 load=3.76 3.68 3.51 
+ raw rtt=12  rto=200ms  r4  mbps=  511.6 wall=  3s fwd/MiB= 1344.5 cores=1.17 load=3.91  
+ raw rtt=12  rto=200ms  r5  mbps=  503.7 wall=  3s fwd/MiB= 1364.7 cores=1.18 load=3.09  
+ raw rtt=25  rto=0      r1  mbps=  454.8 wall=  3s fwd/MiB= 1344.5 cores=1.14 load=4.98 3.94 3.60 
+ raw rtt=25  rto=0      r2  mbps=  449.9 wall=  3s fwd/MiB= 1344.5 cores=1.14 load=4.53 3.87 3.58 
+ raw rtt=25  rto=0      r3  mbps=  432.0 wall=  3s fwd/MiB= 1378.4 cores=1.17 load=4.30 3.84 3.57 
+ raw rtt=25  rto=0      r4  mbps=  449.4 wall=  3s fwd/MiB= 1370.4 cores=1.14 load=3.59  
+ raw rtt=25  rto=0      r5  mbps=  470.2 wall=  3s fwd/MiB= 1344.5 cores=1.11 load=4.40  
+ raw rtt=25  rto=500ms  r1  mbps=  425.7 wall=  3s fwd/MiB= 1387.9 cores=1.07 load=3.76 3.68 3.51 
+ raw rtt=25  rto=500ms  r2  mbps=  244.4 wall=  4s fwd/MiB= 1431.4 cores=0.72 load=4.66 3.89 3.59 
+ raw rtt=25  rto=500ms  r3  mbps=  435.4 wall=  3s fwd/MiB= 1368.0 cores=1.15 load=4.33 3.84 3.57 
+ raw rtt=25  rto=500ms  r4  mbps=  455.6 wall=  3s fwd/MiB= 1344.5 cores=1.11 load=4.40  
+ raw rtt=25  rto=500ms  r5  mbps=   27.6 wall= 21s fwd/MiB= 1363.5 cores=0.09 load=4.17  
+ raw rtt=25  rto=200ms  r1  mbps=  446.9 wall=  3s fwd/MiB= 1367.7 cores=1.09 load=4.98 3.94 3.60 
+ raw rtt=25  rto=200ms  r2  mbps=  405.5 wall=  3s fwd/MiB= 1378.5 cores=1.07 load=4.53 3.87 3.58 
+ raw rtt=25  rto=200ms  r3  mbps=  443.1 wall=  3s fwd/MiB= 1344.5 cores=1.14 load=4.30 3.84 3.57 
+ raw rtt=25  rto=200ms  r4  mbps=  455.8 wall=  3s fwd/MiB= 1375.6 cores=1.12 load=3.59  
+ raw rtt=71  rto=0      r1  mbps=  327.3 wall=  4s fwd/MiB= 1344.6 cores=0.81 load=5.00 4.01 3.64 
+ raw rtt=71  rto=0      r2  mbps=  328.3 wall=  4s fwd/MiB= 1344.6 cores=0.80 load=5.29 4.14 3.69 
+ raw rtt=71  rto=0      r3  mbps=  184.1 wall=  5s fwd/MiB= 1377.8 cores=0.40 load=6.11 4.37 3.78 
+ raw rtt=71  rto=0      r4  mbps=  256.5 wall=  4s fwd/MiB= 1391.9 cores=0.59 load=3.67  
+ raw rtt=71  rto=0      r5  mbps=   12.0 wall= 48s fwd/MiB= 1359.9 cores=0.04 load=3.23  
+ raw rtt=71  rto=500ms  r1  mbps=   60.2 wall= 11s fwd/MiB= 1357.5 cores=0.15 load=5.00 4.01 3.64 
+ raw rtt=71  rto=500ms  r2  mbps=  328.8 wall=  4s fwd/MiB= 1344.6 cores=0.80 load=5.75 4.25 3.73 
+ raw rtt=71  rto=500ms  r3  mbps=  328.6 wall=  4s fwd/MiB= 1344.6 cores=0.82 load=6.58 4.50 3.83 
+ raw rtt=71  rto=500ms  r4  mbps=  146.2 wall=  6s fwd/MiB= 1412.7 cores=0.31 load=3.38  
+ raw rtt=71  rto=500ms  r5  mbps=   39.0 wall= 16s fwd/MiB= 1440.7 cores=0.15 load=3.25  
+ raw rtt=71  rto=200ms  r1  mbps=  245.4 wall=  4s fwd/MiB= 1376.5 cores=0.59 load=5.00 3.99 3.63 
+ raw rtt=71  rto=200ms  r2  mbps=  250.5 wall=  4s fwd/MiB= 1375.9 cores=0.57 load=5.29 4.14 3.69 
+ raw rtt=71  rto=200ms  r3  mbps=  330.5 wall=  4s fwd/MiB= 1344.6 cores=0.79 load=5.69 4.26 3.74 
+ raw rtt=71  rto=200ms  r4  mbps=  103.4 wall=  7s fwd/MiB= 1415.7 cores=0.24 load=3.71  
+ raw rtt=100 rto=0      r1  mbps=   35.7 wall= 17s fwd/MiB= 1368.4 cores=0.13 load=7.26 4.67 3.90 
+ raw rtt=100 rto=0      r2  mbps=  200.5 wall=  5s fwd/MiB= 1374.0 cores=0.44 load=5.60 4.49 3.85 
+ raw rtt=100 rto=0      r3  mbps=  242.9 wall=  5s fwd/MiB= 1344.6 cores=0.53 load=5.05 4.42 3.83 
+ raw rtt=100 rto=0      r4  mbps=   72.9 wall= 10s fwd/MiB= 1357.0 cores=0.19 load=3.53  
+ raw rtt=100 rto=500ms  r1  mbps=  242.8 wall=  5s fwd/MiB= 1344.6 cores=0.54 load=6.17 4.56 3.87 
+ raw rtt=100 rto=500ms  r2  mbps=  243.3 wall=  5s fwd/MiB= 1344.6 cores=0.53 load=5.23 4.43 3.83 
+ raw rtt=100 rto=500ms  r3  mbps=  125.2 wall=  7s fwd/MiB= 1393.3 cores=0.28 load=6.00 4.63 3.91 
+ raw rtt=100 rto=500ms  r4  mbps=   86.0 wall=  9s fwd/MiB= 1356.6 cores=0.21 load=3.47  
+ raw rtt=100 rto=500ms  r5  mbps=   10.7 wall= 53s fwd/MiB= 1366.2 cores=0.04 load=4.29  
+ raw rtt=100 rto=200ms  r1  mbps=  164.2 wall=  6s fwd/MiB= 1375.0 cores=0.36 load=5.91 4.53 3.86 
+ raw rtt=100 rto=200ms  r2  mbps=  242.8 wall=  5s fwd/MiB= 1344.6 cores=0.55 load=5.05 4.41 3.83 
+ raw rtt=100 rto=200ms  r3  mbps=  243.1 wall=  5s fwd/MiB= 1344.6 cores=0.53 load=5.84 4.64 3.92 
+ raw rtt=100 rto=200ms  r4  mbps=  161.5 wall=  7s fwd/MiB= 1375.9 cores=0.34 load=3.86  
+prod rtt=12  rto=0      r1  mbps=  539.4 wall=  3s fwd/MiB= 1344.6 cores=0.00 load=6.17 4.73 3.96 
+prod rtt=12  rto=0      r2  mbps=  531.5 wall=  3s fwd/MiB= 1379.8 cores=0.00 load=5.69 4.67 3.95 
+prod rtt=12  rto=0      r3  mbps=  532.0 wall=  3s fwd/MiB= 1344.6 cores=0.00 load=6.51 4.86 4.02 
+prod rtt=12  rto=500ms  r1  mbps=  545.4 wall=  3s fwd/MiB= 1344.7 cores=0.00 load=6.17 4.73 3.96 
+prod rtt=12  rto=500ms  r2  mbps=  535.2 wall=  3s fwd/MiB= 1344.6 cores=0.00 load=5.69 4.67 3.95 
+prod rtt=12  rto=500ms  r3  mbps=  519.8 wall=  3s fwd/MiB= 1372.3 cores=0.00 load=6.15 4.81 4.01 
+prod rtt=12  rto=200ms  r1  mbps=  537.3 wall=  3s fwd/MiB= 1343.2 cores=0.00 load=5.84 4.68 3.95 
+prod rtt=12  rto=200ms  r2  mbps=  535.3 wall=  3s fwd/MiB= 1344.6 cores=0.00 load=6.51 4.86 4.02 
+prod rtt=12  rto=200ms  r3  mbps=  532.5 wall=  3s fwd/MiB= 1344.6 cores=0.00 load=6.30 4.86 4.03 
+prod rtt=25  rto=0      r1  mbps=  504.7 wall=  3s fwd/MiB= 1344.6 cores=0.00 load=6.52 4.93 4.06 
+prod rtt=25  rto=0      r2  mbps=  488.5 wall=  3s fwd/MiB= 1367.0 cores=0.00 load=5.98 4.87 4.04 
+prod rtt=25  rto=0      r3  mbps=  488.2 wall=  3s fwd/MiB= 1367.2 cores=0.00 load=6.76 5.07 4.13 
+prod rtt=25  rto=500ms  r1  mbps=  492.5 wall=  3s fwd/MiB= 1368.8 cores=0.00 load=6.30 4.86 4.03 
+prod rtt=25  rto=500ms  r2  mbps=  494.2 wall=  3s fwd/MiB= 1343.3 cores=0.00 load=6.23 4.90 4.05 
+prod rtt=25  rto=500ms  r3  mbps=  488.5 wall=  3s fwd/MiB= 1367.6 cores=0.00 load=6.22 4.94 4.07 
+prod rtt=25  rto=200ms  r1  mbps=  494.8 wall=  3s fwd/MiB= 1361.0 cores=0.00 load=6.52 4.93 4.06 
+prod rtt=25  rto=200ms  r2  mbps=  502.1 wall=  3s fwd/MiB= 1344.7 cores=0.00 load=5.98 4.87 4.04 
+prod rtt=25  rto=200ms  r3  mbps=  495.5 wall=  3s fwd/MiB= 1344.2 cores=0.00 load=6.22 4.94 4.07 
+prod rtt=71  rto=0      r1  mbps=  373.6 wall=  4s fwd/MiB= 1332.4 cores=0.00 load=7.41 5.26 4.21 
+prod rtt=71  rto=0      r2  mbps=  257.2 wall=  5s fwd/MiB= 1385.5 cores=0.00 load=7.40 5.37 4.26 
+prod rtt=71  rto=0      r3  mbps=  184.3 wall=  5s fwd/MiB= 1390.9 cores=0.00 load=6.61 5.32 4.27 
+prod rtt=71  rto=500ms  r1  mbps=  185.7 wall=  5s fwd/MiB= 1391.1 cores=0.00 load=7.41 5.26 4.21 
+prod rtt=71  rto=500ms  r2  mbps=  372.6 wall=  4s fwd/MiB= 1330.3 cores=0.00 load=7.37 5.39 4.28 
+prod rtt=71  rto=500ms  r3  mbps=  154.2 wall=  6s fwd/MiB= 1376.1 cores=0.00 load=6.88 5.40 4.30 
+prod rtt=71  rto=200ms  r1  mbps=  172.8 wall=  5s fwd/MiB= 1388.2 cores=0.00 load=7.10 5.17 4.17 
+prod rtt=71  rto=200ms  r2  mbps=  107.5 wall=  7s fwd/MiB= 1362.4 cores=0.00 load=7.22 5.26 4.21 
+prod rtt=71  rto=200ms  r3  mbps=   53.0 wall= 12s fwd/MiB= 1412.2 cores=0.00 load=7.10 5.37 4.27 
+prod rtt=100 rto=0      r1  mbps=  270.6 wall=  5s fwd/MiB= 1340.8 cores=0.00 load=6.57 5.36 4.29 
+prod rtt=100 rto=0      r2  mbps=  112.1 wall=  7s fwd/MiB= 1389.4 cores=0.00 load=5.51 5.20 4.27 
+prod rtt=100 rto=0      r3  mbps=   26.2 wall= 23s fwd/MiB= 1376.1 cores=0.00 load=6.79 5.50 4.40 
+prod rtt=100 rto=500ms  r1  mbps=   99.8 wall=  8s fwd/MiB= 1359.7 cores=0.00 load=6.28 5.32 4.29 
+prod rtt=100 rto=500ms  r2  mbps=  180.6 wall=  6s fwd/MiB= 1371.6 cores=0.00 load=5.39 5.18 4.27 
+prod rtt=100 rto=500ms  r3  mbps=   34.1 wall= 19s fwd/MiB= 1392.7 cores=0.00 load=5.86 5.37 4.38 
+prod rtt=100 rto=200ms  r1  mbps=   81.2 wall=  9s fwd/MiB= 1354.0 cores=0.00 load=5.62 5.21 4.26 
+prod rtt=100 rto=200ms  r2  mbps=   56.7 wall= 12s fwd/MiB= 1361.0 cores=0.00 load=5.68 5.25 4.29 
+prod rtt=100 rto=200ms  r3  mbps=   22.5 wall= 26s fwd/MiB= 1396.6 cores=0.00 load=5.42 5.31 4.38 

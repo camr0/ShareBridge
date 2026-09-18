@@ -40,6 +40,17 @@ then the ones that need a small harness change. Order of dispatch is easiest-win
    `docker restart` anything.
 9. **Report honestly** — including "could not run", failed cells and negative results. Never tidy away
    contradictory data. Report the *raw* numbers you measured, not a rounded story.
+11. **ONE FIELD EXPERIMENT AT A TIME.** Every field cell shares the same agent (`sb-run`) and the same
+   two client VMs, so two concurrent field runs silently corrupt each other's numbers (and can fight
+   over the same share's download budget). Before starting a field cell: confirm no other field agent
+   is active, then list driver/browser processes on BOTH client VMs and **abort the cell if an
+   unexpected `node`/`chrome`/`Xvfb` is running** — that turns silent interference into a detected
+   abort. Report any such abort rather than retrying through it. (Added 2026-09-18 after a wedged
+   field agent was replaced while still nominally alive.)
+12. **NEVER `pkill` the client VMs unless you are certain you are the only field agent running.** A
+   cleanup `pkill -x node|chrome|Xvfb` destroys whatever cell is in flight — including another
+   agent's. This actually happened on 2026-09-18: a stuck agent's exit cleanup killed the live
+   agent's just-started cross-host cell. If you are not sure, leave the processes and report them.
 10. **If the rig is unhealthy** (agent 7879 down, signalling not HTTP 200, a client VM unreachable):
     STOP and report. Do not improvise infrastructure changes.
 
@@ -52,6 +63,18 @@ then the ones that need a small harness change. Order of dispatch is easiest-win
 | Field rig facts / wake-up | `.worktrees/e2e-v1/INFRA.local.md` (gitignored — never quote into committed files) |
 | Field driver | `CLIENT-*:~/sbtest/` — `drive.js`, `drive_click.js`, `drive_keep.js`, `run_cell2.sh`, `analyze.py` |
 | **Results files** | `docs/superpowers/spikes/results/<date>-exp<N>-<slug>.md` — your own file only |
+
+### How to actually reach the hosts (do not hunt for ssh aliases)
+
+`VERSA`, `TESTBOX`, `CLIENT-EAST` and `CLIENT-WEST` are **documentation placeholders, not ssh config
+names.** Concretely:
+
+- `VERSA` → `ssh versa` (resolves directly; this is the only one that works by name)
+- `TESTBOX`, `CLIENT-EAST`, `CLIENT-WEST` → look up their IPs in `.worktrees/e2e-v1/INFRA.local.md`
+  and connect as `ssh ubuntu@<ip>` (non-root user).
+
+Do not spend tool calls searching `~/.ssh/config` for aliases — read `INFRA.local.md` and use the IPs.
+(A previous agent burned 14 tool calls and ran zero cells because of exactly this gap.)
 
 ## 3. Lab harness — how to run it
 
@@ -77,6 +100,25 @@ So lab numbers are an upper bound for anything involving the client-side sink �
 `benchdirect` process at a time — throughput here is CPU-sensitive); discard a cell with
 `shim_write_err>0`; sanity check that `--rtt 71 --mode raw --size 32MiB` gives ≈100 Mbps before
 trusting a sweep.
+
+### ⚠️ LAB BENCH RELIABILITY (2026-09-18) — read before designing a lab experiment
+
+E2 found this Mac cannot currently produce trustworthy **throughput means**: the sanity config varied
+**19.1–245.9 Mbps over 7 repeats (12.8×)**. Identified sources: `mds` (Spotlight), a Time Machine
+backup (~91% CPU, 51 MB/s), another agent's `grep` pegged at 99% CPU, and load averages 3–7.4.
+
+Consequences — design lab experiments around the metrics that survive:
+
+- **Robust:** the *ceiling* (best-case plateau of a cell), **wire datagram/byte volume** per MiB
+  delivered, `shim_drop`, and any code-level fact. E2's ceiling table was identical across `--rtomax`
+  values to within ~1% despite the noise.
+- **Unreliable tonight:** mean/median throughput comparisons between cells, and anything where a
+  modest percentage difference is the result. A cell can collapse into a stalled regime for reasons
+  unrelated to the knob under test.
+- If you must compare means: re-run the baseline immediately before and after the sweep in the same
+  block, report the baseline spread as the bench's error bar, and state clearly when a difference is
+  inside that error bar. Do not report a delta the noise can explain.
+- Record `uptime`, `sysctl vm.swapusage` and the top CPU consumers with each sweep block.
 
 ## 4. Field rig — how to run it
 
@@ -143,9 +185,18 @@ payload ÷ mean datagram size, i.e. the wire/goodput ratio, and retransmit-attri
 Also report the `samples` array's stall structure (the Sept-15 traces showed long 0-Mbps plateaus).
 Decides: whether the `wire ÷ ~3 = goodput` headroom is software-side (fixable) or path loss (not).
 
-### E5 — three never-swept pion knobs (lab; zero code — prod mode + env vars) ← **fourth**
+### E5 — three never-swept pion knobs (lab; **needs code — see note**) ← **fourth**
 `SB_SCTP_FAST_RTX_WND` (`SetSCTPFastRtxWnd`), `SB_SCTP_MAX_RX_BUF` (`SetSCTPMaxReceiveBufferSize`),
 `SB_SCTP_MAX_MSG` (`SetSCTPMaxMessageSize`) — already env-wired in `agent/internal/peer/peer.go`.
+
+> **CORRECTION (2026-09-18, from E2):** in the harness these are **NOT** wired for `--mode prod`.
+> `runProd` (`prodbench.go:119-124`) builds its `SettingEngine` with only
+> `SetIncludeLoopbackCandidate` and `SetSCTPMinCwnd`, and there is **no `SB_SCTP*` env lookup anywhere in
+> the benchdirect tree**. So a prod-mode env sweep measures nothing. E2 proved this the hard way:
+> `--rtomax` is applied only at `rawbench.go:225`, and all 24 prod runs that passed `--rtomax 200ms`
+> recorded `"rto_max_ms": 0`. **You must first add the flag/env wiring to `prodbench.go`** (mirror
+> `rawbench.go`), then sweep. It is a code experiment, not a zero-code one.
+
 Sweep each over ~4 sensible values (read the pion adapter for accepted ranges; record the value's
 effect, including "no effect" and "error") × {rtt 12, 71} × mode prod × 64MiB × n=2.
 Confirm with a code read that the env var is actually consumed before claiming a null result.
