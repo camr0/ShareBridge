@@ -1,0 +1,2 @@
+trace prod rtt=12 loss=0 mbps/100ms: 0 0 0 0 0 215 346 225 220 220 225 215 225 220 225 215 131 | shim fwd=43049 writeErr=0 drop=0
+mode=prod conns=0 sharing= rtt=12ms jitter=0ms bw=30000000 loss=0 queue=5000000 rtomax=0ms sent=33554432 received=33554432 throughput=236.88 Mbps wall=236.88 Mbps chrome_cores=0.62 go_cpu=1.46s

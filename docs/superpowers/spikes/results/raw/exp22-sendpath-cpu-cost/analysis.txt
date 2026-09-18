@@ -1,0 +1,71 @@
+prod cells loaded: 37
+cells with drop/writeErr/short-delivery (excluded from fits): none
+
+=== ALL prod cells (n=37) ===
+  a (fixed startup)       = +0.1266 s
+  b (per-byte)            = 0.04549 s/MiB = 46.58 CPU-seconds per GB
+  c (per-second overhead) = 0.0310 cores (1.55 ms CPU per 50 ms poll)
+  R^2 = 0.94078   max|resid| = 0.458 s
+  => per-byte cost alone saturates 1 core at 184 Mbps
+
+=== prod rtt=12 (n=22) ===
+  a (fixed startup)       = +0.1566 s
+  b (per-byte)            = 0.04474 s/MiB = 45.81 CPU-seconds per GB
+  c (per-second overhead) = 0.0527 cores (2.63 ms CPU per 50 ms poll)
+  R^2 = 0.97483   max|resid| = 0.422 s
+  => per-byte cost alone saturates 1 core at 187 Mbps
+
+=== prod rtt=12 cap=30MB, 16/32/64/128 MiB (size-only fit) (n=9) ===
+  a (fixed startup)       = +0.0220 s
+  b (per-byte)            = 0.04641 s/MiB = 47.52 CPU-seconds per GB
+  R^2 = 0.99783   max|resid| = 0.183 s
+  => per-byte cost alone saturates 1 core at 181 Mbps
+
+=== direct ratio per capped arm (mean of n=3 reps) ===
+  rtt=12 cap= 5MB  n=3    37.25 Mbps   0.2646 cores  ->  140.8 Mbps/core
+  rtt=12 cap=10MB  n=3    74.93 Mbps   0.4840 cores  ->  154.8 Mbps/core
+  rtt=12 cap=20MB  n=3   151.44 Mbps   0.8722 cores  ->  173.6 Mbps/core
+  rtt=12 cap=30MB  n=9   235.23 Mbps   1.2987 cores  ->  181.1 Mbps/core
+  rtt=71 cap= 5MB  n=3    35.51 Mbps   0.2438 cores  ->  145.7 Mbps/core
+  rtt=71 cap=10MB  n=3    72.85 Mbps   0.4511 cores  ->  161.5 Mbps/core
+  rtt=71 cap=20MB  n=3   104.20 Mbps   0.5835 cores  ->  178.6 Mbps/core
+  rtt=71 cap=30MB  n=3   204.46 Mbps   1.0639 cores  ->  192.2 Mbps/core
+
+=== cores per 100 Mbps (measured, per cell) ===
+  e22-prod-rtt12-cap5MB-r1           rtt=12   37.25 Mbps     0.2651 cores  ->  140.5 Mbps/core  (  0.71 cores/100Mbps)
+  e22-prod-rtt12-cap5MB-r2           rtt=12   37.25 Mbps     0.2683 cores  ->  138.8 Mbps/core  (  0.72 cores/100Mbps)
+  e22-prod-rtt12-cap5MB-r3           rtt=12   37.25 Mbps     0.2604 cores  ->  143.0 Mbps/core  (  0.70 cores/100Mbps)
+  e22-prod-rtt12-cap10MB-r3          rtt=12   74.91 Mbps     0.4766 cores  ->  157.2 Mbps/core  (  0.64 cores/100Mbps)
+  e22-prod-rtt12-cap10MB-r1          rtt=12   74.94 Mbps     0.4694 cores  ->  159.7 Mbps/core  (  0.63 cores/100Mbps)
+  e22-prod-rtt12-cap10MB-r2          rtt=12   74.94 Mbps     0.5060 cores  ->  148.1 Mbps/core  (  0.68 cores/100Mbps)
+  e22-prod-rtt12-cap20MB-r1          rtt=12  151.42 Mbps     0.8747 cores  ->  173.1 Mbps/core  (  0.58 cores/100Mbps)
+  e22-prod-rtt12-cap20MB-r3          rtt=12  151.43 Mbps     0.8618 cores  ->  175.7 Mbps/core  (  0.57 cores/100Mbps)
+  e22-prod-rtt12-cap20MB-r2          rtt=12  151.48 Mbps     0.8801 cores  ->  172.1 Mbps/core  (  0.58 cores/100Mbps)
+  e22-prod-sz128MiB-rtt12-cap30MB-r1 rtt=12  225.05 Mbps     1.2523 cores  ->  179.7 Mbps/core  (  0.56 cores/100Mbps)
+  e22-prod-sz128MiB-rtt12-cap30MB-r2 rtt=12  225.07 Mbps     1.2241 cores  ->  183.9 Mbps/core  (  0.54 cores/100Mbps)
+  e22-prod-rtt12-cap30MB-r1          rtt=12  229.10 Mbps     1.3549 cores  ->  169.1 Mbps/core  (  0.59 cores/100Mbps)
+  e22-prod-rtt12-cap30MB-r2          rtt=12  229.11 Mbps     1.3093 cores  ->  175.0 Mbps/core  (  0.57 cores/100Mbps)
+  e22-prod-rtt12-cap30MB-r3          rtt=12  229.20 Mbps     1.2783 cores  ->  179.3 Mbps/core  (  0.56 cores/100Mbps)
+  e22-prod-sz32MiB-rtt12-cap30MB-r1  rtt=12  236.88 Mbps     1.2907 cores  ->  183.5 Mbps/core  (  0.54 cores/100Mbps)
+  e22-prod-sz32MiB-rtt12-cap30MB-r2  rtt=12  237.13 Mbps     1.3601 cores  ->  174.3 Mbps/core  (  0.57 cores/100Mbps)
+  e22-prod-sz16MiB-rtt12-cap30MB-r1  rtt=12  251.06 Mbps     1.2428 cores  ->  202.0 Mbps/core  (  0.50 cores/100Mbps)
+  e22-prod-sz16MiB-rtt12-cap30MB-r2  rtt=12  254.44 Mbps     1.3759 cores  ->  184.9 Mbps/core  (  0.54 cores/100Mbps)
+  e22-prod-rtt12-uncap-r1            rtt=12  521.54 Mbps     3.3964 cores  ->  153.6 Mbps/core  (  0.65 cores/100Mbps)
+  e22-tail-prod-rtt12-uncap          rtt=12  528.26 Mbps     3.4062 cores  ->  155.1 Mbps/core  (  0.64 cores/100Mbps)
+  e22-prod-rtt12-uncap-r2            rtt=12  530.66 Mbps     3.3025 cores  ->  160.7 Mbps/core  (  0.62 cores/100Mbps)
+  e22-prod-rtt12-uncap-r3            rtt=12  533.35 Mbps     3.3575 cores  ->  158.9 Mbps/core  (  0.63 cores/100Mbps)
+  e22-prod-rtt71-uncap-r2            rtt=71   13.47 Mbps     0.0979 cores  ->  137.6 Mbps/core  (  0.73 cores/100Mbps)
+  e22-prod-rtt71-cap20MB-r1          rtt=71   29.84 Mbps     0.1978 cores  ->  150.9 Mbps/core  (  0.66 cores/100Mbps)
+  e22-prod-rtt71-cap5MB-r2           rtt=71   32.70 Mbps     0.2145 cores  ->  152.4 Mbps/core  (  0.66 cores/100Mbps)
+  e22-prod-rtt71-uncap-r3            rtt=71   36.54 Mbps     0.2139 cores  ->  170.8 Mbps/core  (  0.59 cores/100Mbps)
+  e22-prod-rtt71-cap5MB-r1           rtt=71   36.91 Mbps     0.2539 cores  ->  145.4 Mbps/core  (  0.69 cores/100Mbps)
+  e22-prod-rtt71-cap5MB-r3           rtt=71   36.91 Mbps     0.2629 cores  ->  140.4 Mbps/core  (  0.71 cores/100Mbps)
+  e22-prod-rtt71-cap10MB-r3          rtt=71   72.59 Mbps     0.4465 cores  ->  162.6 Mbps/core  (  0.62 cores/100Mbps)
+  e22-prod-rtt71-cap10MB-r2          rtt=71   72.98 Mbps     0.4642 cores  ->  157.2 Mbps/core  (  0.64 cores/100Mbps)
+  e22-prod-rtt71-cap10MB-r1          rtt=71   72.99 Mbps     0.4426 cores  ->  164.9 Mbps/core  (  0.61 cores/100Mbps)
+  e22-prod-rtt71-cap20MB-r2          rtt=71  141.37 Mbps     0.7701 cores  ->  183.6 Mbps/core  (  0.54 cores/100Mbps)
+  e22-prod-rtt71-cap20MB-r3          rtt=71  141.38 Mbps     0.7825 cores  ->  180.7 Mbps/core  (  0.55 cores/100Mbps)
+  e22-prod-rtt71-uncap-r1            rtt=71  170.41 Mbps     0.8940 cores  ->  190.6 Mbps/core  (  0.52 cores/100Mbps)
+  e22-prod-rtt71-cap30MB-r3          rtt=71  204.33 Mbps     1.0827 cores  ->  188.7 Mbps/core  (  0.53 cores/100Mbps)
+  e22-prod-rtt71-cap30MB-r2          rtt=71  204.48 Mbps     1.0946 cores  ->  186.8 Mbps/core  (  0.54 cores/100Mbps)
+  e22-prod-rtt71-cap30MB-r1          rtt=71  204.58 Mbps     1.0143 cores  ->  201.7 Mbps/core  (  0.50 cores/100Mbps)

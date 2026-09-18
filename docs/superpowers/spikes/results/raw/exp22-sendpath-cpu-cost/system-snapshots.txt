@@ -1,0 +1,858 @@
+=== before e22-sanity-raw-rtt71 17:42:13 ===
+17:42  up 19 days, 0 sec, 24 users, load averages: 5.47 3.46 2.84
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 45.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 18.3 pi
+ 10.6 /Applications/RustDesk.app/Contents/MacOS/RustDesk
+  9.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  9.3 /Applications/cmux.app/Contents/MacOS/cmux
+  8.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.9 /System/Library/PrivateFrameworks/XprotectFramework.framework/Versions/A/XPCServices/XprotectService.xpc/Contents/MacOS/XprotectService
+  5.3 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== after e22-sanity-raw-rtt71 17:42:18 ===
+17:42  up 19 days, 0 sec, 24 users, load averages: 5.19 3.44 2.84
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 38.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 20.4 pi
+  8.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.9 /Applications/RustDesk.app/Contents/MacOS/RustDesk
+  7.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.4 /Applications/cmux.app/Contents/MacOS/cmux
+  5.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+  4.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== before e22-prod-rtt12-cap5MB-r1 17:42:29 ===
+17:42  up 19 days, 0 sec, 24 users, load averages: 4.78 3.40 2.83
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 46.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 22.0 pi
+  8.4 /Applications/cmux.app/Contents/MacOS/cmux
+  7.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.7 /usr/libexec/airportd
+  3.8 /usr/libexec/opendirectoryd
+  2.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  2.6 /Applications/Helium.app/Contents/MacOS/Helium
+=== after e22-prod-rtt12-cap5MB-r1 17:42:45 ===
+17:42  up 19 days, 1 min, 24 users, load averages: 3.80 3.25 2.79
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 48.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 19.1 pi
+ 12.7 /Applications/cmux.app/Contents/MacOS/cmux
+  8.0 /usr/libexec/airportd
+  7.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.5 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  4.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  2.6 /usr/libexec/locationd
+=== before e22-prod-rtt12-cap10MB-r1 17:42:45 ===
+17:42  up 19 days, 1 min, 24 users, load averages: 3.80 3.25 2.79
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 49.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 21.5 pi
+ 21.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 17.4 /usr/libexec/trustd
+ 12.5 /usr/libexec/airportd
+ 11.4 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  8.3 /Applications/cmux.app/Contents/MacOS/cmux
+  7.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt12-cap10MB-r1 17:42:53 ===
+17:42  up 19 days, 1 min, 24 users, load averages: 3.53 3.21 2.78
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 49.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 30.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 22.8 pi
+  7.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.5 /Applications/cmux.app/Contents/MacOS/cmux
+  3.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  3.0 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-rtt12-cap20MB-r1 17:42:54 ===
+17:42  up 19 days, 1 min, 24 users, load averages: 3.53 3.21 2.78
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 33.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 27.6 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 20.1 pi
+ 17.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 17.8 /usr/libexec/trustd
+ 14.6 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  8.5 /usr/libexec/airportd
+  8.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+=== after e22-prod-rtt12-cap20MB-r1 17:42:58 ===
+17:42  up 19 days, 1 min, 24 users, load averages: 3.41 3.19 2.77
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 51.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 33.6 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 26.1 pi
+ 12.8 /System/Applications/Mail.app/Contents/MacOS/Mail
+  6.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.0 /Applications/cmux.app/Contents/MacOS/cmux
+  3.6 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-rtt12-cap30MB-r1 17:42:59 ===
+17:42  up 19 days, 1 min, 24 users, load averages: 3.41 3.19 2.77
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 46.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 24.8 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 23.0 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 22.7 pi
+ 15.3 /usr/libexec/trustd
+ 13.5 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  7.9 /System/Applications/Mail.app/Contents/MacOS/Mail
+  7.5 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+=== after e22-prod-rtt12-cap30MB-r1 17:43:02 ===
+17:43  up 19 days, 1 min, 24 users, load averages: 3.61 3.24 2.79
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 40.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 27.8 /System/Applications/Mail.app/Contents/MacOS/Mail
+ 21.6 pi
+ 11.7 /usr/libexec/airportd
+  6.4 /Applications/cmux.app/Contents/MacOS/cmux
+  6.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  3.4 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  3.2 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+=== before e22-prod-rtt71-cap5MB-r1 17:43:02 ===
+17:43  up 19 days, 1 min, 24 users, load averages: 3.61 3.24 2.79
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 40.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 22.0 pi
+ 17.4 /System/Applications/Mail.app/Contents/MacOS/Mail
+ 17.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 10.9 /usr/libexec/trustd
+  8.8 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  7.0 /usr/libexec/airportd
+  6.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt71-cap5MB-r1 17:43:19 ===
+17:43  up 19 days, 1 min, 24 users, load averages: 3.72 3.28 2.81
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+102.3 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 27.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 23.9 /System/Library/PrivateFrameworks/HelpData.framework/Versions/A/Resources/helpd
+  9.6 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+  6.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.7 /System/Library/CoreServices/launchservicesd
+  3.8 /Applications/cmux.app/Contents/MacOS/cmux
+=== before e22-prod-rtt71-cap10MB-r1 17:43:19 ===
+17:43  up 19 days, 1 min, 24 users, load averages: 3.72 3.28 2.81
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+101.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 26.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 17.8 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 11.1 /usr/libexec/trustd
+ 10.5 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  8.9 /System/Library/PrivateFrameworks/HelpData.framework/Versions/A/Resources/helpd
+  5.9 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+  5.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt71-cap10MB-r1 17:43:28 ===
+17:43  up 19 days, 1 min, 24 users, load averages: 3.38 3.22 2.80
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 38.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  3.5 pi
+  3.1 /Applications/cmux.app/Contents/MacOS/cmux
+  2.5 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  2.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  1.7 /usr/libexec/airportd
+=== before e22-prod-rtt71-cap20MB-r1 17:43:28 ===
+17:43  up 19 days, 1 min, 24 users, load averages: 3.38 3.22 2.80
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 41.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 23.9 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 14.9 /usr/libexec/trustd
+ 14.5 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  9.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  4.0 /Applications/cmux.app/Contents/MacOS/cmux
+=== after e22-prod-rtt71-cap20MB-r1 17:43:48 ===
+17:43  up 19 days, 2 mins, 24 users, load averages: 3.33 3.22 2.81
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 30.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 17.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  9.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  4.9 /System/Library/CoreServices/TimeMachine/backupd
+  4.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  4.4 /Applications/cmux.app/Contents/MacOS/cmux
+  3.7 pi
+=== before e22-prod-rtt71-cap30MB-r1 17:43:49 ===
+17:43  up 19 days, 2 mins, 24 users, load averages: 3.33 3.22 2.81
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 31.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 29.2 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 18.3 /usr/libexec/trustd
+ 16.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 14.1 /System/Library/CoreServices/TimeMachine/backupd
+  8.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.4 /Applications/cmux.app/Contents/MacOS/cmux
+  8.2 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+=== after e22-prod-rtt71-cap30MB-r1 17:43:53 ===
+17:43  up 19 days, 2 mins, 24 users, load averages: 3.31 3.21 2.81
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 24.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 10.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+  7.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+  5.0 /System/Library/CoreServices/TimeMachine/backupd
+  4.4 pi
+  4.3 /Applications/cmux.app/Contents/MacOS/cmux
+=== before e22-prod-rtt12-cap5MB-r2 17:43:53 ===
+17:43  up 19 days, 2 mins, 24 users, load averages: 3.31 3.21 2.81
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 35.3 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+ 34.9 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/152.0.7977.64/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)
+ 28.8 /System/Library/CoreServices/TimeMachine/backupd
+ 24.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 20.4 /usr/libexec/trustd
+  8.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.5 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  7.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt12-cap5MB-r2 17:44:09 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 4.09 3.38 2.88
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 96.9 GoogleUpdater
+ 45.4 /usr/libexec/mobileassetd
+ 40.2 /System/Library/CoreServices/TimeMachine/backupd
+ 31.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.8 /Applications/Docker.app/Contents/MacOS/com.docker.backend
+  4.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+=== before e22-prod-rtt12-cap10MB-r2 17:44:09 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 4.09 3.38 2.88
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 97.9 GoogleUpdater
+ 35.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 25.5 /usr/libexec/mobileassetd
+ 24.8 /System/Library/CoreServices/TimeMachine/backupd
+ 18.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 10.8 /usr/libexec/trustd
+  8.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt12-cap10MB-r2 17:44:18 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 4.09 3.40 2.89
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 38.8 /System/Library/CoreServices/TimeMachine/backupd
+ 37.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 36.5 /usr/libexec/mobileassetd
+  7.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  5.6 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+  4.4 /System/Library/CoreServices/launchservicesd
+  4.1 pi
+=== before e22-prod-rtt12-cap20MB-r2 17:44:18 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 4.09 3.40 2.89
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 37.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 34.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 23.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 22.5 /usr/libexec/mobileassetd
+ 19.0 /System/Library/CoreServices/TimeMachine/backupd
+ 12.5 /usr/libexec/trustd
+  7.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.0 /usr/libexec/airportd
+=== after e22-prod-rtt12-cap20MB-r2 17:44:23 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 3.92 3.38 2.88
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 34.7 /System/Library/CoreServices/TimeMachine/backupd
+ 33.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.8 /usr/libexec/mobileassetd
+  3.6 /Applications/cmux.app/Contents/MacOS/cmux
+  3.1 pi
+  2.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  1.8 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+=== before e22-prod-rtt12-cap30MB-r2 17:44:23 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 3.92 3.38 2.88
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 37.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 36.0 /usr/libexec/mobileassetd
+ 27.8 /System/Library/CoreServices/TimeMachine/backupd
+ 20.3 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 12.5 /usr/libexec/trustd
+ 10.3 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  8.0 /usr/libexec/airportd
+  7.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt12-cap30MB-r2 17:44:27 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 3.77 3.36 2.88
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 24.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 23.4 /System/Library/CoreServices/TimeMachine/backupd
+  8.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  5.2 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.6 pi
+  3.9 /Applications/cmux.app/Contents/MacOS/cmux
+=== before e22-prod-rtt71-cap5MB-r2 17:44:27 ===
+17:44  up 19 days, 2 mins, 24 users, load averages: 3.77 3.36 2.88
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 27.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 20.8 /System/Library/CoreServices/TimeMachine/backupd
+ 14.4 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  9.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.2 /usr/libexec/trustd
+  8.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  7.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.8 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== after e22-prod-rtt71-cap5MB-r2 17:44:46 ===
+17:44  up 19 days, 3 mins, 24 users, load averages: 3.16 3.24 2.84
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 61.2 /System/Library/CoreServices/TimeMachine/backupd
+ 29.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 25.1 /usr/libexec/airportd
+ 19.7 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent
+  9.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.4 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  3.7 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-rtt71-cap10MB-r2 17:44:46 ===
+17:44  up 19 days, 3 mins, 24 users, load averages: 3.14 3.24 2.84
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 36.7 /System/Library/CoreServices/TimeMachine/backupd
+ 29.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 21.2 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 18.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 13.8 /usr/libexec/trustd
+ 11.7 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  9.5 /usr/libexec/airportd
+  7.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt71-cap10MB-r2 17:44:55 ===
+17:44  up 19 days, 3 mins, 24 users, load averages: 2.97 3.20 2.83
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 51.6 /System/Library/CoreServices/TimeMachine/backupd
+ 42.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 10.0 /usr/libexec/airportd
+  8.1 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  6.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.1 pi
+  4.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.1 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== before e22-prod-rtt71-cap20MB-r2 17:44:56 ===
+17:44  up 19 days, 3 mins, 24 users, load averages: 2.97 3.20 2.83
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 42.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 42.7 /System/Library/CoreServices/TimeMachine/backupd
+ 12.6 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  6.9 /usr/libexec/trustd
+  6.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.1 /usr/libexec/airportd
+  5.1 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  4.6 pi
+=== after e22-prod-rtt71-cap20MB-r2 17:45:01 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.43 3.29 2.87
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 34.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 29.8 /System/Library/CoreServices/TimeMachine/backupd
+  6.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper.app/Contents/MacOS/Helium Helper
+  3.4 pi
+  3.3 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  3.1 /Applications/cmux.app/Contents/MacOS/cmux
+  1.6 /Applications/RustDesk.app/Contents/MacOS/RustDesk
+=== before e22-prod-rtt71-cap30MB-r2 17:45:01 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.43 3.29 2.87
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 35.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 26.8 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 22.3 /System/Library/CoreServices/TimeMachine/backupd
+ 16.9 /usr/libexec/trustd
+ 14.2 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  9.0 /usr/libexec/airportd
+  7.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== after e22-prod-rtt71-cap30MB-r2 17:45:06 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.63 3.34 2.89
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 29.8 /System/Library/CoreServices/TimeMachine/backupd
+ 21.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.1 pi
+  3.1 /Applications/cmux.app/Contents/MacOS/cmux
+  2.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  2.7 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-rtt12-cap5MB-r3 17:45:06 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.63 3.34 2.89
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 27.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 25.5 /System/Library/CoreServices/TimeMachine/backupd
+ 25.3 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 18.1 /usr/libexec/trustd
+ 15.6 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  8.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.9 /System/Library/CoreServices/launchservicesd
+=== after e22-prod-rtt12-cap5MB-r3 17:45:22 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.83 3.40 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 35.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 32.6 /System/Library/CoreServices/TimeMachine/backupd
+ 22.3 /usr/libexec/airportd
+ 13.5 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+  7.6 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  6.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  6.2 /System/Library/CoreServices/launchservicesd
+=== before e22-prod-rtt12-cap10MB-r3 17:45:22 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.83 3.40 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 34.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 29.2 /System/Library/CoreServices/TimeMachine/backupd
+ 19.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 13.7 /usr/libexec/airportd
+ 13.0 /usr/libexec/trustd
+ 10.2 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  8.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.7 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+=== after e22-prod-rtt12-cap10MB-r3 17:45:31 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.68 3.38 2.91
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 41.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 27.4 /System/Library/CoreServices/TimeMachine/backupd
+ 22.0 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  6.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.9 pi
+  3.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  3.7 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+=== before e22-prod-rtt12-cap20MB-r3 17:45:31 ===
+17:45  up 19 days, 3 mins, 24 users, load averages: 3.68 3.38 2.91
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 33.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 21.7 /System/Library/CoreServices/TimeMachine/backupd
+ 18.0 /usr/libexec/trustd
+  9.6 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  8.7 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  7.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.0 /Applications/cmux.app/Contents/MacOS/cmux
+=== after e22-prod-rtt12-cap20MB-r3 17:45:36 ===
+17:45  up 19 days, 4 mins, 24 users, load averages: 3.54 3.35 2.91
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 38.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 31.6 /System/Library/CoreServices/TimeMachine/backupd
+ 16.4 /usr/libexec/airportd
+ 10.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  6.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.9 /usr/libexec/locationd
+  4.1 /Applications/cmux.app/Contents/MacOS/cmux
+  3.7 pi
+=== before e22-prod-rtt12-cap30MB-r3 17:45:36 ===
+17:45  up 19 days, 4 mins, 24 users, load averages: 3.54 3.35 2.91
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 43.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 40.3 /usr/libexec/searchpartyd
+ 25.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 22.2 /System/Library/CoreServices/TimeMachine/backupd
+ 15.2 /usr/libexec/airportd
+ 15.1 /usr/libexec/trustd
+ 13.5 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  6.0 /usr/libexec/locationd
+=== after e22-prod-rtt12-cap30MB-r3 17:45:40 ===
+17:45  up 19 days, 4 mins, 24 users, load averages: 3.66 3.38 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 35.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 32.9 /System/Applications/Weather.app/Contents/PlugIns/WeatherWidget.appex/Contents/MacOS/WeatherWidget
+ 24.3 /System/Library/CoreServices/TimeMachine/backupd
+ 15.1 /usr/libexec/airportd
+  6.5 /Applications/cmux.app/Contents/MacOS/cmux
+  5.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.1 /System/Library/CoreServices/launchservicesd
+  4.3 /usr/libexec/locationd
+=== before e22-prod-rtt71-cap5MB-r3 17:45:40 ===
+17:45  up 19 days, 4 mins, 24 users, load averages: 3.66 3.38 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 37.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 22.8 /System/Library/CoreServices/TimeMachine/backupd
+ 19.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 12.2 /System/Applications/Weather.app/Contents/PlugIns/WeatherWidget.appex/Contents/MacOS/WeatherWidget
+ 11.4 /usr/libexec/trustd
+  9.1 /usr/libexec/airportd
+  8.7 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  6.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt71-cap5MB-r3 17:45:56 ===
+17:45  up 19 days, 4 mins, 24 users, load averages: 3.56 3.37 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 36.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 31.9 /System/Library/CoreServices/TimeMachine/backupd
+  8.4 /usr/libexec/airportd
+  8.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.7 /Applications/CodexBar.app/Contents/MacOS/CodexBar
+  5.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  3.5 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  3.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== before e22-prod-rtt71-cap10MB-r3 17:45:56 ===
+17:45  up 19 days, 4 mins, 24 users, load averages: 3.56 3.37 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 36.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 22.6 /System/Library/CoreServices/TimeMachine/backupd
+ 17.7 /usr/libexec/trustd
+ 17.0 /usr/libexec/airportd
+  9.9 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  7.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.3 /Applications/cmux.app/Contents/MacOS/cmux
+  5.3 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== after e22-prod-rtt71-cap10MB-r3 17:46:07 ===
+17:46  up 19 days, 4 mins, 24 users, load averages: 3.62 3.39 2.94
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 33.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 32.4 /System/Library/CoreServices/TimeMachine/backupd
+  8.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.6 /System/Library/CoreServices/launchservicesd
+  4.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  3.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  3.4 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+=== before e22-prod-rtt71-cap20MB-r3 17:46:07 ===
+17:46  up 19 days, 4 mins, 24 users, load averages: 3.62 3.39 2.94
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 30.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 28.3 /System/Library/CoreServices/TimeMachine/backupd
+ 10.5 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  8.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.1 /usr/libexec/trustd
+  4.6 /System/Library/CoreServices/launchservicesd
+  4.2 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+=== after e22-prod-rtt71-cap20MB-r3 17:46:13 ===
+17:46  up 19 days, 4 mins, 24 users, load averages: 3.57 3.39 2.94
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 30.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 30.6 /System/Library/CoreServices/TimeMachine/backupd
+  8.6 /Applications/cmux.app/Contents/MacOS/cmux
+  6.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.6 /usr/libexec/airportd
+  4.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  3.7 pi
+  3.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== before e22-prod-rtt71-cap30MB-r3 17:46:13 ===
+17:46  up 19 days, 4 mins, 24 users, load averages: 3.57 3.39 2.94
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 37.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 24.9 /System/Library/CoreServices/TimeMachine/backupd
+ 23.4 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 16.8 /usr/libexec/trustd
+ 16.3 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  7.3 /Applications/cmux.app/Contents/MacOS/cmux
+  6.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.0 /usr/libexec/runningboardd
+=== after e22-prod-rtt71-cap30MB-r3 17:46:17 ===
+17:46  up 19 days, 4 mins, 24 users, load averages: 3.85 3.44 2.96
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 27.6 /System/Library/CoreServices/TimeMachine/backupd
+ 26.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 14.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+ 13.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+ 12.5 /usr/libexec/airportd
+  6.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.3 pi
+  3.6 /Applications/cmux.app/Contents/MacOS/cmux
+=== before e22-prod-rtt12-uncap-r1 17:47:39 ===
+17:47  up 19 days, 6 mins, 24 users, load averages: 2.82 3.23 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 28.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 16.3 pi
+ 15.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 11.6 /Applications/cmux.app/Contents/MacOS/cmux
+  8.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  5.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  5.1 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== after e22-prod-rtt12-uncap-r1 17:47:41 ===
+17:47  up 19 days, 6 mins, 24 users, load averages: 2.82 3.23 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 24.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 13.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.7 /System/Library/CoreServices/TimeMachine/backupd
+  6.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.3 /Applications/cmux.app/Contents/MacOS/cmux
+  6.0 pi
+  5.0 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  3.7 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+=== before e22-prod-rtt71-uncap-r1 17:47:41 ===
+17:47  up 19 days, 6 mins, 24 users, load averages: 2.84 3.23 2.92
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 25.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 15.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 14.2 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 11.5 /System/Library/CoreServices/TimeMachine/backupd
+ 10.1 /usr/libexec/trustd
+  8.7 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  6.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.4 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+=== after e22-prod-rtt71-uncap-r1 17:47:46 ===
+17:47  up 19 days, 6 mins, 24 users, load averages: 3.41 3.34 2.96
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 49.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  8.5 /usr/libexec/airportd
+  8.1 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  6.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.5 pi
+  3.9 /Applications/cmux.app/Contents/MacOS/cmux
+  3.2 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== before e22-prod-rtt12-uncap-r2 17:47:46 ===
+17:47  up 19 days, 6 mins, 24 users, load averages: 3.41 3.34 2.96
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 36.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 21.2 /usr/libexec/searchpartyuseragent
+ 18.0 /usr/libexec/trustd
+ 14.6 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 10.2 /System/Applications/FindMy.app/Contents/PlugIns/FindMyWidgetItems.appex/Contents/MacOS/FindMyWidgetItems
+ 10.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  7.8 /usr/libexec/searchpartyd
+  6.3 /usr/libexec/runningboardd
+=== after e22-prod-rtt12-uncap-r2 17:47:49 ===
+17:47  up 19 days, 6 mins, 24 users, load averages: 3.41 3.34 2.96
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 49.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 24.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 17.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 12.1 /Applications/Helium.app/Contents/MacOS/Helium
+  7.7 /usr/libexec/airportd
+  6.5 pi
+  6.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+=== before e22-prod-rtt71-uncap-r2 17:47:49 ===
+17:47  up 19 days, 6 mins, 24 users, load averages: 3.41 3.34 2.96
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 46.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 18.8 /usr/libexec/trustd
+ 15.4 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 12.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 11.1 /usr/libexec/airportd
+  9.8 /Applications/cmux.app/Contents/MacOS/cmux
+  7.0 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  6.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt71-uncap-r2 17:48:31 ===
+17:48  up 19 days, 6 mins, 24 users, load averages: 3.02 3.23 2.94
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 47.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 12.1 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+  8.2 /System/Library/CoreServices/TimeMachine/backupd
+  8.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.7 /usr/libexec/airportd
+  4.2 /Applications/cmux.app/Contents/MacOS/cmux
+  3.8 pi
+  3.7 /System/Library/ExtensionKit/Extensions/VPN.appex/Contents/MacOS/VPN
+=== before e22-prod-rtt12-uncap-r3 17:48:31 ===
+17:48  up 19 days, 6 mins, 24 users, load averages: 3.02 3.23 2.94
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 38.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.4 /usr/libexec/airportd
+  7.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.5 /System/Library/CoreServices/TimeMachine/backupd
+  4.6 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+  4.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  3.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+=== after e22-prod-rtt12-uncap-r3 17:48:33 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.34 3.30 2.96
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 21.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.6 /System/Library/CoreServices/TimeMachine/backupd
+  7.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.6 pi
+  5.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.5 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  4.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  3.7 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-rtt71-uncap-r3 17:48:34 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.34 3.30 2.96
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 28.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 25.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 19.2 /usr/libexec/airportd
+ 16.2 /usr/libexec/trustd
+ 14.6 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  9.1 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent
+  7.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+=== after e22-prod-rtt71-uncap-r3 17:48:50 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.62 3.36 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 43.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.7 /usr/libexec/airportd
+  7.6 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  3.6 /Applications/cmux.app/Contents/MacOS/cmux
+  3.3 pi
+  2.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  2.0 /Applications/RustDesk.app/Contents/MacOS/RustDesk
+=== before e22-prod-sz16MiB-rtt12-cap30MB-r1 17:48:50 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.62 3.36 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 45.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 14.5 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 10.0 /usr/libexec/airportd
+  8.6 /usr/libexec/trustd
+  7.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.0 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  5.7 /System/Library/CoreServices/launchservicesd
+  4.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+=== after e22-prod-sz16MiB-rtt12-cap30MB-r1 17:48:52 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.65 3.37 3.00
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 25.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.2 /System/Library/CoreServices/launchservicesd
+  6.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.6 /Applications/cmux.app/Contents/MacOS/cmux
+  5.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.1 pi
+  4.0 /System/Library/PrivateFrameworks/HelpData.framework/Versions/A/Resources/helpd
+  3.3 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+=== before e22-prod-sz32MiB-rtt12-cap30MB-r1 17:48:52 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.65 3.37 3.00
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 26.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 21.9 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 15.3 /usr/libexec/trustd
+ 11.2 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+ 11.0 /Applications/cmux.app/Contents/MacOS/cmux
+  8.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.8 /System/Library/CoreServices/launchservicesd
+=== after e22-prod-sz32MiB-rtt12-cap30MB-r1 17:48:55 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.65 3.37 3.00
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 32.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.8 /usr/libexec/airportd
+  4.2 pi
+  3.7 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+  3.7 /Applications/cmux.app/Contents/MacOS/cmux
+  2.9 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-sz128MiB-rtt12-cap30MB-r1 17:48:55 ===
+17:48  up 19 days, 7 mins, 24 users, load averages: 3.65 3.37 3.00
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 34.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 19.2 /usr/libexec/trustd
+  9.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.1 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  7.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.0 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  3.3 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  3.1 pi
+=== after e22-prod-sz128MiB-rtt12-cap30MB-r1 17:49:01 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 3.44 3.33 2.98
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 25.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 10.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  5.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.6 /Applications/cmux.app/Contents/MacOS/cmux
+  5.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.4 /System/Library/CoreServices/TimeMachine/backupd
+  3.7 pi
+  3.5 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-sz16MiB-rtt12-cap30MB-r2 17:49:01 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 3.48 3.34 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 26.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 17.5 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 11.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 11.4 /usr/libexec/trustd
+ 10.2 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  6.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.5 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  5.5 /Applications/cmux.app/Contents/MacOS/cmux
+=== after e22-prod-sz16MiB-rtt12-cap30MB-r2 17:49:03 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 3.48 3.34 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 30.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  3.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.8 /Applications/cmux.app/Contents/MacOS/cmux
+  3.5 pi
+  2.3 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/151.0.7922.137/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  1.8 /System/Library/CoreServices/launchservicesd
+  1.3 /System/Library/CoreServices/TimeMachine/backupd
+=== before e22-prod-sz32MiB-rtt12-cap30MB-r2 17:49:03 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 3.48 3.34 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 34.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 26.6 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 19.2 /usr/libexec/trustd
+ 15.4 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  8.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.5 /usr/libexec/airportd
+  6.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.6 /System/Library/CoreServices/launchservicesd
+=== after e22-prod-sz32MiB-rtt12-cap30MB-r2 17:49:06 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 3.48 3.34 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 39.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 15.0 /usr/libexec/airportd
+  6.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.9 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+  4.3 pi
+  3.9 /Applications/cmux.app/Contents/MacOS/cmux
+  3.6 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-prod-sz128MiB-rtt12-cap30MB-r2 17:49:06 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 3.48 3.34 2.99
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 37.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 11.8 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+  9.1 /usr/libexec/airportd
+  8.1 /usr/libexec/trustd
+  7.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.6 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  4.4 /System/Library/CoreServices/launchservicesd
+=== after e22-prod-sz128MiB-rtt12-cap30MB-r2 17:49:12 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 4.00 3.46 3.04
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 23.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 15.4 /usr/libexec/airportd
+ 11.5 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent
+  5.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.9 /System/Library/CoreServices/launchservicesd
+  4.2 /Applications/cmux.app/Contents/MacOS/cmux
+=== before e22-tail-raw-rtt71 17:49:28 ===
+17:49  up 19 days, 7 mins, 24 users, load averages: 3.82 3.45 3.04
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 39.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 13.9 pi
+ 13.4 /Applications/cmux.app/Contents/MacOS/cmux
+  9.9 /usr/libexec/airportd
+  8.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  3.6 /usr/libexec/locationd
+=== after e22-tail-raw-rtt71 17:49:37 ===
+17:49  up 19 days, 8 mins, 24 users, load averages: 3.70 3.44 3.04
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 50.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 22.0 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  7.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.6 /System/Library/CoreServices/launchservicesd
+  4.4 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  3.5 /Applications/cmux.app/Contents/MacOS/cmux
+  3.4 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+=== before e22-tail-prod-rtt12-uncap 17:49:37 ===
+17:49  up 19 days, 8 mins, 24 users, load averages: 3.70 3.44 3.04
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 49.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 33.4 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 17.0 /System/Library/PrivateFrameworks/EcosystemAnalytics.framework/Support/ecosystemanalyticsd
+ 11.5 /usr/libexec/trustd
+  8.7 /System/Library/PrivateFrameworks/Ecosystem.framework/Support/ecosystemd
+  7.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.3 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+=== after e22-tail-prod-rtt12-uncap 17:49:39 ===
+17:49  up 19 days, 8 mins, 24 users, load averages: 3.70 3.44 3.04
+vm.swapusage: total = 7168.00M  used = 6198.31M  free = 969.69M  (encrypted)
+ 28.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 17.7 /usr/libexec/airportd
+  9.4 /System/Library/ExtensionKit/Extensions/Wi-Fi.appex/Contents/MacOS/Wi-Fi
+  6.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  5.6 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  5.0 pi
+  3.7 /usr/libexec/locationd
