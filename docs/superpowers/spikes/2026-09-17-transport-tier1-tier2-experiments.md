@@ -15,6 +15,28 @@ empty `Result` block until it runs).
 > and it contains the highest-value item: the CA-step tuning is committed and tested but **production runs
 > with no SCTP tuning at all**, leaving a measured ~1.89× on the table.
 
+**Later-session corrections (E19–E25, 2026-09-18 late) — these supersede parts of the sections below.** Full
+reasoning in `ACTIONABLE-FINDINGS-2026-09-18.md` (F10–F13) and `results/`:
+
+- **The loss narrative in §3 below is superseded by F10 (E19).** Measured in-flow loss on real v1 direct
+  transfers is **0.27–0.68 %** (not the ~1.5–2×10⁻⁴ inferred from the lab ladder), the field rides it with
+  ~1 retransmission per loss, the **ACK direction had zero loss**, and the *lab's* uniform-random loss model is
+  the artifact — the field delivers 90–111 Mbps where the lab ladder predicts 15–18. Every loss-tolerance lever
+  (RTO floor, min-cwnd floors) is therefore correctly closed: there is no field window collapse to fix, and the
+  v1 field ceiling is **loss-independent**.
+- **Any "~225 Mbps lab clean-path ceiling" quoted in the lab sections below is a rate CAP, not a ceiling.**
+  Those runs were capped near 240 Mbps (E14). Uncapped, the same production stack does **521–533 Mbps at 3.35
+  cores** (E22). Consequence: E5's **clean-path knob nulls are its weakest evidence** (measured at a rate the
+  stack was not constrained by); its **loss-path** results sit far below any cap and are unaffected.
+- **New since this doc: per-byte CPU cost and its attribution.** The send path costs **~46 CPU-s/GB** (E22,
+  per *byte* not fixed overhead, R²=0.998) and the field's per-core work rate is **~85–100 Mbps/core** (E21, by
+  an independent method) — but the field plateau is **not** purely CPU-quota-set (a 2-core quota already equals
+  the uncapped ceiling) and the **host hypothesis is falsified** (0.000 % steal, 75 % idle). Crypto (0.3 %) and
+  the app layer (2.4–5.5 %) are not levers; chunk size is a no-op (E23). See F11–F13.
+- **E20 withdraws E8b's "per-client-host cap FALSIFIED" headline.** With concurrent rates measured properly,
+  two tabs on one host give **1.07×** and two hosts **1.16×** (0.75× the sum of solos): a modest per-host
+  component plus a dominant shared cap. Striping is not a v1 performance strategy.
+
 This section supersedes the interpretation in **Appendix A (Experiment 9)**, which is partly wrong.
 Exp 9's *measurements* stand; its *conclusions* do not. Everything below is field-measured on the v1/v2
 test rig unless marked lab.
@@ -48,6 +70,14 @@ test rig unless marked lab.
   was invalid — see below.)
 
 ### 3. v1 collapses under loss — it goes *idle* rather than congesting (lab, E1)
+
+> **CORRECTION (2026-09-18, E19): this section describes a LAB-ONLY regime and does not explain the field.**
+> Measured in-flow loss on a real v1 direct transfer is **0.27–0.68%** (client-side capture) — 15–45× the
+> ~1.5–2×10⁻⁴ inferred here — yet the field sender holds **90–111 Mbps** where this ladder predicts 15–18 Mbps.
+> So the collapse is an artifact of the shim's uniform-random per-datagram drop model, not field behaviour: the
+> field's real loss is ridden through at ≈1 retransmission per loss with no spurious-retransmit pressure. Every
+> loss-tolerance lever (RTO floor, min-cwnd floors) is therefore correctly closed, and the v1 field ceiling is
+> **loss-independent** (client sink ~24% + sender/userspace path). See `ACTIONABLE-FINDINGS-2026-09-18.md` F10.
 
 Lab wire/payload is **1.08× (L4) / 1.12× (incl. IP+UDP)** — established three independent ways — with
 **no spurious retransmission** (loss 0.001 adds +0.8% bytes, loss 0.01 adds +1.2%: one-for-one
