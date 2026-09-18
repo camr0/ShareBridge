@@ -297,6 +297,30 @@ capacity:
 - **Caveat:** E24's sanity gate also failed (8.4/9.6 Mbps vs ≈100 expected) — absolutes are banded; the
   *structural* findings (bimodality, `MTU()=1200`, and the field-matching counts) are load-independent.
 
+## F15 — The whole pion fork is worth **−16 % to −24 % of CPU per byte**. The fork question is CLOSED: no.
+**E26 sized the only levers left after F11–F14, and the total is small.** (Harness change: 6 lines + one inert
+file; `go build ./...` and `go vet` pass.)
+- **(A) Syscall batching — 5.6 %, a ceiling.** Baseline `WriteToUDP` = **2.40 CPU-s/GB** (2.37–2.46); batched
+  (batch ≥ 8) = **0.33** ⇒ **−2.1 CPU-s/GB**. This is a *ceiling* rather than a measurement: macOS exposes
+  neither `sendmmsg` nor `UDP_SEGMENT` (both confirmed absent), so a same-bytes/fewer-syscalls proxy was used;
+  Linux realisations are included in the harness and cross-compile.
+  - Bonus, free, no fork needed: **connecting the UDP socket instead of `WriteToUDP` buys 0.72 CPU-s/GB (~2 %)**.
+- **(B) Allocations — 10.3 %, ceiling −3.8 CPU-s/GB.** **GC is only 0.27 % of CPU**, which kills the recurring
+  "Go's garbage collector is the bottleneck" hypothesis outright. Allocation work (`mallocgc` + `memclr`) is
+  10.3 %: pion allocates **~8 fresh 1.2 KB buffers per datagram** (~12× amplification over the bytes delivered).
+- **(C) MTU 1200 → path MTU — unmeasured estimate ≈ −3.0 CPU-s/GB.** `outboundMTU = 1200` is a **package
+  const** (`constants.go:41`), so raising it requires patching pion. Estimated from the −13.9 % datagram count.
+  **Label this an estimate, not a measurement.**
+- **Bounded total: ≈28 CPU-s/GB, i.e. −24 %** (optimistic: two ceilings + one estimate); **measured-only levers
+  bound at −16 %**. Converted to throughput, a fork's best case is **≈1.19–1.32×**.
+- **Why that settles it:** v1 direct would need **~2×** (122 → 233 Mbps) merely to *match* the v2 relay, and E21
+  showed the field plateau is **not purely CPU-quota-set** (a 2-core quota already equals the uncapped ceiling),
+  so even the optimistic 1.3× is not reachable in practice by cutting per-byte cost alone. **A pion fork cannot
+  deliver relay-class speed; the ceiling is not where a fork would act.**
+- **Caveat:** E26's sanity gate also failed (9.63 Mbps vs ≈100 expected; swap 6.06/7.0 GB), so its absolute
+  level is a band — but every lever here is a **ratio measured within one session**, which is exactly what is
+  load-robust, and the three levers were each bounded independent of the others.
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the

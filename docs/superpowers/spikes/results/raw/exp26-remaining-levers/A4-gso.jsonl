@@ -1,0 +1,1 @@
+{"bench":"udpbench","mode":"gso","dg":1237,"batch":8,"datagrams":0,"syscalls":0,"bytes":0,"wall_s":0,"cpu_s":0,"cpu_s_per_gb_wire":0,"cpu_s_per_gb_payload":0,"ns_per_datagram":0,"ns_per_syscall":0,"note":"unsupported on this platform: sendmmsg/UDP_SEGMENT not available on this platform (darwin)"}

@@ -1,0 +1,37 @@
+File: benchdirect
+Type: alloc_space
+Time: 2026-09-18 18:56:42 EDT
+Showing nodes accounting for 691.35MB, 85.11% of 812.32MB total
+Dropped 146 nodes (cum <= 4.06MB)
+Showing top 30 nodes out of 49
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%   493.56MB 60.76%  github.com/pion/sctp.(*Association).writeLoop
+       7MB  0.86%  0.86%   257.29MB 31.67%  github.com/pion/dtls/v3.(*Conn).Write
+       1MB  0.12%  0.98%   250.29MB 30.81%  github.com/pion/dtls/v3.(*Conn).writePackets
+         0     0%  0.98%   236.29MB 29.09%  github.com/pion/dtls/v3.(*Conn).processPacket
+         0     0%  0.98%   236.27MB 29.09%  github.com/pion/sctp.(*Association).gatherOutbound
+       4MB  0.49%  1.48%   225.76MB 27.79%  github.com/pion/sctp.(*Association).gatherOutboundDataAndReconfigPackets
+         0     0%  1.48%   223.27MB 27.49%  github.com/pion/sctp.(*Association).marshalPacket
+   78.59MB  9.67% 11.15%   223.27MB 27.49%  github.com/pion/sctp.(*packet).marshal
+   80.10MB  9.86% 21.01%   154.69MB 19.04%  github.com/pion/dtls/v3/pkg/protocol/recordlayer.(*RecordLayer).Marshal
+         0     0% 21.01%   145.59MB 17.92%  sharebridge/agent/internal/transfer.(*Manager).streamFile
+   69.58MB  8.57% 29.58%   144.68MB 17.81%  github.com/pion/sctp.(*chunkPayloadData).marshal
+   72.59MB  8.94% 38.51%    85.93MB 10.58%  main.(*Shaper).readLoop
+         0     0% 38.51%    81.60MB 10.05%  github.com/pion/dtls/v3/internal/ciphersuite.(*TLSEcdheEcdsaWithAes128GcmSha256).Encrypt
+         0     0% 38.51%    81.60MB 10.05%  github.com/pion/dtls/v3/pkg/crypto/ciphersuite.(*GCM).Encrypt (inline)
+   81.10MB  9.98% 48.50%    81.60MB 10.05%  github.com/pion/dtls/v3/pkg/crypto/ciphersuite.(*aead).encrypt
+         0     0% 48.50%    78.59MB  9.67%  github.com/pion/datachannel.(*DataChannel).WriteDataChannel
+         0     0% 48.50%    78.59MB  9.67%  github.com/pion/sctp.(*Stream).WriteSCTP
+   78.59MB  9.67% 58.17%    78.59MB  9.67%  github.com/pion/sctp.(*Stream).packetize
+         0     0% 58.17%    78.59MB  9.67%  github.com/pion/webrtc/v4.(*DataChannel).Send
+         0     0% 58.17%    78.59MB  9.67%  main.(*benchEndpoint).SendBinaryClass
+         0     0% 58.17%    78.59MB  9.67%  sharebridge/agent/internal/transfer.(*Manager).sendWithBackpressure
+   75.09MB  9.24% 67.42%    75.09MB  9.24%  github.com/pion/sctp.(*chunkHeader).marshal (inline)
+   72.59MB  8.94% 76.35%    72.59MB  8.94%  github.com/pion/dtls/v3/pkg/protocol.(*ApplicationData).Marshal
+      67MB  8.25% 84.60%       67MB  8.25%  sharebridge/agent/internal/transfer.encodeChunkFrame (inline)
+         0     0% 84.60%    29.05MB  3.58%  io.Copy (inline)
+    4.13MB  0.51% 85.11%    29.05MB  3.58%  io.copyBuffer
+         0     0% 85.11%    29.05MB  3.58%  os.(*File).WriteTo
+         0     0% 85.11%    29.05MB  3.58%  os.genericWriteTo
+         0     0% 85.11%    29.05MB  3.58%  os/exec.(*Cmd).Start.func2
+         0     0% 85.11%    29.05MB  3.58%  os/exec.(*Cmd).writerDescriptor.func1

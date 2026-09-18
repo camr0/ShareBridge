@@ -1,0 +1,32 @@
+File: benchdirect
+Type: alloc_objects
+Time: 2026-09-18 18:56:42 EDT
+Showing nodes accounting for 1865595, 59.74% of 3122619 total
+Dropped 104 nodes (cum <= 15613)
+Showing top 25 nodes out of 91
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%    1625891 52.07%  github.com/pion/sctp.(*Association).writeLoop
+    169308  5.42%  5.42%     946188 30.30%  github.com/pion/dtls/v3.(*Conn).Write
+     43691  1.40%  6.82%     776880 24.88%  github.com/pion/dtls/v3.(*Conn).writePackets
+         0     0%  6.82%     679703 21.77%  github.com/pion/sctp.(*Association).gatherOutbound
+     59716  1.91%  8.73%     606156 19.41%  github.com/pion/sctp.(*Association).gatherOutboundDataAndReconfigPackets
+     70219  2.25% 10.98%     551193 17.65%  github.com/pion/sctp.(*Association).readLoop
+         0     0% 10.98%     480974 15.40%  github.com/pion/sctp.(*Association).handleInbound
+         0     0% 10.98%     410045 13.13%  github.com/pion/sctp.(*Association).marshalPacket
+    291120  9.32% 20.31%     410045 13.13%  github.com/pion/sctp.(*packet).marshal
+    300774  9.63% 29.94%     410001 13.13%  github.com/pion/transport/v4/netctx.(*packetConn).WriteToContext
+         0     0% 29.94%     397959 12.74%  github.com/pion/sctp.(*Association).handleChunk
+    185688  5.95% 35.88%     397959 12.74%  github.com/pion/sctp.(*Association).handleSack
+         0     0% 35.88%     340540 10.91%  github.com/pion/dtls/v3.(*Conn).handshake.func3
+         0     0% 35.88%     340540 10.91%  github.com/pion/dtls/v3.(*Conn).readAndBuffer
+         0     0% 35.88%     323188 10.35%  github.com/pion/dtls/v3.(*Conn).processPacket
+     65751  2.11% 37.99%     256380  8.21%  github.com/pion/dtls/v3/pkg/protocol/recordlayer.(*RecordLayer).Marshal
+     87383  2.80% 40.79%     238742  7.65%  github.com/pion/dtls/v3.(*Conn).handleIncomingPacket
+    176134  5.64% 46.43%     176134  5.64%  github.com/pion/sctp.(*Association).movePendingDataChunkToInflightQueue
+         0     0% 46.43%     176134  5.64%  github.com/pion/sctp.(*Association).popPendingDataChunksToSend
+     96327  3.08% 49.51%     162635  5.21%  main.(*Shaper).readLoop
+        85 0.0027% 49.52%     131862  4.22%  main.chromeCPUSeconds
+    131186  4.20% 53.72%     131186  4.20%  strings.genSplit
+         0     0% 53.72%     131075  4.20%  strings.SplitN (inline)
+    131074  4.20% 57.91%     131074  4.20%  github.com/pion/dtls/v3/pkg/protocol/recordlayer.(*Header).Marshal
+     57139  1.83% 59.74%     118925  3.81%  github.com/pion/sctp.(*chunkPayloadData).marshal

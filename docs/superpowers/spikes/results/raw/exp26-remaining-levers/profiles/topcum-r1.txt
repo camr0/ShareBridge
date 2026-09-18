@@ -1,0 +1,48 @@
+File: benchdirect
+Type: cpu
+Time: 2026-09-18 18:56:30 EDT
+Duration: 12.34s, Total samples = 3.12s (25.29%)
+Showing nodes accounting for 2.27s, 72.76% of 3.12s total
+Dropped 140 nodes (cum <= 0.02s)
+Showing top 40 nodes out of 163
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      1.22s 39.10%  runtime.mcall
+         0     0%     0%      1.21s 38.78%  runtime.park_m
+         0     0%     0%      1.20s 38.46%  runtime.schedule
+     1.09s 34.94% 34.94%      1.09s 34.94%  syscall.rawsyscalln
+         0     0% 34.94%      1.09s 34.94%  syscall.syscalln
+         0     0% 34.94%      1.06s 33.97%  runtime.findRunnable
+         0     0% 34.94%      1.05s 33.65%  syscall.syscall6
+         0     0% 34.94%      0.74s 23.72%  internal/poll.(*FD).WriteToInet4
+         0     0% 34.94%      0.74s 23.72%  net.(*UDPConn).writeTo
+         0     0% 34.94%      0.74s 23.72%  net.(*netFD).writeToInet4
+         0     0% 34.94%      0.74s 23.72%  syscall.sendto
+         0     0% 34.94%      0.74s 23.72%  syscall.sendtoInet4
+     0.64s 20.51% 55.45%      0.64s 20.51%  runtime.kevent
+         0     0% 55.45%      0.62s 19.87%  runtime.netpoll
+         0     0% 55.45%      0.60s 19.23%  github.com/pion/sctp.(*Association).writeLoop
+         0     0% 55.45%      0.46s 14.74%  github.com/pion/dtls/v3.(*Conn).Write
+         0     0% 55.45%      0.46s 14.74%  github.com/pion/dtls/v3.(*Conn).writePackets
+         0     0% 55.45%      0.42s 13.46%  main.(*Shaper).drainLoop
+         0     0% 55.45%      0.40s 12.82%  net.(*UDPConn).WriteToUDP
+     0.01s  0.32% 55.77%      0.37s 11.86%  github.com/pion/transport/v4/netctx.(*packetConn).WriteToContext
+         0     0% 55.77%      0.35s 11.22%  github.com/pion/ice/v4.(*Conn).Write
+         0     0% 55.77%      0.35s 11.22%  github.com/pion/webrtc/v4/internal/mux.(*Endpoint).Write
+         0     0% 55.77%      0.35s 11.22%  github.com/pion/webrtc/v4/internal/mux.(*Endpoint).WriteTo
+         0     0% 55.77%      0.34s 10.90%  github.com/pion/ice/v4.(*CandidatePair).Write (inline)
+         0     0% 55.77%      0.34s 10.90%  github.com/pion/ice/v4.(*candidateBase).writeTo
+         0     0% 55.77%      0.34s 10.90%  net.(*UDPConn).WriteTo
+         0     0% 55.77%      0.33s 10.58%  net.(*UDPConn).readFrom
+         0     0% 55.77%      0.33s 10.58%  net.(*UDPConn).readFromUDP
+         0     0% 55.77%      0.32s 10.26%  internal/poll.(*FD).ReadFromInet4
+         0     0% 55.77%      0.32s 10.26%  net.(*netFD).readFromInet4
+         0     0% 55.77%      0.32s 10.26%  runtime.mallocgc
+         0     0% 55.77%      0.31s  9.94%  syscall.recvfrom
+         0     0% 55.77%      0.31s  9.94%  syscall.recvfromInet4
+     0.29s  9.29% 65.06%      0.29s  9.29%  runtime.memclrNoHeapPointers
+         0     0% 65.06%      0.28s  8.97%  runtime.systemstack
+     0.01s  0.32% 65.38%      0.24s  7.69%  runtime.stopm
+         0     0% 65.38%      0.23s  7.37%  runtime.mPark (inline)
+         0     0% 65.38%      0.23s  7.37%  runtime.notesleep
+     0.23s  7.37% 72.76%      0.23s  7.37%  runtime.pthread_cond_wait
+         0     0% 72.76%      0.23s  7.37%  runtime.semasleep

@@ -1,0 +1,1 @@
+sink dg=1237 batch=8 smode=writebig bytes=742200000 datagrams=75000
