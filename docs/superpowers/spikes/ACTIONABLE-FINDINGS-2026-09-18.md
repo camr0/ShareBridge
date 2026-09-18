@@ -103,6 +103,12 @@ stock **85.6 Mbps** CLIENT-EAST / **49.6 Mbps** CLIENT-WEST versus tuned **102�
 `results/2026-09-18-exp13-stock-vs-ca-step.md`. See F1 for what this means for the product.
 
 ## F7 — Context: the architecture comparison (for prioritization, not a code change)
+
+> **Correction (2026-09-18):** an earlier version of this work claimed E8b *falsified* the per-client-host
+> cap hypothesis. That comparison used E8b's **window-average** (89.9 Mbps) against a **sum of per-session
+> rates** (158.7) — miscalibrated. The **concurrent** rate in that cell was 88.8 + 45.4 = **134.2 Mbps**,
+> i.e. **1.38× a single host** (97.3), versus only **1.09× for two tabs on one host**. So per-host limits
+> are real, not falsified — and the client-app finding in F9 is consistent with that.
 Matched field cells, same clients/paths/hour, 754 MiB per cell, v1 measured agent-side, v2 at 87–97% of path
 capacity:
 - **v1 direct:** EAST 102–111 Mbps (n=3), WEST 60.2 (n=2–3).
@@ -117,7 +123,93 @@ capacity:
   field result — v1's userspace SCTP at 112 Mbps against a kernel-TCP transport at 233 Mbps on the same path —
   is the same phenomenon at a different scale.
 
+## F8 — **(b)** `SB_SCTP_MIN_CWND` — **CLOSED. No field value at any size.** Plus a reusable BDP rule
+- **Lab (E14, 240 Mbps cap / rtt 12 / 5 MB queue):** a 2 MiB floor took 27.9 → **204.8 Mbps** at 1e-3 loss
+  and 64.1 → **225.0** at 2e-4, and was a no-op on a clean path; mechanism confirmed in code (pion floors
+  every cwnd write to `minCwnd`, incl. the RTO path).
+- **Field (E17/E18): it does not transfer.** 2 MiB (≈12× BDP) **broke it outright** — 0 of 4 cells
+  completed, one trickled at ~2.7 Mbps. Small floors were **harmless but useless**: 32 KiB 122.2,
+  64 KiB 100.7, 128 KiB 115.6 Mbps, all inside the same-session stock spread (117.7 / 124.4 / 98.9).
+  256 KiB (≈1.6× BDP) degraded 3–4× (36.5 Mbps).
+- **Why:** the lab benefit depended on its synthetic 5 MB queue absorbing the overshoot (the 2 MiB floor was
+  ~5.8× the 360 KB BDP there); the field's queue is far smaller. And **the field never enters the lab's
+  collapse regime at all**: its measured in-flow loss is **0.27–0.68%** (E19), 15–45× the loss E11 inferred,
+  yet the sender holds **90–111 Mbps** where E11's ladder predicts 15–18 — so the "collapse" is an artifact
+  of the lab's uniform-random drop model, and there is no field window collapse for a floor to prevent. See F10.
+- **Reusable rule:** never set a cwnd floor above ≈1× BDP on this path (BDP = rate × RTT ≈ 165 KB at
+  12 ms × 110 Mbps). Degradation begins by ~1.6× BDP; breakage by ~12× BDP.
+- **Consequence for the goal:** the *exposed* SCTP knob space for v1 direct is now exhausted — CA-step
+  (~1.2×, E13) is the only positive, and RTO-max, FastRtxWnd, MaxRxBuf, MaxMsg and min-cwnd are all null or
+  harmful in the field. Making v1 direct appreciably faster now requires either a real
+  congestion-control patch (much less attractive given the path has no collapse to fix at its operating
+  rate) or work outside the transport (see F9).
+
+## F9 — **(b)** The client app sink — the best remaining **user-visible** win, and transport-independent
+- **Field A/B (E15):** removing SHA-1 verification + StreamSaver writes raised the **agent's own send
+  window** by **23.8%** (CLIENT-EAST 112.9 → 151.0 Mbps) and **15.6%** (CLIENT-WEST 63.9 → 75.9) — the sink
+  throttles the *transport* through flow control, not just the UI.
+- **Plus an ~80 s post-transfer tail:** in the control arm the client UI reached `verified` **78.7 s / 82.0 s
+  after** the agent finished sending a ~60 s transfer; with the sink removed, completion was **0.21 s** after.
+  The user-visible download is therefore ~**2.3×** the transport window (~139 s vs ~60 s for 754 MiB), and
+  the rate a user actually experiences is ~45 Mbps while the transport moved ~105.
+- **Actionable, in app code:** move SHA-1 to a Worker with `crypto.subtle`, avoid double-buffering through
+  the service worker, or skip verification for direct transfers. **Applies to v2 as well** — any transport
+  feeding this sink pays it.
+- Caveat: measured on the TESTBOX test-web-root copy with a byte-count-validating discard sink; the real fix
+  needs its own A/B (`results/2026-09-18-exp15-app-sink-isolation.md`).
+
+## F10 — The loss story, corrected: the field is lossy, and it doesn't matter
+**This section supersedes the loss narrative in the earlier overnight summary (§3 of
+`2026-09-17-transport-tier1-tier2-experiments.md`) and in E11's interpretation.**
+- **Measured in-flow loss on a real v1 direct transfer (E19, client-side capture, DTLS record-seq gaps):**
+  CLIENT-EAST **2.70×10⁻³** (at 111.4 Mbps) and **3.87×10⁻³** (at 90.6 Mbps); CLIENT-WEST **6.77×10⁻³** (at
+  58.8 Mbps). The **ACK direction had zero loss**, and retransmits close at ≈1 retransmission per loss.
+- **The open-loop iperf3 figure (0.43% at 100 Mbps) was right; E11's ~1.5–2×10⁻⁴ inference was wrong by
+  15–45×.** The inference extrapolated a lab ladder; the field sender never occupies that regime.
+- **The lab's loss model is the artifact, not the field.** At 2.7–3.9×10⁻³ real loss the field delivers
+  90–111 Mbps where E11's ladder predicts 15–18 Mbps (5.6–7× gap) — consistent with the shim's
+  **uniform-random per-datagram** drops being far more damaging than the field's likely **bursty queue** drops.
+- **Therefore:** every loss-tolerance lever (RTO floor E2/E11, min-cwnd floors E14/E17/E18) was calibrated
+  against a lab-only regime and is correctly closed. There is **no field window collapse to fix**, and the v1
+  field ceiling is **loss-independent** — it is the client sink (F9, ~24%) plus the sender/userspace path.
+- **Do not use SNMP UDP counters on this rig** — they undercount by 50–3000× under GRO/GSO at these rates
+  (measured at both endpoints). NIC `tx_packets` on the sender is wire-exact but the host's background traffic
+  forbids 10⁻⁴ resolution.
+- **Assert the path mode in every cell:** silent relay fallback hit **2 of 6** direct attempts in one session,
+  and relayed cells read ~44.7 Mbps — which looks like a legitimate slow measurement unless you check for
+  `DataChannel lanes ready` and an unused relay standby.
+
+## F11 — The send path's **per-byte CPU cost**, measured — and a correction to the old "225 Mbps ceiling"
+- **E22 (39 cells, 0 failures, all rate-capped where a mean is quoted):** the v1 `prod`-mode send path costs
+  **~46 CPU-s/GB** — three independent fits give 45.8 / 46.6 / 47.5. The cost is **per byte, not fixed
+  overhead**: the size sweep (16/32/64/128 MiB at a pinned rate) fits `go_cpu = +0.022 s + 0.0464 s/MiB`,
+  **R²=0.998** — a line through the origin (128 MiB costs 8.5× what 16 MiB does).
+- **0.52–0.58 cores per 100 Mbps** above 150 Mbps (0.71 at 37 Mbps; that rise is the harness's own 50 ms poll
+  loop, fitted at 0.03–0.05 cores, not pion). **One core saturates at ~180 Mbps** (fits 181/184/187;
+  measured 169–202 Mbps/core).
+- **Correction — the previously quoted 225 Mbps "clean-path ceiling" was a rate CAP, not a ceiling.** It came
+  from E14, whose runs were capped near 240 Mbps. Uncapped at rtt 12 the **same production stack does
+  **521–533 Mbps** (at 3.35 cores). So the pion send path is **not inherently slow**, and the lab-vs-field gap
+  is **~4.3×, not 2×**. Any earlier statement of the form "the lab's clean-path ceiling is ~225" describes the
+  cap; the corresponding *knob* nulls in E5 must be read as "no effect at a rate the stack was not
+  constrained by" and are weakest exactly where they were measured (the clean path), while the *loss-path*
+  E5/E11/E14 results sit far below any cap and are unaffected.
+- **Field bridge:** VERSA's implied cost is **63–113 CPU-s/GB (1.4–2.4× the Mac's)** — consistent with a server
+  core being slower than an Apple-silicon core — which predicts one core saturating at **75–129 Mbps**,
+  **bracketing the field's measured 122 Mbps (EAST) and 68 (WEST)**. The *shape* transfers; absolute cores/Mbps
+  does not.
+- **What this does NOT establish:** that the field is sender-CPU-**bound**. A sender using ~1.3 cores while
+  idle cores sit unused is consuming CPU as a *cost*, not necessarily starving. The discriminator is the field
+  `--cpus` sweep (E21); the per-layer attribution (what a fork should target) is E23.
+- **Why it matters for the fork question:** a fork is justified only if the field cap is per-byte CPU in the
+  send path. E22 makes that *plausible and quantitative* (one core ≈ 180 Mbps on a fast core, ≈ 75–129 on the
+  server's) — but the previously failed fork (BBR-style pacing) attacked the wrong layer, since E19 shows the
+  field rides its 0.27–0.68% loss with ~1 retransmission per loss.
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
+- **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
+  breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the
+  field's clean fast path has no loss-induced collapse to remove. See F8.
 - **RTO-floor tuning** (`--rtomax` / `SB_SCTP_RTO_MAX_MS`): **not a fix — but do not misread this as "never helped".**
   - *Clean paths:* no effect at any RTT (rtt 12/25/71/100, 91 runs, identical ceilings, wire volume flat) — E2.
     Consistent with the mechanism: no drops ⇒ no RTO firings ⇒ the floor never engages.
