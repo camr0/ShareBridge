@@ -374,6 +374,37 @@ file; `go build ./...` and `go vet` pass.)
 - **Benchmark to beat, unchanged:** this same client VM did **239 Mbps through the v2 relay** (E10c), so the client
   is not inherently limited to ~120 — the limit is in the v1 client's path, not the hardware.
 
+## F18 — **The headline v1-vs-v2 comparison is CONFOUNDED: the "v2 browser sink" was a NATIVE browser download, not an app client**
+- **The E10/E10c "v2 browser sink" arm was not a client at all.** `phase-4a/agent/internal/direct/static/app.js:1-7`
+  documents downloads as *"native browser navigations to /asset/{id} … (the server sets
+  Content-Disposition: attachment)"*, triggered by `gallery.js:157 anchor.href = url`; `handlers.go:347
+  handleAsset` streams straight to the HTTP writer. **Zero page-JS per byte — no DataChannel, no SHA-1, no
+  StreamSaver.** So the 239 Mbps measured **Chrome's native HTTP download manager** and says nothing about any
+  DataChannel receive path.
+- **Therefore the campaign's headline comparison mixes transport with client implementation.** v1 direct's
+  numbers (102–151 Mbps) came through the app's **JS** receive path (DataChannel + SHA-1 + StreamSaver), while v2
+  relay's (233–239) came through the browser's **native** downloader. The agent-side metric counts bytes the
+  agent sent, which the client's consumption gates via flow control — so **"v2 is 2.1–3.8× faster" must not be
+  presented as a pure transport result.** Any write-up (including the professor discussion) needs that caveat.
+- **v1's transport ceiling is NOT established at ~120 Mbps.** The same pion stack does **521–533 Mbps uncapped**
+  on loopback (E22), and the field path carries ~246 Mbps. With a client that keeps up, v1 direct could sit near
+  the path limit. **So E28 (a bare receive path) is not merely a client experiment — it is the fair-transport
+  comparison**, and its result decides whether the earlier "v2 is ~2× faster" claim survives in any form.
+- **v1 client per-byte costs, ranked from the code** (`e2e-v1/signaling-server/web/src/`):
+  1. **`downloadSinks.js:20-31` re-concatenates the 1 MiB verification tail on EVERY append** — ~1.06 MiB
+     allocated and copied per 64 KiB flushed (**~17× amplification**) **on the main thread**. This is a
+     bug-class inefficiency and pure app code.
+  2. `vendor/streamsaver.js:287 postMessage(chunk)` — structured clone plus a service-worker hop per chunk.
+  3. `hash-wasm` SHA-1 **on the main thread**, no Worker.
+  4. `binaryEnvelope.js:58 data.slice(14)` — a 64 KiB copy per chunk.
+  5. ~4 promise hops, 2 timer pairs and 3 DOM writes per chunk.
+- **The recommended first change was "move bulk bytes off the DataChannel onto plain HTTP"** — but that follows
+  only if E28 shows a lean DataChannel receive path is *itself* slow. If a bare path is fast, then items 1–5 are
+  the actual defect and HTTP is not required. **E28 decides.**
+- **Evidential status:** this section is **code reading, not measurement**. The ranked list is a hypothesis about
+  where the client's cost sits; it is *consistent* with E27's finding that the cost is in the renderer
+  (0.66–0.86 cores sink-free vs 1.95–2.01 sink-ON) but does not confirm the magnitudes.
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the
