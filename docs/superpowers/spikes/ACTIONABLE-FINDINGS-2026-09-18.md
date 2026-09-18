@@ -60,11 +60,23 @@ This is the mechanism any further optimization must target.
 that matters for this defect). Note the harness needs the wiring added to `prodbench.go` before it can sweep
 them (the harness has no `SB_SCTP*` env lookup; E2 proved prod-mode sweeps of `--rtomax` were silent no-ops).
 
-## F4 — **(a) + cleanup** The pion BBR fork is dead weight — delete it
-`.worktrees/e2e-v1/docs/superpowers/spikes/2026-09-16-71ms-rtt-patch-field-test.md` records: *"the fork is dead
-weight … fork ≈ CA-step-only within noise. Recommendation: delete the fork, keep the `SB_SCTP_CA_STEP` env
-knob."* BBR-lite lost to stock (pion does not pace). The fork directory `agent/forks/_bbr` still exists and no
-`sb-agent:fork` image is present on the rig (so the `s`/`f` rig variants would fail). Remove it.
+## F4 — Fork status: **NOT removed**, currently unused — and **do not delete the patch tooling blindly**
+- The fork is **not wired into any build**: `go.mod` has no `replace` in either tree (`.worktrees/e2e-v1/agent/go.mod`
+  and `.worktrees/benchdirect/agent/go.mod` both resolve upstream `pion/sctp v1.9.4`), and **no `sb-agent:fork`
+  image exists** on the rig — only `sb-agent:pristine` and `sb-agent:phase4a-test`. So rig variants `s`/`f`
+  would fail outright if anyone tried them.
+- The Sept-16 field report recommended deleting it (*"the fork is dead weight … fork ≈ CA-step-only within
+  noise. Recommendation: delete the fork, keep the `SB_SCTP_CA_STEP` env knob"*, `2026-09-16-71ms-rtt-patch-field-test.md`).
+  **That was a recommendation; nothing was deleted** (the BBR patch source is still at `agent/forks/_bbr`).
+- **However — do not delete the tooling as a blunt cleanup.** `agent/apply_sctp_patch.sh`
+  (`go mod edit -replace github.com/pion/sctp=./forks/sctp`) is the **only vehicle for a code-level
+  congestion-control patch**, because **`ssthresh` is not one of the six exposed `SettingEngine` knobs**
+  (documented in `2026-09-15-transport-investigation-results.md:97`). The *BBR patch content* is dead
+  (BBR-lite lost to stock because pion does not pace), but the tooling is the route to F2's fallback fix.
+- Note the first-line fix for F2 needs **no fork at all**: `SB_SCTP_MIN_CWND` → `SetSCTPMinCwnd` is already
+  exposed (see F3). Whether pion actually clamps `cwnd` to that minimum **after an RTO** (`ssthresh =
+  max(cwnd/2, 4*MTU); cwnd = 1 MTU`) is precisely what the queued experiment must determine — if it does,
+  the window collapse is fixable with a knob; if it does not, the fork becomes necessary.
 
 ## F5 — **(b)** v1's **relay** mode is the weakest of the four paths — do not treat it as a fallback
 Measured 2026-09-18 (E12): v1 relay **41.99 Mbps** (CLIENT-EAST, n=2) and **55.31 Mbps** (CLIENT-WEST, n=2),
@@ -87,11 +99,29 @@ capacity:
 - Path capacity: **~246 Mbps UDP** (both hosts), 240 Mbps over 4 TCP flows.
 - **v1 halves as RTT rises; v2 barely moves** — so the v2 advantage grows with distance (2.1–2.3× at 12 ms,
   3.6–3.8× at 71 ms).
+- **Corroborated by earlier work, from the other direction:** the 2026-09-15 investigation compared SCTP against
+  **kernel TCP under `tc netem` at the same nominal settings** (rtt ≈100 ms, 64 Mbps cap, ~800 KB queue): SCTP
+  N=1 **8.7 Mbps** vs kernel TCP **54.7 Mbps**, 0 drops; at 1% loss, SCTP 1.1 Mbps vs TCP 47.2 Mbps. Tonight's
+  field result — v1's userspace SCTP at 112 Mbps against a kernel-TCP transport at 233 Mbps on the same path —
+  is the same phenomenon at a different scale.
 
 ## Do NOT land — negative results (documented so they are not re-litigated)
-- **RTO-floor tuning** (`--rtomax` / `SB_SCTP_RTO_MAX_MS`): no effect on clean paths (91 runs, identical
-  ceilings); under loss only +13.8%/+14.8% at 1e-3 and inside spread at 9e-3, the entire gain being removed 1 s
-  stalls. Not a fix.
+- **RTO-floor tuning** (`--rtomax` / `SB_SCTP_RTO_MAX_MS`): **not a fix — but do not misread this as "never helped".**
+  - *Clean paths:* no effect at any RTT (rtt 12/25/71/100, 91 runs, identical ceilings, wire volume flat) — E2.
+    Consistent with the mechanism: no drops ⇒ no RTO firings ⇒ the floor never engages.
+  - *Under loss, a real but inconsistent effect already on record:* the 2026-09-15 sweep
+    (`2026-09-15-multiconnection-webrtc-benchmark.md`) at a high-RTT / 64 Mbps regime found `rtoMax=200ms`
+    lifting **N=4 at 0.1% loss from 18.5 → 56.6 Mbps (≈3×)** — while **hurting N=1 at the same loss from
+    26.3 → 7.3 Mbps (≈3.6× worse)** — at n=3 with very wide spreads (200ms/N=4 ranged 17.3–95.2) and an 8 MiB
+    size confound. That report's own verdict was *"the 1-second RTO floor is real, but `rtoMax` is not a clean
+    substitute for lowering `rtoMin`, and this does not demonstrate a reliable win"*, and it asked for a 32 MiB
+    re-run.
+  - *Tonight's cleaner test* (E11, interleaved, n=5, baseline-bracketed): **+13.8% / +14.8%** at 0.1% loss and
+    **inside spread** at 0.9% — with the entire gain being the removal of 1 s stall time (4.5 s → 1.2 s). The
+    sender idles less; it does not send more.
+  - **Net: the effect tracks LOSS, not RTT.** High RTT alone does nothing; high RTT with loss is sometimes
+    large but sign-unstable, so it is not a dependable lever. `rtoMax=100ms` (below path RTT) is actively
+    catastrophic — constant spurious retransmits even at zero loss.
 - **Multi-session striping:** actively counterproductive — v1 cross-host N=2 (89.9 Mbps) lands *below* v1 N=1
   (102–122), with both client hosts slowing simultaneously.
 - **The field "wire ÷ 3 = goodput" overhead story:** a measurement artefact. Lab wire/payload is 1.08× (L4) /
