@@ -241,6 +241,33 @@ capacity:
 - **Practical upshot:** further lab work on the fork question has low value because the instrument, not the
   product, is now the limiting factor. The answer lives in the field (E21's `--cpus` sweep).
 
+## F13 — The sender's CPU, quantified in the field — and the **host hypothesis FALSIFIED** (E21)
+- **Field cells (CLIENT-EAST, 754 MiB) with the agent's cgroup CPU quota varied** (agent-side metric, mode
+  asserted): `--cpus=0.5` → **38.31** (n=1); `--cpus=1` → **87.48 / 90.98, mean 89.2** (n=2); `--cpus=2` →
+  **124.17** (n=1); **uncapped → 125.69 / 115.23 / 100.64, mean 113.9** (n=3).
+- **The host is not the problem.** During an uncapped cell: host busy **24.2 %** / idle **75.6 %**, **steal
+  0.000 % (0 jiffies on all six CPUs)**, per-CPU busy 23–26 %, run-queue `r` mostly 0–4, load ≤1.06; the agent
+  itself used only **0.83 mean / 1.42 peak** cores. **So "move the agent to a quieter or faster box" buys
+  nothing** — which also retires the long-standing "VERSA is contended by its co-tenants" hypothesis, and with
+  it the planned co-tenant-load experiment as low value. (Note the correction the agent made to its own first
+  sampler: `vmstat 1 1` yields since-boot averages, not interval figures.)
+- **Per-core work rate ≈ 85–100 Mbps/core** in the field (1 core → 89.2 Mbps). This **independently corroborates
+  F11's field bridge** (VERSA's 63–113 CPU-s/GB predicting 75–129 Mbps/core) — two different methods, same
+  answer, which is the strongest support the per-byte-cost story has.
+- **But the plateau is NOT purely CPU-quota-set.** A 2-core quota (124.17) already equals the uncapped ceiling
+  (−8 %), whereas the per-core rate would predict ~170 Mbps at 2 cores. So the sender has **more CPU available
+  than it uses** at ~120 Mbps, and something else bounds it there. The experiment cannot by itself separate
+  "CPU-set" from "path-set" — the follow-up (E25) tests the **client** side, which E15's 23.8 % sink result
+  makes the leading candidate.
+- **Consequence for the fork question:** the only CPU-side lever remaining is per-byte send cost, and its
+  headroom is real but **bounded**; a fork alone cannot explain the plateau, because the sender is sitting on
+  unused CPU headroom while the rate stalls. A fork plus a client-sink fix is a more coherent story than either
+  alone.
+- **Trap validated again:** **2 of 8 cells (25 %) silently relayed** and had to be discarded (relayed cells read
+  ~44.7 Mbps and look like plausible slow measurements). Keep asserting the mode in every cell.
+- Rig restored and independently verified after the sweep (`sb-agent:pristine`, `NanoCpus=0`, `UI_PORT=7879`,
+  `SB_SCTP_CA_STEP=32768`, no `SB_SCTP_MIN_CWND`, signalling 200, clients clean).
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the
