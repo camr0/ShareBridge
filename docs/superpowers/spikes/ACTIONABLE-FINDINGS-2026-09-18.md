@@ -321,6 +321,33 @@ file; `go build ./...` and `go vet` pass.)
   level is a band — but every lever here is a **ratio measured within one session**, which is exactly what is
   load-robust, and the three levers were each bounded independent of the others.
 
+## F16 — **The client is the binding constraint** at the v1-direct plateau (E25). This is the capstone of F11–F15.
+- **Client CPU sweep (field, 754 MiB, direct asserted in all 5 cells, 0 discarded):** browser pinned to
+  **1 vCPU → 37.19 Mbps (n=2)**; **2 vCPU → 48.31 (n=1)**; **unpinned 4 vCPU → 107.84 (n=2)**. Client steal
+  **0.0 % in every interval**, pinned arms saturated their mask exactly, dominant chrome process 0.71 / 1.45 /
+  2.3 cores.
+- **The deciding number:** the client yields **~35 Mbps per core** (37 → 48 → 108 as cores go 1 → 2 → 4) while
+  the sender yields **~85–100 Mbps per core** and plateaus by 2 cores (E21: 89 Mbps on one core). **A 4-core
+  client ≈ a 2-core sender.** So at the ~110–120 Mbps plateau both ends are near their limits, and the *client*
+  is the tighter one.
+- **This closes the fork question from the other side as well.** A sender-side fork bounded at 1.19–1.32× (F15)
+  cannot move a plateau that the client sets — consistent with E21's finding that the sender sits on unused CPU
+  headroom at the plateau. **Sender-side work is the wrong end of the wire.**
+- **Open tension, being resolved by E27.** This same client VM downloaded at **239.05 Mbps through the v2 relay**
+  (E10c), so the client's cost is **not** a flat ~35 Mbps/core for every path. Either the **app download sink**
+  (SHA-1 + StreamSaver) or the **WebRTC DataChannel receive path** is responsible — or both. E15 showed sink
+  removal alone gives **+23.8 %**; E27 separates the two by running the sink-free client at 1 and 4 vCPUs. The
+  answer decides whether the fix is app code (helps v1 and v2 alike) or architectural (v2's HTTP path is the
+  answer for the client side too).
+- **Test-rig hazard found (TEST RIG ONLY — production untouched).** From **22:41Z, TESTBOX's TLS front
+  intermittently answered every external handshake with TLS alert 80 (internal_error)**; Chromium failed ~55
+  loads while `curl` was 200 12/12. E25's cells therefore ran through a **loopback front to TESTBOX:8080** — the
+  measurements stand, but the caveat is attached to them. Diagnosed and documented, **not repaired** (out of
+  scope for an experiment); it needs an operator decision and it will affect any later run that uses the browser
+  client through the external front.
+- Rig restored and verified afterwards (`sb-agent:pristine`, `NanoCpus=0`, `UI_PORT=7879`, `CA_STEP=32768`,
+  no `MIN_CWND`, API 200, signalling 200, clients clean).
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the
