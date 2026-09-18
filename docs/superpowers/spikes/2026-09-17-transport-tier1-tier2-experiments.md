@@ -9,6 +9,12 @@ empty `Result` block until it runs).
 
 ## OVERNIGHT RESULTS SUMMARY (2026-09-18) — read this before the experiment sections
 
+> **If you are reviewing these experiments to decide what to land on `main`, read
+> `ACTIONABLE-FINDINGS-2026-09-18.md` first.** It classifies every finding as (a) already in main,
+> (b) **in main but not enabled/deployed**, or (c) not in main. Bucket (b) is the one that gets missed,
+> and it contains the highest-value item: the CA-step tuning is committed and tested but **production runs
+> with no SCTP tuning at all**, leaving a measured ~1.89× on the table.
+
 This section supersedes the interpretation in **Appendix A (Experiment 9)**, which is partly wrong.
 Exp 9's *measurements* stand; its *conclusions* do not. Everything below is field-measured on the v1/v2
 test rig unless marked lab.
@@ -461,7 +467,8 @@ a client-side cap rather than a transport cap.
 ## A.1 Environment
 
 - **Agent:** home host, v1 agent container (`sb-agent:pristine`, host networking, UI on 127.0.0.1:7879),
-  `SB_SCTP_CA_STEP=32768` (CA-step **on** — the shipped-tuning configuration).
+  `SB_SCTP_CA_STEP=32768` (CA-step **on** — the **test-rig** tuning. **NOT the shipped configuration:**
+  production `sharebridge-agent` has no `SB_SCTP_*` set at all. See `ACTIONABLE-FINDINGS-2026-09-18.md` F1.)
 - **Clients:** two cloud VMs, **4 vCPU / 14 GB / 92 GB free**, one east (~12 ms to the agent), one west
   (~71 ms). Both already had Node, Playwright 1.63.0 + Chromium 1243, and Xvfb.
 - **Signalling:** v1 signaling server + Caddy TLS on the east host. **To run v1 at all, the v2 relay
