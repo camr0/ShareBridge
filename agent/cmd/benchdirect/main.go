@@ -34,6 +34,8 @@ func main() {
 	conns := flag.Int("conns", 1, "number of parallel PeerConnections (raw mode)")
 	sharing := flag.String("sharing", "shared", "shared|independent bottleneck across connections")
 	out := flag.String("out", "-", "JSON output path (default stdout)")
+	cpuProfile := flag.String("cpuprofile", "", "exp26 instrument: write a sender CPU profile here (empty = off)")
+	memProfile := flag.String("memprofile", "", "exp26 instrument: write a sender heap profile here (empty = off)")
 	flag.Parse()
 
 	sizeBytes, sizeErr := parseByteSize(*size)
@@ -125,6 +127,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	profiler, profErr := startGoProfiling(*cpuProfile)
+	if profErr != nil {
+		fmt.Fprintln(os.Stderr, profErr)
+		os.Exit(2)
+	}
+
 	var (
 		res rawResult
 		err error
@@ -144,6 +152,9 @@ func main() {
 	}
 
 	fmt.Fprintln(os.Stderr, humanSummary(res))
+	if profiler != nil {
+		profiler.Stop(*memProfile, res.GoCPUSec, res.Received).print()
+	}
 	if *out == "-" {
 		if err := writeJSON(os.Stdout, res); err != nil {
 			fmt.Fprintln(os.Stderr, "write output:", err)

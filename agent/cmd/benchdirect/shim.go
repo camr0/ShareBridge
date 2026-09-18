@@ -2,12 +2,64 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"net"
+	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// TEMPORARY exp24 instrumentation: an env-gated datagram-size histogram.
+// Set SB_SHIM_HIST=<path> to record every datagram the shaper forwards, split by
+// direction, and append a size histogram to <path> when the shaper closes.
+// Delete this block (and the two marked call sites) to revert.
+var (
+	histPath string
+	histToB  [65536]atomic.Int64 // forwarded towards peer B = datagrams FROM the Go/pion side (DATA)
+	histToA  [65536]atomic.Int64 // forwarded towards peer A = datagrams FROM the browser (SACK)
+)
+
+func histEnabled() bool {
+	histPath = os.Getenv("SB_SHIM_HIST")
+	return histPath != ""
+}
+
+func dumpHistogram() {
+	if histPath == "" {
+		return
+	}
+	type row struct {
+		size  int
+		toB   int64
+		toA   int64
+	}
+	var rows []row
+	var totB, totA int64
+	for i := range histToB {
+		b, a := histToB[i].Load(), histToA[i].Load()
+		if b == 0 && a == 0 {
+			continue
+		}
+		rows = append(rows, row{size: i, toB: b, toA: a})
+		totB += b
+		totA += a
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].size < rows[j].size })
+	f, err := os.OpenFile(histPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hist: open %s: %v\n", histPath, err)
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "# datagram-size histogram (bytes_l4): toB=Go->browser(DATA), toA=browser->Go(SACK)\n")
+	for _, r := range rows {
+		fmt.Fprintf(f, "%d\t%d\t%d\n", r.size, r.toB, r.toA)
+	}
+	fmt.Fprintf(f, "# TOTALS toB=%d toA=%d all=%d\n", totB, totA, totB+totA)
+}
 
 // flowState is the per-5-tuple state of one Flow. All fields are guarded by the
 // owning Shaper's mutex so a single lock orders both queue and flow state.
@@ -26,6 +78,7 @@ type packet struct {
 	st   *flowState
 	addr *net.UDPAddr
 	due  time.Time
+	toB  bool // TEMPORARY exp24: true when this datagram came FROM peer A (the Go/pion side)
 }
 
 // rateLimiter enforces a byte-rate ceiling using a token bucket.
@@ -88,6 +141,7 @@ type Shaper struct {
 
 // NewShaper starts a bottleneck with the given one-way delay and packet loss.
 func NewShaper(delay time.Duration, loss float64) (*Shaper, error) {
+	histEnabled() // TEMPORARY exp24: read SB_SHIM_HIST once per shaper
 	if loss < 0 || loss > 1 {
 		return nil, errors.New("loss must be between 0 and 1")
 	}
@@ -266,7 +320,7 @@ func (s *Shaper) ingest(st *flowState, src *net.UDPAddr, data []byte) {
 	if s.jitter > 0 {
 		d += time.Duration((rand.Float64()*2 - 1) * float64(s.jitter))
 	}
-	s.queue = append(s.queue, packet{data: data, st: st, addr: target, due: time.Now().Add(d)})
+	s.queue = append(s.queue, packet{data: data, st: st, addr: target, due: time.Now().Add(d), toB: sameUDPAddr(target, st.b)})
 	s.queueBytes += int64(len(data))
 	if headEmpty {
 		select {
@@ -321,6 +375,13 @@ func (s *Shaper) drainLoop() {
 				head.st.writeErrs.Add(1)
 			} else {
 				head.st.forwarded.Add(1)
+				if histPath != "" && len(head.data) < len(histToB) { // TEMPORARY exp24
+					if head.toB {
+						histToB[len(head.data)].Add(1)
+					} else {
+						histToA[len(head.data)].Add(1)
+					}
+				}
 			}
 		}
 	}
@@ -345,6 +406,7 @@ func (s *Shaper) Close() error {
 		_ = c.Close()
 	}
 	s.wg.Wait()
+	dumpHistogram() // TEMPORARY exp24
 	return nil
 }
 

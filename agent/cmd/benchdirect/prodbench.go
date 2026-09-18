@@ -226,26 +226,39 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 		}
 	}
 
+	// CPU accounting for the send path: the Go process is the DATA SENDER here
+	// (same direction as the field), so selfCPUSeconds() is the sender's cost.
+	cpu := startCPUSampler()
+	goCPUStart := selfCPUSeconds()
+	finishCPU := func() {
+		res.GoCPUSec = selfCPUSeconds() - goCPUStart
+		res.ChromeCPUSec, res.ChromeCores = cpu.Stop()
+	}
+
 	mgr := transfer.NewManager(set, benchStorage{size: cfg.size}, 0)
 	go mgr.HandleMessage([]byte(`{"type":"file_request","path":"bench.bin","request_id":"bench"}`))
 
 	deadline := time.Now().Add(cfg.deadline)
 	for {
 		if err := ctx.Err(); err != nil {
+			finishCPU()
 			return res, err
 		}
 		var received int64
 		if err := b.eval("window.__bench.received", &received); err != nil {
+			finishCPU()
 			return res, err
 		}
 		if received >= cfg.size {
 			break
 		}
 		if time.Now().After(deadline) {
+			finishCPU()
 			return res, fmt.Errorf("timed out waiting for receiver: %d/%d", received, cfg.size)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	finishCPU()
 	var summary struct {
 		Received  int64   `json:"received"`
 		ElapsedMs float64 `json:"elapsedMs"`
@@ -258,6 +271,11 @@ func runProd(ctx context.Context, cfg runConfig) (rawResult, error) {
 	res.Received = summary.Received
 	res.Mbps = summary.Mbps
 	res.SentBytes = cfg.size
+	res.ElapsedMs = summary.ElapsedMs
+	if summary.ElapsedMs > 0 {
+		res.WallMbps = float64(summary.Received) * 8 / (summary.ElapsedMs / 1000) / 1e6
+	}
+	res.Samples = summary.Samples
 	var sb strings.Builder
 	for i := 1; i < len(summary.Samples); i++ {
 		d := summary.Samples[i] - summary.Samples[i-1]

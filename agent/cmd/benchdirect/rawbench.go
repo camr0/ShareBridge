@@ -458,6 +458,16 @@ func runRaw(ctx context.Context, cfg runConfig) (rawResult, error) {
 		fmt.Fprintf(&sb, " %.0f", float64(d)*8/0.1/1e6)
 	}
 	fw, we, dropped := shapers[0].Stats()
+	// TEMPORARY exp24: read the association's own MTU and SCTP-level byte
+	// counters so the datagram size is corroborated by a second, independent
+	// instrument (pion's state, not the shim's).
+	for i, c := range conns {
+		if os.Getenv("SB_SHIM_HIST") == "" {
+			break
+		}
+		st := c.pc.SCTP().Stats()
+		fmt.Fprintf(os.Stderr, "exp24 sctp conn=%d mtu=%d bytes_sent=%d bytes_recv=%d cwnd=%d\n", i, st.MTU, st.BytesSent, st.BytesReceived, st.CongestionWindow)
+	}
 	fmt.Fprintf(os.Stderr, "trace %s conns=%d rtt=%d loss=%v mbps/100ms:%s | shim fwd=%d writeErr=%d drop=%d | chrome_cpu=%.2fs (%.2f cores) go_cpu=%.2fs\n",
 		cfg.mode, n, cfg.rttMs, cfg.loss, sb.String(), fw, we, dropped, chromeSec, chromeCores, goCPU)
 	return res, nil
