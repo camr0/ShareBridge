@@ -513,6 +513,43 @@ file; `go build ./...` and `go vet` pass.)
 - **Restore verified:** web-root manifest identical to E29's 140-file original; `sb-run` pristine, `NanoCpus=0`,
   API 200; clients clean (`node`/`chrome`/`Xvfb`/`iperf3` = 0).
 
+## F22 — The client's real per-frame cost is **~65× amplification + 48,260 service-worker hops** — and the v1 **relay** path pays all of it *plus* per-frame JS Noise. Every figure in this campaign was measured through that client.
+- **The code** (`e2e-v1/signaling-server/web/src/downloadSinks.js:19-32`): `append(bytes)` calls
+  `concatBytes(tail, bytes)` on **every** append with `tail` up to 1 MiB, `await writer.write(...)`, then sets
+  `tail = combined.subarray(...)` — a view that keeps the whole previous buffer alive. Hashing is
+  `hasher.update(bytes)`: **streaming** (once per byte, *not* re-hashed per chunk — an earlier suspicion of
+  re-hashing was wrong), but via **`hash-wasm` SHA-1 on the main thread**.
+- **Granularity, which makes the earlier "~17×" quotation optimistic.** The client receives **~16 KiB frames**:
+  E28's byte accounting counted **48,258–48,263 frames** for 790,626,304 B. At 16 KiB appends against a 1 MiB
+  tail, each append allocates and copies ~1.016 MiB → **≈49 GB allocated+copied for a 754 MiB file ≈ 65×
+  amplification**, plus **48,260 StreamSaver `postMessage`/service-worker round trips**, plus 48,260 JS SHA-1
+  updates. All on the main thread.
+- **That single mechanism explains three separate measurements:** the **~87 s tail** (a backlog draining at the
+  client's ~10 MB/s effective processing rate), the **~10 % back-pressure** on the *agent-side* rate at 4 vCPUs
+  (E27/E30), and the **up to 2.2× penalty** when the client is CPU-starved (E27/E28).
+- **The v1 RELAY path pays all of the above plus per-frame JavaScript Noise decryption.**
+  `secureRelayChannel.js` imports `NoiseXX` from the **JS** `noise-p256` implementation and decrypts each frame
+  in `_processMessage`; `MAX_RELAY_PAYLOAD_BYTES` is capped per frame. That is a **fixed per-frame cost on the
+  same main thread**, and it fits what E12 actually measured: **42.0 Mbps EAST (12.5 ms) and 55.3 Mbps WEST
+  (74 ms)** — **latency-independent**, nothing like a bandwidth-delay-product shape, with the agent only
+  **11–19 % busy** and the client idle 40–48 %.
+- **Consequence 1 — every throughput number in this campaign was measured through this client**, including the
+  "~120 Mbps browser ceiling" and the v1 relay's 42/55. Both are ceilings *through a main thread doing ~65× the
+  necessary memory traffic, 48k service-worker hops, and (for relay) JS crypto per frame*.
+- **Consequence 2 — the E29 fix was incomplete, and that is now the most promising remaining lever.** It removed
+  the tail re-copy and moved hashing off the main thread (tail 87.4 s → 0.53 s) but **kept StreamSaver**, and
+  E30's rate moved only 1.10× (108.06 → 119.17). So **StreamSaver's per-frame service-worker hop is the residual
+  main-thread cost** — and removing it (File System Access API, or batching frames before writing) is the next
+  untested client fix, and the first one expected to move the **rate** rather than just the tail.
+- **Consequence 3 — the v1-relay figure needs re-testing with a fixed client.** E12 predates every fix, so its
+  42/55 may be a *main-thread* ceiling rather than a property of the relay design. This is directly load-bearing
+  for the v1-direct-vs-v1-relay choice: it contradicts the belief that v1 relay runs near line speed, but it was
+  measured with the throttled client.
+- **Comparison-pairing correction:** the campaign's headline compared **v1 direct vs v2 relay** — not a
+  like-for-like pairing. The clean matrix is 2×2: v1 direct **measured** (102–131 EAST / 60–68 WEST), v1 relay
+  **measured but client-throttled** (42.0 / 55.3), v2 relay **measured** (233 / 215–228), and **v2 direct never
+  measured** (explicitly skipped by request).
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the

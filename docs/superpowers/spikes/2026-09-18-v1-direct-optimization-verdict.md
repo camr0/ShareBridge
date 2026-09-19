@@ -104,8 +104,15 @@ Matched numbers, for the record (client-side implementation differs as above):
   cores at the ceiling and is not helped by more cores, which is the signature of a **serial** bottleneck; a
   bigger VM would therefore not be expected to raise it. This is the last unverified assumption behind the
   verdict, and it is stated as inference because testing it needs a resource decision, not another run here.
-- **Replacing StreamSaver's write path** (e.g. the File System Access API): E29's pinned arm shows the residual
-  at 1 vCPU is the service-worker hop, not hashing (0.77 of 1.0 core used) — untested as a fix.
+- **Replacing StreamSaver's write path** (File System Access API, or batching frames before writing) — **now the
+  most promising remaining lever, and the first one expected to move the rate rather than the tail.** The client
+  receives ~16 KiB frames (48,260 of them for 754 MiB), and today each one costs a ~1 MiB tail copy plus a
+  StreamSaver `postMessage`/service-worker hop, on the main thread (F22). E29 removed the tail copy and moved
+  hashing off-thread but **kept StreamSaver**, which is why the rate only moved 1.10×. The v1 **relay** path pays
+  the same per-frame cost *plus* JS Noise decryption per frame, so this is likely to lift relay too.
+- **Re-testing the v1 relay with a fixed client.** E12's 42.0 / 55.3 Mbps is latency-independent and was measured
+  with the throttled client, so it may be a main-thread ceiling rather than a property of the relay design. Worth
+  settling, because it decides the v1-direct-vs-v1-relay comparison (F22).
 - **A non-browser v1 client.** The 521–533 Mbps loopback result shows the pion stack itself is not the limit; a
   native v1 client would bypass the browser cap entirely (relevant only if such a client is a product goal).
 - **Two tabs do not add up** (E20: 72.30 Mbps combined), so a single client cannot be multiplied by opening
