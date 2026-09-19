@@ -406,6 +406,14 @@ file; `go build ./...` and `go vet` pass.)
   (0.66–0.86 cores sink-free vs 1.95–2.01 sink-ON) but does not confirm the magnitudes.
 
 ## F19 — **E28 settles it: the browser's DataChannel receive is the v1 ceiling.** App JS costs only ~14 % at 4 vCPUs (but 2.23× at 1 vCPU)
+
+> **CORRECTION (E29, same day): the "~14 %" and the "~124 Mbps browser floor" in this section are too
+> pessimistic and are superseded by F20.** E29's *optimized* client — which keeps full verification — reaches
+> **146.54 Mbps in its own session (1.27× its interleaved control)**, i.e. *above* E28's naive "bare" handler
+> (123.68). So E28's bare arm was itself paying main-thread per-message cost, the browser's receive floor is
+> **≥146.5 Mbps rather than ~124**, and the app's own JS cost ~**27 %** of the achievable rate at 4 vCPUs —
+> 3.23× in user-visible time once the tail is removed. The rest of F19 (the ceiling is client-side, the sender
+> has headroom, a fork cannot help, and the v1-vs-v2 gap is client-architecture rather than transport) stands.
 - **Bare receive path** (real signalling/ICE/lanes unchanged; bulk `onmessage` counts `byteLength` and drops the
   payload — no decode, no assembly, no sink). Byte accounting exact on **all 4 cells** (790,626,304 B;
   48,258–48,263 frames), so the arms are valid, not merely fast:
@@ -443,6 +451,32 @@ file; `go build ./...` and `go vet` pass.)
   unpinned), all with the **+10.0 s** direct-deadline shape — **pinning the client causes silent relay fallback.**
 - Web root restored and verified (`407ee7032f90e429…`, 91,308 B, 644, `cmp`-identical, 0 markers, HTTP-served hash
   matches); rig restored (`sb-agent:pristine`, `NanoCpus=0`, API 200, clients clean).
+
+## F20 — **E29: the verification-preserving client fix is the campaign's biggest win — 1.27× the rate and 3.23× the user-visible time**
+- **The fix (minimal, in the isolated test-web-root copy; full diff in the results file):** (a) keep a **1 MiB tail
+  buffer** instead of re-concatenating the verification tail on every append (`downloadSinks.js:20-31`, the ~17×
+  amplification) and (b) move **SHA-1 into a module worker**. Nothing else changed.
+- **Unpinned 4 vCPU, n=2 each, interleaved:** control **115.36 Mbps**, 54.83 s window, tail **85.17 s**,
+  user-visible **139.87 s**, renderer **2.07 cores** → fixed **146.54 Mbps**, 43.17 s, tail **0.31 s**,
+  user-visible **43.35 s**, renderer **1.07 cores**. That is **1.27× agent-side, 3.23× user-visible, and 48 %
+  less renderer CPU**.
+- **Pinned to 1 vCPU (n=1 each):** the **rate is identical** (37.53 Mbps both arms) but the **tail collapses
+  ≤131.8 s → 1.34 s**, so user-visible time goes **≥299.2 s → 169.55 s (1.76×)**. The fixed arm used only
+  **0.77 of 1.0 core** — so the pinned ceiling is **not** app CPU; it is the **StreamSaver service-worker hop
+  plus the receive path**. Removing hashing from the main thread does not help when the client is pinned; the
+  remaining fix there would be replacing StreamSaver's write path (e.g. the File System Access API).
+- **Verification is preserved and was independently checked:** every fixed cell reported `✓ intact`, the worker
+  digest matched the displayed expected digest, there was no FIX-NOT-ENGAGED/HASH-DISAGREE case, and **200/200
+  randomized equivalence trials were byte-identical**. The fix is therefore a legitimate repair, not a
+  bypass — which matters, because a faster client that no longer verifies would be worthless.
+- **This corrects F19's magnitudes** (see the correction banner there): the app's own JS was ~27 % of the
+  achievable rate at 4 vCPUs, not ~14 %, and the browser's DataChannel receive floor is **≥146.5 Mbps**, not
+  ~124. E28's "bare" handler was itself a main-thread per-message cost, so it under-measured the browser.
+- **What this does NOT change:** the sender still has headroom, a pion fork is still ≤1.19–1.32× (F15) and still
+  aimed at the wrong end of the wire, and the v1-vs-v2 gap is still **client-architecture** (F18/F19) — the
+  fix lands v1 at ~146 Mbps, which is a large gain from ~115 but still short of the relay's 233.
+- Web root restored (manifest byte-identical, 140 files); rig unchanged; **6/6 unpinned cells direct**, 2 pinned
+  cells discarded as relay.
 
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it

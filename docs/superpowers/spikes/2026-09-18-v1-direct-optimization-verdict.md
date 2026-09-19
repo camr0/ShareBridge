@@ -4,13 +4,14 @@
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes
 that gap?
 
-**Answer: no.** The gap is not in the transport, the agent, the host, the path or the loss response. It is the
-**browser's WebRTC DataChannel receive path**, which caps v1 at ~124 Mbps on the 4-vCPU test client *even with a
-receive handler that only counts bytes*. Agent-side and app-code work cannot move it: a pion fork is worth at
-most **1.19–1.32×** and would act on the end of the wire that has demonstrable headroom (~85–100 Mbps/core
-available, CPU never saturated, host 75 % idle), while the app's own JS accounts for only **~14 %** of the
-plateau. What *is* recoverable is app-side and worth having — chiefly the **~80 s post-transfer tail** — but it
-is not the difference between 120 and 233 Mbps.
+**Answer: no — but with one important exception.** The gap is not in the transport, the agent, the host, the path
+or the loss response. It is on the **client**, and the *transport-transport* gap is not closable: a pion fork is
+worth at most **1.19–1.32×** and would act on the end of the wire that has demonstrable headroom (~85–100
+Mbps/core available, CPU never saturated, host 75 % idle). **What *is* closable is the client's app JS: a
+verification-preserving fix measured at 1.27× the rate and 3.23× the user-visible time (E29)**, taking v1 from
+~115 to ~146 Mbps and removing an ~80 s tail. That is a large win — but it lands v1 at ~146 Mbps, still well
+short of the relay's 233, because the browser's WebRTC DataChannel receive path requires JavaScript that the
+native HTTP download path does not.
 
 This document is the synthesis. Per-experiment detail lives in `results/`; the classified findings and their
 caveats are F1–F19 of `ACTIONABLE-FINDINGS-2026-09-18.md`, which is the authoritative record where the two
@@ -32,9 +33,8 @@ documents disagree.
 | Aggressive lab knobs under real loss | the lab's "collapse" is a **model artifact** (uniform-random drops), not a field regime (E19/F10) | **CLOSED** |
 | Host capacity | 0.000 % steal, 0.000 jiffies, 75 % idle, load ≤1.06; agent uses 0.83 mean / 1.42 peak cores (E21) | **FALSIFIED** as a remedy |
 | **pion fork** | crypto AES-GCM **0.3 %**, app layer 2.4–5.5 %, datagram size already at pion's hard-coded MTU 1200, GC **0.27 %**; remaining levers = syscall batching 5.6 %, allocations 10.3 %, MTU estimate ~8 % | **≤1.19–1.32× — insufficient** (E22–E26) |
-| Client app sink (SHA-1 + StreamSaver) | **1.52× at 1 vCPU, 1.098× at 4 vCPU**, plus an **~80 s tail** (E15/E27) | **recoverable — the real remaining win** |
-| Client app JS overall (assembly + sink) | **2.23× at 1 vCPU, 1.137× at 4 vCPU** (E28) | recoverable, but bounded |
-| Browser DataChannel receive | **~124 Mbps at 4 vCPUs / 82.99 at 1 vCPU with app JS removed entirely** (E28) | **the ceiling — not addressable in app or agent code** |
+| Client app sink + assembly (SHA-1, StreamSaver, tail re-concat) | E15/E27: **1.52× at 1 vCPU, 1.098× at 4 vCPU** + an **~80 s tail**. **E29 measured the fix: 1.27× rate, 3.23× user-visible, −48 % renderer CPU**, verification preserved | **recovered — the campaign's biggest win** |
+| Browser DataChannel receive | ≥**146.5 Mbps** at 4 vCPUs (E29's optimized client; E28's naive bare handler under-measured it at 123.68) | **the residual ceiling — not addressable in app or agent code** |
 
 ## 2. Why the ceiling is where it is
 
@@ -77,9 +77,13 @@ Matched numbers, for the record (client-side implementation differs as above):
 
 ## 4. What is actually recoverable
 
-1. **The client sink (~80 s tail, up to 1.52× rate).** Largest user-visible win, and it is app code. On a
-   CPU-starved client (the realistic case on a busy laptop) the app-side cost is **2.23×**. Transport-independent,
-   so it helps v2 as well. *Experiment E29 measures what a verification-preserving fix recovers.*
+1. **The client sink and assembly — MEASURED, and it is the big one (E29).** A minimal, verification-preserving
+   fix (1 MiB tail buffer instead of re-concatenating the verification tail per append; SHA-1 in a module
+   worker) gives **1.27× the rate (115.36 → 146.54 Mbps), 3.23× the user-visible time (139.87 s → 43.35 s),
+   and 48 % less renderer CPU**, with **200/200 randomized equivalence trials byte-identical** and every cell
+   reporting `✓ intact`. Pinned to 1 vCPU the rate is unchanged but the **tail collapses (≤131.8 s → 1.34 s)**,
+   because that ceiling is StreamSaver's service-worker hop, not hashing. **This is the highest-value change
+   available and it is app code.** Transport-independent, so it helps v2 as well.
 2. **Enable the CA-step tuning in production (~1.2×).** Committed and tested on `main`, **not deployed**;
    production users currently get stock timing (~86/50 Mbps-class). A deployment change needing operator
    approval.
@@ -89,9 +93,15 @@ Matched numbers, for the record (client-side implementation differs as above):
 
 ## 5. What would change this verdict (not tested)
 
+- **With the client fixed, who binds now?** E29 lifted the joint rate to **146.54 Mbps**, which is *above* the
+  ~120–124 Mbps plateau earlier attributed to the sender (E21) — so that plateau was itself client-limited, and
+  the sender's true ceiling is higher. Whether v1 then climbs toward the ~246 Mbps path limit, or stalls
+  somewhere below it, is **the open question** (E30).
 - **A larger client.** The test client has 4 vCPUs and the browser's receive scaled 37 → 48 → 108 across
-  1 → 2 → 4 cores. On an 8–16-core machine the ~124 Mbps ceiling may be higher. **This is the single biggest
-  unknown, and it needs a resource decision (a bigger VM), not another experiment on this rig.**
+  1 → 2 → 4 cores. On an 8–16-core machine the residual ceiling may be higher. **This needs a resource
+  decision (a bigger VM), not another experiment on this rig.**
+- **Replacing StreamSaver's write path** (e.g. the File System Access API): E29's pinned arm shows the residual
+  at 1 vCPU is the service-worker hop, not hashing (0.77 of 1.0 core used) — untested as a fix.
 - **A non-browser v1 client.** The 521–533 Mbps loopback result shows the pion stack itself is not the limit; a
   native v1 client would bypass the browser cap entirely (relevant only if such a client is a product goal).
 - **Two tabs do not add up** (E20: 72.30 Mbps combined), so a single client cannot be multiplied by opening
@@ -99,8 +109,10 @@ Matched numbers, for the record (client-side implementation differs as above):
 
 ## 6. Recommended actions, ranked
 
-1. **Fix the client download path** (sink + assembly): kills an ~80 s tail and buys up to ~1.5–2.2× on
-   CPU-constrained clients; helps v1 and v2. Measure with E29's method.
+1. **Apply the client fix (MEASURED, E29) — the highest-value change available.** A minimal,
+   verification-preserving change (1 MiB tail buffer + SHA-1 in a module worker) gives **1.27× the rate,
+   3.23× the user-visible time (−96 s on a 754 MiB transfer), and −48 % renderer CPU**, with 200/200
+   randomized equivalence trials byte-identical. App code; helps v1 and v2 alike.
 2. **Deploy the CA-step tuning** (~1.2×) — the only transport-side win available, already written and tested.
 3. **Settle the v1-vs-v2 question on client architecture, not transport speed.** If the relay path is the
    product's bulk-transfer route, say so explicitly, because that — not SCTP vs TCP — is the mechanism.
