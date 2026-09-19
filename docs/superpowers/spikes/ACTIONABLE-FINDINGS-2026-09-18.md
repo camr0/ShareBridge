@@ -541,6 +541,13 @@ file; `go build ./...` and `go vet` pass.)
   E30's rate moved only 1.10× (108.06 → 119.17). So **StreamSaver's per-frame service-worker hop is the residual
   main-thread cost** — and removing it (File System Access API, or batching frames before writing) is the next
   untested client fix, and the first one expected to move the **rate** rather than just the tail.
+
+  > **CORRECTION (E31/F23): this paragraph's scope was too narrow.** The "only 1.10×" figure is **true on the direct
+  > path** (where the browser's DataChannel receive, not the sink, is the cap) and **badly wrong on the relay path,
+  > where the same fix is worth 4.36× (51.58 → 224.82 Mbps)**. E31 also refuted this finding's *prediction* that the
+  > relay would stay slow because of its own per-frame JS Noise cost. The diagnosis of the sink's cost stands; the
+  > conclusion that it does not move the rate does not, and StreamSaver remains a candidate residual worth measuring
+  > on the relay path specifically.
 - **Consequence 3 — the v1-relay figure needs re-testing with a fixed client.** E12 predates every fix, so its
   42/55 may be a *main-thread* ceiling rather than a property of the relay design. This is directly load-bearing
   for the v1-direct-vs-v1-relay choice: it contradicts the belief that v1 relay runs near line speed, but it was
@@ -549,6 +556,43 @@ file; `go build ./...` and `go vet` pass.)
   like-for-like pairing. The clean matrix is 2×2: v1 direct **measured** (102–131 EAST / 60–68 WEST), v1 relay
   **measured but client-throttled** (42.0 / 55.3), v2 relay **measured** (233 / 215–228), and **v2 direct never
   measured** (explicitly skipped by request).
+
+## F23 — **E31 OVERTURNS E12: v1 relay is ~225–230 Mbps (line speed), not 42/55. The unfixed client was the entire deficit — and relay BEATS direct with the same fixed client.**
+- **Arms** (one matched session, all mode-asserted, exact byte accounting; E12's agent-side metric reused verbatim):
+
+  | arm | Mbps | n |
+  |---|---|---|
+  | **A** relay + unfixed client | **51.58** (50.684, 49.517 EAST; 54.550 WEST) | 3 |
+  | **B** relay + E29's fix | **224.82** (228.631 EAST, 221.003 WEST) | 2 |
+  | **C** relay + discard sink (**relay channel + JS Noise decryption intact**) | **229.93** (227.958 EAST, 231.896 WEST) | 2 |
+  | **D** direct + identical fixed client | **149.090** | 1 |
+
+- **Verdict: the relay's 42/55 was the client sink, not the relay path.** With the sink neutralised but the relay
+  channel and its per-frame **JS Noise decryption fully intact**, the relay delivers **229.93 Mbps ≈ 96–99 % of the
+  same-session 235–239 Mbps TCP capacity** — i.e. it runs at the client VM's ingress ceiling. **C/A = 4.46×.**
+- **E29's fix delivers nearly all of it to real users: 224.82 Mbps, a 4.36× uplift**, with the tail collapsing
+  **3.86 s → 0.60 s** and renderer cost falling (1.67 → 1.40 cores) while moving 4.4× more bytes per second.
+- **v1 relay with the fix is 1.53× FASTER than v1 direct with the identical fixed client** (224.82 vs 149.09). The
+  browser's **DataChannel** receive is therefore the *slower* path, and a WebSocket + JS-Noise channel beats it —
+  the opposite of the intuition that native DTLS/SCTP must outrun JS crypto over WebSocket.
+- **F22 correction:** F22's *diagnosis* (~65× memory amplification + ~48 k main-thread service-worker hops) is
+  **confirmed causal**; F22's *prediction* that the relay would stay slow because of its own per-frame Noise cost is
+  **REFUTED** — Noise decryption is not the binding cost at these rates.
+- **The client fix is worth far more than the direct path suggested.** Direct: **~1.10×** (108.06 → 119.17 — capped by
+  the browser's DataChannel, *not* the sink). Relay: **4.36×** (51.58 → 224.82). Any earlier statement that the fix
+  "buys only ~10 % of rate" is **true for direct and false for relay**.
+- **Retractions:** E12/F5's *"v1 relay is the weakest of the four paths — do not treat it as a fallback"* is
+  **WITHDRAWN**, and so is the accompanying *"relay-as-fallback is a quality cliff"* claim. The relay is a
+  **line-speed** path once the client is fixed.
+- **The v1-vs-v2 speed argument largely disappears:** v1 relay (224.82 with the fix) ≈ v2 relay (233) ≈ the
+  235–239 Mbps TCP capacity. What remains between v1 and v2 is implementation and ops, **not throughput**.
+- **Updated matrix:** v1 direct **149.09** | v1 relay **224.82** (unfixed: 51.58) | v2 relay **233** | v2 direct never
+  measured. Note the ordering is now counterintuitive: **relay > direct on v1**, which reframes the whole
+  v1-vs-v2 comparison — the earlier "2.1–3.8×" was *v1 direct vs v2 relay*, i.e. the wrong pair twice over.
+- **Caveats:** CLIENT-EAST↔TESTBOX clock skew ≈1 s (sub-second tails are ±1 s; tens-of-seconds claims unaffected);
+  the relay share was reused from E12 (agent counter 4→n); Arm D is n=1; and the **v2 units on TESTBOX had to be
+  stopped at 07:19Z** to free :8080/:443 for the v1 rig (documented in the results file's "Rig state change" — a
+  peer session may need them restarted).
 
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it

@@ -1,5 +1,20 @@
 # Can v1 direct be optimized to approach relay-class speed? — verdict, 2026-09-18
 
+> **MAJOR REVISION — 2026-09-19 (E31 / F23). Read this before the tables below.** A follow-up experiment
+> re-measured the **v1 relay** with a fixed client and it **changed two conclusions in this document**:
+>
+> 1. **v1 relay is NOT the weakest path — it is line speed.** E12's 42/55 Mbps was entirely the unfixed client's
+>    sink. With the sink neutralised but the relay channel and its JS Noise decryption intact the relay delivers
+>    **229.93 Mbps ≈ 96–99 % of same-session TCP capacity**; with E29's fix a real client gets **224.82 Mbps (4.36×)**.
+>    E12's/F5's *"do not treat relay as a fallback"* is **withdrawn**.
+> 2. **The client fix is worth much more than this document says** — see §4: on **direct** it is ~1.10× (the browser's
+>    DataChannel is the cap), but on **relay** it is **4.36×**. Statements here that the fix buys "only ~10 % of rate"
+>    are true for direct and **false for relay**.
+>
+> It also produced a counterintuitive ordering — **v1 relay (224.82) > v1 direct (149.09)** with the same fixed
+> client — and closed the v1-vs-v2 throughput gap: v1 relay ≈ v2 relay ≈ 233 ≈ line speed. The v1-vs-v2 question is
+> therefore about implementation and ops, **not speed**. The body below is retained as the pre-E31 record.
+
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes
 that gap?
@@ -73,19 +88,20 @@ Matched numbers, for the record (client-side implementation differs as above):
 |---|---|---|
 | v1 direct (app JS) | 102–131 Mbps | 60–68 Mbps |
 | v1 relay | 42.0 | 55.3 |
+| v1 relay **with E29's client fix** (E31) | **228.6** | **221.0** |
 | v2 relay (native download) | 233.3–233.7 (n=3, spread 0.18 %) | 214.9–228.4 |
 | v2 native-download browser arm | 239.05 | — |
 | path reference | ~246 (UDP) | — |
 
 ## 4. What is actually recoverable
 
-1. **The client fix — MEASURED, and it is the change to make (E29 + E30).** A minimal, verification-preserving
+1. **The client fix — MEASURED, and it is the change to make (E29 + E30 + E31).** A minimal, verification-preserving
    change (1 MiB tail buffer instead of re-concatenating the verification tail per append; SHA-1 in a module
    worker) gives **3.23× the user-visible time (139.87 s → 43.35 s; the tail goes 87.4 s → 0.53 s)** and
-   **−48 % client CPU**, for ~**1.10×** on the raw rate, with **200/200 randomized equivalence trials
-   byte-identical** and every cell reporting `✓ intact`. It matters most on constrained devices (1.76×
-   user-visible even at 1 vCPU). App code; helps v1 and v2 alike. **Take this win, but do not expect it to move
-   the ~120 Mbps transport plateau.**
+   **−48 % client CPU**, with **200/200 randomized equivalence trials byte-identical**. Its **rate** value depends
+   entirely on the path: **~1.10× on direct** (which the browser's DataChannel caps) but **4.36× on relay**
+   (51.58 → 224.82 Mbps, E31). App code; take it — the relay number means it is also the change that makes the
+   relay a genuinely fast path.
 2. **Enable the CA-step tuning in production (~1.2×).** Committed and tested on `main`, **not deployed**;
    production users currently get stock timing (~86/50 Mbps-class). A deployment change needing operator
    approval.
