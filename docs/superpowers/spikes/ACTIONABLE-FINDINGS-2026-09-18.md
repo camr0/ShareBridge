@@ -405,6 +405,45 @@ file; `go build ./...` and `go vet` pass.)
   where the client's cost sits; it is *consistent* with E27's finding that the cost is in the renderer
   (0.66–0.86 cores sink-free vs 1.95–2.01 sink-ON) but does not confirm the magnitudes.
 
+## F19 — **E28 settles it: the browser's DataChannel receive is the v1 ceiling.** App JS costs only ~14 % at 4 vCPUs (but 2.23× at 1 vCPU)
+- **Bare receive path** (real signalling/ICE/lanes unchanged; bulk `onmessage` counts `byteLength` and drops the
+  payload — no decode, no assembly, no sink). Byte accounting exact on **all 4 cells** (790,626,304 B;
+  48,258–48,263 frames), so the arms are valid, not merely fast:
+  - **unpinned 4 vCPU: 123.68 Mbps** (122.29 / 125.07, n=2) — vs sink-free 119.45 (**1.035×**) and the real client
+    108.76 (**1.137×**);
+  - **pinned 1 vCPU: 82.99 Mbps** (79.76 / 86.22, n=2) — vs sink-free 56.35 (**1.47×**) and the real client 37.19
+    (**2.23×**).
+  - Renderer cores: **0.63** @ 123.68 unpinned, **0.35** @ 82.99 pinned — and the pinned arm was **not**
+    pin-saturated (0.78–0.85 busy, unlike E25/E27). The bare path therefore needs only ~0.35–0.63 renderer cores,
+    so its ~83–124 Mbps is a **browser-internal limit, not CPU exhaustion**.
+- **Verdict: the app's JS is not what caps the plateau.** Removing *everything* app-side buys only **13.7 %** at
+  4 vCPUs (108.76 → 123.68), and the bare path lands on the same ~120–124 Mbps plateau the sender showed
+  (E21: uncapped mean 113.9, and 124.17 at a 2-core quota). **This supersedes F18's ranked-defect list as an
+  explanation of the plateau** — those defects still matter enormously when the client is CPU-starved (2.23× at
+  1 vCPU) and they still carry the ~80 s verify/write tail, but they are not the plateau's cause.
+- **The residual is browser-internal.** A bare JS handler cannot exceed ~124 Mbps on this 4-vCPU client, while the
+  sender demonstrably has headroom: its CPU was never saturated in any field cell (E21) and the same pion stack
+  does **521–533 Mbps uncapped against a Go receiver** on loopback (E22). So the field's ~120 Mbps ceiling is the
+  **browser's WebRTC DataChannel receive path** — not the transport, not the agent, not the app.
+- **This resolves F18's confound WITHOUT rescuing v1.** The 2.1–3.8× v1-vs-v2 gap is **not** a TCP-vs-SCTP
+  difference and **not** a kernel-transport difference: **v1 forces a JS receive path (DataChannel) while v2's
+  relay lets the browser use its native HTTP downloader with zero page-JS.** The comparison therefore remains
+  valid **as a user-visible comparison**, but it must be described as a **client-architecture** gap, not a
+  transport one. Both halves of that matter: v2's win is real for users, and the mechanism is not what the
+  earlier write-ups implied.
+- **Answer to "can v1 direct be optimized to relay class?" — not with agent-side or app-code changes.** Remaining
+  app-side headroom is ~14 % at 4 vCPUs plus the ~80 s tail, while the browser-limited remainder would need bulk
+  bytes on an HTTP/native-download path — exactly what v2's relay already does. A **pion fork (≤1.3×, F15)** would
+  also act on the end of the wire that has headroom, so it cannot help either.
+- **Caveat / open question (needs a resource decision, not an unattended experiment):** the test client VM has
+  only **4 vCPUs**, and E25 showed the client scaling 37 → 48 → 108 across 1 → 2 → 4 cores (sub-linear but real).
+  **So ~124 Mbps may understate v1 on 8–16-core client machines — untested.** E20 also showed two tabs on one host
+  do **not** simply add up (72.30 Mbps combined), so a single client does not trivially multiply either.
+- **Methodological catch (now confirmed twice):** pinned arms fell to relay in **3 of 5** attempts (0 of 2
+  unpinned), all with the **+10.0 s** direct-deadline shape — **pinning the client causes silent relay fallback.**
+- Web root restored and verified (`407ee7032f90e429…`, 91,308 B, 644, `cmp`-identical, 0 markers, HTTP-served hash
+  matches); rig restored (`sb-agent:pristine`, `NanoCpus=0`, API 200, clients clean).
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the
