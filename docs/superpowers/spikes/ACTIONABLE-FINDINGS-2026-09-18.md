@@ -407,13 +407,13 @@ file; `go build ./...` and `go vet` pass.)
 
 ## F19 — **E28 settles it: the browser's DataChannel receive is the v1 ceiling.** App JS costs only ~14 % at 4 vCPUs (but 2.23× at 1 vCPU)
 
-> **CORRECTION (E29, same day): the "~14 %" and the "~124 Mbps browser floor" in this section are too
-> pessimistic and are superseded by F20.** E29's *optimized* client — which keeps full verification — reaches
-> **146.54 Mbps in its own session (1.27× its interleaved control)**, i.e. *above* E28's naive "bare" handler
-> (123.68). So E28's bare arm was itself paying main-thread per-message cost, the browser's receive floor is
-> **≥146.5 Mbps rather than ~124**, and the app's own JS cost ~**27 %** of the achievable rate at 4 vCPUs —
-> 3.23× in user-visible time once the tail is removed. The rest of F19 (the ceiling is client-side, the sender
-> has headroom, a fork cannot help, and the v1-vs-v2 gap is client-architecture rather than transport) stands.
+> **RESOLVED by E30 (n=4) — F19's magnitudes STAND; E29's 1.27× was NOT reproducible.** E29 (n=2, interleaved)
+> suggested the app's JS cost ~27 % and the browser's floor was ≥146.5 Mbps. **E30 re-measured the fixed client
+> at n=4: 119.17 Mbps mean (107.5 / 110.8 / 127.5 / 130.9) against an unfixed control of 108.06 (n=2) — 1.10×,
+> with 146.54 not reproduced.** So the app's JS is worth ~10 % of the *rate* at 4 vCPUs, and the browser's
+> receive floor is ~120 Mbps. **What E29 established robustly is the tail and CPU win, not the rate** — see F20
+> and F21. F19's remaining conclusions (the ceiling is client-side, the sender has headroom, a fork cannot help,
+> the v1-vs-v2 gap is client-architecture) are all confirmed and strengthened by E30.
 - **Bare receive path** (real signalling/ICE/lanes unchanged; bulk `onmessage` counts `byteLength` and drops the
   payload — no decode, no assembly, no sink). Byte accounting exact on **all 4 cells** (790,626,304 B;
   48,258–48,263 frames), so the arms are valid, not merely fast:
@@ -452,7 +452,11 @@ file; `go build ./...` and `go vet` pass.)
 - Web root restored and verified (`407ee7032f90e429…`, 91,308 B, 644, `cmp`-identical, 0 markers, HTTP-served hash
   matches); rig restored (`sb-agent:pristine`, `NanoCpus=0`, API 200, clients clean).
 
-## F20 — **E29: the verification-preserving client fix is the campaign's biggest win — 1.27× the rate and 3.23× the user-visible time**
+## F20 — **E29: the verification-preserving client fix removes the ~87 s tail — a 3.23× user-visible win**
+
+> **SUPERSEDED IN PART by E30 (n=4): the RATE gain is 1.10×, not 1.27×, and 146.54 Mbps was not reproduced.**
+> Everything below about the **tail, the user-visible time and the CPU halving is confirmed**; the
+> "146.54 Mbps" figure and the 1.27× multiplier are single-session n=2 excursions. See F21.
 - **The fix (minimal, in the isolated test-web-root copy; full diff in the results file):** (a) keep a **1 MiB tail
   buffer** instead of re-concatenating the verification tail on every append (`downloadSinks.js:20-31`, the ~17×
   amplification) and (b) move **SHA-1 into a module worker**. Nothing else changed.
@@ -477,6 +481,37 @@ file; `go build ./...` and `go vet` pass.)
   fix lands v1 at ~146 Mbps, which is a large gain from ~115 but still short of the relay's 233.
 - Web root restored (manifest byte-identical, 140 files); rig unchanged; **6/6 unpinned cells direct**, 2 pinned
   cells discarded as relay.
+
+## F21 — **E30: "who binds" answered — the client's receive side, and it is SERIALIZED (~120 Mbps). E29's rate gain was noise.**
+- **Arms** (0 of 9 cells discarded to relay; both pinned cells stayed direct first try):
+
+  | arm | n | Mbps | tail | renderer cores |
+  |---|---|---|---|---|
+  | fixed client, 4 vCPU, sender uncapped | 4 | **119.17** (107.5 / 110.8 / 127.5 / 130.9) | 0.53 s | 0.98 |
+  | fixed client + sender `--cpus=2` | 1 | 115.18 | 0.58 s | 0.98 |
+  | fixed client pinned to 2 vCPU | 1 | 68.34 | 0.80 s | 0.57 |
+  | fixed client pinned to 1 vCPU | 1 | 39.02 | 1.82 s | 0.35 |
+  | unfixed control, 4 vCPU | 2 | 108.06 | **87.4 s** | 2.06 |
+
+- **The sender is exonerated, and more strongly than before:** capping it at 2 cores changed nothing (115.18 vs
+  119.17) and it used only **0.65 core**, while iperf3 on the same path carried **246 Mbps UDP / 241 TCP** — 2.1×
+  spare. So the ceiling is not sender CPU and not the path.
+- **The client's receive side binds, and it is serialized.** The pin gradient is **39.0 / 68.3 / 119.2 Mbps at
+  1 / 2 / 4 vCPU** while the client **never saturates its allowance** (0.98 of 4 cores at the ceiling). Needing
+  ~1 core's worth, being hurt by fewer cores and *not helped by more* is the signature of a **serial**
+  bottleneck — which also means **the remaining app-side work (the ~10 % rate gain) cannot lift it.**
+- **Four independent configurations now land on the same ~108–124 Mbps**: the fixed client (119.17), the unfixed
+  control (108.06), a bare counting handler (123.68, E28), and the old client's "sender plateau" (E21: 124.17
+  at a 2-core quota). The plateau is therefore the **browser's WebRTC DataChannel receive path** — not the
+  sender, the transport, the host, the path, the loss response, or the app's JS.
+- **This answers the "bigger client" open question by inference:** the client uses only ~0.98 of 4 cores at the
+  ceiling and is not helped by more CPU, so **a larger client VM would not be expected to raise it** — inference
+  from the serial signature, not a measurement, and the one remaining assumption worth stating as such.
+- **The app fix still earns its place, on the tail rather than the rate:** the unfixed control's tail was
+  **87.4 s** (renderer 2.06 cores) versus **0.53 s** fixed (0.98 cores) — a **user-visible 3.23×**
+  (139.87 s → 43.35 s) and a halving of client CPU, which is what matters on constrained devices.
+- **Restore verified:** web-root manifest identical to E29's 140-file original; `sb-run` pristine, `NanoCpus=0`,
+  API 200; clients clean (`node`/`chrome`/`Xvfb`/`iperf3` = 0).
 
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
