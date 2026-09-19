@@ -594,6 +594,46 @@ file; `go build ./...` and `go vet` pass.)
   stopped at 07:19Z** to free :8080/:443 for the v1 rig (documented in the results file's "Rig state change" — a
   peer session may need them restarted).
 
+## F24 — **E32: v1 direct is LATENCY-SENSITIVE. 15–19 MB/s is a ~12 ms figure; at ~70 ms it is ~9 MB/s. The relay loses ~3 % over the same span and is ~3× faster.**
+- Direct arms, all byte-accounting exact, with the **fixed** client unless stated:
+
+  | arm | Mbps | MB/s | n | measured RTT | tail | renderer cores |
+  |---|---|---|---|---|---|---|
+  | EAST + fix | **137.71** | 17.21 | 2 | 10.9 ms | 0.46 s | 1.01 |
+  | WEST + fix | **74.71** | 9.34 | 3 | 70.4 ms | 0.60 s | 0.62 |
+  | WEST + unfixed | **64.84** | 8.11 | 2 | 70.4 ms | **22.5 s** | 1.92 |
+  | WEST + bare counter | **77.36** | 9.67 | 1 | 70.4 ms | ~1.4 s | 0.34 |
+
+- **Deciding comparison: 137.71 vs 74.71 = 1.84×, with disjoint ranges.** Direct loses ~46 % of its throughput
+  going from ~11 ms to ~70 ms.
+- **It is not the app and not the sink.** The bare counting handler (77.36) matches the fixed client (74.71, 1.04×)
+  while using **3.1× less CPU** (0.34 vs 1.01 cores), and neither saturates. So the ~75 Mbps at 70 ms is the
+  **browser's DataChannel/SCTP receive path** — a transport-level window/RTT behaviour, not app code, and not
+  fixable in app code.
+- **The path is not the limit:** controls with no cell running gave WEST TCP 1-flow **163/111**, 4-flow **245**, UDP
+  300 offered → **249** delivered (17 % loss); EAST TCP **245**, UDP **249**. So WEST could carry ~245–249 Mbps while
+  direct used ~75 — **2.1–3.3× headroom**.
+- **The old "direct halves with RTT" claim is VINDICATED with the fixed client.** E10b's 60.24 reproduces at
+  **64.84** (1.08×) — it had been cast into doubt only because both of its cells were client-throttled. The fix
+  buys just **1.15×** on direct at 70 ms (64.84 → 74.71), consistent with F23: on the direct path the sink is not
+  the binding cost.
+- **At ~70 ms the relay is ~3× faster than direct** (221.0 vs 74.71), because E31 showed the relay loses only ~3 %
+  across 12 → 71 ms. **The relay is the path for distant and mobile users.**
+- **Corrected headline table (fixed client everywhere):**
+
+  | path | ~12 ms | ~70 ms |
+  |---|---|---|
+  | v1 direct | 137.71 Mbps / **17.2 MB/s** | 74.71 / **9.3 MB/s** |
+  | v1 relay | 228.6 / 28.6 | 221.0 / **27.6 MB/s** |
+  | v2 relay | 233 / 29.1 | 215–228 / 27–28.5 |
+
+- **Consequence for the product question:** "is v1 direct fast enough?" **cannot be answered without latency.** At
+  12 ms it is ~17 MB/s; at realistic mobile or long-distance latency it is ~9 MB/s and falls further as RTT rises.
+  The relay holds ~27.6 MB/s at 70 ms and is thus the only path whose speed is confirmed to survive distance.
+- **Caveats:** EAST+fix n=2 and WEST+bare n=1 (single observation); WEST+unfixed n=2; the "disjoint ranges"
+  statement rests on the reported spreads; the fix and bare variants lived in the TESTBOX test web root and were
+  **restored byte-for-byte** (140-file manifest identical).
+
 ## Do NOT land — negative results (documented so they are not re-litigated)
 - **`SB_SCTP_MIN_CWND` at any size** — CLOSED by E17/E18: above ~1.6× BDP it degrades 3–4×, above ~12× BDP it
   breaks outright (0/4 cells completed), and below BDP it is harmless but never beats stock because the

@@ -14,6 +14,14 @@
 > It also produced a counterintuitive ordering — **v1 relay (224.82) > v1 direct (149.09)** with the same fixed
 > client — and closed the v1-vs-v2 throughput gap: v1 relay ≈ v2 relay ≈ 233 ≈ line speed. The v1-vs-v2 question is
 > therefore about implementation and ops, **not speed**. The body below is retained as the pre-E31 record.
+>
+> **SECOND REVISION — 2026-09-19 (E32 / F24): direct's speed is latency-dependent; the relay's is not.**
+> Direct with the fixed client measures **137.71 Mbps (17.2 MB/s) at 10.9 ms** but **74.71 (9.3 MB/s) at 70.4 ms** —
+> **1.84×**, with a bare receive handler matching the fixed client (77.36) on 3.1× less CPU, so the loss is the
+> **browser's DataChannel/SCTP receive path**, not app code (the path had 2.1–3.3× headroom). The relay lost only
+> ~3 % over the same span (228.6 → 221.0), so **at ~70 ms the relay is ~3× faster than direct**. Any statement in
+> this document of the form "v1 direct does ~120–150 Mbps" is **a ~12 ms figure** and must not be read as typical —
+> realistic mobile/distant latency halves it.
 
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes
@@ -87,6 +95,7 @@ Matched numbers, for the record (client-side implementation differs as above):
 | path | CLIENT-EAST ~12 ms | CLIENT-WEST ~71 ms |
 |---|---|---|
 | v1 direct (app JS) | 102–131 Mbps | 60–68 Mbps |
+| v1 direct **with the client fix** (E32) | **137.71** (17.2 MB/s) | **74.71** (9.3 MB/s) |
 | v1 relay | 42.0 | 55.3 |
 | v1 relay **with E29's client fix** (E31) | **228.6** | **221.0** |
 | v2 relay (native download) | 233.3–233.7 (n=3, spread 0.18 %) | 214.9–228.4 |
