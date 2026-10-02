@@ -369,7 +369,13 @@ applied to data-only vs ack-only vs both.
 
 **Cells.** rtt 25/71 × {data 1%, ack 1%, both 1%} × n=2.
 
-**Result.** _pending_
+**Result — CLOSED BY E19 (banner added 2026-10-02).** Not run, and it should not be: E19 measured the field's
+SACK direction directly and found it **lossless** — **0 missing** of 411,209 records (EAST) and 0 of 372,552
+(WEST), bound < 2.7×10⁻⁶ (`results/2026-09-18-exp19-in-flow-loss.md:107–125`). The data direction carries
+0.27–0.68% loss; the ACK direction does not. A lab ACK-loss cell would test a regime the field never exhibits —
+the same error F10 records for the loss levers. Also still `_pending_` in this doc and **subsumed** by candidates
+D1/D2 of the review: Exp 1 (retransmit diagnosis) and Exp 4 (`BufferedAmount` series). See
+`2026-10-02-v1-direct-candidate-experiments-review.md`.
 
 ---
 

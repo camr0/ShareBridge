@@ -124,6 +124,14 @@ capacity:
   is the same phenomenon at a different scale.
 
 ## F8 — **(b)** `SB_SCTP_MIN_CWND` — **CLOSED. No field value at any size.** Plus a reusable BDP rule
+
+> **CORRECTION (2026-10-02) — the closure is valid at ~12 ms and OVERREACHES by one RTT regime.** E18 swept the
+> small floors (32/64/128/256 KiB) on **CLIENT-EAST only**; its own results file says "CLIENT-WEST (71 ms, BDP ≈
+> 1 MB) **not swept**" (`results/2026-09-18-exp18-small-min-cwnd-floors.md:45`). E17's 2 MiB break did hit both
+> clients, but 2 MiB ≈ 2× the *WEST* BDP. So "no field value at any size" holds for the 12 ms regime (BDP ≈165
+> KiB; harm bracketed at 128–256 KiB) and the **70 ms regime has never been swept in its own units** — which
+> matters because E32 showed 70 ms is a distinct, window-shaped regime. Reopened as a cheap, zero-code candidate
+> (A5) in `2026-10-02-v1-direct-candidate-experiments-review.md`.
 - **Lab (E14, 240 Mbps cap / rtt 12 / 5 MB queue):** a 2 MiB floor took 27.9 → **204.8 Mbps** at 1e-3 loss
   and 64.1 → **225.0** at 2e-4, and was a no-op on a clean path; mechanism confirmed in code (pion floors
   every cwnd write to `minCwnd`, incl. the RTO path).
@@ -548,6 +556,12 @@ file; `go build ./...` and `go vet` pass.)
   > relay would stay slow because of its own per-frame JS Noise cost. The diagnosis of the sink's cost stands; the
   > conclusion that it does not move the rate does not, and StreamSaver remains a candidate residual worth measuring
   > on the relay path specifically.
+  >
+  > **EXTENDED (E32, 2026-10-02) — the rate half of this is now closed for 4-vCPU clients.** E32-W5's bare counter
+  > **77.36** vs the fixed client **74.71** = **1.04×** (direct, 70 ms, same session), so the whole app receive
+  > path — StreamSaver included — is worth ≤4% of the rate at 4 vCPU, and "replace StreamSaver" is no longer the
+  > most promising *rate* lever. It remains live for **low-end/pinned clients** (E28-bare pinned 82.99 vs
+  > E29-fixed pinned 37.53 ≈ 2.2×) as a CPU/tail lever.
 - **Consequence 3 — the v1-relay figure needs re-testing with a fixed client.** E12 predates every fix, so its
   42/55 may be a *main-thread* ceiling rather than a property of the relay design. This is directly load-bearing
   for the v1-direct-vs-v1-relay choice: it contradicts the belief that v1 relay runs near line speed, but it was

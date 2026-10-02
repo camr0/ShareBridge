@@ -135,6 +135,15 @@ Matched numbers, for the record (client-side implementation differs as above):
   StreamSaver `postMessage`/service-worker hop, on the main thread (F22). E29 removed the tail copy and moved
   hashing off-thread but **kept StreamSaver**, which is why the rate only moved 1.10×. The v1 **relay** path pays
   the same per-frame cost *plus* JS Noise decryption per frame, so this is likely to lift relay too.
+
+  > **CORRECTION (2026-10-02) — this bullet is STALE; its rate claim is closed for 4-vCPU clients.** E31 and E32
+  > bound the **entire** app receive path — of which the StreamSaver hop is a subset — at ≤4%: E32-W5 bare counter
+  > **77.36** vs fixed client **74.71** = **1.04×** (direct, 70 ms, same session), and E31 arm C discard sink
+  > **229.93** vs fix **224.82** = **1.02×** (relay, JS Noise decryption intact). The "1.10× ⇒ StreamSaver is the
+  > residual" reading does not follow. **Caveat that keeps a sliver open:** this is rate-at-4-vCPU only — at
+  > **1 vCPU** the app path still matters (E28-bare pinned 82.99 vs E29-fixed pinned 37.53 ≈ **2.2×**), so for
+  > low-end/mobile clients the sink write path remains a live **CPU/tail** lever. See
+  > `2026-10-02-v1-direct-candidate-experiments-review.md` §2.1.
 - **Re-testing the v1 relay with a fixed client.** E12's 42.0 / 55.3 Mbps is latency-independent and was measured
   with the throttled client, so it may be a main-thread ceiling rather than a property of the relay design. Worth
   settling, because it decides the v1-direct-vs-v1-relay comparison (F22).
