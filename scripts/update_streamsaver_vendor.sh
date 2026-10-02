@@ -7,7 +7,10 @@ VENDOR_DIR="$ROOT_DIR/signaling-server/web/src/vendor"
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://raw.githubusercontent.com/jimmywarting/StreamSaver.js}"
 UPSTREAM_SHA="${UPSTREAM_SHA:-5b372f7ba5f1e82ef80e2466023930ee2c616a28}"
 SAFARI_REPO="${SAFARI_REPO:-https://raw.githubusercontent.com/camr0/StreamSaver.js}"
-SAFARI_SHA="${SAFARI_SHA:-cfecfdda5e45bc1eecb0ce2c2fb0c420107a0a2e}"
+# 4999d69 = "Wait for service worker close ack": writer.close() only resolves once the service
+# worker confirms it has closed the response, instead of resolving as soon as 'end' is posted.
+# Do NOT bump this to the fork's HEAD -- later commits there are test-only (query-param hooks).
+SAFARI_SHA="${SAFARI_SHA:-4999d69273b727dd1127b28a4cf9fa9a27867b07}"
 HASH_WASM_REPO="${HASH_WASM_REPO:-https://cdn.jsdelivr.net/npm/hash-wasm@4.12.0/dist}"
 HASH_WASM_SOURCE="${HASH_WASM_SOURCE:-https://github.com/Daninet/hash-wasm}"
 HASH_WASM_SHA="${HASH_WASM_SHA:-373b796205ab55fb4a657374dad6ea589bf75815}"

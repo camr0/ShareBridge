@@ -1,4 +1,4 @@
-/* Vendored from https://raw.githubusercontent.com/camr0/StreamSaver.js at cfecfdda5e45bc1eecb0ce2c2fb0c420107a0a2e (sw.js). Updated via scripts/update_streamsaver_vendor.sh. */
+/* Vendored from https://raw.githubusercontent.com/camr0/StreamSaver.js at 4999d69273b727dd1127b28a4cf9fa9a27867b07 (sw.js). Updated via scripts/update_streamsaver_vendor.sh. */
 /* global self ReadableStream Response */
 
 self.addEventListener('install', () => {
@@ -11,6 +11,7 @@ self.addEventListener('activate', event => {
 
 const map = new Map()
 const streamState = new Map() // Track stream state: { controller, hasFetched, pendingClose }
+const swLogPrefix = () => `[SW ${new Date().toISOString()}]`
 
 self.onmessage = event => {
   if (event.data === 'ping') {
@@ -42,7 +43,7 @@ self.onmessage = event => {
 }
 
 function createStream (port, downloadUrl) {
-  console.log('[SW] Creating ReadableStream for download')
+  console.log(swLogPrefix(), 'Creating ReadableStream for download')
 
   const CREDIT_WINDOW = 1
   const state = {
@@ -61,8 +62,10 @@ function createStream (port, downloadUrl) {
       return
     }
 
+    console.log(swLogPrefix(), 'Closing response body')
     state.closed = true
     state.controller.close()
+    console.log(swLogPrefix(), 'Posting done ack to page')
     port.postMessage({ done: true })
   }
   state.closeStream = closeStream
@@ -106,6 +109,10 @@ function createStream (port, downloadUrl) {
         }
 
         if (data === 'end') {
+          console.log(swLogPrefix(), 'Received end from page', {
+            hasFetched: state.hasFetched,
+            queuedChunks: state.chunkQueue.length
+          })
           if (state.chunkQueue.length === 0) {
             if (state.hasFetched) {
               setTimeout(closeStream, 500)
@@ -156,24 +163,24 @@ self.onfetch = event => {
     return event.respondWith(new Response('pong'))
   }
 
-  console.log('[SW] Fetch intercepted:', url)
+  console.log(swLogPrefix(), 'Fetch intercepted:', url)
 
   const hijacke = map.get(url)
 
   if (!hijacke) {
-    console.log('[SW] No match in map for:', url)
+    console.log(swLogPrefix(), 'No match in map for:', url)
     return null
   }
 
   const [ stream, data, port ] = hijacke
 
-  console.log('[SW] Found stream for:', url)
+  console.log(swLogPrefix(), 'Found stream for:', url)
   map.delete(url)
 
   const state = streamState.get(url)
   if (state) {
     state.hasFetched = true
-    console.log('[SW] Fetch happened, pendingClose:', state.pendingClose)
+    console.log(swLogPrefix(), 'Fetch happened, pendingClose:', state.pendingClose)
   }
 
   // Not comfortable letting any user control all headers
@@ -219,14 +226,14 @@ self.onfetch = event => {
     responseHeaders.set('Content-Disposition', `attachment; filename="${fileName}"; filename*=UTF-8''${safeFileName}`)
   }
 
-  console.log('[SW] Responding with stream, Content-Length:', responseHeaders.get('Content-Length'))
+  console.log(swLogPrefix(), 'Responding with stream, Content-Length:', responseHeaders.get('Content-Length'))
   event.respondWith(new Response(stream, { headers: responseHeaders }))
 
   if (state && state.pendingClose && state.controller) {
-    console.log('[SW] Fetch done and pending close - closing after delay')
+    console.log(swLogPrefix(), 'Fetch done and pending close - closing after delay')
     state.pendingClose = false
     setTimeout(() => {
-      console.log('[SW] Closing stream after fetch + delay')
+      console.log(swLogPrefix(), 'Closing stream after fetch + delay')
       state.closeStream()
     }, 500)
   }

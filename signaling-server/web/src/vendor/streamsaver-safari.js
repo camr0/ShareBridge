@@ -1,4 +1,4 @@
-/* Vendored from https://raw.githubusercontent.com/camr0/StreamSaver.js at cfecfdda5e45bc1eecb0ce2c2fb0c420107a0a2e (StreamSaver.js). Updated via scripts/update_streamsaver_vendor.sh. */
+/* Vendored from https://raw.githubusercontent.com/camr0/StreamSaver.js at 4999d69273b727dd1127b28a4cf9fa9a27867b07 (StreamSaver.js). Updated via scripts/update_streamsaver_vendor.sh. */
 /*! streamsaver. MIT License. Jimmy Wärting <https://jimmy.warting.se/opensource> */
 
 /* global chrome location ReadableStream define MessageChannel TransformStream */
@@ -151,6 +151,9 @@
     let downloadUrl = null
     let channel = null
     let ts = null
+    let closePromise = null
+    let resolveClose = null
+    let rejectClose = null
 
     // normalize arguments
     if (Number.isFinite(options)) {
@@ -249,16 +252,16 @@
           }
         } else if (evt.data.abort) {
           chunks = []
-          channel.port1.postMessage('abort')
-          channel.port1.onmessage = null
-          channel.port1.close()
-          channel.port2.close()
-          channel = null
+          console.warn(closeLogPrefix(), 'Service worker reported abort')
+          if (channel) {
+            channel.port1.postMessage('abort')
+          }
+          rejectPendingClose(new Error('Service worker aborted the download'))
+          cleanupChannel()
         } else if (evt.data.done) {
-          channel.port1.onmessage = null
-          channel.port1.close()
-          channel.port2.close()
-          channel = null
+          console.log(closeLogPrefix(), 'Received service worker done ack')
+          cleanupChannel()
+          resolvePendingClose()
         } else if (evt.data.pull) {
           grantCredits(typeof evt.data.pull === 'number' ? evt.data.pull : 1)
         }
@@ -276,6 +279,43 @@
     let chunks = []
     let availableCredits = 0
     let pendingResolve = null
+
+    const closeLogPrefix = () => `[StreamSaver ${new Date().toISOString()}]`
+
+    const cleanupChannel = () => {
+      if (!channel) {
+        return
+      }
+
+      channel.port1.onmessage = null
+      channel.port1.close()
+      channel.port2.close()
+      channel = null
+    }
+
+    const resolvePendingClose = () => {
+      if (!resolveClose) {
+        return
+      }
+
+      const resolve = resolveClose
+      closePromise = null
+      resolveClose = null
+      rejectClose = null
+      resolve()
+    }
+
+    const rejectPendingClose = error => {
+      if (!rejectClose) {
+        return
+      }
+
+      const reject = rejectClose
+      closePromise = null
+      resolveClose = null
+      rejectClose = null
+      reject(error)
+    }
 
     const getFallbackChunks = chunk => {
       if (supportsTransferable || chunk.byteLength <= fallbackChunkSize) {
@@ -348,18 +388,29 @@
           link.download = originalFilename
           link.click()
         } else {
-          console.log('[StreamSaver] Sending "end" to service worker')
+          if (closePromise) {
+            return closePromise
+          }
+
+          closePromise = new Promise((resolve, reject) => {
+            resolveClose = resolve
+            rejectClose = reject
+          })
+
+          console.log(closeLogPrefix(), 'close() called')
+          console.log(closeLogPrefix(), 'Sending "end" to service worker')
           channel.port1.postMessage('end')
-          console.log('[StreamSaver] "end" sent, download should finalize')
+          console.log(closeLogPrefix(), '"end" sent, waiting for service worker done ack')
+          return closePromise
         }
       },
       abort () {
         chunks = []
-        channel.port1.postMessage('abort')
-        channel.port1.onmessage = null
-        channel.port1.close()
-        channel.port2.close()
-        channel = null
+        if (channel) {
+          channel.port1.postMessage('abort')
+        }
+        rejectPendingClose(new Error('StreamSaver download aborted'))
+        cleanupChannel()
       }
     }, opts.writableStrategy)
   }
