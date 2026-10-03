@@ -132,6 +132,19 @@ capacity:
 > KiB; harm bracketed at 128–256 KiB) and the **70 ms regime has never been swept in its own units** — which
 > matters because E32 showed 70 ms is a distinct, window-shaped regime. Reopened as a cheap, zero-code candidate
 > (A5) in `2026-10-02-v1-direct-candidate-experiments-review.md`.
+>
+> **RESOLVED (E33, 2026-10-02) — the 70 ms regime HAS now been swept, the lever is CLOSED there too, and the BDP
+> rule above is CORRECTED.** E33 ran n=3 per floor + 4 interleaved controls on CLIENT-WEST through the deployed
+> (unfixed) client: control **67.12 Mbps**; 256 KiB 73.19 (no benefit — the 80.78 is a session outlier, and the
+> control run immediately after read 67.54); 384 KiB 51.77 (unreliable, 2/3 below the whole control range);
+> 512/640 KiB **~15 Mbps, 4.4× worse**, 6/6 cells in a 14.7–16.8 band. The safe ceiling rises in *bytes*
+> (128 KiB at 12 ms → 256 KiB at 70 ms) but falls as a *fraction of BDP* (0.70× → **0.44×**), so **harm begins
+> below 0.9× BDP at 70 ms — inside what this note called the harmless zone. The harmless zone is therefore NOT
+> defined by BDP multiples**, and a floor chosen to sit "safely below 1× BDP" on a high-RTT path can still land in
+> the destructive regime. Mechanism: the degraded arms hold only ~130–150 KB in flight, far below the 512 KiB
+> floor, so the oversized burst overshoots the bottleneck and the loss cycle pins throughput at ~15 Mbps. E33's
+> D2 also shows there is **no ramp** at 70 ms (flat plateau by t=5–15 s), so there was never anything for a floor
+> to fix. See `results/2026-10-02-exp33-mincwnd-70ms.md`.
 - **Lab (E14, 240 Mbps cap / rtt 12 / 5 MB queue):** a 2 MiB floor took 27.9 → **204.8 Mbps** at 1e-3 loss
   and 64.1 → **225.0** at 2e-4, and was a no-op on a clean path; mechanism confirmed in code (pion floors
   every cwnd write to `minCwnd`, incl. the RTO path).

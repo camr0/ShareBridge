@@ -1,0 +1,35 @@
+# Instrumented agent image (E35 SCTP trace).
+#
+# Unlike ./Dockerfile, this does NOT build Go. VERSA has no toolchain and no
+# forks/ tree, and a prebuilt binary cannot drift from the one the local fork
+# tests ran against. Build the binary on the lab Mac, then lay it out as:
+#
+#   img-instrumented/
+#     Dockerfile      <- this file
+#     agent           <- bin/agent-instrumented-linux-amd64, renamed
+#
+# Produce the binary with:
+#   cd agent
+#   ./apply_sctp_patch.sh trace
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/agent-instrumented-linux-amd64 ./cmd/agent
+#   ./apply_sctp_patch.sh none      # leave the shared tree unpatched
+#
+# Then, on the field rig:
+#   docker build -t sb-agent:instrumented img-instrumented/
+#   docker run ... -e SB_SCTP_TRACE=1 sb-agent:instrumented
+#
+# The trace is inert unless SB_SCTP_TRACE=1. With the switch off, and with no
+# SB_SCTP_* tuning variables set, this image behaves exactly like
+# sb-agent:pristine -- the only difference is one extra os.Getenv per SCTP
+# association.
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /app
+
+COPY agent .
+
+EXPOSE 7878
+
+CMD ["./agent", "daemon"]

@@ -1,0 +1,70 @@
+cells=85  failures(rc!=0)=0  shim_write_err>0=0
+
+=== cap=None (None) rtt=0 ===
+chunk   n    mbps                         chrome_cores                 chrome_cs/GB                 msg/s    up%     
+1KiB    3    441 444 443                  1.500 1.510 1.531            31.3 31.3 31.6               54018    -38.90  
+4KiB    3    459 459 467                  1.294 1.326 1.341            26.7 26.7 26.4               14090    -17.58  
+16KiB   6    410 518 527 526 515 501      0.957 1.261 1.261 1.238 1.185 1.152 23.7 22.5 22.5 22.2 22.4 22.4 3812     0.00    
+64KiB   3    522 523 526                  1.203 1.212 1.227            21.5 21.5 21.6               1000     4.83    
+256KiB  3    455 533 533                  0.788 1.186 1.175            21.6 21.0 21.0               242      6.15    
+  least-squares chrome_cores vs msg/s over 18 cells (1KiB..256KiB): slope = 7.1 us/msg, max residual 0.364 cores
+  16KiB -> 256KiB: chrome_cs/GB 22.60 -> 21.21 (-6.2%)  [16x fewer messages]
+  16KiB -> 1KiB:  chrome_cs/GB 22.60 -> 31.39 (+38.9%)  [16x more messages]
+
+=== cap=8MB (64.0) rtt=0 ===
+chunk   n    mbps                         chrome_cores                 chrome_cs/GB                 msg/s    up%     
+1KiB    3    59 59 59                     0.281 0.275 0.278            38.7 37.8 38.4               7207     -27.08  
+4KiB    3    59 59 59                     0.246 0.247 0.249            34.0 34.1 34.3               1802     -13.09  
+16KiB   6    60 60 60 60 56 60            0.224 0.216 0.218 0.222 0.211 0.222 30.5 29.5 29.8 30.2 30.7 30.2 451      0.35    
+64KiB   3    60 54 60                     0.215 0.206 0.207            29.4 30.7 28.3               111      4.44    
+256KiB  3    60 54 60                     0.214 0.212 0.217            29.2 31.6 29.7               28       2.47    
+  least-squares chrome_cores vs msg/s over 15 cells (1KiB..256KiB): slope = 8.7 us/msg, max residual 0.015 cores
+  16KiB -> 256KiB: chrome_cs/GB 30.17 -> 30.15 (-0.1%)  [16x fewer messages]
+  16KiB -> 1KiB:  chrome_cs/GB 30.17 -> 38.35 (+27.1%)  [16x more messages]
+
+=== cap=30MB (240.0) rtt=0 ===
+chunk   n    mbps                         chrome_cores                 chrome_cs/GB                 msg/s    up%     
+1KiB    3    227 227 227                  1.002 0.998 0.988            37.0 37.0 36.5               27715    -32.80  
+4KiB    3    225 225 227                  0.835 0.834 0.850            31.9 31.7 31.4               6891     -14.34  
+16KiB   6    228 228 226 227 227 228      0.740 0.753 0.710 0.740 0.741 0.787 27.4 27.9 27.1 27.4 27.4 29.1 1735     0.00    
+64KiB   3    229 230 227                  0.735 0.728 0.738            27.3 26.8 27.3               436      2.15    
+256KiB  3    170 231 228                  0.565 0.721 0.708            27.7 26.7 26.2               100      4.57    
+  least-squares chrome_cores vs msg/s over 17 cells (1KiB..256KiB): slope = 9.8 us/msg, max residual 0.048 cores
+  16KiB -> 256KiB: chrome_cs/GB 27.72 -> 26.87 (-3.0%)  [16x fewer messages]
+  16KiB -> 1KiB:  chrome_cs/GB 27.72 -> 36.81 (+32.8%)  [16x more messages]
+
+=== field projection (E28/E32 bare arms) ===
+E28 4-vCPU bare : 123.68 Mbps, 16 KiB msgs -> 943.6 msg/s, renderer 0.63 core, client 1.27 cores
+E32-W5 1-vCPU bare: 77.363 Mbps, 48,258 msgs over 81.758 s -> 590 msg/s, renderer 0.337 core
+  cap=None  slope 7.1 us/msg -> at 943.6 msg/s (16 KiB, field near-field plateau) the per-message term is 0.0067 core of the receiver; cutting 16KiB->64KiB saves 0.40% of receiver CPU
+  cap=8MB   slope 8.7 us/msg -> at 943.6 msg/s (16 KiB, field near-field plateau) the per-message term is 0.0082 core of the receiver; cutting 16KiB->64KiB saves 2.62% of receiver CPU
+  cap=30MB  slope 9.8 us/msg -> at 943.6 msg/s (16 KiB, field near-field plateau) the per-message term is 0.0092 core of the receiver; cutting 16KiB->64KiB saves 0.86% of receiver CPU
+
+=== rtt 71 (all cells collapse; chunk size irrelevant) ===
+  cap=None  16KiB   mbps 8.6 7.9 12.1 | ceil 16 56 35 | chrome_cs/GB 34.7 36.4 29.7 | fwd 87253 89403 86906
+  cap=None  64KiB   mbps 8.2 7.3 7.4 | ceil 42 32 14 | chrome_cs/GB 37.1 38.0 37.0 | fwd 87753 90232 87336
+  cap=None  256KiB  mbps 8.3 7.6 7.6 | ceil 34 50 17 | chrome_cs/GB 35.8 37.1 35.9 | fwd 87572 87916 87392
+  cap=8MB   16KiB   mbps 8.2 8.3 10.3 | ceil 15 55 108 | chrome_cs/GB 36.4 35.9 31.6 | fwd 87152 87638 89880
+  cap=8MB   64KiB   mbps 9.1 7.1 7.8 | ceil 116 25 15 | chrome_cs/GB 33.1 38.0 36.5 | fwd 90544 88438 87264
+  cap=8MB   256KiB  mbps 8.5 8.3 10.5 | ceil 17 80 76 | chrome_cs/GB 33.4 35.8 29.4 | fwd 87148 89829 88962
+  cap=30MB  16KiB   mbps 9.0 8.6 17.9 | ceil 22 19 36 | chrome_cs/GB 32.0 34.1 29.8 | fwd 87010 87185 87180
+  cap=30MB  64KiB   mbps 9.4 9.0 8.9 | ceil 21 15 44 | chrome_cs/GB 30.5 31.6 31.4 | fwd 87104 87141 87617
+  cap=30MB  256KiB  mbps 11.9 18.7 18.1 | ceil 105 248 29 | chrome_cs/GB 28.2 27.0 30.5 | fwd 87947 89466 86536
+
+=== sanity (runbook: rtt 71 raw 32 MiB ~= 100 Mbps) ===
+  e34-sanity-rtt71-32MiB-16KiB-r1      mbps 240.749  ceil 467.4  cores 0.5237
+  e34-sanity-rtt71-32MiB-16KiB-r2      mbps 9.741    ceil 35.7   cores 0.0477
+  e34-sanity-rtt71-32MiB-16KiB-r3      mbps 9.052    ceil 14.7   cores 0.0407
+  e34-sanity-rtt0-32MiB-16KiB-r1       mbps 535.906  ceil 509.6  cores 1.0696
+
+=== in-block 16 KiB baselines (n=3 before + n=3 after each sweep) ===
+  None   pre n=3 0.957 1.261 1.261 | post n=3 1.238 1.185 1.152 | spread 31.8%
+  8MB    pre n=3 0.224 0.216 0.218 | post n=3 0.222 0.211 0.222 | spread 6.1%
+  30MB   pre n=3 0.740 0.753 0.710 | post n=3 0.740 0.741 0.787 | spread 10.7%
+
+=== uncapped rtt-0 ceiling per chunk (best-case plateau, load-robust) ===
+  1KiB    mbps 441 444 443              ceil 486 446 444
+  4KiB    mbps 459 459 467              ceil 464 463 475
+  16KiB   mbps 410 518 527 526 515 501  ceil 455 521 556 525 526 541
+  64KiB   mbps 522 523 526              ceil 522 526 528
+  256KiB  mbps 455 533 533              ceil 533 537 537

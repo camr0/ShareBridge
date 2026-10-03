@@ -1,0 +1,1428 @@
+### SESSION START
+$ uptime
+15:57  up 10 days,  4:15, 22 users, load averages: 7.04 3.94 3.34
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 53.8 /usr/libexec/nehelper
+ 44.7 /usr/libexec/lsd
+ 18.0 pi
+ 16.4 /usr/libexec/nesessionmanager
+ 15.6 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 14.1 /usr/libexec/trustd
+ 13.8 /System/Library/CoreServices/TimeMachine/backupd
+ 11.9 /Applications/cmux.app/Contents/MacOS/cmux
+### e34-sanity-rtt71-32MiB-16KiB-r1 rc=0 wall=2.9s
+$ uptime
+15:57  up 10 days,  4:15, 22 users, load averages: 8.64 4.32 3.48
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 38.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 12.7 pi
+  9.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.5 /System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd
+  6.5 /Applications/cmux.app/Contents/MacOS/cmux
+  4.9 /usr/libexec/dasd
+  4.7 /System/Library/PrivateFrameworks/CoreSuggestions.framework/Versions/A/Support/suggestd
+### e34-sanity-rtt71-32MiB-16KiB-r2 rc=0 wall=29.3s
+$ uptime
+15:57  up 10 days,  4:16, 22 users, load averages: 6.30 4.16 3.45
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 21.6 pi
+ 12.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  7.1 /Applications/cmux.app/Contents/MacOS/cmux
+  7.1 /usr/libexec/dasd
+  6.1 /usr/libexec/UserEventAgent
+### e34-sanity-rtt71-32MiB-16KiB-r3 rc=0 wall=31.3s
+$ uptime
+15:58  up 10 days,  4:16, 22 users, load averages: 4.72 3.99 3.41
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 11.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.9 pi
+  7.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  7.4 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  6.3 /usr/libexec/dasd
+  6.1 /System/Library/CoreServices/launchservicesd
+### e34-sanity-rtt0-32MiB-16KiB-r1 rc=0 wall=1.6s
+$ uptime
+15:58  up 10 days,  4:16, 22 users, load averages: 4.72 3.99 3.41
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 13.5 /Applications/cmux.app/Contents/MacOS/cmux
+ 12.0 pi
+ 11.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.6 /System/Library/CoreServices/TimeMachine/backupd
+  8.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.4 /usr/libexec/signpost_reporter
+  4.6 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### SESSION END
+$ uptime
+15:58  up 10 days,  4:16, 22 users, load averages: 4.72 3.99 3.41
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 13.5 /Applications/cmux.app/Contents/MacOS/cmux
+ 12.0 pi
+ 11.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.6 /System/Library/CoreServices/TimeMachine/backupd
+  8.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.4 /usr/libexec/signpost_reporter
+  4.6 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### SESSION START
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.37 3.94 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 18.2 pi
+ 14.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 14.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 12.2 /Applications/cmux.app/Contents/MacOS/cmux
+  7.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.3 /usr/libexec/dasd
+  5.7 /usr/libexec/UserEventAgent
+  4.8 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-ceil-rtt0-16KiB-r1 rc=0 wall=3.0s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.37 3.94 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 36.7 /usr/libexec/signpost_reporter
+ 16.2 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+ 12.3 pi
+ 11.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 10.5 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 10.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+### e34-ceil-rtt0-64KiB-r1 rc=0 wall=2.2s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.34 3.94 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.1 pi
+  9.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.6 /Applications/cmux.app/Contents/MacOS/cmux
+  7.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.4 /usr/libexec/signpost_reporter
+  7.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  5.5 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  5.1 /usr/libexec/dasd
+### e34-ceil-rtt0-256KiB-r1 rc=0 wall=2.8s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.34 3.94 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+147.9 (compile)
+ 71.8 go
+ 16.2 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+ 13.6 pi
+  8.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.8 /Applications/cmux.app/Contents/MacOS/cmux
+  7.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+### e34-ceil-rtt0-16KiB-r2 rc=0 wall=2.2s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.15 3.91 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 14.8 pi
+ 11.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 10.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.9 /Applications/cmux.app/Contents/MacOS/cmux
+  4.7 /usr/libexec/dasd
+  4.5 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  4.4 /System/Library/CoreServices/launchservicesd
+### e34-ceil-rtt0-64KiB-r2 rc=0 wall=2.1s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.15 3.91 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.9 pi
+  9.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.4 /Applications/cmux.app/Contents/MacOS/cmux
+  5.9 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  5.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  4.1 /usr/sbin/coreaudiod
+### e34-ceil-rtt0-256KiB-r2 rc=0 wall=2.1s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.38 3.96 3.42
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.3 pi
+ 11.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  5.2 /Applications/cmux.app/Contents/MacOS/cmux
+  4.4 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.2 /usr/libexec/dasd
+  4.2 /System/Library/CoreServices/launchservicesd
+### e34-ceil-rtt0-16KiB-r3 rc=0 wall=2.1s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.38 3.96 3.42
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 14.2 /sbin/launchd
+ 14.0 pi
+ 10.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.4 /Applications/cmux.app/Contents/MacOS/cmux
+  5.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.5 /usr/libexec/dasd
+  3.7 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-ceil-rtt0-64KiB-r3 rc=0 wall=2.1s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.59 4.01 3.44
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 14.7 pi
+ 11.5 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  5.3 /usr/libexec/dasd
+  4.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.2 /System/Library/CoreServices/launchservicesd
+### e34-ceil-rtt0-256KiB-r3 rc=0 wall=2.1s
+$ uptime
+15:58  up 10 days,  4:17, 22 users, load averages: 4.59 4.01 3.44
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 20.7 /Applications/cmux.app/Contents/MacOS/cmux
+ 12.0 pi
+ 10.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.5 /System/Library/CoreServices/TimeMachine/backupd
+  7.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.3 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  4.3 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+### e34-ceil-rtt71-16KiB-r1 rc=0 wall=64.1s
+$ uptime
+16:00  up 10 days,  4:18, 22 users, load averages: 5.65 4.36 3.61
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+117.1 go
+ 55.9 /opt/homebrew/Cellar/go/1.26.1/libexec/pkg/tool/darwin_arm64/compile
+  9.3 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  8.0 pi
+  7.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.3 /Applications/cmux.app/Contents/MacOS/cmux
+  3.1 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+### e34-ceil-rtt71-64KiB-r1 rc=0 wall=67.8s
+$ uptime
+16:01  up 10 days,  4:19, 22 users, load averages: 4.22 4.19 3.60
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 22.9 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent
+ 16.5 /Applications/CodexBar.app/Contents/MacOS/CodexBar
+ 13.1 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+ 11.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+ 11.3 /System/Library/CoreServices/launchservicesd
+ 11.2 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 11.1 /usr/libexec/lsd
+  9.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+### e34-ceil-rtt71-256KiB-r1 rc=0 wall=66.9s
+$ uptime
+16:02  up 10 days,  4:20, 22 users, load averages: 3.07 3.84 3.51
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 79.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 31.2 /System/Library/Frameworks/Contacts.framework/Support/contactsd
+ 23.7 /usr/libexec/icloudmailagent
+ 20.3 /System/Applications/Mail.app/Contents/MacOS/Mail
+  9.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.4 /usr/libexec/coreduetd
+  8.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.9 pi
+### e34-ceil-rtt71-16KiB-r2 rc=0 wall=69.9s
+$ uptime
+16:03  up 10 days,  4:21, 22 users, load averages: 3.71 4.02 3.61
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+113.7 pi
+ 11.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 10.4 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  7.3 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  6.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.9 /System/Library/CoreServices/launchservicesd
+  4.8 /usr/libexec/dasd
+  4.2 /usr/libexec/UserEventAgent
+### e34-ceil-rtt71-64KiB-r2 rc=0 wall=75.4s
+$ uptime
+16:04  up 10 days,  4:23, 22 users, load averages: 2.95 3.72 3.53
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  8.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.2 pi
+  7.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  5.9 /Applications/cmux.app/Contents/MacOS/cmux
+  5.3 /usr/libexec/dasd
+  3.9 /usr/libexec/UserEventAgent
+### e34-ceil-rtt71-256KiB-r2 rc=0 wall=72.7s
+$ uptime
+16:05  up 10 days,  4:24, 22 users, load averages: 2.96 3.58 3.49
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 38.8 /Applications/cmux.app/Contents/MacOS/cmux
+ 14.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 11.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.4 /usr/libexec/runningboardd
+ 11.4 pi
+ 10.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  9.7 /System/Library/CoreServices/launchservicesd
+  7.2 /Library/Developer/CoreSimulator/Volumes/iOS_23B86/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.1.simruntime/Contents/Resources/RuntimeRoot/System/Library/PrivateFrameworks/PairedSync.framework/Support/pairedsyncd
+### e34-ceil-rtt71-16KiB-r3 rc=0 wall=46.1s
+$ uptime
+16:06  up 10 days,  4:25, 22 users, load averages: 3.44 3.67 3.53
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 14.4 pi
+ 11.9 /Applications/cmux.app/Contents/MacOS/cmux
+ 11.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 11.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.0 /usr/sbin/coreaudiod
+  6.3 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  6.0 /usr/libexec/dasd
+  5.3 /usr/libexec/UserEventAgent
+### e34-ceil-rtt71-64KiB-r3 rc=0 wall=74.0s
+$ uptime
+16:07  up 10 days,  4:26, 22 users, load averages: 2.52 3.36 3.42
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 30.5 /usr/libexec/signpost_reporter
+ 11.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  9.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.3 /usr/libexec/runningboardd
+  7.8 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  7.8 /usr/libexec/airportd
+  6.2 pi
+### e34-ceil-rtt71-256KiB-r3 rc=0 wall=72.5s
+$ uptime
+16:09  up 10 days,  4:27, 22 users, load averages: 3.27 3.37 3.42
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 11.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.3 /Applications/cmux.app/Contents/MacOS/cmux
+  5.9 /System/Library/CoreServices/launchservicesd
+  5.8 pi
+  5.1 /usr/libexec/UserEventAgent
+  4.8 /usr/libexec/dasd
+  3.4 /usr/libexec/signpost_reporter
+### SESSION END
+$ uptime
+16:09  up 10 days,  4:27, 22 users, load averages: 3.27 3.37 3.42
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 11.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.3 /Applications/cmux.app/Contents/MacOS/cmux
+  5.9 /System/Library/CoreServices/launchservicesd
+  5.8 pi
+  5.1 /usr/libexec/UserEventAgent
+  4.8 /usr/libexec/dasd
+  3.4 /usr/libexec/signpost_reporter
+### SESSION START
+$ uptime
+16:09  up 10 days,  4:27, 22 users, load averages: 3.09 3.33 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 30.9 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 26.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 18.4 pi
+ 10.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 10.2 /Applications/cmux.app/Contents/MacOS/cmux
+  6.6 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  6.2 /usr/libexec/dasd
+  5.7 /usr/libexec/UserEventAgent
+### e34-cap8mb-rtt0-16KiB-r1 rc=0 wall=10.2s
+$ uptime
+16:09  up 10 days,  4:27, 22 users, load averages: 2.92 3.29 3.38
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.1 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  8.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.4 pi
+  6.5 /Applications/cmux.app/Contents/MacOS/cmux
+  6.1 /Applications/Helium.app/Contents/MacOS/Helium
+  5.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.6 /usr/libexec/dasd
+  4.0 /usr/sbin/coreaudiod
+### e34-cap8mb-rtt0-64KiB-r1 rc=0 wall=10.1s
+$ uptime
+16:09  up 10 days,  4:27, 22 users, load averages: 2.55 3.19 3.35
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+  8.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.9 pi
+  7.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.3 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  6.0 /usr/libexec/signpost_reporter
+  5.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  5.5 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  5.5 /Applications/cmux.app/Contents/MacOS/cmux
+### e34-cap8mb-rtt0-256KiB-r1 rc=0 wall=10.1s
+$ uptime
+16:09  up 10 days,  4:28, 22 users, load averages: 2.71 3.21 3.35
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 17.0 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  6.6 pi
+  4.1 /usr/libexec/dasd
+  3.7 /System/Library/CoreServices/launchservicesd
+  3.4 /Applications/Helium.app/Contents/MacOS/Helium
+### e34-cap8mb-rtt0-16KiB-r2 rc=0 wall=10.1s
+$ uptime
+16:09  up 10 days,  4:28, 22 users, load averages: 2.62 3.17 3.34
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 20.7 /Applications/cmux.app/Contents/MacOS/cmux
+  9.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.9 pi
+  7.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.0 /usr/libexec/dasd
+  2.9 /usr/libexec/UserEventAgent
+  1.5 /System/Library/CoreServices/WindowManager.app/Contents/MacOS/WindowManager
+  1.4 /sbin/launchd
+### e34-cap8mb-rtt0-64KiB-r2 rc=0 wall=10.9s
+$ uptime
+16:10  up 10 days,  4:28, 22 users, load averages: 2.68 3.16 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 31.3 pi
+ 14.5 /System/Library/CoreServices/TimeMachine/backupd
+  9.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.5 /usr/libexec/diskimagesiod
+  8.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.5 /System/Library/CoreServices/launchservicesd
+  5.7 /Applications/cmux.app/Contents/MacOS/cmux
+### e34-cap8mb-rtt0-256KiB-r2 rc=0 wall=10.9s
+$ uptime
+16:10  up 10 days,  4:28, 22 users, load averages: 2.94 3.20 3.34
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 11.4 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  9.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.3 pi
+  6.9 /Applications/cmux.app/Contents/MacOS/cmux
+  5.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.1 /usr/libexec/dasd
+### e34-cap8mb-rtt0-16KiB-r3 rc=0 wall=10.1s
+$ uptime
+16:10  up 10 days,  4:28, 22 users, load averages: 2.78 3.16 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+100.4 /System/Library/CoreServices/TimeMachine/backupd
+ 10.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.9 pi
+  5.5 /Applications/cmux.app/Contents/MacOS/cmux
+  3.5 /usr/libexec/dasd
+  3.1 /System/Library/ExtensionKit/Extensions/VPN.appex/Contents/MacOS/VPN
+  3.0 /System/Library/CoreServices/launchservicesd
+### e34-cap8mb-rtt0-64KiB-r3 rc=0 wall=10.1s
+$ uptime
+16:10  up 10 days,  4:29, 22 users, load averages: 2.90 3.17 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 26.6 /System/Library/CoreServices/TimeMachine/backupd
+ 19.6 /Applications/cmux.app/Contents/MacOS/cmux
+ 13.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.0 pi
+  5.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.4 /usr/libexec/dasd
+  4.7 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+### e34-cap8mb-rtt0-256KiB-r3 rc=0 wall=10.2s
+$ uptime
+16:10  up 10 days,  4:29, 22 users, load averages: 3.08 3.20 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 21.7 /Applications/cmux.app/Contents/MacOS/cmux
+ 11.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  9.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.1 pi
+  4.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.6 /usr/libexec/dasd
+  3.4 /System/Library/CoreServices/launchservicesd
+### e34-cap8mb-rtt71-16KiB-r1 rc=0 wall=67.4s
+$ uptime
+16:11  up 10 days,  4:30, 22 users, load averages: 2.66 3.10 3.29
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 60.2 /System/Library/CoreServices/TimeMachine/backupd
+ 26.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 22.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 17.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 10.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.7 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  8.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.9 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-cap8mb-rtt71-64KiB-r1 rc=0 wall=61.0s
+$ uptime
+16:12  up 10 days,  4:31, 22 users, load averages: 2.37 2.94 3.21
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 55.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 28.5 /System/Library/CoreServices/TimeMachine/backupd
+ 25.8 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 19.5 /Applications/cmux.app/Contents/MacOS/cmux
+ 15.1 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 14.7 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 10.8 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+ 10.5 /Applications/Helium.app/Contents/MacOS/Helium
+### e34-cap8mb-rtt71-256KiB-r1 rc=0 wall=65.1s
+$ uptime
+16:14  up 10 days,  4:32, 22 users, load averages: 3.32 3.13 3.27
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 61.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 35.3 /System/Library/CoreServices/TimeMachine/backupd
+ 19.4 /Applications/cmux.app/Contents/MacOS/cmux
+ 17.2 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 16.2 /usr/libexec/sysmond
+ 10.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 10.0 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  8.4 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+### e34-cap8mb-rtt71-16KiB-r2 rc=0 wall=66.9s
+$ uptime
+16:15  up 10 days,  4:33, 22 users, load averages: 3.20 3.17 3.27
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 77.4 /usr/libexec/searchpartyd
+ 35.8 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 20.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 17.8 /Applications/cmux.app/Contents/MacOS/cmux
+ 16.5 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  7.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.9 pi
+  6.4 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+### e34-cap8mb-rtt71-64KiB-r2 rc=0 wall=77.5s
+$ uptime
+16:16  up 10 days,  4:34, 22 users, load averages: 3.36 3.25 3.29
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 69.5 /System/Library/CoreServices/TimeMachine/backupd
+ 25.9 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 12.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.6 /Applications/cmux.app/Contents/MacOS/cmux
+  8.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.3 pi
+  6.0 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+  5.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+### e34-cap8mb-rtt71-256KiB-r2 rc=0 wall=67.2s
+$ uptime
+16:17  up 10 days,  4:35, 22 users, load averages: 3.93 3.39 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 11.7 /System/Library/CoreServices/TimeMachine/backupd
+ 11.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.1 /Library/Developer/CoreSimulator/Volumes/iOS_23B86/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.1.simruntime/Contents/Resources/RuntimeRoot/System/Library/PrivateFrameworks/PairedSync.framework/Support/pairedsyncd
+  9.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.6 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  5.8 pi
+  5.8 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+### e34-cap8mb-rtt71-16KiB-r3 rc=0 wall=53.9s
+$ uptime
+16:18  up 10 days,  4:36, 22 users, load averages: 3.35 3.32 3.31
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 27.9 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  9.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.0 pi
+  6.2 /System/Library/CoreServices/launchservicesd
+  6.0 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  5.1 /usr/libexec/dasd
+### e34-cap8mb-rtt71-64KiB-r3 rc=0 wall=70.8s
+$ uptime
+16:19  up 10 days,  4:38, 22 users, load averages: 2.89 3.15 3.25
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 16.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 14.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 12.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  9.5 /Applications/cmux.app/Contents/MacOS/cmux
+  8.2 /System/Library/CoreServices/launchservicesd
+  7.6 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  7.2 /usr/libexec/dasd
+### e34-cap8mb-rtt71-256KiB-r3 rc=0 wall=53.3s
+$ uptime
+16:20  up 10 days,  4:38, 22 users, load averages: 3.24 3.22 3.26
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 22.1 /System/Library/PrivateFrameworks/PhotoAnalysis.framework/Versions/A/Support/photoanalysisd
+ 13.6 /Applications/cmux.app/Contents/MacOS/cmux
+  8.0 /System/Library/PrivateFrameworks/CalendarDaemon.framework/Support/calaccessd
+  6.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.2 pi
+  5.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.3 /usr/libexec/dasd
+### SESSION END
+$ uptime
+16:20  up 10 days,  4:38, 22 users, load averages: 3.24 3.22 3.26
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 44.8 /System/Library/PrivateFrameworks/PhotoAnalysis.framework/Versions/A/Support/photoanalysisd
+ 14.1 /Applications/cmux.app/Contents/MacOS/cmux
+  6.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.7 /System/Library/PrivateFrameworks/CalendarDaemon.framework/Support/calaccessd
+  6.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.4 pi
+  5.0 /System/Library/PrivateFrameworks/TCC.framework/Support/tccd
+  4.9 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+### SESSION START
+$ uptime
+16:20  up 10 days,  4:39, 22 users, load averages: 3.30 3.23 3.27
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 94.8 /System/Library/PrivateFrameworks/PhotoAnalysis.framework/Versions/A/Support/photoanalysisd
+ 20.8 pi
+ 13.5 /Applications/cmux.app/Contents/MacOS/cmux
+  8.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.3 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  4.0 /usr/libexec/dasd
+### e34-cap30mb-rtt0-16KiB-r1 rc=0 wall=3.4s
+$ uptime
+16:20  up 10 days,  4:39, 22 users, load averages: 3.27 3.23 3.27
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 82.0 /System/Library/PrivateFrameworks/PhotoAnalysis.framework/Versions/A/Support/photoanalysisd
+ 39.0 /System/Library/CoreServices/TimeMachine/backupd
+ 12.4 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  8.4 pi
+  7.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.0 /Applications/cmux.app/Contents/MacOS/cmux
+  3.9 /usr/libexec/dasd
+### e34-cap30mb-rtt0-64KiB-r1 rc=0 wall=3.4s
+$ uptime
+16:20  up 10 days,  4:39, 22 users, load averages: 3.89 3.36 3.31
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+161.3 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+ 89.8 /System/Library/Frameworks/CoreSpotlight.framework/spotlightknowledged
+ 20.5 /System/Library/PrivateFrameworks/PhotoLibraryServices.framework/Versions/A/Support/photolibraryd
+ 10.5 pi
+  9.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.4 /Applications/cmux.app/Contents/MacOS/cmux
+  5.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.5 /usr/libexec/dasd
+### e34-cap30mb-rtt0-256KiB-r1 rc=0 wall=4.3s
+$ uptime
+16:20  up 10 days,  4:39, 22 users, load averages: 4.78 3.55 3.38
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 33.0 /System/Library/PrivateFrameworks/PhotoLibraryServices.framework/Versions/A/Support/photolibraryd
+ 17.4 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/managedcorespotlightd
+  8.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.1 pi
+  7.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.2 /Applications/cmux.app/Contents/MacOS/cmux
+  4.2 /usr/libexec/dasd
+### e34-cap30mb-rtt0-16KiB-r2 rc=0 wall=3.5s
+$ uptime
+16:20  up 10 days,  4:39, 22 users, load averages: 4.78 3.55 3.38
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 66.9 /System/Library/PrivateFrameworks/PhotoAnalysis.framework/Versions/A/Support/photoanalysisd
+ 66.8 /System/Library/CoreServices/TimeMachine/backupd
+ 19.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  9.7 pi
+  8.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.7 /Applications/cmux.app/Contents/MacOS/cmux
+  5.0 /Applications/Discord.app/Contents/Frameworks/Discord Helper (Renderer).app/Contents/MacOS/Discord Helper (Renderer)
+### e34-cap30mb-rtt0-64KiB-r2 rc=0 wall=3.4s
+$ uptime
+16:20  up 10 days,  4:39, 22 users, load averages: 5.04 3.62 3.41
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 32.9 /System/Applications/Photos.app/Contents/MacOS/Photos
+  8.1 pi
+  7.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.6 /Applications/cmux.app/Contents/MacOS/cmux
+  5.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.2 /usr/libexec/dasd
+  2.9 /usr/libexec/UserEventAgent
+### e34-cap30mb-rtt0-256KiB-r2 rc=0 wall=3.4s
+$ uptime
+16:20  up 10 days,  4:39, 22 users, load averages: 4.96 3.63 3.41
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 15.8 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 11.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 11.0 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  9.1 pi
+  7.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.3 /Applications/cmux.app/Contents/MacOS/cmux
+  4.0 /usr/libexec/dasd
+### e34-cap30mb-rtt0-16KiB-r3 rc=0 wall=3.5s
+$ uptime
+16:21  up 10 days,  4:39, 22 users, load averages: 4.72 3.60 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 34.6 /System/Library/PrivateFrameworks/SafariSafeBrowsing.framework/com.apple.Safari.SafeBrowsing.Service
+ 24.6 /System/Library/CoreServices/TimeMachine/backupd
+ 14.5 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 11.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.8 pi
+  6.3 /Applications/cmux.app/Contents/MacOS/cmux
+### e34-cap30mb-rtt0-64KiB-r3 rc=0 wall=3.4s
+$ uptime
+16:21  up 10 days,  4:39, 22 users, load averages: 4.72 3.60 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 15.9 /Applications/cmux.app/Contents/MacOS/cmux
+  8.1 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.9 pi
+  7.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.7 /System/Library/CoreServices/launchservicesd
+  5.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.8 /usr/libexec/dasd
+  4.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+### e34-cap30mb-rtt0-256KiB-r3 rc=0 wall=3.4s
+$ uptime
+16:21  up 10 days,  4:39, 22 users, load averages: 4.82 3.64 3.42
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 16.8 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.1 pi
+  7.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  4.4 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  3.3 /usr/libexec/dasd
+  2.7 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-cap30mb-rtt71-16KiB-r1 rc=0 wall=62.2s
+$ uptime
+16:22  up 10 days,  4:40, 22 users, load averages: 3.42 3.46 3.36
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 24.8 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.8 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  8.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.1 pi
+  4.8 /usr/libexec/dasd
+  4.2 /System/Library/CoreServices/launchservicesd
+### e34-cap30mb-rtt71-64KiB-r1 rc=0 wall=58.9s
+$ uptime
+16:23  up 10 days,  4:41, 22 users, load averages: 2.63 3.26 3.29
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 80.8 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+  9.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.4 /Library/Developer/CoreSimulator/Volumes/iOS_23B86/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.1.simruntime/Contents/Resources/RuntimeRoot/System/Library/PrivateFrameworks/PairedSync.framework/Support/pairedsyncd
+  7.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.3 pi
+  6.9 /Applications/cmux.app/Contents/MacOS/cmux
+  6.3 /System/Library/CoreServices/launchservicesd
+### e34-cap30mb-rtt71-256KiB-r1 rc=0 wall=48.1s
+$ uptime
+16:23  up 10 days,  4:42, 22 users, load averages: 2.96 3.28 3.30
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 26.8 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+  9.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.0 pi
+  8.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.3 /Applications/cmux.app/Contents/MacOS/cmux
+  5.6 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  5.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+### e34-cap30mb-rtt71-16KiB-r2 rc=0 wall=64.0s
+$ uptime
+16:25  up 10 days,  4:43, 22 users, load averages: 3.35 3.29 3.30
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+103.0 /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+ 15.5 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  7.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.0 pi
+  6.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.3 /Applications/cmux.app/Contents/MacOS/cmux
+  5.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.0 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-cap30mb-rtt71-64KiB-r2 rc=0 wall=61.8s
+$ uptime
+16:26  up 10 days,  4:44, 22 users, load averages: 3.76 3.40 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 13.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 12.7 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.0 /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc/Contents/MacOS/remotepairingd
+  7.4 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  7.3 /usr/libexec/dasd
+  7.3 pi
+  7.2 /Applications/cmux.app/Contents/MacOS/cmux
+  6.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+### e34-cap30mb-rtt71-256KiB-r2 rc=0 wall=30.8s
+$ uptime
+16:26  up 10 days,  4:44, 22 users, load averages: 3.94 3.48 3.37
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 24.5 /Applications/cmux.app/Contents/MacOS/cmux
+ 11.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.9 /System/Library/CoreServices/launchservicesd
+  6.8 pi
+  4.0 /usr/libexec/dasd
+  3.8 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-cap30mb-rtt71-16KiB-r3 rc=0 wall=31.8s
+$ uptime
+16:27  up 10 days,  4:45, 22 users, load averages: 3.06 3.32 3.31
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 11.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.8 pi
+  5.0 /Applications/cmux.app/Contents/MacOS/cmux
+  4.4 /usr/libexec/dasd
+  4.2 /usr/sbin/coreaudiod
+  3.2 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-cap30mb-rtt71-64KiB-r3 rc=0 wall=62.0s
+$ uptime
+16:28  up 10 days,  4:46, 22 users, load averages: 2.39 3.09 3.22
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 27.3 /usr/libexec/airportd
+ 14.7 /System/Library/CoreServices/WiFiAgent.app/Contents/MacOS/WiFiAgent
+ 11.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 11.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.9 /Applications/cmux.app/Contents/MacOS/cmux
+  6.9 pi
+  6.7 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+### e34-cap30mb-rtt71-256KiB-r3 rc=0 wall=31.8s
+$ uptime
+16:28  up 10 days,  4:47, 22 users, load averages: 3.29 3.21 3.26
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 28.1 /Applications/cmux.app/Contents/MacOS/cmux
+ 11.4 /Library/Developer/CoreSimulator/Volumes/iOS_23B86/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.1.simruntime/Contents/Resources/RuntimeRoot/System/Library/Frameworks/ManagedAppDistribution.framework/Support/managedappdistributiond
+ 11.0 /usr/libexec/proactiveeventtrackerd
+ 10.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.2 pi
+  8.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+### SESSION END
+$ uptime
+16:28  up 10 days,  4:47, 22 users, load averages: 3.29 3.21 3.26
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 28.1 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.2 pi
+  8.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.9 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+  5.6 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  5.4 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+### SESSION START
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 3.08 3.17 3.24
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 20.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 19.3 pi
+ 10.9 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.1 /usr/libexec/dasd
+  5.7 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  4.5 /usr/libexec/signpost_reporter
+### e34-small-ceil-1KiB-r1 rc=0 wall=2.4s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 3.08 3.17 3.24
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 15.2 pi
+ 11.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.0 /Applications/cmux.app/Contents/MacOS/cmux
+  8.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  5.3 /usr/libexec/dasd
+  4.9 /System/Library/CoreServices/launchservicesd
+  3.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+### e34-small-ceil-4KiB-r1 rc=0 wall=2.3s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 3.23 3.20 3.25
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 15.7 xpcproxy_sim
+ 14.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 12.0 pi
+ 10.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 10.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.7 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  6.0 /Applications/cmux.app/Contents/MacOS/cmux
+  5.7 /System/Library/CoreServices/launchservicesd
+### e34-small-ceil-16KiB-r1 rc=0 wall=2.2s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 3.23 3.20 3.25
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 16.1 pi
+ 12.3 /usr/libexec/signpost_reporter
+ 10.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.8 /Applications/cmux.app/Contents/MacOS/cmux
+  8.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.6 /usr/libexec/dasd
+  4.9 /usr/libexec/lsd
+### e34-small-ceil-1KiB-r2 rc=0 wall=2.3s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 3.93 3.35 3.30
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 20.4 /Applications/cmux.app/Contents/MacOS/cmux
+ 14.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 13.8 /usr/libexec/signpost_reporter
+ 11.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+ 11.2 pi
+  9.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.0 /System/Library/CoreServices/TimeMachine/backupd
+  5.2 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+### e34-small-ceil-4KiB-r2 rc=0 wall=2.3s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 3.93 3.35 3.30
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 61.5 /System/Library/CoreServices/TimeMachine/backupd
+ 28.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 17.8 /Applications/cmux.app/Contents/MacOS/cmux
+ 13.5 pi
+ 12.0 /usr/libexec/runningboardd
+ 11.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.9 /usr/sbin/notifyd
+### e34-small-ceil-16KiB-r2 rc=0 wall=2.2s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 4.26 3.42 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 45.8 /Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/152.0.7977.64/Helpers/Helium Helper (Renderer).app/Contents/MacOS/Helium Helper (Renderer)
+ 20.7 /Applications/cmux.app/Contents/MacOS/cmux
+ 11.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.8 pi
+  6.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.7 /Applications/Helium.app/Contents/MacOS/Helium
+  4.1 /usr/libexec/dasd
+### e34-small-ceil-1KiB-r3 rc=0 wall=2.3s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 4.26 3.42 3.33
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 13.0 pi
+ 10.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.3 /Applications/cmux.app/Contents/MacOS/cmux
+  6.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.2 /usr/libexec/dasd
+  5.9 /System/Library/CoreServices/TimeMachine/backupd
+  5.3 /usr/libexec/signpost_reporter
+  4.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+### e34-small-ceil-4KiB-r3 rc=0 wall=2.3s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 4.96 3.58 3.39
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.3 pi
+ 11.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.8 /Applications/cmux.app/Contents/MacOS/cmux
+  7.4 /usr/libexec/signpost_reporter
+  5.8 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+  4.2 /usr/libexec/dasd
+### e34-small-ceil-16KiB-r3 rc=0 wall=2.3s
+$ uptime
+16:29  up 10 days,  4:47, 22 users, load averages: 4.96 3.58 3.39
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 12.0 pi
+ 10.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.2 /Applications/cmux.app/Contents/MacOS/cmux
+  6.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.6 /System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+  3.9 /usr/libexec/dasd
+  3.1 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-small-cap30mb-1KiB-r1 rc=0 wall=3.4s
+$ uptime
+16:29  up 10 days,  4:48, 22 users, load averages: 4.96 3.61 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 10.9 pi
+ 10.2 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  9.6 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.5 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  8.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.2 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  7.6 /Applications/cmux.app/Contents/MacOS/cmux
+  4.9 /usr/libexec/dasd
+### e34-small-cap30mb-4KiB-r1 rc=0 wall=3.5s
+$ uptime
+16:29  up 10 days,  4:48, 22 users, load averages: 4.96 3.61 3.40
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 11.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  9.8 pi
+  9.3 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.2 /Applications/Helium.app/Contents/MacOS/Helium
+  5.9 /Applications/cmux.app/Contents/MacOS/cmux
+  5.1 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  4.2 /usr/libexec/dasd
+### e34-small-cap30mb-16KiB-r1 rc=0 wall=3.4s
+$ uptime
+16:29  up 10 days,  4:48, 22 users, load averages: 5.04 3.65 3.41
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+  8.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.0 pi
+  8.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.8 /System/Library/CoreServices/launchservicesd
+  5.8 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  5.7 /Applications/cmux.app/Contents/MacOS/cmux
+  5.1 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  4.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+### e34-small-cap30mb-1KiB-r2 rc=0 wall=3.4s
+$ uptime
+16:29  up 10 days,  4:48, 22 users, load averages: 5.28 3.72 3.44
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 71.7 /System/Library/CoreServices/TimeMachine/backupd
+ 25.7 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 10.3 pi
+  8.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.3 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.5 /Applications/cmux.app/Contents/MacOS/cmux
+  5.8 /System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+  5.6 /usr/sbin/notifyd
+### e34-small-cap30mb-4KiB-r2 rc=0 wall=3.5s
+$ uptime
+16:29  up 10 days,  4:48, 22 users, load averages: 5.26 3.74 3.45
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 13.7 /Applications/cmux.app/Contents/MacOS/cmux
+ 11.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  9.5 pi
+  8.9 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.3 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  3.9 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  3.6 /usr/libexec/dasd
+### e34-small-cap30mb-16KiB-r2 rc=0 wall=3.4s
+$ uptime
+16:29  up 10 days,  4:48, 22 users, load averages: 5.26 3.74 3.45
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 16.9 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared
+ 13.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.2 pi
+  7.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.6 /Applications/cmux.app/Contents/MacOS/cmux
+  6.5 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+  6.0 /System/Library/CoreServices/launchservicesd
+  5.5 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+### e34-small-cap30mb-1KiB-r3 rc=0 wall=3.5s
+$ uptime
+16:30  up 10 days,  4:48, 22 users, load averages: 5.56 3.83 3.48
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 20.2 /usr/libexec/searchpartyd
+ 12.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 11.3 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+ 10.9 pi
+ 10.0 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+  8.1 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.8 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.9 /Applications/cmux.app/Contents/MacOS/cmux
+### e34-small-cap30mb-4KiB-r3 rc=0 wall=3.4s
+$ uptime
+16:30  up 10 days,  4:48, 22 users, load averages: 5.67 3.88 3.50
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 15.8 /Applications/cmux.app/Contents/MacOS/cmux
+  9.9 pi
+  9.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.9 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  3.8 /usr/libexec/dasd
+  3.0 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  2.6 /usr/libexec/UserEventAgent
+### e34-small-cap30mb-16KiB-r3 rc=0 wall=3.4s
+$ uptime
+16:30  up 10 days,  4:48, 22 users, load averages: 5.67 3.88 3.50
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 18.0 /Applications/cmux.app/Contents/MacOS/cmux
+ 13.2 /Library/Developer/CoreSimulator/Volumes/iOS_23B86/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.1.simruntime/Contents/Resources/RuntimeRoot/System/Library/PrivateFrameworks/HealthPluginHost.framework/healthappd
+ 10.0 pi
+  8.2 /Applications/Telegram.app/Contents/MacOS/Telegram
+  6.5 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.1 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.7 /usr/libexec/signpost_reporter
+  4.5 /Library/Developer/CoreSimulator/Volumes/iOS_23B86/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.1.simruntime/Contents/Resources/RuntimeRoot/usr/libexec/diagnosticd
+### e34-small-cap8mb-1KiB-r1 rc=0 wall=10.2s
+$ uptime
+16:30  up 10 days,  4:48, 22 users, load averages: 5.26 3.85 3.49
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 38.1 /Applications/cmux.app/Contents/MacOS/cmux
+ 15.2 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ 11.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+ 10.9 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  9.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.3 pi
+  7.8 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  4.6 /usr/libexec/dasd
+### e34-small-cap8mb-4KiB-r1 rc=0 wall=10.2s
+$ uptime
+16:30  up 10 days,  4:48, 22 users, load averages: 5.13 3.87 3.50
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 83.9 /usr/libexec/signpost_reporter
+ 22.4 /Applications/cmux.app/Contents/MacOS/cmux
+  9.6 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  9.5 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.3 pi
+  6.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  4.8 /usr/libexec/dasd
+  3.5 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+### e34-small-cap8mb-16KiB-r1 rc=0 wall=10.1s
+$ uptime
+16:30  up 10 days,  4:49, 22 users, load averages: 4.57 3.79 3.48
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 97.2 /usr/libexec/signpost_reporter
+ 11.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.7 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.4 pi
+  5.6 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  5.5 /Applications/cmux.app/Contents/MacOS/cmux
+  5.2 /usr/libexec/dasd
+### e34-small-cap8mb-1KiB-r2 rc=0 wall=10.2s
+$ uptime
+16:30  up 10 days,  4:49, 22 users, load averages: 4.06 3.72 3.46
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 96.1 /usr/libexec/signpost_reporter
+ 14.4 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+ 10.0 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd
+  9.8 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.2 pi
+  5.7 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN
+  5.6 /System/Library/CoreServices/launchservicesd
+### e34-small-cap8mb-4KiB-r2 rc=0 wall=10.2s
+$ uptime
+16:30  up 10 days,  4:49, 22 users, load averages: 4.29 3.78 3.48
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 96.9 /usr/libexec/signpost_reporter
+ 10.0 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.5 pi
+  7.0 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  6.4 /Applications/cmux.app/Contents/MacOS/cmux
+  5.6 /System/Library/CoreServices/launchservicesd
+  4.6 /usr/libexec/dasd
+### e34-small-cap8mb-16KiB-r2 rc=0 wall=10.7s
+$ uptime
+16:31  up 10 days,  4:49, 22 users, load averages: 4.33 3.80 3.50
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 93.0 /usr/libexec/signpost_reporter
+ 61.0 /System/Library/PrivateFrameworks/CoreSuggestions.framework/Versions/A/Support/suggestd
+ 17.6 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.5 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  6.7 pi
+  6.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  5.2 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+### e34-small-cap8mb-1KiB-r3 rc=0 wall=10.2s
+$ uptime
+16:31  up 10 days,  4:49, 22 users, load averages: 4.12 3.77 3.49
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 91.6 /usr/libexec/signpost_reporter
+ 60.1 /System/Library/CoreServices/TimeMachine/backupd
+ 23.5 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+ 21.8 /Applications/cmux.app/Contents/MacOS/cmux
+  8.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  8.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  7.0 pi
+  5.4 /usr/sbin/notifyd
+### e34-small-cap8mb-4KiB-r3 rc=0 wall=10.2s
+$ uptime
+16:31  up 10 days,  4:49, 22 users, load averages: 3.71 3.70 3.47
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 27.2 /Applications/cmux.app/Contents/MacOS/cmux
+ 10.9 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  9.4 /Applications/Telegram.app/Contents/MacOS/Telegram
+  9.3 pi
+  6.1 /System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+  5.1 /usr/libexec/dasd
+  4.6 /System/Library/PrivateFrameworks/CoreAnalytics.framework/Support/analyticsd
+  4.2 /usr/libexec/signpost_reporter
+### e34-small-cap8mb-16KiB-r3 rc=0 wall=10.1s
+$ uptime
+16:31  up 10 days,  4:50, 22 users, load averages: 3.92 3.74 3.48
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 65.5 /usr/libexec/signpost_reporter
+ 10.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  7.0 pi
+  6.4 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.9 /Applications/cmux.app/Contents/MacOS/cmux
+  4.6 /usr/libexec/dasd
+  3.5 /usr/libexec/UserEventAgent
+### SESSION END
+$ uptime
+16:31  up 10 days,  4:50, 22 users, load averages: 3.92 3.74 3.48
+$ sysctl vm.swapusage
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)
+$ ps -Ao %cpu,comm -r | head -8
+ %CPU COMM
+ 65.5 /usr/libexec/signpost_reporter
+ 10.6 /Applications/Telegram.app/Contents/MacOS/Telegram
+  8.3 /Applications/Tailscale.app/Contents/PlugIns/IPNExtension.appex/Contents/MacOS/IPNExtension
+  8.2 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  7.3 /System/Library/CoreServices/launchservicesd
+  7.0 pi
+  6.8 /System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow
+  5.6 /Applications/cmux.app/Contents/MacOS/cmux
+--- final snapshot ---
+16:33  up 10 days,  4:51, 22 users, load averages: 2.02 3.18 3.30
+vm.swapusage: total = 8192.00M  used = 6719.06M  free = 1472.94M  (encrypted)

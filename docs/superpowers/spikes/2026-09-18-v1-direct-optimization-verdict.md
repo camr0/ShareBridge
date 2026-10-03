@@ -22,6 +22,47 @@
 > ~3 % over the same span (228.6 → 221.0), so **at ~70 ms the relay is ~3× faster than direct**. Any statement in
 > this document of the form "v1 direct does ~120–150 Mbps" is **a ~12 ms figure** and must not be read as typical —
 > realistic mobile/distant latency halves it.
+>
+> **THIRD REVISION — 2026-10-02 (E38): the browser is a real cost at high RTT, but it is NOT *the* ceiling, and
+> the near-field plateau is not browser-specific.** A native **Go/pion receiver** was finally run on the real field
+> path (E2, `results/2026-10-02-exp38-native-receiver-field.md`):
+> - At **~70.75 ms** it does **106.4 Mbps** (100.1 / 107.6 / 111.6, n=3) against the browser's **64.54** — so the
+>   browser's high-RTT receive path costs a real **~45 %**, and the competing "the pion *sender* is the cap"
+>   hypothesis is **refuted**. That much of the verdict holds.
+> - **But the absolute claim — "the v1-direct ceiling *is* the browser's DataChannel receive path" — is wrong.**
+>   At **~10.94 ms** a properly-buffered native receiver lands on **138.98 Mbps**, statistically identical to the
+>   browser's **139.0** (n=2). **At low RTT the browser is not a cap at all.** The ~120–139 Mbps near-field
+>   plateau this document attributes to a "serialized browser receive path" is therefore **shared**, not
+>   browser-specific — and what caps it is still open (E39 is testing whether it is a receive-side buffer/RTO
+>   artifact: the same native receiver *bursts* to **233–237 Mbps** in a sawtooth while averaging 105.8).
+> - **Two levers this document never considered, both found by E38:** (i) **pion's default 1 MiB SCTP advertised
+>   receive window** (`initialRecvBufSize`, pion/sctp v1.9.4 `association.go:74`) hard-caps a stock pion receiver
+>   at `rwnd/RTT` = 1 MiB / 70.75 ms = **118.5 predicted vs 114.95 measured (97 %)**; lifted to 4 MiB the sender
+>   ramps to **232 Mbps = 94 % of the 245 Mbps path capacity**, then collapses cyclically (net 84.9). (ii) The
+>   **client's OS UDP receive buffer** (`net.core.rmem_default` = **208 KiB**) causes SCTP loss and 1–3 s RTO
+>   stalls on low-RTT bursts; at 4 MiB the native receiver goes 105.8 → **138.98**. Chrome sets its own socket
+>   buffers, so (ii) is a native-receiver concern — but it means **stock native-receiver numbers are a floor**.
+> - **Corrected ordering at 70 ms:** path capacity **245** > pion sender + 4 MiB window, peak **232** (unstable,
+>   net 85) > stock pion receiver **115 ≈ rwnd/RTT** > deployed browser **64.5**.
+>
+> Net effect: the *direction* of the campaign's conclusion (the browser's receive path is expensive at high RTT)
+> survives; its *absolute form* does not. Do not quote "the ceiling is the browser" without this revision.
+>
+> **FOURTH REVISION — 2026-10-02 (E39): the near-field plateau is a RECEIVE-SIDE ARTIFACT; the browser is a ~25 %
+> cost, not the ceiling.** E39 swept pion's advertised SCTP receive window (`--max-rx-buf`) on the native receiver
+> at ~10.94 ms with the path controlled **in-session**: TCP 1-flow **244.80** / 4-flow **244.80** / UDP **247.34**
+> Mbps — so the path is ~245, **not** 139. Sustained native throughput by window: **1 MiB → 128.3 (n=5), 8 MiB →
+> 155.4 (n=5), 16 MiB → 176.5 (n=6), 32 MiB → 177.0 (saturated)**; peaks 231–237 at 1 MiB rising to 234–292 at
+> 16 MiB. The lever is **pion's advertised window, not the OS `rmem`** (16 MiB window: 176.2 at 4 MiB rmem ≈
+> 176.6 at 16 MiB). The browser in the same session did **132.0 / 133.1 (mean 132.5)** — the native receiver is
+> **+33 %** above it.
+> **Corrected near-field ordering: path capacity 245 > residual buffer-insensitive sender-side cap ~176 > browser
+> 132.5–139 > default native receiver 128.** Consequences: (i) this document's "~120–139 Mbps serialized browser
+> ceiling" was **partly an artifact of an untuned receiver** and must not be quoted as the browser's limit;
+> (ii) the browser remains a real **~25 %** cost at 11 ms (132.5 vs 176 achievable); (iii) there is a **residual
+> ~176 Mbps cap that receive buffers do not move** — buffer-insensitive, therefore **sender-side**, and now the
+> most interesting unexplained limit in the near field. It sits awkwardly against E21's "sender exonerated"
+> (0.65 core at the plateau) and E22's loopback figure, and needs its own experiment.
 
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes
