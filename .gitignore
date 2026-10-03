@@ -24,3 +24,6 @@ agent/agent
 agent/benchdirect
 agent/forks/sctp/
 agent/forks/sctp-pristine/
+
+# Stray local build artifact (E37 built it here instead of bin/)
+agent/fieldrecv

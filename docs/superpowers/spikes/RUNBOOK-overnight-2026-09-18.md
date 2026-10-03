@@ -32,7 +32,13 @@ then the ones that need a small harness change. Order of dispatch is easiest-win
 5. **No IPs, hostnames, credentials, API keys, share codes or `jti`s in any committed file.** The real
    hosts live in `.worktrees/e2e-v1/INFRA.local.md` (gitignored) — read it, but write `VERSA`,
    `TESTBOX`, `CLIENT-EAST`, `CLIENT-WEST` into results files.
-6. **Never shelve, stop, delete or resize any instance.** The operator does infra teardown.
+6. **Shelve at the END of the campaign — automatically, never between runs.** Unshelving the rig to start and
+   **shelving all three instances when the last run finishes** is expected and required (they bill hourly, ~$1.35/h
+   for the three). The original absolute ban existed only to stop agents thrashing start/stop *between* cells —
+   do not do that, but **do not leave instances running when you are done either**. When finished:
+   `ovhcloud cloud instance shelve <id>` ×3 (ids in `.worktrees/e2e-v1/INFRA.local.md`), then confirm all three
+   read `SHELVED_OFFLOADED`. Still never `delete` or `resize`, and still never stop an instance mid-campaign.
+   *(Clarified by the operator 2026-10-02 after an agent left all three running for hours.)*
 7. **One writer per file.** Never edit a file another agent is writing. **Do NOT run any `git` command**
    (`git add` / `git commit` / `git checkout` / history ops) — several agents share this worktree and the
    index; the orchestrator commits results files serially. Just write your file and report it.
