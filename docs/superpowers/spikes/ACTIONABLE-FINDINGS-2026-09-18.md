@@ -20,21 +20,27 @@ check deployment env explicitly (see F1 for the worked example).
 ## F1 — **(b)** CA-step tuning is committed, tested, and **NOT enabled in production**. Measured upside ~1.89×.
 The highest value/effort item in this document; it needs no new engineering.
 
-> ### ⚠️ SUPERSEDED IN PART — 2026-10-13 (exp40). **The tune is RTT-dependent and it HURTS at low RTT.**
-> `SB_SCTP_CA_STEP=32768` was re-measured on the field rig in a **same-binary, same-session, 100 s-apart A/B
-> with exactly one env var changed**: **177.592 → 223.633 Mbps (+26 %) when the knob was REMOVED**
-> (CLIENT-EAST, ~12.6 ms). With the knob: 163.2–177.6 (n=4, never above 177.6). Without: 184.3–223.6 (n=6,
-> never below 184.3). The knob balloons cwnd to 2.04 MB and srtt to 60 ms → standing-queue overflow →
-> **67 retransmits / 9 RTOs vs 4 / 0** in 676k packets. Trace:
-> `docs/superpowers/spikes/results/2026-10-13-exp40-sender-side-176-cap.md`.
-> This is consistent with `main`'s own `80a1daf3` ("CA-step **+36 %** clean, **3.4×** under loss" at ~71 ms):
-> **the step helps when the path is bandwidth/loss-limited and hurts when it is not.** At 245 Mbps / 12.6 ms,
-> a 32 KiB per-RTT step overshoots straight into the standing queue.
-> **Therefore the "Action" at the bottom of this entry is WRONG as written — do NOT enable it
-> unconditionally in production.** The correct action is an RTT/bandwidth-conditional policy, or leave it
-> unset (production's current state, which is the *good* configuration at low RTT). The consequence recorded
-> below also cuts both ways: every absolute number in this directory was measured knob-ON, so those figures
-> **understate low-RTT performance by up to ~26 %**.
+> ### ⚠️ CONTESTED — 2026-10-13 (exp40, then exp43). **The knob's sign is path-condition-dependent, and for the real browser client it HELPS at both RTTs.**
+> Two same-day field sessions disagree, and both are careful:
+> - **exp40** (native receiver; same binary, same session, 100 s apart; one env var): **177.592 → 223.633 Mbps
+>   (+26 %) when the knob was REMOVED** at ~12.6 ms, on a *clean* path (24 TCP retransmits per 10 s control).
+>   Mechanism: the knob inflates cwnd to 2.04 MB and srtt to 60 ms → standing-queue overflow → 67 retransmits /
+>   9 RTOs vs 4 / 0 in 676k packets.
+> - **exp43** (the **real browser client**; 20 cells, 4 arms plus an interleaved ON/OFF control): the knob
+>   **helps at BOTH RTTs** — **+23.0 % at ~12 ms** (117.8 vs 95.8, arms non-overlapping, re-confirmed at
+>   +18.3 % by a two-minute interleaved ON/OFF pair) and **4.43× at ~70 ms** (59.3 vs 13.4, non-overlapping).
+>   Its native-receiver arm *reversed* exp40's direction (ON 183.3 > OFF 156.1), and its path was 5–6× lossier
+>   (125–147 retransmits per control) at a capacity swinging 210 ↔ 244 Mbps.
+> **Reconciliation:** a large CA step is the wrong medicine on a clean, shallow-buffered path (exp40's
+> mechanism) and the right one on a lossy or ramp-limited path. A browser sink is additionally *drain*-limited,
+> so at 70 ms it cannot be refilled by a 1-MTU-per-RTT ramp at all — a ~525 KB BDP takes ~30 s to refill and
+> every loss resets it (the knob-off 70 ms arm oscillated 4.7–24.2 Mbps for 533 s and averaged 11.9).
+> **So the "Action" below STANDS, with a caveat: enable it** — it is worth ~1.2× at 12 ms and ~4.4× at 70 ms to
+> a browser client — but expect the gain to be path-dependent and re-measure after deployment.
+> **And the consequence recorded below is worse than it reads:** production ships with **no `SB_SCTP_*` at all**,
+> so the *shipped* browser-direct figures are **~95.8 Mbps at 12 ms and ~13.4 Mbps at 70 ms** — not the
+> 132–139 / 64.5 this directory has been quoting. Enabling the knob is the largest confirmed direct-path win
+> available, and at 70 ms it is a ~4.4× one. See `results/2026-10-13-exp43-knob-2x2-baseline.md`.
 
 - **The knob:** `SB_SCTP_CA_STEP=32768` → `se.SetSCTPCwndCAStep(v)`.
 - **In main (branch `main`, worktree `.worktrees/e2e-v1`):** `agent/internal/peer/peer.go:125-127`, with the

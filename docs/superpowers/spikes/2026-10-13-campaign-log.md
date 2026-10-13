@@ -97,13 +97,45 @@ locally (8 checks, exit 0). N5 client wiring also landed: `channelSet.js` accept
 maps them to LANE_BULK, `binaryEnvelope.js` decodes v2, `app.js` routes through `bulkReorder.js`. Client tests
 **305 pass / 0 fail** (31 new). Nothing deployed; N5 proven only on synthetic frames.
 
-## exp43 — the knob 2×2 re-baseline ⏳ (running)
+## exp43 — the knob 2×2 re-baseline ✅ **and it overturns exp40's production implication**
 
-`results/2026-10-13-exp43-knob-2x2-baseline.md`. Because every campaign number was measured knob-ON, and
-because the knob is RTT-conditional, this re-measures the **real browser client** in the production
-configuration: `{knob off, knob on} × {~12.6 ms EAST, ~70.75 ms WEST}`, n=3, plus native `fieldrecv` references
-and (budget permitting) a knob sweep {unset, 8192, 16384, 32768} at 11 ms. This is the number that decides what
-the browser actually achieves.
+`results/2026-10-13-exp43-knob-2x2-baseline.md`. **20 field cells, all valid, zero relay fallbacks.**
+`{knob off, knob on} × {~12.0 ms EAST, ~70.0 ms WEST}` on the **real browser client**, n=3 per arm, plus an
+interleaved ON/OFF control and a native-receiver arm.
+
+| arm | RTT | knob | n | mean Mbps | range |
+|---|---|---|---|---|---|
+| A | 12.013 ms | **unset** (= production) | 3 | **95.757** | 93.9–98.0 |
+| B | 12.013 ms | 32768 | 3 | **117.799** | 107.9–132.9 |
+| C | 69.954 ms | **unset** (= production) | 3 | **13.405** | 11.9–15.2 |
+| D | 69.954 ms | 32768 | 3 | **59.326** | 55.7–63.5 |
+
+- **The knob HELPS the browser at both RTTs: +23.0 % at ~12 ms** (non-overlapping; A's best 97.95 < B's worst
+  107.91; re-confirmed **+18.3 %** by a two-minute interleaved ON/OFF pair) **and 4.43× at ~70 ms**
+  (non-overlapping by 4×).
+- **B1 = 132.886 reproduces October's 132.0/133.1 almost exactly**, so the historical numbers are sound — they
+  were simply all knob-ON.
+- **The alarming number: production runs pion defaults, so the *shipped* browser-direct figures are ~95.8 Mbps
+  at 12 ms and ~13.4 Mbps at 70 ms** — at 70 ms that is **~1/5 of the 64.54 this campaign has been quoting**.
+  The knob-off 70 ms arm never escaped the regime: NIC-counter trace oscillating 4.7–24.2 Mbps for 533 s.
+- **Mechanism / reconciliation with exp40:** the sender is cwnd-limited 100 % of the time and
+  `rate = cwnd / (base RTT + queueing)`. At 1 MTU/RTT the ramp is ~85 KB/s at 12 ms but **~17 KB/s at 70 ms**,
+  so a ~525 KB BDP takes ~30 s to refill and every loss resets it. A browser sink is *drain*-limited and cannot
+  be refilled by that. On a **clean** path a big step instead overshoots the shallow buffer (exp40's
+  mechanism). **So the sign is set by path loss, not by RTT alone.**
+- **It is not a clean refutation of exp40:** arm E *reversed* exp40's native-receiver direction (ON 183.3 >
+  OFF 156.1, ranges slightly overlapping), and today's path was **5–6× lossier** (125–147 TCP retransmits per
+  10 s control vs exp40's 24) at a capacity swinging 210 ↔ 244 Mbps. exp40's cleanest single-variable pair
+  (177.592 ON vs 223.633 OFF) was **not** reproduced.
+- **Doc corrections:** the F1 banner written earlier today ("do NOT enable it in production") is **wrong and has
+  been rewritten** — the action *stands* (enable it; ~1.2× at 12 ms, ~4.4× at 70 ms to a browser), with a
+  path-dependence caveat. Verdict doc gained a **SIXTH REVISION**.
+- **Method note M1:** the launch-ssh hang (backgrounded `nohup` + a second command in one ssh call) cost ~55 min
+  and zero cells. Fixed with `KEEPALIVE_MS` set explicitly plus a bounded local launch
+  (`ssh … & SSHPID=$!; (sleep 20; kill $SSHPID) & wait`); verified the `setsid`-detached driver survives the
+  channel cut. A2's window was recovered from the agent log rather than discarded.
+- **Not run:** the optional native knob sweep {unset, 8192, 16384, 32768} — arm C's four knob-off 70 ms transfers
+  took 7–9 min each and consumed the budget. No monotone curve yet.
 
 ## exp36 (E36, previous pass) — closed
 

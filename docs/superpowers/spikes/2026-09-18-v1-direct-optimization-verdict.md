@@ -80,6 +80,21 @@
 > ~12.6 ms) together make the CA step **RTT-conditional** — do not enable it unconditionally (see the F1
 > banner); (iii) **every absolute number in this document was measured knob-ON**, so the low-RTT figures
 > understate performance by up to ~26 % and need a re-baseline.
+>
+> **SIXTH REVISION — 2026-10-13 (exp43): the fifth revision's production implication was WRONG.** The fifth
+> revision read exp40 as "drop the knob". exp43 then measured the **real browser client** across 20 cells and
+> found the knob **helps at both RTTs** — **+23.0 % at ~12 ms** (117.8 vs 95.8, non-overlapping, re-confirmed
+> +18.3 % by an interleaved ON/OFF pair) and **4.43× at ~70 ms** (59.3 vs 13.4, non-overlapping). Its
+> native-receiver arm *reversed* exp40's direction (ON 183.3 > OFF 156.1), and its path was 5–6× lossier
+> (125–147 TCP retransmits per control vs exp40's 24) at a capacity swinging 210 ↔ 244 Mbps.
+> **Reconciliation:** a large CA step hurts a clean shallow-buffered path and helps a lossy or ramp-limited one;
+> a browser sink is also *drain*-limited, so at 70 ms it cannot be refilled by a 1-MTU-per-RTT ramp at all.
+> The knob's **sign is path-condition-dependent**; its *magnitude* at 70 ms is not in doubt.
+> **The production consequence is larger than the fifth revision said.** Production sets no `SB_SCTP_*` at all,
+> so the **shipped** browser-direct performance is **~95.8 Mbps at ~12 ms and ~13.4 Mbps at ~70 ms** — not the
+> 132–139 / 64.5 this document has quoted throughout. Enabling the knob is the largest confirmed direct-path
+> win available and at 70 ms it is a ~4.4× one. It should still be re-measured post-deployment rather than
+> treated as a constant. See `results/2026-10-13-exp43-knob-2x2-baseline.md`.
 
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes
