@@ -122,6 +122,28 @@
 > still-unlanded **E29 client fix** (−48 % client CPU, 3.23× user-visible, 4.36× on relay) the highest-value
 > item in the whole programme — ahead of any transport knob. See
 > `results/2026-10-13-exp45-client-scaling-and-firefox.md`.
+>
+> **EIGHTH REVISION — 2026-10-13 (exp46): the attribution must be SPLIT BY RTT — airtight at 12 ms, collapsed
+> at 70 ms.** The campaign's claim ("the ceiling is the browser's WebRTC DataChannel receive path") had never
+> been tested against the same browser doing a **native HTTPS download** of the same bytes on the same path in
+> the same hour. exp46 did exactly that, 13 transfer cells:
+> - **At ~12.1 ms the attribution is AIRTIGHT.** Browser native HTTPS = **231.57 Mbps** = **97.5 %** of a
+>   non-browser `curl` on the identical conduit (237.5) and **95.0 %** of the direct `iperf3` path control
+>   (243.7) — while the same browser's DataChannel in the production configuration does **97.69–103.99**
+>   (**117.80** with the knob). **A 2.23–2.37× gap that neither the conduit, the tunnel, the path, nor
+>   Chromium's download machinery can explain.** The ceiling is inside the WebRTC/SCTP/DTLS DataChannel +
+>   app-sink path — and per exp45 its binding constraint there is the **client's receive-pipeline CPU**.
+> - **At ~70.0 ms the attribution does NOT survive in its strong form.** The *direct path itself* carried only
+>   **72.8–120.3 Mbps** of single-flow TCP this session (it moved **1.65×** within the session), and a tunnelled
+>   HTTPS stream over that path delivered **67.2–75.8** — while the browser's DataChannel with the knob ON
+>   delivered **62.3–66.8**. The DataChannel is **at the level of an ordinary TCP stream** on the same path; it
+>   is not the demonstrated ceiling. The alarming 70 ms production figure (13.8–35.4, one hard stall) is a
+>   **sender-side cwnd** phenomenon, exactly as exp43 argued.
+> **Consequence: this document's headline is a ~12 ms result.** At 70 ms the limit is the path/transport and the
+> fix is the CA step (sixth revision), not the receive path. Caveats: the 70 ms arm was served through a
+> **reverse SSH tunnel** (VERSA has no reachable inbound TCP — residential NAT + IPv6 firewall), so TCP-over-TCP
+> confounds it; and the 111–163 Mbps native-TCP band the brief assumed for 70 ms did not hold today
+> (72.8–120.3). See `results/2026-10-13-exp46-native-https-reference.md`.
 
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes

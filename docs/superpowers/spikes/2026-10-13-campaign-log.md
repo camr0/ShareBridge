@@ -178,6 +178,37 @@ fixed in the repo** (`shell_quote()` + the `${ARR[@]+"${ARR[@]}"}` guard for bas
 `chmod 777` on the backup dir); the selftest passes and the fileset now arrives as **one argv element**
 (verified).
 
+## exp46 — N3 native-HTTPS reference ✅ **the attribution splits by RTT**
+
+`results/2026-10-13-exp46-native-https-reference.md`. 13 transfer cells (5 native HTTPS, 6 DataChannel, 2
+non-browser conduit controls) + 3 direct `iperf3` path controls.
+
+| RTT | browser **native HTTPS** | DataChannel knob OFF (prod) | knob ON | native ÷ DC-OFF |
+|---|---|---|---|---|
+| **~12.1 ms** | **231.57 / 231.57** | **97.69 / 103.99** | 117.80 | **2.23–2.37×** |
+| **~70.0 ms** | 222.79 / 230.54 / 232.66 (tunnel) · 52.33 / 37.80 (direct) | 13.78 (incomplete) / 35.42 | 66.82 / 62.32 | see below |
+
+- **At 12 ms the attribution is AIRTIGHT.** Native = **97.5 %** of a non-browser `curl` on the identical conduit
+  (237.5) and **95.0 %** of the direct `iperf3` control (243.7), while the DataChannel does 97.7–104.0.
+  **Neither the conduit, the tunnel, the path, nor Chromium's download machinery can explain 2.3×.** The ceiling
+  is inside the WebRTC/SCTP/DTLS DataChannel + app-sink path — confirmed by direct measurement rather than
+  inference, for the first time.
+- **At 70 ms the strong form does NOT survive.** The direct path itself carried only **72.8–120.3 Mbps** TCP
+  (it moved **1.65× within the session**), a tunnelled HTTPS stream gave **67.2–75.8**, and the knob-ON
+  DataChannel gave **62.3–66.8** — i.e. the DataChannel is **at the level of an ordinary TCP stream**, not the
+  demonstrated ceiling. The alarming production 70 ms number is a **sender-side cwnd** effect (as exp43 argued).
+- **The brief's 70 ms premise was wrong today**: it assumed a 111–163 Mbps native-TCP band; the path gave
+  72.8–120.3.
+- **Blocker, reported not hidden:** VERSA has **no reachable inbound TCP** (residential NAT + IPv6 firewall), so
+  a direct HTTPS server on VERSA is impossible. The payload was served through a **reverse SSH tunnel**, which
+  makes the 70 ms direct arm **TCP-over-TCP** and is why two native-HTTPS numbers (222.79/230.54/232.66) sit far
+  above the path's own TCP capacity. Tunnels, servers and the ufw rule were removed and both `authorized_keys`
+  restored.
+- **Self-reported error:** a dotted-vs-dashed hostname mistake led it to read a "signalling outage" that was not
+  there, and it restarted Caddy on TESTBOX unnecessarily (no effect). Reported as an error.
+- **E1 not run** — it needs the v2 relay stack, which collides with the v1 rig on ports 443/8080, and the brief
+  forbade a rig swap. exp46's native-HTTPS number is largely the v2-direct proxy anyway.
+
 ## exp36 (E36, previous pass) — closed
 
 The Firefox agent was not hung on Playwright: its retry log is timestamped `02:08–02:12Z` **after** the
