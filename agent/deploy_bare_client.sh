@@ -68,10 +68,23 @@ require_host() {
     SB_TESTBOX_HOST=ubuntu@<TESTBOX-IP> '"$0"' '"${1:-deploy}"' '"${2:-}"''
 }
 
+# bash 3.2 (macOS) + `set -u` errors on an empty `"${ARR[@]}"`, so every use site below uses the
+# `${ARR[@]+"${ARR[@]}"}` guard form.
+
+# Quotes one argument so it survives the remote login shell as a SINGLE argv element.
+# Needed because `ssh host cmd "$@"` joins argv with spaces, so a newline-joined fileset
+# (the `bare` set is 3 lines) is re-split into three commands by the remote shell. EXP45 hit
+# exactly that: "bash: line 2: src/bareReceive.js: No such file or directory", exit 127 —
+# and it passed `SB_LOCAL_SIM=1`, which is why the defect shipped.
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
 # Runs a shell script (on stdin) with positional args, on TESTBOX or locally.
 remote_script() {
   if [ "$SIM" = "1" ]; then bash -s -- "$@"
-  else ssh "${SSH_OPTS[@]}" "$SB_TESTBOX_HOST" bash -s -- "$@"
+  else
+    local cmd="bash -s --" a
+    for a in "$@"; do cmd="$cmd $(shell_quote "$a")"; done
+    ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$SB_TESTBOX_HOST" "$cmd"
   fi
 }
 
@@ -79,7 +92,7 @@ remote_script() {
 remote_copy() {
   local dest="$1"; shift
   if [ "$SIM" = "1" ]; then mkdir -p "$dest" && cp "$@" "$dest/"
-  else scp "${SSH_OPTS[@]}" -q "$@" "$SB_TESTBOX_HOST:$dest/"
+  else scp ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -q "$@" "$SB_TESTBOX_HOST:$dest/"
   fi
 }
 
@@ -137,6 +150,9 @@ set -euo pipefail
 WEB="$1"; BACKUP_ROOT="$2"; SESSION="$3"; FILES="$4"; SUDO="$5"
 dir="$BACKUP_ROOT/$SESSION"
 $SUDO mkdir -p "$dir/src"
+# The local side `scp`s manifest.before into $dir as the unprivileged ssh user, so it must be
+# writable by that user. EXP45 hit "scp: dest open .../manifest.before: Permission denied" here.
+$SUDO chmod 777 "$dir"
 printf '%s\n' "$FILES" > /tmp/sb-bare-fileset.$$
 $SUDO cp /tmp/sb-bare-fileset.$$ "$dir/fileset"
 rm -f /tmp/sb-bare-fileset.$$

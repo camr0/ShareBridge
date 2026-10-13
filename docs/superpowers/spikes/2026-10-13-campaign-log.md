@@ -137,6 +137,47 @@ interleaved ON/OFF control and a native-receiver arm.
 - **Not run:** the optional native knob sweep {unset, 8192, 16384, 32768} — arm C's four knob-off 70 ms transfers
   took 7–9 min each and consumed the budget. No monotone curve yet.
 
+## exp45 — C1 client scaling + C2 Firefox ✅ **THE VERDICT REOPENS**
+
+`results/2026-10-13-exp45-client-scaling-and-firefox.md`. 18 completed transfer cells + 4 Firefox relay
+aborts. Zero relay fallbacks on Chromium (0/16).
+
+**C1 — the client CPU IS the cap. "A bigger client VM won't help" is FALSIFIED.**
+
+| arm | client / RTT | knob | n | mean Mbps | exp43 4-vCPU | ratio |
+|---|---|---|---|---|---|---|
+| C1-a | CLIENT-8 8 vCPU, 13.5 ms | 32768 | 3 | **179.554** | 117.799 | **1.52×** |
+| C1-b | CLIENT-8 8 vCPU, 13.5 ms | unset (prod) | 3 | **148.283** | 95.757 | **1.55×** |
+| C1-c | CLIENT-8 8 vCPU, 72 ms | 32768 | 2 | **96.712** | 59.326 | **1.63×** |
+| C1-d | CLIENT-8 8 vCPU, 72 ms | unset (prod) | 2 | **40.070** | 13.405 | **2.99×** |
+| A2 ctrl | CLIENT-8 **pinned to 4 vCPU** | 32768 | 2 | **121.680** | 117.799 | **1.03×** |
+| A3 ctrl | CLIENT-EAST real 4 vCPU | 32768 | 2 | 110.291 | 117.799 | 0.94× |
+
+- **The pin control is decisive:** same host, same path, same container, only the CPU budget changed →
+  **179.554 → 121.680 (1.48×)**, landing **+3.3 %** on exp43's real 4-vCPU number — *despite* that host's TCP
+  path carrying **1.56×** CLIENT-EAST's capacity. So the 4-vCPU ceiling is **not** host/NIC/path.
+- **Not raw CPU exhaustion:** the 8-vCPU client uses 3.2–4.0 of 8 cores, the pinned one 2.62 of 4 — yet
+  halving the budget halves throughput. It is **serialization/queueing** in the receive pipeline.
+  **E28's "serialized receive path" framing survives; what dies is "4 vCPU is enough".**
+- **Production is the most CPU-limited arm in the matrix** (knob-OFF 72 ms scales **2.99×** vs 1.63× for
+  knob-ON). exp43's "production does ~13 Mbps at 70 ms" is partly a *client-hardware* effect — but still 2.4×
+  worse than knob-ON.
+- The knob's **12 ms** benefit is not a client artefact (+21.1 % on 8 vCPU vs +23.0 % on 4 vCPU); at 70 ms it
+  falls from 4.43× to 2.41× only because the bigger client rescues the knob-OFF arm more.
+
+**C2 — Firefox is drivable but unreliable, and much slower.** E36's "Firefox writes no download artifact" is
+circumvented by the recovered bare counter (byte-exact 754 MiB), but **4 of 6 attempts fell back to relay**.
+Like-for-like bare, same client, same hour: **Firefox = 0.525× Chromium** (112.077 vs 213.469 Mbps) — a
+first-order receive-path variable that every Chromium-only conclusion (E25/E27/E28) never controlled for.
+
+**Two blocking defects found in exp44's deploy script** (3 failed deploys before `DEPLOY-OK`): (i)
+`remote_script` passed a newline-joined 3-file fileset through `ssh … bash -s -- "$@"`, which the remote login
+shell re-split into three commands (exit 127); (ii) the root-owned backup dir then rejected the unprivileged
+`scp` of `manifest.before`. Both passed `SB_LOCAL_SIM=1`, which is exactly why they shipped. **Both are now
+fixed in the repo** (`shell_quote()` + the `${ARR[@]+"${ARR[@]}"}` guard for bash 3.2 `set -u`, and a
+`chmod 777` on the backup dir); the selftest passes and the fileset now arrives as **one argv element**
+(verified).
+
 ## exp36 (E36, previous pass) — closed
 
 The Firefox agent was not hung on Playwright: its retry log is timestamped `02:08–02:12Z` **after** the

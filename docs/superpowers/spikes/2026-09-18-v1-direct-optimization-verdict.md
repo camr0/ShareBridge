@@ -95,6 +95,33 @@
 > 132–139 / 64.5 this document has quoted throughout. Enabling the knob is the largest confirmed direct-path
 > win available and at 70 ms it is a ~4.4× one. It should still be re-measured post-deployment rather than
 > treated as a constant. See `results/2026-10-13-exp43-knob-2x2-baseline.md`.
+>
+> **SEVENTH REVISION — 2026-10-13 (exp45): the client CPU *is* the cap. "A bigger client VM won't help" is
+> FALSIFIED, and the verdict reopens.**
+> The last unverified assumption behind this document was that 4 vCPU is enough for the browser receive path.
+> exp45 measured an **8-vCPU** client and ran a **same-host, same-path, same-container `taskset -c 0-3` pin
+> control**:
+> - 8 vCPU vs exp43's 4 vCPU: **1.52× / 1.55× / 1.63× / 2.99×** (12 ms knob-ON / 12 ms knob-OFF / 72 ms
+>   knob-ON / 72 ms knob-OFF).
+> - The pin control is decisive: **179.554 → 121.680 Mbps (1.48×)** on one machine with only the CPU budget
+>   changed, landing **+3.3 %** on exp43's real 4-vCPU number (117.799) — even though that host's TCP path
+>   carried **1.56×** CLIENT-EAST's capacity. The 4-vCPU ceiling is therefore not the host, NIC or path.
+> - **Not raw CPU exhaustion:** the 8-vCPU client uses 3.2–4.0 of 8 cores and the pinned one 2.62 of 4, yet
+>   halving the budget halves throughput. It is **serialization/queueing** in the receive pipeline
+>   (network-service SCTP/DTLS → renderer `onmessage` → sink). **E28's "serialized receive path" framing
+>   survives; what dies is the inference that 4 vCPU is out of its way.**
+> - **Production is the most CPU-limited arm in the matrix:** the knob-OFF 72 ms arm scales **2.99×**
+>   (13.405 → 40.070) versus 1.63× for knob-ON. So the sixth revision's "production does ~13 Mbps at 70 ms"
+>   is partly a *client-hardware* effect — but it is still 2.4× worse than knob-ON.
+> - The knob's 12 ms benefit is **not** a client artefact (+21.1 % on 8 vCPU vs +23.0 % on 4 vCPU); its 70 ms
+>   benefit shrinks relatively (4.43× → 2.41×) only because the bigger client rescues the knob-OFF arm more.
+> - **C2:** with the app pipeline removed entirely, **Firefox (Gecko) delivers 0.525× Chromium (Blink)**
+>   bare-vs-bare, same client, same hour (112.077 vs 213.469 Mbps) — a first-order receive-path variable that
+>   every E25/E27/E28 conclusion (all Chromium-only) never controlled for.
+> **Consequence: the binding constraint on v1 direct is the client's receive-pipeline CPU**, which makes the
+> still-unlanded **E29 client fix** (−48 % client CPU, 3.23× user-visible, 4.36× on relay) the highest-value
+> item in the whole programme — ahead of any transport knob. See
+> `results/2026-10-13-exp45-client-scaling-and-firefox.md`.
 
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes
