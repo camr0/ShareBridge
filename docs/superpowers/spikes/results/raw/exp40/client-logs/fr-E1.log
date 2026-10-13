@@ -1,0 +1,46 @@
+fieldrecv: DIAGNOSTIC max_rx_buf=16777216 (pion default would be 1048576)
+fieldrecv: ice_config received (1 servers, relay_only=false), sending knock
+fieldrecv: nonce received (has_password=false), sending join
+fieldrecv: peer connection state=connecting
+fieldrecv: offer answered
+fieldrecv: peer connection state=connected
+fieldrecv: transport_ready; requesting file
+fieldrecv: file_list selected "debian-13.4.0-amd64-netinst.iso" (790626304 bytes)
+fieldrecv: file_header name="debian-13.4.0-amd64-netinst.iso" size=790626304 operation_id=1
+PROGRESS t=1.0 payload_bytes=358674 wire_bytes=359066 frames=28 bad=0 mbps_inst=2.869
+PROGRESS t=2.0 payload_bytes=424210 wire_bytes=424658 frames=32 bad=0 mbps_inst=0.524
+PROGRESS t=3.0 payload_bytes=39825426 wire_bytes=39859558 frames=2438 bad=0 mbps_inst=315.210
+PROGRESS t=4.0 payload_bytes=59863058 wire_bytes=59914312 frames=3661 bad=0 mbps_inst=160.301
+PROGRESS t=5.0 payload_bytes=79900690 wire_bytes=79969066 frames=4884 bad=0 mbps_inst=160.301
+PROGRESS t=6.0 payload_bytes=106459154 wire_bytes=106550224 frames=6505 bad=0 mbps_inst=212.468
+PROGRESS t=7.0 payload_bytes=135753746 wire_bytes=135869848 frames=8293 bad=0 mbps_inst=234.357
+PROGRESS t=8.0 payload_bytes=150499346 wire_bytes=150628048 frames=9193 bad=0 mbps_inst=117.965
+PROGRESS t=9.0 payload_bytes=151138322 wire_bytes=151267570 frames=9232 bad=0 mbps_inst=5.112
+PROGRESS t=10.0 payload_bytes=180989970 wire_bytes=181144726 frames=11054 bad=0 mbps_inst=238.813
+PROGRESS t=11.0 payload_bytes=210284562 wire_bytes=210464350 frames=12842 bad=0 mbps_inst=234.357
+PROGRESS t=12.0 payload_bytes=230912018 wire_bytes=231109432 frames=14101 bad=0 mbps_inst=165.020
+PROGRESS t=13.0 payload_bytes=248868882 wire_bytes=249081640 frames=15197 bad=0 mbps_inst=143.655
+PROGRESS t=14.0 payload_bytes=278376466 wire_bytes=278614438 frames=16998 bad=0 mbps_inst=236.061
+PROGRESS t=15.0 payload_bytes=307654674 wire_bytes=307917664 frames=18785 bad=0 mbps_inst=234.226
+PROGRESS t=16.0 payload_bytes=317878290 wire_bytes=318150016 frames=19409 bad=0 mbps_inst=81.789
+PROGRESS t=17.0 payload_bytes=341930002 wire_bytes=342222280 frames=20877 bad=0 mbps_inst=192.414
+PROGRESS t=18.0 payload_bytes=371339282 wire_bytes=371656690 frames=22672 bad=0 mbps_inst=235.274
+PROGRESS t=19.0 payload_bytes=386953234 wire_bytes=387283984 frames=23625 bad=0 mbps_inst=124.912
+PROGRESS t=20.0 payload_bytes=409841682 wire_bytes=410191990 frames=25022 bad=0 mbps_inst=183.108
+PROGRESS t=21.0 payload_bytes=439480338 wire_bytes=439855972 frames=26831 bad=0 mbps_inst=237.109
+PROGRESS t=22.0 payload_bytes=468054034 wire_bytes=468454084 frames=28575 bad=0 mbps_inst=228.590
+PROGRESS t=23.0 payload_bytes=497627154 wire_bytes=498052474 frames=30380 bad=0 mbps_inst=236.585
+PROGRESS t=24.0 payload_bytes=526921746 wire_bytes=527372098 frames=32168 bad=0 mbps_inst=234.357
+PROGRESS t=25.0 payload_bytes=542142482 wire_bytes=542605840 frames=33097 bad=0 mbps_inst=121.766
+PROGRESS t=26.0 payload_bytes=543256594 wire_bytes=543720904 frames=33165 bad=0 mbps_inst=8.913
+PROGRESS t=27.0 payload_bytes=573141010 wire_bytes=573630856 frames=34989 bad=0 mbps_inst=239.075
+PROGRESS t=28.0 payload_bytes=602583058 wire_bytes=603098062 frames=36786 bad=0 mbps_inst=235.536
+PROGRESS t=29.0 payload_bytes=631877650 wire_bytes=632417686 frames=38574 bad=0 mbps_inst=234.357
+PROGRESS t=30.0 payload_bytes=642101266 wire_bytes=642650038 frames=39198 bad=0 mbps_inst=81.789
+PROGRESS t=31.0 payload_bytes=650096658 wire_bytes=650652262 frames=39686 bad=0 mbps_inst=63.963
+PROGRESS t=32.0 payload_bytes=682864658 wire_bytes=683448262 frames=41686 bad=0 mbps_inst=262.144
+PROGRESS t=33.0 payload_bytes=712159250 wire_bytes=712767886 frames=43474 bad=0 mbps_inst=234.357
+PROGRESS t=34.0 payload_bytes=722808850 wire_bytes=723426586 frames=44124 bad=0 mbps_inst=85.197
+PROGRESS t=35.0 payload_bytes=746319890 wire_bytes=746957716 frames=45559 bad=0 mbps_inst=188.088
+PROGRESS t=36.0 payload_bytes=775614482 wire_bytes=776277340 frames=47347 bad=0 mbps_inst=234.357
+SUMMARY payload_bytes=790626304 wire_bytes=791302000 frames=48264 bad_frames=0 header_bytes=790626304 wall_s=35.615 mbps=177.592 status=complete selected="local=host remote=prflx"
