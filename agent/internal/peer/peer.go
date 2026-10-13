@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/pion/webrtc/v4"
+	"sharebridge/agent/internal/bulkfan"
 	"sharebridge/agent/internal/multilane"
 )
 
@@ -21,6 +22,12 @@ var requiredLanes = []struct {
 type Peer struct {
 	pc        *webrtc.PeerConnection
 	endpoints map[multilane.Lane]*directEndpoint
+
+	// extraBulk holds the additional ordered bulk DataChannels created by the
+	// N5 lever (SB_BULK_LANES). Empty in the default configuration.
+	extraBulk       []*directEndpoint
+	extraBulkLabels []string
+	extraBulkOpen   int
 
 	mu                  sync.Mutex
 	opened              map[multilane.Lane]bool
@@ -93,6 +100,25 @@ func (p *Peer) CreateOffer() (string, error) {
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) { endpoint.deliver(msg.Data) })
 	}
 
+	// N5 (SB_BULK_LANES, candidate 2026-10-02 N5): extra ordered bulk streams on
+	// the same association. SCTP head-of-line blocking is per-stream, so a loss
+	// stall is confined to 1/K of the flow. Off by default.
+	for i := 1; i < bulkfan.FromOSEnv().Lanes; i++ {
+		label := fmt.Sprintf("bulk-%d", i)
+		dc, err := p.pc.CreateDataChannel(label, nil)
+		if err != nil {
+			_ = p.Close()
+			return "", fmt.Errorf("create %s data channel: %w", label, err)
+		}
+		adapter := &pionDataChannel{dc: dc}
+		endpoint := &directEndpoint{lane: multilane.LaneBulk, dc: adapter}
+		p.extraBulk = append(p.extraBulk, endpoint)
+		p.extraBulkLabels = append(p.extraBulkLabels, label)
+		dc.OnOpen(p.bulkLaneOpened)
+		dc.OnClose(func() { p.laneClosed(multilane.LaneBulk) })
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) { endpoint.deliver(msg.Data) })
+	}
+
 	offer, err := p.pc.CreateOffer(nil)
 	if err != nil {
 		return "", fmt.Errorf("create offer: %w", err)
@@ -110,13 +136,43 @@ func (p *Peer) laneOpened(lane multilane.Lane) {
 		return
 	}
 	p.opened[lane] = true
-	if len(p.opened) != len(requiredLanes) || p.handshakeArmed {
+	if !p.readyForHandshakeLocked() {
 		p.mu.Unlock()
 		return
 	}
 	p.handshakeArmed = true
 	p.mu.Unlock()
 
+	p.installHandshake()
+}
+
+// bulkLaneOpened records an N5 extra bulk lane. Readiness still requires every
+// required lane and the version hello, so a peer with extra lanes is not
+// announced as ready before its striping targets exist.
+func (p *Peer) bulkLaneOpened() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.extraBulkOpen++
+	if !p.readyForHandshakeLocked() {
+		p.mu.Unlock()
+		return
+	}
+	p.handshakeArmed = true
+	p.mu.Unlock()
+
+	p.installHandshake()
+}
+
+func (p *Peer) readyForHandshakeLocked() bool {
+	return len(p.opened) == len(requiredLanes) &&
+		p.extraBulkOpen == len(p.extraBulk) &&
+		!p.handshakeArmed
+}
+
+func (p *Peer) installHandshake() {
 	multilane.InstallHandshakeResponder(p, func() {
 		p.mu.Lock()
 		if p.closed {
@@ -185,6 +241,25 @@ func (p *Peer) Endpoint(lane multilane.Lane) multilane.Endpoint {
 	return p.endpoints[lane]
 }
 
+// BulkEndpoints returns the ordered bulk lanes to stripe across. It returns nil
+// unless the N5 lever created extra lanes, so the transfer manager takes its
+// untouched single-lane path in the default configuration.
+func (p *Peer) BulkEndpoints() []multilane.Endpoint {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.extraBulk) == 0 {
+		return nil
+	}
+	out := make([]multilane.Endpoint, 0, 1+len(p.extraBulk))
+	if primary := p.endpoints[multilane.LaneBulk]; primary != nil {
+		out = append(out, primary)
+	}
+	for _, endpoint := range p.extraBulk {
+		out = append(out, endpoint)
+	}
+	return out
+}
+
 func (p *Peer) SetOnOpen(handler func()) {
 	p.mu.Lock()
 	p.onOpen = handler
@@ -251,13 +326,13 @@ func (p *Peer) Close() error {
 
 // LaneLabelsForTest reports the stable offer creation order.
 func (p *Peer) LaneLabelsForTest() []string {
-	labels := make([]string, 0, len(requiredLanes))
+	labels := make([]string, 0, len(requiredLanes)+len(p.extraBulkLabels))
 	for _, required := range requiredLanes {
 		if _, ok := p.endpoints[required.lane]; ok {
 			labels = append(labels, required.label)
 		}
 	}
-	return labels
+	return append(labels, p.extraBulkLabels...)
 }
 
 type dataChannel interface {

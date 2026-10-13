@@ -25,6 +25,11 @@ then the ones that need a small harness change. Order of dispatch is easiest-win
    `VERSA:/home/ali/sharebridge-test/env-run`. Port 7879 is the *test slot*; the v2 test agent
    `sharebridge-agent-test` also uses 7879 and is **mutually exclusive** with `sb-run` — leave it
    stopped. **If an experiment seems to need port 7878 or the production container, STOP.**
+   ⚠️ **2026-10-13 (exp40): `SB_SCTP_CA_STEP=32768` is the rig's default but it is NOT the production
+   config and NOT the best low-RTT config.** Removing it took the same binary, same session, 100 s apart
+   from **177.592 → 223.633 Mbps (+26 %)** at ~12.6 ms, while `main`'s `80a1daf3` shows it *gains* +36 % at
+   ~71 ms. The step is **RTT-conditional**. Production `sharebridge-agent` sets no `SB_SCTP_*` at all (pion
+   defaults). **Always state which arm you ran** — an unlabelled number is ambiguous by up to 26 %.
 3. **Never touch the v2 relay stack** (on TESTBOX or `VERSA`) or the v2 test agent. It is
    intentionally stopped for the duration of the v1 work.
 4. **Never deploy to production**, never touch DNS/ACME/namespaces, never create or modify anything
@@ -61,6 +66,15 @@ then the ones that need a small harness change. Order of dispatch is easiest-win
    died on provider rate limits mid-run; one had taken 135 tool calls' worth of measurements and lost
    all of it because the results file was never written. Append each cell (raw numbers + timestamps)
    to your results file as soon as you have it. A crash must cost at most one cell.
+14. **LIVENESS — never wedge silently.** Two agents have now gone silent mid-task and burned hours
+   (E36 on 2026-10-02; exp40 on 2026-10-13) with **no child process alive and no output** — the harness
+   still reported them as "running". Every ssh gets `-o ConnectTimeout=10`; anything that could hang
+   gets a remote `timeout 120` (GNU `timeout` is on the Linux hosts, **not** on this Mac). Never put a
+   backgrounded `nohup` job and a `tail` in the same ssh command. **If a command has not returned in
+   ~3 minutes, abandon it** and take a different approach. If you cannot make progress, **write the
+   results file with what you have and report** — partial results are valuable, a silent hang is not.
+   An orchestrator watching a field agent should treat "no output + no child processes" as wedged and
+   restart it rather than wait.
 10. **If the rig is unhealthy** (agent 7879 down, signalling not HTTP 200, a client VM unreachable):
     STOP and report. Do not improvise infrastructure changes.
 

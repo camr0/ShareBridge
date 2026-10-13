@@ -150,6 +150,21 @@ no builder stage, so the image cannot be rebuilt from different source than the 
 **Not verified: the `docker build` itself.** The Docker daemon is not running on the lab Mac, so the context
 was not built into an image; the Dockerfile is a byte-equivalent of the known-good runtime stage.
 
+> ### ⚠️ CORRECTED 2026-10-13 (exp40) — the image was never built, and the "differ only by one `os.Getenv`"
+> ### claim below is **FALSE** and silently confounded exp40's first instrumented arm.
+> 1. **No such image exists.** Confirmed on the rig: `docker images` on VERSA lists only `sb-agent:pristine`
+>    and `sb-agent:phase4a-test` — there is **no `sb-agent:instrumented`**. Only the *build context* at
+>    `/home/ali/sharebridge-test/img-instrumented/` was staged. exp40 worked around it by bind-mounting the
+>    staged binary read-only over `/app/agent` in a container run from `sb-agent:pristine`.
+> 2. **`grep -c SB_SCTP agent/internal/peer/peer.go` in the `benchdirect` worktree returns `0`** — that tree
+>    has *no* `SB_SCTP_*` lookup at all. `benchdirect` is **34 commits behind `main`**, which carries the
+>    tuning commit (`a4015bba`). So an instrumented binary built from `benchdirect` **cannot read
+>    `SB_SCTP_CA_STEP`** and always runs pion's defaults, while the control arm ran with
+>    `SB_SCTP_CA_STEP=32768`. That is exactly the ~19 % arm separation exp40 first saw — and it became
+>    exp40's headline result once chased down.
+> **Before trusting any instrumented-vs-control comparison, run `grep -ao "SB_SCTP_[A-Z_]*" <binary>` on
+> both.**
+
 Why `benchdirect` is the right build tree: `diff -rq` shows `benchdirect/agent` and `e2e-v1/agent` differ only
 in the `cmd/benchdirect` harness, `internal/peer/peer.go`'s opt-in `SB_SCTP_*` tuning (which returns pion's
 default API when no `SB_SCTP_*` variable is set, per its own `apiForPeers` contract), and that file's test.

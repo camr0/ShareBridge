@@ -15,8 +15,20 @@ const LANE_BY_LABEL = Object.freeze({
   bulk: LANE_BULK,
 })
 
+// N5 extra bulk lanes (`bulk-1`, `bulk-2`, …) all carry the bulk traffic class.
+const EXTRA_BULK_LABEL = /^bulk-([1-9][0-9]*)$/
+
+function isExtraBulkLabel(label) {
+  return typeof label === 'string' && EXTRA_BULK_LABEL.test(label)
+}
+
+function laneForLabel(label) {
+  if (LANE_BY_LABEL[label] !== undefined) return LANE_BY_LABEL[label]
+  return isExtraBulkLabel(label) ? LANE_BULK : undefined
+}
+
 export class DirectChannel {
-  constructor(rtcDataChannel, lane = LANE_BY_LABEL[rtcDataChannel?.label]) {
+  constructor(rtcDataChannel, lane = laneForLabel(rtcDataChannel?.label)) {
     this._dc = rtcDataChannel
     this.lane = lane
     this.onopen = null
@@ -65,6 +77,12 @@ class DirectChannelSet {
   constructor(options) {
     this._set = createChannelSet(options)
     this._openNotified = false
+    this._extraBulkLanes = []
+    this._extraBulkHandler = null
+    this._set.onbulklane = (channel, label) => {
+      this._extraBulkLanes.push({ channel, label })
+      if (this._extraBulkHandler) channel.onmessage = this._extraBulkHandler
+    }
     this.ready = this._set.ready.then(() => {
       this._fireOpen()
       return this
@@ -78,17 +96,39 @@ class DirectChannelSet {
       throw error
     }
     const label = rtcDataChannel?.label
-    const channel = new DirectChannel(rtcDataChannel, LANE_BY_LABEL[label])
+    const channel = new DirectChannel(rtcDataChannel, laneForLabel(label))
     this._set.attach(label, channel)
     return channel
   }
 
+  /**
+   * Installs `handler` as the `onmessage` of every N5 extra bulk lane, current
+   * and future — including one that opens after the channel set is already
+   * ready, which is the race this hook exists to close. The primary `bulk` lane
+   * is never touched, so a peer that offers no extra lanes is wired exactly as
+   * before. Returns an unsubscribe function.
+   */
+  subscribeExtraBulkLane(handler) {
+    if (typeof handler !== 'function') throw new TypeError('handler must be a function')
+    this._extraBulkHandler = handler
+    for (const { channel } of this._extraBulkLanes) channel.onmessage = handler
+    return () => {
+      if (this._extraBulkHandler === handler) this._extraBulkHandler = null
+      for (const { channel } of this._extraBulkLanes) {
+        if (channel.onmessage === handler) channel.onmessage = null
+      }
+    }
+  }
+
+  get extraBulkLanes() { return this._extraBulkLanes.map(({ channel }) => channel) }
+
   get control() { return this._set.control }
   get media() { return this._set.media }
   get bulk() { return this._set.bulk }
+  get bulkLanes() { return this._set.bulkLanes }
   get readyState() { return this._set.readyState }
   get bufferedAmount() {
-    return [this.control, this.media, this.bulk]
+    return [this.control, this.media, ...this.bulkLanes]
       .reduce((total, endpoint) => total + (endpoint?.bufferedAmount ?? 0), 0)
   }
 

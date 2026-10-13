@@ -63,6 +63,23 @@
 > ~176 Mbps cap that receive buffers do not move** — buffer-insensitive, therefore **sender-side**, and now the
 > most interesting unexplained limit in the near field. It sits awkwardly against E21's "sender exonerated"
 > (0.65 core at the plateau) and E22's loopback figure, and needs its own experiment.
+>
+> **FIFTH REVISION — 2026-10-13 (exp40): the ~176 "cap" is not a cap, and it is the rig's own tuning.**
+> An instrumented native receiver on the ~12.6 ms path shows the "plateau" is a **cwnd sawtooth**: a hard
+> **234.357 Mbps** instantaneous ceiling (repeated exactly — 1788 × 16 KiB/s = **96 % of the 245 Mbps path**)
+> interrupted by one-sample cliffs with linear 1 MTU/RTT recovery. **Every campaign number (139, 176, 177,
+> 232) is a window average over that duty cycle.** `cwndFill` = 0.998 (**cwnd-limited 100 %** of samples);
+> `pendingBytes` sits at 4.7 of 5 MiB and never drains; `peerRwnd` binds in ≤5/144 samples; CPU ≈0.80 core;
+> in-session path control 244.5 TCP / 246.9 UDP.
+> **The specific ~176 is produced by the rig's own `SB_SCTP_CA_STEP=32768`:** same binary, same session, 100 s
+> apart, one env var changed → **177.592 → 223.633 Mbps (+26 %) when the knob was REMOVED** (knob-on n=4,
+> never above 177.6; knob-off n=6, never below 184.3). The knob inflates cwnd to 2.04 MB and srtt to 60 ms,
+> overflowing a standing queue: **67 retransmits / 9 RTOs vs 4 / 0** in 676k packets.
+> **Consequences:** (i) the ~176 sender-side cap is **not a property of the transport**, so A1/N5 (window
+> multiplication) lose their premise; (ii) `main`'s `80a1daf3` (+36 % at ~71 ms) and this result (−26 % at
+> ~12.6 ms) together make the CA step **RTT-conditional** — do not enable it unconditionally (see the F1
+> banner); (iii) **every absolute number in this document was measured knob-ON**, so the low-RTT figures
+> understate performance by up to ~26 % and need a re-baseline.
 
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes

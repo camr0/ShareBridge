@@ -20,6 +20,22 @@ check deployment env explicitly (see F1 for the worked example).
 ## F1 — **(b)** CA-step tuning is committed, tested, and **NOT enabled in production**. Measured upside ~1.89×.
 The highest value/effort item in this document; it needs no new engineering.
 
+> ### ⚠️ SUPERSEDED IN PART — 2026-10-13 (exp40). **The tune is RTT-dependent and it HURTS at low RTT.**
+> `SB_SCTP_CA_STEP=32768` was re-measured on the field rig in a **same-binary, same-session, 100 s-apart A/B
+> with exactly one env var changed**: **177.592 → 223.633 Mbps (+26 %) when the knob was REMOVED**
+> (CLIENT-EAST, ~12.6 ms). With the knob: 163.2–177.6 (n=4, never above 177.6). Without: 184.3–223.6 (n=6,
+> never below 184.3). The knob balloons cwnd to 2.04 MB and srtt to 60 ms → standing-queue overflow →
+> **67 retransmits / 9 RTOs vs 4 / 0** in 676k packets. Trace:
+> `docs/superpowers/spikes/results/2026-10-13-exp40-sender-side-176-cap.md`.
+> This is consistent with `main`'s own `80a1daf3` ("CA-step **+36 %** clean, **3.4×** under loss" at ~71 ms):
+> **the step helps when the path is bandwidth/loss-limited and hurts when it is not.** At 245 Mbps / 12.6 ms,
+> a 32 KiB per-RTT step overshoots straight into the standing queue.
+> **Therefore the "Action" at the bottom of this entry is WRONG as written — do NOT enable it
+> unconditionally in production.** The correct action is an RTT/bandwidth-conditional policy, or leave it
+> unset (production's current state, which is the *good* configuration at low RTT). The consequence recorded
+> below also cuts both ways: every absolute number in this directory was measured knob-ON, so those figures
+> **understate low-RTT performance by up to ~26 %**.
+
 - **The knob:** `SB_SCTP_CA_STEP=32768` → `se.SetSCTPCwndCAStep(v)`.
 - **In main (branch `main`, worktree `.worktrees/e2e-v1`):** `agent/internal/peer/peer.go:125-127`, with the
   rationale documented in code at `:91-97` and a unit test at `agent/internal/peer/sctp_tuning_test.go`.

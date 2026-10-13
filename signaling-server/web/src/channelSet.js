@@ -1,7 +1,16 @@
 import { PROTOCOL_VERSION } from './multiLaneProtocol.js'
 
 const REQUIRED_LABELS = Object.freeze(['control', 'media', 'bulk'])
+// N5 (SB_BULK_LANES): the agent may open extra ordered bulk DataChannels
+// labelled `bulk-1`, `bulk-2`, … on the same association. They are extra
+// striping lanes, never required lanes: a peer that offers none is handled
+// exactly as before.
+const EXTRA_BULK_LABEL = /^bulk-([1-9][0-9]*)$/
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
+
+function isExtraBulkLabel(label) {
+  return typeof label === 'string' && EXTRA_BULK_LABEL.test(label)
+}
 
 export function createChannelSet({ handshakeTimeoutMs = DEFAULT_HANDSHAKE_TIMEOUT_MS } = {}) {
   if (!Number.isFinite(handshakeTimeoutMs) || handshakeTimeoutMs < 0) {
@@ -15,6 +24,8 @@ class BrowserChannelSet {
     this.readyState = 'connecting'
     this.onclose = null
     this._channels = new Map()
+    this._extraBulk = new Map()
+    this.onbulklane = null
     this._settled = false
     this._closed = false
     this.ready = new Promise((resolve, reject) => {
@@ -29,14 +40,26 @@ class BrowserChannelSet {
   get media() { return this._channels.get('media') ?? null }
   get bulk() { return this._channels.get('bulk') ?? null }
 
+  /**
+   * Every bulk lane in striping order: the primary `bulk` lane followed by the
+   * N5 extra lanes sorted by their numeric suffix. A peer that offers no extra
+   * lanes yields exactly `[bulk]`.
+   */
+  get bulkLanes() {
+    const extras = [...this._extraBulk.entries()]
+      .sort((a, b) => Number(a[0].slice('bulk-'.length)) - Number(b[0].slice('bulk-'.length)))
+      .map(([, channel]) => channel)
+    return [this.bulk, ...extras].filter(Boolean)
+  }
+
   attach(label, channel) {
-    if (!REQUIRED_LABELS.includes(label)) {
+    if (!REQUIRED_LABELS.includes(label) && !isExtraBulkLabel(label)) {
       const error = new Error(`unknown channel label: ${label}`)
       channel?.close?.()
       this._fail(error)
       throw error
     }
-    if (this._channels.has(label)) {
+    if (this._channels.has(label) || this._extraBulk.has(label)) {
       const error = new Error(`duplicate channel label: ${label}`)
       channel?.close?.()
       this._fail(error)
@@ -53,6 +76,19 @@ class BrowserChannelSet {
     }
 
     this._armTimeout()
+
+    if (isExtraBulkLabel(label)) {
+      this._extraBulk.set(label, channel)
+      channel.onopen = () => this._maybeBeginHandshake()
+      channel.onclose = () => this._fail(new Error(`bulk lane closed: ${label}`))
+      if (channel.readyState === 'closed' || channel.readyState === 'closing') {
+        this._fail(new Error(`bulk lane is not openable: ${label}`))
+      } else {
+        this.onbulklane?.(channel, label)
+        this._maybeBeginHandshake()
+      }
+      return channel
+    }
 
     this._channels.set(label, channel)
     channel.onopen = () => this._maybeBeginHandshake()
@@ -144,7 +180,7 @@ class BrowserChannelSet {
     this._closed = true
     clearTimeout(this._timer)
     this.readyState = 'closed'
-    for (const channel of this._channels.values()) {
+    for (const channel of [...this._channels.values(), ...this._extraBulk.values()]) {
       try {
         channel.close()
       } catch {

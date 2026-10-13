@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
-import { encodeChunkEnvelope, encodeThumbnailEnvelope } from './binaryEnvelope.js'
+import { encodeChunkEnvelope, encodeChunkEnvelopeV2, encodeThumbnailEnvelope } from './binaryEnvelope.js'
 import {
   installSessionMessageHandler,
   publishGlobalActions,
@@ -2883,5 +2883,123 @@ test('transfer closure cleanup executes once even if several required lanes repo
     await Promise.all([__test.handleTransferClosure(), __test.handleTransferClosure(), __test.handleTransferClosure()])
     assert.equal(failures, 1)
     __test.setActiveDownload(null)
+  })
+})
+
+// --- N5 (SB_BULK_LANES) client-side striped reorder ---------------------------
+
+async function withStripedDownload(operationId, run) {
+  const appended = []
+  __test.setTransferSession({ channels: null, mode: null })
+  __test.setCurrentFile({ name: 'striped.iso', size: 6, binary_envelope: true, operationId })
+  __test.setActiveDownload({ async append(bytes) { appended.push([...bytes]) } })
+  try {
+    await run(appended)
+  } finally {
+    __test.setActiveDownload(null)
+    __test.setCurrentFile(null)
+    __test.setTransferSession({ channels: null, mode: null })
+  }
+}
+
+const striped = (operationId, sequence, bytes) =>
+  ({ data: encodeChunkEnvelopeV2(operationId, 0, BigInt(sequence), new Uint8Array(bytes)).buffer })
+
+test('striped chunks from several lanes append in global sequence order', async () => {
+  await withStripedDownload('77', async (appended) => {
+    // The lanes deliver out of order (bulk lane 2, then lane 0, then lane 1).
+    await __test.handleBulkMessage(striped('77', 2, [3, 4]))
+    assert.deepEqual(appended, [], 'a chunk ahead of the next expected one is buffered')
+    assert.equal(__test.getBulkReorderState().pending, 1)
+
+    await __test.handleBulkMessage(striped('77', 0, [1, 2]))
+    await __test.handleBulkMessage(striped('77', 1, [9]))
+
+    assert.deepEqual(appended, [[1, 2], [9], [3, 4]], 'the released run is in sequence order')
+    assert.deepEqual(__test.getBulkReorderState(), { operationId: '77', pending: 0, next: 3n })
+  })
+})
+
+test('a striped chunk gap is held and released as one run', async () => {
+  await withStripedDownload('78', async (appended) => {
+    await __test.handleBulkMessage(striped('78', 4, [5]))
+    await __test.handleBulkMessage(striped('78', 3, [4]))
+    assert.deepEqual(appended, [])
+    assert.equal(__test.getBulkReorderState().pending, 2)
+
+    await __test.handleBulkMessage(striped('78', 0, [1]))
+    await __test.handleBulkMessage(striped('78', 2, [3]))
+    assert.deepEqual(appended, [[1]], 'sequence 1 is still missing')
+
+    await __test.handleBulkMessage(striped('78', 1, [2]))
+    assert.deepEqual(appended, [[1], [2], [3], [4], [5]])
+    assert.equal(__test.getBulkReorderState().pending, 0)
+  })
+})
+
+test('a duplicated striped sequence is dropped, not appended twice', async () => {
+  await withStripedDownload('79', async (appended) => {
+    await __test.handleBulkMessage(striped('79', 0, [1]))
+    await __test.handleBulkMessage(striped('79', 0, [1]))
+    await __test.handleBulkMessage(striped('79', 1, [2]))
+    assert.deepEqual(appended, [[1], [2]])
+  })
+})
+
+test('striped chunk accounting counts every arrival exactly once', async () => {
+  await withStripedDownload('80', async (appended) => {
+    await __test.handleBulkMessage(striped('80', 2, [3, 4]))
+    await __test.handleBulkMessage(striped('80', 0, [1, 2]))
+    await __test.handleBulkMessage(striped('80', 1, [9]))
+    assert.deepEqual(appended, [[1, 2], [9], [3, 4]])
+    assert.equal(__test.getCurrentFile().wireBytes, 5n, 'wire bytes total the payloads of all three chunks')
+  })
+})
+
+test('striped chunks that arrive before their header replay in sequence order', async () => {
+  __test.setTransferSession({ channels: null, mode: null })
+  try {
+    // No current operation yet: these land in the early-frame store, which the
+    // reorder buffer has already put in sequence order.
+    await __test.handleBulkMessage(striped('81', 2, [3]))
+    await __test.handleBulkMessage(striped('81', 0, [1]))
+    await __test.handleBulkMessage(striped('81', 1, [2]))
+    assert.deepEqual(__test.getBulkReorderState(), { operationId: '81', pending: 0, next: 3n })
+
+    const appended = []
+    __test.setCurrentFile({ name: 'early.iso', size: 3, binary_envelope: true, operationId: '81' })
+    __test.setActiveDownload({ async append(bytes) { appended.push([...bytes]) } })
+    await __test.drainEarlyFrames('bulk', '81')
+
+    assert.deepEqual(appended, [[1], [2], [3]])
+    __test.setActiveDownload(null)
+    __test.setCurrentFile(null)
+  } finally {
+    __test.setTransferSession({ channels: null, mode: null })
+  }
+})
+
+test('v1 frames never engage the striped reorder path (default client unchanged)', async () => {
+  await withStripedDownload('82', async (appended) => {
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('82', 0, new Uint8Array([7, 7])).buffer })
+    await __test.handleBulkMessage({ data: encodeChunkEnvelope('82', 0, new Uint8Array([8])).buffer })
+
+    assert.deepEqual(appended, [[7, 7], [8]], 'arrival order is the append order, as before')
+    assert.deepEqual(
+      __test.getBulkReorderState(),
+      { operationId: null, pending: 0, next: 0n },
+      'no reorder buffer is ever created for a single-lane peer',
+    )
+  })
+})
+
+test('the reorder buffer is discarded when the operation retires', async () => {
+  await withStripedDownload('83', async (appended) => {
+    await __test.handleBulkMessage(striped('83', 5, [6]))
+    assert.equal(__test.getBulkReorderState().pending, 1)
+
+    __test.setCurrentFile(null)
+    assert.deepEqual(__test.getBulkReorderState(), { operationId: null, pending: 0, next: 0n })
+    assert.deepEqual(appended, [])
   })
 })

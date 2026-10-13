@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"sharebridge/agent/internal/bulkfan"
 	"sharebridge/agent/internal/cloudwebdav"
 	"sharebridge/agent/internal/multilane"
 )
@@ -105,6 +106,10 @@ type Manager struct {
 	control       multilane.Endpoint
 	media         multilane.Endpoint
 	bulk          multilane.Endpoint
+	rawBulk       multilane.Endpoint
+	bulkEndpoints []multilane.Endpoint
+	bulkCfg       bulkfan.Config
+	bulkPacer     *bulkfan.TokenBucket
 	client        StorageBackend
 	gallery       GalleryBackend
 	mediaTransfer atomic.Bool
@@ -183,6 +188,10 @@ func (m *Manager) installChannels() {
 	m.control = m.channels.Endpoint(multilane.LaneControl)
 	m.media = m.channels.Endpoint(multilane.LaneMedia)
 	m.bulk = m.channels.Endpoint(multilane.LaneBulk)
+	m.rawBulk = m.bulk
+	m.discoverBulkEndpoints()
+	m.bulkCfg = bulkfan.FromOSEnv()
+	m.applyBulkConfig()
 	if m.control != nil {
 		m.control.SetOnMessage(m.HandleMessage)
 	}
@@ -1534,7 +1543,77 @@ func (m *Manager) sendWithBackpressure(ctx context.Context, endpoint multilane.E
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := m.pace(ctx, len(data)); err != nil {
+		return err
+	}
 	return endpoint.SendBinaryClass(class, data)
+}
+
+// pace applies the A3 token bucket, if configured. Every sendWithBackpressure
+// caller is a bulk chunk, so pacing here covers the whole bulk path without
+// touching the media lanes.
+func (m *Manager) pace(ctx context.Context, n int) error {
+	if m.bulkPacer == nil || n <= 0 {
+		return nil
+	}
+	wait := m.bulkPacer.Delay(n)
+	if wait <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(wait):
+		return nil
+	}
+}
+
+// discoverBulkEndpoints collects the ordered bulk lanes advertised by the
+// channel set. It returns nothing for the default three-lane set, which keeps
+// striping disabled regardless of the environment.
+func (m *Manager) discoverBulkEndpoints() {
+	m.bulkEndpoints = nil
+	if m.channels == nil {
+		return
+	}
+	provider, ok := m.channels.(multilane.BulkEndpointSet)
+	if !ok {
+		return
+	}
+	if endpoints := provider.BulkEndpoints(); len(endpoints) > 1 {
+		m.bulkEndpoints = endpoints
+	}
+}
+
+// applyBulkConfig rebuilds the pacer and striper from the discovered lanes and
+// the current configuration. Called at construction and by SetBulkConfig.
+func (m *Manager) applyBulkConfig() {
+	m.bulk = m.rawBulk
+	m.bulkPacer = nil
+	if m.bulkCfg.Enabled() {
+		log.Printf("transfer: bulk levers enabled (conns=%d lanes=%d paceMbps=%v, %d bulk endpoint(s)); the matching client-side transport is required",
+			m.bulkCfg.Conns, m.bulkCfg.Lanes, m.bulkCfg.PaceMbps, len(m.bulkEndpoints)+1)
+	}
+	if m.bulkCfg.PacingEnabled() {
+		rate := m.bulkCfg.PaceBytesPerSecond()
+		burst := rate / 20 // 50 ms of credit
+		if burst < chunkSize {
+			burst = chunkSize
+		}
+		m.bulkPacer = bulkfan.NewTokenBucket(rate, burst, nil)
+	}
+	if (m.bulkCfg.FanoutEnabled() || m.bulkCfg.StripeEnabled()) && len(m.bulkEndpoints) > 1 {
+		if striped := newStripedEndpoint(m.bulkEndpoints); striped != nil {
+			m.bulk = striped
+		}
+	}
+}
+
+// SetBulkConfig overrides the environment-derived bulk levers. It exists for
+// the daemon (A1 supplies aggregated lanes) and for hermetic tests.
+func (m *Manager) SetBulkConfig(cfg bulkfan.Config) {
+	m.bulkCfg = cfg
+	m.applyBulkConfig()
 }
 
 func (m *Manager) sendInteractiveMedia(ctx context.Context, operation uint64, data []byte) error {

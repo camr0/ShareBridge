@@ -160,3 +160,53 @@ test('waitForDirectChannelOpen resolves when the RTC data channel opens later', 
   const opened = await pending
   assert.equal(opened, channel)
 })
+
+// --- N5 (SB_BULK_LANES) extra bulk lanes -------------------------------------
+
+test('direct set accepts N5 extra bulk lanes as LANE_BULK and wires their onmessage', async () => {
+  const set = createDirectChannelSet({ handshakeTimeoutMs: 100 })
+  const control = createMockRTCDataChannel('control')
+  const media = createMockRTCDataChannel('media')
+  const bulk = createMockRTCDataChannel('bulk')
+  set.accept(control)
+  set.accept(media)
+  set.accept(bulk)
+
+  const primaryHandler = bulk.onmessage
+  const first = () => {}
+  const unsubscribe = set.subscribeExtraBulkLane(first)
+  assert.equal(typeof unsubscribe, 'function')
+  assert.equal(bulk.onmessage, primaryHandler, 'the primary bulk lane is never rewired')
+  assert.deepEqual(set.extraBulkLanes, [])
+
+  const rtcExtra = createMockRTCDataChannel('bulk-1')
+  const accepted = set.accept(rtcExtra)
+  assert.equal(accepted.lane, 2, 'extra bulk lanes reuse the bulk traffic class lane')
+  assert.equal(accepted.onmessage, first, 'an extra lane arriving after readiness is still wired')
+  assert.equal(bulk.onmessage, primaryHandler)
+  assert.deepEqual(set.extraBulkLanes.map((lane) => lane._dc.label), ['bulk-1'])
+  assert.deepEqual(set.bulkLanes.map((lane) => lane?._dc.label), ['bulk', 'bulk-1'])
+
+  // A handler installed later is applied to the lanes that already exist.
+  unsubscribe()
+  assert.equal(accepted.onmessage, null, 'unsubscribing detaches the lane it wired')
+
+  const second = () => {}
+  set.subscribeExtraBulkLane(second)
+  assert.equal(accepted.onmessage, second, 'a later handler is applied to an already-attached lane')
+  assert.equal(bulk.onmessage, primaryHandler)
+
+  for (const rtc of [control, media, bulk, rtcExtra]) {
+    rtc.readyState = 'open'
+    rtc.onopen()
+  }
+  control.onmessage({ data: JSON.stringify({ type: 'transport_ready', version: 2 }) })
+  await set.ready
+  assert.equal(set.readyState, 'open')
+})
+
+test('direct set still rejects labels that are neither required nor N5 lanes', async () => {
+  const set = createDirectChannelSet({ handshakeTimeoutMs: 100 })
+  assert.throws(() => set.accept(createMockRTCDataChannel('bulk-0')), /unknown/i)
+  await assert.rejects(set.ready, /unknown/i)
+})

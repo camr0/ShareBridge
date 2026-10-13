@@ -11,6 +11,8 @@ import {
 } from './downloadSinks.js'
 import { createDownloadPipeline } from './downloadPipeline.js'
 import { decodeBinaryEnvelope, FRAME_FILE_CHUNK, FRAME_THUMBNAIL } from './binaryEnvelope.js'
+import { ReorderBuffer } from './bulkReorder.js'
+import { installBareReceive } from './bareReceive.js'
 import { createGalleryController } from './gallery.js'
 import { createVideoBufferWarningMonitor } from './videoBufferWarning.js'
 
@@ -49,6 +51,33 @@ const abandonedMediaRequests = new Set()
 let earlyFrameBytes = 0
 let earlyFrameCount = 0
 let earlyFrameTimer = null
+
+// EXP28/EXP44 bare-receive ablation. `null` unless the page was opened with
+// `?bare=1`, in which case every check below is a single falsy test and the
+// production receive path is untouched.
+const bareReceive = installBareReceive()
+
+// N5 (SB_BULK_LANES) reorder state. Only ever populated when a bulk chunk
+// arrives in a v2 envelope carrying a global sequence; the default v1 wire
+// format leaves it null and takes the original direct path.
+let bulkReorderBuffer = null
+let bulkReorderOperationId = null
+
+function resetBulkReorder(operationId) {
+  if (operationId === undefined || bulkReorderOperationId === operationId) {
+    bulkReorderBuffer = null
+    bulkReorderOperationId = null
+  }
+}
+
+/** Buffers an out-of-order striped chunk and returns the newly consecutive run. */
+function reorderStripedBulkFrame(frame) {
+  if (bulkReorderOperationId !== frame.operationId || bulkReorderBuffer === null) {
+    bulkReorderBuffer = new ReorderBuffer()
+    bulkReorderOperationId = frame.operationId
+  }
+  return bulkReorderBuffer.push(frame.sequence, frame)
+}
 
 function nextRequestId(scope) {
   requestSequence += 1
@@ -458,7 +487,17 @@ function attachTransferChannel({
     if (!isCurrentSession()) return
     mediaChain = mediaChain.then(() => isCurrentSession() && handleMediaMessage(event, { isCurrentSession })).catch(handleLaneError)
   }
-  channel.bulk.onmessage = (event) => {
+  channel.bulk.onmessage = onBulkFrame
+  // N5 extra lanes (`bulk-1`, …) when the agent offers them. A peer without the
+  // lever never invokes this, so the wiring above is the entire default path.
+  channel.subscribeExtraBulkLane?.(onBulkFrame)
+  function onBulkFrame(event) {
+    // EXP28 bare mode counts every bulk-lane message — including the extra N5
+    // lanes — and never decodes, routes or assembles it.
+    if (bareReceive) {
+      bareReceive.record(event.data)
+      return
+    }
     if (!isCurrentSession()) return
     bulkChain = bulkChain.then(() => isCurrentSession() && handleBulkMessage(event, { isCurrentSession })).catch(handleLaneError)
   }
@@ -805,6 +844,14 @@ async function handleControlMessage(event, { isCurrentSession = () => true } = {
     preview: typeof event.data === 'string' ? event.data.slice(0, 160) : String(event.data),
   })
   const msg = JSON.parse(event.data)
+  // EXP28 bare mode: keep the real control exchange (join/knock, file_list,
+  // click → file_request) but never create the download operation, the
+  // pipeline or the sink. file_header and chunk_end only frame the transfer.
+  if (bareReceive && (msg.type === 'file_header' || msg.type === 'chunk_end')) {
+    if (msg.type === 'file_header') bareReceive.markHeader(msg)
+    debugLog('bare receive: framing control message', { type: msg.type, operation_id: msg.operation_id })
+    return
+  }
   switch (msg.type) {
     case 'file_list':
       debugLog('file_list received', { count: msg.files?.length || 0, currentPath })
@@ -900,7 +947,25 @@ async function handleBulkMessage(event, context) {
   const frame = decodeBinaryEnvelope(event.data)
   if (frame.type !== FRAME_FILE_CHUNK) throw new Error('bulk lane received non-chunk frame')
   if (frame.generation !== 0) throw new Error('bulk chunk generation must be zero')
-  await routeOrBufferFrame('bulk', frame, context)
+  await ingestBulkFrame(frame, context)
+}
+
+/**
+ * Routes one bulk chunk to the download pipeline. A frame in a v2 envelope
+ * (N5/A1 striping) carries a global chunk sequence and is released only in
+ * sequence order; a v1 frame takes the original direct path unchanged.
+ */
+async function ingestBulkFrame(frame, context) {
+  if (frame.sequence === undefined) {
+    await routeOrBufferFrame('bulk', frame, context)
+    return
+  }
+  const isCurrentSession = context?.isCurrentSession ?? (() => true)
+  const ordered = reorderStripedBulkFrame(frame)
+  for (const ready of ordered) {
+    await routeOrBufferFrame('bulk', ready, context)
+    if (!isCurrentSession()) return
+  }
 }
 
 // Compatibility entry point retained for focused tests; production installs the
@@ -970,6 +1035,7 @@ function acceptAlbumHeader(msg, operationId) {
 
 function retireOperation(scope, operationId) {
   if (!operationId) return
+  if (scope === 'bulk') resetBulkReorder(operationId)
   retiredOperations[scope].add(operationId)
   if (retiredOperations[scope].size > 64) retiredOperations[scope].delete(retiredOperations[scope].values().next().value)
 }
@@ -1152,7 +1218,10 @@ function bufferEarlyFrame(lane, frame, now = Date.now()) {
   pruneEarlyFrames(now)
   const entries = earlyFrames[lane].get(frame.operationId) ?? []
   const last = entries[entries.length - 1]
-  const canCoalesce = Boolean(last?.buffer &&
+  // A v2 striped frame carries a global sequence, so it must never be merged
+  // with a neighbour: coalescing would lose the chunk→sequence mapping. The
+  // default v1 path coalesces exactly as before.
+  const canCoalesce = frame.sequence === undefined && Boolean(last?.buffer &&
     last.frame.type === frame.type &&
     last.frame.generation === frame.generation &&
     last.length + frame.payload.byteLength <= EARLY_FRAME_COALESCE_BYTES)
@@ -1228,6 +1297,9 @@ async function drainEarlyFrames(lane, operationId) {
   for (const entry of entries) {
     earlyFrameBytes -= entry.frame.payload.byteLength
     earlyFrameCount -= 1
+    // Striped bulk frames were already put in sequence order on arrival (the
+    // reorder buffer releases consecutive runs), so the early-frame store for
+    // this lane is ordered and is replayed directly.
     await routeOrBufferFrame(lane, entry.frame)
   }
   if (earlyFrameCount === 0 && earlyFrameTimer !== null) {
@@ -2621,6 +2693,17 @@ export const __test = {
   handleControlMessage,
   handleMediaMessage,
   handleBulkMessage,
+  getBulkReorderState() {
+    return {
+      operationId: bulkReorderOperationId,
+      pending: bulkReorderBuffer?.pending ?? 0,
+      next: bulkReorderBuffer?.next ?? 0n,
+    }
+  },
+  getBareReceive() {
+    return bareReceive
+  },
+  drainEarlyFrames,
   requestFile,
   submitPassword,
   handleTransferClosure,
