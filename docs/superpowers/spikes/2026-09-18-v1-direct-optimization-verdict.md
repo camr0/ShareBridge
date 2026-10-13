@@ -144,6 +144,28 @@
 > **reverse SSH tunnel** (VERSA has no reachable inbound TCP — residential NAT + IPv6 firewall), so TCP-over-TCP
 > confounds it; and the 111–163 Mbps native-TCP band the brief assumed for 70 ms did not hold today
 > (72.8–120.3). See `results/2026-10-13-exp46-native-https-reference.md`.
+>
+> **NINTH REVISION — 2026-10-13 (exp47): there is no RTT at which direct is competitive, and the ratio curve
+> corroborates the eighth revision.** The D3 band sweep (8 vCPU client, n=2, in-band TCP control per band) ran
+> the curve out to 150 ms:
+>
+> | band | knob OFF (production) | knob ON | relay | direct ÷ relay (OFF) |
+> |---|---|---|---|---|
+> | ~30 ms | **73.29** | **96.29** | ~225–230 | 3.1× |
+> | ~50 ms | **62.29** | **74.18** | ~225–230 | 3.6× |
+> | ~100 ms | **34.53** | **53.22** | ~225–230 | 6.6× |
+> | ~150 ms | **24.85** | **36.32** | ~225–230 | 9.1× |
+>
+> The curve is **monotone decreasing and never approaches the relay** — the gap *widens* with RTT — so "where
+> does v1 direct become unusable?" answers as **everywhere measured**. The knob helps in every band (+19 % to
+> +54 %), reproducing the sixth revision's direction at four RTTs rather than two.
+> **The mechanism corroborates the eighth revision:** direct-as-a-fraction-of-TCP **rises with RTT** (0.474 →
+> 0.898 knob off; 0.504 → 1.51 knob on), i.e. at low RTT the WebRTC/SCTP/DTLS + app-sink path is the extra cost
+> and at high RTT the raw path is the limit. At 150 ms with the knob on the DataChannel even **exceeds** the
+> same-band single-flow TCP control — the raw path is binding, not the transport.
+> **Caveat:** the eight TCP controls are not a coherent set (24.1–207.6 Mbps) on a path that moved 1.65× within
+> a session, so the ratios are soft and the absolute numbers plus the monotone trend are the robust part. See
+> `results/2026-10-13-exp47-rtt-bands.md`.
 
 **Question.** v1 direct (browser WebRTC DataChannel) delivers ~100–125 Mbps in the field, while v2's relay
 delivers ~233 Mbps through the same path. Is there a change — up to and including **forking pion** — that closes

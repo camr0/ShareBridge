@@ -209,6 +209,37 @@ non-browser conduit controls) + 3 direct `iperf3` path controls.
 - **E1 not run** — it needs the v2 relay stack, which collides with the v1 rig on ports 443/8080, and the brief
   forbade a rig swap. exp46's native-HTTPS number is largely the v2-direct proxy anyway.
 
+## exp47 — D3 RTT band sweep ✅ **data complete; verdict written by the orchestrator**
+
+`results/2026-10-13-exp47-rtt-bands.md`. **16 cells, n=2 per band, full 4-band × 2-config matrix** on the
+8-vCPU client, plus an in-band TCP control per band. **This took three dispatches** — attempts 1 and 2 died to
+machine reboots / a provider timeout and each left a `netem` qdisc and `ifb` on CLIENT-8; attempt 3 collected
+**all 16 cells** and then died on a connection error before writing its own verdict. The orchestrator wrote the
+analysis from the raw cells; no number was altered.
+
+| band | knob OFF (production) | TCP ctrl | ratio | knob ON | TCP ctrl | ratio | knob effect |
+|---|---|---|---|---|---|---|---|
+| ~30 ms | **73.29** | 154.64 | 0.474 | **96.29** | 191 | 0.504 | **+31.4 %** |
+| ~50 ms | **62.29** | ~207.6 | 0.300 | **74.18** | 119 | 0.623 | **+19.1 %** |
+| ~100 ms | **34.53** | ~102.5 | 0.337 | **53.22** | 57.2 | 0.930 | **+54.1 %** |
+| ~150 ms | **24.85** | ~27.7 | 0.898 | **36.32** | 24.1 | **1.51** | **+46.2 %** |
+
+- **There is no RTT at which direct wins.** The curve is monotone decreasing and sits far below the v1 relay
+  (**~225–230 Mbps at every RTT**) at every band — **3.1× / 3.6× / 6.6× / 9.1×** in the production config,
+  **2.3× / 3.0× / 4.3× / 6.2×** with the knob. The gap **widens** with RTT and never closes. That closes
+  candidate D3's question ("where does direct become unusable?") with **"everywhere measured"**.
+- **The knob helps in every band** (+19 % to +54 %), reproducing exp43's direction at four RTTs rather than two.
+- **The ratio convergence corroborates exp46's split.** Direct-as-a-fraction-of-TCP rises with RTT for both
+  configs: at 30 ms direct carries ~half of what the path does; by 150 ms ~90 % (knob off) and **more than**
+  the TCP control (knob on, 1.51×). So at low RTT the WebRTC/SCTP/DTLS + app-sink path is the extra cost, and
+  at high RTT the raw path is the limit.
+- **Caveat that matters:** the eight TCP controls are **not a coherent set** (24.1 – 207.6 Mbps). This path was
+  unstable all day (exp46 saw it move 1.65× within one session), so **the absolute direct numbers and the
+  monotone trend are robust; the ratios are soft**, and the 150 ms ON ratio of 1.51 means "the control was
+  unreliable there", not a precise multiple.
+- One relay fallback retained (B50-OFF-2, a teardown race). Phase 3 (the OFF re-run) never ran — Phase 1
+  already covers that arm, so the matrix is complete without a same-session reproduction.
+
 ## exp36 (E36, previous pass) — closed
 
 The Firefox agent was not hung on Playwright: its retry log is timestamped `02:08–02:12Z` **after** the
