@@ -73,6 +73,119 @@ export async function createStreamingSink({
   }
 }
 
+// SHA-1 over the same byte stream, computed in a module Web Worker.
+// crypto.subtle.digest has no incremental API (it cannot hash a 754 MiB stream
+// chunk-by-chunk), so the worker runs the same incremental hash-wasm SHA-1.
+export function createWorkerSha1({ workerUrl = new URL('./hashWorker.js', import.meta.url), maxOutstanding = 512 } = {}) {
+  const worker = new Worker(workerUrl, { type: 'module' })
+  const ackWaiters = []
+  let outstanding = 0
+  let seq = 0
+  let digestWaiter = null
+  let failure = null
+
+  worker.onmessage = (event) => {
+    const msg = event.data || {}
+    if (msg.type === 'ack') {
+      outstanding -= 1
+      const release = ackWaiters.shift()
+      if (release) release()
+      return
+    }
+    if (msg.type === 'digest' && digestWaiter && msg.id === digestWaiter.id) {
+      const { resolve } = digestWaiter
+      digestWaiter = null
+      try {
+        globalThis.__exp29 = { ...(globalThis.__exp29 || {}), computedSha1: msg.hex, worker: true }
+      } catch (_) {}
+      resolve(msg.hex)
+      return
+    }
+    if (msg.type === 'error') {
+      failure = new Error('sha1 worker: ' + msg.message)
+      if (digestWaiter) { const { reject } = digestWaiter; digestWaiter = null; reject(failure) }
+    }
+  }
+  worker.onerror = (event) => { failure = new Error('sha1 worker failed: ' + (event.message || 'unknown')) }
+
+  return {
+    update(bytes) {
+      if (failure) throw failure
+      seq += 1
+      // One copy per chunk (64 KiB) is the price of transferable, non-blocking
+      // hashing; it replaces a ~1.06 MiB allocation+copy per chunk.
+      const copy = new Uint8Array(bytes.length)
+      copy.set(bytes)
+      outstanding += 1
+      worker.postMessage({ type: 'update', seq, buf: copy.buffer }, [copy.buffer])
+      if (outstanding >= maxOutstanding) return new Promise((resolve) => ackWaiters.push(resolve))
+      return undefined
+    },
+    digest() {
+      const id = 'digest-' + seq
+      return new Promise((resolve, reject) => {
+        if (failure) { reject(failure); return }
+        digestWaiter = { id, resolve, reject }
+        worker.postMessage({ type: 'digest', id })
+      })
+    },
+  }
+}
+
+// Fixed streaming sink: writes the byte stream through a single fixed
+// tailBytes buffer instead of re-building concatBytes(tail, bytes) per append.
+export async function createStreamingSinkFixed({
+  fileName, mimeType, tailBytes, createWriter, createHasher,
+  deferCloseSettlement = false, onDeferredCloseError,
+}) {
+  const writer = await createWriter(fileName, mimeType)
+  const hasher = await createHasher()
+  const tail = new Uint8Array(tailBytes)
+  let tailLength = 0
+
+  return {
+    async append(bytes) {
+      const updateResult = hasher.update(bytes)
+      if (updateResult && typeof updateResult.then === 'function') await updateResult
+
+      const chunk = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+      let offset = 0
+      while (offset < chunk.length) {
+        if (tailLength === tailBytes) { await writer.write(tail); tailLength = 0 }
+        const take = Math.min(tailBytes - tailLength, chunk.length - offset)
+        tail.set(chunk.subarray(offset, offset + take), tailLength)
+        tailLength += take
+        offset += take
+      }
+    },
+    bufferedTailSize() { return tailLength },
+    async finalize({ expectedSha1, expectedSize, receivedBytes }) {
+      const normalizedExpectedSha1 = normalizeExpectedSha1(expectedSha1)
+      const computedSha1 = normalizedExpectedSha1 ? await hasher.digest('hex') : null
+
+      if (receivedBytes !== expectedSize) {
+        await writer.abort('size-mismatch')
+        return { ok: false, code: 'size-mismatch' }
+      }
+      if (normalizedExpectedSha1 && computedSha1 !== normalizedExpectedSha1) {
+        await writer.abort('checksum-mismatch')
+        return { ok: false, code: 'checksum-mismatch', computedSha1 }
+      }
+      if (tailLength > 0) await writer.write(tail.subarray(0, tailLength))
+      const closeResult = writer.close()
+      if (deferCloseSettlement) {
+        void Promise.resolve(closeResult).then(undefined, (error) => {
+          try { onDeferredCloseError?.(error) } catch (_callbackError) {}
+        })
+      } else {
+        await closeResult
+      }
+      return { ok: true, code: normalizedExpectedSha1 ? 'intact' : 'done', computedSha1 }
+    },
+    async abort(reason) { await writer.abort(reason) },
+  }
+}
+
 export async function createBlobSink({ fileName, mimeType, subtleDigest, triggerBrowserSave }) {
   const chunks = []
 
