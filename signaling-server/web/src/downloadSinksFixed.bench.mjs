@@ -62,7 +62,7 @@ function countingWriter() {
 }
 
 function copyingWriter() {
-  const scratch = new Uint8Array(TAIL)
+  const scratch = new Uint8Array(2 * TAIL) // fixed sink flushes up to 2 x TAIL at finalize
   let calls = 0
   let bytes = 0
   return {

@@ -6,10 +6,10 @@ import {
   createBlobSink,
   createBrowserStreamWriter,
   createIncrementalSha1,
+  createPreferredSha1,
   createSafariBrowserStreamWriter,
   createStreamingSink,
   createStreamingSinkFixed,
-  createWorkerSha1,
 } from './downloadSinks.js'
 import { createDownloadPipeline } from './downloadPipeline.js'
 import { decodeBinaryEnvelope, FRAME_FILE_CHUNK, FRAME_THUMBNAIL } from './binaryEnvelope.js'
@@ -1603,7 +1603,7 @@ async function buildDownloadSink(header, support) {
       mimeType: header.mimeType,
       tailBytes: 1024 * 1024,
       createWriter: createBrowserStreamWriter,
-      createHasher: () => createWorkerSha1(),
+      createHasher: () => createPreferredSha1(),
       ...albumCloseOptions,
     })
   }

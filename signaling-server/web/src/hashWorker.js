@@ -1,5 +1,9 @@
 import { createSHA1 } from './vendor/hash-wasm.js'
 const hasherPromise = createSHA1()
+hasherPromise.then(
+  () => self.postMessage({ type: 'ready' }),
+  (error) => self.postMessage({ type: 'error', message: String(error && error.message ? error.message : error) }),
+)
 self.onmessage = async (event) => {
   const msg = event.data || {}
   try {

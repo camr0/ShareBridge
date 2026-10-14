@@ -11,8 +11,9 @@
 //          written bytes ++ withheld final tail
 //      to be byte-identical (this is the byte stream that is hashed and the
 //      byte stream that is written to disk).
-//   2. The withheld window of the fixed sink is bounded by `tailBytes`
-//      (the one documented semantic delta vs the original).
+//   2. The fixed sink always withholds at least the final min(size, tailBytes)
+//      bytes until the checksum verifies (same guarantee as the original), and
+//      never more than 2 x tailBytes.
 //   3. The production shape (1 MiB tail, 16 KiB frames) is proven byte-identical
 //      AND SHA-1-identical with the real incremental hash-wasm hasher.
 //   4. `createWorkerSha1`'s marshalling protocol is exercised against a mock
@@ -26,6 +27,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import {
   createIncrementalSha1,
+  createPreferredSha1,
   createStreamingSink,
   createStreamingSinkFixed,
   createWorkerSha1,
@@ -54,11 +56,9 @@ function makeRecordingWriter() {
     writer: {
       async write(chunk) {
         writeCalls += 1
-        // Real writers (StreamSaver's WritableStream sink, FileSystemWritable-
-        // FileStream) consume the buffer before the write promise settles; the
-        // fixed sink hands the SAME Uint8Array back on every flush, so a
-        // recorder must copy exactly as a real sink does.
-        written.push(Uint8Array.from(chunk))
+        // Keep the chunk by reference, as StreamSaver's enqueue / blob fallback
+        // does: a sink that reuses a buffer after write() would corrupt this.
+        written.push(chunk)
       },
       async close() { closed = true },
       async abort(reason) { aborted = reason },
@@ -145,6 +145,7 @@ test('EXP48 equivalence: 200 randomized trials are byte-identical to the origina
   let mismatches = 0
   let withheldViolations = 0
   let maxWithheldFixed = 0
+  let minWithheldMargin = Infinity
 
   for (let trial = 0; trial < 200; trial += 1) {
     const chunkCount = Math.floor(random() * 81) // 0..80, ~40 mean => ~8,000 appends
@@ -167,15 +168,18 @@ test('EXP48 equivalence: 200 randomized trials are byte-identical to the origina
     // The hashed stream is the same stream that is written.
     if (!equalBytes(original.stream, concat(chunks))) mismatches += 1
     if (!equalBytes(fixed.hashed, concat(chunks))) mismatches += 1
-    if (fixed.withheld > TAIL) withheldViolations += 1
+    const required = Math.min(expectedSize, TAIL)
+    if (fixed.withheld < required || fixed.withheld > 2 * TAIL) withheldViolations += 1
     if (fixed.withheld > maxWithheldFixed) maxWithheldFixed = fixed.withheld
+    if (fixed.withheld - required < minWithheldMargin) minWithheldMargin = fixed.withheld - required
   }
 
   assert.equal(mismatches, 0, `${mismatches} byte-stream mismatches`)
   assert.equal(withheldViolations, 0)
   // Reporting surface: the test log carries the real counts.
   console.log(`EXP48 LOGIC: ${trials}/200 trials byte-identical, ${appends} appends, ` +
-    `max fixed withheld window ${maxWithheldFixed}/${TAIL} B, mismatches=${mismatches}`)
+    `fixed withheld window max ${maxWithheldFixed} B (tail ${TAIL} B, min margin ${minWithheldMargin} B), ` +
+    `mismatches=${mismatches}`)
   assert.equal(trials, 200)
   assert.ok(appends > 6000, `expected ~6,800 appends, saw ${appends}`)
 })
@@ -237,7 +241,7 @@ test('EXP48 equivalence: production shape (1 MiB tail, 16 KiB frames) is byte- a
   assert.equal(originalSha1, reference)
   assert.equal(fixedSha1, reference)
 
-  assert.ok(fixed.withheld <= TAIL)
+  assert.ok(fixed.withheld >= TAIL && fixed.withheld <= 2 * TAIL)
   assert.ok(fixed.writeCalls < original.writeCalls)
 
   console.log(`EXP48 PRODUCTION-SHAPE: ${FRAMES} x 16 KiB frames, sha1=${fixedSha1} ` +
@@ -315,8 +319,12 @@ test('EXP48 createWorkerSha1: marshalling protocol, transferables, backpressure,
       this.onmessage = null
       this.onerror = null
       this._hash = createHash('sha1')
+      this.terminated = false
       instances.push(this)
+      queueMicrotask(() => this.onmessage?.({ data: { type: 'ready' } }))
     }
+
+    terminate() { this.terminated = true }
 
     postMessage(message, transfer) {
       this.posted.push({ message, transfer })
@@ -348,7 +356,7 @@ test('EXP48 createWorkerSha1: marshalling protocol, transferables, backpressure,
     frames.push(chunk)
   }
 
-  const hasher = createWorkerSha1({ maxOutstanding: 4 })
+  const hasher = await createWorkerSha1({ maxOutstanding: 4 })
   assert.equal(instances.length, 1)
   assert.equal(instances[0].options.type, 'module')
   assert.equal(String(instances[0].url), String(new URL('./hashWorker.js', import.meta.url)))
@@ -364,7 +372,7 @@ test('EXP48 createWorkerSha1: marshalling protocol, transferables, backpressure,
   }
 
   // Every transfer list must contain exactly the transferred copy's buffer.
-  for (const { message, transfer } of instances[0].posted) {
+  for (const { message, transfer } of instances[0].posted.filter((entry) => entry.message.type === 'update')) {
     assert.deepEqual(transfer, [message.buf])
     assert.equal(message.buf.byteLength, 1024)
   }
@@ -381,10 +389,15 @@ test('EXP48 createWorkerSha1: marshalling protocol, transferables, backpressure,
 test('EXP48 createWorkerSha1: worker error surfaces on update and digest', async (t) => {
   const OriginalWorker = globalThis.Worker
   class FailingWorker {
-    constructor() { this.onmessage = null; this.onerror = null }
+    constructor() {
+      this.onmessage = null
+      this.onerror = null
+      queueMicrotask(() => this.onmessage?.({ data: { type: 'ready' } }))
+    }
     postMessage() {
       queueMicrotask(() => this.onmessage?.({ data: { type: 'error', message: 'boom' } }))
     }
+    terminate() {}
   }
   globalThis.Worker = FailingWorker
   t.after(() => {
@@ -392,9 +405,156 @@ test('EXP48 createWorkerSha1: worker error surfaces on update and digest', async
     else globalThis.Worker = OriginalWorker
   })
 
-  const hasher = createWorkerSha1()
+  const hasher = await createWorkerSha1()
   hasher.update(new Uint8Array([1]))
   await new Promise((resolve) => setImmediate(resolve))
   assert.throws(() => hasher.update(new Uint8Array([2])), /sha1 worker: boom/)
   await assert.rejects(() => hasher.digest('hex'), /sha1 worker: boom/)
+})
+
+function withMockWorker(t, WorkerClass) {
+  const OriginalWorker = globalThis.Worker
+  globalThis.Worker = WorkerClass
+  t.after(() => {
+    if (typeof OriginalWorker === 'undefined') delete globalThis.Worker
+    else globalThis.Worker = OriginalWorker
+    delete globalThis.__exp29
+  })
+}
+
+test('fixed sink: flushed chunks are never mutated after write() (writer keeps references)', async () => {
+  const TAIL = 16
+  const chunks = []
+  for (let i = 0; i < 40; i += 1) chunks.push(Uint8Array.from({ length: 7 }, (_, j) => (i * 7 + j) & 0xff))
+  const fixed = await driveSink(buildFixed(TAIL), chunks)
+  assert.ok(equalBytes(fixed.stream, concat(chunks)))
+  assert.ok(fixed.writeCalls > 2)
+})
+
+test('fixed sink: withholds the full final tailBytes until verified (1 MiB + 16 KiB case)', async () => {
+  const TAIL = 1024 * 1024
+  const FRAME = 16 * 1024
+  const frames = Array.from({ length: TAIL / FRAME + 1 }, (_, i) => new Uint8Array(FRAME).fill(i & 0xff))
+  const recorder = makeRecordingWriter()
+  const sink = await createStreamingSinkFixed({
+    fileName: 'payload.bin',
+    mimeType: 'application/octet-stream',
+    tailBytes: TAIL,
+    createWriter: async () => recorder.writer,
+    createHasher: async () => makeStubHasher('badbad').hasher,
+  })
+  for (const frame of frames) await sink.append(frame)
+  assert.ok(sink.bufferedTailSize() >= TAIL)
+  const result = await sink.finalize({ expectedSha1: 'abc123', expectedSize: TAIL + FRAME, receivedBytes: TAIL + FRAME })
+  assert.equal(result.code, 'checksum-mismatch')
+  assert.ok(concat(recorder.written).length <= FRAME, 'more than the head of the file reached disk unverified')
+})
+
+test('fixed sink: ArrayBuffer input is written and hashed identically', async () => {
+  const bytes = Uint8Array.from([9, 8, 7, 6, 5, 4, 3, 2, 1])
+  const recorder = makeRecordingWriter()
+  const { hasher, updates } = makeStubHasher()
+  const sink = await createStreamingSinkFixed({
+    fileName: 'payload.bin',
+    mimeType: 'application/octet-stream',
+    tailBytes: 4,
+    createWriter: async () => recorder.writer,
+    createHasher: async () => hasher,
+  })
+  await sink.append(bytes.slice().buffer)
+  const result = await sink.finalize({ expectedSha1: null, expectedSize: bytes.length, receivedBytes: bytes.length })
+  assert.equal(result.ok, true)
+  assert.ok(equalBytes(concat(recorder.written), bytes))
+  assert.ok(equalBytes(concat(updates.map((update) => new Uint8Array(update))), bytes))
+})
+
+test('fixed sink: hasher is terminated on finalize and abort', async () => {
+  for (const path of ['finalize', 'abort']) {
+    let terminated = 0
+    const sink = await createStreamingSinkFixed({
+      fileName: 'payload.bin',
+      mimeType: 'application/octet-stream',
+      tailBytes: 4,
+      createWriter: async () => makeRecordingWriter().writer,
+      createHasher: async () => ({ update() {}, digest: () => 'x', terminate() { terminated += 1 } }),
+    })
+    await sink.append(new Uint8Array([1, 2]))
+    if (path === 'finalize') await sink.finalize({ expectedSha1: null, expectedSize: 2, receivedBytes: 2 })
+    else await sink.abort('cancelled')
+    assert.equal(terminated, 1, path)
+  }
+})
+
+test('createWorkerSha1: ArrayBuffer input is hashed, not dropped', async (t) => {
+  class EchoWorker {
+    constructor() {
+      this.hash = createHash('sha1')
+      queueMicrotask(() => this.onmessage?.({ data: { type: 'ready' } }))
+    }
+    postMessage(message) {
+      if (message.type === 'update') this.hash.update(new Uint8Array(message.buf))
+      if (message.type === 'digest') {
+        const hex = this.hash.digest('hex')
+        queueMicrotask(() => this.onmessage?.({ data: { type: 'digest', id: message.id, hex } }))
+      }
+    }
+    terminate() {}
+  }
+  withMockWorker(t, EchoWorker)
+  const bytes = Uint8Array.from([1, 2, 3, 4, 5])
+  const hasher = await createWorkerSha1()
+  hasher.update(bytes.slice().buffer)
+  assert.equal(await hasher.digest('hex'), createHash('sha1').update(bytes).digest('hex'))
+})
+
+test('createWorkerSha1: worker crash rejects pending backpressure and digest waiters', async (t) => {
+  let instance = null
+  class SilentWorker {
+    constructor() {
+      instance = this
+      this.terminated = false
+      queueMicrotask(() => this.onmessage?.({ data: { type: 'ready' } }))
+    }
+    postMessage() {} // never acks
+    terminate() { this.terminated = true }
+  }
+  withMockWorker(t, SilentWorker)
+  const hasher = await createWorkerSha1({ maxOutstanding: 2 })
+  hasher.update(new Uint8Array([1]))
+  const blocked = hasher.update(new Uint8Array([2]))
+  assert.ok(blocked && typeof blocked.then === 'function')
+  const digest = hasher.digest('hex')
+  instance.onerror({ message: 'crashed', preventDefault() {} })
+  await assert.rejects(blocked, /sha1 worker failed: crashed/)
+  await assert.rejects(digest, /sha1 worker failed: crashed/)
+  assert.equal(instance.terminated, true)
+})
+
+test('createWorkerSha1: rejects when the worker cannot start', async (t) => {
+  class BrokenWorker {
+    constructor() { queueMicrotask(() => this.onerror?.({ message: 'module load failed' })) }
+    postMessage() {}
+    terminate() {}
+  }
+  withMockWorker(t, BrokenWorker)
+  await assert.rejects(createWorkerSha1(), /module load failed/)
+
+  class HungWorker { postMessage() {} terminate() {} }
+  globalThis.Worker = HungWorker
+  await assert.rejects(createWorkerSha1({ readyTimeoutMs: 5 }), /did not start/)
+})
+
+test('createPreferredSha1: falls back to main-thread hashing when the worker fails', async (t) => {
+  withMockWorker(t, class {})
+  const fallback = { kind: 'main-thread' }
+  const viaFailure = await createPreferredSha1({
+    createWorker: async () => { throw new Error('nope') },
+    createFallback: async () => fallback,
+  })
+  assert.equal(viaFailure, fallback)
+  const worker = { kind: 'worker' }
+  assert.equal(await createPreferredSha1({ createWorker: async () => worker, createFallback: async () => fallback }), worker)
+
+  delete globalThis.Worker
+  assert.equal(await createPreferredSha1({ createWorker: async () => worker, createFallback: async () => fallback }), fallback)
 })
