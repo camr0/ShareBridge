@@ -81,7 +81,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 			if err != nil {
 				if agentID != "" {
 					log.Printf("agent disconnected: %s (agent_id: %s)", apiKeyID, agentID)
-					h.UnregisterAgent(apiKeyID)
+					h.UnregisterAgent(apiKeyID, conn)
 				}
 				return
 			}
@@ -91,10 +91,22 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				continue
 			}
 
+			// A replaced socket cannot reclaim enrollment or mutate another epoch.
+			if agentID != "" && !h.IsCurrentAgent(apiKeyID, conn) {
+				continue
+			}
+
 			switch msg.Type {
 			case "hello":
+				// Enrollment happens once per socket. Ignoring duplicate hellos also
+				// prevents a stale socket reclaiming a newer enrollment after the check above.
+				if agentID != "" {
+					continue
+				}
 				handleHello(ctx, conn, h, apiKeyID, accountID, msg.AgentID, cfg)
-				agentID = msg.AgentID
+				if msg.AgentID != "" {
+					agentID = msg.AgentID
+				}
 
 			case "register_share":
 				if agentID == "" {
@@ -116,7 +128,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				if agentID == "" {
 					continue
 				}
-				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
+				h.ForwardToBrowser(ctx, apiKeyID, conn, msg.SessionID, map[string]any{
 					"type": "offer",
 					"sdp":  msg.SDP,
 				})
@@ -126,7 +138,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					continue
 				}
 				// TURN removed - relay candidates now handled by secure relay
-				h.ForwardToBrowser(ctx, msg.SessionID, map[string]any{
+				h.ForwardToBrowser(ctx, apiKeyID, conn, msg.SessionID, map[string]any{
 					"type":      "ice_candidate",
 					"candidate": msg.Candidate,
 				})
@@ -137,7 +149,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					continue
 				}
 				log.Printf("agent_ws: forwarding nonce to browser conn_id=%s has_password=%v", msg.ConnID, msg.HasPassword)
-				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+				h.ForwardToBrowserByConnID(ctx, apiKeyID, conn, msg.ConnID, map[string]any{
 					"type":         "nonce",
 					"conn_id":      msg.ConnID,
 					"value":        msg.Value,
@@ -150,12 +162,17 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 					continue
 				}
 
+				boundCode, owned := h.BrowserSessionForAgent(apiKeyID, conn, msg.ConnID)
+				if !owned || boundCode != msg.Code {
+					continue
+				}
+
 				session, err := getSessionByCode(app, msg.Code)
 				if err != nil {
 					log.Printf("agent_ws: auth_ok session lookup failed for code %s: %v", msg.Code, err)
 					continue
 				}
-				if session == nil {
+				if session == nil || session.GetString("api_key_id") != apiKeyID {
 					log.Printf("agent_ws: auth_ok session not found for code %s", msg.Code)
 					continue
 				}
@@ -232,7 +249,7 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				}
 
 				// Send relay_policy to browser via hub (always, so browser can proceed)
-				h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+				h.ForwardToBrowserByConnID(ctx, apiKeyID, conn, msg.ConnID, map[string]any{
 					"type":          "relay_policy",
 					"token":         browserJWT,
 					"relay_allowed": relayAllowed,
@@ -243,12 +260,15 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				if agentID == "" {
 					continue
 				}
-				failures := h.IncrementImmichAuthFailure(msg.ConnID)
+				failures := h.IncrementImmichAuthFailure(apiKeyID, conn, msg.ConnID)
+				if failures == 0 {
+					continue
+				}
 				log.Printf("Immich auth failed: conn %s failure %d/5", msg.ConnID, failures)
 				if failures >= 5 {
-					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
+					h.CloseBrowserConnWithError(ctx, apiKeyID, conn, msg.ConnID, "too many incorrect password attempts")
 				} else {
-					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+					h.ForwardToBrowserByConnID(ctx, apiKeyID, conn, msg.ConnID, map[string]any{
 						"type":               "auth_fail",
 						"attempts_remaining": 5 - failures,
 					})
@@ -260,12 +280,15 @@ func AgentWS(app core.App, h *hub.Hub, reg *relay.Registry, cfg *config.Config) 
 				if agentID == "" {
 					continue
 				}
-				failures := h.IncrementAuthFailure(msg.ConnID)
+				failures := h.IncrementAuthFailure(apiKeyID, conn, msg.ConnID)
+				if failures == 0 {
+					continue
+				}
 				log.Printf("HMAC auth failed: conn %s failure %d/3", msg.ConnID, failures)
 				if failures >= 3 {
-					h.CloseBrowserConnWithError(ctx, msg.ConnID, "too many incorrect password attempts")
+					h.CloseBrowserConnWithError(ctx, apiKeyID, conn, msg.ConnID, "too many incorrect password attempts")
 				} else {
-					h.ForwardToBrowserByConnID(ctx, msg.ConnID, map[string]any{
+					h.ForwardToBrowserByConnID(ctx, apiKeyID, conn, msg.ConnID, map[string]any{
 						"type":               "auth_failed",
 						"attempts_remaining": 3 - failures,
 					})

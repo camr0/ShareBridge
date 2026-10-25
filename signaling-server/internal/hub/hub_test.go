@@ -70,7 +70,7 @@ func TestRegisterAndUnregisterAgent(t *testing.T) {
 	assert.True(t, h.AgentConnected(apiKey))
 
 	// Unregister agent
-	h.UnregisterAgent(apiKey)
+	h.UnregisterAgent(apiKey, agentConn)
 	assert.False(t, h.AgentConnected(apiKey))
 
 	// Cleanup
@@ -136,7 +136,7 @@ func TestGetAgentConn_AgentDisconnected(t *testing.T) {
 	assert.NotNil(t, conn)
 
 	// Unregister agent (simulates disconnect)
-	h.UnregisterAgent(apiKey)
+	h.UnregisterAgent(apiKey, agentConn)
 
 	// GetAgentConn should now fail even though code is still registered
 	conn, ok = h.GetAgentConn(code)
@@ -166,7 +166,7 @@ func TestPairSession(t *testing.T) {
 	browserServerConn := <-connChan
 
 	// Pair session
-	err := h.PairSession(code, browserServerConn)
+	err := h.PairSession(code, "browser-id", apiKey, browserServerConn)
 	require.NoError(t, err)
 
 	// Unpair
@@ -182,7 +182,7 @@ func TestPairSession_UnknownCode(t *testing.T) {
 	h := New()
 
 	// Try to pair with unregistered code
-	err := h.PairSession("UNKNOWN-CODE", nil)
+	err := h.PairSession("UNKNOWN-CODE", "browser-id", "unknown-key", nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "code not registered")
 }
@@ -196,7 +196,7 @@ func TestPairSession_AgentNotConnected(t *testing.T) {
 	h.RegisterCode(code, apiKey)
 
 	// Try to pair
-	err := h.PairSession(code, nil)
+	err := h.PairSession(code, "browser-id", apiKey, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "agent not connected")
 }
@@ -256,7 +256,7 @@ func TestUnpairSession(t *testing.T) {
 	browserClient := dialTestClient(t, server)
 	browserServerConn := <-connChan
 
-	err := h.PairSession(code, browserServerConn)
+	err := h.PairSession(code, "browser-id", apiKey, browserServerConn)
 	require.NoError(t, err)
 
 	// Unpair
@@ -268,7 +268,7 @@ func TestUnpairSession(t *testing.T) {
 	assert.NoError(t, err)
 
 	// ForwardToBrowser should also return nil
-	err = h.ForwardToBrowser(ctx, code, map[string]string{"test": "message"})
+	err = h.ForwardToBrowser(ctx, apiKey, agentConn, code, map[string]string{"test": "message"})
 	assert.NoError(t, err)
 
 	// Cleanup
@@ -289,8 +289,8 @@ func TestUnpairSession_ReplacementPairSurvivesOldCleanup(t *testing.T) {
 	h.RegisterAgent(apiKey, agentConn)
 	h.RegisterCode(code, apiKey)
 
-	require.NoError(t, h.PairSession(code, originalBrowserConn))
-	require.NoError(t, h.PairSession(code, replacementBrowserConn))
+	require.NoError(t, h.PairSession(code, "original-id", apiKey, originalBrowserConn))
+	require.NoError(t, h.PairSession(code, "replacement-id", apiKey, replacementBrowserConn))
 
 	h.UnpairSession(code, originalBrowserConn)
 
@@ -314,7 +314,7 @@ func TestHubUnregisterCodeClosesPairedBrowser(t *testing.T) {
 
 	h.RegisterAgent("api-key-1", agentConn)
 	h.RegisterCode("IMMICHKEY1", "api-key-1")
-	require.NoError(t, h.PairSession("IMMICHKEY1", browserConn))
+	require.NoError(t, h.PairSession("IMMICHKEY1", "browser-id", "api-key-1", browserConn))
 
 	start := time.Now()
 	h.UnregisterCode(ctx, "IMMICHKEY1", "api-key-1", "share has been removed")
@@ -331,12 +331,16 @@ func TestHubUnregisterCodeClosesPairedBrowser(t *testing.T) {
 func TestAuthFailureCountersAreSeparate(t *testing.T) {
 	h := New()
 	connID := "conn-mixed-auth"
+	agentConn := new(websocket.Conn)
+	h.RegisterAgent("owner", agentConn)
+	h.RegisterCode("share", "owner")
+	require.NoError(t, h.PairSession("share", connID, "owner", new(websocket.Conn)))
 
-	require.Equal(t, 1, h.IncrementImmichAuthFailure(connID))
-	require.Equal(t, 2, h.IncrementImmichAuthFailure(connID))
-	require.Equal(t, 1, h.IncrementAuthFailure(connID))
-	require.Equal(t, 3, h.IncrementImmichAuthFailure(connID))
-	require.Equal(t, 2, h.IncrementAuthFailure(connID))
+	require.Equal(t, 1, h.IncrementImmichAuthFailure("owner", agentConn, connID))
+	require.Equal(t, 2, h.IncrementImmichAuthFailure("owner", agentConn, connID))
+	require.Equal(t, 1, h.IncrementAuthFailure("owner", agentConn, connID))
+	require.Equal(t, 3, h.IncrementImmichAuthFailure("owner", agentConn, connID))
+	require.Equal(t, 2, h.IncrementAuthFailure("owner", agentConn, connID))
 }
 
 func TestSendToAgent(t *testing.T) {

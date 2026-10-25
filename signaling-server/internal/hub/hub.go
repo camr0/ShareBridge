@@ -11,8 +11,15 @@ import (
 )
 
 type pair struct {
+	apiKeyID    string
 	agentConn   *websocket.Conn
 	browserConn *websocket.Conn
+}
+
+type browserOwner struct {
+	apiKeyID  string
+	sessionID string
+	agentConn *websocket.Conn
 }
 
 type Hub struct {
@@ -21,8 +28,9 @@ type Hub struct {
 	codes           map[string]string          // code → apiKey (for browser lookup)
 	pairs           map[string]*pair           // sessionID → pair
 	connBrowsers    map[string]*websocket.Conn // connID → browser conn
-	connFails       map[string]int             // connID → auth failure count
-	connImmichFails map[string]int             // connID → Immich password auth failure count
+	browserOwners   map[string]browserOwner
+	connFails       map[string]int // connID → auth failure count
+	connImmichFails map[string]int // connID → Immich password auth failure count
 	connWrites      map[*websocket.Conn]*sync.Mutex
 }
 
@@ -32,6 +40,7 @@ func New() *Hub {
 		codes:           make(map[string]string),
 		pairs:           make(map[string]*pair),
 		connBrowsers:    make(map[string]*websocket.Conn),
+		browserOwners:   make(map[string]browserOwner),
 		connFails:       make(map[string]int),
 		connImmichFails: make(map[string]int),
 		connWrites:      make(map[*websocket.Conn]*sync.Mutex),
@@ -42,14 +51,32 @@ func (h *Hub) RegisterAgent(apiKey string, conn *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.agents[apiKey] = conn
+	// Rebind still-owned browsers atomically so reconnecting the agent does not
+	// strand an existing browser's knock/join flow. Replace pair snapshots rather
+	// than mutating pointers already held by a forwarding goroutine.
+	for code, sessionPair := range h.pairs {
+		if sessionPair.apiKeyID == apiKey && h.codes[code] == apiKey {
+			h.pairs[code] = &pair{apiKeyID: apiKey, agentConn: conn, browserConn: sessionPair.browserConn}
+		}
+	}
+	for connID, owner := range h.browserOwners {
+		if owner.apiKeyID == apiKey && h.codes[owner.sessionID] == apiKey {
+			owner.agentConn = conn
+			h.browserOwners[connID] = owner
+		}
+	}
 	h.ensureWriteMuLocked(conn)
 }
 
-func (h *Hub) UnregisterAgent(apiKey string) {
+func (h *Hub) UnregisterAgent(apiKey string, expected *websocket.Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if conn, ok := h.agents[apiKey]; ok {
-		delete(h.connWrites, conn)
+	if expected == nil {
+		return
+	}
+	delete(h.connWrites, expected)
+	if h.agents[apiKey] != expected {
+		return
 	}
 	delete(h.agents, apiKey)
 }
@@ -96,20 +123,26 @@ func (h *Hub) GetAgentConn(code string) (*websocket.Conn, bool) {
 	return conn, ok
 }
 
-// PairSession associates a browser connection with the agent that owns sessionID.
-func (h *Hub) PairSession(sessionID string, browserConn *websocket.Conn) error {
+// PairSession atomically pairs and registers a browser with its persisted share owner.
+func (h *Hub) PairSession(sessionID, connID, apiKeyID string, browserConn *websocket.Conn) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// Direct lookup - don't call GetAgentConn which also acquires the lock
 	apiKey, ok := h.codes[sessionID]
-	if !ok {
+	if !ok || apiKey != apiKeyID {
 		return fmt.Errorf("code not registered")
 	}
 	agentConn, ok := h.agents[apiKey]
 	if !ok {
 		return fmt.Errorf("agent not connected")
 	}
-	h.pairs[sessionID] = &pair{agentConn: agentConn, browserConn: browserConn}
+	if connID == "" || browserConn == nil {
+		return fmt.Errorf("browser identity required")
+	}
+	h.pairs[sessionID] = &pair{apiKeyID: apiKey, agentConn: agentConn, browserConn: browserConn}
+	h.connBrowsers[connID] = browserConn
+	h.browserOwners[connID] = browserOwner{apiKeyID: apiKey, sessionID: sessionID, agentConn: agentConn}
+	h.ensureWriteMuLocked(browserConn)
 	return nil
 }
 
@@ -148,11 +181,12 @@ func (h *Hub) ForwardToAgent(ctx context.Context, sessionID string, msg any) err
 	return send(ctx, h, sessionPair.agentConn, msg)
 }
 
-func (h *Hub) ForwardToBrowser(ctx context.Context, sessionID string, msg any) error {
+func (h *Hub) ForwardToBrowser(ctx context.Context, apiKeyID string, agentConn *websocket.Conn, sessionID string, msg any) error {
 	h.mu.RLock()
 	sessionPair, ok := h.pairs[sessionID]
+	authorized := ok && h.agentOwnsSessionLocked(apiKeyID, agentConn, sessionID) && sessionPair.agentConn == agentConn
 	h.mu.RUnlock()
-	if !ok {
+	if !authorized {
 		return nil
 	}
 	return send(ctx, h, sessionPair.browserConn, msg)
@@ -244,15 +278,6 @@ func (h *Hub) CloseAgent(apiKeyID string) {
 	}
 }
 
-// RegisterBrowserConn stores a browser WebSocket connection keyed by connID.
-// Called when a browser WebSocket connects, before the knock/join flow.
-func (h *Hub) RegisterBrowserConn(connID string, conn *websocket.Conn) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.connBrowsers[connID] = conn
-	h.ensureWriteMuLocked(conn)
-}
-
 // UnregisterBrowserConn removes the browser conn and its failure count.
 // Called in the browser_ws.go defer when the WebSocket closes.
 func (h *Hub) UnregisterBrowserConn(connID string) {
@@ -262,15 +287,16 @@ func (h *Hub) UnregisterBrowserConn(connID string) {
 		delete(h.connWrites, conn)
 	}
 	delete(h.connBrowsers, connID)
+	delete(h.browserOwners, connID)
 	delete(h.connFails, connID)
 	delete(h.connImmichFails, connID)
 }
 
-// ForwardToBrowserByConnID sends msg to the browser identified by connID.
+// ForwardToBrowserByConnID sends only when the current agent owns the browser binding.
 // Used to route nonce responses from the agent back to the correct browser.
-func (h *Hub) ForwardToBrowserByConnID(ctx context.Context, connID string, msg any) error {
+func (h *Hub) ForwardToBrowserByConnID(ctx context.Context, apiKeyID string, agentConn *websocket.Conn, connID string, msg any) error {
 	h.mu.RLock()
-	conn, ok := h.connBrowsers[connID]
+	conn, _, ok := h.browserForAgentLocked(apiKeyID, agentConn, connID)
 	h.mu.RUnlock()
 	if !ok {
 		return nil
@@ -279,28 +305,34 @@ func (h *Hub) ForwardToBrowserByConnID(ctx context.Context, connID string, msg a
 }
 
 // IncrementAuthFailure increments the failure count for connID and returns
-// the new total. Callers decide which strike limit applies to their auth flow.
-func (h *Hub) IncrementAuthFailure(connID string) int {
+// the new total, or zero for an unauthorized target.
+func (h *Hub) IncrementAuthFailure(apiKeyID string, agentConn *websocket.Conn, connID string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if _, _, ok := h.browserForAgentLocked(apiKeyID, agentConn, connID); !ok {
+		return 0
+	}
 	h.connFails[connID]++
 	return h.connFails[connID]
 }
 
 // IncrementImmichAuthFailure increments the Immich password failure count for
-// connID and returns the new total.
-func (h *Hub) IncrementImmichAuthFailure(connID string) int {
+// connID and returns the new total, or zero for an unauthorized target.
+func (h *Hub) IncrementImmichAuthFailure(apiKeyID string, agentConn *websocket.Conn, connID string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if _, _, ok := h.browserForAgentLocked(apiKeyID, agentConn, connID); !ok {
+		return 0
+	}
 	h.connImmichFails[connID]++
 	return h.connImmichFails[connID]
 }
 
 // CloseBrowserConnWithError sends an error message to the browser identified by
 // connID and then closes its WebSocket.
-func (h *Hub) CloseBrowserConnWithError(ctx context.Context, connID, message string) {
+func (h *Hub) CloseBrowserConnWithError(ctx context.Context, apiKeyID string, agentConn *websocket.Conn, connID, message string) {
 	h.mu.RLock()
-	conn, ok := h.connBrowsers[connID]
+	conn, _, ok := h.browserForAgentLocked(apiKeyID, agentConn, connID)
 	h.mu.RUnlock()
 	if !ok {
 		return

@@ -97,21 +97,20 @@ func BrowserWS(app core.App, sessionHub *hub.Hub, cfg *config.Config) http.Handl
 			return
 		}
 
-		if err := sessionHub.PairSession(sessionCode, browserConn); err != nil {
+		apiKeyID := sessionRecord.GetString("api_key_id")
+		connID := generateConnID()
+		if err := sessionHub.PairSession(sessionCode, connID, apiKeyID, browserConn); err != nil {
 			sessionHub.SendDirect(requestCtx, browserConn, map[string]string{"type": "error", "message": "agent not connected"})
 			browserConn.Close(websocket.StatusNormalClosure, "agent not connected")
 			return
 		}
 		defer sessionHub.UnpairSession(sessionCode, browserConn)
 
-		connID := generateConnID()
-		sessionHub.RegisterBrowserConn(connID, browserConn)
 		defer sessionHub.UnregisterBrowserConn(connID)
 
 		log.Printf("browser connected to session %s (conn %s)", sessionCode, connID)
 
 		// Look up the API key to get the account for quota checking
-		apiKeyID := sessionRecord.GetString("api_key_id")
 		apiKeyRecord, err := app.FindRecordById("api_keys", apiKeyID)
 		if err != nil {
 			log.Printf("browser_ws: error looking up api_key %s: %v", apiKeyID, err)

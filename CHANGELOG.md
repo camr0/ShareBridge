@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- Scope agent-to-browser signaling and relay policy to the owning API key, share, and current agent connection; reject cross-account messages and mismatched browser/share authentication results while preserving agent reconnects.
+
 ## [0.8.1] - 2026-10-14
 
 ### Fixed
