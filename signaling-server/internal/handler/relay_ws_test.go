@@ -180,20 +180,42 @@ func TestRelayWS_RejectsReplayedBrowserJTI(t *testing.T) {
 	}
 }
 
+// Configure the package-level timeout before the server goroutine starts, and
+// wait for upgraded handlers to exit before restoring it. httptest.Server.Close
+// does not wait for hijacked WebSocket connections.
+func newRelayTimeoutTestServer(t *testing.T, reg *relay.Registry, cfg *config.Config, timeout time.Duration, connections int) *httptest.Server {
+	t.Helper()
+	originalTimeout := handler.HelloTimeout()
+	handler.SetHelloTimeout(timeout)
+	t.Cleanup(func() { handler.SetHelloTimeout(originalTimeout) })
+	done := make(chan struct{}, connections)
+	t.Cleanup(func() {
+		for range connections {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Error("relay WebSocket handler did not exit")
+				return
+			}
+		}
+	})
+	relayHandler := handler.RelayWS(nil, reg, cfg)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws/relay", func(w http.ResponseWriter, r *http.Request) {
+		defer func() { done <- struct{}{} }()
+		relayHandler(w, r)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server
+}
+
 func TestRelayWS_HelloTimeout(t *testing.T) {
 	reg := relay.NewRegistry(2 * time.Second)
 	cfg := config.Load()
 	cfg.RelayJWTSecret = "secret"
 
-	mux := http.NewServeMux()
-	mux.Handle("/ws/relay", handler.RelayWS(nil, reg, cfg))
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	// Set a short timeout for testing (restore after test)
-	originalTimeout := handler.HelloTimeout()
-	defer handler.SetHelloTimeout(originalTimeout)
-	handler.SetHelloTimeout(500 * time.Millisecond)
+	server := newRelayTimeoutTestServer(t, reg, cfg, 500*time.Millisecond, 1)
 
 	ctx := context.Background()
 	// Client connects but never sends hello
@@ -232,14 +254,7 @@ func TestRelayWS_ProxySessionOutlivesHelloTimeout(t *testing.T) {
 		RegisteredClaims: jwt.RegisteredClaims{ID: "jti-3"},
 	}, now)
 
-	mux := http.NewServeMux()
-	mux.Handle("/ws/relay", handler.RelayWS(nil, reg, cfg))
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	originalTimeout := handler.HelloTimeout()
-	defer handler.SetHelloTimeout(originalTimeout)
-	handler.SetHelloTimeout(100 * time.Millisecond)
+	server := newRelayTimeoutTestServer(t, reg, cfg, 100*time.Millisecond, 2)
 
 	ctx := context.Background()
 	agentConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/ws/relay", nil)
