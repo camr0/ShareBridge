@@ -1,6 +1,7 @@
 services:
   sharebridge-server:
     build: .
+    restart: unless-stopped
     network_mode: host
     environment:
       - PORT=8080
